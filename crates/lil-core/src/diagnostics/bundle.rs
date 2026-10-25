@@ -17,12 +17,15 @@
 //! Never a workspace file. Every entry is redacted ([`super::redact`]); `redactions` counts
 //! the replacements. The zip is built in memory and written by the store's cache writer
 //! (`fsops::write_new_suite_cache_file`: a temp file in the diagnostics folder, then a move
-//! that never replaces), so nothing is written anywhere else; then the folder keeps the newest
-//! [`KEEP_BUNDLES`] bundles. Nothing is sent anywhere (ARCH-122).
+//! that never replaces), so nothing is written anywhere else. No bundle ever removes or
+//! replaces another, and no path is handed out twice: a taken name, or one this core handed
+//! out already, is skipped for the next number. A log whose file name a rule changes is named
+//! `logs/redacted-<n>.<date>.log`. Nothing is sent anywhere (ARCH-122).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use lil_platform::Env;
@@ -32,7 +35,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::redact::{Compiled, Redactor, profile_values};
-use super::{Diagnostics, MAX_RECENT};
+use super::{Diagnostics, MAX_MESSAGE_CHARS, MAX_RECENT, cut_message};
 use crate::engines::comfyui::environment;
 use crate::jobs::JobId;
 use crate::store::fsops;
@@ -42,8 +45,6 @@ use crate::tools::CallCtx;
 pub const LOG_TAIL_BYTES: u64 = 5 * 1024 * 1024;
 /// How much of the logs goes in, in all.
 pub const LOGS_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
-/// How many bundles the diagnostics folder keeps.
-pub const KEEP_BUNDLES: usize = 10;
 /// A bundle's name before its time stamp.
 const BUNDLE_PREFIX: &str = "lilith-diagnostics-";
 /// The manifest's `bundle` version.
@@ -157,7 +158,10 @@ impl Diagnostics {
                     "driver": driver,
                 }),
             ),
-            ("errors.json", json!({ "errors": self.recent(MAX_RECENT) })),
+            (
+                "errors.json",
+                json!({ "errors": self.recent_uncut(MAX_RECENT) }),
+            ),
             (
                 "hardware.json",
                 snapshot.map_or(Value::Null, |s| {
@@ -174,8 +178,9 @@ impl Diagnostics {
         }
         let parts = Parts { unix_secs, entries };
         let env = self.env.clone();
+        let handed = self.handed.clone();
         let trace_id = ctx.trace_id.clone();
-        let written = tokio::task::spawn_blocking(move || write_bundle(&env, parts))
+        let written = tokio::task::spawn_blocking(move || write_bundle(&env, parts, &handed))
             .await
             .map_err(|e| {
                 ErrorBody::new(
@@ -210,7 +215,11 @@ fn newest_capture(environment: &Value, key: &str) -> Option<String> {
 }
 
 /// Builds, redacts and writes the zip (blocking: it reads the logs and `suite.toml`).
-fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
+fn write_bundle(
+    env: &Env,
+    parts: Parts,
+    handed: &Mutex<HashSet<PathBuf>>,
+) -> std::io::Result<BundleResult> {
     let suite_toml = match std::fs::read_to_string(env.suite_toml_to_read()) {
         Ok(text) => Some(text),
         Err(e) => {
@@ -236,7 +245,18 @@ fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
     .compile();
     let mut redactions = 0u32;
     let mut entries: Vec<(String, String)> = Vec::new();
-    for (name, value) in parts.entries {
+    for (name, mut value) in parts.entries {
+        if name == "errors.json" {
+            // Each message redacted whole, then cut: a cut first could leave a fragment no
+            // rule knows.
+            for group in value["errors"].as_array_mut().into_iter().flatten() {
+                if let Some(message) = group["last_message"].as_str() {
+                    let (message, n) = redactor.text(message);
+                    redactions += n;
+                    group["last_message"] = json!(cut_message(&message, MAX_MESSAGE_CHARS));
+                }
+            }
+        }
         let text = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
         let (text, n) = redactor.text(&text);
         redactions += n;
@@ -250,6 +270,7 @@ fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
         }
     }
     let mut budget = LOGS_TOTAL_BYTES;
+    let mut renamed = 0u32;
     for path in newest_logs(&env.logs_dir()) {
         let Some(file) = path.file_name().map(|f| f.to_string_lossy().into_owned()) else {
             continue;
@@ -268,7 +289,20 @@ fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
         budget = budget.saturating_sub(bytes.len() as u64);
         let (text, n) = redact_lines(&redactor, &String::from_utf8_lossy(&bytes));
         redactions += n;
-        entries.push((format!("logs/{file}"), text));
+        // The file name too (a process name can hold the account name).
+        let (shown, m) = redactor.text(&file);
+        let name = if shown == file {
+            format!("logs/{file}")
+        } else {
+            redactions += m;
+            renamed += 1;
+            let date = file
+                .strip_suffix(".log")
+                .and_then(|stem| stem.rsplit_once('.'))
+                .map_or("unknown", |(_, date)| date);
+            format!("logs/redacted-{renamed}.{date}.log")
+        };
+        entries.push((name, text));
     }
 
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -285,49 +319,23 @@ fn write_bundle(env: &Env, parts: Parts) -> std::io::Result<BundleResult> {
         "{BUNDLE_PREFIX}{}.zip",
         lil_schema::time::compact(parts.unix_secs)
     ));
-    let path = fsops::write_new_suite_cache_file(env, &path, &bytes)?;
-    prune_bundles(env, &path);
+    // A path handed out once is never handed out again (compared lower-cased).
+    let key = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let set = || {
+        handed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let path = fsops::write_new_suite_cache_file(env, &path, &bytes, &|candidate| {
+        set().contains(&key(candidate))
+    })?;
+    set().insert(key(&path));
     Ok(BundleResult {
         path: path.display().to_string(),
         bytes: bytes.len() as u64,
         files: entries.into_iter().map(|(name, _)| name).collect(),
         redactions,
     })
-}
-
-/// Removes all but the newest [`KEEP_BUNDLES`] bundles of the diagnostics folder: `written`,
-/// the one just made, and the newest others by their time stamp and number. Other files are
-/// never touched; one that can't be removed is left.
-fn prune_bundles(env: &Env, written: &Path) {
-    let written = written
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned());
-    let dir = env.diagnostics_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
-    // (stamp, number, name) of each bundle.
-    let mut bundles: Vec<(String, u32, String)> = entries
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| Some(name) != written.as_ref())
-        .filter_map(|name| {
-            let stem = name.strip_prefix(BUNDLE_PREFIX)?.strip_suffix(".zip")?;
-            let (stamp, number) = match stem.split_once('-') {
-                Some((stamp, k)) => (stamp, k.parse().ok()?),
-                None => (stem, 1),
-            };
-            let stamped = stamp.len() == 16 && stamp.as_bytes()[8] == b'T' && stamp.ends_with('Z');
-            stamped.then(|| (stamp.to_string(), number, name.clone()))
-        })
-        .collect();
-    bundles.sort();
-    let excess = bundles.len().saturating_sub(KEEP_BUNDLES - 1);
-    for (_, _, name) in &bundles[..excess] {
-        if let Err(e) = fsops::remove_suite_cache_file(env, &dir.join(name)) {
-            tracing::warn!(bundle = %name, error = %e, "an old diagnostics bundle could not be removed");
-        }
-    }
 }
 
 /// `text` redacted line by line.

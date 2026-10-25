@@ -44,9 +44,10 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use base64::Engine as _;
 use lil_platform::names;
 
+/// How many decode-and-redact passes [`Redactor::text`] makes at most.
+pub const MAX_PASSES: usize = 3;
 /// What a redacted value becomes.
 pub const REDACTED: &str = "<redacted>";
 /// What the user-profile folder becomes.
@@ -184,29 +185,43 @@ pub(crate) struct Compiled {
 }
 
 impl Compiled {
-    /// [`Redactor::text`] (module docs).
+    /// [`Redactor::text`] (module docs): the decode-and-redact pass, again until nothing
+    /// changes, at most [`MAX_PASSES`] times, so an encoding nested in another (each pass
+    /// decodes one level) is redacted too.
     pub(crate) fn text(&self, s: &str) -> (String, u32) {
         let mut n = 0;
+        let mut current = self.pass(s, &mut n);
+        for _ in 1..MAX_PASSES {
+            let next = self.pass(&current, &mut n);
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        (current, n)
+    }
+
+    /// One decode-and-redact pass over `s` (module docs).
+    fn pass(&self, s: &str, n: &mut u32) -> String {
         let s = decode_escapes(s);
         let mut s = s.into_owned();
         for word in &self.words {
-            s = replace_words(&s, word, REDACTED, &mut n);
+            s = replace_words(&s, word, REDACTED, n);
         }
-        let s = self.profile(&s, &mut n);
-        let s = sids(&s, &mut n);
-        let s = open_payloads(&s, &mut n);
-        let s = deny_tokens(&s, &mut n);
-        let s = known_tokens(&s, &mut n);
-        let s = targets(&s, &mut n);
-        let mut s = emails(&s, &mut n);
+        let s = self.profile(&s, n);
+        let s = sids(&s, n);
+        let s = open_payloads(&s, n);
+        let s = deny_tokens(&s, n);
+        let s = known_tokens(&s, n);
+        let s = targets(&s, n);
+        let mut s = emails(&s, n);
         if let Some(user) = &self.user {
-            s = replace_words(&s, user, USER, &mut n);
+            s = replace_words(&s, user, USER, n);
         }
         for form in &self.machines {
-            s = replace_words(&s, form, MACHINE, &mut n);
+            s = replace_words(&s, form, MACHINE, n);
         }
-        let s = keys(&s, &mut n);
-        (s, n)
+        keys(&s, n)
     }
 
     /// [`Redactor::toml`].
@@ -250,9 +265,13 @@ impl Compiled {
     }
 }
 
-/// `s` with the encodings of rule 0 decoded (module docs); borrowed when there are none.
+/// `s` with one level of the encodings of rule 0 decoded (module docs); borrowed when there are
+/// none. `%25` decodes to `%`, so a twice percent-encoded form is decoded by the next pass; a
+/// run of percent-encoded bytes that is UTF-8 decodes to its characters; a `\uXXXX` escape
+/// after any run of `\` (a JSON string inside a JSON string) decodes, the run losing the
+/// backslashes of that escape level; and `&#NN;` / `&#xHH;` decode as the `\u` forms do.
 fn decode_escapes(s: &str) -> Cow<'_, str> {
-    if !s.contains('%') && !s.contains("\\u") {
+    if !s.contains('%') && !s.contains("\\u") && !s.contains("&#") {
         return Cow::Borrowed(s);
     }
     let b = s.as_bytes();
@@ -261,23 +280,47 @@ fn decode_escapes(s: &str) -> Cow<'_, str> {
             .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
             .and_then(|_| u32::from_str_radix(&s[range], 16).ok())
     };
+    // What a code point decodes to, if it is one rule 0 decodes.
+    let decoded = |code: u32| match code {
+        0x5c => Some(r"\\".to_string()),
+        0x2f | 0x3a | 0x40 | 0x20 => char::from_u32(code).map(String::from),
+        0xa0.. => char::from_u32(code).map(String::from),
+        _ => None,
+    };
     let mut out = String::with_capacity(s.len());
     let (mut last, mut i) = (0, 0);
     while i < b.len() {
         if b[i] == b'%'
             && let Some(code) = hex(i + 1..i + 3)
         {
-            let decoded = match code {
-                0x5c => Some(r"\\"),
-                0x2f => Some("/"),
-                0x3a => Some(":"),
-                0x40 => Some("@"),
-                0x20 => Some(" "),
-                _ => None,
-            };
-            if let Some(decoded) = decoded {
+            if code == 0x25 {
                 out.push_str(&s[last..i]);
-                out.push_str(decoded);
+                out.push('%');
+                i += 3;
+                last = i;
+                continue;
+            }
+            if code >= 0x80 {
+                // A run of percent-encoded bytes: decoded when it is UTF-8.
+                let mut bytes = Vec::new();
+                let mut j = i;
+                while b.get(j) == Some(&b'%')
+                    && let Some(byte) = hex(j + 1..j + 3).filter(|c| *c >= 0x80)
+                {
+                    bytes.push(byte as u8);
+                    j += 3;
+                }
+                if let Ok(text) = String::from_utf8(bytes) {
+                    out.push_str(&s[last..i]);
+                    out.push_str(&text);
+                    i = j;
+                    last = i;
+                    continue;
+                }
+            } else if let Some(text) = decoded(code) {
+                // `%5C` becomes an escaped backslash, so JSON stays JSON.
+                out.push_str(&s[last..i]);
+                out.push_str(&text);
                 i += 3;
                 last = i;
                 continue;
@@ -286,28 +329,49 @@ fn decode_escapes(s: &str) -> Cow<'_, str> {
         if b[i] == b'\\' {
             let run = b[i..].iter().take_while(|c| **c == b'\\').count();
             let u = i + run;
-            if run % 2 == 1
-                && b.get(u) == Some(&b'u')
-                && let Some(code) = hex(u + 1..u + 5)
+            if b.get(u) == Some(&b'u')
+                && let Some(text) = hex(u + 1..u + 5).and_then(decoded)
             {
-                let decoded = match code {
-                    0x5c => Some(r"\\".to_string()),
-                    0x2f | 0x3a | 0x40 | 0x20 => char::from_u32(code).map(String::from),
-                    0xa0.. => char::from_u32(code).map(String::from),
-                    _ => None,
-                };
-                if let Some(decoded) = decoded {
-                    out.push_str(&s[last..i]);
-                    // The pairs before the escape are escaped backslashes and stay.
-                    out.push_str(&s[i..i + run - 1]);
-                    out.push_str(&decoded);
-                    i = u + 5;
-                    last = i;
-                    continue;
-                }
+                // The escape's own backslashes go: one at its level, the others pairs.
+                let keep = if run % 2 == 1 { run - 1 } else { run - 2 };
+                out.push_str(&s[last..i]);
+                out.push_str(&s[i..i + keep]);
+                out.push_str(&text);
+                i = u + 5;
+                last = i;
+                continue;
             }
             i += run;
             continue;
+        }
+        if b[i] == b'&' && b.get(i + 1) == Some(&b'#') {
+            let (digits, radix, from) = match b.get(i + 2) {
+                Some(b'x' | b'X') => (
+                    b[i + 3..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .count(),
+                    16,
+                    i + 3,
+                ),
+                _ => (
+                    b[i + 2..].iter().take_while(|c| c.is_ascii_digit()).count(),
+                    10,
+                    i + 2,
+                ),
+            };
+            if (1..=6).contains(&digits)
+                && b.get(from + digits) == Some(&b';')
+                && let Some(text) = u32::from_str_radix(&s[from..from + digits], radix)
+                    .ok()
+                    .and_then(decoded)
+            {
+                out.push_str(&s[last..i]);
+                out.push_str(&text);
+                i = from + digits + 1;
+                last = i;
+                continue;
+            }
         }
         i += 1;
     }
@@ -416,8 +480,35 @@ fn word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Whether a value may start at byte `i` of `s`, the one "not inside a word" test every rule
+/// uses: at the text's start, after a character that isn't a word character (as `word`
+/// says), or right after an escape (`\n`, `\r`, `\t`, `\b`, `\f` or `\uXXXX`, after any run of
+/// `\`): a JSON or string escape is a boundary, so a value at the start of an escaped line is
+/// found too. (`\"`, `\\` and `\/` end in a character that is no word character anyway.)
+fn starts_word(s: &str, i: usize, word: impl Fn(char) -> bool) -> bool {
+    if !s.is_char_boundary(i) {
+        return false;
+    }
+    let Some(prev) = s[..i].chars().next_back() else {
+        return true;
+    };
+    if !word(prev) {
+        return true;
+    }
+    let b = s.as_bytes();
+    let after_backslash = |at: usize| at > 0 && b[at - 1] == b'\\';
+    if matches!(prev, 'n' | 'r' | 't' | 'b' | 'f') && after_backslash(i - 1) {
+        return true;
+    }
+    i >= 6
+        && b[i - 5] == b'u'
+        && b[i - 4..i].iter().all(u8::is_ascii_hexdigit)
+        && after_backslash(i - 5)
+}
+
 /// Every whole-word `word` replaced by `with`, in any letter case: where the word starts (or
-/// ends) with a letter, digit or `_`, the character before (or after) it isn't one.
+/// ends) with a letter, digit or `_`, it starts a word ([`starts_word`]) and the character
+/// after it isn't one.
 fn replace_words(s: &str, word: &str, with: &str, n: &mut u32) -> String {
     let (Some(first), Some(final_char)) = (word.chars().next(), word.chars().next_back()) else {
         return s.to_string();
@@ -426,7 +517,7 @@ fn replace_words(s: &str, word: &str, with: &str, n: &mut u32) -> String {
     let (mut last, mut i) = (0, 0);
     while i < s.len() {
         let c = s[i..].chars().next().unwrap_or_default();
-        let before_ok = !word_char(first) || !s[..i].chars().next_back().is_some_and(word_char);
+        let before_ok = !word_char(first) || starts_word(s, i, word_char);
         if before_ok
             && c.to_lowercase().eq(first.to_lowercase())
             && let Some(end) = match_ignoring_case(s, i, word)
@@ -451,8 +542,8 @@ fn holds_scrub_word(key: &str) -> bool {
     SCRUB_WORDS.iter().any(|w| upper.contains(w))
 }
 
-/// Every Windows SID (`S-1-<n>-<n>…`, any case, not inside a longer word) replaced by `<sid>`;
-/// it ends at the first `-` not followed by a digit (`-dev`, `-test-…` stay).
+/// Every Windows SID (`S-1-<n>-<n>…`, any case, starting a word) replaced by `<sid>`, whatever
+/// follows it; it ends at the first `-` not followed by a digit (`-dev`, `-test-…` stay).
 fn sids(s: &str, n: &mut u32) -> String {
     let b = s.as_bytes();
     let digits = |from: usize| {
@@ -467,7 +558,7 @@ fn sids(s: &str, n: &mut u32) -> String {
         let starts = matches!(b[i], b'S' | b's')
             && b[i + 1] == b'-'
             && b[i + 2] == b'1'
-            && (i == 0 || !b[i - 1].is_ascii_alphanumeric());
+            && starts_word(s, i, |c| c.is_ascii_alphanumeric());
         if starts {
             let mut j = i + 3;
             let mut groups = 0;
@@ -479,7 +570,7 @@ fn sids(s: &str, n: &mut u32) -> String {
                 j += 1 + d;
                 groups += 1;
             }
-            if groups >= 2 && !b.get(j).is_some_and(u8::is_ascii_alphanumeric) {
+            if groups >= 2 {
                 out.push_str(&s[last..i]);
                 out.push_str(SID);
                 *n += 1;
@@ -494,45 +585,79 @@ fn sids(s: &str, n: &mut u32) -> String {
     out
 }
 
-/// Every `<scheme>:open/<base64url>` (a `lil`, `lil-dev` or `lil-test-…` scheme, any case) whose
-/// payload decodes has the payload replaced: it is a path, a ref or a name (APP-020).
+/// Every `open/` payload under a suite scheme (`lil`, `lil-dev`, `lil-test-…`, any case,
+/// starting a word) replaced, whether it decodes or not: it is a path, a ref or a name
+/// (APP-020). The scheme may be followed by `//` (`lil://open/…`), and each `/` may be escaped
+/// (`open\/…`); the payload runs over `[A-Za-z0-9+/=_-]`, standard base64 included.
 fn open_payloads(s: &str, n: &mut u32) -> String {
-    const VERB: &[u8] = b":open/";
     let b = s.as_bytes();
-    let scheme_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'_';
-    let payload_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'=';
+    let scheme_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    // A `/`, escaped with any run of `\` or not: its length.
+    let slash = |at: usize| {
+        let run = b[at.min(b.len())..]
+            .iter()
+            .take_while(|c| **c == b'\\')
+            .count();
+        (b.get(at + run) == Some(&b'/')).then_some(run + 1)
+    };
+    let payload_byte =
+        |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=' | b'_' | b'-');
     let mut out = String::with_capacity(s.len());
     let (mut last, mut i) = (0, 0);
-    while i + VERB.len() <= b.len() {
-        if !b[i..i + VERB.len()].eq_ignore_ascii_case(VERB) {
+    while i + 3 <= b.len() {
+        if !(b[i..i + 3].eq_ignore_ascii_case(b"lil") && starts_word(s, i, scheme_char)) {
             i += 1;
             continue;
         }
-        let mut start = i;
-        while start > last && scheme_byte(b[start - 1]) {
-            start -= 1;
+        let mut j = i + 3;
+        if b.get(j) == Some(&b'-') {
+            j += 1;
+            while b
+                .get(j)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+            {
+                j += 1;
+            }
         }
-        let scheme = &s[start..i];
-        let ours = scheme.len() >= 3
-            && scheme[..3].eq_ignore_ascii_case("lil")
-            && (scheme.len() == 3 || scheme.as_bytes()[3] == b'-');
-        let from = i + VERB.len();
-        let mut end = from;
-        while end < b.len() && payload_byte(b[end]) {
-            end += 1;
-        }
-        let decodes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(s[from..end].trim_end_matches('='))
-            .is_ok_and(|bytes| !bytes.is_empty());
-        if ours && decodes {
-            out.push_str(&s[last..from]);
-            out.push_str(REDACTED);
-            *n += 1;
-            last = end;
-            i = end;
+        if b.get(j) != Some(&b':') {
+            i += 1;
             continue;
         }
-        i = from;
+        j += 1;
+        // `lil://open/…`
+        for _ in 0..2 {
+            if let Some(len) = slash(j) {
+                j += len;
+            }
+        }
+        let verb = b
+            .get(j..j + 4)
+            .is_some_and(|v| v.eq_ignore_ascii_case(b"open"));
+        let Some(sep) = verb.then(|| slash(j + 4)).flatten() else {
+            i += 1;
+            continue;
+        };
+        let from = j + 4 + sep;
+        let mut end = from;
+        loop {
+            if end < b.len() && payload_byte(b[end]) {
+                end += 1;
+            } else if let Some(len) = slash(end).filter(|_| b.get(end) == Some(&b'\\')) {
+                // A standard-base64 `/` escaped in JSON.
+                end += len;
+            } else {
+                break;
+            }
+        }
+        if end == from {
+            i = from;
+            continue;
+        }
+        out.push_str(&s[last..from]);
+        out.push_str(REDACTED);
+        *n += 1;
+        last = end;
+        i = end;
     }
     out.push_str(&s[last..]);
     out
@@ -682,7 +807,8 @@ fn known_tokens(s: &str, n: &mut u32) -> String {
     let mut out = String::with_capacity(s.len());
     let (mut last, mut i) = (0, 0);
     while i < b.len() {
-        if i > 0 && alnum_under(b[i - 1]) {
+        let could_start = matches!(b[i], b'g' | b'h' | b's' | b'A' | b'x' | b'e');
+        if !could_start || !starts_word(s, i, |c| c.is_ascii_alphanumeric() || c == '_') {
             i += 1;
             continue;
         }
@@ -731,7 +857,8 @@ fn targets(s: &str, n: &mut u32) -> String {
     let mut out = String::with_capacity(s.len());
     let (mut last, mut i) = (0, 0);
     while i < b.len() {
-        if i > 0 && word(b[i - 1]) {
+        let could_start = matches!(b[i], b'L' | b'l' | b'W' | b'w');
+        if !could_start || !starts_word(s, i, |c| c.is_ascii() && word(c as u8)) {
             i += 1;
             continue;
         }
@@ -901,7 +1028,7 @@ fn keys(s: &str, n: &mut u32) -> String {
     let mut out = String::with_capacity(s.len());
     let (mut last, mut i) = (0, 0);
     while i < b.len() {
-        if !key_byte(b[i]) || (i > 0 && key_byte(b[i - 1])) {
+        if !key_byte(b[i]) || !starts_word(s, i, |c| c.is_ascii() && key_byte(c as u8)) {
             i += 1;
             continue;
         }
@@ -997,6 +1124,24 @@ fn value_at(s: &str, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
         }
         Quote::None | Quote::Single => inner.to_string(),
     };
+    // A TOML multi-line string (`'''…'''`, `"""…"""`, or `"""` escaped any number of times):
+    // to its closing delimiter, or the text's end.
+    let escaped_triple = escaped_quote_at(b, k).and_then(|run| {
+        let one = format!("{}\"", "\\".repeat(run));
+        s[k..].starts_with(&one.repeat(3)).then(|| one.repeat(3))
+    });
+    let triple = ["'''", "\"\"\""]
+        .iter()
+        .find(|d| s[k..].starts_with(**d))
+        .map(|d| (*d).to_string())
+        .or(escaped_triple);
+    if let Some(delim) = triple {
+        let inner = k + delim.len();
+        let close = s[inner..].find(&delim).map_or(s.len(), |p| inner + p);
+        let end = (close + delim.len()).min(s.len());
+        return (s[inner..close] != *REDACTED)
+            .then(|| (k, end, format!("{delim}{REDACTED}{delim}")));
+    }
     if let Some(run) = escaped_quote_at(b, k) {
         // A string escaped `run` times: to the same run before a `"`.
         let inner = k + run + 1;
@@ -1303,6 +1448,8 @@ pub(crate) fn profile_values(doc: &str, key: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
 
     #[test] // spec: ARCH-121
@@ -1513,5 +1660,129 @@ mod tests {
             assert!(!out.contains(secret), "{out}");
         }
         assert!(out.contains("kept = 1"), "{out}");
+    }
+
+    /// A JSON or string escape right before a value is a word boundary for every rule (one
+    /// helper, [`starts_word`]): `\n`, `\t`, `\r` and `\u000a` before each kind of value.
+    #[test] // spec: ARCH-121
+    fn an_escape_before_a_value_is_a_boundary_for_every_rule() {
+        let r = Redactor {
+            labels: vec!["Night Owl".into()],
+            profile_dir: Some(r"C:\Users\Fake\probeuser".into()),
+            machine: Some("PROBEBOX-01".into()),
+            machine_names: vec!["probebox-01-longer-host".into()],
+            names: vec![r"D:\claude\owl-dir".into()],
+        };
+        let ghp = format!("ghp_{}", "A1".repeat(18));
+        let values = [
+            ("probeuser", "<user>"),
+            ("PROBEBOX-01", "<machine>"),
+            ("probebox-01-longer-host", "<machine>"),
+            ("Night Owl", "<redacted>"),
+            (r"D:\\claude\\owl-dir", "<redacted>"),
+            ("S-1-5-21-1-2-3-1001", "<sid>"),
+            (ghp.as_str(), "<redacted>"),
+            ("LILITH-dev/github/agent-token", "<redacted>"),
+        ];
+        for (value, placeholder) in values {
+            for escape in [r"\n", r"\t", r"\r", r"\u000a", r"\\n"] {
+                let text = format!(r#"{{"m":"first line{escape}{value} rest"}}"#);
+                let (out, n) = r.text(&text);
+                assert!(
+                    !out.to_lowercase().contains(&value.to_lowercase()),
+                    "{text} -> {out}"
+                );
+                assert!(n >= 1 && out.contains(placeholder), "{text} -> {out}");
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
+            }
+        }
+        // Still not inside a word.
+        assert_eq!(r.text("xprobeuser and probeusers").1, 0);
+    }
+
+    #[test] // spec: ARCH-121
+    fn a_sid_goes_whatever_follows_it() {
+        let r = Redactor::default();
+        for (text, want) in [
+            ("O:S-1-5-21-1-2-3-1001G:SY", "O:<sid>G:SY"),
+            ("S-1-5-21-1-2-3-1001x", "<sid>x"),
+            ("pipe-S-1-5-18-dev", "pipe-<sid>-dev"),
+        ] {
+            assert_eq!(r.text(text).0, want, "{text}");
+        }
+    }
+
+    #[test] // spec: ARCH-121, APP-020
+    fn an_open_payload_goes_whether_it_decodes_or_not() {
+        let r = Redactor::default();
+        for (text, want) in [
+            // Truncated to 1 mod 4: it no longer decodes.
+            (
+                "lil:open/QzpcVXNlcnNccHJvYmV1c2VyXFBpY3R1cm",
+                "lil:open/<redacted>",
+            ),
+            ("lil:open/QzpcVXNl…", "lil:open/<redacted>…"),
+            ("lil://open/QzpcVXNl", "lil://open/<redacted>"),
+            (
+                r#"{"u":"lil-dev:open\/QzpcVXNl"}"#,
+                r#"{"u":"lil-dev:open\/<redacted>"}"#,
+            ),
+            ("LIL-TEST-x1:OPEN/ab+cd/ef==", "LIL-TEST-x1:OPEN/<redacted>"),
+            (
+                r#"{"u":"lil:open/ab+c\/d=="}"#,
+                r#"{"u":"lil:open/<redacted>"}"#,
+            ),
+            (
+                "http://x/open/abc and file:open/x",
+                "http://x/open/abc and file:open/x",
+            ),
+        ] {
+            assert_eq!(r.text(text).0, want, "{text}");
+        }
+    }
+
+    /// Each pass decodes one more level, up to [`MAX_PASSES`]: a value encoded twice goes.
+    #[test] // spec: ARCH-121
+    fn a_value_encoded_two_levels_deep_goes() {
+        let r = Redactor {
+            profile_dir: Some(r"C:\Users\Fake\probeuser".into()),
+            ..Redactor::default()
+        };
+        for (text, secret) in [
+            ("probe%2540mail.example", "probe"),
+            (
+                r"C%253A%255CUsers%255CFake%255Cprobeuser%255Cx",
+                "probeuser",
+            ),
+            ("J%C3%BCrgen probe%2540mail.example", "probe"),
+            (r#"{"a":"{\"b\":\"probe\\u0040mail.example\"}"}"#, "probe"),
+            ("probe&#64;mail.example", "probe"),
+            (r"lil:open%252FQzpcVXNl", "QzpcVXNl"),
+        ] {
+            let (out, n) = r.text(text);
+            assert!(!out.contains(secret), "{text} -> {out}");
+            assert!(n >= 1, "{text}");
+        }
+        assert!(r.text("J%C3%BCrgen").0.contains("Jürgen"));
+    }
+
+    #[test] // spec: ARCH-121
+    fn a_toml_multi_line_string_in_log_text_goes_whole() {
+        let r = Redactor::default();
+        for (text, secret) in [
+            ("api_key = '''PRB-8''' and on", "PRB-8"),
+            ("api_key = \"\"\"PRB-9\nnext\"\"\" and on", "PRB-9"),
+            (r#"{"m":"api_key = \"\"\"PRB-10\"\"\" end"}"#, "PRB-10"),
+            ("api_key = '''PRB-11 never closed", "PRB-11"),
+        ] {
+            let (out, _) = r.text(text);
+            assert!(!out.contains(secret), "{text} -> {out}");
+        }
+        assert!(
+            r.text("api_key = '''PRB-8''' and on")
+                .0
+                .ends_with(" and on")
+        );
     }
 }

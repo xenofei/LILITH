@@ -739,21 +739,25 @@ fn nothing_is_sent_anywhere() {
 // Canaries, names, retention, the log tail and the network.
 // ---------------------------------------------------------------------------------------------
 
-/// The canaries of [`every_canary_is_gone_from_every_entry`], built at run time: the profile
-/// folder (in three spellings), the computer name, a SID, a token of each well-known format, an
-/// `open/` payload, an e-mail address and a secret under a scrub-word key.
+/// The canaries of [`every_canary_is_gone_from_every_entry`], one or more per redaction
+/// stage, built at run time so no token-shaped literal is in the source.
 struct Canaries {
     machine: String,
-    secret: String,
-    /// What no entry may hold, in any letter case.
+    label: String,
+    config_dir: String,
+    /// Every canary text, each kind once; the planted texts are built from it.
+    parts: Vec<String>,
+    /// What no entry, and no entry name, may hold, in any letter case.
     forbidden: Vec<String>,
-    /// All of them in one text, as a log line, an error, a job argument and a panic carry it.
-    text: String,
+    /// How many profile-folder paths [`Canaries::parts`] holds.
+    paths: usize,
 }
 
 fn canaries(env: &TestEnv) -> Canaries {
     use base64::Engine as _;
     let machine = "CANARYBOX-7Q".to_string();
+    let label = "Canary Label Kq7".to_string();
+    let config_dir = env.root().join("canary-claude-dir").display().to_string();
     let profile = env.env.user_profile().display().to_string();
     let picture = format!(r"{profile}\Pictures\canary-pic.png");
     let sid = "S-1-5-21-4111111111-4222222222-4333333333-1042".to_string();
@@ -768,6 +772,8 @@ fn canaries(env: &TestEnv) -> Canaries {
         format!("sk-ant-api03-{}", "Ch8-".repeat(12)),
         format!("sk-proj-{}", "Ci9".repeat(12)),
         format!("AGE-SECRET-KEY-1{}", "CJ0".repeat(20)),
+        format!("xoxb-{}", "Cl2-".repeat(6)),
+        format!("AKIA{}", "CM3".repeat(5) + "N"),
         format!(
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJjYW5hcnkifQ.{}",
             "Ck1".repeat(10)
@@ -775,80 +781,124 @@ fn canaries(env: &TestEnv) -> Canaries {
     ];
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&picture);
     let open = format!("lil-{}:open/{payload}", env.env.channel());
+    let deny_token = "c0ffee".repeat(5) + "ab";
+    let deny = format!("lil-dev:deny/cf_0123456789abcdef/{deny_token}");
+    let target = "LILITH-dev/canary-target-Zq9".to_string();
     let email = "canary.person@example.com".to_string();
+    let pct_email = "canary.pct%40example.com".to_string();
     let secret = "canary-secret-value-5e1b".to_string();
-    let text = format!(
-        "{picture} {} {} {machine} {sid} {open} {email} api_key={secret} {}",
+    let mut parts = vec![
+        // The profile folder, four ways: each becomes `%USERPROFILE%`.
+        picture.clone(),
         picture.replace('\\', "/"),
         picture.to_uppercase(),
-        tokens.join(" ")
-    );
+        picture.replace('\\', "%5C").replace(':', "%3A"),
+        // The account name alone.
+        "profile".to_string(),
+        label.clone(),
+        config_dir.clone(),
+        machine.clone(),
+        sid.clone(),
+        open,
+        deny,
+        target,
+        email.clone(),
+        pct_email,
+        format!("api_key={secret}"),
+    ];
+    parts.extend(tokens.iter().cloned());
     let mut forbidden = vec![
         profile.clone(),
         profile.replace('\\', "/"),
         profile.replace('\\', r"\\"),
+        profile.replace('\\', "%5C"),
+        label.clone(),
+        config_dir.clone(),
+        config_dir.replace('\\', r"\\"),
         machine.clone(),
         sid,
         payload,
+        deny_token,
+        "canary-target-zq9".to_string(),
         email,
-        secret.clone(),
+        "canary.pct".to_string(),
+        secret,
     ];
     forbidden.extend(tokens);
     Canaries {
         machine,
-        secret,
+        label,
+        config_dir,
+        parts,
         forbidden,
-        text,
+        paths: 4,
     }
+}
+
+/// Whether `word` stands in `text` as a whole word (any case).
+fn has_word(text: &str, word: &str) -> bool {
+    let (text, word) = (text.to_lowercase(), word.to_lowercase());
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(&word).any(|(i, _)| {
+        !text[..i].chars().next_back().is_some_and(is_word)
+            && !text[i + word.len()..].chars().next().is_some_and(is_word)
+    })
 }
 
 #[test] // spec: ARCH-121, QA-084, ARCH-119
 fn every_canary_is_gone_from_every_entry() {
     let env = TestEnv::new();
     let canary = canaries(&env);
+    env.suite_toml_set(&format!(
+        "[[claude_code.profiles]]\nid = \"p_canary\"\nlabel = \"{}\"\nconfig_dir = '{}'\n",
+        canary.label, canary.config_dir
+    ));
     let _core = CoreFixture::start_with_env(&env, &[("COMPUTERNAME", &canary.machine)]);
     let mut pipe = session(&env, None);
+    // Each canary after a space, and each after a `\n` (an escape before a value, N1).
+    let spaced = canary.parts.join(" ");
+    let lined = canary.parts.join("\n");
 
-    // A log line, plain and with the text `Debug`-escaped inside it.
+    // A log line holding the canaries three times: plain, `Debug`-escaped and line by line;
+    // and a log whose file name holds the account name.
     let today = lil_schema::time::date(
         SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64,
     );
-    let line = json!({"fields": {"message": canary.text, "report": format!("{:?}", canary.text),
-                                 "api_key": canary.secret}});
+    let line = json!({"fields": {"message": spaced, "report": format!("{spaced:?}"),
+                                 "lines": lined}});
     write_file(
         &env.env.logs_dir().join(format!("plant.{today}.log")),
         format!("{line}\n").as_bytes(),
     );
-    // An error message.
-    let unknown = pipe.tool(&format!("no.such {}", canary.text), json!({}), None);
+    write_file(
+        &env.env
+            .logs_dir()
+            .join(format!("profile-tools.{today}.log")),
+        b"{\"fields\":{\"message\":\"a log under the account's name\"}}\n",
+    );
+    // An error message, a job's arguments and a panic.
+    let unknown = pipe.tool(&format!("no.such {spaced}"), json!({}), None);
     assert_eq!(unknown["error"]["code"], "tool.unknown", "{unknown}");
-    // A job's arguments.
     let submitted = pipe.tool_ok(
         "test.job",
-        json!({"lane": "cpu", "fail": "final", "estimate_key": canary.text}),
+        json!({"lane": "cpu", "fail": "final", "estimate_key": lined}),
         Some("canary-job"),
     );
     let id = submitted["job"]["job_id"].as_str().unwrap().to_string();
     wait_done(&mut pipe, &id);
-    // A panic.
-    let panicked = pipe.tool("test.panic", json!({"message": canary.text}), None);
+    let panicked = pipe.tool("test.panic", json!({"message": lined}), None);
     assert_eq!(panicked["error"]["code"], "core.bug", "{panicked}");
 
     let result = bundle(&mut pipe, json!({"job_id": id}), "canary-bundle");
     let found = entries(&path_of(&result));
-    for planted in [
-        format!("logs/plant.{today}.log"),
-        "errors.json".to_string(),
-        "job.json".to_string(),
-    ] {
-        assert!(
-            found.contains_key(&planted),
-            "no {planted}: {:?}",
-            found.keys()
-        );
+    let plant = found
+        .get(&format!("logs/plant.{today}.log"))
+        .unwrap_or_else(|| panic!("no plant log: {:?}", found.keys()));
+    for entry in ["errors.json", "job.json"] {
+        assert!(found.contains_key(entry), "no {entry}: {:?}", found.keys());
     }
     assert!(
         found["errors.json"].contains("core.bug"),
@@ -861,6 +911,8 @@ fn every_canary_is_gone_from_every_entry() {
             .any(|(name, text)| name.starts_with("logs/lil-core.") && text.contains("\"panic\"")),
         "the panic is in the core's log"
     );
+
+    // No canary in any entry or entry name.
     for (name, text) in &found {
         let (name_l, text_l) = (name.to_lowercase(), text.to_lowercase());
         for c in &canary.forbidden {
@@ -868,6 +920,37 @@ fn every_canary_is_gone_from_every_entry() {
             assert!(!name_l.contains(&c), "the entry name {name} holds {c:?}");
             assert!(!text_l.contains(&c), "{name} holds {c:?}:\n{text}");
         }
+        assert!(!name_l.contains("profile-tools"), "{name}");
+        let without = text.replace("%USERPROFILE%", "");
+        assert!(
+            !has_word(&without, "profile"),
+            "{name} holds the account name:\n{text}"
+        );
+    }
+    assert!(
+        found.contains_key(&format!("logs/redacted-1.{today}.log")),
+        "the log under the account's name is renamed: {:?}",
+        found.keys()
+    );
+
+    // Each stage did its part in the plant log (so skipping one stage fails here).
+    let copies = 3;
+    assert_eq!(
+        plant.matches("%USERPROFILE%").count(),
+        canary.paths * copies,
+        "each planted profile path:\n{plant}"
+    );
+    for (placeholder, at_least) in [
+        ("<user>", copies),
+        ("<sid>", copies),
+        ("<machine>", copies),
+        ("open/<redacted>", copies),
+        ("deny/cf_0123456789abcdef/<redacted>", copies),
+    ] {
+        assert!(
+            plant.matches(placeholder).count() >= at_least,
+            "{placeholder} at least {at_least} times:\n{plant}"
+        );
     }
 }
 
@@ -880,40 +963,63 @@ async fn a_bundle_in_the_same_second_never_replaces_another() {
     let ctx = common::ctx(&env, lil_protocol::CallerKind::Cli, &events);
     let first = d.bundle(&ctx, None).await.unwrap();
     let first_bytes = std::fs::read(&first.path).unwrap();
-    d.record_error("x.changed", None, "the second bundle differs", 1);
-    let second = d.bundle(&ctx, None).await.unwrap();
-    let third = d.bundle(&ctx, None).await.unwrap();
-    assert!(second.path.ends_with("-2.zip"), "{second:?}");
-    assert!(third.path.ends_with("-3.zip"), "{third:?}");
-    assert_eq!(
-        second.path.replace("-2.zip", ".zip"),
-        first.path,
-        "the same second's name"
-    );
+    d.record_error("x.changed", None, "the later bundles differ", 1);
+    let mut made = vec![first.path.clone()];
+    for _ in 0..14 {
+        made.push(d.bundle(&ctx, None).await.unwrap().path);
+    }
+    // Fifteen paths, never one twice, each still there; the first one's bytes as they were.
+    let distinct: BTreeSet<&String> = made.iter().collect();
+    assert_eq!(distinct.len(), made.len(), "{made:?}");
+    for (k, path) in made.iter().enumerate().skip(1) {
+        assert_eq!(
+            *path,
+            first.path.replace(".zip", &format!("-{}.zip", k + 1)),
+            "{made:?}"
+        );
+    }
+    for path in &made {
+        assert!(Path::new(path).exists(), "{path} was removed");
+    }
     assert_eq!(
         std::fs::read(&first.path).unwrap(),
         first_bytes,
         "the first is kept"
     );
-    assert!(entries(Path::new(&second.path))["errors.json"].contains("x.changed"));
+    assert!(entries(Path::new(&made[1]))["errors.json"].contains("x.changed"));
 
-    // The folder keeps the newest 10, the one just made always among them; other files stay.
-    let notes = env.env.diagnostics_dir().join("notes.txt");
-    write_file(&notes, b"mine");
-    let mut made = vec![first.path, second.path, third.path];
-    for _ in 0..9 {
-        made.push(d.bundle(&ctx, None).await.unwrap().path);
-    }
-    let left: BTreeSet<String> = std::fs::read_dir(env.env.diagnostics_dir())
-        .unwrap()
-        .map(|e| e.unwrap().path().display().to_string())
-        .collect();
-    let want: BTreeSet<String> = made[made.len() - 10..]
-        .iter()
-        .cloned()
-        .chain([notes.display().to_string()])
-        .collect();
-    assert_eq!(left, want);
+    // A file someone else put at the next name is skipped, never replaced.
+    let next = first.path.replace(".zip", "-16.zip");
+    write_file(Path::new(&next), b"not a bundle");
+    let after = d.bundle(&ctx, None).await.unwrap();
+    assert_eq!(after.path, first.path.replace(".zip", "-17.zip"));
+    assert_eq!(std::fs::read(&next).unwrap(), b"not a bundle");
+}
+
+/// A message is redacted whole before the 2,000-character cut, and the cut never leaves part
+/// of a word, so no fragment of a secret or a path is left that no rule knows.
+#[tokio::test] // spec: ARCH-121, QA-084
+async fn a_long_error_message_is_redacted_before_it_is_cut() {
+    let env = TestEnv::new();
+    let events = Arc::new(EventBus::new(FakeClock::new()));
+    let d = diagnostics(&env, &events);
+    let token = format!("ghp_{}", "Zz9".repeat(12));
+    // The token straddles the cut.
+    let message = format!("{} {token} after", "x".repeat(1990));
+    d.record_error("long.message", Some("x.tool"), &message, 1);
+    let shown = &d.recent(1)[0].last_message;
+    assert!(shown.chars().count() <= 2000, "{}", shown.len());
+    assert!(
+        !shown.contains("ghp_"),
+        "the tool shows no fragment: {shown}"
+    );
+    let ctx = common::ctx(&env, lil_protocol::CallerKind::Cli, &events);
+    let result = d.bundle(&ctx, None).await.unwrap();
+    let errors: Value =
+        serde_json::from_str(&entries(Path::new(&result.path))["errors.json"]).unwrap();
+    let last = errors["errors"][0]["last_message"].as_str().unwrap();
+    assert!(!last.contains("ghp_") && !last.contains("Zz9"), "{last}");
+    assert!(last.chars().count() <= 2000, "{}", last.len());
 }
 
 #[test] // spec: ARCH-121

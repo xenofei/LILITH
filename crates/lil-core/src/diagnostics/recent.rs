@@ -10,8 +10,11 @@ use crate::telemetry::format_ts;
 
 /// How many error outcomes are kept.
 pub const RECENT_CAPACITY: usize = 1000;
-/// The longest `last_message` kept, in characters; a longer one ends `…`.
+/// The longest `last_message` shown, in characters; a longer one is cut ([`cut_message`]),
+/// in a bundle only after it was redacted.
 pub const MAX_MESSAGE_CHARS: usize = 2000;
+/// The longest message kept in memory, in characters (cut as [`cut_message`] cuts).
+pub const STORED_MESSAGE_CHARS: usize = 16 * 1024;
 /// `diagnostics.recent`'s largest and default `limit`.
 pub const MAX_RECENT: u32 = 200;
 pub const DEFAULT_RECENT: u32 = 50;
@@ -26,6 +29,42 @@ pub struct ErrorGroup {
     pub last_message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool: Option<String>,
+}
+
+/// `message` at most `max` characters long: a longer one is cut back to the last space or
+/// separator before the limit, so no word is cut in two (a token or a path the redaction
+/// would no longer know), and ends `…`.
+pub fn cut_message(message: &str, max: usize) -> String {
+    if message.chars().count() <= max {
+        return message.to_string();
+    }
+    let head: String = message.chars().take(max.saturating_sub(1)).collect();
+    let boundary = head
+        .char_indices()
+        .rev()
+        .find(|(_, c)| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\\' | '/'
+                        | ','
+                        | ';'
+                        | ':'
+                        | '='
+                        | '"'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                )
+        })
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let mut cut = head[..boundary].to_string();
+    cut.push('…');
+    cut
 }
 
 /// One error outcome.
@@ -52,13 +91,7 @@ impl Ring {
         self.records.push_back(ErrorRecord {
             code: code.to_string(),
             tool: tool.map(str::to_string),
-            message: if message.chars().count() > MAX_MESSAGE_CHARS {
-                let mut cut: String = message.chars().take(MAX_MESSAGE_CHARS - 1).collect();
-                cut.push('…');
-                cut
-            } else {
-                message.to_string()
-            },
+            message: cut_message(message, STORED_MESSAGE_CHARS),
             at_ms,
         });
     }

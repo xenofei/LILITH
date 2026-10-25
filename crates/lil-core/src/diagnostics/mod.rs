@@ -26,7 +26,8 @@ pub mod bundle;
 pub mod recent;
 pub mod redact;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lil_platform::{Clock, Env};
@@ -36,7 +37,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use bundle::{BundleResult, LOG_TAIL_BYTES};
-pub use recent::{DEFAULT_RECENT, ErrorGroup, MAX_RECENT, RECENT_CAPACITY};
+pub use recent::{
+    DEFAULT_RECENT, ErrorGroup, MAX_MESSAGE_CHARS, MAX_RECENT, RECENT_CAPACITY, cut_message,
+};
 pub use redact::Redactor;
 
 use crate::engines::tools::EnginesSlot;
@@ -68,6 +71,8 @@ pub struct Diagnostics {
     errors: Mutex<recent::Ring>,
     /// Each app that said hello, with its `build_id`.
     apps: Mutex<BTreeMap<String, String>>,
+    /// Every bundle path handed out (lower-cased): never handed out again.
+    handed: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl std::fmt::Debug for Diagnostics {
@@ -95,6 +100,7 @@ impl Diagnostics {
             sources,
             errors: Mutex::new(recent::Ring::default()),
             apps: Mutex::new(BTreeMap::new()),
+            handed: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -111,8 +117,18 @@ impl Diagnostics {
     }
 
     /// The kept errors, one group per code, the one whose last error is newest first; at most
-    /// `limit` groups.
+    /// `limit` groups, each `last_message` cut at [`MAX_MESSAGE_CHARS`].
     pub fn recent(&self, limit: u32) -> Vec<ErrorGroup> {
+        let mut groups = self.recent_uncut(limit);
+        for g in &mut groups {
+            g.last_message = cut_message(&g.last_message, MAX_MESSAGE_CHARS);
+        }
+        groups
+    }
+
+    /// [`Diagnostics::recent`] with each `last_message` as kept, for the bundle to redact
+    /// before it cuts.
+    pub(crate) fn recent_uncut(&self, limit: u32) -> Vec<ErrorGroup> {
         lock(&self.errors).groups(limit)
     }
 
@@ -154,8 +170,8 @@ const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the su
     <machine>. Still in it: the names of other programs and network adapters (the hardware \
     snapshot), the job's arguments with any prompt text, and model file names and workspace \
     paths outside the user-profile folder (the logs). It never holds a workspace file; a bundle \
-    made in the same second as another gets a name of its own, the folder keeps the newest 10, \
-    and nothing is sent anywhere: the bundle leaves this PC only when you hand it on.";
+    made in the same second as another gets a name of its own, no bundle removes or replaces \
+    another, and nothing is sent anywhere: the bundle leaves this PC only when you hand it on.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

@@ -152,22 +152,25 @@ pub fn write_suite_cache_file(
     placed
 }
 
-/// How many names [`write_new_suite_cache_file`] tries: `<name>`, then `<stem>-2.<ext>` up to
-/// `<stem>-99.<ext>`.
-pub const NEW_CACHE_NAMES: u32 = 99;
+/// How many names [`write_new_suite_cache_file`] tries before it gives up: `<name>`, then
+/// `<stem>-2.<ext>` and on ("until one is free"; the bound only stops a folder that refuses
+/// every move with `AlreadyExists` from looping for ever).
+pub const NEW_CACHE_NAMES: u32 = 1_000_000;
 
 /// [`write_suite_cache_file`], but never replacing a file: the temp file is moved (without
-/// `MOVEFILE_REPLACE_EXISTING`) to `path`, or, when a file has that name, to
-/// `<stem>-2.<ext>`, `<stem>-3.<ext>` … up to [`NEW_CACHE_NAMES`] names; no name is checked
-/// before the move, so two writers never take the same one. Returns the name it took (a
-/// diagnostics bundle made in the same second as another, Appendix G "Diagnostics").
+/// `MOVEFILE_REPLACE_EXISTING`) to `path`, or, when a file has that name or `skip` says it
+/// was handed out already, to `<stem>-2.<ext>`, `<stem>-3.<ext>` and on until a move takes;
+/// no name is checked for a file before the move, so two writers never take the same one.
+/// Returns the name it took (a diagnostics bundle made in the same second as another,
+/// Appendix G "Diagnostics").
 ///
 /// # Errors
-/// As [`write_suite_cache_file`]; `AlreadyExists` when every name is taken.
+/// As [`write_suite_cache_file`]; `AlreadyExists` past [`NEW_CACHE_NAMES`] names.
 pub fn write_new_suite_cache_file(
     env: &lil_platform::Env,
     path: &Path,
     bytes: &[u8],
+    skip: &dyn Fn(&Path) -> bool,
 ) -> std::io::Result<PathBuf> {
     let (dir, temp) = cache_temp(env, path, bytes)?;
     let name = path
@@ -184,6 +187,9 @@ pub fn write_new_suite_cache_file(
         } else {
             dir.join(format!("{stem}-{k}{ext}"))
         };
+        if skip(&target) {
+            continue;
+        }
         match move_new(&temp, &target) {
             Ok(()) => return Ok(target),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -202,16 +208,6 @@ pub fn write_new_suite_cache_file(
             NEW_CACHE_NAMES - 1
         ),
     ))
-}
-
-/// Removes the file `path` of one of the suite's cache folders (the same check as
-/// [`write_suite_cache_file`]): the diagnostics folder's older bundles.
-///
-/// # Errors
-/// `PermissionDenied` for a path outside the two folders; the removal's error.
-pub fn remove_suite_cache_file(env: &lil_platform::Env, path: &Path) -> std::io::Result<()> {
-    check_cache_path(env, path)?;
-    remove_file(path)
 }
 
 /// The checks of [`write_suite_cache_file`], then `bytes` in a new temp file beside `path`
