@@ -333,7 +333,8 @@ pub enum AgentTokenCommand {
 pub enum ReviewerHelloCommand {
     /// Enroll Windows Hello (at a real terminal): your passphrase first, then Windows Hello.
     Enroll,
-    /// Say whether Windows Hello is enrolled, its route and whether the key is hardware-held.
+    /// Say whether Windows Hello is enrolled, its route, whether the key is hardware-held and
+    /// whether face sign-in is on; with face sign-in on, it removes the enrolment first.
     Status,
     /// Remove the Windows Hello files and key credential; the passphrase key stays.
     Remove,

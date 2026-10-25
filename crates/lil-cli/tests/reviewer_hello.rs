@@ -134,6 +134,8 @@ struct FakeHello {
     answer: Answer,
     click: Click,
     remove_fails: bool,
+    /// Whether the key credential is there when `kek_remove` is asked (it reports that).
+    credential_left: bool,
     face: RefCell<FaceSignIn>,
     /// Face sign-in from the click on: turned on while the window waited (Phase B review m2).
     face_after_click: Option<FaceSignIn>,
@@ -151,6 +153,7 @@ impl FakeHello {
             answer: Answer::Ok,
             click: Click::Accept,
             remove_fails: false,
+            credential_left: false,
             face: RefCell::new(FaceSignIn::Off),
             face_after_click: None,
             shown: RefCell::default(),
@@ -263,12 +266,12 @@ impl HelloPlatform for FakeHello {
         self.prompt()?;
         Ok(Zeroizing::new(self.kek))
     }
-    fn kek_remove(&self, credential: &str) -> io::Result<()> {
+    fn kek_remove(&self, credential: &str) -> io::Result<bool> {
         self.note(format!("hello:kek_remove {credential}"));
         if self.remove_fails {
             return Err(io::Error::other("Windows Hello is switched off"));
         }
-        Ok(())
+        Ok(self.credential_left)
     }
 }
 
@@ -950,6 +953,49 @@ fn windows_hello_is_used_only_while_face_sign_in_is_off() {
     assert_eq!(events(&l), [format!("hello:kek_remove {CREDENTIAL}")]);
 }
 
+/// Phase B re-review N1: face sign-in on, but removing the credential fails. The passphrase is
+/// still used and the advice is to run `remove`; that `remove` then removes the credential left
+/// behind although both files are already gone.
+#[test] // spec: QA-088
+fn a_credential_left_behind_by_a_failed_removal_is_removed_by_remove() {
+    let home = Home::with_key();
+    enroll_kek(&home, &FakeHello::new(&log()));
+    let l = log();
+    let hello = FakeHello {
+        remove_fails: true,
+        ..FakeHello::with_face(&l, FaceSignIn::On)
+    };
+    let said = RefCell::new(Vec::new());
+    let pem = unlock_like_approve(&home, &hello, &asks(&l, PASS), &said).unwrap();
+    assert_eq!(&pem[..], PEM);
+    assert_eq!(events(&l).last().unwrap(), "passphrase:asked");
+    let said = said.borrow().join("\n");
+    assert!(said.contains("lil dev reviewer-hello remove"), "{said}");
+    assert!(home.hello_files().is_empty());
+
+    // The advice works: no files, but the credential is still there and goes.
+    let l = log();
+    let hello = FakeHello {
+        credential_left: true,
+        ..FakeHello::new(&l)
+    };
+    let removed = remove(&home.profile, &hello).unwrap();
+    assert_eq!(events(&l), [format!("hello:kek_remove {CREDENTIAL}")]);
+    assert_eq!(
+        removed,
+        [format!("the Windows Hello key credential {CREDENTIAL}")]
+    );
+    // Nothing enrolled and no credential: still asked, nothing reported, no error even if
+    // Windows Hello is off.
+    let l = log();
+    let hello = FakeHello {
+        remove_fails: true,
+        ..FakeHello::new(&l)
+    };
+    assert!(remove(&home.profile, &hello).unwrap().is_empty());
+    assert_eq!(events(&l), [format!("hello:kek_remove {CREDENTIAL}")]);
+}
+
 /// Phase B review m2: the face check runs again right before Windows Hello is raised. Face
 /// sign-in turned on while the window waited: the enrolment is removed, Windows Hello isn't
 /// raised, and the passphrase is asked.
@@ -989,10 +1035,15 @@ fn remove_deletes_the_hello_files_and_the_credential_and_keeps_the_passphrase_fi
     assert!(home.hello_files().is_empty());
     assert_eq!(events(&l), [format!("hello:kek_remove {CREDENTIAL}")]);
     assert_eq!(home.key_bytes(), before);
-    // Removing again is fine, and has no credential to delete.
+    // Removing again is fine: the credential is still asked for (re-review N1), finds none,
+    // and nothing is reported.
     let l = log();
-    remove(&home.profile, &FakeHello::new(&l)).unwrap();
-    assert!(events(&l).is_empty(), "{:?}", events(&l));
+    assert!(
+        remove(&home.profile, &FakeHello::new(&l))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(events(&l), [format!("hello:kek_remove {CREDENTIAL}")]);
 
     // M5: a credential that can't be removed doesn't keep the files.
     let home = Home::with_key();

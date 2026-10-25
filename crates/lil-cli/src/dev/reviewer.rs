@@ -3571,8 +3571,8 @@ mod tests {
             }
             Ok(Zeroizing::new(self.kek))
         }
-        fn kek_remove(&self, _: &str) -> std::io::Result<()> {
-            Ok(())
+        fn kek_remove(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
         }
     }
 

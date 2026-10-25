@@ -24,7 +24,8 @@
 //! is on, or can't be told, the passphrase is used and you are told why; `enroll` refuses, and
 //! `status` shows it. Found on, LILITH also removes its own enrolment ([`face_gate`]; Phase B
 //! review I1): with face sign-in on, any program running as you could open it with your face.
-//! The check runs when the enrolment is read and again right before each Windows Hello prompt.
+//! The check runs when the enrolment is read and again right before each prompt that signs with
+//! the key; enrolment's create prompt is followed by such a re-checked sign.
 //!
 //! **In front first (QA-088, Phase B ruling).** The window that owns the Windows Hello prompt
 //! shows what you are confirming (for a merge, the summary and the audit, P4a-R38). When
@@ -320,8 +321,9 @@ pub trait HelloPlatform {
         accept: Option<&str>,
         ready: &dyn Fn() -> io::Result<()>,
     ) -> io::Result<Zeroizing<[u8; 32]>>;
-    /// Deletes the key credential; one that isn't there is fine. No prompt.
-    fn kek_remove(&self, credential: &str) -> io::Result<()>;
+    /// Deletes the key credential; one that isn't there is fine. Whether it was there. No
+    /// prompt.
+    fn kek_remove(&self, credential: &str) -> io::Result<bool>;
 }
 
 /// The real Windows Hello (`lil_platform::hello`): every prompt is owned by a window this
@@ -353,8 +355,10 @@ impl HelloPlatform for WindowsHello {
     ) -> io::Result<Zeroizing<[u8; 32]>> {
         lil_platform::hello::kek_derive(credential, challenge, shown, accept, ready)
     }
-    fn kek_remove(&self, credential: &str) -> io::Result<()> {
-        lil_platform::hello::kek_remove(credential)
+    fn kek_remove(&self, credential: &str) -> io::Result<bool> {
+        let existed = lil_platform::hello::credential_exists(credential)?;
+        lil_platform::hello::kek_remove(credential)?;
+        Ok(existed)
     }
 }
 
@@ -791,8 +795,10 @@ pub fn status(profile: &Path, platform: &dyn HelloPlatform) -> Vec<String> {
 
 /// Removes the Windows Hello files, then the key credential; `app-key.age` stays. A damaged
 /// enrolment is removed too. The files go first, so a credential that can't be removed (Windows
-/// Hello switched off) never keeps them; that failure is then the error. Returns what was
-/// removed.
+/// Hello switched off) never keeps them; that failure is then the error. The credential is
+/// removed even when the files are already gone (Phase B re-review N1: a removal that failed
+/// half-way leaves only the credential); its failure is reported only when files were there.
+/// Returns what was removed.
 pub fn remove(profile: &Path, platform: &dyn HelloPlatform) -> Result<Vec<String>> {
     let enrolled_somehow =
         hello_file_path_in(profile).exists() || hello_age_path_in(profile).exists();
@@ -802,12 +808,16 @@ pub fn remove(profile: &Path, platform: &dyn HelloPlatform) -> Result<Vec<String
             removed.push(path.display().to_string());
         }
     }
-    if enrolled_somehow {
-        platform.kek_remove(CREDENTIAL).map_err(|e| {
-            anyhow!(
+    let existed = match platform.kek_remove(CREDENTIAL) {
+        Ok(existed) => existed,
+        Err(e) if enrolled_somehow => {
+            return Err(anyhow!(
                 "the Windows Hello files are removed, but removing the key credential {CREDENTIAL} failed: {e}"
-            )
-        })?;
+            ));
+        }
+        Err(_) => false,
+    };
+    if enrolled_somehow || existed {
         removed.push(format!("the Windows Hello key credential {CREDENTIAL}"));
     }
     Ok(removed)
