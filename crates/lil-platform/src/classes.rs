@@ -391,6 +391,24 @@ pub fn remove_test_registry(env: &Env) -> io::Result<()> {
     delete_tree(&hkcu_subkey(&env.registry_root())?)
 }
 
+/// The ids of the test channels' registry roots directly below `HKCU\Software` that have
+/// `TestEnv`'s shape, `LILITH-test-<8 lowercase hex>` (read-only): what a killed test can
+/// leave behind (Task 3's review M9). Every other name, a desktop-group root among them, is
+/// left out.
+pub fn test_registry_ids() -> io::Result<Vec<String>> {
+    let head = format!("{}-test-", names::APP_NAME);
+    Ok(subkey_names("Software")?
+        .into_iter()
+        .filter_map(|name| {
+            name.get(..head.len())
+                .filter(|h| h.eq_ignore_ascii_case(&head))?;
+            let id = &name[head.len()..];
+            (id.len() == 8 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                .then(|| id.to_string())
+        })
+        .collect())
+}
+
 /// `HKCU`'s subkey of Windows' own per-app notification settings for `env`'s AUMID, which
 /// Windows creates on the AUMID's first toast (`Setting()` answers `ERROR_NOT_FOUND` until then).
 pub(crate) const NOTIFICATION_SETTINGS: &str =

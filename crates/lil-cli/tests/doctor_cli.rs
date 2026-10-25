@@ -4,9 +4,14 @@
 //! reported without stopping the doctor; no default workspace, no core.
 //!
 //! The prompts are answered through stdin. Every test runs on its own `TestEnv` channel with
-//! isolated git (QA-038); any core `lil` starts is drained when the env drops (QA-041).
+//! isolated git (QA-038); any core `lil` starts is drained when the env drops (QA-041). Since
+//! plan 4a the doctor also asks to set up the notification shortcut and handlers (Task 13), so
+//! a run that should leave no problem answers [`YES`].
 
 use std::path::{Path, PathBuf};
+
+/// `y` to every question: the one a test is about, then the notification setup's.
+const YES: &str = "y\ny\ny\ny\n";
 
 use lil_testkit::{LilOutput, TestEnv, sha256_file};
 
@@ -82,7 +87,7 @@ fn doctor_answers_y_sets_it_aside_and_the_core_starts() {
     let env = TestEnv::with_label("Ünïcödé space");
     let (db, before) = damaged_state_db(&env);
 
-    let out = env.lil_with_stdin(&["doctor"], "y\n");
+    let out = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(out.code, 0, "{out:?}");
     let lines = printed(&out);
     assert!(
@@ -147,7 +152,7 @@ fn doctor_sets_autocrlf_only_after_yes() {
         "answering n changed core.autocrlf"
     );
 
-    let yes = env.lil_with_stdin(&["doctor"], "y\n");
+    let yes = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(yes.code, 0, "{yes:?}");
     assert!(
         printed(&yes).contains(&"fixed: core.autocrlf set to false for this repository only"),
@@ -221,7 +226,7 @@ fn doctor_without_a_default_workspace_skips_the_workspace_checks() {
     let env = TestEnv::with_label("Ünïcödé space");
     let skipped = "ok: no default workspace; workspace checks skipped";
 
-    let out = env.lil(&["doctor"]);
+    let out = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(out.code, 0, "{out:?}");
     assert!(printed(&out).contains(&skipped), "{out:?}");
     let probe = env.lil(&["--no-start", "status"]);
@@ -396,7 +401,7 @@ fn doctor_sets_leftover_side_files_aside_only_after_yes() {
     assert!(!no.stderr.contains("<name>"), "{no:?}");
     assert!(no.stdout.contains("answer y to set them aside"), "{no:?}");
 
-    let yes = env.lil_with_stdin(&["doctor"], "y\n");
+    let yes = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(yes.code, 0, "{yes:?}");
     assert!(!wal.exists(), "{yes:?}");
     let aside = named(&db, "state.db-wal.damaged-");
@@ -439,7 +444,7 @@ fn hot_journal_recovery_then_set_aside_when_still_unusable() {
     // After SQLite rolls the journal back the database is still from a newer version.
     env.write_hot_journal_db(&db, 999);
 
-    let out = env.lil_with_stdin(&["doctor"], "y\ny\n");
+    let out = env.lil_with_stdin(&["doctor"], YES);
     assert_eq!(out.code, 0, "{out:?}");
     let recover = out
         .stderr

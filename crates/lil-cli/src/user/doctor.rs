@@ -40,8 +40,18 @@
 //!    environment scrub still refuses (the suite's own or a paid-provider prefix), or one that
 //!    can never name a variable, is a `problem:` naming the entry; nothing is written. Healthy
 //!    or empty `pass_env` prints nothing.
+//! 6. The notification setup (APP-020–022; P4a-R26; Appendix G "Activation and
+//!    registration"): the AUMID shortcut, and the channel's `lil:` scheme and `.lilref`
+//!    handlers, each checked against the channel's `lil-image.exe` and written through
+//!    `lil_platform` only after the person types `y` at a terminal; never with
+//!    `--non-interactive`. Handlers another channel or build holds are a `warning:` and kept.
+//!    After a write, a running core re-reads its notification path (`desktop.get {fresh}`).
+//! 7. ComfyUI (ARCH-065, CORE-130, CORE-164), from a core that already runs (none is started
+//!    for it): a `warning:` for each `engines.environment` change, with the rollback hint; the
+//!    asset catalogue line; and the `models.report` counts as `info:`.
 
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::io::{self, BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,6 +64,9 @@ use lil_client::doctor::{
     workspace_state_db,
 };
 use lil_client::{ClientError, StartPolicy, WorkspaceOrigin, WorkspaceSource};
+use lil_platform::desktop::{
+    HandlerState, ShortcutState, handler_state, register_handlers, shortcut_state, write_shortcut,
+};
 use lil_platform::names::{
     LEGACY_WORKSPACE_DIR, LEGACY_WORKSPACE_FILE, WORKSPACE_DIR, WORKSPACE_FILE,
 };
@@ -177,6 +190,12 @@ pub(super) fn run(global: &GlobalArgs) -> Result<i32, Exit> {
     // 5. ComfyUI's `pass_env` (ruling P3-R31): a listed name the scrub still refuses, or one
     // that can never match, is reported here, never let through silently.
     comfy_pass_env(&env, &mut report);
+
+    // 6.
+    notification_setup(global, &env, interactive, &mut report);
+
+    // 7.
+    comfyui_engine(global, &env, &mut report)?;
 
     Ok(if report.problems == 0 {
         EXIT_OK
@@ -1165,4 +1184,470 @@ fn claude_rules(client: &BlockingClient, report: &mut Report) -> Result<(), Exit
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 6: the notification setup (APP-020–022; P4a-R26; Appendix G "Activation and
+// registration").
+// ---------------------------------------------------------------------------------------------
+
+/// The app the shortcut and the handlers open.
+const APP_EXE: &str = "lil-image.exe";
+
+/// Step 6: the AUMID shortcut, then the scheme and `.lilref` handlers, against the channel's
+/// `lil-image.exe`: in the install folder on stable, else beside this `lil` (the folder the
+/// core trusts apps from, and the one its notification path checks).
+fn notification_setup(global: &GlobalArgs, env: &Env, interactive: bool, report: &mut Report) {
+    let Some(exe) = env
+        .install_dir()
+        .or_else(|| current_exe_dir().ok())
+        .map(|dir| dir.join(APP_EXE))
+    else {
+        report.problem(
+            "the folder lil runs from can't be found, so the Start-menu shortcut and the link \
+             handlers can't be checked",
+        );
+        return;
+    };
+    let wrote_shortcut = shortcut(env, &exe, interactive, report);
+    let wrote_handlers = handlers(env, &exe, interactive, report);
+    if wrote_shortcut || wrote_handlers {
+        refresh_notification_path(global);
+    }
+}
+
+/// Explains `what` and asks `question`; `true` only for the person's `y`. Otherwise `what` is
+/// a `problem:` saying how to `verb` `it` later; with `--non-interactive` nothing is asked.
+fn offered(
+    interactive: bool,
+    report: &mut Report,
+    what: &str,
+    (verb, it): (&str, &str),
+    explain: &str,
+    question: &str,
+) -> bool {
+    if !interactive {
+        report.problem(&format!(
+            "{what} — run lil doctor in a terminal; it asks before it {verb}s {it}"
+        ));
+        return false;
+    }
+    say(&format!(
+        "{}. Nothing has been changed. {explain}",
+        capitalised(what)
+    ));
+    if !ask(question) {
+        report.problem(&format!(
+            "{what} — run lil doctor again and answer y to {verb} {it}"
+        ));
+        return false;
+    }
+    true
+}
+
+/// The AUMID shortcut: `ok:`, or a `problem:` created or repaired only after `y`. Whether it
+/// was written.
+fn shortcut(env: &Env, exe: &Path, interactive: bool, report: &mut Report) -> bool {
+    let lnk = env.start_menu_shortcut();
+    let lnk = lnk.display();
+    let aumid = env.notification_aumid();
+    let state = shortcut_state(env, exe);
+    let what = match state {
+        ShortcutState::Ok => {
+            report.ok(&format!(
+                "the Start-menu shortcut {lnk} carries LILITH's notification identity {aumid}"
+            ));
+            return false;
+        }
+        ShortcutState::Missing => format!(
+            "the Start-menu shortcut {lnk} is missing, so Windows shows no LILITH notification"
+        ),
+        ShortcutState::WrongTarget => format!(
+            "the Start-menu shortcut {lnk} doesn't open {}, so LILITH's notifications may not \
+             show",
+            exe.display()
+        ),
+        ShortcutState::WrongAumid => format!(
+            "the Start-menu shortcut {lnk} doesn't carry LILITH's notification identity \
+             {aumid}, so LILITH's notifications may not show"
+        ),
+        ShortcutState::WrongClsid => format!(
+            "the Start-menu shortcut {lnk} or the registration of its notification identity \
+             {aumid} is incomplete, so a notification you miss may not stay in the \
+             notification centre"
+        ),
+    };
+    let verb = if state == ShortcutState::Missing {
+        "create"
+    } else {
+        "repair"
+    };
+    let explain = format!(
+        "Windows shows an app's notifications only when a Start-menu shortcut carries the app's \
+         notification identity. lil doctor can write {lnk}, opening {}, and register the \
+         identity {aumid} for your user account under {}.",
+        exe.display(),
+        env.classes_root()
+    );
+    let question = format!("{} the Start-menu shortcut? [y/N] ", capitalised(verb));
+    if !offered(
+        interactive,
+        report,
+        &what,
+        (verb, "it"),
+        &explain,
+        &question,
+    ) {
+        return false;
+    }
+    match write_shortcut(env, exe) {
+        Ok(()) => {
+            report.fixed(&format!(
+                "the Start-menu shortcut {lnk} is {verb}d, with LILITH's notification identity \
+                 {aumid}"
+            ));
+            true
+        }
+        Err(e) => {
+            report.problem(&format!(
+                "{what}, and it couldn't be written: {e} — run lil doctor again"
+            ));
+            false
+        }
+    }
+}
+
+/// The channel's scheme and `.lilref` handlers: `ok:`, a `problem:` when missing (registered
+/// only after `y`), or a `warning:` when another channel or build holds them, which are kept.
+/// Whether they were written.
+fn handlers(env: &Env, exe: &Path, interactive: bool, report: &mut Report) -> bool {
+    let scheme = env.activation_scheme();
+    let shown_exe = exe.display();
+    match handler_state(env, exe) {
+        HandlerState::Ok => {
+            report.ok(&format!(
+                "the {scheme}: link and .lilref file handlers open {shown_exe}"
+            ));
+            false
+        }
+        HandlerState::OtherChannel(other) => {
+            report.warning(&format!(
+                "the {scheme}: link or .lilref file handler opens {}, not {shown_exe}: another \
+                 LILITH channel or build holds it, and lil doctor leaves it as it is",
+                other.display()
+            ));
+            false
+        }
+        HandlerState::Missing => {
+            let what = format!(
+                "the {scheme}: link and .lilref file handlers aren't registered for {shown_exe}, \
+                 so notification clicks and {scheme}: links open nothing"
+            );
+            let explain = format!(
+                "lil doctor can register them for your user account under {}: {scheme}: links \
+                 and .lilref files then open {shown_exe}.",
+                env.classes_root()
+            );
+            let question = format!("Register the {scheme}: link and .lilref file handlers? [y/N] ");
+            if !offered(
+                interactive,
+                report,
+                &what,
+                ("register", "them"),
+                &explain,
+                &question,
+            ) {
+                return false;
+            }
+            match register_handlers(env, exe) {
+                Ok(()) => {
+                    report.fixed(&format!(
+                        "the {scheme}: link and .lilref file handlers are registered for \
+                         {shown_exe}"
+                    ));
+                    true
+                }
+                Err(e) => {
+                    report.problem(&format!(
+                        "{what}, and they couldn't be registered: {e} — run lil doctor again"
+                    ));
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// After a write, a core that already runs reads its notification path again at once instead
+/// of serving its 10 s cache (P4a-R33). None is started for it, and a failure changes nothing.
+fn refresh_notification_path(global: &GlobalArgs) {
+    let Ok(cfg) = config(global, StartPolicy::NoStart) else {
+        return;
+    };
+    if let Ok(client) = BlockingClient::connect(&cfg) {
+        let mut args = Map::new();
+        args.insert("fresh".into(), Value::Bool(true));
+        let _ = client.call_tool("desktop.get", args, None);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 7: ComfyUI's environment, asset catalogue and models (ARCH-065, CORE-130, CORE-164).
+// ---------------------------------------------------------------------------------------------
+
+/// What each engine-environment warning ends with (Appendix G).
+const ROLLBACK_HINT: &str = "Roll back with ComfyUI-Manager's snapshot restore or comfy-cli's \
+                             version switch; the suite doesn't restore engines (CORE-166).";
+
+/// Step 7, from a core that already runs: none is started for it, since a core that has just
+/// started has no engine reading yet.
+fn comfyui_engine(global: &GlobalArgs, env: &Env, report: &mut Report) -> Result<(), Exit> {
+    match comfyui_configured(env) {
+        Some(true) => {}
+        Some(false) => {
+            report.ok(
+                "ComfyUI isn't configured ([engines.comfyui] in suite.toml); its environment, \
+                 asset catalogue and model checks are skipped",
+            );
+            return Ok(());
+        }
+        // Step 2 has said why `suite.toml` can't be used.
+        None => return Ok(()),
+    }
+    let cfg = config(global, StartPolicy::NoStart)?;
+    let client = match BlockingClient::connect(&cfg) {
+        Ok(client) => client,
+        Err(ClientError::NotRunning) => {
+            report.line(
+                "info",
+                "no core runs, so ComfyUI's environment, asset catalogue and models aren't \
+                 checked — start the core (lil status starts it), then run lil doctor again",
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(cannot_run(e)),
+    };
+    match read(&client, "engines.environment") {
+        Ok(view) => {
+            for line in change_lines(&view) {
+                report.warning(&line);
+            }
+        }
+        Err(why) => report.line(
+            "info",
+            &format!("ComfyUI's environment can't be compared: {why}"),
+        ),
+    }
+    let status = read(&client, "engines.status").unwrap_or(Value::Null);
+    let catalogue = status["engines"]
+        .as_array()
+        .and_then(|e| e.iter().find(|e| e["engine"] == "comfyui"))
+        .and_then(|e| e["asset_catalogue"].as_str());
+    match catalogue {
+        Some("on") => report.warning("ComfyUI's asset catalogue is on"),
+        Some("off") => report.ok("ComfyUI's asset catalogue is off"),
+        _ => report.line("info", "ComfyUI's asset catalogue is unknown"),
+    }
+    match read(&client, "models.report") {
+        Ok(models) => report.line("info", &models_line(&models)),
+        Err(why) => report.line(
+            "info",
+            &format!("models: the model report isn't available: {why}"),
+        ),
+    }
+    Ok(())
+}
+
+/// Whether `suite.toml` has an `[engines.comfyui]` table; `None` when it can't be read or
+/// parsed (step 2 reports that).
+fn comfyui_configured(env: &Env) -> Option<bool> {
+    let text = match std::fs::read_to_string(env.suite_toml_to_read()) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    let table: toml::Table = text.parse().ok()?;
+    Some(
+        table
+            .get("engines")
+            .and_then(|e| e.get("comfyui"))
+            .is_some_and(toml::Value::is_table),
+    )
+}
+
+/// The structured result of the read tool `tool` called with `{}`, or why there is none.
+fn read(client: &BlockingClient, tool: &str) -> Result<Value, String> {
+    match client.call_tool(tool, Map::new(), None) {
+        Ok(Outcome::Ok(output)) => Ok(output.structured),
+        Ok(Outcome::Error { error }) => Err(error.message),
+        Ok(Outcome::PendingConfirmation(_)) => Err("it waits for a confirmation".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// One warning per `engines.environment` change (Appendix G "Engine environments"), each
+/// ending with [`ROLLBACK_HINT`]. Names and versions are outside text ([`shown`]).
+fn change_lines(view: &Value) -> Vec<String> {
+    view["changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let text = |key: &str| c[key].as_str().map(shown);
+            let (from, to) = (text("from"), text("to"));
+            let node = c["what"] == "node";
+            let subject = match c["what"].as_str() {
+                Some("comfyui") => "ComfyUI".to_string(),
+                Some("driver") => "the GPU driver".to_string(),
+                _ => format!(
+                    "the custom node {}",
+                    text("name").unwrap_or_else(|| "(unnamed)".to_string())
+                ),
+            };
+            let unknown = || "unknown".to_string();
+            let how = match c["change"].as_str() {
+                Some("added") if node => {
+                    format!("{subject} ({}) was added", to.unwrap_or_else(unknown))
+                }
+                Some("removed") if node => {
+                    format!("{subject} ({}) was removed", from.unwrap_or_else(unknown))
+                }
+                Some("added") => format!("{subject} is now known: {}", to.unwrap_or_else(unknown)),
+                Some("removed") => format!(
+                    "{subject} ({}) is no longer known",
+                    from.unwrap_or_else(unknown)
+                ),
+                _ => format!(
+                    "{subject} went from {} to {}",
+                    from.unwrap_or_else(unknown),
+                    to.unwrap_or_else(unknown)
+                ),
+            };
+            format!(
+                "ComfyUI's environment changed since the previous capture: {how}. {ROLLBACK_HINT}"
+            )
+        })
+        .collect()
+}
+
+/// The `info:` counts of a `models.report` result (CORE-164): files, then each state, then
+/// the registry entries no file has.
+fn models_line(report: &Value) -> String {
+    if report["refreshed"].is_null() {
+        return "models: no inventory yet in this core run; it is taken when ComfyUI is ready"
+            .to_string();
+    }
+    let models = report["models"].as_array().map_or(&[][..], Vec::as_slice);
+    let count = |state: &str| {
+        models
+            .iter()
+            .filter(|m| {
+                m["states"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v == state))
+            })
+            .count()
+    };
+    let files = models.len();
+    let mut line = format!(
+        "models: {files} file{} in {}\\models, {} orphan, {} duplicate, {} unknown family, {} \
+         missing",
+        if files == 1 { "" } else { "s" },
+        shown(report["root"].as_str().unwrap_or_default()),
+        count("orphan"),
+        count("duplicate"),
+        count("unknown_family"),
+        report["missing"].as_array().map_or(0, Vec::len)
+    );
+    let unread = match report["registry"].as_str() {
+        Some("ok") => None,
+        Some("missing") => Some("registry/models.yaml isn't there"),
+        Some("unreadable") => Some("registry/models.yaml can't be read"),
+        Some("no_workspace") => Some("there is no default workspace"),
+        _ => Some("the registry wasn't read"),
+    };
+    if let Some(why) = unread {
+        let _ = write!(line, " ({why}, so no file is counted orphan or missing)");
+    }
+    line
+}
+
+/// Outside text (a folder name, a version, a path) as the doctor prints it: control,
+/// text-direction and zero-width characters shown as `⟨U+XXXX⟩`, so none changes how the
+/// terminal shows the line, and at most 200 characters, ending `…` when cut.
+fn shown(text: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in text.chars().enumerate() {
+        if i == 200 {
+            out.push('…');
+            break;
+        }
+        let hidden = c.is_control()
+            || matches!(
+                c,
+                '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+            );
+        if hidden {
+            let _ = write!(out, "\u{27e8}U+{:04X}\u{27e9}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test] // spec: CORE-130
+    fn each_kind_of_change_is_one_warning_with_the_hint() {
+        let view = json!({"changes": [
+            {"what": "node", "name": "a_node", "from": "1.0 (abc)", "to": "1.1 (def)", "change": "changed"},
+            {"what": "node", "name": "new\u{202e}node", "to": "2.0", "change": "added"},
+            {"what": "node", "name": "old_node", "from": "0.9", "change": "removed"},
+            {"what": "comfyui", "from": "aaa", "to": "bbb", "change": "changed"},
+            {"what": "driver", "to": "581.57", "change": "added"},
+        ]});
+        let lines = change_lines(&view);
+        let said = [
+            "the custom node a_node went from 1.0 (abc) to 1.1 (def)",
+            "the custom node new⟨U+202E⟩node (2.0) was added",
+            "the custom node old_node (0.9) was removed",
+            "ComfyUI went from aaa to bbb",
+            "the GPU driver is now known: 581.57",
+        ];
+        assert_eq!(lines.len(), said.len(), "{lines:?}");
+        for (line, said) in lines.iter().zip(said) {
+            assert!(line.contains(said), "{line}");
+            assert!(line.ends_with(ROLLBACK_HINT), "{line}");
+        }
+        assert!(change_lines(&json!({"captures": [], "changes": []})).is_empty());
+    }
+
+    #[test] // spec: CORE-164
+    fn the_model_counts_say_when_the_registry_wasnt_read() {
+        let report = json!({"root": r"C:\Comfy", "refreshed": "2026-10-25T10:00:00Z",
+        "registry": "no_workspace", "missing": [],
+        "models": [
+            {"path": "a", "states": ["duplicate"]},
+            {"path": "b", "states": ["duplicate", "unknown_family"]},
+        ]});
+        let line = models_line(&report);
+        assert!(
+            line.starts_with(
+                r"models: 2 files in C:\Comfy\models, 0 orphan, 2 duplicate, 1 unknown family, 0 missing"
+            ),
+            "{line}"
+        );
+        assert!(line.contains("there is no default workspace"), "{line}");
+        let none = json!({"root": r"C:\Comfy", "refreshed": null, "registry": "ok", "models": [], "missing": []});
+        assert!(models_line(&none).contains("no inventory yet"));
+    }
 }

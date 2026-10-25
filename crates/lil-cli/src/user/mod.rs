@@ -1,5 +1,5 @@
 //! The `lil` user commands over `lil-client` (ARCH-016, ARCH-018, ARCH-030): `status`, `call`,
-//! `events --follow`, `core stop`, `workspace init|use`, `notify`, `doctor` and `test --real`. Spec Appendix D, "The `lil` user
+//! `events --follow`, `core stop`, `workspace init|use`, `notify`, `doctor`, `confirm-window` and `test --real`. Spec Appendix D, "The `lil` user
 //! commands", and Appendices E and F, "The `lil` commands this plan adds", are the contract for
 //! their flags, output and exit codes. `hook` runs the Claude Code plugin's hooks.
 //!
@@ -16,6 +16,7 @@
 //! maps it where it occurs to its plain message on stderr and exit code 2 ([`cannot_run`]).
 
 mod call;
+mod confirm_window;
 mod core;
 mod doctor;
 mod events;
@@ -119,6 +120,12 @@ pub enum UserCommand {
     /// repair what is safe to repair. Anything persistent beyond that is done only after you
     /// type y.
     Doctor,
+    /// Open the confirmation window: starts lil-image.exe beside lil.exe on the confirmation
+    /// <ID>, or on every pending one. For use at a terminal, not in scripts.
+    ConfirmWindow {
+        /// The confirmation to show (cf_ and 16 hex digits); without it, every pending one.
+        id: Option<String>,
+    },
     /// Run a Claude Code plugin hook: reads the hook JSON on stdin, prints the hook's answer
     /// (or nothing) and exits 0. Never starts the core.
     Hook {
@@ -195,6 +202,7 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
         }
         UserCommand::Notify { paths } => notify::run(global, &paths),
         UserCommand::Doctor => doctor::run(global),
+        UserCommand::ConfirmWindow { id } => confirm_window::run(global, id.as_deref()),
         UserCommand::Hook { event } => Ok(hook::run(event, global)),
         UserCommand::Test { real: _, record } => test_real::run(record.as_deref()),
     };

@@ -7,6 +7,9 @@
 //! process), and checks that [`lil_testkit::cleanup::leftovers_log`] gained no entry for them.
 //! It runs cargo, so it is ignored by default:
 //! `cargo nextest run -p lil-testkit --run-ignored only -E 'test(leave_no_test_root)'`.
+//!
+//! It also checks the sweep of the registry keys killed tests leave behind
+//! ([`lil_testkit::env::sweep_test_registry_roots`]).
 
 use std::path::Path;
 use std::process::Command;
@@ -80,4 +83,88 @@ fn in_process_fixtures_leave_no_test_root() {
         leaked.is_empty(),
         "these tests left their folder behind: {leaked:?}\n{added}"
     );
+}
+
+/// `reg <args>`; whether it succeeded.
+fn reg(args: &[&str]) -> bool {
+    Command::new("reg")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("cannot run reg: {e}"))
+        .success()
+}
+
+/// `HKCU\Software\<name>`.
+fn key(name: &str) -> String {
+    format!(r"HKCU\Software\{name}")
+}
+
+/// An 8-hex id that no `lil-testenv-*` folder in the temporary folder names.
+fn rootless_id() -> String {
+    let names: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.starts_with("lil-testenv-"))
+        .collect();
+    (0u32..)
+        .map(|n| {
+            let h = std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), n);
+            format!("{:08x}", h as u32)
+        })
+        .find(|id| !names.iter().any(|n| n.contains(&format!("{id}-"))))
+        .unwrap()
+}
+
+/// A test that was killed leaves its `HKCU\Software\LILITH-test-<id>` key (Task 3's review M9):
+/// the sweep removes such a key once no `lil-testenv-*<id>-*` folder is left, keeps one whose
+/// folder is there (a test still running), and never touches a key of another shape.
+#[test] // spec: QA-038
+fn leftover_test_registry_keys_are_swept() {
+    let env = lil_testkit::TestEnv::new();
+    let live = env.env.channel().to_string();
+    let live = live.strip_prefix("test-").unwrap().to_string();
+    assert!(
+        env.root()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&format!("{live}-")),
+        "the folder names its channel: {}",
+        env.root().display()
+    );
+    let gone = rootless_id();
+    let upper = rootless_id().to_ascii_uppercase();
+    let other_shapes = [
+        format!("LILITH-test-{gone}0"),
+        format!("LILITH-test-{}", &gone[..7]),
+        format!("LILITH-test-{upper}"),
+        format!("LILITH-testx-{gone}"),
+    ];
+    let mut made = vec![format!("LILITH-test-{gone}"), format!("LILITH-test-{live}")];
+    made.extend(other_shapes.iter().cloned());
+    for name in &made {
+        assert!(
+            reg(&["add", &key(name), "/v", "LilTestChannel", "/d", "x", "/f"]),
+            "{name}"
+        );
+    }
+
+    let swept = lil_testkit::env::sweep_test_registry_roots();
+    let exists: Vec<bool> = made.iter().map(|n| reg(&["query", &key(n)])).collect();
+    for name in &made[1..] {
+        let _ = reg(&["delete", &key(name), "/f"]);
+    }
+    let swept = swept.unwrap();
+
+    assert!(!exists[0], "the rootless key is removed: {swept:?}");
+    assert!(
+        exists[1],
+        "the key whose folder is there is kept: {swept:?}"
+    );
+    for (name, there) in made.iter().zip(&exists).skip(2) {
+        assert!(there, "{name} is another shape and is never touched");
+    }
+    assert!(!swept.iter().any(|k| k.contains(&live)), "{swept:?}");
 }

@@ -37,7 +37,7 @@ use crate::power::PowerRequest;
 
 pub use crate::classes::{
     TEST_MARKER, leftover_registrations, register_handlers, remove_notification_settings,
-    remove_test_registry, unregister_handlers,
+    remove_test_registry, test_registry_ids, unregister_handlers,
 };
 pub use crate::power::POWER_REASON;
 pub use crate::shortcut::{
@@ -408,6 +408,18 @@ impl NotShownEnd {
         }
         toasts_state_after_post(read, self.first_ok_post.map(|t| now.saturating_sub(t)))
     }
+}
+
+/// The AUMID shortcut's state for `exe`, read from the disk and the registry: what `lil doctor`
+/// checks before it offers to write it (P4a-R26), on every channel.
+pub fn shortcut_state(env: &Env, exe: &Path) -> ShortcutState {
+    crate::shortcut::state(env, exe)
+}
+
+/// The scheme and `.lilref` handlers' state for `exe`, read from the registry: what `lil
+/// doctor` checks before it offers to write them (P4a-R26), on every channel.
+pub fn handler_state(env: &Env, exe: &Path) -> HandlerState {
+    crate::classes::state(env, exe)
 }
 
 /// The real desktop for `env`'s channel: toasts through

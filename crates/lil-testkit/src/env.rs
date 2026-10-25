@@ -12,7 +12,8 @@
 //! still serving its channel (QA-041), so no core outlives its test and no temporary folder
 //! stays locked. It then removes its folder with [`crate::cleanup`], which clears sealed
 //! read-only files, never follows a junction out of the folder, retries briefly while another
-//! handle still holds a file, and reports anything it had to leave.
+//! handle still holds a file, and reports anything it had to leave. The registry key a killed
+//! test leaves is swept by a later process's first `TestEnv` ([`sweep_test_registry_roots`]).
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
@@ -20,7 +21,7 @@ use std::io::{BufRead as _, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, Once, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use lil_platform::{
@@ -62,7 +63,9 @@ pub struct LilOutput {
 }
 
 impl TestEnv {
-    /// Arms the guard with the real locations, then builds the isolated `Env`.
+    /// Arms the guard with the real locations, then builds the isolated `Env`. Its folder is
+    /// `%TEMP%\lil-testenv-<id>-<random>`, `<id>` being its channel's. The first one in a
+    /// process sweeps the registry keys killed tests left ([`sweep_test_registry_roots`]).
     ///
     /// # Panics
     /// If the known folders cannot be resolved or the temporary directory cannot be created.
@@ -70,21 +73,30 @@ impl TestEnv {
         TestEnv::make("lil-testenv-".to_string())
     }
 
-    /// [`TestEnv::new`], with `label` in the temporary directory's name. Spaces and non-ASCII
-    /// letters are kept, so paths with them get exercised.
+    /// [`TestEnv::new`], with `label` in the temporary directory's name
+    /// (`lil-testenv-<label>-<id>-<random>`). Spaces and non-ASCII letters are kept, so paths
+    /// with them get exercised.
     pub fn with_label(label: &str) -> TestEnv {
         TestEnv::make(format!("lil-testenv-{label}-"))
     }
 
     fn make(prefix: String) -> TestEnv {
         static REAL: OnceLock<RealLocations> = OnceLock::new();
+        static SWEPT: Once = Once::new();
         let real = REAL.get_or_init(|| {
             RealLocations::from_system().expect("cannot resolve the real known folders")
         });
         arm_test_guard(real.clone());
+        SWEPT.call_once(|| {
+            if let Err(e) = sweep_test_registry_roots() {
+                eprintln!("the sweep of leftover test registry keys failed: {e}");
+            }
+        });
 
+        // The id in the folder's name lets the sweep match a registry key to its folder.
+        let id = unique_id();
         let root = tempfile::Builder::new()
-            .prefix(&prefix)
+            .prefix(&format!("{prefix}{id}-"))
             .tempdir()
             .expect("cannot create the test directory")
             .keep();
@@ -96,7 +108,7 @@ impl TestEnv {
         for r in [&roots.roaming, &roots.local, &roots.user_profile] {
             std::fs::create_dir_all(r).expect("cannot create a test root");
         }
-        let env = Env::with_roots(Channel::Test(unique_id()), roots, TEST_PIPE_SID.to_string());
+        let env = Env::with_roots(Channel::Test(id), roots, TEST_PIPE_SID.to_string());
         TestEnv {
             env,
             drain_counts: Arc::default(),
@@ -542,6 +554,49 @@ impl Drop for TestEnv {
             let _ = self.clean_up();
         }
     }
+}
+
+/// Removes the registry roots `HKCU\Software\LILITH-test-<id>` that tests killed before their
+/// cleanup left (nextest's `terminate-after`; Task 3's review M9): each one
+/// `lil_platform::desktop::test_registry_ids` lists for which no `lil-testenv-*<id>-*` folder is
+/// in the system temporary folder. A key whose folder is there belongs to a test still running,
+/// in this process or another, and is kept. The keys are listed before the folders, so a test
+/// that starts in between is seen with its folder. Nothing else is touched: not
+/// `HKCU\Software\LILITH`, not `HKCU\Software\Classes`, not a key of another shape. Returns the
+/// keys removed.
+///
+/// # Errors
+/// When the keys or the temporary folder can't be listed, or a key can't be removed.
+pub fn sweep_test_registry_roots() -> std::io::Result<Vec<String>> {
+    let ids = lil_platform::desktop::test_registry_ids()?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prefix = "lil-testenv-";
+    let folders: Vec<String> = std::fs::read_dir(std::env::temp_dir())?
+        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+        .filter_map(|n| n.strip_prefix(prefix).map(str::to_string))
+        .collect();
+    let scratch = std::env::temp_dir().join("lil-registry-sweep");
+    let mut removed = Vec::new();
+    for id in ids {
+        let tail = format!("{id}-");
+        if folders.iter().any(|f| f.contains(&tail)) {
+            continue;
+        }
+        let env = Env::with_roots(
+            Channel::Test(id),
+            Roots {
+                roaming: scratch.clone(),
+                local: scratch.clone(),
+                user_profile: scratch.clone(),
+            },
+            TEST_PIPE_SID.to_string(),
+        );
+        lil_platform::desktop::remove_test_registry(&env)?;
+        removed.push(env.registry_root());
+    }
+    Ok(removed)
 }
 
 /// 8 lowercase hex characters, distinct per call within a process and random across processes.
