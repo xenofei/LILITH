@@ -31,12 +31,20 @@
 //! the last one in the list; a later `DISMISSED`, `CHANGES_REQUESTED`, `COMMENTED` or `PENDING`
 //! review by the App on that commit cancels an earlier approval. No other login counts, a
 //! person's included.
+//!
+//! **Your authentication** (QA-036 as amended 2026-10-23, P4a-R38): once every other condition
+//! held, [`merge_pr`] asks its [`MergeGate`] last, just before GitHub is asked to merge, on every
+//! merge, protected files or not. `lil dev merge` on its own asks you (Windows Hello when
+//! enrolled, then the reviewer key's passphrase); `lil dev merge-flow` has already asked, for
+//! that PR and head only. A refusal merges nothing.
 
 use super::agent_access::GIT_CREDENTIAL_HELPER;
 use super::github::{
     BASE_BRANCH, CheckState, GitHubApi, MergeOutcome, RestClient, Review, github_token,
 };
 use super::guard::{self, Verdict};
+use super::merge_flow::{AskOnEveryMerge, MergeGate, MergeSubject};
+use super::reviewer_hello::Authenticator;
 use super::root;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -144,6 +152,8 @@ pub enum Refusal {
         url: String,
         expected: String,
     },
+    /// Your authentication for the merge didn't succeed (QA-036, P4a-R38).
+    NotAuthenticated(String),
 }
 
 /// `true` when the latest review on commit `sha` by `login` (compared exactly) is `APPROVED`.
@@ -328,16 +338,36 @@ pub fn merge_conditions(
     }
 }
 
-/// Checks [`merge_conditions`], then asks GitHub to merge pinned to the checked SHA. Returns the
-/// merge commit's SHA.
+/// Checks [`merge_conditions`], then asks `gate` for your authentication (every merge, protected
+/// files or not: QA-036, P4a-R38), then asks GitHub to merge pinned to the checked SHA. Returns
+/// the merge commit's SHA.
 pub fn merge_pr(
     cfg: &MergeGuardConfig,
     gh: &dyn GitHubApi,
     pr: u64,
     verdict_for: &dyn Fn(&str, &str) -> Result<Verdict>,
     hooks_path_configured: Option<String>,
+    gate: &dyn MergeGate,
 ) -> Result<String, Vec<Refusal>> {
     let head = merge_conditions(cfg, gh, pr, verdict_for, hooks_path_configured)?;
+    // What the gate shows of the PR (re-review m5): its title and author, escaped, from a read
+    // at the checked head; nothing is decided on them.
+    let (title, author) = match gh.pr(pr) {
+        Ok(info) if info.head_sha == head => (
+            guard::escape_controls(&info.title),
+            guard::escape_controls(&info.author),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let subject = MergeSubject {
+        pr,
+        head: &head,
+        title: &title,
+        author: &author,
+        base_branch: &cfg.base_branch,
+    };
+    gate.authorize(&subject)
+        .map_err(|e| vec![Refusal::NotAuthenticated(one_line(&e))])?;
     match gh.merge(pr, &head) {
         Ok(MergeOutcome::Merged { sha }) => Ok(sha),
         Ok(MergeOutcome::HeadMoved) => Err(vec![Refusal::HeadMoved]),
@@ -405,6 +435,7 @@ fn explain_one(r: &Refusal) -> String {
             "origin is {}, expected {expected}. Point origin at that GitHub repo, then try again.",
             redact_url(url)
         ),
+        Refusal::NotAuthenticated(message) => format!("Not authenticated: {message}"),
         Refusal::MergeCallFailed(message) => format!(
             "The merge request to GitHub failed ({message}). It may or may not have merged: look at the PR on GitHub before trying again."
         ),
@@ -641,7 +672,7 @@ pub(crate) fn fetch(repo: &Path, refspecs: &[&str]) -> Result<()> {
 
 /// Everything after [`preflight`] and the origin check: fetches `origin/main`, re-reads the
 /// committed settings from it, builds the GitHub client from those settings with `github`, and
-/// runs [`merge_pr`]. The verdict closure fetches `refs/pull/<pr>/head` and judges
+/// runs [`merge_pr`] with `gate`. The verdict closure fetches `refs/pull/<pr>/head` and judges
 /// `origin/main...<head sha>`.
 ///
 /// `checked` is the settings `origin` was verified against; fresh settings naming a different
@@ -652,6 +683,7 @@ pub(crate) fn merge_in_repo<'g>(
     checked: &MergeGuardConfig,
     hooks_path_configured: Option<String>,
     github: &dyn Fn(&MergeGuardConfig) -> Result<Box<dyn GitHubApi + 'g>>,
+    gate: &dyn MergeGate,
 ) -> Result<String, Vec<Refusal>> {
     let base_spec = format!("+refs/heads/{BASE_BRANCH}:{}", settings_ref());
     fetch(repo, &[&base_spec]).map_err(|e| {
@@ -675,7 +707,34 @@ pub(crate) fn merge_in_repo<'g>(
         fetch(repo, &[&pr_spec])?;
         guard::verdict(repo, base, head)
     };
-    merge_pr(&cfg, gh.as_ref(), pr, &verdict_for, hooks_path_configured)
+    merge_pr(
+        &cfg,
+        gh.as_ref(),
+        pr,
+        &verdict_for,
+        hooks_path_configured,
+        gate,
+    )
+}
+
+/// `lil dev merge`'s merge: [`merge_in_repo`] with the gate that asks `auth` on every merge,
+/// protected files or not (QA-036, P4a-R38).
+pub(crate) fn merge_asking<'g>(
+    repo: &Path,
+    pr: u64,
+    checked: &MergeGuardConfig,
+    hooks_path_configured: Option<String>,
+    github: &dyn Fn(&MergeGuardConfig) -> Result<Box<dyn GitHubApi + 'g>>,
+    auth: &dyn Authenticator,
+) -> Result<String, Vec<Refusal>> {
+    merge_in_repo(
+        repo,
+        pr,
+        checked,
+        hooks_path_configured,
+        github,
+        &AskOnEveryMerge::new(auth),
+    )
 }
 
 fn refuse(header: &str, refusals: &[Refusal]) -> i32 {
@@ -686,8 +745,9 @@ fn refuse(header: &str, refusals: &[Refusal]) -> i32 {
     1
 }
 
-/// `lil dev merge <pr>`: exit 0 when merged, 1 when refused.
-pub fn run_merge(pr: u64) -> i32 {
+/// `lil dev merge <pr> [--passphrase]`: exit 0 when merged, 1 when refused. With
+/// `passphrase_only`, Windows Hello is skipped and the passphrase is asked at the terminal.
+pub fn run_merge(pr: u64, passphrase_only: bool) -> i32 {
     let header = format!("lil dev merge refused PR #{pr}:");
     let repo = match root::repo_root() {
         Ok(r) => r,
@@ -713,12 +773,23 @@ pub fn run_merge(pr: u64) -> i32 {
             &github_token()?,
         )?))
     };
-    match merge_in_repo(&repo, pr, &cfg, hooks, &github) {
-        Ok(merge_sha) => {
+    // QA-036, P4a-R38: every merge asks for your authentication (Windows Hello when enrolled,
+    // then the passphrase), after every other condition held. The key is loaded first, so a
+    // missing one is refused before any network call.
+    let what = format!("merge PR #{pr}");
+    let merged = super::reviewer::with_owner_authenticator(&what, passphrase_only, |_, auth| {
+        merge_asking(&repo, pr, &cfg, hooks, &github, auth)
+    });
+    match merged {
+        Ok(Ok(merge_sha)) => {
             println!("Merged PR #{pr} (merge commit {}).", short(&merge_sha));
             0
         }
-        Err(refusals) => refuse(&header, &refusals),
+        Ok(Err(refusals)) => refuse(&header, &refusals),
+        Err(e) => refuse(
+            &header,
+            &[Refusal::NotAuthenticated(one_line(&format!("{e:#}")))],
+        ),
     }
 }
 
@@ -846,6 +917,28 @@ mod tests {
         Ok(Verdict::default())
     }
 
+    /// The gate for the tests that aren't about authentication: it lets every merge through.
+    struct Allow;
+
+    impl MergeGate for Allow {
+        fn authorize(&self, _: &MergeSubject) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A gate that records what it was asked and answers `answer`.
+    struct Gate {
+        asked: RefCell<Vec<(u64, String)>>,
+        answer: std::result::Result<(), String>,
+    }
+
+    impl MergeGate for Gate {
+        fn authorize(&self, s: &MergeSubject) -> std::result::Result<(), String> {
+            self.asked.borrow_mut().push((s.pr, s.head.to_string()));
+            self.answer.clone()
+        }
+    }
+
     fn protected(_: &str, _: &str) -> Result<Verdict> {
         Ok(Verdict {
             needs_approval: vec![Blocker::ProtectedChanged {
@@ -953,7 +1046,7 @@ mod tests {
             Ok(HEAD.to_string())
         );
         assert_eq!(
-            merge_pr(&cfg(), &fake, PR, &clean, hooks()),
+            merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow),
             Ok(format!("merge-of-{HEAD}"))
         );
         assert_eq!(fake.pr(PR).unwrap().state, "closed");
@@ -963,7 +1056,7 @@ mod tests {
     fn missing_check_refuses() {
         let fake = green();
         fake.set_check(HEAD, "pr-ready", CheckState::Missing);
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow));
         assert_eq!(
             r,
             vec![Refusal::CheckNotGreen {
@@ -984,7 +1077,7 @@ mod tests {
     fn pending_check_refuses() {
         let fake = green();
         fake.set_check(HEAD, "every-push", CheckState::Pending);
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow));
         assert_eq!(
             r,
             vec![Refusal::CheckNotGreen {
@@ -1009,7 +1102,7 @@ mod tests {
             "protected-test-check",
             CheckState::Failure("failure".into()),
         );
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow));
         let msg = explain(&r);
         assert!(msg.contains("protected-test-check"), "{msg}");
         assert!(msg.contains("failure"), "{msg}");
@@ -1017,10 +1110,49 @@ mod tests {
         assert_eq!(fake.pr(PR).unwrap().state, "open");
     }
 
+    /// QA-036 as amended (P4a-R38): every merge asks for your authentication, protected files or
+    /// not, after every other condition held; a refusal merges nothing.
+    #[test] // spec: QA-036
+    fn every_merge_asks_for_authentication_last_and_a_refusal_merges_nothing() {
+        for verdict in [&clean as &dyn Fn(&str, &str) -> Result<Verdict>, &protected] {
+            // Authenticated: merged, and the gate was asked once, about the checked head.
+            let fake = green();
+            fake.add_review(PR, BOT, "APPROVED", HEAD);
+            let gate = Gate {
+                asked: RefCell::default(),
+                answer: Ok(()),
+            };
+            assert!(merge_pr(&cfg(), &fake, PR, verdict, hooks(), &gate).is_ok());
+            assert_eq!(gate.asked.borrow().clone(), [(PR, HEAD.to_string())]);
+            assert_eq!(fake.pr(PR).unwrap().state, "closed");
+
+            // Not authenticated: nothing merged.
+            let fake = green();
+            fake.add_review(PR, BOT, "APPROVED", HEAD);
+            let gate = Gate {
+                asked: RefCell::default(),
+                answer: Err("cancelled; nothing was merged".into()),
+            };
+            let r = refusals(merge_pr(&cfg(), &fake, PR, verdict, hooks(), &gate));
+            assert!(matches!(&r[..], [Refusal::NotAuthenticated(_)]), "{r:?}");
+            assert!(explain(&r).contains("cancelled"), "{}", explain(&r));
+            assert_eq!(fake.pr(PR).unwrap().state, "open");
+        }
+        // A PR that fails another condition never asks you at all.
+        let fake = green();
+        fake.set_check(HEAD, "pr-ready", CheckState::Missing);
+        let gate = Gate {
+            asked: RefCell::default(),
+            answer: Ok(()),
+        };
+        refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &gate));
+        assert!(gate.asked.borrow().is_empty());
+    }
+
     #[test]
     fn protected_change_without_app_approval_refuses() {
         let fake = green();
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks(), &Allow));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(lines)]
                 if lines.iter().any(|l| l.contains("crates/lil-spec-tests/tests/smoke.rs"))),
@@ -1037,7 +1169,7 @@ mod tests {
         // The same change with the app's approval of the head commit goes through.
         fake.add_review(PR, BOT, "APPROVED", HEAD);
         assert_eq!(
-            merge_pr(&cfg(), &fake, PR, &protected, hooks()),
+            merge_pr(&cfg(), &fake, PR, &protected, hooks(), &Allow),
             Ok(format!("merge-of-{HEAD}"))
         );
     }
@@ -1046,7 +1178,7 @@ mod tests {
     fn approval_on_older_commit_does_not_count() {
         let fake = green();
         fake.add_review(PR, BOT, "APPROVED", OLD);
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks(), &Allow));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
             "{r:?}"
@@ -1060,7 +1192,7 @@ mod tests {
         // Neither does the app slug without the `[bot]` suffix, or another app.
         fake.add_review(PR, "lilith-reviewer", "APPROVED", HEAD);
         fake.add_review(PR, "lilith-app[bot]", "APPROVED", HEAD);
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks(), &Allow));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
             "{r:?}"
@@ -1071,7 +1203,14 @@ mod tests {
     fn hooks_not_installed_refuses_before_anything() {
         let panics = |_: &str, _: &str| -> Result<Verdict> { panic!("verdict computed") };
         for found in [None, Some(String::new()), Some(".git/hooks".to_string())] {
-            let r = refusals(merge_pr(&cfg(), &NoNetwork, PR, &panics, found.clone()));
+            let r = refusals(merge_pr(
+                &cfg(),
+                &NoNetwork,
+                PR,
+                &panics,
+                found.clone(),
+                &Allow,
+            ));
             assert_eq!(
                 r,
                 vec![Refusal::HooksNotInstalled {
@@ -1095,7 +1234,7 @@ mod tests {
             fail: None,
             move_head_on_merge_to: Some(NEW),
         };
-        let r = refusals(merge_pr(&cfg(), &gh, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &gh, PR, &clean, hooks(), &Allow));
         assert_eq!(r, vec![Refusal::HeadMoved]);
         let msg = explain(&r);
         assert!(msg.contains("moved"), "{msg}");
@@ -1125,7 +1264,7 @@ mod tests {
     fn draft_pr_refuses() {
         let fake = green();
         fake.set_draft(PR, true);
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow));
         assert_eq!(r, vec![Refusal::PrIsDraft]);
         assert!(explain(&r).contains("draft"));
         assert_eq!(fake.pr(PR).unwrap().state, "open");
@@ -1135,7 +1274,7 @@ mod tests {
     fn closed_pr_refuses() {
         let fake = green();
         fake.set_state(PR, "closed");
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow));
         assert_eq!(
             r,
             vec![Refusal::PrNotOpen {
@@ -1152,7 +1291,7 @@ mod tests {
         for name in cfg().required_checks {
             fake.set_check(HEAD, &name, CheckState::Success);
         }
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow));
         assert_eq!(
             r,
             vec![Refusal::WrongBase {
@@ -1168,7 +1307,7 @@ mod tests {
             let fake = green();
             fake.add_review(PR, BOT, "APPROVED", HEAD);
             let gh = Scripted::failing(&fake, method);
-            let r = refusals(merge_pr(&cfg(), &gh, PR, &protected, hooks()));
+            let r = refusals(merge_pr(&cfg(), &gh, PR, &protected, hooks(), &Allow));
             assert!(
                 r.iter()
                     .any(|x| matches!(x, Refusal::CouldNotCheck(m) if m.contains("502"))),
@@ -1182,7 +1321,7 @@ mod tests {
     fn verdict_error_is_a_refusal() {
         let fake = green();
         let broken = |_: &str, _: &str| -> Result<Verdict> { Err(anyhow!("unknown revision")) };
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &broken, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &broken, hooks(), &Allow));
         assert!(
             matches!(&r[..], [Refusal::CouldNotCheck(m)] if m.contains("unknown revision")),
             "{r:?}"
@@ -1194,7 +1333,7 @@ mod tests {
     fn failed_merge_call_is_reported_as_uncertain() {
         let fake = green();
         let gh = Scripted::failing(&fake, "merge");
-        let r = refusals(merge_pr(&cfg(), &gh, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &gh, PR, &clean, hooks(), &Allow));
         assert!(matches!(&r[..], [Refusal::MergeCallFailed(_)]), "{r:?}");
         assert!(explain(&r).contains("may or may not"), "{}", explain(&r));
     }
@@ -1203,7 +1342,7 @@ mod tests {
     fn not_mergeable_is_explained() {
         let fake = green();
         fake.set_not_mergeable(PR, "Merge conflict");
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &clean, hooks(), &Allow));
         assert_eq!(r, vec![Refusal::NotMergeable("Merge conflict".into())]);
         assert!(explain(&r).contains("Merge conflict"));
     }
@@ -1212,7 +1351,7 @@ mod tests {
     fn every_failing_condition_is_reported() {
         let fake = FakeGitHub::new();
         fake.add_pr(PR, HEAD, "main");
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks(), &Allow));
         // Four missing checks and the missing approval.
         assert_eq!(r.len(), 5, "{r:?}");
         assert_eq!(explain(&r).lines().count(), 5);
@@ -1271,7 +1410,7 @@ mod tests {
         let fake = green();
         fake.add_review(PR, BOT, "APPROVED", HEAD);
         fake.add_review(PR, BOT, "DISMISSED", HEAD);
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks(), &Allow));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
             "{r:?}"
@@ -1708,7 +1847,7 @@ mod tests {
             Ok(boxed(&fake))
         };
 
-        let r = refusals(merge_in_repo(&f.work, 42, &cfg(), hooks(), &github));
+        let r = refusals(merge_in_repo(&f.work, 42, &cfg(), hooks(), &github, &Allow));
         assert_eq!(r.len(), 2, "{r:?}");
         assert_eq!(
             r[0],
@@ -1733,6 +1872,7 @@ mod tests {
             &cfg(),
             Some(".git/hooks".into()),
             &github,
+            &Allow,
         ));
         assert!(
             matches!(&r[..], [Refusal::HooksNotInstalled { .. }]),
@@ -1743,7 +1883,7 @@ mod tests {
         fake.set_check(&f.head, "pr-ready", CheckState::Success);
         fake.add_review(42, BOT, "APPROVED", &f.head);
         assert_eq!(
-            merge_in_repo(&f.work, 42, &cfg(), hooks(), &github),
+            merge_in_repo(&f.work, 42, &cfg(), hooks(), &github, &Allow),
             Ok(format!("merge-of-{}", f.head))
         );
     }
@@ -1761,7 +1901,7 @@ mod tests {
             fake.set_check(&f.head, &name, CheckState::Success);
         }
         let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> { Ok(boxed(&fake)) };
-        let r = refusals(merge_in_repo(&f.work, 42, &cfg(), hooks(), &github));
+        let r = refusals(merge_in_repo(&f.work, 42, &cfg(), hooks(), &github, &Allow));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(lines)]
                 if lines.iter().any(|l| l.contains("crates/lil-spec-tests/tests/smoke.rs"))),
@@ -1785,7 +1925,7 @@ mod tests {
         }
         fake.add_review(42, BOT, "APPROVED", &f.head);
         let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> { Ok(boxed(&fake)) };
-        let r = refusals(merge_in_repo(&f.work, 42, &stale, found, &github));
+        let r = refusals(merge_in_repo(&f.work, 42, &stale, found, &github, &Allow));
         assert_eq!(
             r,
             vec![Refusal::CheckNotGreen {
@@ -1807,7 +1947,7 @@ mod tests {
         let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + 'static>> {
             panic!("GitHub must not be contacted")
         };
-        let r = refusals(merge_in_repo(&f.work, 42, &checked, found, &github));
+        let r = refusals(merge_in_repo(&f.work, 42, &checked, found, &github, &Allow));
         assert!(
             matches!(&r[..], [Refusal::CouldNotCheck(m)] if m.contains("Elsewhere")),
             "{r:?}"
@@ -2002,7 +2142,7 @@ mod tests {
         ] {
             fake.add_review(PR, login, "APPROVED", HEAD);
         }
-        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks()));
+        let r = refusals(merge_pr(&cfg(), &fake, PR, &protected, hooks(), &Allow));
         assert!(
             matches!(&r[..], [Refusal::ProtectedNeedsApproval(_)]),
             "{r:?}"
@@ -2012,5 +2152,71 @@ mod tests {
             &cfg().reviewer_login(),
             HEAD
         ));
+    }
+
+    /// An `Authenticator` that records what it was asked and answers `answer`.
+    struct RecordingAuth {
+        asked: RefCell<Vec<String>>,
+        answer: std::result::Result<(), crate::dev::reviewer_key::KeyError>,
+    }
+
+    impl Authenticator for RecordingAuth {
+        fn authenticate(
+            &self,
+            summary: &str,
+            _audit: &str,
+        ) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, crate::dev::reviewer_key::KeyError>
+        {
+            self.asked.borrow_mut().push(summary.to_string());
+            self.answer
+                .map(|()| zeroize::Zeroizing::new(b"pem".to_vec()))
+        }
+    }
+
+    /// `lil dev merge`'s merge (`merge_asking`, what `run_merge` calls) asks your authentication
+    /// once, about the checked head, after every other condition held; without it nothing is
+    /// merged (QA-036, P4a-R38; Task 28 review, I3).
+    #[test] // spec: QA-036
+    fn dev_merge_uses_the_gate_that_asks_you_on_every_merge() {
+        use crate::dev::reviewer_key::KeyError;
+        for answer in [
+            Ok(()),
+            Err(KeyError::Cancelled),
+            Err(KeyError::WrongPassphrase),
+        ] {
+            let f = fixture();
+            let fake = FakeGitHub::new();
+            fake.add_pr(42, &f.head, "main");
+            for name in cfg().required_checks {
+                fake.set_check(&f.head, &name, CheckState::Success);
+            }
+            fake.add_review(42, BOT, "APPROVED", &f.head);
+            let github =
+                |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> { Ok(boxed(&fake)) };
+            let auth = RecordingAuth {
+                asked: RefCell::default(),
+                answer,
+            };
+            let r = merge_asking(&f.work, 42, &cfg(), hooks(), &github, &auth);
+            let asked = auth.asked.borrow().clone();
+            assert_eq!(asked.len(), 1, "{asked:?}");
+            assert!(asked[0].contains("PR #42"), "{asked:?}");
+            assert!(asked[0].contains(&f.head), "{asked:?}");
+            // Re-review m5: the PR's title and author, and the configured base branch.
+            for detail in ["PR 42's title", "an-author", "Into main"] {
+                assert!(asked[0].contains(detail), "{detail}: {asked:?}");
+            }
+            match answer {
+                Ok(()) => {
+                    assert_eq!(r, Ok(format!("merge-of-{}", f.head)));
+                    assert_eq!(fake.pr(42).unwrap().state, "closed");
+                }
+                Err(_) => {
+                    let r = refusals(r);
+                    assert!(matches!(&r[..], [Refusal::NotAuthenticated(_)]), "{r:?}");
+                    assert_eq!(fake.pr(42).unwrap().state, "open");
+                }
+            }
+        }
     }
 }

@@ -7,7 +7,8 @@
 //! guard, the file layer (`fs`, `paths`) every file write goes through, the hardware and
 //! engine-process layer (`hw`, `job_object`, `engine_spawn`), the desktop (`desktop`: toasts,
 //! the AUMID shortcut, the handlers, fullscreen, the foreground and the power request; and its
-//! fake, `desktop_fake`) and the shared log setup (`logs`).
+//! fake, `desktop_fake`), Windows Hello for the reviewer key (`hello`) and the shared log setup
+//! (`logs`).
 
 mod classes;
 pub mod clock;
@@ -18,6 +19,7 @@ pub mod engine_spawn;
 pub mod env;
 pub mod fs;
 pub mod guard;
+pub mod hello;
 pub mod hw;
 pub mod hw_fake;
 mod hw_nvml;

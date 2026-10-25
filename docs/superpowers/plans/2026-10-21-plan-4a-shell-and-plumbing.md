@@ -1618,6 +1618,13 @@ pub trait Authenticator { fn authenticate(&self, summary: &str, audit: &str) -> 
 git commit -m "dev: Windows Hello (route proven in Step 0) unlocks the reviewer key and gates the one-click merge flow; the passphrase file stays the fallback"
 ```
 
+**Recorded 2026-10-24 (Step 0, the plan 4a rulings and the owner's decision; QA-088's 2026-10-24 lines; spike 11 §8):**
+- **The route is the KEK** (plan 4a ruling). The probe created a window-owned credential, signed twice with identical signatures, and saw the prompt come to the front by itself in all 7 steps, over fullscreen too.
+- **When LILITH's own window can't take the front** (plan 4a ruling, for LILITH's own window; the owner's 2026-10-23 line still governs the Windows Hello prompt, which the probe saw come forward every time). On this PC the foreground lock timeout is at its maximum. The window flashes in the taskbar and waits, within the 120 s limit, for you to bring it forward. The 1 s live delay then starts.
+- **Owner decision 2026-10-24: Hello unlocks merges only without face sign-in.** LILITH uses Windows Hello only while face recognition isn't enrolled for Windows Hello, checked when the enrolment is read and again right before each prompt that signs with the key (enrolment's create prompt is followed by such a re-checked sign). While face sign-in is on, or LILITH can't tell, the passphrase is used and you are told why. `status` shows it, and `enroll` refuses. The check is read-only, through WinBio and the Biometric device list.
+- **Face sign-in found on removes LILITH's own enrolment** (plan 4a ruling): both Hello files and the key credential; the passphrase file stays. Unknown keeps the enrolment and warns.
+- **Step 4's owner check is the first real merge through `lil dev merge-flow`** on the next real PR, not a test PR (plan 4a ruling).
+
 ---
 
 ### Task 29: Close-out: the desktop group, the layout and responsiveness checks, and the milestone checks (APP-001, APP-003, APP-135, APP-136, APP-139, ARCH-116, QA-030, QA-042, QA-064, QA-071; P4a-R31) — **protected: `test-params.toml`, `.github/workflows/ci-pr-ready.yml` (pushed by the owner)**

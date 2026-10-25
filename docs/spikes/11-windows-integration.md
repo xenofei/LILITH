@@ -303,6 +303,12 @@ The KEK route's crypto works on this PC: create, 10 identical signatures across 
 - **A non-elevated token in the Sandbox:** the untried `wsb exec … -r ExistingLogin` (§7), if Task 30 wants toast and foreground tests back in the Sandbox.
 - **S1.5:** the owner hears the FAIL before Task 2 (the bar's FAIL path).
 - **S1.8:** to Task 28's route step: own the prompt by a real window that is in front (not `GetConsoleWindow()`), bind the `*ForWindowAsync` calls for KEK, and prove placement against other apps, a fullscreen one included, with no input during the call; else DPAPI with the Hello gate, if its prompt is proven in front; else the passphrase.
+  - **Task 28's route step, recorded (2026-10-24, build 10.0.26300.9711, not elevated, TPM 2.0, foreground lock timeout 2147483647 ms).** The route is the **KEK**.
+    - The probe (`crates/lil-platform/examples/hello-probe.rs`) bound `RequestCreateForWindowAsync` and `RequestSignForWindowAsync` by hand from the OS metadata.
+    - It created the throwaway credential `LILITH-hello-probe`, signed with it twice with identical signatures, and deleted it.
+    - The Windows Hello prompt was the foreground window within 1–302 ms in all 7 steps, with another window in front and with a fullscreen one, and no input before it.
+    - The probe's own window could not be raised while another window had the focus. The probe printed "passphrase" only because its rule required that raise.
+    - The rulings (plan 4a, 2026-10-24): the KEK route; LILITH's own window, when Windows keeps it behind, flashes and waits for the owner. The owner's decision (2026-10-24): Hello unlocks merges only without face sign-in. See QA-088's 2026-10-24 lines.
 - **S1.7:** the 2-hour stay-awake wait was not run; if a later task needs it, it needs the owner's consent to a long unattended wait.
 - **UIA and toasts:** why the harness's search missed every toast on 26H2 is unconfirmed; a tree listing taken while a banner is up would settle it.
 - **S1.4 for Task 30:** no synthetic click was ever made on a toast, so whether a runner can stand in for the owner's click is unknown.

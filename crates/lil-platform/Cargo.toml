@@ -16,7 +16,9 @@ nvml-wrapper.workspace = true
 rusqlite.workspace = true
 # The fake hardware script the test kit and a test-channel core read (hw_fake, QA-066).
 serde_json.workspace = true
-sha2.workspace = true
+# `zeroize`: the KEK hasher's state, which holds the Windows Hello signature, is wiped on drop
+# (hello, P4a-R23).
+sha2 = { workspace = true, features = ["zeroize"] }
 # CPU, RAM, per-process CPU time, network and disks (CORE-059).
 sysinfo.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
@@ -25,6 +27,10 @@ toml.workspace = true
 # workspace's tracing stack.
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# `IAsyncOperation<T>` named as a type: Windows Hello's window-owned calls, bound by hand (hello,
+# Task 28). Not a workspace dependency, since only lil-platform names it; the version is the one
+# `windows` 0.62.2 already pulls in.
+windows-future = "0.3.2"
 zeroize.workspace = true
 
 # Plan 4a Task 5 adds the feature set Task 1 recorded (spike 11, S1.1), and the registry.
@@ -45,6 +51,11 @@ features = [
     "Security_Cryptography",
     # IBuffer (Windows Hello, Task 28).
     "Storage_Streams",
+    # WinBioEnumBiometricUnits and WinBioEnumEnrollments: whether Windows Hello face sign-in is
+    # enrolled, read-only (Task 28 Phase B, owner decision 2026-10-24).
+    "Win32_Devices_BiometricFramework",
+    # SetupDiGetClassDevsW: whether any biometric device is present, read-only (Task 28 Phase B).
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",
     # The NVIDIA adapter's LUID, for the PDH GPU memory instances (CORE-059).
     "Win32_Graphics_Dxgi",
@@ -95,6 +106,13 @@ features = [
     "Win32_System_WinRT",
     # QueryUnbiasedInterruptTime: the sleep record's monotonic clock (ARCH-127, Task 9).
     "Win32_System_WindowsProgramming",
+    # EM_REPLACESEL, EM_SETREADONLY and WM_MOUSELEAVE: the Windows Hello window's text and its
+    # Merge button refuse changes from other programs (Task 28).
+    "Win32_UI_Controls",
+    # EnableWindow and SetFocus: the Windows Hello window's Merge / Deny buttons (Task 28).
+    "Win32_UI_Input_KeyboardAndMouse",
+    # GetCurrentInputMessageSource: only a real click accepts the Windows Hello window (Task 28).
+    "Win32_UI_Input",
     # Also SHQueryUserNotificationState (fullscreen, CORE-160), IShellLinkW and
     # FOLDERID_Programs (the AUMID shortcut).
     "Win32_UI_Shell",
@@ -110,8 +128,21 @@ features = [
 [dev-dependencies]
 tempfile.workspace = true
 # tests/spawn.rs and tests/engine_spawn.rs mark a pipe handle inheritable to prove the spawn
-# does not leak it; tests/clock.rs reads the time zone's raw fields.
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time"] }
+# does not leak it; tests/clock.rs reads the time zone's raw fields. The Windows Hello probe
+# (examples/hello-probe.rs, Task 28 Step 0) reads the last-input time and the tick count, and
+# its test window may send one Alt tap before a call.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# Task 28's route step (P4a-R38): `cargo run -p lil-platform --example hello-probe -- dry | run`.
+# Its own tests (the placement bar and the route rule) run with the crate's.
+[[example]]
+name = "hello-probe"
+test = true
 
 [lints]
 workspace = true

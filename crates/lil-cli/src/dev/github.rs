@@ -39,6 +39,11 @@ pub struct PrInfo {
     pub base_ref: String,
     pub state: String,
     pub draft: bool,
+    /// Shown, never decided on (the merge flow's summary, Task 28): the title, the author's
+    /// login and the head branch, each empty when GitHub didn't give it.
+    pub title: String,
+    pub author: String,
+    pub head_ref: String,
 }
 
 /// A pull request GitHub associates with a commit (`GET .../commits/{sha}/pulls`).
@@ -279,7 +284,16 @@ pub fn parse_pr(v: &Value) -> Result<PrInfo> {
         draft: v["draft"]
             .as_bool()
             .ok_or_else(|| anyhow!("PR response is missing `draft`"))?,
+        // Display-only fields: missing is empty, never an error.
+        title: shown(v.get("title")),
+        author: shown(v.pointer("/user/login")),
+        head_ref: shown(v.pointer("/head/ref")),
     })
+}
+
+/// A display-only string field of a response: empty when missing.
+fn shown(val: Option<&Value>) -> String {
+    val.and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
 /// The only check-run app the merge gate trusts (controller ruling R11). Any app with
@@ -904,8 +918,9 @@ mod tests {
     fn pr_and_review_parsing() {
         use serde_json::json;
         let pr = parse_pr(&json!({
-            "number": 7, "state": "open", "draft": true,
-            "head": {"sha": "h"}, "base": {"ref": "main"}
+            "number": 7, "state": "open", "draft": true, "title": "Add the thing",
+            "user": {"login": "someone"},
+            "head": {"sha": "h", "ref": "feature"}, "base": {"ref": "main"}
         }))
         .unwrap();
         assert_eq!(
@@ -915,8 +930,21 @@ mod tests {
                 head_sha: "h".into(),
                 base_ref: "main".into(),
                 state: "open".into(),
-                draft: true
+                draft: true,
+                title: "Add the thing".into(),
+                author: "someone".into(),
+                head_ref: "feature".into(),
             }
+        );
+        // The shown-only fields may be missing; the decided ones may not.
+        let bare = parse_pr(&json!({
+            "number": 7, "state": "open", "draft": false,
+            "head": {"sha": "h"}, "base": {"ref": "main"}
+        }))
+        .unwrap();
+        assert_eq!(
+            (bare.title, bare.author, bare.head_ref),
+            (String::new(), String::new(), String::new())
         );
         assert!(parse_pr(&json!({"number": 7})).is_err());
 
