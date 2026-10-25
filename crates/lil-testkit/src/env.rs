@@ -12,8 +12,10 @@
 //! still serving its channel (QA-041), so no core outlives its test and no temporary folder
 //! stays locked. It then removes its folder with [`crate::cleanup`], which clears sealed
 //! read-only files, never follows a junction out of the folder, retries briefly while another
-//! handle still holds a file, and reports anything it had to leave. The registry key a killed
-//! test leaves is swept by a later process's first `TestEnv` ([`sweep_test_registry_roots`]).
+//! handle still holds a file, and reports anything it had to leave. Its channel's registry root,
+//! `HKCU\Software\LILITH-test-<id>`, names its owner process from the start and is removed on
+//! drop; the one a killed test leaves is swept by a later process's first `TestEnv`
+//! ([`sweep_test_registry_roots`]).
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
@@ -87,10 +89,13 @@ impl TestEnv {
             RealLocations::from_system().expect("cannot resolve the real known folders")
         });
         arm_test_guard(real.clone());
-        SWEPT.call_once(|| {
-            if let Err(e) = sweep_test_registry_roots() {
-                eprintln!("the sweep of leftover test registry keys failed: {e}");
+        SWEPT.call_once(|| match sweep_test_registry_roots() {
+            Ok(sweep) => {
+                for (key, e) in sweep.failed {
+                    eprintln!("the sweep could not remove the leftover test key {key}: {e}");
+                }
             }
+            Err(e) => eprintln!("the sweep of leftover test registry keys failed: {e}"),
         });
 
         // The id in the folder's name lets the sweep match a registry key to its folder.
@@ -109,6 +114,14 @@ impl TestEnv {
             std::fs::create_dir_all(r).expect("cannot create a test root");
         }
         let env = Env::with_roots(Channel::Test(id), roots, TEST_PIPE_SID.to_string());
+        // The channel's registry root names its owner, so no sweep removes it while this
+        // process lives; the drop removes it.
+        let marked = process_owner()
+            .ok_or_else(|| std::io::Error::other("this process's start time can't be read"))
+            .and_then(|owner| lil_platform::desktop::mark_test_registry_owner(&env, &owner));
+        if let Err(e) = marked {
+            eprintln!("the test registry root's owner can't be written: {e}");
+        }
         TestEnv {
             env,
             drain_counts: Arc::default(),
@@ -534,6 +547,10 @@ impl TestEnv {
             self.launched.load(Ordering::Relaxed),
             Arc::clone(&self.drain_counts),
         );
+        // `HKCU\Software\LILITH-test-<id>`, by its exact name (test channels only).
+        if let Err(e) = lil_platform::desktop::remove_test_registry(&self.env) {
+            eprintln!("{} could not be removed: {e}", self.env.registry_root());
+        }
         crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR).map_err(|left| {
             crate::cleanup::report_leftovers(&self.root, &left);
             left.iter()
@@ -556,36 +573,45 @@ impl Drop for TestEnv {
     }
 }
 
-/// Removes the registry roots `HKCU\Software\LILITH-test-<id>` that tests killed before their
-/// cleanup left (nextest's `terminate-after`; Task 3's review M9): each one
-/// `lil_platform::desktop::test_registry_ids` lists for which no `lil-testenv-*<id>-*` folder is
-/// in the system temporary folder. A key whose folder is there belongs to a test still running,
-/// in this process or another, and is kept. The keys are listed before the folders, so a test
-/// that starts in between is seen with its folder. Nothing else is touched: not
-/// `HKCU\Software\LILITH`, not `HKCU\Software\Classes`, not a key of another shape. Returns the
-/// keys removed.
+/// How long ago a test registry root must have been written before the sweep may remove it: 6
+/// times nextest's longest stop (`terminate-after` 120 s × 5), so no live test of any worktree
+/// or test kit is that old.
+pub const SWEEP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The folder name every `TestEnv` folder starts with.
+const FOLDER_PREFIX: &str = "lil-testenv-";
+
+/// What a sweep did: the keys removed, and each key it couldn't remove with why.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RegistrySweep {
+    pub removed: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Removes the registry roots `HKCU\Software\LILITH-test-<8 lowercase hex>` that tests killed
+/// before their drop left (nextest's `terminate-after`; Task 3's review M9; a test that ends
+/// removes its own in its drop). [`sweep_with`] decides, over
+/// `lil_platform::desktop::test_registry_roots`, the `lil-testenv-*` folders in the system
+/// temporary folder (listed after the keys, so a test that starts in between is seen with its
+/// folder), the clock and [`owner_alive`]. Removal is by exact name through
+/// `remove_test_registry`, which refuses anything but a test channel; nothing else is touched.
 ///
 /// # Errors
-/// When the keys or the temporary folder can't be listed, or a key can't be removed.
-pub fn sweep_test_registry_roots() -> std::io::Result<Vec<String>> {
-    let ids = lil_platform::desktop::test_registry_ids()?;
-    if ids.is_empty() {
-        return Ok(Vec::new());
+/// When the keys or the temporary folder can't be listed. A key that can't be removed is in
+/// [`RegistrySweep::failed`], and the sweep goes on.
+pub fn sweep_test_registry_roots() -> std::io::Result<RegistrySweep> {
+    let roots = lil_platform::desktop::test_registry_roots()?;
+    if roots.is_empty() {
+        return Ok(RegistrySweep::default());
     }
-    let prefix = "lil-testenv-";
     let folders: Vec<String> = std::fs::read_dir(std::env::temp_dir())?
         .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
-        .filter_map(|n| n.strip_prefix(prefix).map(str::to_string))
+        .filter(|n| n.starts_with(FOLDER_PREFIX))
         .collect();
     let scratch = std::env::temp_dir().join("lil-registry-sweep");
-    let mut removed = Vec::new();
-    for id in ids {
-        let tail = format!("{id}-");
-        if folders.iter().any(|f| f.contains(&tail)) {
-            continue;
-        }
+    let mut remove = |id: &str| {
         let env = Env::with_roots(
-            Channel::Test(id),
+            Channel::Test(id.to_string()),
             Roots {
                 roaming: scratch.clone(),
                 local: scratch.clone(),
@@ -593,10 +619,81 @@ pub fn sweep_test_registry_roots() -> std::io::Result<Vec<String>> {
             },
             TEST_PIPE_SID.to_string(),
         );
-        lil_platform::desktop::remove_test_registry(&env)?;
-        removed.push(env.registry_root());
+        lil_platform::desktop::remove_test_registry(&env)
+    };
+    Ok(sweep_with(
+        &roots,
+        &folders,
+        std::time::SystemTime::now(),
+        &owner_alive,
+        &mut remove,
+    ))
+}
+
+/// The sweep's rule (I3): a root is removed only when all three hold:
+/// 1. no `folders` entry is a `lil-testenv-*<id>-*` folder;
+/// 2. it was last written at least [`SWEEP_MIN_AGE`] before `now` (a time after `now` keeps it);
+/// 3. it names no owner, or its owner isn't `alive`.
+///
+/// `remove` is called with the id of each root to remove; one that fails is reported in
+/// [`RegistrySweep::failed`] and the others are still tried.
+pub fn sweep_with(
+    roots: &[lil_platform::desktop::TestRegistryRoot],
+    folders: &[String],
+    now: std::time::SystemTime,
+    alive: &dyn Fn(&str) -> bool,
+    remove: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> RegistrySweep {
+    let mut sweep = RegistrySweep::default();
+    for root in roots {
+        let tail = format!("{}-", root.id);
+        let has_folder = folders.iter().any(|f| {
+            f.strip_prefix(FOLDER_PREFIX)
+                .is_some_and(|rest| rest.contains(&tail))
+        });
+        let old = now
+            .duration_since(root.last_written)
+            .is_ok_and(|age| age >= SWEEP_MIN_AGE);
+        let owned = root.owner.as_deref().is_some_and(alive);
+        if has_folder || !old || owned {
+            continue;
+        }
+        let key = format!(r"HKCU\Software\{}-test-{}", names::APP_NAME, root.id);
+        match remove(&root.id) {
+            Ok(()) => sweep.removed.push(key),
+            Err(e) => sweep.failed.push((key, e.to_string())),
+        }
     }
-    Ok(removed)
+    sweep
+}
+
+/// This process as a test registry root's owner: `<pid>:<creation FILETIME>`, or `None` when
+/// its start time can't be read.
+pub fn process_owner() -> Option<String> {
+    use lil_platform::process::{ProcessInspector as _, SystemInspector};
+    static OWNER: OnceLock<Option<String>> = OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            let pid = std::process::id();
+            let started = SystemInspector.started(pid).ok()?;
+            Some(format!("{pid}:{started}"))
+        })
+        .clone()
+}
+
+/// Whether `owner` ([`process_owner`]'s form) is a process that still runs: one with that pid,
+/// not exited, created at that time (so a reused pid isn't taken for it). Anything that can't
+/// be read or parsed counts as not running.
+pub fn owner_alive(owner: &str) -> bool {
+    use lil_platform::process::{ProcessInspector as _, SystemInspector, open};
+    let Some((pid, started)) = owner.split_once(':') else {
+        return false;
+    };
+    let (Ok(pid), Ok(started)) = (pid.parse::<u32>(), started.parse::<u64>()) else {
+        return false;
+    };
+    open(pid).is_ok_and(|p| matches!(p.exit_code(), Ok(None)))
+        && SystemInspector.started(pid).is_ok_and(|s| s == started)
 }
 
 /// 8 lowercase hex characters, distinct per call within a process and random across processes.

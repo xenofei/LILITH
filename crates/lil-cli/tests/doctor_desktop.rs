@@ -1,23 +1,26 @@
 //! `lil doctor`'s plan-4a checks against the real `lil` and `lil-core` (APP-022, ARCH-065,
 //! CORE-130, CORE-164, QA-060; Appendix G "Activation and registration" and "The `lil`
 //! commands this plan adds"; P4a-R26):
-//! - the AUMID shortcut and the channel's `lil:` and `.lilref` handlers, written only after `y`
-//!   and never with `--non-interactive`; handlers another channel holds are a warning and kept;
+//! - the AUMID shortcut, created or repaired only after `y`, and the channel's `lil:` and
+//!   `.lilref` handlers, each on its own: only the missing ones are written, after `y`, never
+//!   with `--non-interactive`; one another channel or another program holds is a warning and
+//!   kept (plan 4a ruling, 2026-10-25);
 //! - a `warning:` for each `engines.environment` change, the asset catalogue line and the
-//!   `models.report` counts, from a running core attached to the fake ComfyUI;
+//!   `models.report` counts, from a core that ran before the doctor; one the doctor's
+//!   workspace checks started isn't read yet;
 //! - a second run changes nothing.
 //!
 //! A test channel writes its shortcut under `<test root>\profile\Programs\` and its handlers
-//! under `HKCU\Software\LILITH-test-<id>\Classes`, which the shell never reads (QA-040); each
-//! test removes that key when it ends. The prompts are answered through stdin.
+//! under `HKCU\Software\LILITH-test-<id>\Classes`, which the shell never reads (QA-040); the
+//! `TestEnv`'s drop removes that key. The prompts are answered through stdin.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use lil_platform::desktop::{
-    HandlerState, ShortcutState, handler_state, read_shortcut, register_handlers,
-    remove_test_registry, shortcut_state,
+    HandlerPart, HandlerState, ShortcutState, handler_parts, handler_state, read_shortcut,
+    register_handlers, shortcut_state, write_shortcut,
 };
 use lil_protocol::{Outcome, ToolOutput};
 use lil_testkit::{CoreFixture, FakeComfy, LilOutput, TestEnv, ensure_built};
@@ -33,15 +36,6 @@ const CATALOGUE: [&str; 3] = [
     "warning: ComfyUI's asset catalogue is on",
     "info: ComfyUI's asset catalogue is unknown",
 ];
-
-/// The test channel's registry root, removed again when the test ends.
-struct Registry<'a>(&'a TestEnv);
-
-impl Drop for Registry<'_> {
-    fn drop(&mut self) {
-        let _ = remove_test_registry(&self.0.env);
-    }
-}
 
 /// `lil doctor` with `answer` typed at every question.
 fn doctor(env: &TestEnv, answer: &str) -> LilOutput {
@@ -100,7 +94,6 @@ fn reg_dump(env: &TestEnv) -> String {
 #[test] // spec: APP-022, QA-060
 fn shortcut_problem_then_fixed_after_yes() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
     let lnk = shortcut(&env);
 
     let no = doctor(&env, "n");
@@ -129,7 +122,6 @@ fn shortcut_problem_then_fixed_after_yes() {
 #[test] // spec: APP-020, APP-021, QA-060
 fn handlers_missing_then_registered_after_yes() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
     let scheme = env.env.activation_scheme();
 
     let no = doctor(&env, "n");
@@ -154,7 +146,6 @@ fn handlers_missing_then_registered_after_yes() {
 #[test] // spec: APP-020, APP-021
 fn handlers_held_by_another_channel_are_a_warning_and_kept() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
     let other = env.root().join(r"other build\lil-image.exe");
     register_handlers(&env.env, &other).unwrap();
     let classes = env.env.classes_root();
@@ -167,9 +158,13 @@ fn handlers_held_by_another_channel_are_a_warning_and_kept() {
     assert!(before.iter().all(|t| !t.is_empty()), "{before:?}");
 
     let out = doctor(&env, "y");
+    // One for the scheme, one for `.lilref`.
     let warned = lines(&out, "warning:", "handler");
-    assert_eq!(warned.len(), 1, "{out:?}");
-    assert!(warned[0].contains(&other.display().to_string()), "{out:?}");
+    assert_eq!(warned.len(), 2, "{out:?}");
+    for line in &warned {
+        assert!(line.contains(&other.display().to_string()), "{out:?}");
+        assert!(line.contains("another LILITH channel or build"), "{out:?}");
+    }
     assert!(lines(&out, "problem:", "handler").is_empty(), "{out:?}");
     assert!(lines(&out, "fixed:", "handler").is_empty(), "{out:?}");
     assert_eq!(
@@ -184,7 +179,6 @@ fn handlers_held_by_another_channel_are_a_warning_and_kept() {
 #[test] // spec: APP-022, P4a-R26
 fn non_interactive_never_writes() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
 
     // A `y` waiting on stdin is never read.
     let out = env.lil_with_stdin(&["--non-interactive", "doctor"], &"y\n".repeat(20));
@@ -196,16 +190,103 @@ fn non_interactive_never_writes() {
     assert_eq!(lines(&out, "problem:", "handler").len(), 1, "{out:?}");
     assert!(!shortcut(&env).exists());
     assert_eq!(handler_state(&env.env, &app_exe()), HandlerState::Missing);
+    // The root itself names the test's owner; nothing is below it.
     assert!(
-        !reg_has(&env.env.registry_root()),
-        "nothing was written under the test registry root"
+        !reg_has(&env.env.classes_root()),
+        "nothing was written under the test classes root"
     );
+}
+
+/// `reg add <key> /ve /d <value> /f`: the key's default value.
+fn reg_default(key: &str, value: &str) {
+    let ok = Command::new("reg")
+        .args(["add", key, "/ve", "/d", value, "/f"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("cannot run reg: {e}"))
+        .success();
+    assert!(ok, "reg add {key}");
+}
+
+#[test] // spec: APP-020, APP-021
+fn a_missing_own_scheme_is_offered_while_another_channel_holds_lilref() {
+    let env = TestEnv::new();
+    let classes = env.env.classes_root();
+    let other = env.root().join(r"stable\lil-image.exe");
+    reg_default(&format!(r"{classes}\.lilref"), "LILITH.lilref.stable");
+    reg_default(
+        &format!(r"{classes}\LILITH.lilref.stable\shell\open\command"),
+        &format!("\"{}\" \"%1\"", other.display()),
+    );
+    let lilref = reg_tree(&format!(r"{classes}\.lilref"));
+
+    let no = doctor(&env, "n");
+    let missing = lines(&no, "problem:", "link handler");
+    assert_eq!(missing.len(), 1, "{no:?}");
+    assert!(!missing[0].contains(".lilref"), "{no:?}");
+    let kept = lines(&no, "warning:", ".lilref file handler");
+    assert_eq!(kept.len(), 1, "{no:?}");
+    assert!(kept[0].contains(&other.display().to_string()), "{no:?}");
+
+    let yes = doctor(&env, "y");
+    assert_eq!(lines(&yes, "fixed:", "link handler").len(), 1, "{yes:?}");
+    let parts = handler_parts(&env.env, &app_exe());
+    assert_eq!(parts.scheme, HandlerPart::Ok);
+    assert_eq!(parts.lilref, HandlerPart::OtherBuild(other));
+    assert_eq!(reg_tree(&format!(r"{classes}\.lilref")), lilref);
+}
+
+#[test] // spec: APP-021
+fn a_lilref_another_program_holds_is_a_warning_naming_it() {
+    let env = TestEnv::new();
+    let classes = env.env.classes_root();
+    reg_default(&format!(r"{classes}\.lilref"), "txtfile");
+
+    let out = doctor(&env, "y");
+    let kept = lines(&out, "warning:", ".lilref file handler");
+    assert_eq!(kept.len(), 1, "{out:?}");
+    assert!(kept[0].contains("another program (txtfile)"), "{out:?}");
+    let parts = handler_parts(&env.env, &app_exe());
+    assert_eq!(
+        parts.scheme,
+        HandlerPart::Ok,
+        "the missing scheme was written"
+    );
+    assert_eq!(parts.lilref, HandlerPart::Foreign("txtfile".into()));
+}
+
+#[test] // spec: APP-022
+fn a_shortcut_to_another_build_is_repaired_after_yes() {
+    let env = TestEnv::new();
+    let other = env.root().join(r"other build\lil-image.exe");
+    write_shortcut(&env.env, &other).unwrap();
+    assert_eq!(
+        shortcut_state(&env.env, &app_exe()),
+        ShortcutState::WrongTarget
+    );
+
+    let no = doctor(&env, "n");
+    let wrong = lines(&no, "problem:", "shortcut");
+    assert_eq!(wrong.len(), 1, "{no:?}");
+    assert!(wrong[0].contains("doesn't open"), "{no:?}");
+    assert!(
+        no.stderr.contains("Repair the Start-menu shortcut? [y/N]"),
+        "{no:?}"
+    );
+    assert_eq!(read_shortcut(&shortcut(&env)).unwrap().target, other);
+
+    let yes = doctor(&env, "y");
+    let fixed = lines(&yes, "fixed:", "shortcut");
+    assert_eq!(fixed.len(), 1, "{yes:?}");
+    assert!(fixed[0].contains("is repaired"), "{yes:?}");
+    assert_eq!(read_shortcut(&shortcut(&env)).unwrap().target, app_exe());
+    assert_eq!(shortcut_state(&env.env, &app_exe()), ShortcutState::Ok);
 }
 
 #[test] // spec: QA-060
 fn a_second_run_changes_nothing() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
     let first = doctor(&env, "y");
     assert_eq!(first.code, 0, "{first:?}");
     let lnk = shortcut(&env);
@@ -291,7 +372,6 @@ fn captures(env: &TestEnv) -> usize {
 #[test] // spec: CORE-130
 fn engine_changes_warn_with_the_rollback_hint() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
     let fake = FakeComfy::start();
     attach(&env, &fake);
     node_version(&fake, "1.0.0");
@@ -311,6 +391,11 @@ fn engine_changes_warn_with_the_rollback_hint() {
         "{out:?}"
     );
     assert!(changed[0].ends_with(HINT), "{out:?}");
+    // Dated by the newer capture, so the repeat on the next run reads as the same change.
+    assert!(
+        changed[0].starts_with("warning: ComfyUI's environment changed on 20"),
+        "{out:?}"
+    );
 }
 
 #[test] // spec: ARCH-065
@@ -321,7 +406,6 @@ fn asset_catalogue_lines() {
         (404, json!({"error": "not found"}), "unknown"),
     ] {
         let env = TestEnv::new();
-        let _registry = Registry(&env);
         let fake = FakeComfy::start();
         fake.set_features(status, body);
         attach(&env, &fake);
@@ -360,7 +444,6 @@ fn safetensors(header: &Value) -> Vec<u8> {
 #[test] // spec: CORE-164
 fn models_report_counts_are_info() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
     let ws = env.make_workspace("models");
     env.register_workspace(&ws, true);
     let absent = "ab".repeat(32);
@@ -411,7 +494,6 @@ fn models_report_counts_are_info() {
 #[test] // spec: ARCH-065, CORE-130
 fn without_a_core_the_comfyui_lines_say_so_and_start_none() {
     let env = TestEnv::new();
-    let _registry = Registry(&env);
     let fake = FakeComfy::start();
     attach(&env, &fake);
 
@@ -422,4 +504,26 @@ fn without_a_core_the_comfyui_lines_say_so_and_start_none() {
     }
     let probe = env.lil(&["--no-start", "status"]);
     assert_eq!(probe.code, 3, "no core was started: {probe:?}");
+}
+
+#[test] // spec: ARCH-065, CORE-130
+fn a_core_the_workspace_checks_started_is_not_read_yet() {
+    let env = TestEnv::new();
+    let ws = env.make_workspace("just started");
+    env.register_workspace(&ws, true);
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+
+    let out = doctor(&env, "n");
+    assert_eq!(
+        lines(&out, "info:", "the core has just started").len(),
+        1,
+        "{out:?}"
+    );
+    for line in CATALOGUE {
+        assert!(!out.stdout.contains(line), "{out:?}");
+    }
+    assert!(lines(&out, "info:", "models:").is_empty(), "{out:?}");
+    let probe = env.lil(&["--no-start", "status"]);
+    assert_eq!(probe.code, 0, "the workspace checks started it: {probe:?}");
 }

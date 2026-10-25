@@ -8,11 +8,16 @@
 //! It runs cargo, so it is ignored by default:
 //! `cargo nextest run -p lil-testkit --run-ignored only -E 'test(leave_no_test_root)'`.
 //!
-//! It also checks the sweep of the registry keys killed tests leave behind
-//! ([`lil_testkit::env::sweep_test_registry_roots`]).
+//! It also checks the test registry roots: a `TestEnv` names its owner in its root and its drop
+//! removes it, and the sweep of the roots killed tests leave behind
+//! ([`lil_testkit::env::sweep_test_registry_roots`]) follows its rule, checked over a fake
+//! registry ([`lil_testkit::env::sweep_with`]) so no other run's key can be hit.
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
+
+use lil_platform::desktop::{TestRegistryRoot, test_registry_roots};
 
 /// The five tests, as `(test binary, test name)`.
 const TESTS: [(&str, &str); 5] = [
@@ -96,75 +101,132 @@ fn reg(args: &[&str]) -> bool {
         .success()
 }
 
-/// `HKCU\Software\<name>`.
-fn key(name: &str) -> String {
-    format!(r"HKCU\Software\{name}")
+/// A root as the sweep sees it, last written `age` before `now`.
+fn root(id: &str, owner: Option<&str>, now: SystemTime, age: Duration) -> TestRegistryRoot {
+    TestRegistryRoot {
+        id: id.to_string(),
+        owner: owner.map(str::to_string),
+        last_written: now - age,
+    }
 }
 
-/// An 8-hex id that no `lil-testenv-*` folder in the temporary folder names.
-fn rootless_id() -> String {
-    let names: Vec<String> = std::fs::read_dir(std::env::temp_dir())
-        .unwrap()
-        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
-        .filter(|n| n.starts_with("lil-testenv-"))
-        .collect();
-    (0u32..)
-        .map(|n| {
-            let h = std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), n);
-            format!("{:08x}", h as u32)
-        })
-        .find(|id| !names.iter().any(|n| n.contains(&format!("{id}-"))))
-        .unwrap()
-}
-
-/// A test that was killed leaves its `HKCU\Software\LILITH-test-<id>` key (Task 3's review M9):
-/// the sweep removes such a key once no `lil-testenv-*<id>-*` folder is left, keeps one whose
-/// folder is there (a test still running), and never touches a key of another shape.
+/// A killed test leaves its `HKCU\Software\LILITH-test-<id>` key (Task 3's review M9). The
+/// sweep's rule, over a fake registry so no real key of another worktree can be hit: a key is
+/// removed only with no `lil-testenv-*<id>-*` folder, at least an hour old and with no live
+/// owner; a failed removal doesn't stop the rest.
 #[test] // spec: QA-038
 fn leftover_test_registry_keys_are_swept() {
-    let env = lil_testkit::TestEnv::new();
-    let live = env.env.channel().to_string();
-    let live = live.strip_prefix("test-").unwrap().to_string();
-    assert!(
-        env.root()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .contains(&format!("{live}-")),
-        "the folder names its channel: {}",
-        env.root().display()
-    );
-    let gone = rootless_id();
-    let upper = rootless_id().to_ascii_uppercase();
-    let other_shapes = [
-        format!("LILITH-test-{gone}0"),
-        format!("LILITH-test-{}", &gone[..7]),
-        format!("LILITH-test-{upper}"),
-        format!("LILITH-testx-{gone}"),
+    let now = SystemTime::now();
+    let hours = Duration::from_secs(2 * 60 * 60);
+    let roots = [
+        root("0000000a", None, now, hours), // an old orphan of an old test kit
+        root("0000000b", Some("dead"), now, hours), // an old orphan whose owner ended
+        root("0000000c", None, now, Duration::from_secs(5 * 60)), // fresh: a test still running
+        root("0000000d", Some("live"), now, hours), // its owner still runs
+        root("0000000e", None, now, hours), // its folder is there
+        root("0000000f", None, now, hours), // its labelled folder is there
+        root("00000010", None, now, hours), // can't be removed
+        root("00000011", None, now, hours), // removed after the failure
+        TestRegistryRoot {
+            // Written after `now` (a clock change): kept.
+            last_written: now + hours,
+            ..root("00000012", None, now, hours)
+        },
     ];
-    let mut made = vec![format!("LILITH-test-{gone}"), format!("LILITH-test-{live}")];
-    made.extend(other_shapes.iter().cloned());
-    for name in &made {
-        assert!(
-            reg(&["add", &key(name), "/v", "LilTestChannel", "/d", "x", "/f"]),
-            "{name}"
-        );
-    }
+    let folders = [
+        "lil-testenv-0000000e-x1y2z3".to_string(),
+        "lil-testenv-Ünïcödé space-0000000f-a1b2c3".to_string(),
+        // Not a TestEnv folder, and the id doesn't end a segment: neither counts.
+        "lil-other-0000000a-a1b2c3".to_string(),
+        "lil-testenv-0000000b0-a1b2c3".to_string(),
+    ];
+    let alive = |owner: &str| owner == "live";
+    let mut asked = Vec::new();
+    let mut remove = |id: &str| {
+        asked.push(id.to_string());
+        if id == "00000010" {
+            Err(std::io::Error::other("access denied"))
+        } else {
+            Ok(())
+        }
+    };
+    let sweep = lil_testkit::env::sweep_with(&roots, &folders, now, &alive, &mut remove);
 
-    let swept = lil_testkit::env::sweep_test_registry_roots();
-    let exists: Vec<bool> = made.iter().map(|n| reg(&["query", &key(n)])).collect();
-    for name in &made[1..] {
-        let _ = reg(&["delete", &key(name), "/f"]);
-    }
-    let swept = swept.unwrap();
-
-    assert!(!exists[0], "the rootless key is removed: {swept:?}");
-    assert!(
-        exists[1],
-        "the key whose folder is there is kept: {swept:?}"
+    assert_eq!(asked, ["0000000a", "0000000b", "00000010", "00000011"]);
+    assert_eq!(
+        sweep.removed,
+        [
+            r"HKCU\Software\LILITH-test-0000000a",
+            r"HKCU\Software\LILITH-test-0000000b",
+            r"HKCU\Software\LILITH-test-00000011",
+        ]
     );
-    for (name, there) in made.iter().zip(&exists).skip(2) {
-        assert!(there, "{name} is another shape and is never touched");
+    assert_eq!(sweep.failed.len(), 1, "{sweep:?}");
+    assert_eq!(sweep.failed[0].0, r"HKCU\Software\LILITH-test-00000010");
+}
+
+/// The owner test: this process is alive; the same pid with another start time, or a value that
+/// doesn't parse, isn't.
+#[test] // spec: QA-038
+fn a_root_owner_is_alive_only_as_this_very_process() {
+    let owner = lil_testkit::env::process_owner().expect("this process's start time");
+    assert!(lil_testkit::env::owner_alive(&owner), "{owner}");
+    let (pid, started) = owner.split_once(':').unwrap();
+    let reused = format!("{pid}:{}", started.parse::<u64>().unwrap() + 1);
+    assert!(!lil_testkit::env::owner_alive(&reused));
+    for bad in ["", "x", "1:", ":1", "4294967296:1"] {
+        assert!(!lil_testkit::env::owner_alive(bad), "{bad}");
     }
-    assert!(!swept.iter().any(|k| k.contains(&live)), "{swept:?}");
+}
+
+/// A `TestEnv`'s registry root names its owner from the start and is listed with it (read-only:
+/// nothing but this test's own keys is written or removed); keys of another shape are never
+/// listed; and the drop removes the root with everything a doctor `y` would write below it.
+#[test] // spec: QA-038
+fn a_test_env_owns_its_registry_root_and_its_drop_removes_it() {
+    let env = lil_testkit::TestEnv::new();
+    let id = env.env.channel().to_string();
+    let id = id.strip_prefix("test-").unwrap().to_string();
+    let listed = test_registry_roots().unwrap();
+    let ours = listed
+        .iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("{id} not in {listed:?}"));
+    assert_eq!(ours.owner, lil_testkit::env::process_owner());
+    let age = SystemTime::now()
+        .duration_since(ours.last_written)
+        .unwrap_or_default();
+    assert!(age < Duration::from_secs(600), "{ours:?}");
+
+    // Other shapes, made from this test's own id so no other run's key is involved.
+    let other_shapes = [
+        format!("LILITH-test-{id}0"),
+        format!("LILITH-test-{}", &id[..7]),
+        format!("LILITH-testx-{id}"),
+    ];
+    for name in &other_shapes {
+        assert!(reg(&[
+            "add",
+            &format!(r"HKCU\Software\{name}"),
+            "/v",
+            "x",
+            "/d",
+            "x",
+            "/f"
+        ]));
+    }
+    let listed = test_registry_roots().unwrap();
+    for name in &other_shapes {
+        let _ = reg(&["delete", &format!(r"HKCU\Software\{name}"), "/f"]);
+    }
+    for name in &other_shapes {
+        let tail = name.split_once("-test-").map_or("", |(_, t)| t);
+        assert!(!listed.iter().any(|r| r.id == tail), "{name} listed");
+    }
+
+    let key = env.env.registry_root();
+    lil_platform::desktop::register_handlers(&env.env, &env.root().join("lil-image.exe")).unwrap();
+    assert!(reg(&["query", &format!(r"{key}\Classes")]));
+    drop(env);
+    assert!(!reg(&["query", &key]), "{key} was left after the drop");
 }

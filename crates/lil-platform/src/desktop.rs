@@ -36,8 +36,10 @@ use crate::env::Env;
 use crate::power::PowerRequest;
 
 pub use crate::classes::{
-    TEST_MARKER, leftover_registrations, register_handlers, remove_notification_settings,
-    remove_test_registry, test_registry_ids, unregister_handlers,
+    HandlerPart, HandlerParts, TEST_MARKER, TEST_OWNER, TestRegistryRoot, handler_parts,
+    leftover_registrations, mark_test_registry_owner, register_handlers, register_lilref,
+    register_scheme, remove_notification_settings, remove_test_registry, test_registry_roots,
+    unregister_handlers,
 };
 pub use crate::power::POWER_REASON;
 pub use crate::shortcut::{
@@ -411,13 +413,15 @@ impl NotShownEnd {
 }
 
 /// The AUMID shortcut's state for `exe`, read from the disk and the registry: what `lil doctor`
-/// checks before it offers to write it (P4a-R26), on every channel.
+/// checks before it offers to write it (P4a-R26), on every channel. It blocks (the registry
+/// and COM): never call it on a GUI thread (QA-026).
 pub fn shortcut_state(env: &Env, exe: &Path) -> ShortcutState {
     crate::shortcut::state(env, exe)
 }
 
-/// The scheme and `.lilref` handlers' state for `exe`, read from the registry: what `lil
-/// doctor` checks before it offers to write them (P4a-R26), on every channel.
+/// The scheme and `.lilref` handlers' one state for `exe` ([`HandlerParts::state`]), read from
+/// the registry; [`handler_parts`] gives each part. It blocks: never call it on a GUI thread
+/// (QA-026).
 pub fn handler_state(env: &Env, exe: &Path) -> HandlerState {
     crate::classes::state(env, exe)
 }
