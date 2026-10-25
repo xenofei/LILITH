@@ -50,9 +50,6 @@ pub use workspace::{
 /// the current user that it could inspect).
 pub(crate) const WRONG_FOLDER: &str = "its executable is not in the folder this client trusts";
 
-/// The start of the `Io` message of a core executable that could not be launched.
-pub(crate) const CANNOT_START: &str = "Cannot start the LILITH core";
-
 /// The core executable's file name, next to the client's own executable.
 pub const CORE_EXE: &str = "lil-core.exe";
 
@@ -258,6 +255,12 @@ pub enum ClientError {
     /// The core answered with a JSON-RPC protocol fault, or with something that is not the
     /// protocol.
     Protocol(RpcError),
+    /// No core was running and this client could not launch the core executable `exe` (it is
+    /// missing, or the system refused to run it); `source` says why.
+    CannotStart {
+        exe: PathBuf,
+        source: io::Error,
+    },
     Io(io::Error),
     /// The core closed the connection.
     Closed,
@@ -392,6 +395,11 @@ impl fmt::Display for ClientError {
                 "The LILITH core answered with a protocol error ({}): {}",
                 e.code, e.message
             ),
+            ClientError::CannotStart { exe, source } => write!(
+                f,
+                "Cannot start the LILITH core {}: {source}",
+                exe.display()
+            ),
             ClientError::Io(e) => write!(f, "{e}"),
             ClientError::Closed => f.write_str("The LILITH core closed the connection."),
         }
@@ -401,7 +409,7 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ClientError::Io(e) => Some(e),
+            ClientError::Io(e) | ClientError::CannotStart { source: e, .. } => Some(e),
             _ => None,
         }
     }

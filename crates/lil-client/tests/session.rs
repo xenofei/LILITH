@@ -554,6 +554,40 @@ fn a_failed_start_is_tried_once_until_retry_now() {
     stop(&cfg);
 }
 
+/// A `retry_now` that comes while a start is under way is that start's retry, not a second
+/// start: two in a row (the second one 20 ms later, with the core still starting) give one
+/// core start. Only a later `retry_now` starts another.
+#[test] // spec: ARCH-100, CORE-004, ARCH-018
+fn two_retries_during_a_start_give_one_start() {
+    let env = TestEnv::new();
+    let cfg = config(&env);
+    let db = env.env.suite_state_db();
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
+    runtime().block_on(async {
+        let session = Session::start(cfg.clone(), Vec::new());
+        let mut state = session.state();
+        wait_state(&mut state, "Unavailable", |s| {
+            matches!(s, SessionState::Unavailable { .. })
+        })
+        .await;
+        assert_eq!(failed_starts(&env), 1);
+
+        session.retry_now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        session.retry_now();
+        let asked = tokio::time::Instant::now();
+        while failed_starts(&env) < 2 {
+            assert!(asked.elapsed() < DEADLINE, "retry_now started no core");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // A second start would follow the first one's failure at once.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(failed_starts(&env), 2, "the second retry started a core");
+        session.close().await;
+    });
+}
+
 /// P4a-R33: after each failed attempt the session waits 250 ms, doubling up to 5 s.
 #[test] // spec: APP-034, ARCH-100
 fn backoff_doubles_from_250_ms_to_5_s() {

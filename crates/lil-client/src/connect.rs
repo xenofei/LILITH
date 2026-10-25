@@ -54,7 +54,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::conn::{Conn, EventStream};
-use crate::{CANNOT_START, ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
+use crate::{ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
 
 /// The first pause between attempts to open the pipe.
 const BACKOFF_START: Duration = Duration::from_millis(25);
@@ -578,11 +578,9 @@ impl<'a> Finder<'a> {
                     extra_env: self.cfg.spawn_env.clone(),
                     remove_env: Vec::new(),
                 })
-                .map_err(|e| {
-                    ClientError::Io(io::Error::new(
-                        e.kind(),
-                        format!("{CANNOT_START} {}: {e}", exe.display()),
-                    ))
+                .map_err(|source| ClientError::CannotStart {
+                    exe: exe.clone(),
+                    source,
                 })?;
                 self.spawned = Some(handle);
                 Ok(())
