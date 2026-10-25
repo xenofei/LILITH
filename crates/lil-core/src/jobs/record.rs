@@ -648,6 +648,7 @@ pub async fn batch_brief(db: &StateDb, batch_id: &str) -> Result<Vec<BatchJob>, 
                     created_utc: r.get(6)?,
                     started_utc: r.get(7)?,
                     finished_utc: r.get(8)?,
+                    error_code: error.as_ref().map(|e| e.code.clone()),
                     error_message: error.map(|e| e.message),
                     retry_of: r.get(10)?,
                     index: u32_col(r, 11)?,
@@ -662,7 +663,8 @@ pub async fn batch_brief(db: &StateDb, batch_id: &str) -> Result<Vec<BatchJob>, 
     .await
 }
 
-/// The batches with a job that finished at `since_utc` (Unix seconds) or later, at most 1,000.
+/// The batches with a job that finished at `since_utc` (Unix seconds) or later, the latest
+/// first, at most 1,000.
 pub async fn batches_finished_since(
     db: &StateDb,
     since_utc: i64,
@@ -670,7 +672,8 @@ pub async fn batches_finished_since(
     db.call(move |conn| {
         let read = || -> rusqlite::Result<Vec<String>> {
             conn.prepare(
-                "SELECT DISTINCT batch_id FROM jobs                  WHERE finished_utc >= ?1 AND batch_id IS NOT NULL LIMIT 1000",
+                "SELECT DISTINCT batch_id FROM jobs                  WHERE finished_utc >= ?1 AND batch_id IS NOT NULL \
+                 GROUP BY batch_id ORDER BY max(finished_utc) DESC LIMIT 1000",
             )?
             .query_map(params![since_utc], |r| r.get(0))?
             .collect()

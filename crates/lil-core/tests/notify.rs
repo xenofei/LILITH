@@ -333,6 +333,7 @@ fn summary(id: &str, index: u32, status: &str, surface: &str, retry_of: Option<&
             .is_final()
             .then_some(105 + i64::from(index)),
         error_message: None,
+        error_code: None,
         retry_of: retry_of.map(str::to_string),
         index,
         origin: Some(StartedBy {
@@ -348,6 +349,16 @@ fn summary(id: &str, index: u32, status: &str, surface: &str, retry_of: Option<&
 fn a_batch_ended_by_a_core_start_or_stop_never_toasts() {
     let mut interrupted = summary("j_2", 1, "failed", "cli", None);
     interrupted.substatus = Some("interrupted".into());
+    // An engine's interruption (ComfyUI restarted, QA-009) still ends the batch's toast.
+    interrupted.error_code = Some("comfyui.restarted".into());
+    let end = batch_end(&[
+        summary("j_1", 0, "succeeded", "cli", None),
+        interrupted.clone(),
+    ])
+    .unwrap();
+    assert_eq!(end.failed.unwrap().job_id, "j_2");
+    // A core's start or stop: never.
+    interrupted.error_code = Some("core.draining".into());
     assert!(
         batch_end(&[
             summary("j_1", 0, "succeeded", "cli", None),
@@ -530,22 +541,11 @@ fn a_suite_window_in_front_suppresses_and_nothing_is_queued() {
     ready(&mut p);
     let _app = app(&env);
 
-    let logs = capture_logs();
     desktop(&mut p, json!({"foreground": "suite"}));
-    let made = write(&mut p, "test.job", json!({"lane": "cpu"}));
-    let batch_id = made["job"]["batch_id"].as_str().unwrap().to_string();
-    let ids = job_ids(&made);
-    assert_eq!(wait_done(&mut p, &ids[0])["status"], "succeeded");
+    let ids = batch(&mut p, 1);
     let held = write(&mut p, "notify.claude_code", json!({"message": "in front"}));
     assert_eq!(held, json!({"posted": false, "reason": "foreground"}));
-    // The notifier has handled the batch's end while the app was in front (its log line),
-    // before the foreground moves.
-    until("the batch's end handled", || {
-        logs.text()
-            .lines()
-            .any(|l| l.contains(&batch_id) && l.contains("outcome=Foreground"))
-            .then_some(())
-    });
+    // At once, whether or not the notifier got to the batch yet: it is judged as it ended.
     desktop(&mut p, json!({"foreground": "other"}));
     // Later toasts go out; nothing of the time in front comes with them.
     fence(&mut p, &env);
@@ -1381,4 +1381,82 @@ fn a_workspace_recovered_later_posts_its_own_restart_toast() {
         "{toast}"
     );
     assert_eq!(toast["tag"], format!("restart_{}", ids[0]), "{toast}");
+}
+
+#[test] // spec: APP-146, ARCH-055
+fn a_resync_looks_back_from_the_events_own_time() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let clock = FakeClock::new();
+    let core = core_with(&env, clock.clone(), Some(Arc::new(SeqIds::new())), None);
+    let (notifier, events) = (core.core().notifier().clone(), core.core().events().clone());
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    // One real job event handled first.
+    fence(&mut p, &env);
+    // The notifier stalls; the events it will handle late carry the time they happened.
+    notifier.pause_job_events(true);
+    let happened = lil_schema::time::rfc3339(
+        i64::try_from(
+            lil_platform::Clock::utc_now(clock.as_ref())
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap(),
+    );
+    let stale = |n: usize| {
+        for i in 0..n {
+            events.publish(
+                "jobs",
+                json!({"kind": "job", "job": {"job_id": format!("j_stale{i}"), "batch_id": "b_stale",
+                       "status": "queued", "updated": happened}}),
+            );
+        }
+    };
+    stale(1100);
+    let ids = batch(&mut p, 2);
+    stale(1500);
+    // Handled more than 5 s after the batch ended.
+    clock.advance(Duration::from_secs(60));
+    notifier.pause_job_events(false);
+    let launch = format!("{scheme}:task/{}", ids[0]);
+    until("the batch's toast after the late resync", || {
+        posts(&mut p, "job_finished")
+            .iter()
+            .any(|t| t["launch"] == launch.as_str())
+            .then_some(())
+    });
+}
+
+#[test] // spec: APP-146, ARCH-055, APP-022
+fn a_carried_over_confirmation_of_a_later_workspace_gets_its_toast_when_its_retry_comes() {
+    let env = TestEnv::new();
+    let (first, later) = (env.make_workspace("first"), env.make_workspace("later"));
+    env.register_workspace(&first, false);
+    env.register_workspace(&later, true);
+    let k = key();
+    let id = {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({"workspace": env.workspace_id(&later)}));
+        ready(&mut p);
+        pending_id(&p.tool("test.destructive", json!({}), Some(&k)))
+    };
+    env.register_workspace(&first, true);
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    write(
+        &mut p,
+        "workspace.set_default",
+        json!({"path": later.to_string_lossy()}),
+    );
+    // The agent's retry opens the workspace: the confirmation still waits, with its toast.
+    let mut agent = pipe(&env, json!({"workspace": env.workspace_id(&later)}));
+    assert_eq!(
+        pending_id(&agent.tool("test.destructive", json!({}), Some(&k))),
+        id
+    );
+    let toast = until_posts(&mut p, "confirmation_waiting", 1).remove(0);
+    assert_eq!(toast["tag"], id.as_str(), "{toast}");
 }

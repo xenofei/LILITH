@@ -463,6 +463,15 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let active_projects = dispatcher.active_projects().clone();
     let jobs = dispatcher.jobs().clone();
     notifier.set_jobs(&jobs).await;
+    // Whether a suite window is in front as each job ends, before its final row (P4a-R7).
+    {
+        let notifier = Arc::downgrade(&notifier);
+        jobs.set_end_hook(Arc::new(move |id: &crate::jobs::JobId| {
+            if let Some(notifier) = notifier.upgrade() {
+                notifier.job_ending(id);
+            }
+        }));
+    }
     // One restart-hold toast per recovery that holds jobs (P4a-R41), set before any recovery.
     {
         let notifier = notifier.clone();

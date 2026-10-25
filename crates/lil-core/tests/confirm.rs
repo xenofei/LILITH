@@ -1534,3 +1534,73 @@ async fn a_reconcile_posts_the_missing_toasts_and_clears_stale_ones() {
         )]
     );
 }
+
+/// N6: a re-post the reconcile can't make (here the category is off) leaves no earlier run's
+/// toast behind with its dead Deny.
+#[tokio::test] // spec: APP-146, APP-022
+async fn a_refused_re_post_removes_the_earlier_runs_toast() {
+    use lil_platform::desktop::{Desktop as _, Toast};
+    use lil_platform::desktop_fake::ToastOp;
+    let rig = PathRig::new().await;
+    let states = Arc::new(
+        StateRegistry::open(
+            &rig._env.env,
+            Arc::new(|what: &str| panic!("fatal: {what}")),
+        )
+        .unwrap(),
+    );
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let confirm = Confirm::new(
+        states,
+        Arc::new(lil_core::events::EventBus::new(clock.clone())),
+        clock,
+        Arc::new(SeqIds::new()),
+        UiPresence::new(),
+        rig.notifier.clone(),
+        LIFETIME,
+        McpConfirmation::Core,
+        lil_core::store::FailPoints::none(),
+    );
+    rig.notifier.set_confirm(&confirm);
+    rig.category(false).await;
+    let waiting = confirm
+        .request(ConfirmRequest {
+            scope: "cli|none".into(),
+            idem_key: "k-old".into(),
+            tool: "test.destructive".into(),
+            args_hash: "h".into(),
+            arguments: json!({}),
+            caller_kind: "cli".into(),
+            session_id: "s_cli".into(),
+            project: None,
+            covers: vec![Cover::Confirm],
+            cap: None,
+        })
+        .await
+        .unwrap();
+    // The earlier run's toast of it, with a Deny no core accepts any more.
+    rig.fake
+        .post(&Toast {
+            tag: waiting.confirmation_id.clone(),
+            group: "confirmation_waiting".into(),
+            xml: "<toast/>".into(),
+            silent: false,
+        })
+        .unwrap();
+    confirm.reconcile_toasts();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while !rig
+        .fake
+        .records()
+        .iter()
+        .any(|r| r.op == ToastOp::Remove && r.tag == waiting.confirmation_id)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            rig.fake.records()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(rig.fake.history().is_empty());
+}

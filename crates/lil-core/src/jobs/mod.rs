@@ -634,6 +634,9 @@ impl JsonSchema for Surface {
 /// Told the jobs a recovery held (P4a-R41), in queue order ([`Jobs::set_restart_hold_sink`]).
 pub type RestartHoldSink = Arc<dyn Fn(Vec<JobId>) + Send + Sync>;
 
+/// Told of a job's end before its final row is written ([`Jobs::set_end_hook`]).
+pub type JobEndHook = Arc<dyn Fn(&JobId) + Send + Sync>;
+
 /// One job of a batch as the notifier reads it (APP-146): the narrow columns, without the
 /// job's arguments or result. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq)]
@@ -649,6 +652,8 @@ pub struct BatchJob {
     pub started_utc: Option<i64>,
     pub finished_utc: Option<i64>,
     pub error_message: Option<String>,
+    /// The error's code (`core.draining`: a core's start or stop interrupted it).
+    pub error_code: Option<String>,
     pub retry_of: Option<String>,
     pub index: u32,
     pub origin: Option<StartedBy>,

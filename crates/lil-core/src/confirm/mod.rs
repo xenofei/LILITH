@@ -60,7 +60,7 @@ mod store;
 
 pub use stage::AgentConfirm;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
@@ -84,6 +84,13 @@ use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::FailPoints;
 pub use crate::tools::ConfirmedVia;
 use crate::tools::{CapHit, IdemRef, cap_hits_json};
+
+/// How many ended confirmation ids [`Confirm`] remembers.
+const ENDED_KEPT: usize = 4096;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The event topic of the confirmations.
 pub const CONFIRMATIONS_TOPIC: &str = "confirmations";
@@ -345,6 +352,9 @@ pub struct Confirm {
     mcp: McpConfirmation,
     failpoints: Arc<FailPoints>,
     pending: Mutex<HashMap<String, Tracked>>,
+    /// The newest confirmations that ended in this core: a read that raced the end never
+    /// tracks one again. Taken under `pending`'s lock.
+    ended: Mutex<VecDeque<String>>,
     /// The caps: stage 5's cap half and a cap answer's `raise`.
     caps: std::sync::OnceLock<Arc<Caps>>,
 }
@@ -385,6 +395,7 @@ impl Confirm {
             mcp,
             failpoints,
             pending: Mutex::new(HashMap::new()),
+            ended: Mutex::new(VecDeque::new()),
             caps: std::sync::OnceLock::new(),
         })
     }
@@ -492,9 +503,17 @@ impl Confirm {
     }
 
     /// Knows `row` as pending; a toast token already bound to it stays.
-    fn track(&self, row: &ConfirmationRow) {
+    ///
+    /// `true` when it wasn't known before. One that ended in this core (a list or a retry that
+    /// read it before its answer landed) is never known again.
+    fn track(&self, row: &ConfirmationRow) -> bool {
         let mut tracked = self.tracked();
-        let toast_token = tracked.get(&row.id).and_then(|t| t.toast_token.clone());
+        if lock(&self.ended).contains(&row.id) {
+            return false;
+        }
+        let known = tracked.get(&row.id);
+        let new = known.is_none();
+        let toast_token = known.and_then(|t| t.toast_token.clone());
         tracked.insert(
             row.id.clone(),
             Tracked {
@@ -505,12 +524,28 @@ impl Confirm {
                 toast_token,
             },
         );
+        new
+    }
+
+    /// The ids of the pending confirmations this core knows of.
+    pub fn tracked_ids(&self) -> HashSet<String> {
+        self.tracked().keys().cloned().collect()
     }
 
     /// Forgets `id` as pending: it ended (its toast token dies with it), and the notification
     /// path is told.
     fn untrack(&self, id: &str) {
-        self.tracked().remove(id);
+        {
+            let mut tracked = self.tracked();
+            let mut ended = lock(&self.ended);
+            if !ended.iter().any(|e| e == id) {
+                ended.push_back(id.to_string());
+                while ended.len() > ENDED_KEPT {
+                    ended.pop_front();
+                }
+            }
+            tracked.remove(id);
+        }
         self.notify.ended(id);
     }
 
@@ -619,7 +654,10 @@ impl Confirm {
                 Replay::Expired
             }
             ConfState::Pending => {
-                self.track(&row);
+                // Known only now (a workspace opened after the start): its toast too.
+                if self.track(&row) {
+                    self.notify.pending(&row.view());
+                }
                 Replay::StillPending(row.pending())
             }
             // An approval holds for the lifetime from its answer (Appendix F: a confirmation
@@ -1155,9 +1193,13 @@ mod tests {
         c.track(&row("cf_2"));
         c.restore_toast_token("cf_1", "a".repeat(32));
         assert!(c.take_toast_token("cf_1", &"a".repeat(32)), "restored");
-        // The end kills it.
+        // The end kills it, and a read that raced the end never tracks it again.
         c.untrack("cf_2");
         assert!(!c.take_toast_token("cf_2", &"b".repeat(32)));
+        assert!(!c.track(&row("cf_2")), "ended");
+        assert!(!c.tracked_ids().contains("cf_2"));
+        assert!(c.track(&row("cf_3")), "new");
+        assert!(!c.track(&row("cf_3")), "known");
         assert!(same_token("ab", "ab") && !same_token("ab", "ac") && !same_token("ab", "abc"));
     }
 }
