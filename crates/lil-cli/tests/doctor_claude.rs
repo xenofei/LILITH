@@ -86,6 +86,23 @@ fn doctor_plugin_install_only_after_yes_in_the_default_profile() {
     );
     assert!(claude_log(&env).is_empty(), "{:?}", claude_log(&env));
 
+    // Plugin 1.3.0, the version before the Notification hook (P4a-R18): `y` updates it in
+    // place.
+    installed(&env, "1.3.0");
+    let yes = doctor(&env, env.root(), "y");
+    assert!(
+        ran(&claude_log(&env), &["plugin", "update", PLUGIN]),
+        "{:?}",
+        claude_log(&env)
+    );
+    assert!(
+        lines(&yes)
+            .iter()
+            .any(|l| l.starts_with("fixed:") && l.contains("1.3.1")),
+        "{yes:?}"
+    );
+    std::fs::remove_file(profile(&env).join("fake-claude.log")).unwrap();
+
     // Plugin 1.2.0: `y` updates it in place, never removes it.
     installed(&env, "1.2.0");
     let yes = doctor(&env, env.root(), "y");
@@ -102,7 +119,7 @@ fn doctor_plugin_install_only_after_yes_in_the_default_profile() {
     assert!(
         lines(&yes)
             .iter()
-            .any(|l| l.starts_with("fixed:") && l.contains("1.3.0")),
+            .any(|l| l.starts_with("fixed:") && l.contains("1.3.1")),
         "{yes:?}"
     );
 
@@ -125,7 +142,7 @@ fn doctor_plugin_install_only_after_yes_in_the_default_profile() {
     );
 
     // A path outside the channel's trusted folder is a problem too; the trusted one is ok.
-    installed(&env, "1.3.0");
+    installed(&env, "1.3.1");
     plugin_options(
         &env,
         json!({"lil_mcp_path": r"C:\elsewhere\lil-mcp.exe", "lil_path": format!("{folder}\\lil.exe")}),
@@ -148,7 +165,7 @@ fn doctor_claude_rules_name_both_tool_name_forms() {
     let env = TestEnv::new();
     let ws = env.copy_fixture_workspace("rules");
     env.register_workspace(&ws, true);
-    installed(&env, "1.3.0");
+    installed(&env, "1.3.1");
     let settings = ws.join(".claude").join("settings.json");
     std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
     // The person's own settings stay.
@@ -212,7 +229,7 @@ fn doctor_claude_rules_name_both_tool_name_forms() {
 #[test] // spec: ARCH-104
 fn doctor_lists_skills_writing_directly() {
     let env = TestEnv::new();
-    installed(&env, "1.3.0");
+    installed(&env, "1.3.1");
     let inventory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../plugin/worldwright/skills-inventory.toml");
     let table: toml::Table = std::fs::read_to_string(inventory).unwrap().parse().unwrap();
@@ -247,7 +264,7 @@ fn another_copy_of_the_plugin_is_named_with_its_removal_steps_and_never_removed(
     // The same plugin name from another marketplace.
     let other = format!("{}@old-market", PLUGIN.split('@').next().unwrap());
     let list = json!([
-        {"id": PLUGIN, "version": "1.3.0", "scope": "user", "enabled": true, "installPath": "x"},
+        {"id": PLUGIN, "version": "1.3.1", "scope": "user", "enabled": true, "installPath": "x"},
         {"id": other, "version": "1.2.0", "scope": "local",
          "projectPath": "D:/projects/ws", "enabled": true, "installPath": "y"}
     ]);
@@ -333,7 +350,7 @@ fn the_hooks_are_checked_to_run() {
     // Claude Code loads the plugin from a folder without hooks/hooks.json.
     let install = env.root().join("installed-plugin");
     std::fs::create_dir_all(&install).unwrap();
-    let list = json!([{"id": PLUGIN, "version": "1.3.0", "scope": "user", "enabled": true,
+    let list = json!([{"id": PLUGIN, "version": "1.3.1", "scope": "user", "enabled": true,
                        "installPath": install.to_str().unwrap()}]);
     std::fs::write(profile(&env).join("fake-plugins.json"), list.to_string()).unwrap();
     let out = doctor(&env, env.root(), "n");
@@ -368,7 +385,7 @@ fn the_hooks_are_checked_to_run() {
 #[test] // spec: AI-117, ARCH-108; ruling P3-R30
 fn a_claude_code_older_than_2_1_295_is_a_problem_with_the_update_step() {
     let env = TestEnv::new();
-    installed(&env, "1.3.0");
+    installed(&env, "1.3.1");
     for (version, problem) in [
         ("2.1.294", true),
         ("2.0.999", true),

@@ -181,6 +181,42 @@ fn boundaries_hold_per_crate_with_rmcp_in_the_workspace() {
     assert_eq!(platform_crates(&closure), [&"windows-link".to_string()]);
 }
 
+/// `lil-mcp` adapts the protocol and holds no policy or state (ARCH-012), so its own normal
+/// dependencies are only plan 3's (`lil-client`, `lil-protocol`, `rmcp`, `tokio`,
+/// `serde_json`, `tracing`) and, from plan 4a, `lil-platform` and `toml`, for starting a
+/// registered app without focus (P4a-R30). A new one fails here until a ruling allows it.
+#[test] // spec: ARCH-012, ARCH-111
+fn lil_mcp_depends_only_on_its_allowed_crates() {
+    let metadata = cargo_metadata();
+    let package = metadata["packages"]
+        .as_array()
+        .expect("packages array")
+        .iter()
+        .find(|p| p["name"] == "lil-mcp")
+        .expect("lil-mcp is a workspace member");
+    let normal: BTreeSet<String> = package["dependencies"]
+        .as_array()
+        .expect("dependencies array")
+        .iter()
+        .filter(|d| d["kind"].is_null())
+        .map(|d| d["name"].as_str().unwrap().to_string())
+        .collect();
+    let allowed = BTreeSet::from(
+        [
+            "lil-client",
+            "lil-protocol",
+            "rmcp",
+            "tokio",
+            "serde_json",
+            "tracing",
+            "lil-platform",
+            "toml",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(normal, allowed);
+}
+
 /// The walker follows transitive normal edges and ignores dev and build edges.
 #[test] // spec: QA-027
 fn closure_follows_only_normal_edges() {

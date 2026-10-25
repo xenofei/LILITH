@@ -8,6 +8,7 @@
 //! | `project.set_status` | write | `{project, status: "active"\|"paused"\|"archived"}` | `{project, status, stale: [ref]}` |
 //! | `project.status` | read | `{project?}` | `{project, status, assets_by_status, orphans: [path], needs_repair: [path], missing: [path]}` |
 //! | `project.context` | read | `{project?}` | `{project, settings, links, suggested_tools: [name]}` |
+//! | `projects.list` | read | `{}` | `{projects: [{project, name, status, assets}]}` (module `projects`) |
 //!
 //! - `project.create` writes `projects/<slug>/project.yaml` from the template (`status:
 //!   active`, `links: []`), then `progress.md` (the template, or the file that is there) with
@@ -26,6 +27,11 @@
 //! - `project.context` gives the call's settings with their sources, the project's `links`,
 //!   and `suggested_tools`: the tools whose module is `workspace` or one of the project's
 //!   `modules` (CORE-058).
+//! - `projects.list` (the top bar's switcher, APP-006; Appendix G "Session and listing tools")
+//!   lists each `projects/<slug>/` that holds a `project.yaml`, by slug: its `name` (else the
+//!   slug), its status as `project.status` reads it (`unknown` when the file doesn't parse) and
+//!   the number of its assets in the index, once the first reconcile is done. It names no
+//!   project, so it never changes the session's active project.
 //!
 //! An omitted `project` is the call's resolved project (`CallCtx::project`). Changes are
 //! published on the topic `project:<slug>` as `{kind: "status"}` and `{kind: "progress"}`.
@@ -49,6 +55,9 @@ use crate::projects::{
     project_yaml_path, read_project, restore_staleness, unknown_project,
 };
 use crate::store::{Expect, StoreError};
+
+/// The LILITH module of `projects.list` (Appendix G).
+pub const PROJECTS_MODULE: &str = "projects";
 
 /// I4's project types.
 pub const PROJECT_TYPES: &[&str] = &[
@@ -150,6 +159,28 @@ struct ContextResult {
     links: Vec<String>,
     suggested_tools: Vec<String>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ProjectEntry {
+    project: String,
+    name: String,
+    /// As `project.status` reads it: `active`, `paused`, `archived`, or `unknown`.
+    status: String,
+    /// Its assets in the index.
+    assets: u64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ListResult {
+    projects: Vec<ProjectEntry>,
+}
+
+const LIST_DESCRIPTION: &str = "The workspace's projects, by slug, with each one's name, \
+    status (active, paused or archived) and number of assets. Takes no arguments.";
 
 fn invalid(ctx: &CallCtx, why: String) -> ErrorBody {
     ErrorBody::new(&PARAMS_INVALID, why, ctx.trace_id.clone())
@@ -368,7 +399,59 @@ async fn context(
     ))
 }
 
-/// Registers the project tools (module `workspace`). `project.context` suggests from `tools`,
+async fn list(ctx: &CallCtx) -> Result<(ListResult, String), ErrorBody> {
+    let open = ctx.workspace()?;
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let dir = open.ws.path.join("projects");
+    // Only the folder names are read here; each project's file goes through the store.
+    let mut slugs: Vec<String> = tokio::task::spawn_blocking(move || {
+        std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|name| lil_schema::is_slug(name))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    slugs.sort();
+    open.index
+        .ready_result()
+        .await
+        .map_err(|e| e.to_error(&ctx.trace_id))?;
+    let mut projects = Vec::new();
+    for slug in slugs {
+        let (name, status) = match read_project(&open.store, &slug).await.map_err(error)? {
+            ProjectFile::Missing => continue,
+            ProjectFile::Parsed(p) => (
+                p.name.clone().unwrap_or_else(|| slug.clone()),
+                p.status.clone().unwrap_or_else(|| "active".to_string()),
+            ),
+            ProjectFile::Unreadable(_) => (slug.clone(), "unknown".to_string()),
+        };
+        let assets = open
+            .index
+            .assets_of(&slug)
+            .await
+            .map_err(|e| e.to_error(&ctx.trace_id))?
+            .len();
+        projects.push(ProjectEntry {
+            project: slug,
+            name,
+            status,
+            assets: u64::try_from(assets).unwrap_or(u64::MAX),
+        });
+    }
+    let summary = format!("{} project(s)", projects.len());
+    Ok((ListResult { projects }, summary))
+}
+
+/// Registers the project tools (module `workspace`; `projects.list` in `projects`).
+/// `project.context` suggests from `tools`,
 /// which `core_registry` fills with every registered tool once registration is done.
 pub fn register_project_tools(reg: &mut Registry, tools: Arc<OnceLock<Vec<ToolDescriptor>>>) {
     reg.register(typed_tool(
@@ -384,6 +467,13 @@ pub fn register_project_tools(reg: &mut Registry, tools: Arc<OnceLock<Vec<ToolDe
         EffectClass::Write,
         WORKSPACE_MODULE,
         |ctx, args: SetStatusArgs| Box::pin(set_status(ctx, args)),
+    ));
+    reg.register(typed_tool(
+        "projects.list",
+        LIST_DESCRIPTION,
+        EffectClass::Read,
+        PROJECTS_MODULE,
+        |ctx, _args: NoArgs| Box::pin(list(ctx)),
     ));
     reg.register(typed_tool(
         "project.status",

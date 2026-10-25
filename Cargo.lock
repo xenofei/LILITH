@@ -1685,11 +1685,14 @@ name = "lil-mcp"
 version = "0.0.0"
 dependencies = [
  "lil-client",
+ "lil-parse",
+ "lil-platform",
  "lil-protocol",
  "lil-testkit",
  "rmcp",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 

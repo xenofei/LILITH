@@ -148,7 +148,8 @@ fn read_registration(
     })
 }
 
-/// The longest target accepted.
+/// The longest target accepted, in bytes of UTF-8: the longest an `open/` launch URL carries
+/// (Appendix G "`lil:` URLs").
 const MAX_TARGET: usize = 4096;
 
 /// What is to be opened, as far as handlers care.
@@ -166,11 +167,11 @@ impl Target {
     /// Reads `text` as a target. It is untrusted input: it is checked, never executed.
     ///
     /// # Errors
-    /// Why `text` is not a target: empty, longer than 4096 characters, a control character, a
-    /// `lil://` ref that doesn't parse.
+    /// Why `text` is not a target: empty, longer than 4096 bytes of UTF-8, a control
+    /// character, a `lil://` ref that doesn't parse.
     pub fn parse(text: &str) -> Result<Target, String> {
-        if text.is_empty() || text.chars().count() > MAX_TARGET {
-            return Err(format!("a target is 1 to {MAX_TARGET} characters"));
+        if text.is_empty() || text.len() > MAX_TARGET {
+            return Err(format!("a target is 1 to {MAX_TARGET} bytes of UTF-8"));
         }
         if text.chars().any(char::is_control) {
             return Err("a target holds no control characters".to_string());

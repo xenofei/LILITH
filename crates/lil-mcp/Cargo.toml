@@ -7,16 +7,21 @@ license.workspace = true
 publish.workspace = true
 
 # The stdio MCP server Claude Code starts (ARCH-012, ARCH-110). Global Constraints: lil-client,
-# lil-protocol, rmcp, tokio, serde_json and tracing only.
+# lil-protocol, rmcp, tokio, serde_json and tracing, and (P4a-R30) lil-platform and toml: starting
+# a registered app without focus is a Windows call only lil-platform makes (ARCH-111), and the app
+# registrations it checks first are TOML. Neither adds policy or state (ARCH-012).
 [dependencies]
 rmcp.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "io-std", "sync"] }
+toml.workspace = true
 tracing.workspace = true
 lil-client = { path = "../lil-client" }
+lil-platform = { path = "../lil-platform" }
 lil-protocol = { path = "../lil-protocol" }
 
 [dev-dependencies]
+lil-parse = { path = "../lil-parse" }
 lil-testkit = { path = "../lil-testkit" }
 
 [lints]

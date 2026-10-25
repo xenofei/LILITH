@@ -113,6 +113,75 @@ pub fn write_new_file(
     Ok(())
 }
 
+/// Writes `bytes` as the file `path`, directly in one of the suite's own cache folders: the
+/// `.lilref` cache ([`Env::lilref_dir`], APP-021) or the diagnostics folder
+/// ([`Env::diagnostics_dir`], ARCH-119). The folder is made; the data goes to a new temp file
+/// beside the target (flushed to disk), which is moved to the target's name, or replaces the
+/// file there (`ReplaceFileW`, its backup then removed). Whatever fails, the temp file is
+/// removed again.
+///
+/// Refused with `PermissionDenied` before anything is written or made: a relative path, a
+/// path with a `.` or `..` part, and a path whose folder isn't one of the two (compared with
+/// `folder_key`, ignoring case), so nothing is written anywhere else (Appendix G).
+///
+/// [`Env::lilref_dir`]: lil_platform::Env::lilref_dir
+/// [`Env::diagnostics_dir`]: lil_platform::Env::diagnostics_dir
+pub fn write_suite_cache_file(
+    env: &lil_platform::Env,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let refuse = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a file of the suite's .lilref or diagnostics folder: {why}",
+                path.display()
+            ),
+        )
+    };
+    if !path.is_absolute() {
+        return Err(refuse("the path is relative"));
+    }
+    // Read from the text: `Path::components` drops a `.` in the middle.
+    if path
+        .to_string_lossy()
+        .split(['\\', '/'])
+        .any(|part| part == "." || part == "..")
+    {
+        return Err(refuse("its name holds `.` or `..`"));
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refuse("it names no file"));
+    };
+    let key = lil_platform::paths::folder_key(dir);
+    if ![env.lilref_dir(), env.diagnostics_dir()]
+        .iter()
+        .any(|allowed| lil_platform::paths::folder_key(allowed) == key)
+    {
+        return Err(refuse("its folder is another one"));
+    }
+    ensure_dir(dir)?;
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
+    let temp = write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none())?;
+    let placed = match move_new(&temp, path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let backup = dir.join(format!("{stem}.bak"));
+            replace(path, &temp, &backup).map(|()| {
+                let _ = remove_file(&backup);
+            })
+        }
+        other => other,
+    };
+    if placed.is_err() {
+        let _ = remove_file(&temp);
+    }
+    placed
+}
+
 /// A new file written in pieces (an engine output streamed into a staging handle or a job
 /// cache, Appendix F "ComfyUI client"): [`create_streamed`] creates it (never an existing
 /// file), [`StreamedFile::write`] appends, [`StreamedFile::finish`] flushes it with

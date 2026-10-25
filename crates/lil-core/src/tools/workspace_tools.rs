@@ -1,12 +1,21 @@
 //! The workspace tools (ARCH-003, ARCH-090, ARCH-094, ARCH-098, CORE-007; owner decisions 1
-//! and 2), module `workspace`: `workspace.create` and `workspace.set_default`. `lil workspace
-//! init|use` are thin wrappers over them, and so is the Home panel later; the core stays the
-//! only writer of `suite.toml` ([`register_workspace`]).
+//! and 2), module `workspace`: `workspace.create`, `workspace.set_default` and
+//! `workspaces.list`. `lil workspace init|use` are thin wrappers over them, and so is the Home
+//! panel later; the core stays the only writer of `suite.toml` ([`register_workspace`]).
 //!
 //! | Tool | Effect | Arguments | `structured` result |
 //! |---|---|---|---|
 //! | `workspace.create` | write | `{path, name?, default?}` | `{id, path, created, default, warnings}` |
 //! | `workspace.set_default` | write | `{path}` | `{id, path}` |
+//! | `workspaces.list` | read | `{}` | `{workspaces: [{id, path, name?, default, served, missing}]}` |
+//!
+//! **`workspaces.list`** (the top bar's switcher, APP-006; Appendix G "Session and listing
+//! tools") reads `suite.toml` and writes nothing: `default_workspace` first, then each
+//! `[[workspaces]]` entry, each folder once (compared with `folder_key`). An existing folder
+//! has the id of its canonical path and that path, and `name` from its workspace file when the
+//! file has one; a folder that is gone is `missing`, with the path as registered and the id
+//! of that path made absolute. `served` marks the workspace this core serves, the default
+//! (owner decision 2), when its folder exists.
 //!
 //! **`workspace.create`:**
 //! 1. The path is made absolute and passed through `check_workspace` before anything is
@@ -44,7 +53,9 @@ use lil_platform::paths::{folder_key, strip_verbatim};
 use lil_platform::{Env, check_workspace};
 use lil_protocol::{EffectClass, ErrorBody, codes};
 use lil_schema::SuiteToml;
-use lil_schema::workspace_yaml::{PROGRESS_TEMPLATE, new_project_yaml, new_workspace_yaml};
+use lil_schema::workspace_yaml::{
+    PROGRESS_TEMPLATE, new_project_yaml, new_workspace_yaml, read_workspace_yaml,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -124,6 +135,36 @@ pub struct SetDefaultResult {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListArgs {}
+
+/// One workspace of `workspaces.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceListed {
+    /// 16 hex characters.
+    pub id: String,
+    pub path: String,
+    /// The workspace file's `name`, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub default: bool,
+    /// The workspace this core serves.
+    pub served: bool,
+    /// Its folder is gone.
+    pub missing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ListResult {
+    pub workspaces: Vec<WorkspaceListed>,
+}
+
+const LIST_DESCRIPTION: &str = "The registered workspaces: the default first, each with its \
+    id, folder, name, whether it is the default, whether this core serves it (only the default \
+    is served) and whether its folder is missing. Takes no arguments; workspace.set_default \
+    changes the default.";
+
 /// What the workspace tools share.
 struct Tools {
     hub: Arc<WorkspaceHub>,
@@ -160,7 +201,7 @@ pub fn register_workspace_tools(
             Box::pin(async move { create(&t, ctx, args).await })
         },
     ));
-    let t = tools;
+    let t = tools.clone();
     reg.register(typed_tool(
         "workspace.set_default",
         SET_DEFAULT_DESCRIPTION,
@@ -171,6 +212,90 @@ pub fn register_workspace_tools(
             Box::pin(async move { set_default(&t, ctx, args).await })
         },
     ));
+    let t = tools;
+    reg.register(typed_tool(
+        "workspaces.list",
+        LIST_DESCRIPTION,
+        EffectClass::Read,
+        WORKSPACE_MODULE,
+        move |_ctx, _args: ListArgs| {
+            let t = t.clone();
+            Box::pin(async move {
+                t.hub.refresh_default();
+                let served = t.hub.default_id();
+                let env = t.env.clone();
+                let workspaces =
+                    tokio::task::spawn_blocking(move || listed(&env, served.as_deref()))
+                        .await
+                        .unwrap_or_default();
+                let summary = format!("{} workspace(s)", workspaces.len());
+                Ok((ListResult { workspaces }, summary))
+            })
+        },
+    ));
+}
+
+/// `workspaces.list`'s entries (module docs); `served` is the id of the workspace this core
+/// serves.
+fn listed(env: &Env, served: Option<&str>) -> Vec<WorkspaceListed> {
+    let suite = std::fs::read_to_string(env.suite_toml_to_read())
+        .ok()
+        .and_then(|text| SuiteToml::parse(&text).ok());
+    let Some(suite) = suite else {
+        return Vec::new();
+    };
+    let default = suite
+        .default_workspace
+        .clone()
+        .filter(|p| !p.is_empty())
+        .map(|p| folder_key(Path::new(&p)));
+    let paths = suite
+        .default_workspace
+        .iter()
+        .chain(suite.workspaces.iter().map(|w| &w.path))
+        .filter(|p| !p.is_empty());
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for registered in paths {
+        let key = folder_key(Path::new(registered));
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let is_default = default.as_deref() == Some(key.as_str());
+        let entry = match std::fs::canonicalize(registered) {
+            Ok(canonical) if canonical.is_dir() => {
+                let path = strip_verbatim(&canonical);
+                check_workspace(&path);
+                let id = Env::workspace_hash(&canonical);
+                let name = workspace_file_in(&path)
+                    .and_then(|file| std::fs::read_to_string(file).ok())
+                    .and_then(|text| read_workspace_yaml(&text).ok())
+                    .and_then(|ws| ws.name);
+                WorkspaceListed {
+                    served: served == Some(id.as_str()),
+                    id,
+                    path: path.display().to_string(),
+                    name,
+                    default: is_default,
+                    missing: false,
+                }
+            }
+            _ => {
+                let absolute =
+                    std::path::absolute(registered).unwrap_or_else(|_| PathBuf::from(registered));
+                WorkspaceListed {
+                    id: Env::workspace_hash(&absolute),
+                    path: registered.clone(),
+                    name: None,
+                    default: is_default,
+                    served: false,
+                    missing: true,
+                }
+            }
+        };
+        out.push(entry);
+    }
+    out
 }
 
 /// ARCH-094: `Err` (why) when `path` is the install folder or inside it, folders compared with

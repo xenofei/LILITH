@@ -138,7 +138,137 @@ const CAPS_1_2: &[&str] = &[
     "caps.v1",
     "queue.v1",
     "desktop.v1",
+    "context.v1",
 ];
+
+/// The fixture workspace (its `sketchbook` project) with a second project `harbor`, registered
+/// as the default.
+fn context_workspace(env: &TestEnv) -> std::path::PathBuf {
+    let ws = env.copy_fixture_workspace("context");
+    lil_testkit::files::write_file(
+        &ws.join(r"projects\harbor\project.yaml"),
+        b"name: Harbor\nslug: harbor\nstatus: active\n",
+    );
+    env.register_workspace(&ws, true);
+    ws
+}
+
+/// `app/set_context` (ARCH-088; Appendix G "Session and listing tools"): the slug becomes the
+/// session's project, so a later call naming none works in it; `null` forgets it; the result
+/// names the session's workspace.
+#[test] // spec: ARCH-088, APP-043
+fn set_context_changes_the_session_project() {
+    let env = TestEnv::new();
+    let ws = context_workspace(&env);
+    let _core = app_core(&env);
+    let mut app = lil_testkit::TestApp::start_with_capabilities(&env, Some(&ws), &[], CAPS_1_2);
+    let context = |app: &mut lil_testkit::TestApp| {
+        let out = app.tool("project.context", json!({}), None);
+        assert_eq!(out["status"], "ok", "{out}");
+        out["structured"]["project"].as_str().unwrap().to_string()
+    };
+    assert_eq!(context(&mut app), "sketchbook");
+
+    let set = app.call("app/set_context", json!({"project": "harbor"}));
+    let id = env.workspace_id(&ws);
+    assert_eq!(set["result"]["status"], "ok", "{set}");
+    assert_eq!(set["result"]["project"], "harbor", "{set}");
+    assert_eq!(set["result"]["workspace"]["id"], id.as_str(), "{set}");
+    let path = set["result"]["workspace"]["path"].as_str().unwrap();
+    assert!(
+        path.eq_ignore_ascii_case(&std::fs::canonicalize(&ws).unwrap().to_string_lossy()[4..]),
+        "{set}"
+    );
+    assert_eq!(context(&mut app), "harbor");
+    // As a call naming it would, it left the workspace's hint, which a new session starts from.
+    let hint = std::fs::read_to_string(ws.join(r".lilith\state.json")).unwrap();
+    assert!(hint.contains("\"harbor\""), "{hint}");
+    let mut other = lil_testkit::TestApp::start_with_capabilities(&env, Some(&ws), &[], CAPS_1_2);
+    assert_eq!(context(&mut other), "harbor");
+    other.call("app/set_context", json!({"project": "sketchbook"}));
+    assert_eq!(context(&mut other), "sketchbook");
+    // The first session keeps its own.
+    assert_eq!(context(&mut app), "harbor");
+
+    // `null` forgets the session's project: it falls back to the hint.
+    let cleared = app.call("app/set_context", json!({"project": null}));
+    assert_eq!(cleared["result"]["status"], "ok", "{cleared}");
+    assert_eq!(cleared["result"]["project"], Value::Null, "{cleared}");
+    assert_eq!(context(&mut app), "sketchbook");
+
+    // A session without a workspace has no project to set; it can still clear.
+    let mut bare = lil_testkit::TestApp::start_with_capabilities(&env, None, &[], CAPS_1_2);
+    let refused = bare.call("app/set_context", json!({"project": "harbor"}));
+    assert_eq!(
+        refused["result"]["error"]["code"], "workspace.required",
+        "{refused}"
+    );
+    let cleared = bare.call("app/set_context", json!({"project": null}));
+    assert_eq!(
+        cleared["result"],
+        json!({"status": "ok", "workspace": null, "project": null}),
+        "{cleared}"
+    );
+}
+
+#[test] // spec: ARCH-088, APP-043
+fn set_context_unknown_project_is_project_unknown() {
+    let env = TestEnv::new();
+    let ws = context_workspace(&env);
+    let _core = app_core(&env);
+    let mut app = lil_testkit::TestApp::start_with_capabilities(&env, Some(&ws), &[], CAPS_1_2);
+    let refused = app.call("app/set_context", json!({"project": "nowhere"}));
+    assert_eq!(
+        refused["result"]["error"]["code"], "project.unknown",
+        "{refused}"
+    );
+    let refused = app.call("app/set_context", json!({"project": "Not A Slug"}));
+    assert_eq!(
+        refused["result"]["error"]["code"], "params.invalid",
+        "{refused}"
+    );
+    // Nothing changed.
+    let out = app.tool("project.context", json!({}), None);
+    assert_eq!(out["structured"]["project"], "sketchbook", "{out}");
+    assert!(!ws.join(r".lilith\state.json").exists());
+}
+
+#[test] // spec: ARCH-031, APP-039, APP-043
+fn set_context_needs_context_v1() {
+    let env = TestEnv::new();
+    let ws = context_workspace(&env);
+    let _core = app_core(&env);
+    let change = json!({"project": "harbor"});
+    for caller in ["cli", "mcp"] {
+        let mut pipe = connect(&env, json!({"caller_kind": caller}));
+        let refused = pipe.call("app/set_context", change.clone());
+        assert_eq!(
+            refused["result"]["error"]["code"], "caller.not_allowed",
+            "{caller}: {refused}"
+        );
+    }
+    let without: Vec<&str> = CAPS_1_2
+        .iter()
+        .copied()
+        .filter(|c| *c != "context.v1")
+        .collect();
+    let mut old = lil_testkit::TestApp::start_with_capabilities(&env, Some(&ws), &[], &without);
+    let refused = old.call("app/set_context", change.clone());
+    assert_eq!(
+        refused["result"]["error"]["code"], "caller.not_allowed",
+        "an app without context.v1: {refused}"
+    );
+    let mut app = lil_testkit::TestApp::start_with_capabilities(&env, Some(&ws), &[], CAPS_1_2);
+    for bad in [
+        json!({"project": "harbor", "workspace": "x"}),
+        json!({"project": 7}),
+    ] {
+        let refused = app.call("app/set_context", bad.clone());
+        assert_eq!(refused["error"]["code"], -32602, "{bad}: {refused}");
+    }
+    let set = app.call("app/set_context", change);
+    assert_eq!(set["result"]["status"], "ok", "{set}");
+}
 
 /// `app/desktop.set` (APP-039, APP-146; Appendix D): a verified app only, and only with
 /// `desktop.v1` in the shared capabilities; then `DesktopSettings`. Its params are strict, and a

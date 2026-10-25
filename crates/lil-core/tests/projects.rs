@@ -1334,6 +1334,67 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
     assert_removed(env);
 }
 
+/// `projects.list` (APP-006; Appendix G "Session and listing tools"): every project folder with
+/// a `project.yaml`, by slug, with its name, status and asset count; it names no project, so it
+/// leaves the session's active project alone.
+#[tokio::test] // spec: APP-006, ARCH-088
+async fn projects_list_counts_assets() {
+    let env = TestEnv::new();
+    let ws = workspace(&env, |ws| {
+        // Neither a folder without `project.yaml` nor a file is a project.
+        write_file(&file(ws, "projects/not-one/assets/notes.txt"), b"x");
+        write_file(&file(ws, "projects/stray.txt"), b"x");
+        // One whose `project.yaml` doesn't parse is listed, as `project.status` reads it.
+        write_file(
+            &file(ws, "projects/broken/project.yaml"),
+            b"[not, a, mapping",
+        );
+    });
+    let fx = fx_with(&env, &ws, None);
+    fx.ok(
+        "s_1",
+        "project.create",
+        json!({"project": "harbor", "name": "Harbor Town", "type": "game"}),
+    )
+    .await;
+    fx.ok(
+        "s_1",
+        "project.set_status",
+        json!({"project": "harbor", "status": "paused"}),
+    )
+    .await;
+    let sketchbook = fx
+        .ok("s_2", "project.status", json!({"project": "sketchbook"}))
+        .await;
+    let assets: u64 = sketchbook["assets_by_status"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n.as_u64().unwrap())
+        .sum();
+    assert!(assets > 0, "the fixture has assets: {sketchbook}");
+
+    let listed = fx.ok("s_3", "projects.list", json!({})).await;
+    assert_eq!(
+        listed,
+        json!({"projects": [
+            {"project": "broken", "name": "broken", "status": "unknown", "assets": 0},
+            {"project": "harbor", "name": "Harbor Town", "status": "paused", "assets": 0},
+            {"project": "sketchbook", "name": "Sketchbook", "status": "active", "assets": assets},
+        ]})
+    );
+    // It named no project: the session still has the default.
+    let context = fx.ok("s_3", "project.context", json!({})).await;
+    assert_eq!(context["project"], "sketchbook", "{context}");
+    assert_eq!(
+        fx.code("s_3", "projects.list", json!({"project": "harbor"}))
+            .await,
+        "params.invalid"
+    );
+    fx.shutdown().await;
+    assert_removed(env);
+}
+
 #[test] // spec: CORE-048, I6
 fn graph_reports_cycles() {
     let n = |p: &str, a: &str| (p.to_string(), a.to_string());

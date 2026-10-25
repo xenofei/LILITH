@@ -932,6 +932,63 @@ async fn first_suite_toml_is_created_new() {
     assert_eq!(registration(&env, &ws), (true, false));
 }
 
+/// `workspaces.list` (APP-006; Appendix G "Session and listing tools"): the default first, then
+/// each registered workspace once in `suite.toml`'s order, a folder that is gone `missing`, the
+/// workspace file's `name` when it has one, and `served` on the one this core serves. A session
+/// without a workspace may call it, and it writes nothing.
+#[test] // spec: APP-006, ARCH-090
+fn workspaces_list_marks_the_default_and_the_served_one() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let legacy = env.make_legacy_workspace("old");
+    let a = env.make_workspace("Ünïcödé a");
+    let unnamed = env.root().join("ws-unnamed");
+    write_file(&unnamed.join("lilith.yaml"), b"created: 2026-10-01\n");
+    let gone = env.root().join("ws-gone");
+    env.register_workspace(&legacy, false);
+    env.register_workspace(&a, true);
+    env.register_workspace(&gone, false);
+    // The default again, spelled in another case: still listed once.
+    env.register_workspace(&PathBuf::from(arg(&a).to_uppercase()), false);
+    env.register_workspace(&unnamed, false);
+    let _core = core(&env);
+    let before = std::fs::read(env.env.suite_toml()).unwrap();
+
+    let entry = |ws: &Path, name: Option<&str>, default: bool| {
+        let mut e = json!({"id": env.workspace_id(ws), "path": canonical(ws).display().to_string(),
+                           "default": default, "served": default, "missing": false});
+        if let Some(name) = name {
+            e["name"] = json!(name);
+        }
+        e
+    };
+    let absolute = std::path::absolute(&gone).unwrap();
+    let expected = json!({"workspaces": [
+        entry(&a, Some("Ünïcödé a"), true),
+        entry(&legacy, Some("old"), false),
+        {"id": Env::workspace_hash(&absolute), "path": arg(&gone), "default": false,
+         "served": false, "missing": true},
+        entry(&unnamed, None, false),
+    ]});
+    for mut pipe in [session(&env, &a), none(&env)] {
+        let listed = pipe.tool_ok("workspaces.list", json!({}), None);
+        assert_eq!(listed, expected);
+    }
+    assert_eq!(std::fs::read(env.env.suite_toml()).unwrap(), before);
+
+    // A default whose folder is gone is still marked the default, and nothing is served.
+    let other = TestEnv::new();
+    let gone = other.root().join("ws-gone");
+    other.register_workspace(&gone, true);
+    let _other_core = core(&other);
+    let listed = none(&other).tool_ok("workspaces.list", json!({}), None);
+    assert_eq!(
+        listed,
+        json!({"workspaces": [{"id": Env::workspace_hash(&std::path::absolute(&gone).unwrap()),
+                               "path": arg(&gone), "default": true, "served": false,
+                               "missing": true}]})
+    );
+}
+
 #[test] // spec: QA-003, ARCH-090
 fn unsupported_fix_has_the_agent_hint_and_a_quoted_path() {
     let env = TestEnv::with_label("Ünïcödé space");

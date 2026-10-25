@@ -5,7 +5,8 @@
 //! - `handlers`: registrations (`apps\<app>.toml`), targets and which app handles what;
 //! - `notify`: the notifier, the core's toasts and the notification path (plan 4a);
 //! - `toast_xml`: the toast XML (Appendix G "Toast XML");
-//! - `tools`: `handlers.for`, `open_in`, `ui.show` and `notify.claude_code`.
+//! - `lilref`: the `.lilref` files of `lilref.write` (APP-021);
+//! - `tools`: `handlers.for`, `open_in`, `ui.show`, `lilref.write` and `notify.claude_code`.
 //!
 //! An agent's `open_in` or `ui.show` that names an app posts an `agent_activity` toast
 //! ([`notify::Notifier::agent_opened`], APP-065), once the server has set the notifier.
@@ -18,13 +19,16 @@
 //!   `{target, intent, focus}` on `open_requests:<app>`, and `pid` is the app's process.
 //!   `focus` is `false` for every agent caller (`assistant`, `mcp`, `cli`) and `true` for an
 //!   app (APP-065), so an agent's request shows the content without activating the window;
-//! - it isn't: nothing is published, and `launch_command` is the registered `exe`, its
-//!   registered `args` and `lil:open/<target>`, for the requester to run.
+//! - it isn't: nothing is published, and `launch_command` is the registered `exe` with
+//!   [`launch_args`]: its registered `args`, `--intent <intent>` and
+//!   `<scheme>:open/<base64url of the target>` under the channel's activation scheme (APP-020,
+//!   the plan-3 carry N6), for the requester to run.
 //!
-//! The target is passed on as given, as one argument. It was checked, never executed or
-//! parsed beyond its type and format.
+//! The target is passed on base64url-encoded in one argument, so no character of it can split
+//! the command line. It was checked, never executed or parsed beyond its type and format.
 
 pub mod handlers;
+pub mod lilref;
 pub mod notify;
 pub mod toast_xml;
 pub mod tools;
@@ -33,6 +37,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use lil_platform::Env;
 use lil_protocol::{CallerKind, ErrorBody, codes};
 use lil_schema::refs::AssetRef;
 use schemars::JsonSchema;
@@ -43,6 +48,7 @@ pub use handlers::{
     AppRegistration, HandlerView, Intent, OpensEntry, Target, handlers_for_target,
     load_registrations,
 };
+pub use lilref::{lilref_file_name, write_lilref};
 pub use notify::{Notifier, NotifierParts, NotifyOutcome};
 pub use toast_xml::{ToastActions, ToastText, toast_xml};
 pub use tools::register_interchange_tools;
@@ -75,12 +81,29 @@ struct AppConn {
     pid: u32,
 }
 
+/// The arguments of a `launch_command` (APP-063, the plan-3 carry N6): the registered `args`,
+/// then `--intent <intent>`, then `<scheme>:open/<base64url of the target's UTF-8, without
+/// padding>`, the URL the app's `lil:` handler reads back (Appendix G "`lil:` URLs").
+pub fn launch_args(
+    reg: &AppRegistration,
+    target: &Target,
+    intent: Intent,
+    scheme: &str,
+) -> Vec<String> {
+    let mut args = reg.args.clone();
+    args.push("--intent".to_string());
+    args.push(intent_name(intent).to_string());
+    args.push(lil_parse::open_url(scheme, &target.text));
+    args
+}
+
 /// The handler registry and the running apps.
 pub struct Interchange {
     /// The folder of the core executable: installed apps' `apps\` is beside it.
     core_dir: PathBuf,
-    /// `%APPDATA%\LILITH` of this channel: external programs' `apps\` is in it.
-    data_dir: PathBuf,
+    /// This channel's paths: external programs' `apps\` is in `%APPDATA%\LILITH`, the
+    /// `.lilref` cache in the local folder, and the activation scheme of the launch URLs.
+    env: Env,
     /// The open `ui:*` connections, by connection id.
     connected: Mutex<BTreeMap<u64, AppConn>>,
     /// The notifier, once the server set it: `notify.claude_code` and the agent-activity toasts.
@@ -91,16 +114,16 @@ impl std::fmt::Debug for Interchange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Interchange")
             .field("core_dir", &self.core_dir)
-            .field("data_dir", &self.data_dir)
+            .field("data_dir", &self.env.data_dir())
             .finish_non_exhaustive()
     }
 }
 
 impl Interchange {
-    pub fn new(core_dir: PathBuf, data_dir: PathBuf) -> Arc<Interchange> {
+    pub fn new(core_dir: PathBuf, env: Env) -> Arc<Interchange> {
         Arc::new(Interchange {
             core_dir,
-            data_dir,
+            env,
             connected: Mutex::new(BTreeMap::new()),
             notifier: OnceLock::new(),
         })
@@ -140,7 +163,12 @@ impl Interchange {
     /// The registrations on disk now: an app installed or registered after the core started
     /// is found by the next call.
     pub fn registrations(&self) -> Vec<AppRegistration> {
-        load_registrations(&self.core_dir, &self.data_dir)
+        load_registrations(&self.core_dir, &self.env.data_dir())
+    }
+
+    /// This channel's paths.
+    pub fn env(&self) -> &Env {
+        &self.env
     }
 
     /// The pid of the running `app` (the oldest of its connections); `Some(0)` when Windows
@@ -246,21 +274,20 @@ impl Interchange {
                 launch_command: None,
             };
         }
-        let mut args = reg.args.clone();
-        args.push(format!("lil:open/{}", target.text));
+        let scheme = self.env.activation_scheme();
         OpenResult {
             running: false,
             pid: None,
             launch_command: Some(LaunchCommand {
                 exe: reg.exe.clone(),
-                args,
+                args: launch_args(reg, target, intent, &scheme),
             }),
         }
     }
 
     /// [`Interchange::registrations`] on a blocking thread.
     async fn load_registrations(&self) -> Vec<AppRegistration> {
-        let (core_dir, data_dir) = (self.core_dir.clone(), self.data_dir.clone());
+        let (core_dir, data_dir) = (self.core_dir.clone(), self.env.data_dir());
         tokio::task::spawn_blocking(move || load_registrations(&core_dir, &data_dir))
             .await
             .unwrap_or_default()

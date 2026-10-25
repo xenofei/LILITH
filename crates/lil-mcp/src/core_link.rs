@@ -32,6 +32,9 @@ pub struct Linked {
     pub workspace_note: Option<String>,
     /// The folders an absolute artifact path may be in: the suite's job cache.
     pub roots: Vec<PathBuf>,
+    /// The folders a trusted core's executable may be in (ARCH-027): an app is launched only
+    /// from the registrations beside a core in one of them ([`crate::launch`]).
+    pub server_dirs: Vec<PathBuf>,
 }
 
 impl Linked {
@@ -183,6 +186,7 @@ async fn connect(cwd: &std::path::Path) -> Link {
         names,
         workspace_note,
         roots,
+        server_dirs: cfg.server_dirs.clone(),
     }))
 }
 

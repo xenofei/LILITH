@@ -29,7 +29,7 @@
 //!    workspace's `.claude/settings.json` through its store; never with `--non-interactive`.
 //! 4. Claude Code (AI-114, AI-117, ARCH-104, ARCH-108): `claude.exe` on `PATH` (on a test channel
 //!    only the test kit's, in this executable's folder); the plugin `worldwright@lilith` at
-//!    1.3.0 in the default profile (the folder `CLAUDE_CONFIG_DIR` names, else Claude Code's
+//!    1.3.1 in the default profile (the folder `CLAUDE_CONFIG_DIR` names, else Claude Code's
 //!    own; the doctor never sets it), installed or updated in place with Claude Code's own
 //!    commands only after the person types `y`, never removed; the plugin's options
 //!    `lil_mcp_path` and `lil_path` (read from the profile's `settings.json`, never written)
@@ -628,7 +628,7 @@ const PLUGIN: &str = "worldwright@lilith";
 /// The plugin's marketplace, as `plugin/.claude-plugin/marketplace.json` names it.
 const MARKETPLACE: &str = "lilith";
 /// The plugin version this suite ships.
-const PLUGIN_VERSION: &str = "1.3.0";
+const PLUGIN_VERSION: &str = "1.3.1";
 /// The oldest Claude Code that honours the plugin hooks' `"onFailure": "block"` (ruling
 /// P3-R30): an older one runs them as if a failure let the action through.
 const MIN_CLAUDE_CODE: &str = "2.1.295";

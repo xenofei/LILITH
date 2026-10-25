@@ -337,7 +337,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     if cfg.test_tools {
         register_test_hold(&mut registry, &holds, &test_holds);
     }
-    let interchange = Interchange::new(core_dir(), cfg.env.data_dir());
+    let interchange = Interchange::new(core_dir(), cfg.env.clone());
     register_interchange_tools(&mut registry, &interchange);
     if cfg.test_tools {
         register_hw_tick(&mut registry, telemetry.clone());

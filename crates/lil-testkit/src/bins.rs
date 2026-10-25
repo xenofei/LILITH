@@ -1,6 +1,6 @@
 //! The real `lil`, `lil-core` and `lil-mcp` binaries and the test kit's own (`lil-test-app`,
-//! `lil-fake-comfyui`, `lil-fake-comfy-cli` and the fake `claude`) for E2E tests (QA-056,
-//! QA-066).
+//! `lil-fake-comfyui`, `lil-fake-comfy-cli`, `lil-fake-image` and the fake `claude`) for E2E
+//! tests (QA-056, QA-066).
 //!
 //! They are built into their own target directory, `<workspace>\target\testbins`, so a test
 //! core that is still running never locks a binary the main build wants to relink, and the
@@ -38,6 +38,9 @@ pub struct Bins {
     pub fake_comfyui: PathBuf,
     /// `<dir>\lil-fake-comfy-cli.exe`
     pub fake_comfy_cli: PathBuf,
+    /// `<dir>\lil-fake-image.exe`: the stand-in for `lil-image.exe`, which tests copy into
+    /// their own folder under that name.
+    pub fake_image: PathBuf,
     /// `<dir>\claude.exe`: the fake Claude Code. Never on the real `PATH`; tests put the
     /// folder on a child's `PATH` with [`crate::TestEnv::path_with_testbins`].
     pub claude: PathBuf,
@@ -53,12 +56,13 @@ impl Bins {
             test_app: dir.join("lil-test-app.exe"),
             fake_comfyui: dir.join("lil-fake-comfyui.exe"),
             fake_comfy_cli: dir.join("lil-fake-comfy-cli.exe"),
+            fake_image: dir.join("lil-fake-image.exe"),
             claude: dir.join("claude.exe"),
             dir: dir.to_path_buf(),
         }
     }
 
-    fn all(&self) -> [&PathBuf; 7] {
+    fn all(&self) -> [&PathBuf; 8] {
         [
             &self.lil,
             &self.lil_core,
@@ -66,6 +70,7 @@ impl Bins {
             &self.test_app,
             &self.fake_comfyui,
             &self.fake_comfy_cli,
+            &self.fake_image,
             &self.claude,
         ]
     }

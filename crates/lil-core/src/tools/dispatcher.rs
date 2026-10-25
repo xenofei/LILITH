@@ -92,9 +92,11 @@ use std::sync::{Arc, Weak};
 use std::time::UNIX_EPOCH;
 
 use lil_platform::{Clock, IdSource};
+use lil_protocol::app::SetContextResult;
 use lil_protocol::{
     CallerKind, CodeSpec, Detail, EffectClass, ErrorBody, Outcome, PendingConfirmation,
-    ToolCallParams, ToolDescriptor, ToolOutput, args_hash, codes, fits_response_result,
+    ToolCallParams, ToolDescriptor, ToolOutput, WorkspaceInfo, args_hash, codes,
+    fits_response_result,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinError;
@@ -217,6 +219,61 @@ impl Dispatcher {
     /// The workspace hub its calls open workspaces through.
     pub fn hub(&self) -> &Arc<WorkspaceHub> {
         &self.inner.hub
+    }
+
+    /// `app/set_context` (ARCH-088; Appendix G "Session and listing tools"): `project` becomes
+    /// the session's active project as a call naming it would make it (and so the hint, on a
+    /// read-write workspace); `None` forgets the session's, so its calls fall back to the hint,
+    /// then `sketchbook`. The workspace is the session's, chosen by its `core/hello`.
+    ///
+    /// # Errors
+    /// `workspace.required` for a slug in a session without a workspace; the session's
+    /// workspace errors (`workspace.unsupported`, …); `params.invalid` for a name that isn't a
+    /// slug; `project.unknown` without its `project.yaml`; `store.io` when that can't be read.
+    pub async fn set_context(
+        &self,
+        session: &Session,
+        project: Option<&str>,
+        trace_id: &str,
+    ) -> Result<SetContextResult, ErrorBody> {
+        use crate::projects::{ProjectFile, project_yaml_path, read_project, unknown_project};
+        let workspace = session.workspace.as_ref().map(|w| WorkspaceInfo {
+            id: w.id.clone(),
+            path: w.path.display().to_string(),
+        });
+        let traced = |mut e: ErrorBody| {
+            e.trace_id = trace_id.to_string();
+            e
+        };
+        let Some(slug) = project else {
+            self.inner.active.forget(&session.id);
+            return Ok(SetContextResult {
+                workspace,
+                project: None,
+            });
+        };
+        let Some(open) = self.inner.open_workspace(session, trace_id).await? else {
+            return Err(ErrorBody::new(
+                &codes::WORKSPACE_REQUIRED,
+                "A project is set within a workspace, and this session has none. Connect with \
+                 a workspace first.",
+                trace_id,
+            ));
+        };
+        project_yaml_path(slug).map_err(traced)?;
+        let file = read_project(&open.store, slug)
+            .await
+            .map_err(|e| e.to_error(trace_id))?;
+        if file == ProjectFile::Missing {
+            return Err(traced(unknown_project(slug)));
+        }
+        if let Err(e) = remember_project(&self.inner.active, &session.id, &open, slug).await {
+            tracing::warn!(project = %slug, error = %e, "the active-project hint in state.json could not be written");
+        }
+        Ok(SetContextResult {
+            workspace,
+            project: Some(slug.to_string()),
+        })
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is

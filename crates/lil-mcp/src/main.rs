@@ -2,9 +2,11 @@
 //! protocol and lowers results (`lil_protocol::lowering`); it holds no policy and no state,
 //! because the core enforces everything. It reaches the core as `mcp` through `lil-client`,
 //! starting the core when none runs (ARCH-018); the core decides whether the connection
-//! really is `mcp` (ARCH-047).
+//! really is `mcp` (ARCH-047). For an `mcp` session it also starts a stopped suite app without
+//! focus after an `open_in` or `ui.show` (ARCH-015, [`launch`]).
 
 mod core_link;
+mod launch;
 mod resources;
 mod server;
 

@@ -830,6 +830,9 @@ fn every_tool_declares_a_module() {
             TEST_MODULE
         } else if d.name.starts_with("job.") || d.name.starts_with("jobs.") {
             crate::jobs::JOBS_MODULE
+        } else if d.name == "projects.list" {
+            // Appendix G "Session and listing tools".
+            crate::tools::project_tools::PROJECTS_MODULE
         } else {
             WORKSPACE_MODULE
         };
@@ -886,6 +889,29 @@ async fn the_desktop_tools_are_pinned() {
             ),
         ]
     );
+}
+
+/// The plan-4a listing rows (CORE-146; Appendix G "Session and listing tools"): `projects.list`
+/// reads in `projects` and `workspaces.list` reads in `workspace` (the interchange rows are
+/// pinned in `tests/interchange.rs`).
+#[test] // spec: CORE-146, CORE-058, APP-006
+fn the_listing_tools_are_pinned() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
+    let row = |name: &str, effect, module: &str| (name.to_string(), effect, module.to_string());
+    let expected = vec![
+        row("projects.list", EffectClass::Read, "projects"),
+        row("workspaces.list", EffectClass::Read, WORKSPACE_MODULE),
+    ];
+    let mut found: Vec<(String, EffectClass, String)> = reg
+        .descriptors()
+        .into_iter()
+        .map(|d| (d.name, d.effect, d.module))
+        .filter(|(name, _, _)| expected.iter().any(|e| &e.0 == name))
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(found, expected);
 }
 
 #[test] // spec: CORE-014

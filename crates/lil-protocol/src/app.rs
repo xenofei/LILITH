@@ -3,7 +3,9 @@
 //! [`CapsView`] `caps.get` returns too; and of protocol 1.2 (Appendix G "Pause GPU work"),
 //! `app/queue.pause` and `app/queue.resume`, which need `queue.v1` and return a
 //! [`QueueState`], and `app/desktop.set` (Appendix G "Notifications"), which needs `desktop.v1`
-//! and returns the [`DesktopSettings`] `desktop.get` returns too.
+//! and returns the [`DesktopSettings`] `desktop.get` returns too, and `app/set_context`
+//! (Appendix G "Session and listing tools"), which needs `context.v1` and sets the session's
+//! project.
 //!
 //! Every `app/*` method is for verified `ui:*` connections only, except the read-only
 //! `app/confirmations.list`, which `cli` may call too; the confirmation methods need
@@ -41,6 +43,11 @@ pub const QUEUE_CAPABILITY: &str = "queue.v1";
 pub const DESKTOP_SET: &str = "app/desktop.set";
 /// The capability `app/desktop.set` needs.
 pub const DESKTOP_CAPABILITY: &str = "desktop.v1";
+
+/// `app/set_context` (protocol 1.2).
+pub const SET_CONTEXT: &str = "app/set_context";
+/// The capability `app/set_context` needs.
+pub const CONTEXT_CAPABILITY: &str = "context.v1";
 
 /// The most confirmations one `app/confirmations.list` returns, and its default.
 pub const LIST_LIMIT_MAX: u32 = 500;
@@ -342,10 +349,50 @@ pub struct DesktopSettings {
     pub notification_path: NotificationPath,
 }
 
+/// `app/set_context` params: `{project: <slug> | null}`. `null` forgets the session's project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetContextParams {
+    pub project: Option<String>,
+}
+
+/// `app/set_context`'s result: the session's workspace (chosen by its `core/hello`) and the
+/// project it now has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetContextResult {
+    pub workspace: Option<crate::session::WorkspaceInfo>,
+    pub project: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test] // spec: ARCH-088, APP-043
+    fn set_context_params_are_strict_and_the_result_serialises() {
+        let p: SetContextParams = serde_json::from_value(json!({"project": "harbor"})).unwrap();
+        assert_eq!(p.project.as_deref(), Some("harbor"));
+        let cleared: SetContextParams = serde_json::from_value(json!({"project": null})).unwrap();
+        assert_eq!(cleared, SetContextParams::default());
+        for bad in [json!({"project": 3}), json!({"workspace": "x"})] {
+            assert!(
+                serde_json::from_value::<SetContextParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        let result = SetContextResult {
+            workspace: Some(crate::session::WorkspaceInfo {
+                id: "0123456789abcdef".into(),
+                path: r"C:\ws".into(),
+            }),
+            project: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            json!({"workspace": {"id": "0123456789abcdef", "path": r"C:\ws"}, "project": null})
+        );
+    }
 
     #[test] // spec: CORE-160, APP-043
     fn queue_params_are_strict_and_the_lane_defaults_to_gpu_heavy() {
