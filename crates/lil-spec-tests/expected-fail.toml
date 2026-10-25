@@ -13,13 +13,4 @@ tests = [
     { name = "lil-spec-tests::diagnostics::diagnostics_recent_groups_errors_by_code", rule = "QA-083", file = "tests/diagnostics.rs" },
     # ARCH-117
     { name = "lil-spec-tests::diagnostics::every_process_logs_json_lines", rule = "ARCH-117", file = "tests/diagnostics.rs" },
-    # Task 13
-    # APP-022, QA-060
-    { name = "lil-spec-tests::doctor_4a::doctor_checks_the_aumid_shortcut_and_repairs_after_yes", rule = "APP-022", file = "tests/doctor_4a.rs" },
-    # APP-022, QA-060
-    { name = "lil-spec-tests::doctor_4a::doctor_registers_the_handlers_after_yes", rule = "APP-022", file = "tests/doctor_4a.rs" },
-    # CORE-130, ARCH-065, CORE-164
-    { name = "lil-spec-tests::doctor_4a::doctor_reports_engine_changes_and_the_asset_catalogue", rule = "CORE-130", file = "tests/doctor_4a.rs" },
-    # APP-049
-    { name = "lil-spec-tests::doctor_4a::confirm_window_starts_the_app_in_confirm_mode", rule = "APP-049", file = "tests/doctor_4a.rs" },
 ]
