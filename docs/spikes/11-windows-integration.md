@@ -308,7 +308,7 @@ The KEK route's crypto works on this PC: create, 10 identical signatures across 
     - It created the throwaway credential `LILITH-hello-probe`, signed with it twice with identical signatures, and deleted it.
     - The Windows Hello prompt was the foreground window within 1–302 ms in all 7 steps, with another window in front and with a fullscreen one, and no input before it.
     - The probe's own window could not be raised while another window had the focus. The probe printed "passphrase" only because its rule required that raise.
-    - The owner's rulings: the KEK route; a window Windows keeps behind flashes and waits for the owner (no passphrase fallback for that); and Windows Hello unlocks merges only while face sign-in is off (QA-088's 2026-10-24 lines).
+    - The rulings (plan 4a, 2026-10-24): the KEK route; LILITH's own window, when Windows keeps it behind, flashes and waits for the owner. The owner's decision (2026-10-24): Hello unlocks merges only without face sign-in. See QA-088's 2026-10-24 lines.
 - **S1.7:** the 2-hour stay-awake wait was not run; if a later task needs it, it needs the owner's consent to a long unattended wait.
 - **UIA and toasts:** why the harness's search missed every toast on 26H2 is unconfirmed; a tree listing taken while a banner is up would settle it.
 - **S1.4 for Task 30:** no synthetic click was ever made on a toast, so whether a runner can stand in for the owner's click is unknown.
