@@ -223,8 +223,10 @@ impl Dispatcher {
 
     /// `app/set_context` (ARCH-088; Appendix G "Session and listing tools"): `project` becomes
     /// the session's active project as a call naming it would make it (and so the hint, on a
-    /// read-write workspace); `None` forgets the session's, so its calls fall back to the hint,
-    /// then `sketchbook`. The workspace is the session's, chosen by its `core/hello`.
+    /// read-write workspace); `Some(None)` forgets the session's, so its calls fall back to the
+    /// hint, then `sketchbook`; `None` (no `project` given) changes nothing and answers the
+    /// project the session has set, if any. The workspace is the session's, chosen by its
+    /// `core/hello`.
     ///
     /// # Errors
     /// `workspace.required` for a slug in a session without a workspace; the session's
@@ -233,7 +235,7 @@ impl Dispatcher {
     pub async fn set_context(
         &self,
         session: &Session,
-        project: Option<&str>,
+        project: Option<Option<&str>>,
         trace_id: &str,
     ) -> Result<SetContextResult, ErrorBody> {
         use crate::projects::{ProjectFile, project_yaml_path, read_project, unknown_project};
@@ -244,6 +246,12 @@ impl Dispatcher {
         let traced = |mut e: ErrorBody| {
             e.trace_id = trace_id.to_string();
             e
+        };
+        let Some(project) = project else {
+            return Ok(SetContextResult {
+                workspace,
+                project: self.inner.active.get(&session.id),
+            });
         };
         let Some(slug) = project else {
             self.inner.active.forget(&session.id);

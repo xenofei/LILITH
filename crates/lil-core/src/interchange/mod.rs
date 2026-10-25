@@ -163,7 +163,12 @@ impl Interchange {
     /// The registrations on disk now: an app installed or registered after the core started
     /// is found by the next call.
     pub fn registrations(&self) -> Vec<AppRegistration> {
-        load_registrations(&self.core_dir, &self.env.data_dir())
+        load_registrations(&self.core_dir, &self.env.data_dir(), self.test_app())
+    }
+
+    /// Whether the test app may be registered from outside: on test channels only.
+    fn test_app(&self) -> bool {
+        crate::identity::trusts_test_app(self.env.channel())
     }
 
     /// This channel's paths.
@@ -287,8 +292,9 @@ impl Interchange {
 
     /// [`Interchange::registrations`] on a blocking thread.
     async fn load_registrations(&self) -> Vec<AppRegistration> {
-        let (core_dir, data_dir) = (self.core_dir.clone(), self.env.data_dir());
-        tokio::task::spawn_blocking(move || load_registrations(&core_dir, &data_dir))
+        let (core_dir, data_dir, test_app) =
+            (self.core_dir.clone(), self.env.data_dir(), self.test_app());
+        tokio::task::spawn_blocking(move || load_registrations(&core_dir, &data_dir, test_app))
             .await
             .unwrap_or_default()
     }

@@ -3,7 +3,7 @@
 //! (Windows Terminal opens only `http`, `https` and `file` links).
 //!
 //! The file is `<local dir>\cache\lilref\<first 16 hex of SHA-256 of the ref>.lilref`, holding
-//! `lil_schema::write_lilref`'s text for the ref in its canonical form (a legacy `ww://` ref is
+//! `lil_schema::write_lilref`'s text for the ref in its canonical form (a legacy-scheme ref is
 //! written as `lil://`, so both name one file). Writing the same ref again replaces the file.
 //! It is written through `fsops::write_suite_cache_file`, which refuses any other folder.
 

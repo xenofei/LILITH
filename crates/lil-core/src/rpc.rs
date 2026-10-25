@@ -432,7 +432,7 @@ impl RpcRouter {
             let trace_id = self.ids.id("t");
             let set = self
                 .dispatcher
-                .set_context(session, p.project.as_deref(), &trace_id)
+                .set_context(session, p.project.as_ref().map(Option::as_deref), &trace_id)
                 .await;
             return outcome(id, into_outcome(set));
         }

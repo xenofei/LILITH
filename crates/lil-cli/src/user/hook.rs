@@ -20,8 +20,8 @@
 //!   to `notify.claude_code` on a core that already runs, which shows it as a Windows
 //!   notification from the suite; nothing otherwise. A message over 2,000 characters or a
 //!   title over 100 is cut to that length; an input without a non-empty string `message`, or
-//!   with a `title` that isn't a string, calls nothing. It always prints nothing: Claude Code
-//!   ignores a Notification hook's output and exit code.
+//!   with a `title` that isn't a string, calls nothing. It waits at most 5 s for the core and
+//!   always prints nothing: Claude Code ignores a Notification hook's output and exit code.
 //! - With `LIL_ENGINE=1` (Engine A) every hook prints nothing (ARCH-107) and calls nothing.
 //!
 //! The hooks never start a core and never wait for a person (ARCH-018). PreToolUse fails
@@ -65,6 +65,9 @@ const LISTED: usize = 20;
 /// The longest message and title `notify.claude_code` takes, in characters (Appendix G).
 const NOTICE_MESSAGE_MAX: usize = 2000;
 const NOTICE_TITLE_MAX: usize = 100;
+
+/// The longest the Notification hook waits for the core: Claude Code ignores its result.
+const NOTICE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `lil hook <event>`: reads stdin and prints the output.
 ///
@@ -248,15 +251,21 @@ fn notification(input: &Value) {
     let Some(cfg) = hook_config(env) else {
         return;
     };
-    let Ok(client) = BlockingClient::connect(&cfg) else {
-        return;
-    };
     let mut args = Map::new();
     args.insert("message".into(), json!(cut(message, NOTICE_MESSAGE_MAX)));
     if let Some(title) = title.filter(|t| !t.is_empty()) {
         args.insert("title".into(), json!(cut(title, NOTICE_TITLE_MAX)));
     }
-    let _ = client.call_tool("notify.claude_code", args, Some(lil_client::mint_id("ik")));
+    // A core that hangs keeps no `lil` waiting past the deadline (review M8): the hook returns
+    // and the process exits, ending the call's thread with it.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(client) = BlockingClient::connect(&cfg) {
+            let _ = client.call_tool("notify.claude_code", args, Some(lil_client::mint_id("ik")));
+        }
+        let _ = done.send(());
+    });
+    let _ = finished.recv_timeout(NOTICE_DEADLINE);
 }
 
 fn session_start(input: &Value, global: &GlobalArgs) -> Option<Value> {

@@ -190,11 +190,19 @@ fn set_context_changes_the_session_project() {
     // The first session keeps its own.
     assert_eq!(context(&mut app), "harbor");
 
+    // `{}` changes nothing (review M3): it answers the session's project.
+    let unchanged = app.call("app/set_context", json!({}));
+    assert_eq!(unchanged["result"]["status"], "ok", "{unchanged}");
+    assert_eq!(unchanged["result"]["project"], "harbor", "{unchanged}");
+    assert_eq!(context(&mut app), "harbor");
+
     // `null` forgets the session's project: it falls back to the hint.
     let cleared = app.call("app/set_context", json!({"project": null}));
     assert_eq!(cleared["result"]["status"], "ok", "{cleared}");
     assert_eq!(cleared["result"]["project"], Value::Null, "{cleared}");
     assert_eq!(context(&mut app), "sketchbook");
+    let unchanged = app.call("app/set_context", json!({}));
+    assert_eq!(unchanged["result"]["project"], Value::Null, "{unchanged}");
 
     // A session without a workspace has no project to set; it can still clear.
     let mut bare = lil_testkit::TestApp::start_with_capabilities(&env, None, &[], CAPS_1_2);

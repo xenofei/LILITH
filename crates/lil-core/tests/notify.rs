@@ -1338,6 +1338,12 @@ fn agent_open_posts_agent_activity_with_an_open_url() {
     let longer = format!(r"C:\{}.png", "\u{1F600}".repeat(1023));
     let refused = p.tool("ui.show", json!({ "target": longer }), None);
     assert_eq!(refused["error"]["code"], "params.invalid", "{refused}");
+    fence(&mut p, &env);
+    assert_eq!(
+        posts(&mut p, "agent_activity").len(),
+        3,
+        "nothing posted for it"
+    );
 
     // Your own app's request posts nothing.
     let mut a = app(&env);

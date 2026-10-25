@@ -987,6 +987,29 @@ fn workspaces_list_marks_the_default_and_the_served_one() {
                                "path": arg(&gone), "default": true, "served": false,
                                "missing": true}]})
     );
+
+    // Review M5: a file at a registered path is the wrong type, not missing.
+    let third = TestEnv::new();
+    let file = third.root().join("ws-file");
+    write_file(&file, b"not a folder");
+    third.register_workspace(&file, false);
+    let _third_core = core(&third);
+    let listed = none(&third).tool_ok("workspaces.list", json!({}), None);
+    assert_eq!(
+        listed,
+        json!({"workspaces": [{"id": Env::workspace_hash(&std::fs::canonicalize(&file).unwrap()),
+                               "path": canonical(&file).display().to_string(),
+                               "default": false, "served": false, "missing": false,
+                               "problem": "not_a_folder"}]})
+    );
+    // Review M4: a suite.toml that isn't valid is an error, not an empty list.
+    write_file(
+        &third.env.suite_toml(),
+        b"[[workspaces]
+path = ",
+    );
+    let refused = none(&third).tool("workspaces.list", json!({}), None);
+    assert_eq!(refused["error"]["code"], "store.io", "{refused}");
 }
 
 #[test] // spec: QA-003, ARCH-090

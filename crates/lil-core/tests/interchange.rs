@@ -137,14 +137,75 @@ fn registrations_load_from_both_folders() {
     // An external program can't replace an installed app.
     register(&data_dir, "test", r"C:\Tools\fake.exe", "", "", r#""open""#);
 
-    let regs = load_registrations(&r.core_dir, &data_dir);
+    let regs = load_registrations(&r.core_dir, &data_dir, false);
     let names: Vec<(&str, bool)> = regs.iter().map(|g| (g.app.as_str(), g.external)).collect();
     assert_eq!(names, [("test", false), ("viewer", true)]);
     // An installed app's relative exe is beside the core.
     assert_eq!(regs[0].exe, r.core_dir.join("test.exe"));
     assert_eq!(regs[1].exe, PathBuf::from(r"C:\Tools\viewer.exe"));
     assert_eq!(regs[1].args, ["--flag"]);
-    assert!(load_registrations(&r.core_dir.join("nowhere"), &r.core_dir.join("nor")).is_empty());
+    assert!(
+        load_registrations(&r.core_dir.join("nowhere"), &r.core_dir.join("nor"), false).is_empty()
+    );
+}
+
+/// Ruling I1 of the Task 11 review: an external registration whose exe is in the core's folder
+/// (or below it) is skipped, so it can't start a suite program with arguments of its own.
+#[test] // spec: APP-061, ARCH-015
+fn an_external_registration_of_a_suite_exe_is_skipped() {
+    let r = rig();
+    let data_dir = r.env.env.data_dir();
+    register(
+        &r.core_dir,
+        "image",
+        "lil-image.exe",
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    let inside = r.core_dir.join("LIL-IMAGE.EXE");
+    let below = r.core_dir.join("sub").join("x.exe");
+    for (name, exe) in [("evil", &inside), ("evil-two", &below)] {
+        register(
+            &data_dir,
+            name,
+            &exe.display().to_string(),
+            r#""image""#,
+            r#""png""#,
+            r#""open""#,
+        );
+    }
+    register(
+        &data_dir,
+        "viewer",
+        &r.env
+            .root()
+            .join("tools")
+            .join("viewer.exe")
+            .display()
+            .to_string(),
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    let test_app = r.core_dir.join("lil-test-app.exe");
+    register(
+        &data_dir,
+        "test",
+        &test_app.display().to_string(),
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    let names = |test_app: bool| -> Vec<String> {
+        load_registrations(&r.core_dir, &data_dir, test_app)
+            .into_iter()
+            .map(|g| g.app)
+            .collect()
+    };
+    assert_eq!(names(false), ["image", "viewer"]);
+    // On a test channel the test app, beside the test core, may be registered from outside.
+    assert_eq!(names(true), ["image", "test", "viewer"]);
 }
 
 #[tokio::test] // spec: APP-061
@@ -562,6 +623,25 @@ fn lilref_write_stays_in_the_cache_folder() {
         env.root().join("elsewhere.lilref"),
         cache.clone(),
         PathBuf::from("a.lilref"),
+        // Names Windows reads as something else (review M1).
+        cache.join("a.lilref:evil"),
+        cache.join("a*.lilref"),
+        cache.join("a?.lilref"),
+        cache.join("a\"b.lilref"),
+        cache.join("a<b.lilref"),
+        cache.join("a>b.lilref"),
+        cache.join("a|b.lilref"),
+        cache.join("a\u{1}b.lilref"),
+        cache.join("a.lilref."),
+        cache.join("a.lilref "),
+        cache.join("NUL"),
+        cache.join("nul.lilref"),
+        cache.join("Con.txt"),
+        cache.join("aux"),
+        cache.join("PRN.zip"),
+        cache.join("com1.lilref"),
+        cache.join("LPT9"),
+        cache.join("nul .lilref"),
     ] {
         let refused = write_suite_cache_file(&env.env, &outside, b"x").unwrap_err();
         assert_eq!(
@@ -578,6 +658,41 @@ fn lilref_write_stays_in_the_cache_folder() {
     let upper = PathBuf::from(cache.to_string_lossy().to_uppercase()).join("b.lilref");
     write_suite_cache_file(&env.env, &upper, b"b").unwrap();
     assert_eq!(std::fs::read(cache.join("b.lilref")).unwrap(), b"b");
+    // Names that only look like device names are fine.
+    for fine in ["console.lilref", "com10.lilref", "nul-x.lilref", "lpt.zip"] {
+        write_suite_cache_file(&env.env, &cache.join(fine), b"f").unwrap();
+    }
+}
+
+/// Review M2: a crash's temp and backup files older than a day are swept when the folder is
+/// written next; newer ones, and other files, stay.
+#[test] // spec: APP-021, ARCH-119
+#[allow(clippy::disallowed_methods)] // ages the leftovers it plants
+fn suite_cache_leftovers_older_than_a_day_are_swept() {
+    use lil_core::store::fsops::write_suite_cache_file;
+    let env = TestEnv::new();
+    let cache = env.env.lilref_dir();
+    let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+    for name in [
+        ".a.lilref.1-1.tmp",
+        ".a.lilref.1-2.bak",
+        ".b.lilref.1-3.tmp",
+        "old.lilref",
+    ] {
+        write_file(&cache.join(name), b"x");
+        if name != ".b.lilref.1-3.tmp" {
+            std::fs::File::options()
+                .write(true)
+                .open(cache.join(name))
+                .unwrap()
+                .set_modified(two_days_ago)
+                .unwrap();
+        }
+    }
+    write_suite_cache_file(&env.env, &cache.join("c.lilref"), b"c").unwrap();
+    let mut left = names_in(&cache);
+    left.sort();
+    assert_eq!(left, [".b.lilref.1-3.tmp", "c.lilref", "old.lilref"]);
 }
 
 /// The interchange rows (CORE-146; Appendix G): `handlers.for`, `open_in` and `ui.show` read,

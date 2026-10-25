@@ -118,11 +118,16 @@ pub fn write_new_file(
 /// ([`Env::diagnostics_dir`], ARCH-119). The folder is made; the data goes to a new temp file
 /// beside the target (flushed to disk), which is moved to the target's name, or replaces the
 /// file there (`ReplaceFileW`, its backup then removed). Whatever fails, the temp file is
-/// removed again.
+/// removed again, and a file `ReplaceFileW` had already moved to the backup name is moved
+/// back when nothing took its place. Temp and backup files of this function older than a day
+/// (a crash's leftovers) are removed from the folder first.
 ///
 /// Refused with `PermissionDenied` before anything is written or made: a relative path, a
-/// path with a `.` or `..` part, and a path whose folder isn't one of the two (compared with
-/// `folder_key`, ignoring case), so nothing is written anywhere else (Appendix G).
+/// path with a `.` or `..` part, a path whose folder isn't one of the two (compared with
+/// `folder_key`, ignoring case), and a file name Windows would read as something else: one
+/// with `:` (a stream), `*?"<>|` or a control character, one ending in `.` or a space, or a
+/// reserved device name (`CON`, `NUL`, `COM1`, … with any extension). So nothing is written
+/// anywhere else (Appendix G).
 ///
 /// [`Env::lilref_dir`]: lil_platform::Env::lilref_dir
 /// [`Env::diagnostics_dir`]: lil_platform::Env::diagnostics_dir
@@ -156,6 +161,12 @@ pub fn write_suite_cache_file(
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(refuse("it names no file"));
     };
+    if let Some(why) = name
+        .to_str()
+        .map_or(Some("its name is not Unicode"), odd_file_name)
+    {
+        return Err(refuse(why));
+    }
     let key = lil_platform::paths::folder_key(dir);
     if ![env.lilref_dir(), env.diagnostics_dir()]
         .iter()
@@ -164,15 +175,20 @@ pub fn write_suite_cache_file(
         return Err(refuse("its folder is another one"));
     }
     ensure_dir(dir)?;
+    sweep_leftovers(dir);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
     let temp = write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none())?;
     let placed = match move_new(&temp, path) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let backup = dir.join(format!("{stem}.bak"));
-            replace(path, &temp, &backup).map(|()| {
-                let _ = remove_file(&backup);
-            })
+            let replaced = replace(path, &temp, &backup);
+            if replaced.is_err() && !path.exists() {
+                // `ReplaceFileW` had moved the old file to the backup name: put it back.
+                let _ = move_new(&backup, path);
+            }
+            let _ = remove_file(&backup);
+            replaced
         }
         other => other,
     };
@@ -180,6 +196,61 @@ pub fn write_suite_cache_file(
         let _ = remove_file(&temp);
     }
     placed
+}
+
+/// Why `name` can't be a file name [`write_suite_cache_file`] writes, if it can't.
+fn odd_file_name(name: &str) -> Option<&'static str> {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Some("its name holds a character Windows reads otherwise");
+    }
+    if name.ends_with(['.', ' ']) {
+        return Some("its name ends in `.` or a space");
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix)
+            .is_some_and(|n| n.len() == 1 && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    if RESERVED.contains(&stem.as_str()) || numbered("COM") || numbered("LPT") {
+        return Some("its name is a reserved device name");
+    }
+    None
+}
+
+/// Removes [`write_suite_cache_file`]'s temp and backup files (`.<name>.<pid>-<n>.tmp` or
+/// `.bak`) older than a day from `dir`: what a crash between writing and moving left.
+#[allow(clippy::disallowed_methods)]
+fn sweep_leftovers(dir: &Path) {
+    const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with('.') || !(name.ends_with(".tmp") || name.ends_with(".bak")) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > DAY);
+        if old {
+            let _ = remove_file(&entry.path());
+        }
+    }
 }
 
 /// A new file written in pieces (an engine output streamed into a staging handle or a job

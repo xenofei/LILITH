@@ -35,6 +35,8 @@ pub struct Linked {
     /// The folders a trusted core's executable may be in (ARCH-027): an app is launched only
     /// from the registrations beside a core in one of them ([`crate::launch`]).
     pub server_dirs: Vec<PathBuf>,
+    /// This channel's activation scheme: a launched app's URL must be under it.
+    pub scheme: String,
 }
 
 impl Linked {
@@ -187,6 +189,7 @@ async fn connect(cwd: &std::path::Path) -> Link {
         workspace_note,
         roots,
         server_dirs: cfg.server_dirs.clone(),
+        scheme: cfg.env.activation_scheme(),
     }))
 }
 

@@ -5,7 +5,12 @@
 //! executable; external programs register the same way in `%APPDATA%\LILITH\apps\`
 //! ([`AppRegistration::external`]). A file that doesn't parse is skipped and logged, so one
 //! bad file never hides the others. An installed app wins over an external one of the same
-//! name, so a program in the user's folder can't stand in for an app the suite ships.
+//! name, so a program in the user's folder can't stand in for an app the suite ships, and an
+//! external registration whose `exe` is in the core's folder is skipped, so it can't start a
+//! suite program with arguments of its own (ruling I1 of the Task 11 review). The one
+//! exception is the test app (`lil-test-app.exe`) on a test channel, the channels whose core
+//! accepts it as `ui:test` ([`crate::identity::trusts_test_app`]): tests register it from
+//! outside, and it sits beside the test core.
 //!
 //! A [`Target`] is what is to be opened: a file path, a `lil://` ref, a candidate
 //! (`@candidate/<run>/<file>`, APP-057) or a document (`doc:<doc_id>/…`). Its type and format
@@ -78,11 +83,16 @@ struct RawRegistration {
 }
 
 /// Loads the registrations in `<core_dir>\apps` (installed apps) and `<data_dir>\apps`
-/// (external programs), by file name. A missing folder has none.
-pub fn load_registrations(core_dir: &Path, data_dir: &Path) -> Vec<AppRegistration> {
+/// (external programs), by file name. A missing folder has none. `test_app`: the test app may
+/// be registered from outside although it is in the core's folder (module docs).
+pub fn load_registrations(
+    core_dir: &Path,
+    data_dir: &Path,
+    test_app: bool,
+) -> Vec<AppRegistration> {
     let mut found: Vec<AppRegistration> = Vec::new();
     for (dir, external) in [(core_dir, false), (data_dir, true)] {
-        for reg in load_folder(&dir.join("apps"), core_dir, external) {
+        for reg in load_folder(&dir.join("apps"), core_dir, external, test_app) {
             if found.iter().any(|f| f.app == reg.app) {
                 tracing::warn!(app = %reg.app, external, "an app of this name is registered already; this registration is skipped");
             } else {
@@ -93,7 +103,12 @@ pub fn load_registrations(core_dir: &Path, data_dir: &Path) -> Vec<AppRegistrati
     found
 }
 
-fn load_folder(folder: &Path, core_dir: &Path, external: bool) -> Vec<AppRegistration> {
+fn load_folder(
+    folder: &Path,
+    core_dir: &Path,
+    external: bool,
+    test_app: bool,
+) -> Vec<AppRegistration> {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return Vec::new();
     };
@@ -109,13 +124,15 @@ fn load_folder(folder: &Path, core_dir: &Path, external: bool) -> Vec<AppRegistr
     files.sort();
     files
         .into_iter()
-        .filter_map(|file| match read_registration(&file, core_dir, external) {
-            Ok(reg) => Some(reg),
-            Err(why) => {
-                tracing::warn!(file = %file.display(), %why, "an app registration is skipped");
-                None
-            }
-        })
+        .filter_map(
+            |file| match read_registration(&file, core_dir, external, test_app) {
+                Ok(reg) => Some(reg),
+                Err(why) => {
+                    tracing::warn!(file = %file.display(), %why, "an app registration is skipped");
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -123,6 +140,7 @@ fn read_registration(
     file: &Path,
     core_dir: &Path,
     external: bool,
+    test_app: bool,
 ) -> Result<AppRegistration, String> {
     let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read it: {e}"))?;
     let raw: RawRegistration = toml::from_str(&text).map_err(|e| format!("not valid: {e}"))?;
@@ -139,6 +157,20 @@ fn read_registration(
     } else {
         core_dir.join(raw.exe)
     };
+    let the_test_app = test_app
+        && exe
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case(crate::identity::TEST_APP_EXE.0));
+    if external && !the_test_app {
+        let core = lil_platform::paths::folder_key(core_dir);
+        if exe
+            .ancestors()
+            .skip(1)
+            .any(|dir| lil_platform::paths::folder_key(dir) == core)
+        {
+            return Err("an external program's exe can't be in the suite's folder".to_string());
+        }
+    }
     Ok(AppRegistration {
         app: raw.app,
         exe,

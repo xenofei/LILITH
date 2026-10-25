@@ -350,10 +350,25 @@ pub struct DesktopSettings {
 }
 
 /// `app/set_context` params: `{project: <slug> | null}`. `null` forgets the session's project.
+// `{}` (no `project`) changes nothing and answers the current context (review M3). These are
+// plain comments: doc comments would change the schema hash, and the wire shape is unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetContextParams {
-    pub project: Option<String>,
+    // `None`: not given; `Some(None)`: `null`; `Some(Some(slug))`: a project.
+    #[serde(
+        default,
+        deserialize_with = "given",
+        skip_serializing_if = "Option::is_none"
+    )]
+    // On the wire it is still an optional string or null.
+    #[schemars(with = "Option<String>")]
+    pub project: Option<Option<String>>,
+}
+
+/// A field that is present, `null` or not: `Some(value)`. Absent fields take the default.
+fn given<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 /// `app/set_context`'s result: the session's workspace (chosen by its `core/hello`) and the
@@ -372,9 +387,13 @@ mod tests {
     #[test] // spec: ARCH-088, APP-043
     fn set_context_params_are_strict_and_the_result_serialises() {
         let p: SetContextParams = serde_json::from_value(json!({"project": "harbor"})).unwrap();
-        assert_eq!(p.project.as_deref(), Some("harbor"));
+        assert_eq!(p.project, Some(Some("harbor".to_string())));
         let cleared: SetContextParams = serde_json::from_value(json!({"project": null})).unwrap();
-        assert_eq!(cleared, SetContextParams::default());
+        assert_eq!(cleared.project, Some(None));
+        // Review M3: `{}` is not `null`: it changes nothing.
+        let unchanged: SetContextParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(unchanged, SetContextParams::default());
+        assert_eq!(unchanged.project, None);
         for bad in [json!({"project": 3}), json!({"workspace": "x"})] {
             assert!(
                 serde_json::from_value::<SetContextParams>(bad.clone()).is_err(),

@@ -153,6 +153,18 @@ pub struct WorkspaceListed {
     pub served: bool,
     /// Its folder is gone.
     pub missing: bool,
+    /// Why a registered path that is there isn't a usable folder: `not_a_folder` (a file is
+    /// there) or `unreadable` (it can't be resolved); absent when it is a folder or gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<WorkspaceProblem>,
+}
+
+/// Why a registered workspace path isn't a usable folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceProblem {
+    NotAFolder,
+    Unreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -218,8 +230,9 @@ pub fn register_workspace_tools(
         LIST_DESCRIPTION,
         EffectClass::Read,
         WORKSPACE_MODULE,
-        move |_ctx, _args: ListArgs| {
+        move |ctx, _args: ListArgs| {
             let t = t.clone();
+            let ctx_trace = ctx.trace_id.clone();
             Box::pin(async move {
                 t.hub.refresh_default();
                 let served = t.hub.default_id();
@@ -227,7 +240,16 @@ pub fn register_workspace_tools(
                 let workspaces =
                     tokio::task::spawn_blocking(move || listed(&env, served.as_deref()))
                         .await
-                        .unwrap_or_default();
+                        .map_err(|e| {
+                            ErrorBody::new(
+                                &codes::CORE_BUG,
+                                format!(
+                                    "Listing the workspaces failed: {e}. This is a bug in LILITH."
+                                ),
+                                &ctx_trace,
+                            )
+                        })?
+                        .map_err(|why| ErrorBody::new(&codes::STORE_IO, why, &ctx_trace))?;
                 let summary = format!("{} workspace(s)", workspaces.len());
                 Ok((ListResult { workspaces }, summary))
             })
@@ -236,14 +258,26 @@ pub fn register_workspace_tools(
 }
 
 /// `workspaces.list`'s entries (module docs); `served` is the id of the workspace this core
-/// serves.
-fn listed(env: &Env, served: Option<&str>) -> Vec<WorkspaceListed> {
-    let suite = std::fs::read_to_string(env.suite_toml_to_read())
-        .ok()
-        .and_then(|text| SuiteToml::parse(&text).ok());
-    let Some(suite) = suite else {
-        return Vec::new();
+/// serves. No `suite.toml` registers none; one that can't be read or isn't valid is the
+/// message of a `store.io` error, as the workspace tools that write it give (review M4).
+fn listed(env: &Env, served: Option<&str>) -> Result<Vec<WorkspaceListed>, String> {
+    let file = env.suite_toml_to_read();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "The workspace registry {} can't be read: {e}.",
+                file.display()
+            ));
+        }
     };
+    let suite = SuiteToml::parse(&text).map_err(|e| {
+        format!(
+            "The workspace registry {} is not valid: {e}. Fix or remove it, or run lil doctor.",
+            file.display()
+        )
+    })?;
     let default = suite
         .default_workspace
         .clone()
@@ -263,7 +297,21 @@ fn listed(env: &Env, served: Option<&str>) -> Vec<WorkspaceListed> {
         }
         let is_default = default.as_deref() == Some(key.as_str());
         let entry = match std::fs::canonicalize(registered) {
-            Ok(canonical) if canonical.is_dir() => {
+            // A file at the registered path is the wrong type, not missing (review M5).
+            Ok(canonical) if !canonical.is_dir() => {
+                let path = strip_verbatim(&canonical);
+                check_workspace(&path);
+                WorkspaceListed {
+                    id: Env::workspace_hash(&canonical),
+                    path: path.display().to_string(),
+                    name: None,
+                    default: is_default,
+                    served: false,
+                    missing: false,
+                    problem: Some(WorkspaceProblem::NotAFolder),
+                }
+            }
+            Ok(canonical) => {
                 let path = strip_verbatim(&canonical);
                 check_workspace(&path);
                 let id = Env::workspace_hash(&canonical);
@@ -278,24 +326,27 @@ fn listed(env: &Env, served: Option<&str>) -> Vec<WorkspaceListed> {
                     name,
                     default: is_default,
                     missing: false,
+                    problem: None,
                 }
             }
-            _ => {
+            Err(e) => {
                 let absolute =
                     std::path::absolute(registered).unwrap_or_else(|_| PathBuf::from(registered));
+                let gone = e.kind() == std::io::ErrorKind::NotFound;
                 WorkspaceListed {
                     id: Env::workspace_hash(&absolute),
                     path: registered.clone(),
                     name: None,
                     default: is_default,
                     served: false,
-                    missing: true,
+                    missing: gone,
+                    problem: (!gone).then_some(WorkspaceProblem::Unreadable),
                 }
             }
         };
         out.push(entry);
     }
-    out
+    Ok(out)
 }
 
 /// ARCH-094: `Err` (why) when `path` is the install folder or inside it, folders compared with
