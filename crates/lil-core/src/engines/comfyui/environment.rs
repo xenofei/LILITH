@@ -7,11 +7,28 @@
 //! file `gitdir: <path>` as a worktree or submodule has), its `HEAD` (a commit id, or `ref:
 //! <name>`), then that ref's loose file or its `packed-refs` line. A repository it can't read
 //! has no commit; nothing here fails the capture.
+//!
+//! **Stored captures** (plan 4a; Appendix G "Engine environments"): each capture is kept in the
+//! suite `state.db` table `engine_captures`, the newest [`KEEP_CAPTURES`] per engine
+//! ([`store_capture`]); `engines.environment` ([`environment`]) shows the newest two and what
+//! changed between them ([`changes`]). The suite records environments and never restores one
+//! (CORE-130; CORE-166 is Later).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use lil_protocol::{ErrorBody, codes};
+use rusqlite::params;
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::engines::Engines;
+use crate::jobs::EngineKind;
+use crate::state::{StateDb, StateError};
+
+/// How many captures are kept per engine.
+pub const KEEP_CAPTURES: u32 = 10;
 
 /// What the environment was when the engine became ready.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -174,4 +191,216 @@ fn git_head(dir: &Path) -> Option<String> {
         let (id, r) = line.split_once(' ')?;
         (r.trim() == name && is_commit(id)).then(|| id.to_ascii_lowercase())
     })
+}
+
+/// Keeps `capture` of `engine` taken at `at_ms` (Unix milliseconds; one more than the engine's
+/// newest when that is not earlier), then drops all but the newest [`KEEP_CAPTURES`] of it.
+///
+/// # Errors
+/// The suite `state.db` can't be written.
+pub async fn store_capture(
+    db: &StateDb,
+    engine: &str,
+    capture: &Value,
+    at_ms: i64,
+) -> Result<(), StateError> {
+    let (engine, text) = (engine.to_string(), capture.to_string());
+    db.call(move |conn| {
+        let mut run = || -> rusqlite::Result<()> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let newest: Option<i64> = tx.query_row(
+                "SELECT MAX(captured_utc) FROM engine_captures WHERE engine = ?1",
+                [&engine],
+                |r| r.get(0),
+            )?;
+            let at = newest.map_or(at_ms, |n| at_ms.max(n.saturating_add(1)));
+            tx.execute(
+                "INSERT INTO engine_captures (engine, captured_utc, capture) VALUES (?1, ?2, ?3)",
+                params![engine, at, text],
+            )?;
+            tx.execute(
+                "DELETE FROM engine_captures WHERE engine = ?1 AND captured_utc NOT IN \
+                 (SELECT captured_utc FROM engine_captures WHERE engine = ?1 \
+                  ORDER BY captured_utc DESC LIMIT ?2)",
+                params![engine, KEEP_CAPTURES],
+            )?;
+            tx.commit()
+        };
+        run().map_err(|e| StateError::Io(e.to_string()))
+    })
+    .await
+}
+
+/// The newest `limit` captures of `engine`, newest first. A capture that isn't JSON (the file
+/// was edited by hand) is left out.
+///
+/// # Errors
+/// The suite `state.db` can't be read.
+pub async fn recent(db: &StateDb, engine: &str, limit: u32) -> Result<Vec<Value>, StateError> {
+    let engine = engine.to_string();
+    let texts: Vec<String> = db
+        .call(move |conn| {
+            let run = || -> rusqlite::Result<Vec<String>> {
+                let mut st = conn.prepare(
+                    "SELECT capture FROM engine_captures WHERE engine = ?1 \
+                     ORDER BY captured_utc DESC LIMIT ?2",
+                )?;
+                let rows = st.query_map(params![engine, limit], |r| r.get(0))?;
+                rows.collect()
+            };
+            run().map_err(|e| StateError::Io(e.to_string()))
+        })
+        .await?;
+    Ok(texts
+        .iter()
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect())
+}
+
+/// `engines.environment`'s result.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct EnvironmentView {
+    /// The newest two captures ([`EnvCapture`]), newest first.
+    pub captures: Vec<Value>,
+    /// What changed from the older to the newer ([`changes`]).
+    pub changes: Vec<EnvChange>,
+}
+
+/// What a change is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeWhat {
+    Comfyui,
+    Node,
+    Driver,
+}
+
+/// How it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Changed,
+    Added,
+    Removed,
+}
+
+/// One change between two captures. A node's `name` is its `custom_nodes` folder and its
+/// `from`/`to` are `<version> (<commit>)`, or whichever of the two is known (untrusted text,
+/// as the folder's files say).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct EnvChange {
+    pub what: ChangeWhat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    pub change: ChangeKind,
+}
+
+/// The change of ComfyUI's revision or the driver (`None`: not known), `None` when there is
+/// none.
+fn change_of(what: ChangeWhat, from: Option<String>, to: Option<String>) -> Option<EnvChange> {
+    let change = match (&from, &to) {
+        (None, None) => return None,
+        (Some(_), None) => ChangeKind::Removed,
+        (None, Some(_)) => ChangeKind::Added,
+        (Some(a), Some(b)) if a == b => return None,
+        (Some(_), Some(_)) => ChangeKind::Changed,
+    };
+    Some(EnvChange {
+        what,
+        name: None,
+        from,
+        to,
+        change,
+    })
+}
+
+/// A top-level text of a capture; `None` when it is `null` or missing.
+fn text_of(capture: &Value, key: &str) -> Option<String> {
+    capture.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Each node of a capture by its folder name, with its `<version> (<commit>)` text.
+fn nodes_of(capture: &Value) -> BTreeMap<String, Option<String>> {
+    capture["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| {
+            let name = n["name"].as_str()?.to_string();
+            let text = match (n["version"].as_str(), n["git_rev"].as_str()) {
+                (Some(v), Some(g)) => Some(format!("{v} ({g})")),
+                (Some(v), None) => Some(v.to_string()),
+                (None, Some(g)) => Some(g.to_string()),
+                (None, None) => None,
+            };
+            Some((name, text))
+        })
+        .collect()
+}
+
+/// What changed from `older` to `newer` (two [`EnvCapture`]s as JSON): ComfyUI's revision,
+/// then each node by name, then the driver.
+pub fn changes(newer: &Value, older: &Value) -> Vec<EnvChange> {
+    let mut out = Vec::new();
+    out.extend(change_of(
+        ChangeWhat::Comfyui,
+        text_of(older, "comfyui"),
+        text_of(newer, "comfyui"),
+    ));
+    let (old_nodes, new_nodes) = (nodes_of(older), nodes_of(newer));
+    let mut names: Vec<&String> = old_nodes.keys().chain(new_nodes.keys()).collect();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let (from, to) = (old_nodes.get(name).cloned(), new_nodes.get(name).cloned());
+        // A node present on one side only is added or removed, revision known or not.
+        let change = match (&from, &to) {
+            (Some(_), None) => Some(ChangeKind::Removed),
+            (None, Some(_)) => Some(ChangeKind::Added),
+            (Some(a), Some(b)) if a != b => Some(ChangeKind::Changed),
+            _ => None,
+        };
+        if let Some(change) = change {
+            out.push(EnvChange {
+                what: ChangeWhat::Node,
+                name: Some(name.clone()),
+                from: from.flatten(),
+                to: to.flatten(),
+                change,
+            });
+        }
+    }
+    out.extend(change_of(
+        ChangeWhat::Driver,
+        text_of(older, "driver"),
+        text_of(newer, "driver"),
+    ));
+    out
+}
+
+/// `engines.environment` (CORE-130; Appendix G): ComfyUI's newest two stored captures, newest
+/// first, and what changed between them (none with fewer than two).
+///
+/// # Errors
+/// `state.unavailable` when the suite `state.db` can't be read.
+pub async fn environment(engines: &Engines) -> Result<EnvironmentView, ErrorBody> {
+    let db = engines.comfy().suite_state();
+    let captures = recent(&db, EngineKind::ComfyUi.wire(), 2)
+        .await
+        .map_err(|e| {
+            ErrorBody::new(
+                &codes::STATE_UNAVAILABLE,
+                format!("the engine captures can't be read: {e}"),
+                "",
+            )
+        })?;
+    let changes = match captures.as_slice() {
+        [newer, older] => changes(newer, older),
+        _ => Vec::new(),
+    };
+    Ok(EnvironmentView { captures, changes })
 }

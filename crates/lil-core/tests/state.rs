@@ -654,7 +654,7 @@ fn old_rows_read_with_derived_batch_and_origin() {
     db.close().expect("close");
 
     let migrated = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("migrate");
-    assert_eq!(migrated.schema_version(), 9);
+    assert_eq!(migrated.schema_version(), known());
     let row = runtime()
         .block_on(lil_core::jobs::record::get(&migrated, "j_00000000000000a7"))
         .expect("read")
@@ -673,4 +673,59 @@ fn old_rows_read_with_derived_batch_and_origin() {
     );
     assert!(summary.status_seq.is_empty(), "no history before plan 4a");
     migrated.close();
+}
+
+/// A suite `state.db` at 9 holding a cached model hash migrates to 10 (Task 8's
+/// `ENGINE_RECORDS`): the row keeps its hash, has no family and is marked unread, so the next
+/// inventory reads its header once; `engine_captures` is keyed by engine and time.
+#[test] // spec: CORE-004, CORE-130, CORE-164
+fn migration_10_adds_family_and_captures() {
+    let env = TestEnv::new();
+    let path = env.root().join("old9").join("state.db");
+    env.write_state_db_version(&path, 9, true);
+    let db = Connection::open(&path).expect("open the old database");
+    for m in &SUITE_MIGRATIONS[..9] {
+        db.execute_batch(m).expect("an earlier migration");
+    }
+    db.execute(
+        "INSERT INTO model_hashes (path, size, mtime, file_id, sha256)
+         VALUES ('C:\\comfy\\models\\a.safetensors', 4, 7, 'v-f', 'abc')",
+        [],
+    )
+    .expect("an old hash row");
+    db.close().expect("close");
+
+    let migrated = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("migrate");
+    assert_eq!(migrated.schema_version(), 10);
+    assert_eq!(known(), 10);
+    assert_eq!(lil_schema::SUITE_STATE_SCHEMA, 10);
+    migrated.close();
+    let db = read_only(&path);
+    let row: (String, Option<String>, i64) = db
+        .query_row(
+            "SELECT sha256, family, family_read FROM model_hashes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("the row");
+    assert_eq!(row, ("abc".to_string(), None, 0));
+    let columns: Vec<String> = db
+        .prepare("SELECT name FROM pragma_table_info('engine_captures') ORDER BY cid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(columns, ["engine", "captured_utc", "capture"]);
+    drop(db);
+    let db = Connection::open(&path).unwrap();
+    let insert = |at: i64| {
+        db.execute(
+            "INSERT INTO engine_captures (engine, captured_utc, capture) VALUES ('comfyui', ?1, '{}')",
+            [at],
+        )
+    };
+    insert(1).unwrap();
+    assert!(insert(1).is_err(), "one capture per engine and time");
+    insert(2).unwrap();
 }

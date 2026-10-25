@@ -2,7 +2,8 @@
 //! attached engine, its HTTP [`client`] and websocket ([`ws`]), the `comfy.prompt` jobs
 //! ([`handler`]) with their graph checks ([`graph`]), uploads ([`uploads`]) and staged outputs
 //! ([`salvage`]), node installs through comfy-cli ([`install`]), outside jobs ([`outside`]), and
-//! the model inventory with the environment capture ([`inventory`], [`environment`]).
+//! the model inventory with its report and the stored environment captures ([`inventory`],
+//! [`environment`]).
 
 pub mod client;
 pub mod environment;
@@ -19,15 +20,16 @@ pub mod ws;
 pub use client::{
     ComfyClient, ComfyError, OutputFile, QueueEntry, QueueView, RemoteJob, RemoteState,
 };
-pub use environment::EnvCapture;
+pub use environment::{EnvCapture, EnvChange, EnvironmentView};
 pub use graph::{MODEL_EXTENSIONS, ModelRef, apply_node_replacements, model_refs, partner_nodes};
 pub use handler::{
     ComfyPromptHandler, DEFAULT_EXPECTED_OUTPUT_BYTES, DEFAULT_EXPECTED_SECS,
-    DEFAULT_PREVIEW_METHOD, OOM_RETRIES, PROMPT_KIND, PromptArgs, PromptInput, comfy_estimate_key,
-    confine_input, is_oom, prefix_outputs, prompt_spec, rejection_detail, safe_name,
+    DEFAULT_PREVIEW_METHOD, OOM_ADVICE, OOM_RETRIES, PROMPT_KIND, PromptArgs, PromptInput,
+    comfy_estimate_key, confine_input, is_oom, prefix_outputs, prompt_spec, rejection_detail,
+    safe_name,
 };
 pub use install::{INSTALL_KIND, NodeInstallHandler};
-pub use inventory::{INVENTORY_KIND, InventoryHandler};
+pub use inventory::{INVENTORY_KIND, InventoryHandler, ModelsReport};
 pub use outside::{OutsideWatch, POLL_EVERY};
 pub use supervisor::ComfyEndpoint;
 pub use uploads::{UPLOAD_KEEP, Uploads, upload_name};

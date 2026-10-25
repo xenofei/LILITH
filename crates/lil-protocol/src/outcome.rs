@@ -81,12 +81,15 @@ pub struct Detail {
     pub untrusted: bool,
 }
 
-/// The fix, in two forms (QA-003): a UI action and, optionally, an agent hint.
+/// The fix, in two forms (QA-003): a UI action and, optionally, an agent hint; from plan 4a
+/// also, optionally, advice for you in words (Appendix G "Out of memory").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Fix {
     pub ui_action: UiAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_hint: Option<AgentHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_hint: Option<String>,
 }
 
 /// A UI action such as "Start ComfyUI": a stable id and its label.
@@ -180,6 +183,7 @@ mod tests {
                         tool: "engine.start".into(),
                         arguments: json!({"engine": "comfyui"}),
                     }),
+                    user_hint: None,
                 }),
                 data: Some(json!({"port": 8188})),
                 trace_id: "t1".into(),

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// The suite `state.db` schema this build knows: its `PRAGMA user_version` after every suite
 /// migration (CORE-004, QA-062). `lil-core` applies the migrations and checks its own count
 /// against this; `lil doctor` reads it to tell a database from a newer version apart.
-pub const SUITE_STATE_SCHEMA: i64 = 9;
+pub const SUITE_STATE_SCHEMA: i64 = 10;
 
 /// The same for a workspace `state.db` (in the workspace's local folder): its `user_version`
 /// after every workspace migration. `lil doctor` reads it when it checks the default
@@ -82,6 +82,22 @@ pub struct PowerToml {
     pub cpu_tdp_w: Option<String>,
     pub electricity_rate: Option<String>,
     pub electricity_currency: Option<String>,
+}
+
+/// `[engines.comfyui] reserve_vram_gb` unless it is set (ARCH-126, P4a-R15; Appendix G
+/// "ComfyUI launch profile").
+pub const DEFAULT_RESERVE_VRAM_GB: &str = "1.5";
+/// `[engines.comfyui] preview_method` unless it is set.
+pub const DEFAULT_PREVIEW_METHOD: &str = "taesd";
+/// The `preview_method` values ComfyUI's `--preview-method` takes.
+pub const PREVIEW_METHODS: [&str; 4] = ["none", "auto", "latent2rgb", "taesd"];
+
+/// Whether `s` is a valid `reserve_vram_gb`: a non-negative decimal, digits with at most one
+/// `.`, as ComfyUI's `--reserve-vram` reads it (a float, in gigabytes).
+pub fn is_reserve_vram_gb(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_digit())
+        && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && s.bytes().filter(|b| *b == b'.').count() <= 1
 }
 
 #[cfg(test)]

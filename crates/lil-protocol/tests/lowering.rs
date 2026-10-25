@@ -78,6 +78,7 @@ fn error_outcome(untrusted: bool) -> Outcome<ToolOutput> {
                     tool: "job.wait".into(),
                     arguments: json!({"job_id": "j_0123456789abcdef"}),
                 }),
+                user_hint: None,
             }),
             data: None,
             trace_id: "t_0123456789abcdef".into(),

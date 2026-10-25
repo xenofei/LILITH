@@ -41,7 +41,8 @@
 //!    [`JobDone::windows`]. An `execution_error` is `comfyui.execution_failed` with ComfyUI's
 //!    text as untrusted detail (ARCH-060); CUDA out of memory ([`is_oom`]) posts `/free`,
 //!    re-reads the VRAM and, for a local job, is retried while `attempt <= OOM_RETRIES`; it
-//!    then fails with `comfyui.out_of_memory` (ARCH-072). An `execution_interrupted`, a prompt
+//!    then fails with `comfyui.out_of_memory` and the advice [`OOM_ADVICE`] (ARCH-072,
+//!    CORE-163). An `execution_interrupted`, a prompt
 //!    `/api/jobs` reports `cancelled`, or a queued prompt that disappears while the websocket
 //!    stays connected (ComfyUI did not restart), when the job didn't ask for it, was an outside
 //!    cancel: `comfyui.execution_failed`, "cancelled from outside the suite", never retried
@@ -106,6 +107,9 @@ use crate::store::{WsPath, fsops};
 pub const PROMPT_KIND: &str = "comfy.prompt";
 /// How often an out-of-memory failure of a local job is retried (ARCH-072): attempts 1 and 2.
 pub const OOM_RETRIES: u32 = 2;
+/// The advice of the out-of-memory failure that ends a job (CORE-163; Appendix G).
+pub const OOM_ADVICE: &str = "Close other programs that use the GPU, or choose the model \
+                              profile's lighter variant, then retry.";
 /// `extra_data.preview_method` unless the arguments say otherwise (CORE-130).
 pub const DEFAULT_PREVIEW_METHOD: &str = "taesd";
 /// The `expected_secs` of a prompt whose submitter gives none (the watchdog's yardstick).
@@ -1412,6 +1416,7 @@ impl Attempt<'_> {
                 tool: "engines.status".to_string(),
                 arguments: json!({}),
             }),
+            user_hint: None,
         });
         Err(JobFailure::Final(e))
     }
@@ -1965,15 +1970,28 @@ impl Attempt<'_> {
                 &text,
             ));
         }
-        let e = untrusted(
-            error(
-                &codes::COMFYUI_OUT_OF_MEMORY,
-                "ComfyUI ran out of GPU memory.",
-                self.job,
-            ),
+        let retry = !self.external && self.job.attempt <= OOM_RETRIES;
+        // The failure that ends the job says what ran out and what to try (CORE-163; Appendix
+        // G "Out of memory").
+        let message = if retry || self.external {
+            "ComfyUI ran out of GPU memory.".to_string()
+        } else {
+            format!("ComfyUI ran out of GPU memory, also on {OOM_RETRIES} retries.")
+        };
+        let mut e = untrusted(
+            error(&codes::COMFYUI_OUT_OF_MEMORY, message, self.job),
             &text,
         );
-        let retry = !self.external && self.job.attempt <= OOM_RETRIES;
+        if !retry {
+            e.fix = Some(lil_protocol::Fix {
+                ui_action: lil_protocol::UiAction {
+                    id: "retry_job".to_string(),
+                    label: "Retry the job".to_string(),
+                },
+                agent_hint: None,
+                user_hint: Some(OOM_ADVICE.to_string()),
+            });
+        }
         if !retry && !self.external {
             return JobFailure::Final(e);
         }

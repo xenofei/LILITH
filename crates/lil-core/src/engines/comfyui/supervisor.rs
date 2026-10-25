@@ -32,8 +32,8 @@ use super::outside::{OutsideWatch, Suite};
 use super::uploads::Uploads;
 use crate::engines::config::{ComfyConfig, DEFAULT_PORT, LOOPBACK};
 use crate::engines::{
-    COMFYUI_ROLE, EngineClass, EngineState, EngineStatus, InventoryStatus, Listen, OutsideJobs,
-    TOPIC,
+    COMFYUI_ROLE, Catalogue, EngineClass, EngineState, EngineStatus, InventoryStatus,
+    LaunchProfileStatus, Listen, OutsideJobs, TOPIC,
 };
 use crate::events::EventBus;
 use crate::jobs::{EngineKind, Jobs};
@@ -179,6 +179,10 @@ pub(crate) struct Comfy {
     graph_info: tokio::sync::Mutex<Option<(u64, Arc<GraphInfo>)>>,
     /// The model inventory refreshed in a readiness epoch.
     inventory: Mutex<Option<(u64, Arc<Inventory>)>>,
+    /// The newest inventory of this core run, whatever its epoch (`models.report`).
+    last_inventory: Mutex<Option<Arc<Inventory>>>,
+    /// The asset catalogue as probed in a readiness epoch (ARCH-065).
+    catalogue: Mutex<Option<(u64, Catalogue)>>,
 }
 
 /// What the graph checks need of one engine run: `/object_info` and `/node_replacements`
@@ -246,6 +250,8 @@ impl Comfy {
             ready: tokio::sync::watch::Sender::new((0, false)),
             graph_info: tokio::sync::Mutex::new(None),
             inventory: Mutex::new(None),
+            last_inventory: Mutex::new(None),
+            catalogue: Mutex::new(None),
         })
     }
 
@@ -402,6 +408,37 @@ impl Comfy {
                 models: u32::try_from(inv.files.len()).unwrap_or(u32::MAX),
                 refreshed: inv.refreshed.clone(),
             }),
+            launch_profile: self
+                .config
+                .as_ref()
+                .filter(|_| v.class != EngineClass::Attached)
+                .map(|c| LaunchProfileStatus::of(&c.profile)),
+            asset_catalogue: self.catalogue_now(v.state),
+        }
+    }
+
+    /// The catalogue probed since the engine last became ready; `unknown` before that, or when
+    /// it isn't ready.
+    fn catalogue_now(&self, state: EngineState) -> Catalogue {
+        let epoch = self.ready_epoch();
+        match *lock(&self.catalogue) {
+            Some((e, found)) if e == epoch && state == EngineState::Ready => found,
+            _ => Catalogue::Unknown,
+        }
+    }
+
+    /// Probes the asset catalogue once per readiness epoch (ARCH-065; Appendix G), and publishes
+    /// the status when it is known. Called by a supervisor pass that found the engine ready.
+    async fn probe_catalogue(&self, client: &ComfyClient) {
+        let epoch = self.ready_epoch();
+        if epoch == 0 || lock(&self.catalogue).is_some_and(|(e, _)| e == epoch) {
+            return;
+        }
+        let found = client.asset_catalogue().await;
+        *lock(&self.catalogue) = Some((epoch, found));
+        tracing::info!(catalogue = ?found, "ComfyUI's asset catalogue was probed");
+        if found != Catalogue::Unknown {
+            self.publish("status");
         }
     }
 
@@ -498,6 +535,14 @@ impl Comfy {
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
     }
 
+    /// Now, in milliseconds since 1970, by the core's clock.
+    pub(crate) fn now_ms(&self) -> i64 {
+        self.clock
+            .utc_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    }
+
     /// Now, RFC 3339 UTC, by the core's clock.
     pub(crate) fn now_rfc3339(&self) -> String {
         lil_schema::time::rfc3339(self.now_secs())
@@ -511,9 +556,16 @@ impl Comfy {
     /// Keeps the inventory a job refreshed in readiness `epoch`, unless the engine became ready
     /// again since.
     pub(crate) fn set_inventory(&self, epoch: u64, inventory: Inventory) {
+        let inventory = Arc::new(inventory);
+        *lock(&self.last_inventory) = Some(inventory.clone());
         if epoch == self.ready_epoch() {
-            *lock(&self.inventory) = Some((epoch, Arc::new(inventory)));
+            *lock(&self.inventory) = Some((epoch, inventory));
         }
+    }
+
+    /// The newest inventory of this core run, even of an engine that has stopped since.
+    pub(crate) fn last_inventory(&self) -> Option<Arc<Inventory>> {
+        lock(&self.last_inventory).clone()
     }
 
     /// The inventory refreshed since the engine last became ready, if any.
@@ -740,6 +792,7 @@ impl Comfy {
                         version: version_of(&stats),
                     });
                 }
+                self.probe_catalogue(client).await;
                 self.idle_free(config, client).await;
             }
             (Some((launcher, _)), Err(e)) => {
@@ -787,6 +840,8 @@ impl Comfy {
                         self.set_view(v);
                     }
                 }
+                drop(ops);
+                self.probe_catalogue(client).await;
             }
             (None, Err(_)) => {
                 let Ok(ops) = self.ops.try_lock() else {

@@ -6,7 +6,8 @@
 //! ([`ComfyClient::state`]: `/api/jobs/{id}`, `/history/{id}`, `/queue`), `/view` streamed into
 //! a new file with its SHA-256 taken on the way, `/upload/image`, `/queue`, `/api/jobs`,
 //! `/object_info` and `/node_replacements`; for the outside-jobs poll, `/api/queue` and
-//! `/api/jobs/{id}`. The websocket is in [`super::ws`].
+//! `/api/jobs/{id}`; for the asset catalogue, `/api/features`. The websocket is in
+//! [`super::ws`].
 //!
 //! The client never uses a proxy and never follows a redirect (a 3xx is
 //! [`ComfyError::Protocol`]): every request goes straight to the loopback address, and only
@@ -20,6 +21,7 @@ use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use crate::engines::Catalogue;
 use crate::store::fsops;
 
 /// How long one request may take, connection included.
@@ -603,6 +605,24 @@ impl ComfyClient {
     /// [`ComfyError`].
     pub async fn node_replacements(&self) -> Result<Value, ComfyError> {
         self.get_json("node_replacements").await
+    }
+
+    /// Whether the asset catalogue is on, by `GET /api/features`'s `assets` boolean (ARCH-065;
+    /// Appendix G): [`Catalogue::Unknown`] when the request fails, the route is missing (an
+    /// older ComfyUI) or there is no `assets` key. `/api/assets` is never asked: ComfyUI
+    /// registers it even when the catalogue is off.
+    pub async fn asset_catalogue(&self) -> Catalogue {
+        match self.get_json("api/features").await {
+            Ok(features) => match features.get("assets").and_then(Value::as_bool) {
+                Some(true) => Catalogue::On,
+                Some(false) => Catalogue::Off,
+                None => Catalogue::Unknown,
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "ComfyUI's /api/features did not say whether the asset catalogue is on");
+                Catalogue::Unknown
+            }
+        }
     }
 }
 

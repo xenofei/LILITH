@@ -12,18 +12,28 @@
 //!   `registry/models.yaml` is `{model_id, model_name, size, sha256}` (the entry's `id` and
 //!   `name`, or its `id` twice; trusted, the file name left out); any other is `{name, size,
 //!   sha256, untrusted: true}`, its file name being the outside world's (ARCH-060).
+//! - **Families** (CORE-164; Appendix G "Model inventory report"). A `.safetensors`, `.sft`
+//!   or `.gguf` file's family is read from its header (`lil_parse`, within its limits) in the
+//!   same open as its hash, and cached with it (`model_hashes.family`, `family_read`): it is
+//!   read again only when the file's identity changed, or when the last read couldn't open or
+//!   read the file. Pickle formats (`.ckpt`, `.pt`, `.pth`, `.bin`) are hashed, never parsed.
+//!   Family text is the outside world's (ARCH-060).
 //! - **Result.** `structured` is `{environment, models}` ([`super::environment::EnvCapture`]);
-//!   the inventory is kept for the graph checks and `engines.status` while the engine stays
-//!   ready.
+//!   the capture is also kept in the suite `state.db` ([`super::environment::store_capture`]).
+//!   The inventory is kept for the graph checks and `engines.status` while the engine stays
+//!   ready, and the newest one of the core run for `models.report` ([`models_report`]).
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
+use lil_parse::{Family, HeaderError};
 use lil_platform::fs::{FileIdentity, Probe};
 use lil_protocol::{ErrorBody, codes};
 use rusqlite::params;
+use schemars::JsonSchema;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -32,7 +42,8 @@ use super::environment;
 use super::graph::is_model_file;
 use crate::engines::{ENGINES_MODULE, Engines};
 use crate::jobs::{
-    JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobSpec, Lane, Priority, cancelled_error,
+    EngineKind, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobSpec, Lane, Priority,
+    cancelled_error,
 };
 use crate::state::{StateDb, StateError};
 
@@ -51,6 +62,9 @@ pub struct ModelFile {
     pub size: u64,
     /// `None` for a cloud placeholder (never read).
     pub sha256: Option<String>,
+    /// The model family its header names (untrusted, ARCH-060); `None` when it names none, for
+    /// a format without a header, or when it couldn't be read.
+    pub family: Option<String>,
 }
 
 /// The inventory kept while the engine stays ready.
@@ -117,14 +131,33 @@ struct Walked {
 /// Asked between files and between the chunks of a file being hashed.
 pub type Cancelled = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// A cached row: size, mtime, FileId and SHA-256.
-type Row = (u64, i64, String, String);
+/// A cached row: size, mtime, FileId, SHA-256, family and whether the family was read.
+type Row = (u64, i64, String, String, Option<String>, bool);
 
-/// The model files below `models_dir`, with their hashes (module docs): a file whose path,
-/// size, mtime and FileId match its cached row is not read, nor one whose volume and FileId, size and
-/// mtime match another row (the same file reached through another link); the others are
-/// hashed through `probe` and the cache is updated. Rows of files gone from `models_dir` are
-/// dropped, but not those below a folder that could not be read. `cancelled` is asked
+/// A family read: `Some(family)` once the header gave its answer (a header that is malformed
+/// or over the limits answers `None`), `None` when the file couldn't be opened or read, so it is
+/// read again next time.
+type FamilyRead = Option<Option<String>>;
+
+/// A row to write, by its path.
+type Fresh = (String, Row);
+
+/// The extensions whose header names a family (CORE-164); every other model format is a pickle
+/// or unknown, and is never parsed.
+fn has_header(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        ["safetensors", "sft", "gguf"]
+            .iter()
+            .any(|h| e.eq_ignore_ascii_case(h))
+    })
+}
+
+/// The model files below `models_dir`, with their hashes and families (module docs): a file
+/// whose path, size, mtime and FileId match its cached row is not read, nor one whose volume and
+/// FileId, size and mtime match another row (the same file reached through another link),
+/// unless its family is still to be read; the others are opened once through `probe`, for
+/// their header and their hash, and the cache is updated. Rows of files gone from `models_dir`
+/// are dropped, but not those below a folder that could not be read. `cancelled` is asked
 /// between files and every chunk of a hash. A missing `models_dir` has no files.
 ///
 /// # Errors
@@ -144,8 +177,10 @@ pub async fn scan(
     let cached: HashMap<String, Row> = db
         .call(move |conn| {
             let run = || -> rusqlite::Result<HashMap<String, Row>> {
-                let mut st =
-                    conn.prepare("SELECT path, size, mtime, file_id, sha256 FROM model_hashes")?;
+                let mut st = conn.prepare(
+                    "SELECT path, size, mtime, file_id, sha256, family, family_read \
+                     FROM model_hashes",
+                )?;
                 let rows = st.query_map([], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -154,6 +189,8 @@ pub async fn scan(
                             r.get::<_, i64>(2)?,
                             r.get::<_, String>(3)?,
                             r.get::<_, String>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, i64>(6)? != 0,
                         ),
                     ))
                 })?;
@@ -163,13 +200,13 @@ pub async fn scan(
         })
         .await
         .map_err(|e| ScanError::State(e.to_string()))?;
-    let by_identity: HashMap<(String, u64, i64), String> = cached
+    let by_identity: HashMap<(String, u64, i64), &Row> = cached
         .values()
-        .filter(|(_, _, id, _)| !id.is_empty())
-        .map(|(size, mtime, id, sha)| ((id.clone(), *size, *mtime), sha.clone()))
+        .filter(|row| !row.2.is_empty())
+        .map(|row| ((row.2.clone(), row.0, row.1), row))
         .collect();
     let mut files = Vec::with_capacity(walked.files.len());
-    let mut fresh: Vec<(String, u64, i64, String, String)> = Vec::new();
+    let mut fresh: Vec<Fresh> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for f in walked.files {
         if cancelled() {
@@ -178,59 +215,70 @@ pub async fn scan(
         let key = f.abs.display().to_string();
         seen.insert(key.clone());
         let file_id = identity_key(&f.id).unwrap_or_default();
-        let known = match cached.get(&key) {
-            Some((size, mtime, id, sha))
-                if *size == f.id.size && *mtime == f.id.last_write && *id == file_id =>
-            {
-                Some(sha.clone())
+        let own = cached.get(&key);
+        let known: Option<&Row> = match own {
+            Some(row) if row.0 == f.id.size && row.1 == f.id.last_write && row.2 == file_id => {
+                Some(row)
             }
             _ if !file_id.is_empty() => by_identity
                 .get(&(file_id.clone(), f.id.size, f.id.last_write))
-                .cloned(),
+                .copied(),
             _ => None,
         };
-        let sha256 = if f.id.is_cloud_placeholder() {
-            None
-        } else if let Some(sha) = known {
-            if !cached.contains_key(&key) {
-                fresh.push((
-                    key.clone(),
+        let (sha256, family) = if f.id.is_cloud_placeholder() {
+            (None, None)
+        } else {
+            // A file whose hash isn't known, or whose family is still to be read, is opened
+            // once for both; any other isn't opened.
+            let read = if known.is_none_or(|row| !row.5) {
+                let need_hash = known.is_none();
+                let (abs, p, stop) = (f.abs.clone(), probe.clone(), cancelled.clone());
+                match tokio::task::spawn_blocking(move || {
+                    read_model(p.as_ref(), &abs, need_hash, stop.as_ref())
+                })
+                .await
+                {
+                    Ok(Ok(read)) => Some(read),
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        return Err(ScanError::Cancelled);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(file = %f.abs.display(), error = %e, "a model file could not be read");
+                        None
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let (family_read, read_sha) = read.unwrap_or((None, None));
+            let sha = known.map(|row| row.3.clone()).or(read_sha);
+            // The family just read, else the cached one when it was read.
+            let (family, was_read) = match (family_read, known) {
+                (Some(family), _) => (family, true),
+                (None, Some(row)) if row.5 => (row.4.clone(), true),
+                _ => (None, false),
+            };
+            if let Some(sha) = &sha {
+                let row: Row = (
                     f.id.size,
                     f.id.last_write,
                     file_id,
                     sha.clone(),
-                ));
+                    family.clone(),
+                    was_read,
+                );
+                if own != Some(&row) {
+                    fresh.push((key.clone(), row));
+                }
             }
-            Some(sha)
-        } else {
-            let (abs, p, stop) = (f.abs.clone(), probe.clone(), cancelled.clone());
-            match tokio::task::spawn_blocking(move || hash_file(p.as_ref(), &abs, stop.as_ref()))
-                .await
-            {
-                Ok(Ok(sha)) => {
-                    fresh.push((
-                        key.clone(),
-                        f.id.size,
-                        f.id.last_write,
-                        file_id,
-                        sha.clone(),
-                    ));
-                    Some(sha)
-                }
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    return Err(ScanError::Cancelled);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(file = %f.abs.display(), error = %e, "a model file could not be hashed");
-                    None
-                }
-                Err(_) => None,
-            }
+            (sha, family)
         };
         files.push(ModelFile {
             path: f.rel,
             size: f.id.size,
             sha256,
+            family,
         });
     }
     let kept: Vec<String> = walked.unreadable.iter().map(|d| d.to_lowercase()).collect();
@@ -248,12 +296,22 @@ pub async fn scan(
         db.call(move |conn| {
             let mut run = || -> rusqlite::Result<()> {
                 let tx = conn.transaction()?;
-                for (path, size, mtime, file_id, sha256) in &fresh {
+                for (path, (size, mtime, file_id, sha256, family, read)) in &fresh {
                     tx.execute(
-                        "INSERT INTO model_hashes (path, size, mtime, file_id, sha256) \
-                         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(path) DO UPDATE SET \
-                         size = ?2, mtime = ?3, file_id = ?4, sha256 = ?5",
-                        params![path, size.cast_signed(), mtime, file_id, sha256],
+                        "INSERT INTO model_hashes \
+                         (path, size, mtime, file_id, sha256, family, family_read) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(path) DO UPDATE SET \
+                         size = ?2, mtime = ?3, file_id = ?4, sha256 = ?5, family = ?6, \
+                         family_read = ?7",
+                        params![
+                            path,
+                            size.cast_signed(),
+                            mtime,
+                            file_id,
+                            sha256,
+                            family,
+                            i64::from(*read)
+                        ],
                     )?;
                 }
                 for path in &gone {
@@ -348,14 +406,67 @@ fn identity_key(id: &FileIdentity) -> Option<String> {
         .map(|f| format!("{:016x}-{}", id.volume_serial, hex(&f)))
 }
 
-/// The SHA-256 of `path`'s data, read through `probe`; `cancelled` is asked before each
-/// chunk, and ends it with [`std::io::ErrorKind::Interrupted`].
-fn hash_file(
+/// Opens `path` once through `probe` and reads its family (a header format only, never a
+/// pickle: [`has_header`]) and, with `hash`, then its SHA-256. A file of another format that
+/// needs no hash isn't opened: its family is `None`, read. `cancelled` is asked before each
+/// chunk of the hash, and ends it with [`std::io::ErrorKind::Interrupted`].
+///
+/// # Errors
+/// The file can't be opened, or its hash can't be read.
+fn read_model(
     probe: &dyn Probe,
     path: &Path,
+    hash: bool,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> std::io::Result<(FamilyRead, Option<String>)> {
+    let header = has_header(path);
+    if !header && !hash {
+        return Ok((Some(None), None));
+    }
+    let mut file = probe.open_read(path)?;
+    let family = if header {
+        read_family(&mut file, path)
+    } else {
+        Some(None)
+    };
+    let sha = if hash {
+        file.seek(std::io::SeekFrom::Start(0))?;
+        Some(hash_open(&mut file, cancelled)?)
+    } else {
+        None
+    };
+    Ok((family, sha))
+}
+
+/// The family in the header of the open `file` (`path` names its format): see [`FamilyRead`].
+fn read_family(file: &mut std::fs::File, path: &Path) -> FamilyRead {
+    let gguf = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    let read = if gguf {
+        // Its walk makes many small reads.
+        lil_parse::gguf_family(&mut std::io::BufReader::new(&mut *file))
+    } else {
+        lil_parse::safetensors_family(file)
+    };
+    match read {
+        Ok(Family::Known(family)) => Some(Some(family)),
+        Ok(Family::Unknown) | Err(HeaderError::Malformed(_)) => Some(None),
+        // A file shorter than its header says is malformed, not unreadable.
+        Err(HeaderError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Some(None),
+        Err(HeaderError::Io(e)) => {
+            tracing::warn!(file = %path.display(), error = %e, "a model file's header could not be read");
+            None
+        }
+    }
+}
+
+/// The SHA-256 of the rest of `file`; `cancelled` is asked before each chunk, and ends it with
+/// [`std::io::ErrorKind::Interrupted`].
+fn hash_open(
+    file: &mut std::fs::File,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> std::io::Result<String> {
-    let mut file = probe.open_read(path)?;
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -498,6 +609,19 @@ impl InventoryHandler {
                 "",
             )))
         })?;
+        // Kept for `engines.environment` and `lil doctor`; one that can't be kept is logged,
+        // and the inventory goes on.
+        let kept = serde_json::to_value(&environment).unwrap_or(Value::Null);
+        if let Err(e) = environment::store_capture(
+            &comfy.suite_state(),
+            EngineKind::ComfyUi.wire(),
+            &kept,
+            comfy.now_ms(),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "the engine environment capture could not be kept");
+        }
         let files = match &root {
             Some(root) => {
                 let cancel = job.cancel.clone();
@@ -551,6 +675,156 @@ impl JobHandler for InventoryHandler {
     fn cancel_in_engine<'a>(&'a self, _job: &'a JobCtx) -> JobFuture<'a, ()> {
         Box::pin(std::future::ready(()))
     }
+}
+
+/// `models.report`'s result (CORE-164; Appendix G "Model inventory report").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ModelsReport {
+    /// `[engines.comfyui] root`.
+    pub root: String,
+    /// When the inventory was refreshed (RFC 3339 UTC); `null` before the first one.
+    pub refreshed: Option<String>,
+    pub models: Vec<ModelReportEntry>,
+    pub missing: Vec<MissingModel>,
+}
+
+/// One model file of the report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ModelReportEntry {
+    /// Below `<root>\models`, with `\` (untrusted).
+    pub path: String,
+    pub size: u64,
+    /// `null` for a file never read (a cloud placeholder).
+    pub sha256: Option<String>,
+    /// From the header (untrusted); `null` when none could be read.
+    pub family: Option<String>,
+    pub states: Vec<ModelState>,
+    /// The `registry/models.yaml` entry with its SHA-256 (trusted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// Always true: `path` and `family` are outside text (ARCH-060).
+    pub untrusted: bool,
+}
+
+/// The inventory glossary's states of a file (CORE-164).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelState {
+    /// No `registry/models.yaml` entry has its SHA-256.
+    Orphan,
+    /// Another file has the same SHA-256.
+    Duplicate,
+    /// Its header names no family.
+    UnknownFamily,
+}
+
+/// A `registry/models.yaml` SHA-256 that no file has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MissingModel {
+    pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    pub sha256: String,
+}
+
+/// The report's entries for `files` against `registry` (Appendix G): each file's states, and
+/// the registry hashes no file has, each once per entry.
+pub fn report_entries(
+    files: &[ModelFile],
+    registry: &[lil_schema::engine_files::RegistryModel],
+) -> (Vec<ModelReportEntry>, Vec<MissingModel>) {
+    let by_hash: HashMap<&str, &lil_schema::engine_files::RegistryModel> = registry
+        .iter()
+        .flat_map(|m| m.sha256.iter().map(move |h| (h.as_str(), m)))
+        .collect();
+    let mut copies: HashMap<&str, usize> = HashMap::new();
+    for sha in files.iter().filter_map(|f| f.sha256.as_deref()) {
+        *copies.entry(sha).or_default() += 1;
+    }
+    let models = files
+        .iter()
+        .map(|f| {
+            let sha = f.sha256.as_deref();
+            let entry = sha.and_then(|h| by_hash.get(h));
+            let mut states = Vec::new();
+            if entry.is_none() {
+                states.push(ModelState::Orphan);
+            }
+            if sha.is_some_and(|h| copies.get(h).is_some_and(|n| *n > 1)) {
+                states.push(ModelState::Duplicate);
+            }
+            if f.family.is_none() {
+                states.push(ModelState::UnknownFamily);
+            }
+            ModelReportEntry {
+                path: f.path.clone(),
+                size: f.size,
+                sha256: f.sha256.clone(),
+                family: f.family.clone(),
+                states,
+                model_id: entry.map(|m| m.id.clone()),
+                model_name: entry.and_then(|m| m.name.clone()),
+                untrusted: true,
+            }
+        })
+        .collect();
+    let mut missing: Vec<MissingModel> = Vec::new();
+    for m in registry {
+        for sha in &m.sha256 {
+            let listed = missing
+                .iter()
+                .any(|x| x.model_id == m.id && x.sha256 == *sha);
+            if !copies.contains_key(sha.as_str()) && !listed {
+                missing.push(MissingModel {
+                    model_id: m.id.clone(),
+                    model_name: m.name.clone(),
+                    sha256: sha.clone(),
+                });
+            }
+        }
+    }
+    (models, missing)
+}
+
+/// `models.report` (CORE-164; Appendix G): the newest inventory of this core run with the
+/// glossary's states, matched against the default workspace's `registry/models.yaml` as it is
+/// now. Before the first inventory, `refreshed` is `null` and both lists are empty. Nothing is
+/// moved or deleted.
+///
+/// # Errors
+/// `engine.not_configured` without `[engines.comfyui] root`.
+pub async fn models_report(engines: &Engines) -> Result<ModelsReport, ErrorBody> {
+    let comfy = engines.comfy();
+    let root = comfy.config().and_then(|c| c.root.clone()).ok_or_else(|| {
+        ErrorBody::new(
+            &codes::ENGINE_NOT_CONFIGURED,
+            "The model report reads ComfyUI's models folder: set [engines.comfyui] root in \
+             suite.toml.",
+            "",
+        )
+    })?;
+    let root = root.display().to_string();
+    let Some(inventory) = comfy.last_inventory() else {
+        return Ok(ModelsReport {
+            root,
+            refreshed: None,
+            models: Vec::new(),
+            missing: Vec::new(),
+        });
+    };
+    let workspace = comfy.default_workspace();
+    let registry = tokio::task::spawn_blocking(move || read_registry(workspace.as_deref()))
+        .await
+        .unwrap_or_default();
+    let (models, missing) = report_entries(&inventory.files, &registry);
+    Ok(ModelsReport {
+        root,
+        refreshed: Some(inventory.refreshed.clone()),
+        models,
+        missing,
+    })
 }
 
 #[cfg(test)]

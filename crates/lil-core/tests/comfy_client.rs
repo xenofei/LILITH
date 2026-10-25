@@ -1051,6 +1051,39 @@ async fn oom_frees_then_retries_at_most_twice() {
     assert_eq!(calls, ["/prompt", "/free", "/prompt", "/free", "/prompt"]);
 }
 
+/// The last out of memory after the two retries fails with Appendix G's advice (CORE-163).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-163
+async fn out_of_memory_fails_with_advice_after_two_retries() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    fake.oom_next(3);
+    let rig = Rig::new(&env);
+    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    let failed = rig.done(&id).await;
+    assert_eq!(failed.status, JobStatus::Failed, "{failed:?}");
+    assert_eq!(posted(&fake).len(), 3, "the first try and two retries");
+    let error = failed.error.expect("the job's error");
+    assert_eq!(error.code, "comfyui.out_of_memory");
+    assert_eq!(
+        error.message,
+        "ComfyUI ran out of GPU memory, also on 2 retries."
+    );
+    let fix = error.fix.expect("a fix");
+    assert_eq!(
+        fix.user_hint.as_deref(),
+        Some(
+            "Close other programs that use the GPU, or choose the model profile's lighter \
+             variant, then retry."
+        )
+    );
+    assert_eq!(error.retry, lil_protocol::RetryPolicy::AfterResolve);
+    assert!(
+        error.detail.is_some_and(|d| d.untrusted),
+        "ComfyUI's own text stays untrusted"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Previews, windows and the watchdog (ARCH-033, CORE-065, CORE-126).
 // ---------------------------------------------------------------------------------------------

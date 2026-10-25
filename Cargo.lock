@@ -1655,6 +1655,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
+ "lil-parse",
  "lil-platform",
  "lil-protocol",
  "lil-schema",

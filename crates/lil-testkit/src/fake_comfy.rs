@@ -308,6 +308,20 @@ impl FakeComfy {
         self.shared.lock().fail_next.push_back(kind);
     }
 
+    /// The next `n` prompts the suite submits run out of GPU memory ([`FakeFailure::Oom`]).
+    pub fn oom_next(&self, n: u32) {
+        for _ in 0..n {
+            self.fail_next(FakeFailure::Oom);
+        }
+    }
+
+    /// What `GET /api/features` answers: `status` with the JSON `body` (default: 200 with
+    /// `{"supports_preview_metadata": true, "assets": false}`, as ComfyUI 0.42.1 with its asset
+    /// catalogue off).
+    pub fn set_features(&self, status: u16, body: Value) {
+        self.shared.lock().features = Some((status, body));
+    }
+
     /// The next suite prompt that runs also reports an output named `filename` (under a node
     /// `extra<n>`), as a custom save node might; with `write` the fake writes that file into
     /// `<root>\output` first, otherwise it only reports it.
@@ -674,6 +688,8 @@ struct State {
     object_info: Value,
     /// `system.argv` (`None`: `["main.py"]`).
     argv: Option<Vec<String>>,
+    /// `GET /api/features`'s status and body (`None`: the default, [`FakeComfy::set_features`]).
+    features: Option<(u16, Value)>,
     clients: Vec<Client>,
     next_number: u64,
     next_id: u64,
@@ -1289,6 +1305,18 @@ async fn handle(
             json_response(StatusCode::OK, &Value::Object(one))
         }
         (&Method::GET, ["node_replacements"]) => json_response(StatusCode::OK, &json!({})),
+        (&Method::GET, ["features"]) => {
+            let (status, body) = shared.lock().features.clone().unwrap_or_else(|| {
+                (
+                    200,
+                    json!({"supports_preview_metadata": true, "assets": false}),
+                )
+            });
+            json_response(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                &body,
+            )
+        }
         _ => json_response(StatusCode::NOT_FOUND, &json!({"error": "not found"})),
     };
     Ok(response)

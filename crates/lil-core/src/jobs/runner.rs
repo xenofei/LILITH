@@ -408,6 +408,7 @@ fn job_error(mut error: ErrorBody, job_id: &str, how: RetryHow) -> ErrorBody {
                         label: "Retry the job".to_string(),
                     },
                     agent_hint: Some(hint),
+                    user_hint: None,
                 });
             }
         }
