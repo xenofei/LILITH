@@ -104,8 +104,8 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BringWindowToTop, CW_USEDEFAULT, CallWindowProcW, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, FLASHW_ALL,
-    FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GWLP_WNDPROC, GetClientRect, GetDlgItem,
-    GetForegroundWindow, GetMessageW, GetParent, GetWindowLongPtrW, GetWindowRect,
+    FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GWLP_WNDPROC, GetClientRect, GetCursorPos,
+    GetDlgItem, GetForegroundWindow, GetMessageW, GetParent, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HMENU, InSendMessage, KillTimer, MSG, PostMessageW, PostQuitMessage,
     RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
@@ -1523,8 +1523,12 @@ impl StatusLine {
 
 /// How long the cursor must rest on the accept button, by real pointer moves, before a mouse
 /// or touchpad press on it counts (re-review 3 m3): a program that warps the cursor onto Merge
-/// (`SetCursorPos`) doesn't make the owner's next click a click on Merge.
-pub const HOVER_BEFORE_PRESS: Duration = Duration::from_millis(300);
+/// (`SetCursorPos`) doesn't make the owner's next click a click on Merge. 150 ms (plan 4a
+/// ruling 2026-10-25, down from 300 ms, which refused brisk deliberate clicks): a warp's move
+/// isn't a hardware one and starts the rest again, and a still hand sends no moves, so the
+/// length only narrows a warp made while the hand is still moving. Real moves over the button
+/// while it is grey count too ([`grey_rest_move`]).
+pub const HOVER_BEFORE_PRESS: Duration = Duration::from_millis(150);
 
 /// The accept button's press state (pure: the caller passes what it judged and `now`). Only a
 /// real press on the button lets its release arm it (re-review 3 m1): a posted
@@ -1595,16 +1599,35 @@ pub fn release_refusal(input: ButtonInput, press: Result<(), Refusal>) -> Option
     if arms_accept(input) || input.msg != WM_LBUTTONUP || !input.over_button {
         return None;
     }
-    let pointer = input.origin == InputOrigin::Hardware
-        && matches!(
-            input.device,
-            InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
-        )
-        && !input.sent_by_another_thread;
-    if !pointer {
+    if !is_real_pointer(input.origin, input.device, input.sent_by_another_thread) {
         return Some(Refusal::NotPointer);
     }
     Some(press.err().unwrap_or(Refusal::NoRealPress))
+}
+
+/// Whether an input message is real pointer input handled on its window's own thread (pure):
+/// `IMO_HARDWARE` from a mouse, touch, pen or touchpad, not sent from another thread.
+pub fn is_real_pointer(origin: InputOrigin, device: InputDevice, sent: bool) -> bool {
+    origin == InputOrigin::Hardware
+        && matches!(
+            device,
+            InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
+        )
+        && !sent
+}
+
+/// Whether a `WM_MOUSEMOVE` the asking window gets counts towards the rest on the accept
+/// button (plan 4a ruling 2026-10-25; pure). A grey button gets no mouse input, so the window
+/// gets the moves over it: a real pointer move over the grey button counts, so a pointer parked
+/// there before the buttons turn on isn't refused; any other move (elsewhere, or not real, a
+/// `SetCursorPos` warp's included) starts the rest again ([`PressTracker::on_move`]).
+pub fn grey_rest_move(
+    over_grey_accept: bool,
+    origin: InputOrigin,
+    device: InputDevice,
+    sent: bool,
+) -> bool {
+    over_grey_accept && is_real_pointer(origin, device, sent)
 }
 
 /// Whether a message to the read-only text or a button would change what it shows (re-review 3
@@ -1779,12 +1802,8 @@ fn real_pointer_inside(button: HWND, lp: LPARAM) -> (bool, InputDevice) {
     let (origin, device) = current_input_source();
     // SAFETY: a query about the message this thread is handling.
     let sent = unsafe { InSendMessage() }.as_bool();
-    let pointer = matches!(
-        device,
-        InputDevice::Mouse | InputDevice::Touch | InputDevice::Pen | InputDevice::Touchpad
-    );
     (
-        origin == InputOrigin::Hardware && pointer && !sent && point_inside(button, lp),
+        is_real_pointer(origin, device, sent) && point_inside(button, lp),
         device,
     )
 }
@@ -1951,6 +1970,21 @@ fn refuse_click(window: HWND, refusal: Refusal) {
         "lil: a click on {label} didn't count: {}",
         refusal.name()
     );
+}
+
+/// Whether `point` (the window's client coordinates) is on the accept button; with
+/// `grey_only`, only while the button is disabled.
+fn over_accept(window: HWND, (x, y): (i32, i32), grey_only: bool) -> bool {
+    // SAFETY: queries about the window's own child control.
+    unsafe {
+        GetDlgItem(Some(window), ID_ACCEPT as i32)
+            .ok()
+            .filter(|&b| !(grey_only && IsWindowEnabled(b).as_bool()))
+            .and_then(place_in_parent)
+            .is_some_and(|(left, top, right, bottom)| {
+                x >= left && x < right && y >= top && y < bottom
+            })
+    }
 }
 
 fn set_buttons_enabled(window: HWND, enabled: bool) {
@@ -2200,16 +2234,44 @@ extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             WM_LBUTTONDOWN => {
                 // A grey button gets no mouse input: a press on it comes here (Task 28b).
                 let brought_forward = CLICK_ACTIVATED.with(|c| c.replace(false));
-                let (x, y) = message_point(lp);
-                let on_grey_accept = GetDlgItem(Some(hwnd), ID_ACCEPT as i32)
-                    .ok()
-                    .filter(|&b| !IsWindowEnabled(b).as_bool())
-                    .and_then(place_in_parent)
-                    .is_some_and(|(left, top, right, bottom)| {
-                        x >= left && x < right && y >= top && y < bottom
-                    });
-                if on_grey_accept {
+                if over_accept(hwnd, message_point(lp), true) {
                     refuse_click(hwnd, grey_click_refusal(brought_forward));
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_MOUSEMOVE => {
+                // Moves over the grey button come here too; real ones count towards the rest
+                // (plan 4a ruling 2026-10-25). A move here anywhere else, or one that isn't
+                // real, starts it again.
+                let (origin, device) = current_input_source();
+                let real = grey_rest_move(
+                    over_accept(hwnd, message_point(lp), true),
+                    origin,
+                    device,
+                    InSendMessage().as_bool(),
+                );
+                with_press(|p| p.on_move(real, Instant::now()));
+                if real {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut track);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_MOUSELEAVE => {
+                // The pointer left the window's own area. Onto the accept button (it turned on
+                // under the pointer) the rest goes on, and the button's own moves carry it;
+                // anywhere else it is gone.
+                let mut cursor = windows::Win32::Foundation::POINT::default();
+                let on_button = GetCursorPos(&mut cursor).is_ok()
+                    && ScreenToClient(hwnd, &mut cursor).as_bool()
+                    && over_accept(hwnd, (cursor.x, cursor.y), false);
+                if !on_button {
+                    with_press(PressTracker::on_leave);
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -2739,6 +2801,93 @@ mod tests {
                 .starts_with("That click didn't come from your mouse or touchpad")
         );
         assert!(Refusal::NoRealPress.message("Approve").contains("Approve"));
+    }
+
+    /// Plan 4a ruling 2026-10-25: real pointer moves over the grey accept button count towards
+    /// the rest, so a pointer parked on it before the buttons turn on isn't refused; anything
+    /// else there (a warp's move, injected, sent, a key's device) doesn't, and starts it again.
+    #[test] // spec: QA-088
+    fn real_moves_over_the_grey_button_count_towards_the_rest() {
+        let pointers = [
+            InputDevice::Mouse,
+            InputDevice::Touch,
+            InputDevice::Pen,
+            InputDevice::Touchpad,
+        ];
+        for device in pointers {
+            assert!(
+                grey_rest_move(true, InputOrigin::Hardware, device, false),
+                "{device:?}"
+            );
+            // Elsewhere in the window, it isn't on the button.
+            assert!(
+                !grey_rest_move(false, InputOrigin::Hardware, device, false),
+                "{device:?}"
+            );
+            // Sent from another thread.
+            assert!(
+                !grey_rest_move(true, InputOrigin::Hardware, device, true),
+                "{device:?}"
+            );
+        }
+        for origin in [
+            InputOrigin::Injected,
+            InputOrigin::System,
+            InputOrigin::Unavailable,
+        ] {
+            assert!(
+                !grey_rest_move(true, origin, InputDevice::Mouse, false),
+                "{origin:?}"
+            );
+        }
+        for device in [InputDevice::Keyboard, InputDevice::Unavailable] {
+            assert!(
+                !grey_rest_move(true, InputOrigin::Hardware, device, false),
+                "{device:?}"
+            );
+        }
+
+        // The parked pointer: real moves over the grey button, then it turns on, and the owner
+        // clicks without moving again: the press counts.
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let hover = HOVER_BEFORE_PRESS.as_millis() as u64;
+        let mut p = PressTracker::default();
+        p.on_move(
+            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            at(0),
+        );
+        p.on_move(
+            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            at(5),
+        );
+        p.on_press(true, InputDevice::Mouse, at(hover));
+        assert_eq!(p.on_release(), Ok(()));
+        // Parked, then the cursor is warped (the warp's move isn't a hardware one) and the owner
+        // clicks at once: the rest started again at the warp, so the press doesn't count.
+        let mut p = PressTracker::default();
+        p.on_move(
+            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            at(0),
+        );
+        p.on_move(
+            grey_rest_move(true, InputOrigin::System, InputDevice::Mouse, false),
+            at(hover * 3),
+        );
+        p.on_press(true, InputDevice::Mouse, at(hover * 3 + 1));
+        assert_eq!(p.on_release(), Err(Refusal::NoRest));
+        // Parked, then moved off the button within the window: the rest is gone.
+        let mut p = PressTracker::default();
+        p.on_move(
+            grey_rest_move(true, InputOrigin::Hardware, InputDevice::Mouse, false),
+            at(0),
+        );
+        p.on_move(
+            grey_rest_move(false, InputOrigin::Hardware, InputDevice::Mouse, false),
+            at(1),
+        );
+        p.on_press(true, InputDevice::Mouse, at(hover * 3));
+        assert_eq!(p.on_release(), Err(Refusal::NoRest));
     }
 
     /// Task 28b: a refused release names the first gate it failed: a pointer that isn't real
