@@ -13,13 +13,8 @@
 
 use std::process::ExitCode;
 
-use lil_core::store::fsops;
 use lil_core::{CoreConfig, CoreExit, claim_pipe, start_claimed};
 use lil_platform::Env;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
-
-/// Daily log files kept (ARCH-117).
-const LOG_FILES_KEPT: usize = 14;
 
 fn main() -> ExitCode {
     match run() {
@@ -46,39 +41,21 @@ fn run() -> Result<u8, CoreExit> {
     })
 }
 
-/// JSON lines without ANSI escapes to `logs_dir\core.<date>.log`, rotated daily, 14 files
-/// kept, and a panic hook that logs the panic's text (`panic`) and location before the default
-/// hook runs (ARCH-117, ARCH-119). The hook's line is logged in the panicking task's span, so a
-/// tool's panic carries the call's `trace_id`.
+/// The shared log setup (ARCH-117, ARCH-119; P4a-R20): JSON lines to
+/// `logs_dir\lil-core.<YYYY-MM-DD>.log`, a file a day, 14 kept, a day's file stopped at 64 MiB
+/// with one `log_capped` line, and a panic hook that logs the panic's text (`panic`) and
+/// location before the default hook runs. The hook's line is logged in the panicking task's
+/// span, so a tool's panic carries the call's `trace_id`.
 fn init_logs(env: &Env) -> Result<(), CoreExit> {
-    let dir = env.logs_dir();
-    let startup = |what: &str, e: &dyn std::fmt::Display| {
-        CoreExit::Startup(format!("cannot {what} {}: {e}", dir.display()))
-    };
-    fsops::ensure_dir(&dir).map_err(|e| startup("create the log folder", &e))?;
-    let appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .filename_prefix("core")
-        .filename_suffix("log")
-        .max_log_files(LOG_FILES_KEPT)
-        .build(&dir)
-        .map_err(|e| startup("open the log in", &e))?;
-    tracing_subscriber::fmt()
-        .json()
-        .with_ansi(false)
-        .with_writer(appender)
-        .try_init()
-        .map_err(|e| startup("start logging to", &e))?;
-
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_default();
-        let text = info.payload_as_str().unwrap_or("(no message)");
-        tracing::error!(%location, panic = text, "panic");
-        default_hook(info);
-    }));
-    Ok(())
+    // The log of before plan 4a, `core.<date>.log`, goes once it is 14 days old.
+    lil_platform::logs::prune_retired(&env.logs_dir(), "core");
+    // The guard holds nothing: logging lasts for the process.
+    lil_platform::logs::init(env, "lil-core")
+        .map(drop)
+        .map_err(|e| {
+            CoreExit::Startup(format!(
+                "cannot start logging to {}: {e}",
+                env.logs_dir().display()
+            ))
+        })
 }

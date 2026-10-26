@@ -47,7 +47,6 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = "1.2.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
-tracing-appender = "0.2.5"
 # Session, trace and idempotency ids: lil-platform only, never lil-protocol (ARCH-111).
 getrandom = "0.4.3"
 # Plan 2b (core platform I-b), pinned to the crates.io releases current on 2026-10-16.
@@ -67,6 +66,9 @@ rmcp = { version = "3.5.1", default-features = false, features = ["server", "tra
 # The fake ComfyUI's HTTP server: lil-testkit only.
 hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "http1"] }
+# Plan 4a (Task 12): the diagnostics bundle (P4a-R19), current on crates.io on 2026-10-25; deflate
+# only, through the pure-Rust zlib-rs back end.
+zip = { version = "9.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # The reviewer key's scrypt (N = 2^18) takes minutes unoptimised; optimise just the KDF so
 # `lil dev reviewer-setup` / `approve` and their tests stay quick in dev and test builds.

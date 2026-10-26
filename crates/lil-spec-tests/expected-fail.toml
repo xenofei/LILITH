@@ -6,11 +6,4 @@
 # Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 12
-    # ARCH-121, QA-084
-    { name = "lil-spec-tests::diagnostics::diagnostics_bundle_redacts_secrets_labels_and_emails", rule = "ARCH-121", file = "tests/diagnostics.rs" },
-    # QA-083
-    { name = "lil-spec-tests::diagnostics::diagnostics_recent_groups_errors_by_code", rule = "QA-083", file = "tests/diagnostics.rs" },
-    # ARCH-117
-    { name = "lil-spec-tests::diagnostics::every_process_logs_json_lines", rule = "ARCH-117", file = "tests/diagnostics.rs" },
 ]

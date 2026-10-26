@@ -231,7 +231,7 @@ impl RpcRouter {
     /// hello timeout. An app that can answer confirmations makes them
     /// answerable (APP-051) from now until [`Router::closed`], and the observers are told of the
     /// session: all under the map lock, so a connection that closes meanwhile is never counted.
-    fn settle_ready(&self, conn_id: u64, session: Arc<Session>) {
+    fn settle_ready(&self, conn_id: u64, session: Arc<Session>, build_id: &str) {
         let mut conns = self.conns();
         if let Some(conn) = conns.get_mut(&conn_id) {
             if can_answer(&session) {
@@ -241,6 +241,7 @@ impl RpcRouter {
             // as running or holding.
             for observer in &self.observers {
                 observer.ready(conn_id, &session);
+                observer.said_hello(conn_id, &session, build_id);
             }
             conn.state = ConnState::Ready(session);
             conn.hello_settled.cancel();
@@ -723,7 +724,7 @@ impl RpcRouter {
             }),
             core: self.core.clone(),
         };
-        self.settle_ready(conn.conn_id, session);
+        self.settle_ready(conn.conn_id, session, &p.build_id);
         // Events can reach the connection from now on.
         self.events.attach(conn.conn_id, conn.outbound.clone());
         // 9. The reply.

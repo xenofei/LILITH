@@ -58,6 +58,9 @@
 //!   workspace first used later, posts one toast for them (the jobs' restart-hold sink). After
 //!   each confirmation load (the suite's at start, the default workspace's once it opens) the
 //!   notifier reconciles the confirmation toasts with the pending confirmations.
+//! - The diagnostics ([`crate::diagnostics`], P4a-R24) are built with the telemetry and the
+//!   engines' slot before the dispatcher; they are its error sink (each error outcome is a
+//!   recent error) and a router observer (the apps' build ids for the bundle).
 
 use std::collections::HashMap;
 use std::io;
@@ -78,6 +81,7 @@ use crate::desktop::{
     AutoPause, DesktopSettingsStore, DesktopWatch, KeepAwake, UiApps, start_autopause,
     start_keep_awake,
 };
+use crate::diagnostics::{Diagnostics, DiagnosticsSources, register_diagnostics_tools};
 use crate::docs::{Holds, TestHolds, register_doc_tools, register_test_hold};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
@@ -348,6 +352,18 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     if cfg.test_tools {
         register_engine_test_tools(&mut registry);
     }
+    // The diagnostics (P4a-R24): recent errors from the dispatcher, the bundle, and the
+    // versions of the apps that say hello.
+    let diagnostics = Diagnostics::new(
+        cfg.env.clone(),
+        cfg.clock.clone(),
+        events.clone(),
+        DiagnosticsSources {
+            telemetry: Some(telemetry.clone()),
+            engines: Some(engine_slot.clone()),
+        },
+    );
+    register_diagnostics_tools(&mut registry, &diagnostics);
     // The desktop (P4a-R24): the real one on stable and dev, the fake on test channels, so no
     // test reads the real desktop or holds a real power request (QA-038).
     let fake_desktop = cfg.test_tools.then(|| {
@@ -460,6 +476,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         cfg.clock.clone(),
         lifecycle.clone(),
     );
+    dispatcher.set_error_sink(diagnostics.clone());
     let active_projects = dispatcher.active_projects().clone();
     let jobs = dispatcher.jobs().clone();
     notifier.set_jobs(&jobs).await;
@@ -603,6 +620,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         .with_observer(ui_apps.clone())
         .with_observer(holds)
         .with_observer(interchange)
+        .with_observer(diagnostics)
         .with_observer(Arc::new(AppTracker::new(telemetry.clone())));
     if cfg.test_tools {
         router = router.with_observer(test_holds);

@@ -28,9 +28,11 @@ tokio-util.workspace = true
 tokio-tungstenite.workspace = true
 # App registrations (`apps\<app>.toml`, APP-061).
 toml.workspace = true
+# The diagnostics bundle's redacted `suite.toml`, comments kept (ARCH-121).
+toml_edit.workspace = true
 tracing.workspace = true
-tracing-appender.workspace = true
-tracing-subscriber.workspace = true
+# The diagnostics bundle (P4a-R19).
+zip.workspace = true
 # The model-header readers of the inventory's families (CORE-164).
 lil-parse = { path = "../lil-parse" }
 lil-platform = { path = "../lil-platform" }
@@ -44,6 +46,7 @@ proptest.workspace = true
 roxmltree.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
 lil-testkit = { path = "../lil-testkit" }
 
 [lints]

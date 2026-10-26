@@ -108,6 +108,11 @@ pub trait ConnObserver: Send + Sync + 'static {
     fn ready(&self, conn_id: u64, session: &Session) {
         let _ = (conn_id, session);
     }
+    /// The `build_id` connection `conn_id`'s `core/hello` gave, told right after
+    /// [`ConnObserver::ready`]: the diagnostics bundle's app versions (ARCH-121).
+    fn said_hello(&self, conn_id: u64, session: &Session, build_id: &str) {
+        let _ = (conn_id, session, build_id);
+    }
     /// Connection `conn_id` ended (also one that never said hello).
     fn closed(&self, conn_id: u64);
 }

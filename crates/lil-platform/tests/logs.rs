@@ -198,3 +198,108 @@ fn panic_hook_logs_the_location() {
         "{location}"
     );
 }
+
+/// Two processes of one name (here two writers) append to one day's file: the cap counts the
+/// file, it gets exactly one `log_capped` line, and nothing follows it (ARCH-117).
+#[test] // spec: ARCH-117
+fn writers_sharing_a_day_share_its_cap() {
+    const CAP: u64 = 4 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let writer =
+        || DailyWriter::new(dir.path(), "shared", CAP, || "2026-03-01".to_string()).unwrap();
+    let (mut a, mut b) = (writer(), writer());
+    let line = |who: &str, i: u32| {
+        format!("{{\"who\":\"{who}\",\"i\":{i},\"pad\":\"0123456789abcdef0123456789\"}}\n")
+    };
+    for i in 0..200 {
+        a.write_all(line("a", i).as_bytes()).unwrap();
+        b.write_all(line("b", i).as_bytes()).unwrap();
+    }
+    let text = std::fs::read_to_string(dir.path().join("shared.2026-03-01.log")).unwrap();
+    assert_eq!(text.matches("log_capped").count(), 1, "{text}");
+    let last = text.lines().last().unwrap();
+    assert!(
+        last.contains("log_capped"),
+        "nothing follows the capped line: {last}"
+    );
+    let before = text.len() - last.len() - 1;
+    assert!(
+        before as u64 <= CAP,
+        "{before} bytes before the capped line"
+    );
+}
+
+/// A process name no longer used keeps no file older than 14 days; other names and other
+/// files are never touched.
+#[test] // spec: ARCH-117
+fn retired_process_files_older_than_14_days_go() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "core.2026-01-01.log",
+        "core.2026-01-05.log",
+        "core.2026-01-06.log",
+        "core.notes.txt",
+        "lil-core.2026-01-01.log",
+    ] {
+        std::fs::write(dir.path().join(name), b"{}\n").unwrap();
+    }
+    lil_platform::logs::prune_retired_at(dir.path(), "core", "2026-01-20");
+    let mut left: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "core.2026-01-06.log",
+            "core.notes.txt",
+            "lil-core.2026-01-01.log"
+        ]
+    );
+}
+
+/// Set by `a_panic_inside_a_write_does_not_deadlock` for its child run only: the log folder.
+const WRITE_PANIC_VAR: &str = "LIL_PLATFORM_TEST_WRITE_PANIC";
+
+/// The child half of `a_panic_inside_a_write_does_not_deadlock`: logging through a writer
+/// whose date panics on its second use, so the second line panics with the writer's lock held.
+#[test]
+fn write_panic_helper() {
+    if let Some(dir) = std::env::var_os(WRITE_PANIC_VAR) {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let writer = DailyWriter::new(Path::new(&dir), "writepanic", 1024 * 1024, move || {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                panic!("the date failed inside a write");
+            }
+            "2026-03-02".to_string()
+        })
+        .unwrap();
+        let _guard = lil_platform::logs::init_with(writer, "writepanic").unwrap();
+        tracing::info!("a second line");
+    }
+}
+
+/// A panic raised while a line is written (the writer's lock held) doesn't make the panic hook
+/// wait on that lock: the process ends instead of hanging (ARCH-119).
+#[test] // spec: ARCH-119
+fn a_panic_inside_a_write_does_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let args: Vec<&OsStr> = ["write_panic_helper", "--exact"]
+        .iter()
+        .map(OsStr::new)
+        .collect();
+    let out = run_hidden(
+        &exe,
+        &args,
+        exe.parent().unwrap(),
+        &[(WRITE_PANIC_VAR.into(), dir.path().as_os_str().to_owned())],
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert!(out.code.is_some(), "the helper hung: {out:?}");
+    assert_ne!(out.code, Some(0), "the helper must fail: {out:?}");
+    let text = std::fs::read_to_string(dir.path().join("writepanic.2026-03-02.log")).unwrap();
+    assert!(text.contains("logging started"), "{text}");
+}
