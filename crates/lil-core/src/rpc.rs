@@ -52,6 +52,9 @@
 //! process (client pid and caller kind) has a session in another workspace and none in this
 //! one when the connection closes, or says hello in another workspace afterwards. Either way,
 //! once no app that can answer is connected, the toasts held back while it was in front go out.
+//! A process is assumed to keep one session at a time: a second live one of the same pid and
+//! caller in another workspace counts as a switch. The waits live in one core instance: after
+//! a core restart, prompts reloaded from `state.db` end at their expiry (Appendix G).
 //!
 //! **Lifecycle** (ARCH-020, ruling P23). [`Router::opened`] and [`Router::closed`] feed the
 //! [`Lifecycle`]'s connection count. A refused connection stops counting when it is refused

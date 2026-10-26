@@ -51,7 +51,13 @@
 //!   new one's. That is the app's signal to reload what it built from the old core or
 //!   workspace: it reloads each topic on its `resync_required` in the stream, not on
 //!   [`SessionState::Ready`], which comes on another channel and so in no fixed order with the
-//!   events.
+//!   events. What follows the mark can still predate the reload: the new connection replays
+//!   from the topics' cursors, and on a switch to another workspace of the same core, topics
+//!   whose names carry no workspace (`jobs`, `project:<slug>`) can still carry the old
+//!   workspace's events. Every event carries full state or asks for a reload, so the models
+//!   converge. A backlog overflow can fold the mark into an ordinary `resync_required` (a seq
+//!   other than 0): every `resync_required` means "reload this topic", and a change of core or
+//!   workspace is also told by the hello in [`SessionState::Ready`].
 //! - **Events** reach [`Session::events`] in the core's order, across reconnects. A topic
 //!   subscribed while there is no connection, or while one is being set up, is subscribed on
 //!   it: the task makes the connection the current one, then subscribes the topics added
@@ -81,10 +87,10 @@
 //! - **Calls** ([`Session::call_tool`], [`Session::app_call`]) go out on the current
 //!   connection and the session never sends one again. A call while there is no connection is
 //!   [`ClientError::NotConnected`] at once: nothing was sent, so it is safe to make again. A
-//!   call in flight when the connection is lost ends with [`ClientError::Closed`]: it may have
-//!   run. Retrying after `Closed` is the caller's, with the same idempotency key, so a caller
-//!   that may retry passes its own ([`crate::mint_id`]`("ik")`); `app/*` methods have no key,
-//!   so they are not retried after `Closed`.
+//!   call in flight when the connection is lost or left (a switch) ends with
+//!   [`ClientError::Closed`]: it may have been sent, and may have run, so it is not safe to
+//!   make again. Only `NotConnected` is. After a switch the new connection is in
+//!   another workspace, whose idempotency scope knows nothing of the old call.
 //! - **Switching workspace** (P4a-R34) is a new connection whose hello names the workspace. It
 //!   replaces the current one only once the core accepted it, and it never changes
 //!   `suite.toml`'s default.
@@ -265,11 +271,10 @@ impl Session {
     /// idempotency key is minted), carrying `trace_id` when given (ARCH-118). Never sent again
     /// by the session (module docs).
     ///
-    /// [`ClientError::NotConnected`]: no connection, nothing was sent. [`ClientError::Closed`]:
-    /// the connection was lost while the call was in flight, so it may have run and its
-    /// outcome is unknown. A caller that may retry after `Closed` passes its own key
-    /// ([`crate::mint_id`]`("ik")`) and retries with that key: a key minted here is never seen
-    /// by the caller.
+    /// [`ClientError::NotConnected`]: no connection, nothing was sent, so it is safe to make
+    /// again. [`ClientError::Closed`]: the connection was lost or left (a switch) while the
+    /// call was in flight, so it may have been sent and may have run, and its outcome is
+    /// unknown: it is not made again (module docs, "Calls").
     pub async fn call_tool(
         &self,
         name: &str,
