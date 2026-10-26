@@ -7,8 +7,10 @@
 //   1. lil_qt::boot() reads the raw command line (P4a-R3) and refuses anything but the switches
 //      this build takes. Task 19 adds the forwarded launch, which exits 0 here, and the one
 //      positional argument. It also refuses a start without an absolute exe folder.
-//   2. Every variable Qt, QML, the scene graph, WebEngine or the Vulkan loader reads by prefix
-//      (lil_qt::qt_env_to_clear) is removed from the process environment, and checked gone.
+//   2. The variables that choose where Qt, QML, the scene graph, WebEngine or the Vulkan loader
+//      load code, QML or data from, which exe WebEngine starts, or that open debugging, all names
+//      under their prefixes (lil_qt::qt_env_to_clear), are removed from the process environment,
+//      and checked gone.
 //   3. The names (the caches and the WebEngine profile follow them), AA_ShareOpenGLContexts
 //      (APP-137) and the library path (this exe's folder only) are set; qt.conf beside the exe
 //      pins Qt's other folders to it.
@@ -24,7 +26,9 @@
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
 // idle (tools/deploy/check-deploy.ps1). The log bridge writes `first_frame` and `interactive` as
-// JSON lines on stderr (APP-136).
+// JSON lines on stderr (APP-136). Under --smoke-exit the `start` line also says whether the DLL
+// search can still find `lil-search-probe.dll` (searched by bare name and mapped as data, never
+// run), which the deploy check plants on PATH and in the current folder.
 #include "lilshim/Activation.h"
 #include "lilshim/DockFactory.h"
 #include "lilshim/LogBridge.h"
@@ -37,6 +41,7 @@
 #include <QAbstractEventDispatcher>
 #include <QGuiApplication>
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -152,12 +157,19 @@ int main(int, char **)
     QJsonArray envLeft;
     for (const rust::String &name : lil_qt::env_left())
         envLeft.append(fromRust(name));
-    lilshim::logEvent(QStringLiteral("start"),
-                      {{"qt_version", QString::fromLatin1(qVersion())},
-                       {"platform", QGuiApplication::platformName()},
-                       {"env_left", envLeft},
-                       {"no_activate", plan.no_activate},
-                       {"smoke_exit", plan.smoke_exit}});
+    QJsonObject startFields{{"qt_version", QString::fromLatin1(qVersion())},
+                            {"platform", QGuiApplication::platformName()},
+                            {"env_left", envLeft},
+                            {"no_activate", plan.no_activate},
+                            {"smoke_exit", plan.smoke_exit}};
+    if (plan.smoke_exit) {
+        // Step 0's check: a bare-name search for the deploy check's probe, mapped as data only.
+        HMODULE probe = LoadLibraryExW(L"lil-search-probe.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE);
+        startFields.insert(QStringLiteral("search_probe_found"), probe != nullptr);
+        if (probe)
+            FreeLibrary(probe);
+    }
+    lilshim::logEvent(QStringLiteral("start"), startFields);
 
     KDDockWidgets::initFrontend(KDDockWidgets::FrontendType::QtQuick);
     lilshim::DockFactory::install();

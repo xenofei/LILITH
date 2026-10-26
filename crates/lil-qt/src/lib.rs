@@ -9,10 +9,12 @@
 //! - **The command line:** its rest must be well formed, or the start is refused before Qt starts.
 //!   Until Task 19 adds the one positional argument (a `lil:` URL or a `.lilref` path), that
 //!   means nothing, or the switches `--smoke-exit` and `--no-activate`, each at most once.
-//! - **The environment:** [`qt_env_to_clear`] names every variable Qt, QML, the scene graph,
-//!   WebEngine or the Vulkan loader reads by prefix, so none can load code or data from another
-//!   folder, start another exe or open WebEngine to debugging; `main.cpp` removes them before Qt
-//!   is initialised, and refuses to start if one is still there.
+//! - **The environment:** [`qt_env_to_clear`] names the variables, by their Qt, QML, scene-graph,
+//!   QML-engine, WebEngine and Vulkan-loader prefixes, that choose where Qt loads code, QML or data
+//!   from, which exe WebEngine starts, or that open debugging; `main.cpp` removes them before Qt
+//!   is initialised, and refuses to start if one is still there. (Qt also reads a few names
+//!   outside these prefixes, such as `QQC2_STYLE` and `QMLSCENE_DEVICE`; they choose among what
+//!   the app folder holds and load nothing from elsewhere.)
 //! - **The library path:** [`app_dir`] is the exe's folder, the only one Qt loads plugins from; a
 //!   start without one is refused.
 //!

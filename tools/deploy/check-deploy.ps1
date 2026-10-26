@@ -13,17 +13,19 @@
      QT_QPA_PLATFORM=offscreen, QT_PLUGIN_PATH, QT_OPENGL=software, QT_OPENGL_DLL,
      QML_IMPORT_PATH, QML2_IMPORT_PATH, QSG_RHI_BACKEND=opengl, QV4_*, QTWEBENGINEPROCESS_PATH,
      QTWEBENGINE_DISABLE_SANDBOX and the Vulkan loader's layer and driver variables, pointing at a
-     folder that doesn't exist. Missing-DLL and crash dialogs are turned off for it.
+     folder that doesn't exist. A probe DLL, lil-search-probe.dll, sits in a folder first on PATH
+     and in the run's current folder. Missing-DLL and crash dialogs are turned off for it.
      - First a refused launch, `lil-image.exe -platformpluginpath <that folder>`: it must exit 2
-       before Qt starts (no `start` line), so it opens nothing.
+       before Qt starts (no `start` line), so it should open nothing.
      - Then `lil-image.exe --smoke-exit --no-activate`.
   3. Passes when the smoke run exits 0 within -TimeoutSec; its log (JSON lines on stderr) has a
-     `start` with platform `windows` and no variable left to clear, import paths without the
-     hostile folder, a `first_frame` whose graphics API isn't OpenGL, and an `interactive` with
-     WebEngine not loaded (APP-137); it never took the foreground; and the folder is within
-     budget.
-  Off a GitHub runner the window shows on this PC's screen, so the hands-off pop-up
-  (tools/sandbox/hands-off.ps1) warns 10 s ahead and counts down; -NoHandsOff skips it.
+     `start` with platform `windows`, no variable left to clear and the probe DLL not found (the
+     DLL search lockdown), import paths without the hostile folder, a `first_frame` whose
+     graphics API isn't OpenGL, and an `interactive` with WebEngine not loaded (APP-137); it
+     never took the foreground; and the folder is within budget.
+  Off a GitHub runner both launches run inside the hands-off pop-up's window (tools/sandbox/
+  hands-off.ps1: 10 s of warning, then a countdown), since a regression could open a window on
+  this PC's screen; -NoHandsOff skips it.
 #>
 param(
     [Parameter(Mandatory)] [string]$Deploy,
@@ -98,28 +100,25 @@ $hostileEnv = [ordered]@{
     VK_LOADER_DEBUG = 'all'
 }
 
+# The DLL-search probe (main.cpp step 0): lil-search-probe.dll, a copy of a deployed DLL, in a
+# folder first on PATH and in the run's current folder. lil-image looks for it by bare name and
+# must not find it.
+$probeRoot = Join-Path ([IO.Path]::GetTempPath()) ("lil-search-probe-{0}" -f $PID)
+$probeOnPath = Join-Path $probeRoot 'on-path'
+$probeCwd = Join-Path $probeRoot 'cwd'
+New-Item -ItemType Directory -Force -Path $probeOnPath, $probeCwd | Out-Null
+foreach ($d in $probeOnPath, $probeCwd) { Copy-Item -LiteralPath (Join-Path $Deploy 'vcruntime140_1.dll') -Destination (Join-Path $d 'lil-search-probe.dll') }
+
 function New-StartInfo([string[]]$appArgs) {
     $psi = [System.Diagnostics.ProcessStartInfo]::new($exe)
     foreach ($a in $appArgs) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
-    $psi.WorkingDirectory = $Deploy
+    $psi.WorkingDirectory = $probeCwd
     $psi.RedirectStandardError = $true
-    $psi.Environment['PATH'] = $cleanPath
+    $psi.Environment['PATH'] = $probeOnPath + ';' + $cleanPath
     foreach ($k in $unset) { [void]$psi.Environment.Remove($k) }
     foreach ($k in $hostileEnv.Keys) { $psi.Environment[$k] = $hostileEnv[$k] }
     $psi
-}
-
-# The refused launch: exit 2 before Qt starts, so no window and no `start` line.
-$r = [System.Diagnostics.Process]::Start((New-StartInfo @('-platformpluginpath', $hostile)))
-$rErr = $r.StandardError.ReadToEndAsync()
-if (-not $r.WaitForExit(15000)) { try { $r.Kill($true) } catch { }; $failures.Add('the refused launch was still running after 15 s') }
-else {
-    $r.WaitForExit()
-    $rText = $rErr.GetAwaiter().GetResult()
-    Write-Host ("refused launch (-platformpluginpath): exit {0}" -f $r.ExitCode)
-    if ($r.ExitCode -ne 2) { $failures.Add("the refused launch exited $($r.ExitCode), not 2") }
-    if ($rText -match '"event":"start"') { $failures.Add('the refused launch started Qt') }
 }
 
 # The hands-off pop-up, off CI.
@@ -143,6 +142,19 @@ if (-not $NoHandsOff -and $env:GITHUB_ACTIONS -ne 'true') {
         Start-Sleep -Milliseconds 250
     }
     Start-Sleep -Seconds 10
+}
+
+# The refused launch, inside the hands-off window: exit 2 before Qt starts, so no window and
+# no `start` line.
+$r = [System.Diagnostics.Process]::Start((New-StartInfo @('-platformpluginpath', $hostile)))
+$rErr = $r.StandardError.ReadToEndAsync()
+if (-not $r.WaitForExit(15000)) { try { $r.Kill($true) } catch { }; $failures.Add('the refused launch was still running after 15 s') }
+else {
+    $r.WaitForExit()
+    $rText = $rErr.GetAwaiter().GetResult()
+    Write-Host ("refused launch (-platformpluginpath): exit {0}" -f $r.ExitCode)
+    if ($r.ExitCode -ne 2) { $failures.Add("the refused launch exited $($r.ExitCode), not 2") }
+    if ($rText -match '"event":"start"') { $failures.Add('the refused launch started Qt') }
 }
 
 # 3. The run.
@@ -180,6 +192,7 @@ if (-not $start) { $failures.Add('no start event') }
 else {
     if ($start.platform -ne 'windows') { $failures.Add("the platform was $($start.platform): QT_QPA_PLATFORM wasn't cleared before Qt started") }
     if (@($start.env_left).Count) { $failures.Add("variables left to clear at start: $(@($start.env_left) -join ', ')") }
+    if ($start.search_probe_found -ne $false) { $failures.Add('the DLL search found lil-search-probe.dll on PATH or in the current folder (no lockdown)') }
 }
 $imports = $events | Where-Object { $_.event -eq 'qml_import_paths' } | Select-Object -First 1
 if (-not $imports) { $failures.Add('no qml_import_paths event') }
@@ -190,6 +203,7 @@ if (-not $inter) { $failures.Add('no interactive event') }
 elseif ($inter.webengine_loaded -ne $false) { $failures.Add('Qt6WebEngineCore.dll was loaded at interactive (APP-137)') }
 if ($foreground -gt 0) { $failures.Add("lil-image.exe took the foreground with --no-activate ($foreground samples)") }
 
+Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
 if ($failures.Count) {
     Write-Host 'deploy_runs_off_path: FAIL'
     $failures | ForEach-Object { Write-Host "  $_" }

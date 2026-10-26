@@ -8,6 +8,8 @@
   - APP-137: `dumpbin /dependents` of -Exe (lil-image.exe) and -Shim (the shim DLL) lists no
     Qt6WebEngine* DLL, and the lil_qt static library (-RustLibrary) names WebEngine in neither
     its linker directives nor its symbols;
+  - lil-image.exe imports SetDefaultDllDirectories and SetDllDirectoryW (the DLL search
+    lockdown; deploy_runs_off_path checks that it works);
   - OPS-094 (Ruling Q8): every *140*.dll that `dumpbin /dependents` reports for any exe or DLL
     in the deploy folder is present in the deploy folder itself (System32 has them all, so the
     off-PATH run can't see a missing one), vcruntime140.dll, vcruntime140_1.dll and
@@ -45,6 +47,11 @@ foreach ($bin in $Exe, $Shim) {
     $web = @($deps | Where-Object { $_ -match '^Qt6WebEngine' })
     if ($web.Count) { $failures.Add("$(Split-Path $bin -Leaf) imports $($web -join ', ')") }
     Write-Host ("{0}: {1} dependents, WebEngine: {2}" -f (Split-Path $bin -Leaf), $deps.Count, $(if ($web.Count) { $web -join ', ' } else { 'none' }))
+}
+# The DLL search lockdown (main.cpp step 0) is in the exe: it imports both calls.
+$imports = (& dumpbin /nologo /imports $Exe 2>&1) | Out-String
+foreach ($fn in 'SetDefaultDllDirectories', 'SetDllDirectoryW') {
+    if ($imports -notmatch "\b$fn\b") { $failures.Add("$(Split-Path $Exe -Leaf) doesn't import $fn") }
 }
 $directives = (& dumpbin /nologo /directives $RustLibrary 2>&1) | Out-String
 $symbols = (& dumpbin /nologo /linkermember:1 $RustLibrary 2>&1) | Out-String
