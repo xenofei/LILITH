@@ -679,6 +679,7 @@ fn a_restart_hold_posts_one_toast() {
 /// nothing, and a hold of new jobs posts again.
 #[test] // spec: APP-146, ARCH-022, CORE-160
 fn a_restart_hold_toasts_once_per_held_batch() {
+    let logs = capture_logs();
     let env = TestEnv::new();
     // Jobs held in a paused lane when `start` drops its core.
     let held_in = |n: u64| {
@@ -717,12 +718,14 @@ fn a_restart_hold_toasts_once_per_held_batch() {
             .filter(|j| j["pause_reasons"] == json!(["restart"]))
             .count();
         assert_eq!(held, 2, "held again: {listed}");
-        desktop(
-            &mut p,
-            json!({"toasts": "ready", "shortcut": true, "handlers": true,
-                   "foreground": "other", "fullscreen": "no"}),
-        );
-        fence(&mut p, &env);
+        // The recovery's toast decision is logged once it is made (review M-5): wait for it,
+        // not for time.
+        until("the restart hold's outcome logged", || {
+            logs.text()
+                .lines()
+                .any(|l| l.contains("the restart hold's toast") && l.contains("Duplicate"))
+                .then_some(())
+        });
         assert!(
             posts(&mut p, "job_failed").is_empty(),
             "{:?}",
