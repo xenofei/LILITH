@@ -1,3 +1,5 @@
 /target/
 .claude/settings.local.json
 /build/
+# cxx-qt-build 0.10.0 writes this under CMake, with absolute build-tree paths (cxx-qt #1493).
+crates/lil-qt/.qmlls.ini
