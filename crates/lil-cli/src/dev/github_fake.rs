@@ -41,6 +41,8 @@ struct State {
     /// The JWTs `app_slug` was asked with (test JWTs only).
     app_jwts: Vec<String>,
     app_slug_error: Option<String>,
+    /// The error `dismiss_approvals_as_app` answers with.
+    dismiss_error: Option<String>,
     /// The order of the App calls: `app`, `post_review`, `workflow_runs`, `rerun <id>`, plus
     /// anything a test adds with [`FakeGitHub::log_event`].
     events: Vec<String>,
@@ -73,6 +75,7 @@ impl FakeGitHub {
                 base_ref: base_ref.into(),
                 state: "open".into(),
                 draft: false,
+                merged: false,
                 title: format!("PR {number}'s title"),
                 author: "an-author".into(),
                 head_ref: "feature".into(),
@@ -103,6 +106,15 @@ impl FakeGitHub {
         self.lock().prs.get_mut(&number).expect("unknown PR").state = state.into();
     }
 
+    /// Marks the PR merged and closed (as GitHub shows a merge, for example one whose merge
+    /// call failed after GitHub had merged).
+    pub fn set_merged(&self, number: u64) {
+        let mut st = self.lock();
+        let pr = st.prs.get_mut(&number).expect("unknown PR");
+        pr.state = "closed".into();
+        pr.merged = true;
+    }
+
     pub fn set_draft(&self, number: u64, draft: bool) {
         self.lock().prs.get_mut(&number).expect("unknown PR").draft = draft;
     }
@@ -117,6 +129,11 @@ impl FakeGitHub {
             state: state.into(),
             commit_id: commit_id.into(),
         });
+    }
+
+    /// Makes `dismiss_approvals_as_app` fail with `message`.
+    pub fn set_dismiss_error(&self, message: &str) {
+        self.lock().dismiss_error = Some(message.into());
     }
 
     /// Makes `merge` answer `NotMergeable(message)` (GitHub's 405) while the head still matches.
@@ -263,7 +280,9 @@ impl GitHubApi for FakeGitHub {
         if let Some(msg) = st.not_mergeable.get(&number) {
             return Ok(MergeOutcome::NotMergeable(msg.clone()));
         }
-        st.prs.get_mut(&number).expect("checked above").state = "closed".into();
+        let pr = st.prs.get_mut(&number).expect("checked above");
+        pr.state = "closed".into();
+        pr.merged = true;
         Ok(MergeOutcome::Merged {
             sha: format!("merge-of-{head}"),
         })
@@ -361,5 +380,28 @@ impl GitHubApi for FakeGitHub {
             .app_slug
             .clone()
             .unwrap_or_else(|| DEFAULT_APP_SLUG.into()))
+    }
+
+    fn dismiss_approvals_as_app(
+        &self,
+        number: u64,
+        sha: &str,
+        login: &str,
+        _message: &str,
+        _installation_token: &str,
+    ) -> Result<usize> {
+        let mut st = self.lock();
+        st.events.push("dismiss".into());
+        if let Some(msg) = &st.dismiss_error {
+            return Err(anyhow!("fake: {msg}"));
+        }
+        let mut n = 0;
+        for r in st.reviews.entry(number).or_default().iter_mut() {
+            if r.login == login && r.commit_id == sha && r.state == "APPROVED" {
+                r.state = "DISMISSED".into();
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 }

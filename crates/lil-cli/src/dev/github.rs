@@ -39,6 +39,9 @@ pub struct PrInfo {
     pub base_ref: String,
     pub state: String,
     pub draft: bool,
+    /// GitHub's `merged`: the PR was merged (its `state` is then `closed`). A response without
+    /// it reads as not merged, so the merge flow's withdrawal still dismisses the approval.
+    pub merged: bool,
     /// Shown, never decided on (the merge flow's summary, Task 28): the title, the author's
     /// login and the head branch, each empty when GitHub didn't give it.
     pub title: String,
@@ -151,6 +154,21 @@ pub trait GitHubApi {
         let _ = jwt;
         bail!("this GitHub client can't ask for the App's slug")
     }
+    /// Dismisses every `APPROVED` review that `login` left on commit `sha` of PR `number`, with
+    /// `message`, using the reviewer app's `installation_token` (review round 1, I-3: the merge
+    /// flow withdraws its approval when it stops without merging). Returns how many it
+    /// dismissed. Only the real client and the fake answer.
+    fn dismiss_approvals_as_app(
+        &self,
+        number: u64,
+        sha: &str,
+        login: &str,
+        message: &str,
+        installation_token: &str,
+    ) -> Result<usize> {
+        let _ = (number, sha, login, message, installation_token);
+        bail!("this GitHub client can't dismiss reviews")
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -251,6 +269,21 @@ pub fn build_workflow_runs_request(
     )
 }
 
+/// `PUT .../reviews/{review_id}/dismissals`: dismisses one review with `message`.
+pub fn build_dismiss_request(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    review_id: u64,
+    message: &str,
+) -> (Method, String, Value) {
+    (
+        Method::PUT,
+        format!("/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissals"),
+        json!({ "message": message, "event": "DISMISS" }),
+    )
+}
+
 /// `GET /app`, authenticated with an App JWT: the App the JWT belongs to.
 pub fn build_app_request() -> (Method, String) {
     (Method::GET, "/app".to_owned())
@@ -284,6 +317,7 @@ pub fn parse_pr(v: &Value) -> Result<PrInfo> {
         draft: v["draft"]
             .as_bool()
             .ok_or_else(|| anyhow!("PR response is missing `draft`"))?,
+        merged: v["merged"].as_bool().unwrap_or(false),
         // Display-only fields: missing is empty, never an error.
         title: shown(v.get("title")),
         author: shown(v.pointer("/user/login")),
@@ -353,6 +387,27 @@ pub fn parse_reviews(v: &Value) -> Result<Vec<Review>> {
             commit_id: r["commit_id"].as_str().unwrap_or_default().to_owned(),
         })
         .collect())
+}
+
+/// The ids of the `APPROVED` reviews by `login` (compared exactly) on commit `sha`, in one page
+/// of `GET .../pulls/{n}/reviews`. Fails closed: a body that is not an array, or such a review
+/// without an `id`, is an error.
+pub fn parse_approval_ids(v: &Value, login: &str, sha: &str) -> Result<Vec<u64>> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow!("reviews response is not an array"))?;
+    arr.iter()
+        .filter(|r| {
+            r.pointer("/user/login").and_then(Value::as_str) == Some(login)
+                && r["commit_id"].as_str() == Some(sha)
+                && r["state"].as_str() == Some("APPROVED")
+        })
+        .map(|r| {
+            r["id"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("an approving review has no `id`"))
+        })
+        .collect()
 }
 
 /// Parses one page of `GET .../commits/{sha}/pulls`. Fails closed: a body that is not an array,
@@ -680,12 +735,61 @@ impl GitHubApi for RestClient {
         Self::expect_ok(&m, &url, status, &body)?;
         parse_app_slug(&body).with_context(|| format!("{m} {url} (HTTP {status})"))
     }
+
+    fn dismiss_approvals_as_app(
+        &self,
+        number: u64,
+        sha: &str,
+        login: &str,
+        message: &str,
+        installation_token: &str,
+    ) -> Result<usize> {
+        let (_, path) = build_reviews_request(&self.owner, &self.repo, number);
+        let mut ids = Vec::new();
+        for page in self.get_pages(&path, &format!("reviews on PR #{number}"))? {
+            ids.extend(parse_approval_ids(&page, login, sha)?);
+        }
+        for id in &ids {
+            let (m, path, body) =
+                build_dismiss_request(&self.owner, &self.repo, number, *id, message);
+            let url = self.abs(&path);
+            let (status, _, resp) = self.send(m.clone(), &url, Some(&body), installation_token)?;
+            Self::expect_ok(&m, &url, status, &resp)?;
+        }
+        Ok(ids.len())
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dev::github_fake::FakeGitHub;
     use reqwest::Method;
+
+    #[test]
+    fn dismiss_request_and_approval_ids() {
+        let (method, path, body) = build_dismiss_request("xenofei", "LILITH", 7, 99, "withdrawn");
+        assert_eq!(method, Method::PUT);
+        assert_eq!(path, "/repos/xenofei/LILITH/pulls/7/reviews/99/dismissals");
+        assert_eq!(body["event"], "DISMISS");
+        assert_eq!(body["message"], "withdrawn");
+        let page = serde_json::json!([
+            {"id": 1, "user": {"login": "lilith-reviewer[bot]"}, "state": "APPROVED", "commit_id": "abc"},
+            {"id": 2, "user": {"login": "lilith-reviewer[bot]"}, "state": "APPROVED", "commit_id": "old"},
+            {"id": 3, "user": {"login": "lilith-reviewer"}, "state": "APPROVED", "commit_id": "abc"},
+            {"id": 4, "user": {"login": "lilith-reviewer[bot]"}, "state": "DISMISSED", "commit_id": "abc"},
+            {"id": 5, "user": null, "state": "APPROVED", "commit_id": "abc"},
+            {"id": 6, "user": {"login": "lilith-reviewer[bot]"}, "state": "APPROVED", "commit_id": "abc"}
+        ]);
+        assert_eq!(
+            parse_approval_ids(&page, "lilith-reviewer[bot]", "abc").unwrap(),
+            [1, 6]
+        );
+        assert!(parse_approval_ids(&serde_json::json!({"message": "x"}), "a", "b").is_err());
+        let no_id = serde_json::json!([
+            {"user": {"login": "a"}, "state": "APPROVED", "commit_id": "b"}
+        ]);
+        assert!(parse_approval_ids(&no_id, "a", "b").is_err());
+    }
 
     #[test]
     fn merge_request_pins_sha() {
@@ -931,11 +1035,19 @@ mod tests {
                 base_ref: "main".into(),
                 state: "open".into(),
                 draft: true,
+                merged: false,
                 title: "Add the thing".into(),
                 author: "someone".into(),
                 head_ref: "feature".into(),
             }
         );
+        // `merged` is read when GitHub gives it; without it the PR reads as not merged.
+        let merged = parse_pr(&json!({
+            "number": 7, "state": "closed", "draft": false, "merged": true,
+            "head": {"sha": "h"}, "base": {"ref": "main"}
+        }))
+        .unwrap();
+        assert!(merged.merged);
         // The shown-only fields may be missing; the decided ones may not.
         let bare = parse_pr(&json!({
             "number": 7, "state": "open", "draft": false,

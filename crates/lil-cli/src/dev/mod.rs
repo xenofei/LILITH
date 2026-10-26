@@ -78,8 +78,9 @@ pub enum DevCommand {
     ///
     /// Prints one plain line per protected change that needs approval and per warning
     /// (removed or switched-off tests, new sleeps or retries, new lint suppressions).
-    /// Exits 0 when nothing needs approval, 1 when something does and isn't approved,
-    /// and 2 when the guard couldn't run.
+    /// Exits 0 when nothing needs approval, 1 when something does, and 2 when the guard
+    /// couldn't run. With --pr (CI's protected-test-check) it exits 0 only when the
+    /// reviewer app approved the head commit on that PR, protected files or not.
     ///
     /// With --post-merge --before <sha> --after <sha> (CI, after a push to main), it judges
     /// every step main took from before to after instead: each must come from a PR merged
@@ -94,8 +95,8 @@ pub enum DevCommand {
         /// The commit or ref being judged.
         #[arg(long, required_unless_present = "post_merge")]
         head: Option<String>,
-        /// Count the reviewer app's approval from this PR. Only an APPROVED review by the app
-        /// on the exact head commit counts.
+        /// Require the reviewer app's approval from this PR, whatever changed. Only an APPROVED
+        /// review by the app on the exact head commit counts.
         #[arg(long)]
         pr: Option<u64>,
         /// Judge a push to main (before..after) instead of a PR.
@@ -129,30 +130,37 @@ pub enum DevCommand {
         tests_result: Option<String>,
     },
 
-    /// Merge a PR into main, but only when it is safe. This is the only way agents merge.
+    /// Merge a PR into main, but only when it is safe and the owner authenticated it.
     ///
     /// First, `lil dev install-hooks` must have run: core.hooksPath is tools/git-hooks, and
     /// the repository's local credential.helper entries are an empty one and then the
     /// `lil dev git-credential` helper, with no other helper after them. Otherwise it
-    /// refuses before contacting GitHub. Then it merges only when all three
-    /// of these hold for the PR's current head commit:
+    /// refuses before contacting GitHub. Then it shows the PR's head commit, files,
+    /// protected changes and CI, and asks for the owner's authentication: Windows Hello
+    /// when enrolled, else the reviewer key's passphrase at a terminal. Without it nothing
+    /// is approved or merged. After it, it waits until every other required check is
+    /// green on that commit; only then, on every merge, protected files or not, does it
+    /// post the reviewer app's approval of that head commit (GitHub's
+    /// protected-test-check needs it), wait for that check, and merge only when all
+    /// three of these hold for it:
     ///
     ///   1. CI is green: every-push, pr-ready, protected-test-check and privacy-check
     ///      have all passed on that exact commit. A check that is missing, still
     ///      running or failed means no merge.
-    ///   2. Protected files are approved: if the PR changes any protected file, the
-    ///      reviewer app (named in dev/merge-guard.toml) has approved that exact commit. A human
-    ///      approval, or an approval of an older commit, doesn't count.
-    ///   3. The merge is pinned: GitHub is asked to merge only that checked commit, so
-    ///      a push after the checks makes the merge fail instead of slipping in.
+    ///   2. The reviewer app (named in dev/merge-guard.toml) has approved that exact
+    ///      commit: protected-test-check needs it on every PR, and lil checks it again
+    ///      itself for protected changes. A human approval, or an approval of an older
+    ///      commit, doesn't count.
+    ///   3. The merge is pinned: GitHub is asked to merge only the commit you
+    ///      authenticated, so a push after it makes the merge fail instead of slipping in.
     ///
-    /// Draft PRs, closed PRs and PRs into another branch are refused. If anything can't
-    /// be checked (a network or git error), it refuses. Every refusal says, in plain
-    /// words, which condition failed.
-    ///
-    /// Every merge, protected files or not, then asks for the owner's authentication
-    /// before GitHub is asked: Windows Hello when enrolled, else the reviewer key's
-    /// passphrase at a terminal. Without it nothing is merged.
+    /// It asks nothing when a required check other than protected-test-check has
+    /// already failed. When it stops without merging after posting the approval, it
+    /// dismisses the approval, re-runs protected-test-check until it reports failure,
+    /// and says exactly what holds. Press Ctrl+C once to stop it, and don't close the
+    /// window while it runs. Draft PRs, closed PRs and PRs into
+    /// another branch are refused. If anything can't be checked (a network or git
+    /// error), it refuses. Every refusal says, in plain words, which condition failed.
     #[command(verbatim_doc_comment)]
     Merge {
         /// The pull request number.
@@ -168,7 +176,7 @@ pub enum DevCommand {
     /// CI on that commit) and shows it with the summary and the independent audit from
     /// the two files. Then it asks for the owner's authentication: Windows Hello first,
     /// then the reviewer key's passphrase. Only after that succeeds does it post the
-    /// reviewer approval (when protected files changed), wait for CI on that commit and
+    /// reviewer approval of that commit (on every merge), wait for CI on that commit and
     /// merge with `lil dev merge`'s checks. Without it nothing is approved or merged.
     #[command(verbatim_doc_comment)]
     MergeFlow {

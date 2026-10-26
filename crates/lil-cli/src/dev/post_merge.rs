@@ -12,10 +12,12 @@
 //! - GitHub must associate it with a PR merged into the base branch
 //!   ([`GitHubApi::commit_pulls`]); otherwise it is a direct push and is flagged, whatever it
 //!   changed.
+//! - The reviewer App must have approved that PR's final head commit ([`app_approved`], under
+//!   its login: [`MergeGuardConfig::reviewer_login`]), protected files or not (QA-035 as
+//!   amended, owner decision 2026-10-26: every merge into main carries that approval;
+//!   [`Flag::Unapproved`]).
 //! - If the step changed protected files (the guard verdict of the step against its first
-//!   parent), the reviewer App must have approved that PR's final head commit
-//!   ([`app_approved`], under its login: [`MergeGuardConfig::reviewer_login`]).
-//!   A merge commit must then also be a plain merge of that head: exactly
+//!   parent), a merge commit must also be a plain merge of that head: exactly
 //!   two parents, the second being the PR's head, and a tree equal to
 //!   `git merge-tree --write-tree <first parent> <head>`. A conflict or any difference is
 //!   flagged ([`Flag::MergeNotClean`]), because a merge commit can carry changes of its own
@@ -67,6 +69,9 @@ pub enum Flag {
     /// No PR merged into main is associated with this commit. `lines` are the protected
     /// changes it made, if any.
     DirectPush { sha: String, lines: Vec<String> },
+    /// A merged PR without protected changes, but without the reviewer App's approval of its
+    /// final head, which every merge into main needs (owner decision 2026-10-26).
+    Unapproved { sha: String, prs: Vec<u64> },
     /// Protected changes without the reviewer App's approval of the PR's final head.
     UnapprovedProtected {
         sha: String,
@@ -261,10 +266,19 @@ fn judge_step(
             lines,
         });
     }
-    if verdict.needs_approval.is_empty() {
-        return None;
-    }
     let numbers = |ps: &[&CommitPull]| ps.iter().map(|p| p.number).collect::<Vec<_>>();
+    if verdict.needs_approval.is_empty() {
+        // Every merge into main needs the App's approval of the PR's final head, whatever it
+        // changed (owner decision 2026-10-26).
+        return match approved_any(gh, login, sha, &merged) {
+            Ok(true) => None,
+            Ok(false) => Some(Flag::Unapproved {
+                sha: sha.to_string(),
+                prs: numbers(&merged),
+            }),
+            Err(flag) => Some(flag),
+        };
+    }
     let candidates: Vec<&CommitPull> = if parents.len() > 1 {
         // A merge step must be a plain merge of the approved head, or the approval doesn't
         // cover what it brings in.
@@ -303,10 +317,30 @@ fn judge_step(
     } else {
         merged.clone()
     };
+    match approved_any(gh, login, sha, &candidates) {
+        Ok(true) => None,
+        Ok(false) => Some(Flag::UnapprovedProtected {
+            sha: sha.to_string(),
+            prs: numbers(&candidates),
+            lines,
+        }),
+        Err(flag) => Some(flag),
+    }
+}
+
+/// `Ok(true)` when the App (`login`) approved the final head of one of `candidates`, the PRs
+/// that brought step `sha` in. A reviews read that fails, when no candidate is approved, is a
+/// [`Flag::CouldNotCheck`].
+fn approved_any(
+    gh: &dyn GitHubApi,
+    login: &str,
+    sha: &str,
+    candidates: &[&CommitPull],
+) -> Result<bool, Flag> {
     let mut errors = Vec::new();
-    for p in &candidates {
+    for p in candidates {
         match gh.reviews(p.number) {
-            Ok(reviews) if app_approved(&reviews, login, &p.head_sha) => return None,
+            Ok(reviews) if app_approved(&reviews, login, &p.head_sha) => return Ok(true),
             Ok(_) => {}
             Err(e) => errors.push(format!(
                 "reading the reviews of PR #{} failed: {e:#}",
@@ -314,17 +348,14 @@ fn judge_step(
             )),
         }
     }
-    if !errors.is_empty() {
-        return Some(Flag::CouldNotCheck {
+    if errors.is_empty() {
+        Ok(false)
+    } else {
+        Err(Flag::CouldNotCheck {
             sha: Some(sha.to_string()),
             message: one_line(&errors.join("; ")),
-        });
+        })
     }
-    Some(Flag::UnapprovedProtected {
-        sha: sha.to_string(),
-        prs: numbers(&candidates),
-        lines,
-    })
 }
 
 /// `None` when `merge`'s tree is exactly what `git merge-tree --write-tree first second` gives;
@@ -376,6 +407,14 @@ fn explain_one(f: &Flag) -> String {
             "Commit {} was a direct push to main: no merged PR into main brought it in. It also changed protected files: {}",
             short(sha),
             lines.join(" ")
+        ),
+        Flag::Unapproved { sha, prs } => format!(
+            "Commit {} (from PR {}) was merged without the reviewer app's approval of the PR's final head commit, which every merge into main needs.",
+            short(sha),
+            prs.iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
         ),
         Flag::UnapprovedProtected { sha, prs, lines } => format!(
             "Commit {} (from PR {}) changed protected files, and the reviewer app hadn't approved the PR's final head commit: {}",
@@ -1028,13 +1067,52 @@ mod tests {
         let fake = FakeGitHub::new();
         fake.add_commit_pull(&merge, 7, &head, "main", true);
         fake.add_review(7, BOT, "APPROVED", &head);
-        // A PR without protected changes needs no approval.
+        // A PR without protected changes needs the approval too (owner decision 2026-10-26).
         fake.add_commit_pull(&docs_merge, 8, &docs_head, "main", true);
+        fake.add_review(8, BOT, "APPROVED", &docs_head);
         assert_eq!(
             post_merge_flags(&dir, &before, &docs_merge, &fake, &cfg()),
             vec![]
         );
         assert_eq!(explain_flags(&[]), "Nothing to flag.");
+    }
+
+    /// Review round 1, M-1 (QA-035 as amended, owner decision 2026-10-26): a merged PR that
+    /// changed nothing protected is flagged too when the App hadn't approved its final head, an
+    /// approval of an older head or by anyone else included.
+    #[test] // spec: QA-035
+    fn post_merge_flags_an_ordinary_merge_without_the_approval() {
+        let (_tmp, dir, before) = repo();
+        let (docs_head, docs_merge) = merge_pr(&dir, "docs", "README.md", "hello again\n");
+        let fake = FakeGitHub::new();
+        fake.add_commit_pull(&docs_merge, 8, &docs_head, "main", true);
+        fake.add_review(8, "xenofei", "APPROVED", &docs_head);
+        fake.add_review(8, BOT, "APPROVED", &before);
+        let flags = post_merge_flags(&dir, &before, &docs_merge, &fake, &cfg());
+        assert_eq!(
+            flags,
+            vec![Flag::Unapproved {
+                sha: docs_merge.clone(),
+                prs: vec![8]
+            }]
+        );
+        let text = explain_flags(&flags);
+        assert!(
+            text.contains("#8") && text.contains("reviewer app"),
+            "{text}"
+        );
+        // A dismissed approval doesn't count either.
+        fake.add_review(8, BOT, "DISMISSED", &docs_head);
+        assert_eq!(
+            post_merge_flags(&dir, &before, &docs_merge, &fake, &cfg()).len(),
+            1
+        );
+        // Reviews that can't be read are a flag, never a pass.
+        let flags = post_merge_flags(&dir, &before, &docs_merge, &ReviewsFail(&fake), &cfg());
+        assert!(
+            matches!(&flags[..], [Flag::CouldNotCheck { .. }]),
+            "{flags:?}"
+        );
     }
 
     /// The App's approval counts under its login in the settings at `before`, and under no
@@ -1283,6 +1361,7 @@ mod tests {
         let (head, merge) = merge_pr(&dir, "docs", "README.md", "two\n");
         let fake = FakeGitHub::new();
         fake.add_commit_pull(&merge, 7, &head, "main", true);
+        fake.add_review(7, BOT, "APPROVED", &head);
         let flags = post_merge_flags(&dir, &old_tip, &merge, &fake, &cfg());
         assert_eq!(
             flags,

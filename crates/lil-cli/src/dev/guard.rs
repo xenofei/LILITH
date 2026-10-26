@@ -1634,6 +1634,10 @@ Binary files a/bin.png and b/bin.png differ\n";
                 "GIT_CONFIG_GLOBAL",
                 if cfg!(windows) { "NUL" } else { "/dev/null" },
             )
+            // git reads `$XDG_CONFIG_HOME/git/ignore` whatever GIT_CONFIG_GLOBAL says, so a
+            // machine's own ignore list (one naming `.claude/settings.local.json`, say) could
+            // silently drop a test's file. A folder that never exists: no ignore file.
+            .env("XDG_CONFIG_HOME", dir.join(".git").join("no-xdg-config"))
             .output()
             .expect("git must be installed");
         assert!(
@@ -2542,6 +2546,8 @@ Binary files a/bin.png and b/bin.png differ\n";
                     "GIT_CONFIG_GLOBAL",
                     if cfg!(windows) { "NUL" } else { "/dev/null" },
                 )
+                // As `git_in`: no machine ignore list.
+                .env("XDG_CONFIG_HOME", d.join(".git").join("no-xdg-config"))
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -2821,6 +2827,8 @@ Binary files a/bin.png and b/bin.png differ\n";
             "tools/git-hooks/post-merge",
             "crates/lil-cli/src/dev/extra.rs",
             ".claude/settings.local.json",
+            // Owner decision 2026-10-26: the Windows Hello code behind every merge (QA-088).
+            "crates/lil-platform/src/hello.rs",
         ]
         .iter()
         .enumerate()
