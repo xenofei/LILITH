@@ -23,7 +23,8 @@
 //! 6. **Well-known secret formats**, with no key before them: GitHub tokens (`gh[pousr]_…`,
 //!    `github_pat_…`), Hugging Face (`hf_…`), Anthropic and OpenAI keys (`sk-ant-…`, `sk-…`),
 //!    age secret keys (`AGE-SECRET-KEY-1…`), Slack (`xox[abpr]-…`), AWS key ids (`AKIA…`) and
-//!    JWT-shaped tokens (`eyJ….….…`).
+//!    JWT-shaped tokens (`eyJ….….…`): where a word starts, and with a body of [`GLUED_BODY`]
+//!    or more glued to a word too (`j_sk-ant-…`; Checkpoint A walkthrough).
 //! 7. **Credential Manager targets**: [`names::APP_NAME`] or [`names::LEGACY_APP_NAME`], an
 //!    optional `-<channel>`, then `/<name>`, in any letter case; a quoted target to its quote.
 //! 8. **E-mail addresses** (`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`).
@@ -1258,7 +1259,13 @@ const TOKEN_FORMATS: &[TokenFormat] = &[
     },
 ];
 
-/// Every well-known secret (rule 6) replaced, wherever it is.
+/// The shortest body (after its prefix) of a well-known secret glued to a word, such as an
+/// id's `j_` before it: a shorter one counts only where a word starts, so an ordinary word
+/// (`task-list`) is never taken for a key.
+pub const GLUED_BODY: usize = 32;
+
+/// Every well-known secret (rule 6) replaced, wherever it is: at a word's start, or with a
+/// body of [`GLUED_BODY`] or more glued to a word too.
 fn known_tokens(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let run = |from: usize, ok: fn(u8) -> bool| {
@@ -1271,15 +1278,22 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
     let mut i = 0;
     while i < b.len() {
         let could_start = matches!(b[i], b'g' | b'h' | b's' | b'A' | b'x' | b'e');
-        if !could_start || !starts_word(s, i, |c| c.is_ascii_alphanumeric() || c == '_', cx) {
+        if !could_start {
             i += 1;
             continue;
         }
+        // Glued to a word, only a long body counts (Checkpoint A walkthrough, ODD-7).
+        let at_word = starts_word(s, i, |c| c.is_ascii_alphanumeric() || c == '_', cx);
         let mut end = TOKEN_FORMATS.iter().find_map(|f| {
             let p = f.prefix.as_bytes();
             let body = i + p.len();
             let len = run(body, f.body);
-            (b.get(i..body) == Some(p) && len >= f.min).then_some(body + len)
+            let min = if at_word {
+                f.min
+            } else {
+                f.min.max(GLUED_BODY)
+            };
+            (b.get(i..body) == Some(p) && len >= min).then_some(body + len)
         });
         // A JWT: three base64url parts, the first a JSON header (`eyJ`).
         if end.is_none() && b[i..].starts_with(b"eyJ") {
@@ -1292,6 +1306,7 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
             if one >= 10
                 && let Some((at, len)) = three
                 && len >= 8
+                && (at_word || at + 1 + len - (i + 3) >= GLUED_BODY)
             {
                 end = Some(at + 1 + len);
             }
@@ -2114,6 +2129,40 @@ mod tests {
             }
         }
         assert_eq!(r.text("desk-top and task-list-of-many-words").1, 0);
+    }
+
+    /// Checkpoint A walkthrough (ODD-7): a well-known token with a long body goes even glued
+    /// to an id (`j_sk-ant-…`); a short body glued to a word is an ordinary word.
+    #[test] // spec: ARCH-121
+    fn long_known_tokens_go_even_glued_to_a_word() {
+        let r = Redactor::default();
+        let tokens = [
+            format!("sk-ant-api03-{}", "Kq7".repeat(11)),
+            format!("ghp_{}", "A1".repeat(18)),
+            format!("hf_{}", "d4".repeat(17)),
+            format!(
+                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.{}",
+                "h8".repeat(12)
+            ),
+        ];
+        for token in &tokens {
+            for text in [
+                format!("There is no job \"j_{token}\" here."),
+                format!("id-{token}"),
+                format!("x{token}y"),
+            ] {
+                let (out, n) = r.text(&text);
+                assert!(!out.contains(token.as_str()), "{text} -> {out}");
+                assert_eq!(n, 1, "{text} -> {out}");
+            }
+        }
+        for text in [
+            "the_disk-cleanup-of-old-files ran",
+            "a whisk-and-bowl-kind-of-thing",
+            "mask_ghp_short",
+        ] {
+            assert_eq!(r.text(text), (text.to_string(), 0), "{text}");
+        }
     }
 
     #[test] // spec: ARCH-121
