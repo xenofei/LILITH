@@ -546,6 +546,12 @@ fn sequence_end(s: &str, esc: &Esc) -> Option<usize> {
     }
 }
 
+/// The end of the terminal control sequence starting at byte `j` of `s`, if one does
+/// ([`esc_at`], [`sequence_end`]): what a bare word steps over in the first round.
+fn control_sequence_at(s: &str, j: usize) -> Option<usize> {
+    esc_at(s.as_bytes(), j).and_then(|esc| sequence_end(s, &esc))
+}
+
 /// `s` with every terminal control sequence removed (module docs, rule 0), and where each run
 /// of them stood (byte offsets in the result, ascending); `None` when it has none. Nothing is
 /// put in their place, so a value a sequence split is whole again.
@@ -1293,7 +1299,12 @@ fn targets(s: &str, cx: &mut Cx) -> String {
                     }
                 }
             }
-            None => {
+            None => loop {
+                let from = end;
+                // A whole control sequence is stepped over, never stopped in at its `;`.
+                while let Some(after) = control_sequence_at(s, end) {
+                    end = after;
+                }
                 while b.get(end).is_some_and(|c| {
                     !(c.is_ascii_whitespace()
                         || matches!(
@@ -1312,7 +1323,10 @@ fn targets(s: &str, cx: &mut Cx) -> String {
                 }) {
                     end += 1;
                 }
-            }
+                if end == from {
+                    break;
+                }
+            },
         }
         if end == name {
             i += 1;
@@ -1566,8 +1580,15 @@ fn value_at(s: &str, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
             };
             let run_end = |from: usize| {
                 let mut j = from;
-                while j < b.len() && !stop(j) {
-                    j += 1;
+                while j < b.len() {
+                    // A whole control sequence is stepped over, never stopped in at its `;`.
+                    if let Some(after) = control_sequence_at(s, j) {
+                        j = after;
+                    } else if stop(j) {
+                        break;
+                    } else {
+                        j += 1;
+                    }
                 }
                 j
             };
@@ -2244,6 +2265,69 @@ mod tests {
                 &r,
                 r#"{"m":"\u001b]0;D:\\x07dir\u0007ok"}"#.to_string(),
                 r#"{"m":"ok"}"#.to_string(),
+            ),
+            // A bare value coloured with a multi-parameter SGR (`\033[1;32m`, as custom nodes
+            // print): the first round's word steps over the whole sequence, never stopping at
+            // its `;`.
+            (
+                &r,
+                "api_key=\u{1b}[1;32mhunter2secret\u{1b}[0m".to_string(),
+                "api_key=<redacted>".to_string(),
+            ),
+            (
+                &r,
+                "api_key=\u{1b}[0;32mhunter2secret\u{1b}[0m".to_string(),
+                "api_key=<redacted>".to_string(),
+            ),
+            (
+                &r,
+                "password=\u{1b}[38;5;208mhunter2secret\u{1b}[0m".to_string(),
+                "password=<redacted>".to_string(),
+            ),
+            (
+                &r,
+                "API key: \u{1b}[1;32mhunter2secret\u{1b}[0m".to_string(),
+                "API key: <redacted>".to_string(),
+            ),
+            (
+                &r,
+                "token: \u{1b}[1;32mhunter2secret\u{1b}[0m".to_string(),
+                "token: <redacted>".to_string(),
+            ),
+            (
+                &r,
+                r#"{"m":"api_key=\u001b[1;32mhunter2secret\u001b[0m"}"#.to_string(),
+                r#"{"m":"api_key=<redacted>"}"#.to_string(),
+            ),
+            (
+                &r,
+                r"'api_key=\x1b[1;32mhunter2secret\x1b[0m'".to_string(),
+                "'api_key=<redacted>'".to_string(),
+            ),
+            (
+                &r,
+                "Authorization: Bearer \u{1b}[1;32mhunter2secret".to_string(),
+                "Authorization: <redacted>".to_string(),
+            ),
+            (
+                &r,
+                "--api-key \u{1b}[1;32mhunter2secret".to_string(),
+                "--api-key <redacted>".to_string(),
+            ),
+            (
+                &r,
+                format!("token=\u{1b}[1;32m{ghp}"),
+                "token=<redacted>".to_string(),
+            ),
+            (
+                &r,
+                format!(r#"{{"m":"token=\u001b[1;32m{ghp}"}}"#),
+                r#"{"m":"token=<redacted>"}"#.to_string(),
+            ),
+            (
+                &r,
+                "cred LILITH-dev/\u{1b}[1;32mgithub-token".to_string(),
+                "cred <redacted>".to_string(),
             ),
             (&r, "\u{1b}probeuser".to_string(), "<user>".to_string()),
             (
