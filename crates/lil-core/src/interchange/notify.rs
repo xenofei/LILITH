@@ -17,7 +17,9 @@
 //!   - No toast is ever a progress toast or updated in place (P4a-R36).
 //! - **As posted** (Checkpoint A walkthrough): every toast's title and body are redacted as a
 //!   diagnostics bundle's entries are (BUG-1), and while the handlers aren't this channel's, a
-//!   toast with a target is posted without it, its body ending [`OPEN_LILITH`] (ODD-6).
+//!   toast with a target is posted without it, its body ending [`OPEN_LILITH`] (ODD-6). A
+//!   confirmation's toast posted so holds no live token, and the next reconcile that finds the
+//!   handlers `ok` posts it again with its buttons and a fresh token.
 //! - **When.** A toast is posted only when its category is on, the channel's toasts can post
 //!   (`ready` or `not_yet_shown`) with the shortcut `ok`, and no connected `ui:*` app owns the
 //!   foreground window (P4a-R7); otherwise nothing is posted or queued. While the fullscreen
@@ -173,6 +175,9 @@ struct Memory {
     recent: VecDeque<(Duration, String)>,
     /// The confirmations whose toast this run posted.
     confirmations: HashSet<String>,
+    /// The confirmations whose toast this run posted without its target (the handlers weren't
+    /// this channel's): a reconcile posts each again once they are.
+    bare: HashSet<String>,
     /// The ended batches toasted: `(batch id, the newest attempts' ids)`, newest last.
     batches: VecDeque<(String, Vec<String>)>,
     /// The batches settled (toasted or not): `(batch id, every job id then)`, newest last. A
@@ -672,7 +677,15 @@ impl Notifier {
     /// posted one already.
     /// `reconciling`: an earlier run's toast of a refused re-post is looked for and removed.
     async fn confirmation_pending(&self, view: &ConfirmationView, reconciling: bool) {
-        if lock(&self.memory).confirmations.contains(&view.id) {
+        let (posted, bare) = {
+            let memory = lock(&self.memory);
+            (
+                memory.confirmations.contains(&view.id),
+                memory.bare.contains(&view.id),
+            )
+        };
+        // Posted, or posted bare and the handlers still aren't this channel's.
+        if posted || (bare && !self.handlers_ok().await) {
             return;
         }
         let Some(confirm) = self.confirm.get().and_then(Weak::upgrade) else {
@@ -707,9 +720,17 @@ impl Notifier {
                 deny_url: deny_url.clone(),
             },
         };
-        let outcome = self.post(CONFIRMATION_WAITING, &view.id, &text).await;
-        if outcome == NotifyOutcome::Posted {
-            lock(&self.memory).confirmations.insert(view.id.clone());
+        let (outcome, posted_bare) = self.post_toast(CONFIRMATION_WAITING, &view.id, &text).await;
+        if outcome == NotifyOutcome::Posted && posted_bare {
+            // No Deny shows its token: none lives.
+            confirm.forget_toast_token(&view.id, &token);
+            lock(&self.memory).bare.insert(view.id.clone());
+            tracing::info!(confirmation = %view.id, "a confirmation toast was posted without its target");
+        } else if outcome == NotifyOutcome::Posted {
+            let mut memory = lock(&self.memory);
+            memory.bare.remove(&view.id);
+            memory.confirmations.insert(view.id.clone());
+            drop(memory);
             tracing::info!(confirmation = %view.id, deny = %cut_token(&deny_url), "a confirmation toast was posted");
         } else {
             confirm.forget_toast_token(&view.id, &token);
@@ -733,7 +754,11 @@ impl Notifier {
 
     /// A confirmation answered, expired or cancelled: its toast goes, whichever run posted it.
     async fn confirmation_ended(&self, id: &str) {
-        lock(&self.memory).confirmations.remove(id);
+        {
+            let mut memory = lock(&self.memory);
+            memory.confirmations.remove(id);
+            memory.bare.remove(id);
+        }
         self.remove_toast(id).await;
     }
 
@@ -766,12 +791,16 @@ impl Notifier {
         for row in &rows {
             self.confirmation_pending(&row.view(), true).await;
         }
-        let gone: Vec<String> = lock(&self.memory)
-            .confirmations
-            .iter()
-            .filter(|id| !pending.contains(*id))
-            .cloned()
-            .collect();
+        let gone: Vec<String> = {
+            let memory = lock(&self.memory);
+            memory
+                .confirmations
+                .iter()
+                .chain(&memory.bare)
+                .filter(|id| !pending.contains(*id))
+                .cloned()
+                .collect()
+        };
         for id in gone {
             self.confirmation_ended(&id).await;
         }
@@ -804,6 +833,27 @@ impl Notifier {
 
     /// Posts `text` tagged `tag` in `category` (module docs, "When"): what became of it.
     async fn post(&self, category: &str, tag: &str, text: &ToastText) -> NotifyOutcome {
+        self.post_toast(category, tag, text).await.0
+    }
+
+    /// Whether the notification path's handlers are this channel's (the cached reading).
+    async fn handlers_ok(&self) -> bool {
+        let settings = self.settings.clone();
+        tokio::task::spawn_blocking(move || {
+            settings.notification_path(false).handlers == HandlersWire::Ok
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// [`Notifier::post`], and whether the toast went without its target (module docs, "As
+    /// posted").
+    async fn post_toast(
+        &self,
+        category: &str,
+        tag: &str,
+        text: &ToastText,
+    ) -> (NotifyOutcome, bool) {
         let (on, quiet) = {
             let s = self.current.borrow();
             (
@@ -812,7 +862,7 @@ impl Notifier {
             )
         };
         if !on {
-            return NotifyOutcome::CategoryOff;
+            return (NotifyOutcome::CategoryOff, false);
         }
         let silent = quiet && *self.fullscreen.borrow();
         let (settings, watch, apps, desktop, env) = (
@@ -826,11 +876,13 @@ impl Notifier {
         let posted = tokio::task::spawn_blocking(move || {
             let path = settings.notification_path(false);
             if !can_post(&path) {
-                return NotifyOutcome::Unavailable;
+                return (NotifyOutcome::Unavailable, false);
             }
             if watch.foreground_is_one_of(&apps.pids()) {
-                return NotifyOutcome::Foreground;
+                return (NotifyOutcome::Foreground, false);
             }
+            let bare = path.handlers != HandlersWire::Ok
+                && (text.launch.is_some() || text.actions != ToastActions::None);
             let toast = Toast {
                 tag,
                 group,
@@ -838,19 +890,19 @@ impl Notifier {
                 silent,
             };
             match desktop.post(&toast) {
-                Ok(()) => NotifyOutcome::Posted,
+                Ok(()) => (NotifyOutcome::Posted, bare),
                 Err(e) => {
                     tracing::warn!(tag = %toast.tag, group = %toast.group, error = %e, "a toast could not be posted");
                     // Reachable sees the failure at once (Appendix G "Ready").
                     settings.notification_path(true);
-                    NotifyOutcome::Unavailable
+                    (NotifyOutcome::Unavailable, false)
                 }
             }
         })
         .await;
         posted.unwrap_or_else(|e| {
             tracing::error!(error = %e, "posting a toast failed");
-            NotifyOutcome::Unavailable
+            (NotifyOutcome::Unavailable, false)
         })
     }
 }

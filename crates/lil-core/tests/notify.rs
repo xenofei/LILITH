@@ -1021,6 +1021,72 @@ fn a_restart_reposts_the_waiting_toasts_and_removes_them_when_answered() {
     });
 }
 
+/// Checkpoint A walkthrough (ODD-6, review): a confirmation's toast reposted at a restart
+/// without its target (a test core starts with no handlers) is posted again by the next
+/// reconcile once the handlers are this channel's, with Open, Deny and a fresh token: the
+/// fresh token denies, and the earlier run's is dead.
+#[test] // spec: APP-146, APP-022, ARCH-055
+fn a_reposted_toast_gets_its_buttons_and_a_fresh_token_once_the_handlers_are_back() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let ids: Arc<dyn IdSource> = Arc::new(lil_platform::RandomIds);
+    let (id, old_token) = {
+        let _core = core_with(&env, FakeClock::new(), Some(ids.clone()), None);
+        let mut p = pipe(&env, json!({}));
+        ready(&mut p);
+        let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        let token = deny_token(&mut p, &scheme, &id);
+        (id, token)
+    };
+    let _core = core_with(&env, FakeClock::new(), Some(ids), None);
+    let mut p = pipe(&env, json!({}));
+    let of_id = |p: &mut RawPipe| -> Vec<Value> {
+        posts(p, "confirmation_waiting")
+            .into_iter()
+            .filter(|t| t["tag"] == id.as_str())
+            .collect()
+    };
+    let bare = until("the bare repost", || of_id(&mut p).into_iter().next());
+    assert!(actions(bare["xml"].as_str().unwrap()).is_empty(), "{bare}");
+    // The handlers are back; the last app closing reconciles.
+    desktop(&mut p, json!({"handlers": true}));
+    drop(app(&env));
+    let full = until("the repost with its buttons", || {
+        of_id(&mut p)
+            .into_iter()
+            .find(|t| !actions(t["xml"].as_str().unwrap()).is_empty())
+    });
+    assert_eq!(full["launch"], format!("{scheme}:confirm/{id}"), "{full}");
+    assert_eq!(
+        full["body"], "A script (lil) wants to run test.destructive",
+        "{full}"
+    );
+    let xml = full["xml"].as_str().unwrap();
+    let token = actions(xml)[1]
+        .1
+        .strip_prefix(&format!("{scheme}:deny/{id}/"))
+        .unwrap_or_else(|| panic!("not a deny URL of {id}: {xml}"))
+        .to_string();
+    assert_ne!(token, old_token);
+    let mut a = app(&env);
+    let deny = |a: &mut TestApp, token: &str| -> Value {
+        a.call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": id, "answer": "deny", "toast_token": token}),
+        )["result"]
+            .clone()
+    };
+    assert_eq!(error_code(&deny(&mut a, &old_token)), "confirm.unknown");
+    let denied = deny(&mut a, &token);
+    assert_eq!(denied["status"], "ok", "the fresh token denies: {denied}");
+    until(&format!("the toast of {id} removed"), || {
+        ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == id.as_str())
+            .then_some(())
+    });
+}
+
 #[test] // spec: APP-146, ARCH-055, APP-022
 fn a_toast_held_back_while_the_app_was_in_front_goes_out_when_it_closes() {
     let env = TestEnv::new();
