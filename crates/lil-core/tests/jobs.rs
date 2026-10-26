@@ -3434,6 +3434,33 @@ async fn resume_removes_only_its_reason() {
     fx.shutdown().await;
 }
 
+/// Checkpoint A walkthrough (ODD-1): a job submitted into a paused lane is `queue_paused`,
+/// with its reasons, in the submit result itself, as `jobs.list` then shows it; a batch's
+/// jobs too.
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-117
+async fn a_job_submitted_into_a_paused_lane_is_queue_paused_in_its_result() {
+    let fx = Fx::suite().await;
+    fx.jobs.pause(Lane::Cpu, PauseReason::Manual).await;
+    let one = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let batch = fx
+        .jobs
+        .submit_batch(
+            &fx.ctx(),
+            (0..2)
+                .map(|_| spec(Lane::Cpu, Priority::Agent, json!({})))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    for job in std::iter::once(&one).chain(&batch) {
+        assert_eq!(job.substatus.as_deref(), Some("queue_paused"), "{job:?}");
+        assert_eq!(job.pause_reasons, ["manual"], "{job:?}");
+        let listed = until_substatus(&fx, &job.job_id, "queue_paused").await;
+        assert_eq!(listed.pause_reasons, job.pause_reasons);
+    }
+    fx.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)] // spec: CORE-160, CORE-117
 async fn queue_paused_jobs_list_their_reasons() {
     let fx = Fx::suite().await;
