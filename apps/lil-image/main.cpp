@@ -1,14 +1,23 @@
-// lil-image.exe, the image app (APP-001). Rust settles the start before Qt does (lil_qt::boot),
-// and Qt sees only what the plan hands it (Checkpoint A I-3):
+// lil-image.exe, the image app (APP-001). Rust settles the start before Qt is initialised
+// (lil_qt::boot), and Qt sees only what the plan hands it (Checkpoint A I-3, as ruled at review).
+// Every failure below is a refusal: exit 2, before the application object exists.
+//   0. DLL searches are locked to this exe's folder and System32 (SetDefaultDllDirectories, and
+//      SetDllDirectoryW(L"") takes the current folder out), so a DLL planted on PATH or in the
+//      current folder never loads, whatever name Qt or a driver asks for (opengl32sw.dll, say).
 //   1. lil_qt::boot() reads the raw command line (P4a-R3) and refuses anything but the switches
-//      this build takes, before Qt starts (exit 2). Task 19 adds the forwarded launch, which
-//      exits 0 here, and the one positional argument.
-//   2. The variables that load Qt or QML code from another folder, or open WebEngine to
-//      debugging, are removed from the process environment.
+//      this build takes. Task 19 adds the forwarded launch, which exits 0 here, and the one
+//      positional argument. It also refuses a start without an absolute exe folder.
+//   2. Every variable Qt, QML, the scene graph, WebEngine or the Vulkan loader reads by prefix
+//      (lil_qt::qt_env_to_clear) is removed from the process environment, and checked gone.
 //   3. The names (the caches and the WebEngine profile follow them), AA_ShareOpenGLContexts
 //      (APP-137) and the library path (this exe's folder only) are set; qt.conf beside the exe
 //      pins Qt's other folders to it.
 //   4. QGuiApplication is built from the program name alone: no Qt option reaches it.
+// "Before Qt is initialised", not "before any Qt code": Qt's DLLs run their own static
+// initialisers when the process loads them, before main, and this file's Q_IMPORT_QML_PLUGIN
+// lines and cxx-qt's generated initialisers run before main too. They only register plugin and
+// type functions and read no environment variable; a static initialiser that reads one must not
+// be added.
 // So it runs from a deploy folder (build/<preset>/deploy), never from bin/: its own folder is
 // where Qt's platform plugin must be.
 //
@@ -27,8 +36,10 @@
 
 #include <QAbstractEventDispatcher>
 #include <QGuiApplication>
+#include <QJsonArray>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
+#include <QSGRendererInterface>
 #include <QTimer>
 #include <QtQml/qqmlextensionplugin.h>
 
@@ -54,16 +65,30 @@ Q_IMPORT_QML_PLUGIN(Lilith_ShimPlugin)
 
 namespace {
 
-// Removes `name` from the CRT's tables (which Qt's qgetenv reads) and from the process
-// environment (which child processes such as QtWebEngineProcess inherit).
-void clearVariable(const std::string &name)
+int refuse(const char *why)
 {
-    const int len = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
+    std::fprintf(stderr, "%s\n", why);
+    return 2;
+}
+
+// Removes `name` from the CRT's tables (which Qt's qgetenv reads) and from the process
+// environment (which child processes such as QtWebEngineProcess inherit). True only when both
+// no longer have it.
+bool clearVariable(const std::string &name)
+{
+    const int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.c_str(), -1, nullptr, 0);
     if (len <= 1)
-        return;
+        return false;
     std::wstring wide(size_t(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, wide.data(), len);
-    _wputenv_s(wide.c_str(), L"");
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.c_str(), -1, wide.data(), len) != len)
+        return false;
+    if (_wputenv_s(wide.c_str(), L"") != 0)
+        return false;
+    size_t crtSize = 0;
+    _wgetenv_s(&crtSize, nullptr, 0, wide.c_str());
+    SetLastError(ERROR_SUCCESS);
+    const DWORD processSize = GetEnvironmentVariableW(wide.c_str(), nullptr, 0);
+    return crtSize == 0 && processSize == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND;
 }
 
 QString fromRust(const rust::String &s)
@@ -71,21 +96,38 @@ QString fromRust(const rust::String &s)
     return QString::fromUtf8(s.data(), qsizetype(s.size()));
 }
 
+QString graphicsApiName(QQuickWindow *window)
+{
+    const QSGRendererInterface *ri = window->rendererInterface();
+    switch (ri ? ri->graphicsApi() : QSGRendererInterface::Unknown) {
+    case QSGRendererInterface::Direct3D11: return QStringLiteral("d3d11");
+    case QSGRendererInterface::Direct3D12: return QStringLiteral("d3d12");
+    case QSGRendererInterface::OpenGL: return QStringLiteral("opengl");
+    case QSGRendererInterface::Vulkan: return QStringLiteral("vulkan");
+    case QSGRendererInterface::Software: return QStringLiteral("software");
+    default: return QStringLiteral("other");
+    }
+}
+
 } // namespace
 
 int main(int, char **)
 {
-    // 1. The plan, before anything of Qt runs.
-    const lil_qt::QtBoot plan = lil_qt::boot();
-    if (!plan.refused.empty()) {
-        const std::string why(plan.refused);
-        std::fprintf(stderr, "%s\n", why.c_str());
-        return 2;
-    }
+    // 0. DLL searches: this exe's folder and System32 only.
+    if (!SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
+        || !SetDllDirectoryW(L""))
+        return refuse("LILITH didn't start: it couldn't restrict where DLLs load from.");
 
-    // 2. The environment Qt and WebEngine would read.
-    for (const rust::String &name : plan.clear_env)
-        clearVariable(std::string(name));
+    // 1. The plan, before Qt is initialised.
+    const lil_qt::QtBoot plan = lil_qt::boot();
+    if (!plan.refused.empty())
+        return refuse(std::string(plan.refused).c_str());
+
+    // 2. The environment Qt, WebEngine and the Vulkan loader would read.
+    for (const rust::String &name : plan.clear_env) {
+        if (!clearVariable(std::string(name)))
+            return refuse("LILITH didn't start: an environment variable Qt reads couldn't be cleared.");
+    }
 
     // 3. Names, attributes and the library path, before the application object exists.
     QCoreApplication::setOrganizationName(fromRust(plan.org));
@@ -105,9 +147,15 @@ int main(int, char **)
     QGuiApplication app(qtArgc, qtArgv.data());
 
     lilshim::installLogBridge();
+    // env_left: what step 2 left of the cleared variables (none); the deploy check reads it,
+    // with the platform, the import paths and the first frame's graphics API.
+    QJsonArray envLeft;
+    for (const rust::String &name : lil_qt::env_left())
+        envLeft.append(fromRust(name));
     lilshim::logEvent(QStringLiteral("start"),
                       {{"qt_version", QString::fromLatin1(qVersion())},
                        {"platform", QGuiApplication::platformName()},
+                       {"env_left", envLeft},
                        {"no_activate", plan.no_activate},
                        {"smoke_exit", plan.smoke_exit}});
 
@@ -115,6 +163,8 @@ int main(int, char **)
     lilshim::DockFactory::install();
 
     QQmlApplicationEngine engine;
+    lilshim::logEvent(QStringLiteral("qml_import_paths"),
+                      {{"paths", QJsonArray::fromStringList(engine.importPathList())}});
     KDDockWidgets::QtQuick::Platform::instance()->setQmlEngine(&engine);
     engine.loadFromModule("Lilith.UiKit", "ShellWindow");
     auto *window = engine.rootObjects().isEmpty()
@@ -135,10 +185,12 @@ int main(int, char **)
 
     // first_frame: the window's first frameSwapped (render thread).
     auto *frameOnce = new QMetaObject::Connection;
-    *frameOnce = QObject::connect(window, &QQuickWindow::frameSwapped, window, [frameOnce, reached] {
+    *frameOnce = QObject::connect(window, &QQuickWindow::frameSwapped, window, [frameOnce, reached, window] {
         QObject::disconnect(*frameOnce);
         delete frameOnce;
-        lilshim::logEvent(QStringLiteral("first_frame"), {{"ms", lilshim::msSinceProcessStart()}});
+        lilshim::logEvent(QStringLiteral("first_frame"),
+                          {{"ms", lilshim::msSinceProcessStart()},
+                           {"graphics_api", graphicsApiName(window)}});
         reached();
     }, Qt::DirectConnection);
 

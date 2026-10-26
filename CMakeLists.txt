@@ -11,6 +11,12 @@
 cmake_minimum_required(VERSION 3.24)
 project(lilith LANGUAGES CXX)
 
+# The pinned toolset, MSVC 14.44 (cl 19.44.x), the one Qt 6.12 supports for x64;
+# tools/dev-shell.ps1 selects it. Another compiler fails here rather than building something else.
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR NOT CMAKE_CXX_COMPILER_VERSION MATCHES "^19\\.44\\.")
+    message(FATAL_ERROR "The compiler is ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}, not MSVC 19.44.x (14.44): configure through tools/dev-shell.ps1.")
+endif()
+
 # Rust always links the release MSVC runtime, so everything else does too, in every
 # configuration, and Qt's Debug libraries are never mixed in.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")

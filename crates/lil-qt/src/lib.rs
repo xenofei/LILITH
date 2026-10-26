@@ -9,8 +9,12 @@
 //! - **The command line:** its rest must be well formed, or the start is refused before Qt starts.
 //!   Until Task 19 adds the one positional argument (a `lil:` URL or a `.lilref` path), that
 //!   means nothing, or the switches `--smoke-exit` and `--no-activate`, each at most once.
-//! - **The environment:** [`qt_env_to_clear`] names the variables that load Qt or QML code from
-//!   another folder, or open WebEngine to debugging; `main.cpp` removes them before any Qt call.
+//! - **The environment:** [`qt_env_to_clear`] names every variable Qt, QML, the scene graph,
+//!   WebEngine or the Vulkan loader reads by prefix, so none can load code or data from another
+//!   folder, start another exe or open WebEngine to debugging; `main.cpp` removes them before Qt
+//!   is initialised, and refuses to start if one is still there.
+//! - **The library path:** [`app_dir`] is the exe's folder, the only one Qt loads plugins from; a
+//!   start without one is refused.
 //!
 //! With the `qt` feature, [`qt`] is the cxx-qt bridge: the `Lilith.Core` QML module and the
 //! boot call `main.cpp` makes.
@@ -37,17 +41,29 @@ pub const SMOKE_EXIT: &str = "--smoke-exit";
 /// `--no-activate`: show the window without taking the focus; its taskbar button flashes.
 pub const NO_ACTIVATE: &str = "--no-activate";
 
-/// The variables removed by name, compared without regard to ASCII case (Windows' rule).
-const CLEAR_EXACT: [&str; 5] = [
-    "QT_PLUGIN_PATH",
-    "QML_IMPORT_PATH",
-    "QML2_IMPORT_PATH",
-    "QTWEBENGINE_CHROMIUM_FLAGS",
-    "QTWEBENGINE_REMOTE_DEBUGGING",
+/// The variables removed by prefix, compared without regard to ASCII case (Windows' rule): Qt's
+/// (`QT_PLUGIN_PATH`, `QT_QPA_*`, `QT_OPENGL`, `QT_OPENGL_DLL`, ...), QML's (`QML_IMPORT_PATH`,
+/// `QML2_IMPORT_PATH`), the scene graph's (`QSG_RHI_BACKEND`, ...), the QML engine's (`QV4_*`),
+/// WebEngine's (`QTWEBENGINEPROCESS_PATH`, `QTWEBENGINE_DISABLE_SANDBOX`, `QTWEBENGINE_*_PATH`,
+/// `QTWEBENGINE_CHROMIUM_FLAGS`, `QTWEBENGINE_REMOTE_DEBUGGING`) and the Vulkan loader's own.
+const CLEAR_PREFIXES: [&str; 7] = [
+    "QT_",
+    "QML_",
+    "QML2_",
+    "QSG_",
+    "QV4_",
+    "QTWEBENGINE",
+    "VK_LOADER_",
 ];
 
-/// The variables removed by prefix, compared the same way.
-const CLEAR_PREFIXES: [&str; 2] = ["QT_QPA_", "QT_QML_"];
+/// The Vulkan loader's layer and driver variables, removed by name, compared the same way.
+const CLEAR_EXACT: [&str; 5] = [
+    "VK_INSTANCE_LAYERS",
+    "VK_LAYER_PATH",
+    "VK_ADD_LAYER_PATH",
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
+];
 
 /// The window a start opens. Task 19 adds the confirmation window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,10 +130,11 @@ pub fn boot(raw_cmdline: &str, env: &Env) -> BootPlan {
     plan
 }
 
-/// The environment variables to remove before any Qt or WebEngine call (Checkpoint A I-3):
-/// `QT_PLUGIN_PATH`, every `QT_QPA_*`, `QML_IMPORT_PATH`, `QML2_IMPORT_PATH`, every `QT_QML_*`,
-/// `QTWEBENGINE_CHROMIUM_FLAGS` and `QTWEBENGINE_REMOTE_DEBUGGING`, from `names` (the process's
-/// variable names), keeping each name as it was spelled.
+/// The environment variables to remove before Qt is initialised (Checkpoint A I-3, as ruled at
+/// review): every name starting with `QT_`, `QML_`, `QML2_`, `QSG_`, `QV4_`, `QTWEBENGINE` or
+/// `VK_LOADER_`, and `VK_INSTANCE_LAYERS`, `VK_LAYER_PATH`, `VK_ADD_LAYER_PATH`,
+/// `VK_ICD_FILENAMES` and `VK_DRIVER_FILES`, from `names` (the process's variable names),
+/// keeping each name as it was spelled.
 pub fn qt_env_to_clear<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     names
         .into_iter()
@@ -130,11 +147,19 @@ pub fn qt_env_to_clear<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Stri
         .collect()
 }
 
+/// The folder of `exe` (the running exe): Qt's only library path. `None`, which refuses the
+/// start, when there is no exe or its folder is empty or not absolute: an empty library path
+/// would make Qt look for its plugins under the current drive's root.
+pub fn app_dir(exe: Option<&std::path::Path>) -> Option<String> {
+    let dir = exe?.parent()?;
+    (dir.is_absolute() && !dir.as_os_str().is_empty()).then(|| dir.display().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lil_platform::{Channel, Roots};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn env(channel: Channel) -> Env {
         let roots = Roots {
@@ -214,38 +239,64 @@ mod tests {
 
     #[test] // spec: APP-020
     fn qt_env_to_clear_names_the_load_and_debug_variables() {
-        let names = [
-            "PATH",
+        // Every name that loads code or data, starts another exe or opens a debugger.
+        let cleared = [
             "QT_PLUGIN_PATH",
             "qt_plugin_path",
             "QT_QPA_PLATFORM",
             "QT_QPA_PLATFORM_PLUGIN_PATH",
-            "QML_IMPORT_PATH",
-            "QML2_IMPORT_PATH",
+            "QT_OPENGL",
+            "QT_OPENGL_DLL",
+            "QT_QUICK_BACKEND",
             "QT_QML_DEBUG",
             "Qt_Qml_Something",
+            "QT_LOGGING_RULES",
+            "QML_IMPORT_PATH",
+            "QML2_IMPORT_PATH",
+            "QML_DISK_CACHE_PATH",
+            "QSG_RHI_BACKEND",
+            "QSG_INFO",
+            "QV4_FORCE_INTERPRETER",
+            "QTWEBENGINEPROCESS_PATH",
+            "QTWEBENGINE_DISABLE_SANDBOX",
+            "QTWEBENGINE_RESOURCES_PATH",
+            "QTWEBENGINE_LOCALES_PATH",
+            "QTWEBENGINE_DICTIONARIES_PATH",
             "QTWEBENGINE_CHROMIUM_FLAGS",
             "QTWEBENGINE_REMOTE_DEBUGGING",
-            "QT_QUICK_BACKEND",
+            "VK_INSTANCE_LAYERS",
+            "VK_LAYER_PATH",
+            "VK_ADD_LAYER_PATH",
+            "vk_icd_filenames",
+            "VK_DRIVER_FILES",
+            "VK_LOADER_DEBUG",
+            "VK_LOADER_LAYERS_ENABLE",
+        ];
+        let kept = [
+            "PATH",
             "QTDIR",
-            "QT_PLUGIN_PATHS",
             "XQT_QPA_PLATFORM",
             "LIL_CHANNEL",
+            "VK_SDK_PATH",
+            "VULKAN_SDK",
+            "QMAKE",
         ];
+        let names: Vec<&str> = cleared.iter().chain(kept.iter()).copied().collect();
+        assert_eq!(qt_env_to_clear(names), cleared);
+    }
+
+    #[test] // spec: APP-020
+    fn app_dir_is_the_exe_folder_or_refuses() {
         assert_eq!(
-            qt_env_to_clear(names),
-            [
-                "QT_PLUGIN_PATH",
-                "qt_plugin_path",
-                "QT_QPA_PLATFORM",
-                "QT_QPA_PLATFORM_PLUGIN_PATH",
-                "QML_IMPORT_PATH",
-                "QML2_IMPORT_PATH",
-                "QT_QML_DEBUG",
-                "Qt_Qml_Something",
-                "QTWEBENGINE_CHROMIUM_FLAGS",
-                "QTWEBENGINE_REMOTE_DEBUGGING",
-            ]
+            app_dir(Some(Path::new(r"C:\lil\deploy\lil-image.exe"))).as_deref(),
+            Some(r"C:\lil\deploy")
         );
+        for exe in [
+            None,
+            Some(Path::new("lil-image.exe")),
+            Some(Path::new(r"deploy\lil-image.exe")),
+        ] {
+            assert_eq!(app_dir(exe), None, "{exe:?}");
+        }
     }
 }

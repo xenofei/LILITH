@@ -21,6 +21,7 @@ function(lil_qml_test name file)
     add_test(NAME ${name} COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/${file})
     set_tests_properties(${name} PROPERTIES
         LABELS qml
+        TIMEOUT 300
         # QtTest writes to the debugger, not stderr, when no console is attached (CTest, CI).
         ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")

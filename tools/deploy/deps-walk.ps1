@@ -11,7 +11,8 @@
   - OPS-094 (Ruling Q8): every *140*.dll that `dumpbin /dependents` reports for any exe or DLL
     in the deploy folder is present in the deploy folder itself (System32 has them all, so the
     off-PATH run can't see a missing one), vcruntime140.dll, vcruntime140_1.dll and
-    msvcp140.dll among them;
+    msvcp140.dll among them, and every VC++ runtime DLL in it is version 14.44.x (the pinned
+    toolset's redist, cmake/deploy.cmake);
   - the dynamic Lilith.Web module is deployed as Lilith\Web\ (its qmldir and plugin DLL).
 #>
 param(
@@ -64,6 +65,14 @@ foreach ($f in $files) {
 $missing = @($wanted | Where-Object { -not (Test-Path -LiteralPath (Join-Path $Deploy $_) -PathType Leaf) })
 foreach ($m in $missing) { $failures.Add("$m is imported but not in the deploy folder") }
 Write-Host ("VC++ runtime imported by {0} binaries: {1}; missing app-local: {2}" -f $files.Count, ($wanted -join ', '), $(if ($missing.Count) { $missing -join ', ' } else { 'none' }))
+# ...and it is the pinned 14.44 toolset's own: every runtime DLL in the folder is 14.44.x.
+$runtime = @(Get-ChildItem -LiteralPath $Deploy -File -Filter '*.dll' | Where-Object { $_.Name -match '^(vcruntime|msvcp|concrt|vccorlib|vcomp|vcamp)140' })
+foreach ($dll in $runtime) {
+    $v = $dll.VersionInfo
+    if ($v.FileMajorPart -ne 14 -or $v.FileMinorPart -ne 44) { $failures.Add("$($dll.Name) is $($v.FileVersion), not 14.44.x") }
+}
+if ($runtime.Count -eq 0) { $failures.Add('no VC++ runtime DLL in the deploy folder') }
+Write-Host ("VC++ runtime versions: {0}" -f (($runtime | ForEach-Object { "$($_.Name) $($_.VersionInfo.FileVersion)" }) -join ', '))
 
 # The dynamic Lilith.Web module.
 $web = Join-Path $Deploy 'Lilith\Web'

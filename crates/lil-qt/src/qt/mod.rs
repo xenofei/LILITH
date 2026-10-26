@@ -41,7 +41,18 @@ pub mod ffi {
     extern "Rust" {
         /// Plans this start from the raw command line and the process environment.
         fn boot() -> QtBoot;
+
+        /// The process environment's names that `qt_env_to_clear` would still clear: empty once
+        /// `main.cpp` has cleared them (logged at start, checked by the deploy check).
+        fn env_left() -> Vec<String>;
     }
+}
+
+fn env_left() -> Vec<String> {
+    let names: Vec<String> = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    crate::qt_env_to_clear(names.iter().map(String::as_str))
 }
 
 /// `Core`'s Rust side.
@@ -58,19 +69,37 @@ impl Default for CoreRust {
 }
 
 fn boot() -> ffi::QtBoot {
-    let names: Vec<String> = std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
-        .collect();
+    let (names, odd): (Vec<_>, Vec<_>) = std::env::vars_os()
+        .map(|(name, _)| name.into_string())
+        .partition(Result::is_ok);
+    let names: Vec<String> = names.into_iter().filter_map(Result::ok).collect();
     let clear_env = crate::qt_env_to_clear(names.iter().map(String::as_str));
-    let app_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.display().to_string()))
-        .unwrap_or_default();
-    let plan = match lil_platform::Env::from_process() {
+    // A name that isn't UTF-8 can't be handed to main.cpp to clear: one that would be cleared
+    // refuses the start instead.
+    let odd: Vec<String> = odd
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    let unclearable = !crate::qt_env_to_clear(odd.iter().map(String::as_str)).is_empty();
+    let app_dir = crate::app_dir(std::env::current_exe().ok().as_deref());
+    let env = match (lil_platform::Env::from_process(), &app_dir) {
+        (Err(e), _) => Err(format!("LILITH didn't start: {e}")),
+        (Ok(_), _) if unclearable => Err(
+            "LILITH didn't start: an environment variable Qt reads couldn't be cleared."
+                .to_string(),
+        ),
+        (Ok(_), None) => {
+            Err("LILITH didn't start: it couldn't tell which folder it runs from.".to_string())
+        }
+        (Ok(env), Some(_)) => Ok(env),
+    };
+    let app_dir = app_dir.unwrap_or_default();
+    let plan = match env {
         Ok(env) => crate::boot(&lil_platform::desktop::raw_command_line(), &env),
-        Err(e) => {
+        Err(refused) => {
             return ffi::QtBoot {
-                refused: format!("LILITH didn't start: {e}"),
+                refused,
                 no_activate: false,
                 smoke_exit: false,
                 org: String::new(),

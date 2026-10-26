@@ -19,11 +19,13 @@ add_custom_command(TARGET lil-image POST_BUILD
     VERBATIM)
 
 # The deploy folder, build/<preset>/deploy (OPS-094): our files first, then windeployqt, then the
-# VC++ runtime of the toolset that built them (cmake/deploy.cmake).
+# VC++ runtime of the pinned 14.44 toolset that built them (cmake/deploy.cmake). Its redist is
+# found under the Visual Studio install, not through VCToolsRedistDir, which names the install's
+# default redist whatever toolset vcvars64 -vcvars_ver picked.
 set(LIL_DEPLOY_DIR ${CMAKE_BINARY_DIR}/deploy)
-file(TO_CMAKE_PATH "$ENV{VCToolsRedistDir}" LIL_VC_REDIST_DIR)
-if(NOT LIL_VC_REDIST_DIR)
-    message(WARNING "VCToolsRedistDir isn't set (run CMake through tools/dev-shell.ps1): the deploy target can't copy the VC++ runtime.")
+file(TO_CMAKE_PATH "$ENV{VCINSTALLDIR}" LIL_VC_INSTALL_DIR)
+if(NOT LIL_VC_INSTALL_DIR)
+    message(FATAL_ERROR "VCINSTALLDIR isn't set: configure through tools/dev-shell.ps1.")
 endif()
 add_custom_target(deploy
     COMMAND ${CMAKE_COMMAND}
@@ -35,7 +37,7 @@ add_custom_target(deploy
         -DSHIM_DLL=$<TARGET_FILE:lil-qt-shim>
         -DWEB_DLL=$<TARGET_FILE:lil-web>
         -DKDDW_QML_DIR=${LIL_KDDW_QML_DIR}
-        -DVC_REDIST_DIR=${LIL_VC_REDIST_DIR}
+        -DVC_INSTALL_DIR=${LIL_VC_INSTALL_DIR}
         -P ${CMAKE_SOURCE_DIR}/cmake/deploy.cmake
     COMMENT "Deploying to ${LIL_DEPLOY_DIR}"
     VERBATIM)
@@ -52,4 +54,4 @@ add_test(NAME deps_walk
 add_test(NAME deploy_runs_off_path
     COMMAND ${LIL_PWSH} -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_SOURCE_DIR}/tools/deploy/check-deploy.ps1
         -Deploy ${LIL_DEPLOY_DIR})
-set_tests_properties(deps_walk deploy_runs_off_path PROPERTIES LABELS deploy)
+set_tests_properties(deps_walk deploy_runs_off_path PROPERTIES LABELS deploy TIMEOUT 300)

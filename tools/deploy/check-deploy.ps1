@@ -7,14 +7,21 @@
   1. Measures the folder (every file, in MiB) against the budget: test-params.toml's
      [budgets] deploy_folder_mib once Task 29 adds it; until then 365.3 MiB, Task 0's trimmed
      332.1 MiB plus 10 % (spike 10 §8.2).
-  2. Starts the deployed lil-image.exe --smoke-exit --no-activate with spike 02's stripped
-     environment: every PATH folder of Qt, Visual Studio, MSVC or the Windows Kits removed, and
-     the Qt, QML and developer-environment variables unset. It also sets QT_QPA_PLATFORM to
-     offscreen, which lil-image must clear before Qt starts (Checkpoint A I-3), so the start
-     event must name the windows platform. Missing-DLL and crash dialogs are turned off for it.
-  3. Passes when it exits 0 within -TimeoutSec, its log (JSON lines on stderr) has `first_frame`
-     and `interactive` (with WebEngine not loaded, APP-137), it never took the foreground, and
-     the folder is within budget.
+  2. Starts the deployed lil-image.exe with spike 02's stripped environment (every PATH folder of
+     Qt, Visual Studio, MSVC or the Windows Kits removed, the developer-environment variables
+     unset) plus a hostile one: a value for every prefix lil-image clears (Checkpoint A I-3), as
+     QT_QPA_PLATFORM=offscreen, QT_PLUGIN_PATH, QT_OPENGL=software, QT_OPENGL_DLL,
+     QML_IMPORT_PATH, QML2_IMPORT_PATH, QSG_RHI_BACKEND=opengl, QV4_*, QTWEBENGINEPROCESS_PATH,
+     QTWEBENGINE_DISABLE_SANDBOX and the Vulkan loader's layer and driver variables, pointing at a
+     folder that doesn't exist. Missing-DLL and crash dialogs are turned off for it.
+     - First a refused launch, `lil-image.exe -platformpluginpath <that folder>`: it must exit 2
+       before Qt starts (no `start` line), so it opens nothing.
+     - Then `lil-image.exe --smoke-exit --no-activate`.
+  3. Passes when the smoke run exits 0 within -TimeoutSec; its log (JSON lines on stderr) has a
+     `start` with platform `windows` and no variable left to clear, import paths without the
+     hostile folder, a `first_frame` whose graphics API isn't OpenGL, and an `interactive` with
+     WebEngine not loaded (APP-137); it never took the foreground; and the folder is within
+     budget.
   Off a GitHub runner the window shows on this PC's screen, so the hands-off pop-up
   (tools/sandbox/hands-off.ps1) warns 10 s ahead and counts down; -NoHandsOff skips it.
 #>
@@ -70,6 +77,51 @@ public static uint ForegroundPid() { uint pid; GetWindowThreadProcessId(GetForeg
 # exit code, never a dialog.
 [void][LilDeployCheck.Win]::SetErrorMode(0x0001 -bor 0x0002)
 
+# The hostile values: one per cleared prefix, at a folder that doesn't exist.
+$hostile = Join-Path ([IO.Path]::GetTempPath()) ("lil-hostile-{0}" -f $PID)
+$hostileEnv = [ordered]@{
+    QT_QPA_PLATFORM = 'offscreen'
+    QT_PLUGIN_PATH = $hostile
+    QT_OPENGL = 'software'
+    QT_OPENGL_DLL = (Join-Path $hostile 'opengl32sw.dll')
+    QML_IMPORT_PATH = $hostile
+    QML2_IMPORT_PATH = $hostile
+    QSG_RHI_BACKEND = 'opengl'
+    QV4_FORCE_INTERPRETER = '1'
+    QTWEBENGINEPROCESS_PATH = (Join-Path $hostile 'QtWebEngineProcess.exe')
+    QTWEBENGINE_DISABLE_SANDBOX = '1'
+    VK_INSTANCE_LAYERS = 'VK_LAYER_lil_hostile'
+    VK_LAYER_PATH = $hostile
+    VK_ADD_LAYER_PATH = $hostile
+    VK_ICD_FILENAMES = (Join-Path $hostile 'icd.json')
+    VK_DRIVER_FILES = (Join-Path $hostile 'icd.json')
+    VK_LOADER_DEBUG = 'all'
+}
+
+function New-StartInfo([string[]]$appArgs) {
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($exe)
+    foreach ($a in $appArgs) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.WorkingDirectory = $Deploy
+    $psi.RedirectStandardError = $true
+    $psi.Environment['PATH'] = $cleanPath
+    foreach ($k in $unset) { [void]$psi.Environment.Remove($k) }
+    foreach ($k in $hostileEnv.Keys) { $psi.Environment[$k] = $hostileEnv[$k] }
+    $psi
+}
+
+# The refused launch: exit 2 before Qt starts, so no window and no `start` line.
+$r = [System.Diagnostics.Process]::Start((New-StartInfo @('-platformpluginpath', $hostile)))
+$rErr = $r.StandardError.ReadToEndAsync()
+if (-not $r.WaitForExit(15000)) { try { $r.Kill($true) } catch { }; $failures.Add('the refused launch was still running after 15 s') }
+else {
+    $r.WaitForExit()
+    $rText = $rErr.GetAwaiter().GetResult()
+    Write-Host ("refused launch (-platformpluginpath): exit {0}" -f $r.ExitCode)
+    if ($r.ExitCode -ne 2) { $failures.Add("the refused launch exited $($r.ExitCode), not 2") }
+    if ($rText -match '"event":"start"') { $failures.Add('the refused launch started Qt') }
+}
+
 # The hands-off pop-up, off CI.
 $popup = $null
 $state = $null
@@ -95,15 +147,7 @@ if (-not $NoHandsOff -and $env:GITHUB_ACTIONS -ne 'true') {
 
 # 3. The run.
 $err = Join-Path ([IO.Path]::GetTempPath()) ("lil-check-deploy-{0}.log" -f $PID)
-$psi = [System.Diagnostics.ProcessStartInfo]::new($exe)
-$psi.ArgumentList.Add('--smoke-exit')
-$psi.ArgumentList.Add('--no-activate')
-$psi.UseShellExecute = $false
-$psi.WorkingDirectory = $Deploy
-$psi.RedirectStandardError = $true
-$psi.Environment['PATH'] = $cleanPath
-foreach ($k in $unset) { [void]$psi.Environment.Remove($k) }
-$psi.Environment['QT_QPA_PLATFORM'] = 'offscreen'
+$psi = New-StartInfo @('--smoke-exit', '--no-activate')
 $code = $null
 $foreground = 0
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -127,14 +171,21 @@ $first = $events | Where-Object { $_.event -eq 'first_frame' } | Select-Object -
 $inter = $events | Where-Object { $_.event -eq 'interactive' } | Select-Object -First 1
 $qtWarnings = @($events | Where-Object { $_.event -eq 'qt_msg' -and $_.type -ne 'debug' -and $_.type -ne 'info' } | ForEach-Object { "[$($_.type)] $($_.msg)" })
 
-Write-Host ("run: exit {0} in {1:N1} s; platform {2}; first_frame {3} ms; interactive {4} ms; foreground samples {5}" -f `
-    $(if ($null -eq $code) { 'none (timed out)' } else { $code }), $sw.Elapsed.TotalSeconds, $start.platform, $first.ms, $inter.ms, $foreground)
+Write-Host ("run: exit {0} in {1:N1} s; platform {2}; first_frame {3} ms ({6}); interactive {4} ms; foreground samples {5}" -f `
+    $(if ($null -eq $code) { 'none (timed out)' } else { $code }), $sw.Elapsed.TotalSeconds, $start.platform, $first.ms, $inter.ms, $foreground, $first.graphics_api)
 $qtWarnings | Select-Object -First 10 | ForEach-Object { Write-Host "  qt: $_" }
 if ($null -eq $code) { $failures.Add("lil-image.exe didn't exit within $TimeoutSec s") }
 elseif ($code -ne 0) { $failures.Add("lil-image.exe exited $code") }
 if (-not $start) { $failures.Add('no start event') }
-elseif ($start.platform -ne 'windows') { $failures.Add("the platform was $($start.platform): QT_QPA_PLATFORM wasn't cleared before Qt started") }
+else {
+    if ($start.platform -ne 'windows') { $failures.Add("the platform was $($start.platform): QT_QPA_PLATFORM wasn't cleared before Qt started") }
+    if (@($start.env_left).Count) { $failures.Add("variables left to clear at start: $(@($start.env_left) -join ', ')") }
+}
+$imports = $events | Where-Object { $_.event -eq 'qml_import_paths' } | Select-Object -First 1
+if (-not $imports) { $failures.Add('no qml_import_paths event') }
+elseif (@($imports.paths | Where-Object { "$_" -like "*lil-hostile*" }).Count) { $failures.Add('a QML import path came from the environment') }
 if (-not $first) { $failures.Add('no first_frame event') }
+elseif ($first.graphics_api -eq 'opengl') { $failures.Add('the scene graph used OpenGL: QSG_RHI_BACKEND wasn''t cleared') }
 if (-not $inter) { $failures.Add('no interactive event') }
 elseif ($inter.webengine_loaded -ne $false) { $failures.Add('Qt6WebEngineCore.dll was loaded at interactive (APP-137)') }
 if ($foreground -gt 0) { $failures.Add("lil-image.exe took the foreground with --no-activate ($foreground samples)") }
