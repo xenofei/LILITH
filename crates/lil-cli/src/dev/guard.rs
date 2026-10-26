@@ -2821,6 +2821,8 @@ Binary files a/bin.png and b/bin.png differ\n";
             "tools/git-hooks/post-merge",
             "crates/lil-cli/src/dev/extra.rs",
             ".claude/settings.local.json",
+            // Owner decision 2026-10-26: the Windows Hello code behind every merge (QA-088).
+            "crates/lil-platform/src/hello.rs",
         ]
         .iter()
         .enumerate()

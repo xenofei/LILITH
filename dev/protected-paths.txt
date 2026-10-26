@@ -4,6 +4,7 @@ test-params.toml
 tools/git-hooks/**
 crates/lil-cli/src/dev/**
 crates/lil-dev-guard/**
+crates/lil-platform/src/hello.rs
 dev/protected-paths.txt
 dev/merge-guard.toml
 .github/workflows/ci-guard.yml
