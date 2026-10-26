@@ -444,7 +444,10 @@ fn incompatible_core_reports_incompatible_and_is_left_running() {
         let refused = session
             .call_tool("test.echo", args(json!({"text": "x"})), None, None)
             .await;
-        assert!(matches!(refused, Err(ClientError::Closed)), "{refused:?}");
+        assert!(
+            matches!(refused, Err(ClientError::NotConnected)),
+            "{refused:?}"
+        );
         session.close().await;
     });
 
@@ -552,6 +555,33 @@ fn a_failed_start_is_tried_once_until_retry_now() {
     });
     assert_eq!(failed_starts(&env), 2, "the session started another core");
     stop(&cfg);
+}
+
+/// A `retry_now` made during the attempt that starts a core, and so before that start fails,
+/// is that start's retry, not a second start. Both are sent before the session's task first
+/// runs (a current-thread runtime), so they reach it while the attempt is under way, with no
+/// timing involved: only the end of the failed start decides.
+#[test] // spec: ARCH-100, CORE-004, ARCH-018
+fn retries_during_a_start_give_one_start() {
+    let env = TestEnv::new();
+    let cfg = config(&env);
+    let db = env.env.suite_state_db();
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
+    runtime().block_on(async {
+        let session = Session::start(cfg.clone(), Vec::new());
+        session.retry_now();
+        session.retry_now();
+        let mut state = session.state();
+        wait_state(&mut state, "Unavailable", |s| {
+            matches!(s, SessionState::Unavailable { .. })
+        })
+        .await;
+        // A second start would follow the first one's failure at once.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(failed_starts(&env), 1, "the retries started another core");
+        session.close().await;
+    });
 }
 
 /// P4a-R33: after each failed attempt the session waits 250 ms, doubling up to 5 s.

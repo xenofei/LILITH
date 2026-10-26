@@ -416,6 +416,27 @@ fn damaged_state_db_is_a_plain_start_failure() {
     assert_eq!(sha256_file(&db), before, "{} was changed", db.display());
 }
 
+/// A core executable that cannot be launched is its own kind of error, so callers never
+/// read the message to tell it from other I/O errors (ARCH-018).
+#[test] // spec: ARCH-018
+fn a_core_that_cannot_be_launched_is_cannot_start() {
+    let env = TestEnv::new();
+    let mut cfg = config(&env);
+    let missing = env.root().join("no such bin").join("lil-core.exe");
+    cfg.core_exe = missing.clone();
+
+    let err = connect_async(&cfg).expect_err("connected without a core executable");
+    match &err {
+        ClientError::CannotStart { exe, .. } => assert_eq!(exe, &missing),
+        other => panic!("expected CannotStart, got {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(
+        text.starts_with("Cannot start the LILITH core ") && text.contains("no such bin"),
+        "{text}"
+    );
+}
+
 #[test] // spec: ARCH-110, ARCH-035
 fn call_mints_an_idempotency_key() {
     let env = TestEnv::new();
