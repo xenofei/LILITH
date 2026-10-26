@@ -26,7 +26,7 @@ Agents write most of the code here. The guard makes sure two things stay true ho
 
 - A change to a **protected file** reaches `main` only after the reviewer App has approved that exact commit, and the App can approve only when you type its passphrase at a terminal.
 - Every merge goes through `lil dev merge <PR>`, which checks everything first. You run it, never an agent (owner decision; standing rule since the rename, recorded 2026-10-21).
-- Every merge into `main` carries the reviewer App's approval of the PR's exact head commit, protected files or not, and only your Windows Hello or passphrase can post it. `lil dev merge` and `lil dev merge-flow` post it after you authenticate. GitHub refuses a merge without it, because `protected-test-check` fails on a PR whose head the App hasn't approved (owner decision 2026-10-26). This needs the two ruleset settings in section 2.4.1.
+- Every merge into `main` carries the reviewer App's approval of the PR's exact head commit, protected files or not, and only your Windows Hello or passphrase can post it. `lil dev merge` and `lil dev merge-flow` post it after you authenticate. GitHub refuses a merge into `main` without it when the merge is made with the agent token or any other account without admin rights, because `protected-test-check` fails on a PR whose head the App hasn't approved (owner decision 2026-10-26). Your own admin login can still change the ruleset or bypass it; agents never use it (section 2.7). This needs the two ruleset settings in section 2.4.1.
 
 Protected files are the ones that decide whether the tests and the guard itself can be trusted: spec tests, golden files, recorded fixtures, committed property-test seeds, `test-params.toml`, the hook scripts, the sources of `lil dev merge` and the guard, the settings in `dev/`, every workflow under `.github/workflows/`, `.claude/**`, `.cargo/**`, and a few build files (QA-019). The authoritative list is `dev/protected-paths.txt`. Only **adding** a file under the test homes (`crates/lil-spec-tests/**` and `**/proptest-regressions/**`) is free. Modifying or deleting any protected file, or adding one anywhere else, needs approval (QA-020).
 
@@ -195,7 +195,7 @@ If the check picker offers only checks that have already run in the repository, 
 
 #### 2.4.1 The owner's approval on every merge (owner decision 2026-10-26)
 
-`protected-test-check` fails on any PR whose head commit the reviewer App hasn't approved, and only your authentication in `lil dev merge` or `lil dev merge-flow` posts that approval. For GitHub to refuse a merge that skips you, two settings of the ruleset above must hold. Agents never change them; you do, in the browser:
+`protected-test-check` fails on any PR whose head commit the reviewer App hasn't approved, and only your authentication posts that approval: in `lil dev merge` or `lil dev merge-flow`, or, for protected changes, in `lil dev approve`. An approval from `lil dev approve` also lets that commit merge once CI is green. For GitHub to refuse a merge made with the agent token that skips you, two settings of the ruleset above must hold. Agents never change them; you do, in the browser:
 
 1. **The ruleset on `main` requires `protected-test-check`.** Settings → Rules → Rulesets → the ruleset on `main` → **Require status checks to pass** → the list of checks includes `protected-test-check`. If it doesn't, choose **Add checks**, type `protected-test-check` and add it.
 2. **Its expected source is GitHub Actions.** In the same list, the source shown next to `protected-test-check` is **GitHub Actions**, not "Any source". If it says "Any source", pick **GitHub Actions** from that check's source menu. A commit status posted with any other token, the agent token included, then can't stand in for the check.
@@ -204,7 +204,16 @@ Save the ruleset (**Save changes**). The ruleset described above already has bot
 
 Until both hold, nothing breaks: the check runs on every PR and `lil dev merge` still requires it to pass, but GitHub doesn't refuse a merge made around `lil` (for example through the API with the agent token once the other checks are green).
 
-What it doesn't cover: the workflow file a PR's check runs comes from the PR, so a PR that changes `.github/workflows/ci-guard.yml` changes its own check. The agent token can't push workflow changes (section 7, check 4), and the post-merge check judges every push to `main` from `main`.
+**Right after the PR that brought this in merges:** PRs that were already open keep the green `protected-test-check` they got from the older `lil`, so until it runs again the agent token could merge them without you. Claude starts a fresh run of the check on every open PR into `main` right after that merge, a normal CI run that changes no setting. The agent token can't press **Re-run** (it has Actions: Read only), so Claude closes and reopens each PR, which starts a new run on the same commit, or pushes a new commit to it. Each one then shows the check red until it is merged with `lil dev merge`. You can also re-run them yourself in the browser: the run's page → **Re-run all jobs**.
+
+**An approval is a standing grant for its commit.** While it stands, that commit can be merged once CI is green, by anyone who can call GitHub's merge API. So `lil dev merge` and `lil dev merge-flow` ask nothing while another required check has already failed on the commit, and when they stop without merging after posting the approval (a CI failure, the 20-minute wait running out, a moved head, an error or Ctrl+C), they dismiss the approval again and say so. If the dismissal fails, the message says the approval still stands: dismiss it on the PR's page (the review's **…** menu → **Dismiss review**).
+
+What it doesn't cover:
+
+- The workflow file a PR's check runs comes from the PR, so a PR that changes `.github/workflows/ci-guard.yml` changes its own check. The agent token can't push workflow changes (section 7, check 4), and the post-merge check judges every push to `main` from `main` and flags a merged PR without the App's approval of its head.
+- Your own full-access login (gh's stored login, git's stored login) can change the ruleset, bypass it or push a workflow change. The guarantee holds only while agents use nothing stronger than the agent token (section 2.7).
+
+**If every PR stays red.** Every merge now depends on the reviewer App (its key, an installation token and its Actions write permission for the re-run) and on CI reading the PR's reviews. If a change on `main` breaks that (a bug in `lil dev guard --pr`, a change to GitHub's reviews API or to the workflow token's permissions), every PR shows `protected-test-check` red, including the PR that fixes it. To get out: in the ruleset on `main`, remove `protected-test-check` from the required checks, merge the fix, then add the check back (source GitHub Actions) at once. While it is removed, GitHub doesn't refuse merges made around `lil`. A check that is red only because it read the reviews just before the approval landed is cured by running the merge again.
 
 **Other settings:**
 
@@ -302,14 +311,16 @@ Until the installation accepts, `lil dev approve` still posts approvals, then pr
 
 Agents must have no credential stronger than the agent token. Step 2.6 gives git that token. This step covers the other door: the GitHub CLI (`gh`), which uses whatever login is stored for the Windows user.
 
+**Agents push and call GitHub with the agent token only** (owner decision 2026-10-26). Your own `gh` login keeps its full rights for your own work, and agents never use it. That is what the merge gate in section 2.4.1 relies on: GitHub refuses a merge into `main` that you didn't authenticate when it comes from the agent token, not when it comes from your admin login.
+
 Your full-access login can stay on the PC when other projects need it. This repository then relies on the following, in layers:
 
 1. **git here uses only the agent token.** `lil dev install-hooks` (step 2.6) sets a repo-local credential helper, so pushes and fetches in this clone never use the stored full-access login.
 2. **Agents can't run `gh` directly.** The project's Claude Code settings (`.claude/settings.json`) deny `gh`, `gh.exe` and a path to either, in both the Bash and PowerShell tools, including inside compound commands (`cd x && gh ...`). Agents use `lil dev gh -- <gh arguments>` instead. It runs `gh` with the agent token in the child process only, never your login, and refuses merge, auth and write API calls (see `lil dev gh --help` for what it allows). The older narrower rules (`gh pr merge`, `gh auth token` and so on) stay in the list as a second layer.
-3. **GitHub's ruleset on `main` has no bypass** (section 2.4), so nobody, you included, can push to `main` or merge without the required checks. This holds whatever credential is used.
+3. **GitHub's ruleset on `main` has no bypass list** (section 2.4), so no account without admin rights can push to `main` or merge without the required checks. An admin login, yours included, can still edit or switch off the ruleset itself, and then merge.
 4. **The settings file is a protected path.** Changing the deny rules needs your approval of the pull request (`lil dev approve`).
 
-**What this does not stop.** The deny rules read the command text an agent writes, not the program it ends up running. They don't stop a script or subprocess that calls `gh` (`bash -c`, `pwsh -c`, `cmd /c`, `env gh`, Python), a copy of `gh.exe` under another name, or a program that reads the stored login directly (gh's own config file or the Windows Credential Manager entry) and calls the GitHub API. **Your login remains reachable to a determined process running as the same Windows user.** The ruleset still stops that process from landing code on `main`, but it could do other things your login can do, such as changing repository settings. The rules guard against a plain command and an agent's habits, not against an agent that goes around them.
+**What this does not stop.** The deny rules read the command text an agent writes, not the program it ends up running. They don't stop a script or subprocess that calls `gh` (`bash -c`, `pwsh -c`, `cmd /c`, `env gh`, Python), a copy of `gh.exe` under another name, or a program that reads the stored login directly (gh's own config file or the Windows Credential Manager entry) and calls the GitHub API. **Your login remains reachable to a determined process running as the same Windows user.** Such a process could do anything your login can do: change repository settings, edit or switch off the ruleset, push a workflow change, and then land code on `main`. The ruleset stops it only while it uses nothing stronger than the agent token. The rules guard against a plain command and an agent's habits, not against an agent that goes around them.
 
 **Owner-only work** (settings, App and token pages, anything needing your login) is best done in the browser, not through an agent session.
 
@@ -351,7 +362,7 @@ You run every merge (owner decision; standing rule since the rename, recorded 20
 cargo run -q -p lil-cli -- dev merge <PR>
 ```
 
-It shows the PR's head commit, its files, its protected changes and CI on that commit, and asks for your authentication (Windows Hello when enrolled, else the reviewer key's passphrase; `--passphrase` skips Windows Hello). Only then does it post the reviewer App's approval of that commit, protected files or not, re-run `protected-test-check`, wait for CI to pass on that commit and merge it, pinned to that commit (owner decision 2026-10-26). Before that, `protected-test-check` is red on every PR: that is expected. `lil dev merge-flow` does the same, with an agent's summary and an independent audit shown first.
+It shows the PR's head commit, its files, its protected changes and CI on that commit, and asks for your authentication (Windows Hello when enrolled, else the reviewer key's passphrase; `--passphrase` skips Windows Hello). Only then does it post the reviewer App's approval of that commit, protected files or not, re-run `protected-test-check`, wait for CI to pass on that commit and merge it, pinned to that commit (owner decision 2026-10-26). Before that, `protected-test-check` is red on every PR: that is expected. If another required check has already failed on that commit, it asks nothing and says which. If it stops without merging after posting the approval, it dismisses the approval and says so. `lil dev merge-flow` does the same, with an agent's summary and an independent audit shown first.
 
 You can still approve protected changes on their own first, with `lil dev approve`, as below.
 
