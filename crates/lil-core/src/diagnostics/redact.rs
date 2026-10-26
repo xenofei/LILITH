@@ -23,8 +23,10 @@
 //! 6. **Well-known secret formats**, with no key before them: GitHub tokens (`gh[pousr]_…`,
 //!    `github_pat_…`), Hugging Face (`hf_…`), Anthropic and OpenAI keys (`sk-ant-…`, `sk-…`),
 //!    age secret keys (`AGE-SECRET-KEY-1…`), Slack (`xox[abpr]-…`), AWS key ids (`AKIA…`) and
-//!    JWT-shaped tokens (`eyJ….….…`): where a word starts, and with a body of [`GLUED_BODY`]
-//!    or more glued to a word too (`j_sk-ant-…`; Checkpoint A walkthrough).
+//!    JWT-shaped tokens (`eyJ….….…`): where a word starts, and glued to a word too
+//!    (`j_sk-ant-…`; Checkpoint A walkthrough) with a body of [`GLUED_BODY`] or more that
+//!    looks like a secret ([`looks_secret`]; a JWT needs only the length). Each body is read
+//!    once, so the work grows linearly with the text.
 //! 7. **Credential Manager targets**: [`names::APP_NAME`] or [`names::LEGACY_APP_NAME`], an
 //!    optional `-<channel>`, then `/<name>`, in any letter case; a quoted target to its quote.
 //! 8. **E-mail addresses** (`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`).
@@ -443,6 +445,9 @@ thread_local! {
     /// How many bytes [`Runs::new`] has read on this thread: the redaction's work on runs of
     /// `\`, which must grow linearly with the text.
     static RUN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many bytes [`known_tokens`] has read for token bodies on this thread: its work,
+    /// which must grow linearly with the text.
+    static TOKEN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The `ESC` at byte `i` of `runs`' text, in any spelling of [`EscForm`].
@@ -1260,20 +1265,45 @@ const TOKEN_FORMATS: &[TokenFormat] = &[
 ];
 
 /// The shortest body (after its prefix) of a well-known secret glued to a word, such as an
-/// id's `j_` before it: a shorter one counts only where a word starts, so an ordinary word
-/// (`task-list`) is never taken for a key.
+/// id's `j_` before it; it must also look like a secret ([`looks_secret`]). A shorter one
+/// counts only where a word starts.
 pub const GLUED_BODY: usize = 32;
 
-/// Every well-known secret (rule 6) replaced, wherever it is: at a word's start, or with a
-/// body of [`GLUED_BODY`] or more glued to a word too.
+/// Whether a body glued to a word looks like a secret rather than a name (CA-walk review):
+/// at least two digits and two letters, and one part between `-` and `_` of 16 characters or
+/// more holding both letters and digits. A hyphenated name (`task-generate-…-batch-01`) has
+/// no such part. Whatever fails this, every suffix of it fails too.
+fn looks_secret(body: &[u8]) -> bool {
+    let digits = body.iter().filter(|c| c.is_ascii_digit()).count();
+    let letters = body.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    digits >= 2
+        && letters >= 2
+        && body.split(|c| matches!(c, b'-' | b'_')).any(|part| {
+            part.len() >= 16
+                && part.iter().any(u8::is_ascii_digit)
+                && part.iter().any(u8::is_ascii_alphabetic)
+        })
+}
+
+/// Every well-known secret (rule 6) replaced, wherever it is: at a word's start, or glued to a
+/// word with a body of [`GLUED_BODY`] or more that looks like a secret. A body is read only at
+/// its format's prefix, and once a long glued body fails, no later glued start inside it is
+/// read again (its body is a suffix of the one that failed, so it fails too): the work is
+/// linear in the text (CA-walk review).
 fn known_tokens(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let run = |from: usize, ok: fn(u8) -> bool| {
-        b[from.min(b.len())..]
+        let n = b[from.min(b.len())..]
             .iter()
             .take_while(|c| ok(**c))
-            .count()
+            .count();
+        #[cfg(test)]
+        TOKEN_BYTES.with(|t| t.set(t.get() + n + 1));
+        n
     };
+    // Where each format's last long glued body that failed ends, and the JWT's.
+    let mut dead = [0usize; TOKEN_FORMATS.len()];
+    let mut jwt_dead = 0usize;
     let mut out = Out::new(s);
     let mut i = 0;
     while i < b.len() {
@@ -1282,33 +1312,54 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
             i += 1;
             continue;
         }
-        // Glued to a word, only a long body counts (Checkpoint A walkthrough, ODD-7).
-        let at_word = starts_word(s, i, |c| c.is_ascii_alphanumeric() || c == '_', cx);
-        let mut end = TOKEN_FORMATS.iter().find_map(|f| {
+        let mut word_start: Option<bool> = None;
+        let mut at_word = || {
+            *word_start.get_or_insert_with(|| {
+                starts_word(s, i, |c| c.is_ascii_alphanumeric() || c == '_', cx)
+            })
+        };
+        let mut end = None;
+        for (k, f) in TOKEN_FORMATS.iter().enumerate() {
             let p = f.prefix.as_bytes();
             let body = i + p.len();
+            if b.get(i..body) != Some(p) {
+                continue;
+            }
+            let word = at_word();
+            if !word && body < dead[k] {
+                continue;
+            }
             let len = run(body, f.body);
-            let min = if at_word {
-                f.min
-            } else {
-                f.min.max(GLUED_BODY)
-            };
-            (b.get(i..body) == Some(p) && len >= min).then_some(body + len)
-        });
+            if word {
+                if len >= f.min {
+                    end = Some(body + len);
+                    break;
+                }
+            } else if len >= f.min.max(GLUED_BODY) {
+                if looks_secret(&b[body..body + len]) {
+                    end = Some(body + len);
+                    break;
+                }
+                dead[k] = body + len;
+            }
+        }
         // A JWT: three base64url parts, the first a JSON header (`eyJ`).
-        if end.is_none() && b[i..].starts_with(b"eyJ") {
+        if end.is_none() && b[i..].starts_with(b"eyJ") && i >= jwt_dead {
+            let word = at_word();
             let one = run(i, alnum_dash_under);
             let two = (b.get(i + one) == Some(&b'.')).then(|| run(i + one + 1, alnum_dash_under));
             let three = two.filter(|t| *t >= 8).and_then(|t| {
                 let at = i + one + 1 + t;
                 (b.get(at) == Some(&b'.')).then(|| (at, run(at + 1, alnum_dash_under)))
             });
-            if one >= 10
-                && let Some((at, len)) = three
-                && len >= 8
-                && (at_word || at + 1 + len - (i + 3) >= GLUED_BODY)
-            {
-                end = Some(at + 1 + len);
+            match three {
+                Some((at, len)) if one >= 10 && len >= 8 => {
+                    if word || at + 1 + len - (i + 3) >= GLUED_BODY {
+                        end = Some(at + 1 + len);
+                    }
+                }
+                // No later start inside this first part can be a JWT either.
+                _ => jwt_dead = i + one,
             }
         }
         match end {
@@ -2156,12 +2207,56 @@ mod tests {
                 assert_eq!(n, 1, "{text} -> {out}");
             }
         }
+        // A long ordinary name glued to a prefix isn't a key either (review M-1): its body
+        // doesn't look like a secret.
+        let letters = "abcdefghijklmnopqrstuvwxyzabcdef";
         for text in [
             "the_disk-cleanup-of-old-files ran",
             "a whisk-and-bowl-kind-of-thing",
             "mask_ghp_short",
+            "task-generate-character-portraits-batch-01",
+            "risk-assessment-for-the-new-castle-level-two",
+            "comfy.inventory · whisk-and-bowl-kind-of-thing-for-the-kitchen-scene · 3 s",
+            "task-sdxl-v2-portraits-x4-upscale-batch-0003",
+            &format!("graph_of_leaf_nodes_hf_{letters}"),
+            &format!("level_ghp_{letters}{letters}"),
         ] {
             assert_eq!(r.text(text), (text.to_string(), 0), "{text}");
+        }
+    }
+
+    /// Review I-2: [`known_tokens`] reads each body once, so its work grows linearly with the
+    /// text however many prefixes a long word holds (it was quadratic: every `g`, `h`, `s`,
+    /// `A`, `x` or `e` inside a word read the rest of the word again). Work is counted, never
+    /// timed.
+    #[test] // spec: ARCH-121
+    fn known_tokens_cost_linear_work() {
+        for unit in [
+            "ghsAxe0123456789",
+            "ask-",
+            "ghp_",
+            "ahf_",
+            "eyJa",
+            "xoxb-",
+            "AKIAZ",
+            "s",
+        ] {
+            let work = |n: usize| {
+                let text = format!("x{}", unit.repeat(n));
+                TOKEN_BYTES.with(|c| c.set(0));
+                let mut cx = Cx::default();
+                let _ = known_tokens(&text, &mut cx);
+                (TOKEN_BYTES.with(std::cell::Cell::get), text.len())
+            };
+            let ((small, small_len), (large, large_len)) = (work(2_500), work(10_000));
+            assert!(
+                small <= small_len * 40,
+                "{unit:?}: {small} bytes read for {small_len}"
+            );
+            assert!(
+                large <= large_len * 40,
+                "{unit:?}: {large} bytes read for {large_len} ({small} for {small_len})"
+            );
         }
     }
 
