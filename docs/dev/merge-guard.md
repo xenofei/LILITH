@@ -26,6 +26,7 @@ Agents write most of the code here. The guard makes sure two things stay true ho
 
 - A change to a **protected file** reaches `main` only after the reviewer App has approved that exact commit, and the App can approve only when you type its passphrase at a terminal.
 - Every merge goes through `lil dev merge <PR>`, which checks everything first. You run it, never an agent (owner decision; standing rule since the rename, recorded 2026-10-21).
+- Every merge into `main` carries the reviewer App's approval of the PR's exact head commit, protected files or not, and only your Windows Hello or passphrase can post it. `lil dev merge` and `lil dev merge-flow` post it after you authenticate. GitHub refuses a merge without it, because `protected-test-check` fails on a PR whose head the App hasn't approved (owner decision 2026-10-26). This needs the two ruleset settings in section 2.4.1.
 
 Protected files are the ones that decide whether the tests and the guard itself can be trusted: spec tests, golden files, recorded fixtures, committed property-test seeds, `test-params.toml`, the hook scripts, the sources of `lil dev merge` and the guard, the settings in `dev/`, every workflow under `.github/workflows/`, `.claude/**`, `.cargo/**`, and a few build files (QA-019). The authoritative list is `dev/protected-paths.txt`. Only **adding** a file under the test homes (`crates/lil-spec-tests/**` and `**/proptest-regressions/**`) is free. Modifying or deleting any protected file, or adding one anywhere else, needs approval (QA-020).
 
@@ -37,7 +38,7 @@ No single mechanism is trusted on its own. A local check can be skipped, so each
 | --- | --- |
 | **Git hooks** (`tools/git-hooks`) | `pre-push` refuses any push that changes `main` and runs the privacy scan on every pushed branch and tag. `pre-merge-commit` refuses a local merge into `main`. Installed by `lil dev install-hooks`. |
 | **Credential helper** | `lil dev install-hooks` also makes git in that clone use only the agent token (`lil dev git-credential`), not any personal login. |
-| **`lil dev merge <PR>`** | Merges through GitHub's merge API, pinned to the exact head commit it checked. Refuses unless CI is green, protected changes are approved, and the hooks and credential helper are installed. |
+| **`lil dev merge <PR>`** | Asks for your authentication, posts the reviewer App's approval of the PR's head commit, waits for CI, then merges through GitHub's merge API, pinned to that exact commit. Refuses unless CI is green, the App approved that commit, and the hooks and credential helper are installed. |
 | **Ruleset on `main`** (GitHub) | Requires a pull request and the four checks below, blocks force-push and deletion, no bypass. This is the server-side backstop. |
 | **CI checks** | See the next table. |
 | **Post-merge check** (`post-merge.yml`) | Runs after every push to `main`. If a commit got in without a merged PR, or a protected change got in without the App's approval, or the tests fail, it opens a **revert PR** and an **issue** assigned to the owner (section 4). |
@@ -50,7 +51,7 @@ No single mechanism is trusted on its own. A local check can be skipped, so each
 | --- | --- | --- |
 | `every-push` | `ci-push.yml` | Runs on every push to a branch other than `main`: rustfmt, clippy, cargo-deny, the workspace tests, the spec tests and the spec traceability report. |
 | `pr-ready` | `ci-pr-ready.yml` | Runs on every pull request: everything `every-push` runs, plus cargo-audit and a release build. On a **draft** PR it fails on purpose (a skipped required check would count as passing). Marking the PR ready for review runs it again. |
-| `protected-test-check` | `ci-guard.yml` | Judges the PR's head commit with `lil` built from `main` (the PR's own code is never run). Fails when a protected file is modified or deleted without the reviewer App's approval of that exact commit. Runs when a PR is opened, pushed to or reopened (not on reviews, not on draft-to-ready), and never cancels a run for the same commit. Every run is its own check suite, so a commit can have more than one (after a close and reopen) and the merge needs all of them green; `lil dev approve` re-runs the red ones after posting the approval. |
+| `protected-test-check` | `ci-guard.yml` | Judges the PR's head commit with `lil` built from `main` (the PR's own code is never run). Fails unless the reviewer App approved that exact commit, on every PR, protected files or not (owner decision 2026-10-26). So it is red on every PR until you merge it with `lil dev merge`, which posts the approval and re-runs it. Runs when a PR is opened, pushed to or reopened (not on reviews, not on draft-to-ready), and never cancels a run for the same commit. Every run is its own check suite, so a commit can have more than one (after a close and reopen) and the merge needs all of them green; `lil dev approve` re-runs the red ones after posting the approval. |
 | `privacy-check` | `ci-push.yml` | Runs `lil dev privacy-scan` on every commit of the pushed branch that `main` lacks. It fails if the `LIL_PRIVACY_DENYLIST` secret is missing or empty. |
 
 A second privacy job, `privacy-check-pr`, runs on pull requests and shows the same verdict there. It is not a required check, because a required check name must come from exactly one job. `nightly.yml` (release build and coverage) is not required either.
@@ -192,6 +193,19 @@ The names below are GitHub's at the time of writing. If a page has moved, look f
 
 If the check picker offers only checks that have already run in the repository, push a throwaway branch and open a throwaway PR first so the four names exist, then add them to the ruleset. Add the ruleset as soon as the names are available.
 
+#### 2.4.1 The owner's approval on every merge (owner decision 2026-10-26)
+
+`protected-test-check` fails on any PR whose head commit the reviewer App hasn't approved, and only your authentication in `lil dev merge` or `lil dev merge-flow` posts that approval. For GitHub to refuse a merge that skips you, two settings of the ruleset above must hold. Agents never change them; you do, in the browser:
+
+1. **The ruleset on `main` requires `protected-test-check`.** Settings → Rules → Rulesets → the ruleset on `main` → **Require status checks to pass** → the list of checks includes `protected-test-check`. If it doesn't, choose **Add checks**, type `protected-test-check` and add it.
+2. **Its expected source is GitHub Actions.** In the same list, the source shown next to `protected-test-check` is **GitHub Actions**, not "Any source". If it says "Any source", pick **GitHub Actions** from that check's source menu. A commit status posted with any other token, the agent token included, then can't stand in for the check.
+
+Save the ruleset (**Save changes**). The ruleset described above already has both if it was set up as written; then there is nothing to change, only to check.
+
+Until both hold, nothing breaks: the check runs on every PR and `lil dev merge` still requires it to pass, but GitHub doesn't refuse a merge made around `lil` (for example through the API with the agent token once the other checks are green).
+
+What it doesn't cover: the workflow file a PR's check runs comes from the PR, so a PR that changes `.github/workflows/ci-guard.yml` changes its own check. The agent token can't push workflow changes (section 7, check 4), and the post-merge check judges every push to `main` from `main`.
+
 **Other settings:**
 
 1. **Pull requests restricted to collaborators** (Settings → General, pull request creation, or the equivalent current location).
@@ -331,13 +345,15 @@ Agents never run `lil dev approve` or `lil dev merge`: the owner runs both, from
 
 ### What the owner does
 
-You run every merge, and approve protected changes first when a PR has them (owner decision; standing rule since the rename, recorded 2026-10-21). To merge, in the same clean checkout described in step 2 below:
+You run every merge (owner decision; standing rule since the rename, recorded 2026-10-21). To merge, in the same clean checkout described in step 2 below, updated first (`git pull --ff-only`):
 
 ```powershell
 cargo run -q -p lil-cli -- dev merge <PR>
 ```
 
-It merges only when CI is green for the PR's current head commit, any protected changes are approved, and the merge can be pinned to that commit.
+It shows the PR's head commit, its files, its protected changes and CI on that commit, and asks for your authentication (Windows Hello when enrolled, else the reviewer key's passphrase; `--passphrase` skips Windows Hello). Only then does it post the reviewer App's approval of that commit, protected files or not, re-run `protected-test-check`, wait for CI to pass on that commit and merge it, pinned to that commit (owner decision 2026-10-26). Before that, `protected-test-check` is red on every PR: that is expected. `lil dev merge-flow` does the same, with an agent's summary and an independent audit shown first.
+
+You can still approve protected changes on their own first, with `lil dev approve`, as below.
 
 To approve a protected change:
 
@@ -377,7 +393,8 @@ An approval covers one commit. If anything is pushed to the PR after you approve
 
 | What it says (shortened) | What it means | What to do |
 | --- | --- | --- |
-| "Protected files changed and the reviewer app hasn't approved this exact commit: ..." | The PR changes protected files and the App hasn't approved this commit, or approved an older one. | The owner runs `lil dev approve <PR>` when asked (above). Agents don't retry. |
+| "Protected files changed and the reviewer app hasn't approved this exact commit: ..." | The PR changes protected files and the App hasn't approved this commit, or approved an older one. | The owner runs `lil dev merge <PR>` again, which posts the approval after authentication, or `lil dev approve <PR>` first. Agents don't retry. |
+| `protected-test-check` red with "Not approved: lilith-reviewer[bot] hasn't approved ..." | The App hasn't approved the PR's current head commit. Expected on every PR until you merge it. | Nothing: `lil dev merge <PR>` posts the approval after your authentication and re-runs the check. After a new push, the old approval no longer counts. |
 | "The PR's head moved after the checks passed, so GitHub refused the pinned merge." | A commit was pushed between the check and the merge. Nothing was merged. | Run `lil dev merge <PR>` again. If the PR has protected changes, it needs a fresh approval of the new head. |
 | "CI check ... hasn't reported for ... yet" / "is still running" / "finished as failure, not success" | A required check hasn't run, hasn't finished or failed on that exact commit. | Wait, or fix the failure and push. `every-push` and `privacy-check` start on a push, while `pr-ready` and `protected-test-check` start on PR events. A draft PR fails `pr-ready` on purpose: mark it ready for review. |
 | "The git hooks aren't installed ..." or "The agent credential helper isn't installed ..." | This clone isn't set up, or someone changed `core.hooksPath` or the credential helper. | Run `lil dev install-hooks` in the clone. Nothing was contacted. |
@@ -395,7 +412,7 @@ An approval covers one commit. If anything is pushed to the PR after you approve
 | --- | --- |
 | "only runs at a real terminal" | Run it from PowerShell or Windows Terminal, not from a script or an agent session. |
 | "there is no reviewer key at ...; run `lil dev reviewer-setup` first" | Do section 2.5 on this PC. |
-| "nothing protected to approve" | The PR changes no protected file, so it needs no approval. |
+| "nothing protected to approve" | The PR changes no protected file. `lil dev merge <PR>` posts the approval every merge needs when you authenticate. |
 | "wrong passphrase; nothing was posted" | Try again. |
 | "the PR head moved since the summary; nothing was approved" | The PR changed while you read it. Run `approve` again and read the new summary. |
 | "PR #... is closed / a draft / targets ..." | Fix the PR first. |
