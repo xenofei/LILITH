@@ -8,8 +8,9 @@
 //!   topic keeps only its newest event ([`PREVIEW_HISTORY`]): a late subscriber wants only the
 //!   newest frame. A publish also prunes every topic once per [`SWEEP_EVERY`], so a topic
 //!   nothing publishes to any more (a finished job's) holds nothing once its events are
-//!   [`HISTORY_SECS`] old; a topic's seq is never forgotten, so cursors stay valid (Appendix G
-//!   "Events").
+//!   [`HISTORY_SECS`] old; a topic's seq is kept, so cursors stay valid, except that a per-job
+//!   topic (`job:`, `preview:`) no client follows is forgotten once empty, and a later cursor
+//!   of it is beyond its seq (Appendix G "Events").
 //! - **Subscribing with a cursor `s`.** `s` equal to the topic's current seq replays nothing;
 //!   a history that still holds `s+1..=current` replays those events in order; anything else
 //!   (older than the history, or beyond the current seq, such as a cursor from an earlier
@@ -224,6 +225,14 @@ impl EventBus {
             for (name, other) in &mut inner.topics {
                 prune(&mut other.history, now, history_max(name));
             }
+            // A per-job topic no client follows is forgotten once it is empty: a finished
+            // job's topics would otherwise stay for the core's lifetime (review fix M-4).
+            let clients = &inner.clients;
+            inner.topics.retain(|name, t| {
+                !(t.history.is_empty()
+                    && (name.starts_with("job:") || name.starts_with("preview:"))
+                    && !clients.values().any(|c| c.topics.contains(name)))
+            });
         }
 
         let item = Queued {
@@ -499,6 +508,12 @@ impl EventBus {
             .clients
             .get(&client)
             .map_or(0, |c| c.pending.lock().len())
+    }
+
+    /// Whether the bus still keeps `topic` (its seq and history).
+    #[cfg(test)]
+    fn knows(&self, topic: &str) -> bool {
+        self.lock().topics.contains_key(topic)
     }
 
     /// How many events `topic`'s history holds now.
@@ -1137,26 +1152,55 @@ mod tests {
         assert_eq!(bus.queued(1), 4);
     }
 
-    /// Checkpoint A I1: a topic nothing publishes to any more (a finished job's `job:` and
-    /// `preview:` topics) is pruned by the sweep a publish on another topic runs; its seq stays.
+    /// Checkpoint A I1: a topic nothing publishes to any more is pruned by the sweep a publish
+    /// on another topic runs; its seq stays.
     #[tokio::test] // spec: ARCH-032, CORE-012
     async fn a_quiet_topics_history_is_swept_by_a_publish_elsewhere() {
         let (clock, bus) = bus();
         for n in 0..5 {
-            bus.publish("job:j_1", json!(n));
+            bus.publish("test:quiet", json!(n));
         }
-        assert_eq!(bus.retained("job:j_1"), 5);
+        assert_eq!(bus.retained("test:quiet"), 5);
         clock.advance(Duration::from_secs(HISTORY_SECS + 1));
         bus.publish("jobs", json!("elsewhere"));
         assert_eq!(
-            bus.retained("job:j_1"),
+            bus.retained("test:quiet"),
             0,
             "swept without a publish of its own"
         );
         assert_eq!(bus.retained("jobs"), 1);
-        let states = bus.subscribe(1, &names(&["job:j_1"]), &cursors(&[])).await;
-        assert_eq!(states, [state("job:j_1", 5)], "the seq is kept");
-        assert_eq!(bus.publish("job:j_1", json!(5)), 6);
+        let states = bus
+            .subscribe(1, &names(&["test:quiet"]), &cursors(&[]))
+            .await;
+        assert_eq!(states, [state("test:quiet", 5)], "the seq is kept");
+        assert_eq!(bus.publish("test:quiet", json!(5)), 6);
+    }
+
+    /// Review M-4: a per-job topic (`job:`, `preview:`) that no client follows is forgotten
+    /// once the sweep empties it; one a client follows, and any other topic, keeps its seq.
+    #[tokio::test] // spec: ARCH-032, CORE-012
+    async fn an_emptied_per_job_topic_nobody_follows_is_forgotten() {
+        let (clock, bus) = bus();
+        bus.subscribe(1, &names(&["job:j_2"]), &cursors(&[])).await;
+        for topic in ["job:j_1", "preview:j_1", "job:j_2", "test:other"] {
+            bus.publish(topic, json!(1));
+        }
+        clock.advance(Duration::from_secs(HISTORY_SECS + 1));
+        bus.publish("jobs", json!("elsewhere"));
+        assert!(!bus.knows("job:j_1"));
+        assert!(!bus.knows("preview:j_1"));
+        assert!(bus.knows("job:j_2"), "a client follows it");
+        assert!(bus.knows("test:other"), "not a per-job topic");
+        // A cursor of a forgotten topic is beyond its seq: resync_required, as for another
+        // core's cursor.
+        let states = bus
+            .subscribe(2, &names(&["job:j_1"]), &cursors(&[("job:j_1", 1)]))
+            .await;
+        assert_eq!(states, [state("job:j_1", 0)]);
+        assert_eq!(
+            bus.queued_events(2),
+            [event("job:j_1", 0, EventKind::ResyncRequired, Value::Null)]
+        );
     }
 
     /// Checkpoint A I1: a `preview:<job_id>` topic keeps only its newest frame.
