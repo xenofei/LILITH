@@ -1,0 +1,42 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_PREFIX_PATH": "$env{LIL_QT_DIR}"
+      }
+    },
+    { "name": "dev", "inherits": "base", "displayName": "Development (build/dev)" },
+    { "name": "ci", "inherits": "base", "displayName": "CI (build/ci)" }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev", "targets": ["all", "deploy"] },
+    { "name": "ci", "configurePreset": "ci", "targets": ["all", "deploy"] }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "offscreen",
+      "hidden": true,
+      "inherits": "base",
+      "environment": { "QT_QPA_PLATFORM": "offscreen" }
+    },
+    { "name": "qml", "inherits": "offscreen", "configurePreset": "dev", "filter": { "include": { "label": "^qml$" } } },
+    { "name": "grabs", "inherits": "offscreen", "configurePreset": "dev", "filter": { "include": { "label": "^grabs$" } }, "execution": { "noTestsAction": "ignore" } },
+    { "name": "deploy", "inherits": "base", "configurePreset": "dev", "filter": { "include": { "label": "^deploy$" } } },
+    { "name": "bench", "inherits": "base", "configurePreset": "dev", "filter": { "include": { "label": "^bench$" } }, "execution": { "noTestsAction": "ignore" } },
+    { "name": "ci-qml", "inherits": "offscreen", "configurePreset": "ci", "filter": { "include": { "label": "^qml$" } } },
+    { "name": "ci-deploy", "inherits": "base", "configurePreset": "ci", "filter": { "include": { "label": "^deploy$" } } }
+  ]
+}

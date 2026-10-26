@@ -1,0 +1,11 @@
+# The image app's registration (APP-066), installed as apps\image.toml beside lil-core.exe. The
+# core offers it for images: lil:// asset refs of images and the image file formats. `args` stays
+# empty: lil-mcp passes only the registration's args, then --intent, --no-activate and the URL
+# (Task 11).
+app = "image"
+exe = "lil-image.exe"
+
+[[opens]]
+types = ["image"]
+formats = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "exr", "tga"]
+intents = ["open", "edit", "use_as_input"]
