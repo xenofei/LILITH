@@ -178,7 +178,7 @@ impl Inner {
                 .open(&path)?;
             let len = file.metadata()?.len();
             let capped = ends_capped(&file, len);
-            prune(&self.dir, &self.process);
+            prune(&self.dir, &self.process, &date);
             self.open = Some(Day {
                 date,
                 file,
@@ -318,13 +318,16 @@ fn capped_line(cap: u64) -> String {
     )
 }
 
-/// Deletes all but the newest [`LOG_FILES_KEPT`] `<process>.<YYYY-MM-DD>.log` files in `dir`.
-/// Other files are never touched; a file that can't be deleted is left.
-fn prune(dir: &Path, process: &str) {
+/// Deletes all but the newest [`LOG_FILES_KEPT`] `<process>.<YYYY-MM-DD>.log` files in `dir`,
+/// never the day `today`'s, which the writer has just opened: with the clock behind newer
+/// files it is kept with the newest others. Other files are never touched; a file that can't
+/// be deleted is left.
+fn prune(dir: &Path, process: &str, today: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let prefix = format!("{process}.");
+    let own = format!("{process}.{today}.log");
     let mut dated: Vec<String> = entries
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
@@ -332,10 +335,11 @@ fn prune(dir: &Path, process: &str) {
             name.strip_prefix(&prefix)
                 .and_then(|rest| rest.strip_suffix(".log"))
                 .is_some_and(is_date)
+                && *name != own
         })
         .collect();
     dated.sort();
-    let excess = dated.len().saturating_sub(LOG_FILES_KEPT);
+    let excess = dated.len().saturating_sub(LOG_FILES_KEPT - 1);
     for name in &dated[..excess] {
         let _ = std::fs::remove_file(dir.join(name));
     }

@@ -1050,7 +1050,27 @@ impl JobHandler for ComfyPromptHandler {
                 ))
             })?;
             let external = job.spec.external_side_effects;
-            let endpoint = match engines.ensure_ready(EngineKind::ComfyUi).await {
+            // An owned start can take minutes: a cancel ends the attempt at once (Checkpoint A
+            // I5), and the start, the engine's and shared by every job, goes on in its task.
+            let mut start = {
+                let engines = engines.clone();
+                tokio::spawn(async move { engines.ensure_ready(EngineKind::ComfyUi).await })
+            };
+            let mut cancel = job.cancel.clone();
+            let ready = tokio::select! {
+                biased;
+                () = cancel_set(&mut cancel) => {
+                    return Err(JobFailure::Final(cancelled_error(&job.trace_id)));
+                }
+                ready = &mut start => ready.unwrap_or_else(|e| {
+                    Err(error(
+                        &codes::CORE_BUG,
+                        format!("ComfyUI's readiness check ended: {e}. This is a bug in LILITH."),
+                        job,
+                    ))
+                }),
+            };
+            let endpoint = match ready {
                 Ok(endpoint) => endpoint,
                 Err(mut e) => {
                     e.trace_id.clone_from(&job.trace_id);

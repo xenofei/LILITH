@@ -53,7 +53,8 @@
 //!   in the month it was made: held ones of earlier months don't count against this month.
 //! - **Alerts** at 50 %, 80 % and 100 % of the settled amount, once per level, cap and month
 //!   (CORE-089), on the `caps` topic as `{kind: "alert", cap, threshold_pct, period}`; a change
-//!   is `{kind: "changed", caps: CapsView}` and invalid caps `{kind: "invalid", caps: [names]}`.
+//!   is `{kind: "changed", caps: CapsView}` and invalid caps `{kind: "invalid", caps: [names]}`
+//!   (empty once a hand edit made them valid again; caps are read at each use).
 //! - **Who changes them** ([`Caps::set`]): only a verified `ui:*` session with `caps.v1`
 //!   (`app/caps.set` or a cap confirmation's `raise`). No tool writes them (CORE-008).
 //! - **Fail closed.** A cap that doesn't parse counts as exceeded; a call whose estimate can't
@@ -527,7 +528,8 @@ impl Caps {
     }
 
     /// `suite.toml`'s caps, read now. A missing file is no caps; one that can't be read fails
-    /// closed. A new set of invalid caps is published as `invalid`.
+    /// closed. A changed set of invalid caps is published as `invalid`, an empty one too once
+    /// the set cleared.
     pub fn settings(&self) -> CapsSettings {
         let path = self.env.suite_toml_to_read();
         let s = match std::fs::read_to_string(&path) {
@@ -547,7 +549,9 @@ impl Caps {
             last.clone_from(&s.invalid);
             changed
         };
-        if changed && !s.invalid.is_empty() {
+        // A set that cleared is published too (empty), so a gauge stops showing "invalid"
+        // (Appendix G, Checkpoint A M4).
+        if changed {
             self.events
                 .publish(TOPIC, json!({"kind": "invalid", "caps": s.invalid}));
         }

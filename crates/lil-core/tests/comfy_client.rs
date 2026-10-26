@@ -1277,7 +1277,16 @@ async fn executed_graph_is_recorded_from_history() {
     let rig = Rig::new(&env);
     let id = rig.submit(tiny_args(1), Priority::Agent).await;
     let done = rig.done(&id).await;
-    let structured = done.result.unwrap().structured;
+    // The row keeps it; a summary leaves it out (Appendix G, Checkpoint A I4).
+    assert!(
+        done.result
+            .unwrap()
+            .structured
+            .get("executed_graph")
+            .is_none(),
+        "a summary leaves out the graph"
+    );
+    let structured = rig.row(&id).await.result.unwrap().structured;
     let posted_graph = &posted(&fake)[0]["prompt"];
     assert_eq!(&structured["executed_graph"], posted_graph);
     assert_eq!(
@@ -2521,7 +2530,8 @@ async fn withdrawn_then_restarted(clean: bool) {
     let outside = fake.add_outside_prompt(true, None);
     let ids = Arc::new(SeqIds::new());
     let rig = Rig::with_ids(&env, ids.clone());
-    let id = rig.submit(tiny_args(1), Priority::Agent).await;
+    // A tool's job: a restart holds it (a job the core submits itself it never holds).
+    let id = submit_as_tool(&rig, false).await;
     rig.until(&id, "queued in ComfyUI", |j| {
         j.substatus.as_deref() == Some("queued_in_engine")
     })

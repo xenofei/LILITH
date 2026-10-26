@@ -1480,6 +1480,31 @@ async fn invalid_cap_fails_closed_and_is_reported() {
     );
 }
 
+/// Checkpoint A M4: caps are read at each use, so a hand edit that makes an invalid cap valid
+/// again counts at once, and `caps` says so with `{kind: "invalid", caps: []}`.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-085, ARCH-056
+async fn a_hand_fixed_cap_says_the_invalid_caps_cleared() {
+    let rig = Rig::new("[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"ten\"\n");
+    let watch = rig.watch_caps().await;
+    assert!(matches!(
+        rig.caps.check(&usd("0.01")).await.unwrap(),
+        CapCheck::Exceeds(_)
+    ));
+    lil_testkit::files::write_file(
+        &rig.env.env.suite_toml(),
+        b"[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"10\"\n",
+    );
+    assert_eq!(
+        rig.caps.check(&usd("0.01")).await.unwrap(),
+        CapCheck::Within
+    );
+    let events = watch.events(&rig).await;
+    let invalid: Vec<&Value> = events.iter().filter(|e| e["kind"] == "invalid").collect();
+    assert_eq!(invalid.len(), 2, "{events:?}");
+    assert_eq!(invalid[0]["caps"], json!(["monthly"]));
+    assert_eq!(invalid[1]["caps"], json!([]), "the invalid caps cleared");
+}
+
 #[tokio::test(flavor = "multi_thread")] // spec: CORE-085
 async fn legacy_usd_keys_read_only_when_display_is_usd() {
     let legacy = "[caps]\nmonthly_usd = 3\nper_call_max_usd = \"1\"\n[caps.provider_monthly_usd]\nfakeprov = \"2\"\n";

@@ -64,6 +64,32 @@ fn one_file_a_day_and_14_kept() {
     assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
 }
 
+/// Checkpoint A store M2: with the clock behind 14 newer dated files (a CMOS reset, a clock
+/// that ran ahead set right), the pruning never removes the day's own file: its lines stay on
+/// disk, and the oldest of the newer files goes instead.
+#[test] // spec: ARCH-117
+fn the_days_own_file_survives_a_clock_behind_newer_files() {
+    let dir = tempfile::tempdir().unwrap();
+    for day in 1..=14 {
+        std::fs::write(
+            dir.path().join(format!("core.2026-02-{day:02}.log")),
+            b"{}\n",
+        )
+        .unwrap();
+    }
+    let mut writer = DailyWriter::new(dir.path(), "core", 64 * 1024 * 1024, || {
+        "2026-01-15".to_string()
+    })
+    .unwrap();
+    writer.write_all(b"{\"a\":1}\n").unwrap();
+    writer.write_all(b"{\"a\":2}\n").unwrap();
+    let text = std::fs::read_to_string(dir.path().join("core.2026-01-15.log")).unwrap();
+    assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    let mut want = vec!["core.2026-01-15.log".to_string()];
+    want.extend((2..=14).map(|d| format!("core.2026-02-{d:02}.log")));
+    assert_eq!(files_of(dir.path(), "core"), want);
+}
+
 /// A process that starts again on a day whose file is already capped writes nothing more and
 /// no second `log_capped` line; the next day starts a new file.
 #[test] // spec: ARCH-117

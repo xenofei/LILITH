@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, UNIX_EPOCH};
 
 use lil_platform::desktop::{Desktop, Toast};
-use lil_platform::{Clock, Env, IdSource};
+use lil_platform::{Channel, Clock, Env, IdSource};
 use lil_protocol::app::{
     ConfirmationView, DesktopSettings, HandlersWire, NotificationPath as PathWire, ShortcutWire,
     ToastsWire,
@@ -186,8 +186,11 @@ pub struct Notifier {
     confirm: OnceLock<Weak<Confirm>>,
     jobs: OnceLock<Weak<Jobs>>,
     news: mpsc::UnboundedSender<ConfirmNews>,
-    /// Holds the handling of `jobs` events while `true` (the overflow test's lever).
+    /// Holds the handling of `jobs` events while `true` (the overflow test's lever, on a test
+    /// channel only).
     jobs_paused: watch::Sender<bool>,
+    /// The core's channel: [`Notifier::pause_job_events`] works only on a test one.
+    channel: Channel,
     /// A reconcile is queued and not yet begun: another one is not queued.
     reconcile_queued: AtomicBool,
     memory: Mutex<Memory>,
@@ -240,6 +243,7 @@ impl Notifier {
             events: events.clone(),
             apps,
             scheme: env.activation_scheme(),
+            channel: env.channel().clone(),
             clock,
             ids,
             confirm: OnceLock::new(),
@@ -367,11 +371,14 @@ impl Notifier {
         });
     }
 
-    /// Holds (`true`) or lets go the handling of `jobs` events. Only the bus overflow test
-    /// uses it: events queue up meanwhile, as when the notifier falls behind.
+    /// Holds (`true`) or lets go the handling of `jobs` events: `true` when done. Only the bus
+    /// overflow test uses it (events queue up meanwhile, as when the notifier falls behind),
+    /// so it works only on a test channel, as the `test.*` tools exist only there; elsewhere
+    /// it is refused (`false`) and changes nothing (Checkpoint A ruling).
     #[doc(hidden)]
-    pub fn pause_job_events(&self, on: bool) {
-        self.jobs_paused.send_replace(on);
+    #[must_use]
+    pub fn pause_job_events(&self, on: bool) -> bool {
+        hold_job_events(&self.channel, &self.jobs_paused, on)
     }
 
     fn utc_secs(&self) -> i64 {
@@ -1001,6 +1008,17 @@ pub fn elapsed_text(secs: i64) -> String {
     }
 }
 
+/// [`Notifier::pause_job_events`]: sets `held` to `on` on a test channel (`true`); on any
+/// other channel nothing changes (`false`).
+fn hold_job_events(channel: &Channel, held: &watch::Sender<bool>, on: bool) -> bool {
+    if !matches!(channel, Channel::Test(_)) {
+        tracing::warn!(%channel, "the job events lever is for test channels only; refused");
+        return false;
+    }
+    held.send_replace(on);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     #[test] // spec: APP-065
@@ -1014,6 +1032,25 @@ mod tests {
     }
 
     use super::*;
+
+    /// Checkpoint A ruling (conformance M-7): the overflow test's lever holds the `jobs`
+    /// events only on a test channel, as the `test.*` tools exist only there; on stable and
+    /// dev it is refused and changes nothing.
+    #[test] // spec: QA-040, APP-146
+    fn the_job_events_lever_works_only_on_test_channels() {
+        use lil_platform::Channel;
+        for channel in [Channel::Stable, Channel::Dev] {
+            let held = watch::Sender::new(false);
+            assert!(!hold_job_events(&channel, &held, true), "{channel}");
+            assert!(!*held.borrow(), "{channel}: nothing held");
+        }
+        let held = watch::Sender::new(false);
+        let test = Channel::Test("ab12cd34".into());
+        assert!(hold_job_events(&test, &held, true));
+        assert!(*held.borrow());
+        assert!(hold_job_events(&test, &held, false));
+        assert!(!*held.borrow());
+    }
 
     #[test] // spec: APP-146
     fn elapsed_reads_seconds_minutes_and_hours() {

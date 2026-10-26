@@ -873,7 +873,7 @@ fn a_bus_overflow_mid_batch_still_ends_in_one_toast() {
     };
 
     // The notifier falls behind: its queue fills with other events first.
-    notifier.pause_job_events(true);
+    assert!(notifier.pause_job_events(true), "a test channel");
     noise(1500);
     let ids = batch(&mut p, 2);
     // A confirmation waits meanwhile, and one is answered: its own path, never dropped.
@@ -887,7 +887,7 @@ fn a_bus_overflow_mid_batch_still_ends_in_one_toast() {
     assert_eq!(r["result"]["status"], "ok", "{r}");
     // More than the bus holds: the batch's end events are cleared, and a resync is queued.
     noise(1500);
-    notifier.pause_job_events(false);
+    assert!(notifier.pause_job_events(false), "a test channel");
 
     let launch = format!("{scheme}:task/{}", ids[0]);
     until("the batch's toast after the resync", || {
@@ -1411,7 +1411,7 @@ fn a_resync_looks_back_from_the_events_own_time() {
     // One real job event handled first.
     fence(&mut p, &env);
     // The notifier stalls; the events it will handle late carry the time they happened.
-    notifier.pause_job_events(true);
+    assert!(notifier.pause_job_events(true), "a test channel");
     let happened = lil_schema::time::rfc3339(
         i64::try_from(
             lil_platform::Clock::utc_now(clock.as_ref())
@@ -1435,7 +1435,7 @@ fn a_resync_looks_back_from_the_events_own_time() {
     stale(1500);
     // Handled more than 5 s after the batch ended.
     clock.advance(Duration::from_secs(60));
-    notifier.pause_job_events(false);
+    assert!(notifier.pause_job_events(false), "a test channel");
     let launch = format!("{scheme}:task/{}", ids[0]);
     until("the batch's toast after the late resync", || {
         posts(&mut p, "job_finished")

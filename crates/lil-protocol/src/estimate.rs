@@ -179,11 +179,17 @@ pub struct SpreadSum {
 
 /// The sum of one part over jobs, one entry per job (`None`: the job has no such part): the
 /// p50s add, and the p90 is that sum plus the root of the summed squares of each job's
-/// (p90 − p50); p90s are never added (Appendix G "Adding estimates"). For `money` use
-/// [`sum_money`], which never adds across currencies.
+/// (p90 − p50); p90s are never added (Appendix G "Adding estimates"). Only [`Spread::new`]
+/// makes a `Spread` outside this module; a figure that isn't finite and 0 or more counts as
+/// not estimated all the same, should one be made inside it. For `money` use [`sum_money`],
+/// which never adds across currencies.
 pub fn sum_part(parts: &[Option<&Spread>]) -> SpreadSum {
     let (mut p50, mut squares, mut found) = (0.0, 0.0, 0_u32);
-    for s in parts.iter().flatten() {
+    let estimates = parts
+        .iter()
+        .flatten()
+        .filter(|s| Spread::new(s.p50, s.p90).is_some());
+    for s in estimates {
         found += 1;
         p50 += s.p50;
         let spread = s.p90 - s.p50;
@@ -263,6 +269,33 @@ mod tests {
             assert_eq!(wall(p50, p90).spread(), None, "{p50} {p90}");
         }
         assert_eq!(Spread::new(f64::NAN, 1.0), None);
+    }
+
+    /// Checkpoint A conformance M-8: a `Spread` that `Spread::new` would refuse (only this
+    /// module can make one, its fields being private) counts as not estimated in `sum_part`.
+    #[test] // spec: CORE-161
+    fn sum_part_counts_a_bad_figure_as_not_estimated() {
+        let good = Spread::new(2.0, 5.0).unwrap();
+        let bad = [
+            Spread {
+                p50: f64::NAN,
+                p90: 1.0,
+            },
+            Spread {
+                p50: 1.0,
+                p90: f64::INFINITY,
+            },
+            Spread {
+                p50: -1.0,
+                p90: 2.0,
+            },
+        ];
+        let parts: Vec<Option<&Spread>> = std::iter::once(Some(&good))
+            .chain(bad.iter().map(Some))
+            .collect();
+        let sum = sum_part(&parts);
+        assert_eq!((sum.total, sum.of, sum.not_estimated), (Some(good), 4, 3));
+        assert_eq!(sum_part(&[Some(&bad[0])]).total, None);
     }
 
     #[test] // spec: CORE-161

@@ -15,7 +15,7 @@
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.lilith\fence\<name>` |
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
-//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?, estimate_key?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
+//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?, estimate_key?, fail_message?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
 //! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
 //! | `test.desktop` | write | `{fullscreen?: "no" \| "d3d" \| "busy" \| "presentation", foreground?: "suite" \| "other", shortcut?: bool, handlers?: bool, toasts?: "ready" \| "not_yet_shown" \| "disabled_for_app" \| "disabled_for_user" \| "disabled_by_policy" \| "elevated" \| "no_platform", post_fails?: bool, clear?: bool}` | `{toasts: [{op: "post" \| "remove", tag, group, title?, body?, launch?, silent?, xml?}], power_held, polls}`: sets the test channel's `FakeDesktop` and reads what it recorded (plan 4a's test contract); the server registers it |
@@ -195,7 +195,9 @@ impl TestJobHandler {
             Some(TestJobFail::Final) => {
                 return Err(JobFailure::Final(fail(
                     &codes::PARAMS_INVALID,
-                    "test.job was asked to fail",
+                    args.fail_message
+                        .as_deref()
+                        .unwrap_or("test.job was asked to fail"),
                 )));
             }
             Some(TestJobFail::DiskFull) => {
@@ -277,6 +279,9 @@ struct TestJobArgs {
     /// The estimate key of its jobs (default `"test"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     estimate_key: Option<String>,
+    /// The message of a `final` failure (default "test.job was asked to fail").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fail_message: Option<String>,
 }
 
 fn is_zero(n: &u64) -> bool {

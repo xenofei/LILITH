@@ -328,6 +328,25 @@ fn recent_groups_by_code_newest_first_over_the_last_1000() {
     assert_eq!(d.recent(1).len(), 1);
 }
 
+/// Review M-6: a tool call's error message is kept redacted, as a job's is, so every row of
+/// `diagnostics.recent` reads the same way.
+#[test] // spec: ARCH-121, QA-083
+fn a_tool_calls_error_message_is_kept_redacted() {
+    let env = TestEnv::new();
+    let d = diagnostics(&env, &Arc::new(EventBus::new(FakeClock::new())));
+    let profile = env.env.user_profile().display().to_string();
+    d.record_error(
+        "store.io",
+        Some("x.tool"),
+        &format!("token: SECRET-PROBE-62 in {profile}\\notes.txt"),
+        1_790_000_000_000,
+    );
+    let message = &d.recent(1)[0].last_message;
+    assert!(!message.contains("SECRET-PROBE-62"), "{message}");
+    assert!(!message.contains(&profile), "{message}");
+    assert!(message.contains("%USERPROFILE%"), "{message}");
+}
+
 #[tokio::test] // spec: ARCH-121, QA-083
 async fn each_error_is_published_on_the_diagnostics_topic() {
     let env = TestEnv::new();
@@ -644,6 +663,46 @@ fn wait_done(pipe: &mut RawPipe, id: &str) -> Value {
         }
         assert!(Instant::now() < until, "job {id} did not finish: {waited}");
     }
+}
+
+/// Checkpoint A ruling (conformance M-4): a job's final failure is a recent error, with its
+/// kind as the tool, its id and its message redacted; a cancelled job adds none.
+#[test] // spec: QA-083, ARCH-121
+fn a_jobs_failure_is_a_recent_error_with_its_id_and_a_redacted_message() {
+    let env = TestEnv::new();
+    let _core = CoreFixture::start(&env);
+    let mut pipe = session(&env, None);
+    let failed = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "fail": "final",
+               "fail_message": "the node said api_key=SECRET-PROBE-41 and gave up"}),
+        Some("job-fail-1"),
+    );
+    let id = failed["job"]["job_id"].as_str().unwrap().to_string();
+    assert_eq!(wait_done(&mut pipe, &id)["status"], "failed");
+    let cancelled = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "gated": true}),
+        Some("job-cancel-1"),
+    );
+    let gated = cancelled["job"]["job_id"].as_str().unwrap().to_string();
+    pipe.tool_ok("job.cancel", json!({"job_id": gated}), Some("cancel-1"));
+    assert_eq!(wait_done(&mut pipe, &gated)["status"], "cancelled");
+
+    let recent = pipe.tool_ok("diagnostics.recent", json!({}), None);
+    let errors = recent["errors"].as_array().unwrap();
+    let job_rows: Vec<&Value> = errors
+        .iter()
+        .filter(|g| g.get("last_job_id").is_some())
+        .collect();
+    assert_eq!(job_rows.len(), 1, "only the failure: {recent}");
+    let row = job_rows[0];
+    assert_eq!(row["code"], "params.invalid", "{row}");
+    assert_eq!(row["last_tool"], "test.job", "{row}");
+    assert_eq!(row["last_job_id"], id.as_str(), "{row}");
+    let message = row["last_message"].as_str().unwrap();
+    assert!(!message.contains("SECRET-PROBE-41"), "{message}");
+    assert!(message.contains("<redacted>"), "{message}");
 }
 
 #[test] // spec: QA-084, ARCH-121

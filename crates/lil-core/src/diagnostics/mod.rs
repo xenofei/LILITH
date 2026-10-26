@@ -11,6 +11,10 @@
 //!   every error outcome of a `tools/call` (through `tools`' `ErrorSink`, so `tools` names no
 //!   type of this module); the last [`RECENT_CAPACITY`] are kept in memory, grouped by code,
 //!   and each is published on the `diagnostics` topic as `{kind: "error", code, tool?, at}`.
+//!   A job's final failure is one too (Checkpoint A ruling): as a [`JobCompletion`] it records
+//!   the error with the job's kind as the tool and the job's id; a cancel, a job that never
+//!   started and a resolved unknown job are not failures. Every message is kept redacted as a
+//!   bundle's entries are (review fix M-6).
 //! - **The bundle** ([`bundle`]): one zip in `<local dir>\diagnostics\`, written through the
 //!   store's cache writer, never holding a workspace file, every entry redacted
 //!   ([`redact`]). Nothing is sent anywhere (ARCH-122): the bundle leaves the machine only
@@ -31,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lil_platform::{Clock, Env};
-use lil_protocol::{CallerKind, EffectClass, ErrorBody, codes};
+use lil_protocol::{CallerKind, EffectClass, ErrorBody, Outcome, ToolOutput, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -44,7 +48,9 @@ pub use redact::Redactor;
 
 use crate::engines::tools::EnginesSlot;
 use crate::events::EventBus;
-use crate::jobs::JobId;
+use crate::jobs::{
+    JobCompletion, JobCtx, JobDone, JobFuture, JobId, is_cancelled, never_started, resolved_unknown,
+};
 use crate::session::Session;
 use crate::telemetry::{Telemetry, format_ts};
 use crate::tools::{ErrorSink, Registry, typed_tool};
@@ -107,13 +113,51 @@ impl Diagnostics {
     /// Keeps an error outcome (at most the last [`RECENT_CAPACITY`]) and publishes it on the
     /// `diagnostics` topic as `{kind: "error", code, tool?, at}`.
     pub fn record_error(&self, code: &str, tool: Option<&str>, message: &str, at_ms: i64) {
-        lock(&self.errors).push(code, tool, message, at_ms);
+        self.record(code, tool, None, message, at_ms);
+    }
+
+    /// [`Diagnostics::record_error`], for a job's final failure too (`job_id`; its event
+    /// carries it). The message is kept redacted as a bundle's entries are, whichever path it
+    /// came by (review fix M-6), so every row of `diagnostics.recent` reads the same way.
+    fn record(
+        &self,
+        code: &str,
+        tool: Option<&str>,
+        job_id: Option<&str>,
+        message: &str,
+        at_ms: i64,
+    ) {
+        // The redaction reads suite.toml and asks Windows for one short name, for every error
+        // kept (a tool call's or a job's), as the caps read suite.toml at each use: brief, and
+        // only on an error path.
+        let suite_toml = std::fs::read_to_string(self.env.suite_toml_to_read()).ok();
+        let (message, _) = bundle::redactor_for(&self.env, suite_toml.as_deref()).text(message);
+        lock(&self.errors).push(code, tool, job_id, &message, at_ms);
         let mut data = json!({"kind": "error", "code": code});
         if let Some(tool) = tool {
             data["tool"] = json!(tool);
         }
+        if let Some(job_id) = job_id {
+            data["job_id"] = json!(job_id);
+        }
         data["at"] = json!(format_ts(at_ms));
         self.events.publish(DIAGNOSTICS_TOPIC, data);
+    }
+
+    /// Records job `job`'s final failure `error` (module docs).
+    fn record_job_error(&self, job: &JobCtx, error: &ErrorBody) {
+        let at_ms = self
+            .clock
+            .utc_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        self.record(
+            &error.code,
+            Some(job.spec.kind),
+            Some(job.id.as_str()),
+            &error.message,
+            at_ms,
+        );
     }
 
     /// The kept errors, one group per code, the one whose last error is newest first; at most
@@ -138,6 +182,26 @@ impl Diagnostics {
     }
 }
 
+impl JobCompletion for Diagnostics {
+    fn completed<'a>(
+        &'a self,
+        job: &'a JobCtx,
+        outcome: &'a Outcome<ToolOutput>,
+        _done: Option<&'a JobDone>,
+    ) -> JobFuture<'a, ()> {
+        Box::pin(async move {
+            let Outcome::Error { error } = outcome else {
+                return;
+            };
+            // Not failures: a cancel, a job that never started, an unknown one you resolved.
+            if is_cancelled(outcome) || never_started(outcome) || resolved_unknown(outcome) {
+                return;
+            }
+            self.record_job_error(job, error);
+        })
+    }
+}
+
 impl ErrorSink for Diagnostics {
     fn record_error(&self, code: &str, tool: Option<&str>, message: &str, at_ms: i64) {
         Diagnostics::record_error(self, code, tool, message, at_ms);
@@ -157,7 +221,8 @@ impl ConnObserver for Diagnostics {
 const RECENT_DESCRIPTION: &str = "Returns the core's recent errors grouped by code, the code \
     whose last error is newest first: for each, the code, how many of the core's last 1,000 \
     error outcomes had it, when the first and the last of them were (RFC 3339 UTC), the last \
-    one's message and the tool it came from. `limit` is 1-200 (default 50).";
+    one's message (redacted as a diagnostics bundle is) and the tool it came from, or for a \
+    job's failure the job's kind and id. `limit` is 1-200 (default 50).";
 
 const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the suite's \
     diagnostics folder, and returns its path, its size in bytes, the files in it and how many \

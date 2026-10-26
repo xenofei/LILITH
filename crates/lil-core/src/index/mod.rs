@@ -732,6 +732,31 @@ impl Index {
             .await
     }
 
+    /// How many assets each project has, by project, from one grouped count; a project
+    /// without assets isn't listed (`projects.list`, Checkpoint A store M5).
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn asset_counts(&self) -> Result<BTreeMap<String, u64>, IndexError> {
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare("SELECT project, COUNT(*) FROM assets GROUP BY project")
+                    .map_err(|e| sql(&e))?;
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(project, n)| (project, u64::try_from(n).unwrap_or(0)))
+                        .collect()
+                })
+                .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
     /// The files of `project`'s asset folders whose state is one of `states`, by path.
     ///
     /// # Errors

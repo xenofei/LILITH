@@ -18,8 +18,10 @@
 //! - [`fsops`]: every file-mutating call of the crate, one
 //!   `#[allow(clippy::disallowed_methods)]` per function (enforced by
 //!   `crates/lil-testkit/tests/single_write_allowance.rs`). SQLite creating and writing its own
-//!   database files, and the log appender writing the core's log, are not `lil-core` file calls;
-//!   the folders for them are created through [`fsops::ensure_dir`].
+//!   database files, and the log setup (`lil_platform::logs`) writing and pruning its own
+//!   `<process>.<YYYY-MM-DD>.log` files (with `main.rs`'s one call that removes the retired
+//!   `core.<date>.log` files once they are 14 days old), are not `lil-core` file calls; the
+//!   folders for them are created through [`fsops::ensure_dir`].
 
 pub mod failpoints;
 pub mod fsops;

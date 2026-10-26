@@ -2073,6 +2073,63 @@ async fn restart_cancels_a_start_in_progress() {
     engines.stop(EngineKind::ComfyUi).await.unwrap();
 }
 
+/// Checkpoint A I5: `job.cancel` of a `comfy.prompt` job whose attempt waits for an owned
+/// autostart that hangs ends the job `cancelled` at once, instead of after the start's 600 s
+/// timeout. The start is the engine's and goes on; `engines.stop` then ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-146, ARCH-064
+async fn a_cancel_during_an_owned_autostart_ends_the_job_at_once() {
+    let env = TestEnv::new();
+    let root = comfy_root(&env, "comfy-hang-autostart", false, false);
+    lil_testkit::files::write_file(&root.join("fake-silent"), b"");
+    let port = lil_testkit::free_loopback_port();
+    env.suite_toml_set(&format!(
+        "[engines.comfyui]\nroot = '{}'\npython = '{}'\nport = {port}\nautostart = true\n",
+        path_str(&root),
+        path_str(&ensure_built().fake_comfyui),
+    ));
+    let rig = Rig::new(env);
+    let engines = rig.engines(Arc::new(OsSockets));
+    let caller = rig.caller();
+    let spec = lil_core::engines::comfyui::handler::prompt_spec(
+        json!({"graph": {"1": {"class_type": "EmptyImage", "inputs": {}}}}),
+        Priority::Agent,
+        "test",
+        None,
+        60,
+    );
+    let job = rig.jobs.submit(&caller, spec).await.unwrap();
+    let begun = Instant::now();
+    loop {
+        let status = engines.status().await.remove(0);
+        if status.state == EngineState::Starting && root.join("fake-comfyui.json").is_file() {
+            break;
+        }
+        assert!(
+            begun.elapsed() < DEADLINE,
+            "the autostart never began: {status:?}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    rig.jobs
+        .cancel(&caller, &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    // Far below the start's 600 s timeout; a failure deadline only.
+    let (job, done) = tokio::time::timeout(
+        Duration::from_secs(10),
+        rig.jobs
+            .wait(&caller, &JobId(job.job_id), Duration::from_secs(10)),
+    )
+    .await
+    .expect("the cancel waited for the start")
+    .unwrap();
+    assert!(done, "the cancel waited for the start: {job:?}");
+    assert_eq!(job.status, JobStatus::Cancelled, "{job:?}");
+    let status = engines.status().await.remove(0);
+    assert_eq!(status.state, EngineState::Starting, "the start goes on");
+    engines.stop(EngineKind::ComfyUi).await.unwrap();
+}
+
 /// Only a 404, or a JSON answer without `assets`, ends the probing; another 4xx or an answer
 /// that can't be read is probed again like a 5xx (plan 4a ruling, 2026-10-24, fix round 2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-065

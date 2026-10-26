@@ -1396,6 +1396,52 @@ async fn fixed_costs_are_in_month_totals() {
     assert_eq!(backwards.code, "params.invalid");
 }
 
+/// Checkpoint A conformance M-2 (CORE-117): a `comfy.prompt` job that held the GPU lease names
+/// the GPU adapter of the newest reading as its `engine_device`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-117
+async fn a_comfy_job_names_its_gpu_as_engine_device() {
+    let fake = FakeComfy::start();
+    let env = TestEnv::new();
+    env.suite_toml_set(&format!(
+        "[engines.comfyui]\nport = {}\nroot = '{}'\nautostart = false\n",
+        fake.port(),
+        fake.root().to_str().unwrap(),
+    ));
+    let rig = Rig::with(env, &busy(), PowerSettings::default());
+    rig.run(1).await;
+    let _engines = Engines::new(
+        rig.env.env.clone(),
+        rig.jobs.clone(),
+        rig.telemetry.clone(),
+        rig.events.clone(),
+        rig.clock.clone(),
+        FailPoints::none(),
+        rig.meter.clone(),
+        Arc::new(OsSockets),
+    );
+    let graph = json!({
+        "1": {"class_type": "EmptyImage",
+              "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}},
+        "2": {"class_type": "SaveImage",
+              "inputs": {"images": ["1", 0], "filename_prefix": "ComfyUI"}},
+    });
+    let spec = lil_core::engines::comfyui::handler::prompt_spec(
+        json!({"graph": graph}),
+        Priority::Agent,
+        "test",
+        None,
+        60,
+    );
+    let job = rig
+        .jobs
+        .submit(&rig.caller(CallerKind::Cli), spec)
+        .await
+        .unwrap();
+    let job = rig.wait(&job.job_id).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{job:?}");
+    assert_eq!(job.engine_device.as_deref(), Some("Fake GPU"), "{job:?}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Fix round 1.
 // ---------------------------------------------------------------------------------------------
