@@ -341,7 +341,7 @@ fn withdrawn(result: Result<String>, facts: &Facts) -> String {
     match result {
         Ok(line) => line,
         Err(w) => format!(
-            "the reviewer App's approval of {} could NOT be withdrawn ({w:#}), so it may still stand: anyone who can call GitHub's merge API can merge that commit while protected-test-check is green. Dismiss the approval on the PR's page, then re-run protected-test-check (the run's page, Re-run all jobs)",
+            "the reviewer App's approval of {} could NOT be withdrawn ({w:#}), so it may still stand: anyone who can call GitHub's merge API can merge that commit while protected-test-check is green, and if the PR is closed, reopening it turns the check green again. Don't reopen or merge it without a new authentication. Dismiss the approval on the PR's page, then re-run protected-test-check (the run's page, Re-run all jobs)",
             short(&facts.head)
         ),
     }

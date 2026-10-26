@@ -39,6 +39,9 @@ pub struct PrInfo {
     pub base_ref: String,
     pub state: String,
     pub draft: bool,
+    /// GitHub's `merged`: the PR was merged (its `state` is then `closed`). A response without
+    /// it reads as not merged, so the merge flow's withdrawal still dismisses the approval.
+    pub merged: bool,
     /// Shown, never decided on (the merge flow's summary, Task 28): the title, the author's
     /// login and the head branch, each empty when GitHub didn't give it.
     pub title: String,
@@ -314,6 +317,7 @@ pub fn parse_pr(v: &Value) -> Result<PrInfo> {
         draft: v["draft"]
             .as_bool()
             .ok_or_else(|| anyhow!("PR response is missing `draft`"))?,
+        merged: v["merged"].as_bool().unwrap_or(false),
         // Display-only fields: missing is empty, never an error.
         title: shown(v.get("title")),
         author: shown(v.pointer("/user/login")),
@@ -1031,11 +1035,19 @@ mod tests {
                 base_ref: "main".into(),
                 state: "open".into(),
                 draft: true,
+                merged: false,
                 title: "Add the thing".into(),
                 author: "someone".into(),
                 head_ref: "feature".into(),
             }
         );
+        // `merged` is read when GitHub gives it; without it the PR reads as not merged.
+        let merged = parse_pr(&json!({
+            "number": 7, "state": "closed", "draft": false, "merged": true,
+            "head": {"sha": "h"}, "base": {"ref": "main"}
+        }))
+        .unwrap();
+        assert!(merged.merged);
         // The shown-only fields may be missing; the decided ones may not.
         let bare = parse_pr(&json!({
             "number": 7, "state": "open", "draft": false,

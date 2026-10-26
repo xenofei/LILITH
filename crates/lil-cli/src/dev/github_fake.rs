@@ -75,6 +75,7 @@ impl FakeGitHub {
                 base_ref: base_ref.into(),
                 state: "open".into(),
                 draft: false,
+                merged: false,
                 title: format!("PR {number}'s title"),
                 author: "an-author".into(),
                 head_ref: "feature".into(),
@@ -103,6 +104,15 @@ impl FakeGitHub {
     /// Sets GitHub's `state` (`open` or `closed`).
     pub fn set_state(&self, number: u64, state: &str) {
         self.lock().prs.get_mut(&number).expect("unknown PR").state = state.into();
+    }
+
+    /// Marks the PR merged and closed (as GitHub shows a merge, for example one whose merge
+    /// call failed after GitHub had merged).
+    pub fn set_merged(&self, number: u64) {
+        let mut st = self.lock();
+        let pr = st.prs.get_mut(&number).expect("unknown PR");
+        pr.state = "closed".into();
+        pr.merged = true;
     }
 
     pub fn set_draft(&self, number: u64, draft: bool) {
@@ -270,7 +280,9 @@ impl GitHubApi for FakeGitHub {
         if let Some(msg) = st.not_mergeable.get(&number) {
             return Ok(MergeOutcome::NotMergeable(msg.clone()));
         }
-        st.prs.get_mut(&number).expect("checked above").state = "closed".into();
+        let pr = st.prs.get_mut(&number).expect("checked above");
+        pr.state = "closed".into();
+        pr.merged = true;
         Ok(MergeOutcome::Merged {
             sha: format!("merge-of-{head}"),
         })
