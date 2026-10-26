@@ -919,6 +919,104 @@ fn a_key_across_the_cut_is_redacted_whole() {
     assert!(leaks.is_empty(), "a head of a key is left: {leaks:#?}");
 }
 
+/// The long, variable-length key formats of the PR #53 audit, with fake bodies.
+fn split_keys() -> Vec<(&'static str, String, String)> {
+    // A fixed pseudo-random run of letters and digits (no real key).
+    let fake = |len: usize, mut seed: u64| -> String {
+        const SET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        (0..len)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                SET[usize::try_from(seed >> 33).unwrap() % SET.len()] as char
+            })
+            .collect()
+    };
+    vec![
+        (
+            "sk-ant",
+            "sk-ant-".to_string(),
+            format!("api03-{}", fake(89, 1)),
+        ),
+        ("sk-proj", "sk-proj-".to_string(), fake(120, 2)),
+        ("sk", "sk-".to_string(), fake(48, 3)),
+        (
+            "github_pat",
+            "github_pat_".to_string(),
+            format!("11{}_{}", fake(22, 4), fake(59, 5)),
+        ),
+        (
+            "xoxb",
+            "xoxb-".to_string(),
+            format!("2718281828-3141592653589-{}", fake(24, 6)),
+        ),
+    ]
+}
+
+/// The splitters of the PR #53 audit: a control character, a line break, a terminal control
+/// sequence and an invisible character.
+const SPLITTERS: [(&str, &str); 7] = [
+    ("BEL", "\u{7}"),
+    ("LF", "\n"),
+    ("CRLF", "\r\n"),
+    ("SGR", "\u{1b}[0m"),
+    ("OSC8", "\u{1b}]8;;https://example.com/x\u{1b}\\"),
+    ("ZWSP", "\u{200b}"),
+    ("SHY", "\u{ad}"),
+];
+
+/// Each key split at 1/2 and 3/4 of its body by each splitter: `(name, split key)`.
+fn split_cases() -> Vec<(String, String)> {
+    let mut cases = Vec::new();
+    for (format, prefix, body) in split_keys() {
+        for (num, den) in [(1, 2), (3, 4)] {
+            let at = body.len() * num / den;
+            for (splitter, text) in SPLITTERS {
+                cases.push((
+                    format!("{format} {num}/{den} {splitter}"),
+                    format!("{prefix}{}{text}{}", &body[..at], &body[at..]),
+                ));
+            }
+        }
+    }
+    cases
+}
+
+/// The PR #53 audit: a long key split deep inside by one splitter is redacted whole in its
+/// toast, its tail with its head; ordinary words after a space stay.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_split_deep_inside_is_redacted_whole_in_its_toast() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut leaks = Vec::new();
+    for (i, (name, key)) in split_cases().into_iter().enumerate() {
+        let tag = format!("t{i}");
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({ "message": format!("{tag}: key {key} end") }),
+        );
+        let body = notice_body(&mut p, &tag);
+        if body != format!("{tag}: key <redacted> end") {
+            leaks.push(format!("{name}: {body:?}"));
+        }
+    }
+    assert!(leaks.is_empty(), "{} leaks: {leaks:#?}", leaks.len());
+    let (_, prefix, body) = split_keys().remove(0);
+    write(
+        &mut p,
+        "notify.claude_code",
+        json!({ "message": format!("words: {prefix}{body} then_some_ordinary_words") }),
+    );
+    assert_eq!(
+        notice_body(&mut p, "words"),
+        "words: <redacted> then_some_ordinary_words"
+    );
+}
+
 /// Re-review I-A: a terminal sequence still bounds a key, and one inside a key doesn't hide
 /// it: an ANSI-coloured AWS key id and Slack token, and a GitHub token a CSI splits.
 #[test] // spec: APP-146, ARCH-121, APP-022

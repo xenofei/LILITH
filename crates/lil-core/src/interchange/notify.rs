@@ -1015,10 +1015,15 @@ fn settled(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> Strin
 }
 
 /// `s` normalised to at most `max` `char`s ([`lil_parse::without_default_ignorables`], then
-/// [`shown_plain`]) and redacted, again until normalising and redaction both leave it as it
+/// [`shown_plain`], then a token's rest glued to its placeholder taken into it) and redacted, again until normalising and redaction both leave it as it
 /// is; `None` when it hasn't after [`SETTLE_ROUNDS`] rounds.
 fn settle(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> Option<String> {
-    let norm = |t: &str| shown_plain(&lil_parse::without_default_ignorables(t), max);
+    // Each normalising also takes into a `<redacted>` the rest of a token glued to it once a
+    // splitter between them is gone (PR #53 audit).
+    let norm = |t: &str| {
+        let shown = shown_plain(&lil_parse::without_default_ignorables(t), max);
+        crate::diagnostics::redact::glued_tails(&shown).0
+    };
     let mut shown = norm(s);
     for _ in 0..SETTLE_ROUNDS {
         let (redacted, n) = redact(&shown);
