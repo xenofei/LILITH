@@ -138,10 +138,11 @@ pub enum DevCommand {
     /// refuses before contacting GitHub. Then it shows the PR's head commit, files,
     /// protected changes and CI, and asks for the owner's authentication: Windows Hello
     /// when enrolled, else the reviewer key's passphrase at a terminal. Without it nothing
-    /// is approved or merged. After it, on every merge, protected files or not, it posts
-    /// the reviewer app's approval of that head commit (GitHub's protected-test-check
-    /// needs it), waits for CI on that commit, and merges only when all three of these
-    /// hold for it:
+    /// is approved or merged. After it, it waits until every other required check is
+    /// green on that commit; only then, on every merge, protected files or not, does it
+    /// post the reviewer app's approval of that head commit (GitHub's
+    /// protected-test-check needs it), wait for that check, and merge only when all
+    /// three of these hold for it:
     ///
     ///   1. CI is green: every-push, pr-ready, protected-test-check and privacy-check
     ///      have all passed on that exact commit. A check that is missing, still
@@ -155,7 +156,9 @@ pub enum DevCommand {
     ///
     /// It asks nothing when a required check other than protected-test-check has
     /// already failed. When it stops without merging after posting the approval, it
-    /// dismisses the approval again and says so. Draft PRs, closed PRs and PRs into
+    /// dismisses the approval, re-runs protected-test-check until it reports failure,
+    /// and says exactly what holds. Press Ctrl+C once to stop it, and don't close the
+    /// window while it runs. Draft PRs, closed PRs and PRs into
     /// another branch are refused. If anything can't be checked (a network or git
     /// error), it refuses. Every refusal says, in plain words, which condition failed.
     #[command(verbatim_doc_comment)]

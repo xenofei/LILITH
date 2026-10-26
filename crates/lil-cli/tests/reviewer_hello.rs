@@ -27,7 +27,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use merge_flow::{Facts, MergeFlowSteps, MergeGate, NO_AUDIT, merge_alone, merge_flow};
+use merge_flow::{Facts, MergeFlowSteps, MergeGate, NO_AUDIT, Wait, merge_alone, merge_flow};
 use reviewer_hello::{
     Authenticator, CREDENTIAL, FaceSignIn, HelloFile, HelloPlatform, KeyAuthenticator, NoTerminal,
     PassphraseUnlocker, QUOTE, Route, Unlocker, discard_enrolment_beside, enroll, enrolled_hello,
@@ -702,8 +702,14 @@ struct FakeSteps {
     rerun: bool,
     /// The head of each approval posted.
     approved: RefCell<Vec<String>>,
-    /// Makes `wait_for_checks` fail with this.
+    /// Makes the wait for the other checks, before the approval, fail with this.
+    others_error: Option<&'static str>,
+    /// Makes the wait for the guard check, after the approval, fail with this.
     wait_error: Option<&'static str>,
+    /// Makes `post_approval` fail with this.
+    post_error: Option<&'static str>,
+    /// Makes `merge` panic.
+    merge_panics: bool,
     /// Makes `merge` fail with this after the gate let it through.
     merge_error: Option<&'static str>,
     /// Makes `withdraw_approval` fail.
@@ -729,7 +735,10 @@ impl FakeSteps {
             merge_head: None,
             rerun: true,
             approved: RefCell::default(),
+            others_error: None,
             wait_error: None,
+            post_error: None,
+            merge_panics: false,
             merge_error: None,
             withdraw_fails: false,
         }
@@ -746,14 +755,19 @@ impl MergeFlowSteps for FakeSteps {
         self.log
             .borrow_mut()
             .push(format!("steps:post_approval {}", facts.pr));
+        if let Some(e) = self.post_error {
+            return Err(anyhow::anyhow!("{e}"));
+        }
         self.approved.borrow_mut().push(facts.head.clone());
         Ok(self.rerun)
     }
-    fn wait_for_checks(&self, _facts: &Facts, guard_rerun: bool) -> anyhow::Result<()> {
-        self.log
-            .borrow_mut()
-            .push(format!("steps:wait_for_checks rerun={guard_rerun}"));
-        match self.wait_error {
+    fn wait_for_checks(&self, _facts: &Facts, wait: Wait) -> anyhow::Result<()> {
+        let (event, error) = match wait {
+            Wait::Others => ("steps:wait others".to_string(), self.others_error),
+            Wait::Guard { rerun } => (format!("steps:wait guard rerun={rerun}"), self.wait_error),
+        };
+        self.log.borrow_mut().push(event);
+        match error {
             Some(e) => Err(anyhow::anyhow!("{e}")),
             None => Ok(()),
         }
@@ -765,10 +779,11 @@ impl MergeFlowSteps for FakeSteps {
         if let Some(e) = self.merge_error {
             return Err(anyhow::anyhow!("{e}"));
         }
+        assert!(!self.merge_panics, "a bug in the merge step");
         self.log.borrow_mut().push("steps:merge".into());
         Ok("feedface".into())
     }
-    fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<()> {
+    fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<String> {
         assert_eq!(pem, PEM);
         self.log
             .borrow_mut()
@@ -776,7 +791,10 @@ impl MergeFlowSteps for FakeSteps {
         if self.withdraw_fails {
             anyhow::bail!("HTTP 403 from GitHub");
         }
-        Ok(())
+        Ok(format!(
+            "the reviewer App's approval of {} was withdrawn and protected-test-check now reports failure",
+            &facts.head[..7]
+        ))
     }
 }
 
@@ -834,8 +852,9 @@ fn no_network_call_before_the_key_is_unlocked() {
             "steps:facts".to_string(),
             "window:Merge".into(),
             format!("hello:kek_derive {CREDENTIAL} 5a"),
+            "steps:wait others".into(),
             "steps:post_approval 42".into(),
-            "steps:wait_for_checks rerun=true".into(),
+            "steps:wait guard rerun=true".into(),
             "steps:merge".into(),
         ]
     );
@@ -1193,7 +1212,7 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
         // 2026-10-26), and a failed guard check is waited on after its re-run was asked for (M8).
         assert!(e.contains(&"steps:post_approval 42".to_string()), "{e:?}");
         assert!(
-            e.contains(&"steps:wait_for_checks rerun=true".to_string()),
+            e.contains(&"steps:wait guard rerun=true".to_string()),
             "{e:?}"
         );
     }
@@ -1282,8 +1301,9 @@ fn every_merge_posts_the_approval_of_the_head_you_authenticated() {
                     [
                         "steps:facts",
                         "auth",
+                        "steps:wait others",
                         "steps:post_approval 42",
-                        "steps:wait_for_checks rerun=true",
+                        "steps:wait guard rerun=true",
                         "steps:merge",
                     ],
                     "protected {protected:?}, approved {already_approved}, alone {alone}"
@@ -1355,6 +1375,81 @@ fn a_failed_check_stops_the_flow_before_anything_is_asked() {
     }
 }
 
+/// Review round 2, I-2: the approval comes at the last moment. Every other required check is
+/// waited on first, after your authentication; only once they are green is the approval posted
+/// and the guard check waited on. A failure or the wait running out before that posts nothing
+/// and withdraws nothing.
+#[test] // spec: QA-033, QA-036
+fn the_approval_is_posted_only_after_the_other_checks_are_green() {
+    for alone in [false, true] {
+        // Pending, then green: the approval follows the wait.
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let mut steps = FakeSteps::new(&l, &[]);
+        steps.facts.checks = vec![("pr-ready".into(), "pending".into())];
+        if alone {
+            merge_alone(&steps, &auth)
+        } else {
+            merge_flow("s", "a", &steps, &auth)
+        }
+        .unwrap();
+        assert_eq!(
+            events(&l),
+            [
+                "steps:facts",
+                "auth",
+                "steps:wait others",
+                "steps:post_approval 42",
+                "steps:wait guard rerun=true",
+                "steps:merge",
+            ]
+        );
+
+        // Pending, then failed (or the wait ran out): nothing posted, nothing to withdraw.
+        for error in [
+            "CI check pr-ready finished as failure on 1234567; nothing was approved or merged",
+            "CI isn't green on 1234567 after 20 minutes; nothing was approved or merged",
+        ] {
+            let l = log();
+            let auth = FakeAuth::new(&l, Ok(()));
+            let mut steps = FakeSteps::new(&l, &[]);
+            steps.facts.checks = vec![("pr-ready".into(), "pending".into())];
+            steps.others_error = Some(error);
+            let e = if alone {
+                merge_alone(&steps, &auth)
+            } else {
+                merge_flow("s", "a", &steps, &auth)
+            }
+            .unwrap_err();
+            assert_eq!(format!("{e:#}"), error);
+            assert_eq!(events(&l), ["steps:facts", "auth", "steps:wait others"]);
+            assert!(steps.approved.borrow().is_empty());
+        }
+    }
+}
+
+/// Review round 2, M-1: a failed post (GitHub may have created the review and lost the answer)
+/// and a panic after the post both withdraw too; the panic still ends the flow.
+#[test] // spec: QA-033, QA-036
+fn a_failed_post_or_a_panic_withdraws_the_approval_too() {
+    let l = log();
+    let auth = FakeAuth::new(&l, Ok(()));
+    let mut steps = FakeSteps::new(&l, &[]);
+    steps.post_error = Some("posting the approval on PR #42 failed");
+    let e = format!("{:#}", merge_alone(&steps, &auth).unwrap_err());
+    assert!(e.contains("was withdrawn"), "{e}");
+    assert_eq!(events(&l).last().unwrap(), "steps:withdraw 1234567");
+
+    let l = log();
+    let auth = FakeAuth::new(&l, Ok(()));
+    let mut steps = FakeSteps::new(&l, &[]);
+    steps.merge_panics = true;
+    let panicked =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| merge_alone(&steps, &auth)));
+    assert!(panicked.is_err(), "the panic was swallowed");
+    assert_eq!(events(&l).last().unwrap(), "steps:withdraw 1234567");
+}
+
 /// Review round 1, I-3: every exit that doesn't merge, once the approval is posted, withdraws
 /// it and says so: a CI failure or the wait running out, a gate refusal (a moved head), a failed
 /// merge call. A failed withdrawal says the approval still stands. A merge withdraws nothing.
@@ -1406,7 +1501,8 @@ fn every_exit_without_a_merge_after_the_approval_withdraws_it() {
                 assert!(!ev.contains(&"steps:merge".to_string()), "{what}");
                 if withdraw_fails {
                     assert!(e.contains("could NOT be withdrawn"), "{what}: {e}");
-                    assert!(e.contains("still stands"), "{what}: {e}");
+                    assert!(e.contains("may still stand"), "{what}: {e}");
+                    assert!(e.contains("re-run protected-test-check"), "{what}: {e}");
                 } else {
                     assert!(e.contains("was withdrawn"), "{what}: {e}");
                 }
