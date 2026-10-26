@@ -127,11 +127,16 @@ pub struct Estimate {
     pub unknown: Vec<UnknownPart>,
 }
 
-/// One job's p50 and p90 of a part, as numbers: each finite and 0 or more.
+/// One job's p50 and p90 of a part, as numbers: each finite and 0 or more. Only
+/// [`Spread::new`] makes one, so [`sum_part`] never meets a figure that is not an estimate:
+///
+/// ```compile_fail
+/// let not_an_estimate = lil_protocol::estimate::Spread { p50: f64::NAN, p90: -1.0 };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spread {
-    pub p50: f64,
-    pub p90: f64,
+    p50: f64,
+    p90: f64,
 }
 
 impl Spread {
@@ -140,6 +145,14 @@ impl Spread {
     pub fn new(p50: f64, p90: f64) -> Option<Spread> {
         let fine = |v: f64| v.is_finite() && v >= 0.0;
         (fine(p50) && fine(p90)).then_some(Spread { p50, p90 })
+    }
+
+    pub fn p50(&self) -> f64 {
+        self.p50
+    }
+
+    pub fn p90(&self) -> f64 {
+        self.p90
     }
 
     fn parse(p50: &str, p90: &str) -> Option<Spread> {

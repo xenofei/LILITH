@@ -32,15 +32,26 @@
 //!   `context.v1`, else `caller.not_allowed`; ARCH-088), and any
 //!   other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
-//!   A verified `ui:*` session that can answer confirmations counts in the
-//!   [`crate::confirm::UiPresence`] while its connection is open; when it closes, its pending
-//!   cap confirmations are cancelled.
+//!   `app/*` methods are admitted as `tools/call` is (APP-041): a draining core answers them
+//!   `core.draining`, each counts as a call in flight until it is answered, and each error
+//!   outcome goes to the dispatcher's error sink (the recent errors) with the method as its
+//!   tool. A verified `ui:*` session that can answer confirmations counts in the
+//!   [`crate::confirm::UiPresence`] while its connection is open.
 //!   `core/drain` and `lil/*` run on the connection's reader ([`Router::runs_inline`]): they
 //!   are cheap and take no in-flight permit, so they are not refused or delayed for want of
 //!   one. Reading stays in order, though: one read after a request that waits for a permit
 //!   (the connection has [`crate::MAX_IN_FLIGHT_PER_CONN`] requests running) waits with it. A
 //!   request handler that panics in its own task is answered with `core.bug`
 //!   ([`Router::panicked`]).
+//!
+//! **An app's cap prompts** (APP-029; Appendix G "Connections"). A `ui:*` session's pending
+//! cap confirmations end with its app's process, not with one of its connections, so a
+//! reconnect keeps them: the process is opened at the hello, and when the connection closes
+//! the confirmations are cancelled once the process exits. They are cancelled at once instead
+//! when there is no process to wait for (it could not be opened), and on a switch: the same
+//! process (client pid and caller kind) has a session in another workspace and none in this
+//! one when the connection closes, or says hello in another workspace afterwards. Either way,
+//! once no app that can answer is connected, the toasts held back while it was in front go out.
 //!
 //! **Lifecycle** (ARCH-020, ruling P23). [`Router::opened`] and [`Router::closed`] feed the
 //! [`Lifecycle`]'s connection count. A refused connection stops counting when it is refused
@@ -60,9 +71,11 @@
 //! Hello handling follows a fixed order. `protocol` is read first and alone
 //! ([`peek_protocol`]), so a client of any version gets the frozen refusal before any other
 //! field is checked; only then are the params parsed strictly (-32602 on an unknown field).
-//! Then the caller is verified and the workspace resolved, on a blocking thread (they inspect
-//! processes and read `suite.toml`); the reader awaits that, so a request pipelined right
-//! behind the hello still sees its session (I4). Then the session is minted.
+//! Next, a draining core answers the hello `core.draining` and starts no session (the
+//! connection stays `AwaitingHello`). Then the caller is
+//! verified and the workspace resolved, on a blocking thread (they inspect processes and read
+//! `suite.toml`); the reader awaits that, so a request pipelined right behind the hello still
+//! sees its session (I4). Then the session is minted.
 //!
 //! [`Router::opened`] starts the hello timeout: a connection that has neither a session nor a
 //! refusal when it runs out is closed.
@@ -74,7 +87,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use lil_platform::process::{ProcessInfo, ProcessInspector};
+use lil_platform::process::{ProcessHandle, ProcessInfo, ProcessInspector};
 use lil_platform::{Env, IdSource};
 use lil_protocol::app;
 use lil_protocol::{
@@ -84,8 +97,8 @@ use lil_protocol::{
     UnsubscribeParams, UnsubscribeResult, WorkspaceInfo, codes, incompatible_refusal,
     is_valid_topic, method, negotiate, peek_protocol, rpc_code, schema_hash, shared_capabilities,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize as _, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -125,6 +138,18 @@ struct Conn {
     hello_settled: CancellationToken,
     /// Cancelled in [`Router::closed`]: ends the tasks watching this connection.
     ended: CancellationToken,
+    /// A `ui:*` session's app process, opened at the hello: its cap prompts end when it
+    /// exits (module docs, "An app's cap prompts"). `None` for any other caller, or a process
+    /// that could not be opened.
+    app: Option<ProcessHandle>,
+}
+
+/// An app process some of whose `ui:*` sessions lost their connection while it still ran:
+/// their pending cap confirmations wait for it to exit, or for a switch (module docs). One task
+/// waits per process.
+struct LeftApp {
+    /// Each such session's id and workspace id.
+    sessions: Vec<(String, String)>,
 }
 
 /// The core's router.
@@ -139,6 +164,9 @@ pub struct RpcRouter {
     instance_id: String,
     core: CoreInfo,
     conns: Mutex<HashMap<u64, Conn>>,
+    /// By client pid: the app processes whose sessions' cap prompts wait for them
+    /// ([`LeftApp`]). Locked after `conns` when both are held.
+    left: Arc<Mutex<HashMap<u32, LeftApp>>>,
     dispatcher: Dispatcher,
     /// The dispatcher's bus.
     events: Arc<EventBus>,
@@ -184,6 +212,7 @@ impl RpcRouter {
                 pipe: pipe.to_string(),
             },
             conns: Mutex::new(HashMap::new()),
+            left: Arc::new(Mutex::new(HashMap::new())),
             dispatcher,
             events,
             lifecycle,
@@ -227,11 +256,19 @@ impl RpcRouter {
         self.conns.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Moves `conn_id` out of `AwaitingHello` into `Ready` with its session and stops its
-    /// hello timeout. An app that can answer confirmations makes them
+    /// Moves `conn_id` out of `AwaitingHello` into `Ready` with its session (and `app`, its app
+    /// process) and stops its hello timeout. An app that can answer confirmations makes them
     /// answerable (APP-051) from now until [`Router::closed`], and the observers are told of the
     /// session: all under the map lock, so a connection that closes meanwhile is never counted.
-    fn settle_ready(&self, conn_id: u64, session: Arc<Session>, build_id: &str) {
+    /// An app's session in another workspace than one it left ends that one's cap prompts (a
+    /// switch; module docs).
+    fn settle_ready(
+        &self,
+        conn_id: u64,
+        session: Arc<Session>,
+        build_id: &str,
+        app: Option<ProcessHandle>,
+    ) {
         let mut conns = self.conns();
         if let Some(conn) = conns.get_mut(&conn_id) {
             if can_answer(&session) {
@@ -243,9 +280,95 @@ impl RpcRouter {
                 observer.ready(conn_id, &session);
                 observer.said_hello(conn_id, &session, build_id);
             }
+            if matches!(session.caller, CallerKind::Ui(_)) {
+                let switched: Vec<(String, String)> =
+                    match lock(&self.left).get_mut(&session.client_pid) {
+                        Some(left) => {
+                            let (gone, kept) = std::mem::take(&mut left.sessions)
+                                .into_iter()
+                                .partition(|(_, ws)| ws != session.workspace_id());
+                            left.sessions = kept;
+                            gone
+                        }
+                        None => Vec::new(),
+                    };
+                for (id, _) in switched {
+                    self.cancel_app_prompts(id);
+                }
+            }
             conn.state = ConnState::Ready(session);
+            conn.app = app;
             conn.hello_settled.cancel();
         }
+    }
+
+    /// A `ui:*` session's connection closed; `conns` are the connections still open and `app`
+    /// its app process. Its cap prompts are cancelled at once when that process has a session
+    /// in another workspace and none in this one (a switch), or when there is no process to
+    /// wait for; otherwise when the process exits (module docs). Either way, the toasts held
+    /// back while an app was in front go out if no app that can answer is left.
+    fn app_connection_closed(
+        &self,
+        conns: &HashMap<u64, Conn>,
+        session: &Session,
+        app: Option<ProcessHandle>,
+    ) {
+        let (mut here, mut elsewhere) = (false, false);
+        for conn in conns.values() {
+            if let ConnState::Ready(other) = &conn.state
+                && other.client_pid == session.client_pid
+                && other.caller == session.caller
+            {
+                if other.workspace_id() == session.workspace_id() {
+                    here = true;
+                } else {
+                    elsewhere = true;
+                }
+            }
+        }
+        let app = match app {
+            Some(app) if here || !elsewhere => app,
+            _ => return self.cancel_app_prompts(session.id.clone()),
+        };
+        self.confirm.after_app_closed();
+        let (pid, entry) = (
+            session.client_pid,
+            (session.id.clone(), session.workspace_id().to_string()),
+        );
+        let mut left = lock(&self.left);
+        if let Some(waiting) = left.get_mut(&pid) {
+            // A task waits for this process already.
+            waiting.sessions.push(entry);
+            return;
+        }
+        left.insert(
+            pid,
+            LeftApp {
+                sessions: vec![entry],
+            },
+        );
+        let (confirm, left) = (self.confirm.clone(), self.left.clone());
+        tokio::spawn(async move {
+            if let Err(e) = app.wait().await {
+                tracing::warn!(pid, error = %e, "cannot wait for an app to exit; its cap prompts are cancelled now");
+            }
+            let sessions = lock(&left).remove(&pid).map(|l| l.sessions);
+            for (id, _) in sessions.unwrap_or_default() {
+                confirm.cancel_for_session(&id).await;
+            }
+            confirm.after_app_closed();
+        });
+    }
+
+    /// Cancels the pending cap confirmations of the `ui:*` session `session_id` now
+    /// (Appendix G "Connections"); then, with no app left that can answer, the toasts held back
+    /// while it was in front go out (the notifier's reconcile).
+    fn cancel_app_prompts(&self, session_id: String) {
+        let confirm = self.confirm.clone();
+        tokio::spawn(async move {
+            confirm.cancel_for_session(&session_id).await;
+            confirm.after_app_closed();
+        });
     }
 
     /// Settles `conn` as refused: it stops counting towards idle and is closed once the core
@@ -346,11 +469,46 @@ impl RpcRouter {
             (ConnState::Ready(_), method::SUBSCRIBE) => self.subscribe(conn, id, req.params).await,
             (ConnState::Ready(_), method::UNSUBSCRIBE) => self.unsubscribe(conn, id, req.params),
             (ConnState::Ready(session), m) if m.starts_with(method::APP_PREFIX) => {
-                self.app(conn, id, &session, m, req.params).await
+                self.admitted_app(conn, id, &session, m, req.params).await
             }
             (ConnState::Ready(_), _) => not_found(id),
         };
         Some(response)
+    }
+
+    /// An `app/*` method, admitted as `tools/call` is (APP-041; Appendix G "Connections"): a
+    /// draining core answers it `core.draining`, it counts as a call in flight until it is
+    /// answered, and its error outcome goes to the dispatcher's error sink with the method as
+    /// its tool.
+    async fn admitted_app(
+        &self,
+        conn: &ConnCtx,
+        id: Id,
+        session: &Session,
+        m: &str,
+        params: Option<Value>,
+    ) -> Response {
+        let Some(_in_flight) = self.lifecycle.try_call_started() else {
+            let trace_id = self.ids.id("t");
+            tracing::info!(conn_id = conn.conn_id, method = m, caller = %session.caller, trace_id, "app/* refused: the core is draining");
+            let error = ErrorBody::new(
+                &codes::CORE_DRAINING,
+                "The core is shutting down, so this was not done. Call it again once a core runs.",
+                trace_id,
+            );
+            self.dispatcher.record_error(m, &error);
+            return outcome::<ToolOutput>(id, Outcome::Error { error });
+        };
+        let response = self.app(conn, id, session, m, params).await;
+        if let Response::Result { result, .. } = &response
+            && result.get("status").and_then(Value::as_str) == Some("error")
+            && let Some(error) = result
+                .get("error")
+                .and_then(|e| ErrorBody::deserialize(e).ok())
+        {
+            self.dispatcher.record_error(m, &error);
+        }
+        response
     }
 
     /// An `app/*` method (module docs). A verified `ui:*` caller may call each; `cli` only
@@ -647,6 +805,15 @@ impl RpcRouter {
                 "the client's schema hash differs from the core's"
             );
         }
+        // A core that no longer admits calls starts no session (Appendix G "Connections").
+        if self.lifecycle.is_draining() {
+            let error = ErrorBody::new(
+                &codes::CORE_DRAINING,
+                "The core is shutting down. Connect again once a core runs.",
+                trace_id,
+            );
+            return Some(self.hello_error(conn, id, error));
+        }
         // 5. Who is calling; 6. the workspace. On a blocking thread (module docs).
         let identify = Identify {
             inspector: self.inspector.clone(),
@@ -724,7 +891,12 @@ impl RpcRouter {
             }),
             core: self.core.clone(),
         };
-        self.settle_ready(conn.conn_id, session, &p.build_id);
+        // An app's process, so its cap prompts can wait for it (module docs).
+        let app = match session.caller {
+            CallerKind::Ui(_) => lil_platform::process::open(session.client_pid).ok(),
+            _ => None,
+        };
+        self.settle_ready(conn.conn_id, session, &p.build_id, app);
         // Events can reach the connection from now on.
         self.events.attach(conn.conn_id, conn.outbound.clone());
         // 9. The reply.
@@ -920,6 +1092,7 @@ impl Router for RpcRouter {
                 counted: true,
                 hello_settled: hello_settled.clone(),
                 ended: CancellationToken::new(),
+                app: None,
             },
         );
         let close = conn.close.clone();
@@ -980,15 +1153,10 @@ impl Router for RpcRouter {
                     if can_answer(session) {
                         self.confirm.presence().closed();
                     }
-                    // An app's pending cap confirmations end with it (Appendix F).
+                    // An app's pending cap confirmations end with its process, or at once
+                    // when it has switched workspace (module docs).
                     if matches!(session.caller, CallerKind::Ui(_)) {
-                        let (confirm, id) = (self.confirm.clone(), session.id.clone());
-                        // Then, with no app left that can answer, the toasts held back while
-                        // it was in front go out (the notifier's reconcile).
-                        tokio::spawn(async move {
-                            confirm.cancel_for_session(&id).await;
-                            confirm.after_app_closed();
-                        });
+                        self.app_connection_closed(&conns, session, gone.app);
                     }
                 }
                 gone.counted
@@ -1004,6 +1172,11 @@ impl Router for RpcRouter {
             observer.closed(conn.conn_id);
         }
     }
+}
+
+/// Every update is a single step, so the data stays consistent after a panic.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Parses a method's params strictly; omitted params are `{}`. Any failure is -32602

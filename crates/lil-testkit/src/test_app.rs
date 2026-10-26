@@ -266,6 +266,43 @@ impl TestApp {
         &self.hello
     }
 
+    /// The app closes its connection and connects again, as the same process, saying hello
+    /// with the workspace id `workspace` (`"none"` for none); returns the new hello's result,
+    /// which [`TestApp::hello`] gives from now on. Events that arrive meanwhile are kept for
+    /// [`TestApp::next_event`]; the subscriptions of the old connection are not made again.
+    ///
+    /// # Panics
+    /// If the core refuses the hello, or no answer comes within 30 s.
+    pub fn reconnect(&mut self, workspace: &str) -> Value {
+        let line = json!({"lil_test_app": "reconnect", "workspace": workspace});
+        self.rpc.io.send_line(&line.to_string());
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Some(line) = self.rpc.io.read_line(left) else {
+                panic!(
+                    "lil-test-app said no hello after reconnecting within {DEADLINE:?}\nstderr so far: {}",
+                    self.rpc.io.stderr()
+                );
+            };
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                panic!("lil-test-app sent a line that is not JSON: {line}");
+            };
+            if message.get("method") == Some(&json!(lil_protocol::method::EVENT)) {
+                self.rpc.events.push_back(message["params"].clone());
+                continue;
+            }
+            if message.get("id") == Some(&json!(0)) {
+                assert_eq!(
+                    message["result"]["status"], "ok",
+                    "the core refused lil-test-app's hello: {message}"
+                );
+                self.hello = message["result"].clone();
+                return self.hello.clone();
+            }
+        }
+    }
+
     /// Sends a request and returns the whole response object (`result` or `error`); events
     /// that arrive meanwhile are kept for [`TestApp::next_event`].
     ///

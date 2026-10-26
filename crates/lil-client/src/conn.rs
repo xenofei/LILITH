@@ -42,6 +42,7 @@ pub(crate) struct Conn {
     shared: Arc<Shared>,
     next_id: AtomicI64,
     reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -89,14 +90,24 @@ impl Conn {
         let (read, write) = tokio::io::split(pipe);
         let shared = Arc::new(Shared::default());
         let (outbound, queue) = mpsc::channel(OUTBOUND_CAPACITY);
-        tokio::spawn(write_lines(write, queue, shared.clone()));
+        let writer = tokio::spawn(write_lines(write, queue, shared.clone()));
         let reader = tokio::spawn(read_lines(read, shared.clone()));
         Arc::new(Conn {
             outbound,
             shared,
             next_id: AtomicI64::new(1),
             reader,
+            writer,
         })
+    }
+
+    /// Closes the connection now, whoever still holds it: waiting calls get
+    /// [`ClientError::Closed`], every stream ends after what it holds, and the pipe closes
+    /// (lines not yet written are dropped).
+    pub(crate) fn shutdown(&self) {
+        self.shared.close();
+        self.reader.abort();
+        self.writer.abort();
     }
 
     /// Sends a request and waits for its response: the `result`, or the JSON-RPC error as

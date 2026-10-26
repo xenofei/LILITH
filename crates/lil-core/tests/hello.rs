@@ -388,3 +388,79 @@ fn test_app_resolves_to_ui_test_on_test_channels_only() {
     let app = TestApp::start(&env, None, &[]);
     assert_eq!(app.hello()["caller_kind"], "cli", "{}", app.hello());
 }
+
+/// A monthly cap of 1 USD: a `test.destructive` call costing 5 asks about the cap.
+const MONTHLY_1: &str = "[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n";
+
+/// The state of confirmation `id` in `app`'s `app/confirmations.list` history, if it is there.
+fn history_state(app: &mut TestApp, id: &str) -> Option<Value> {
+    let history = app.call("app/confirmations.list", json!({"state": "history"}));
+    history["result"]["confirmations"]
+        .as_array()
+        .and_then(|list| list.iter().find(|c| c["id"] == id))
+        .map(|c| c["state"].clone())
+}
+
+/// Waits until `app` lists confirmation `id` as cancelled.
+fn wait_cancelled(app: &mut TestApp, id: &str, why: &str) {
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while history_state(app, id) != Some(json!("cancelled")) {
+        assert!(std::time::Instant::now() < deadline, "{why}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// An app's own cap prompt outlives a reconnect of the app (APP-029; Appendix G
+/// "Connections"): the retry its new connection makes with the call's key finds the same
+/// confirmation still pending, and the prompt is cancelled only once the app's process exits.
+#[test] // spec: APP-029, APP-054, CORE-091
+fn an_apps_cap_prompt_outlives_its_reconnect_and_ends_with_its_process() {
+    let env = TestEnv::new();
+    env.suite_toml_set(MONTHLY_1);
+    let _core = core_trusting_testbins(&env, true);
+    let mut app = TestApp::start(&env, None, &[]);
+    let (key, args) = ("ik_00000000000000a1", json!({"cost": "5"}));
+    let asked = app.tool("test.destructive", args.clone(), Some(key));
+    assert_eq!(asked["status"], "pending_confirmation", "{asked}");
+    assert_eq!(asked["covers"], json!(["cap"]), "{asked}");
+    let id = asked["confirmation_id"].as_str().unwrap().to_string();
+
+    let pid = app.pid();
+    let hello = app.reconnect("none");
+    assert_eq!(hello["caller_kind"], "ui:test", "{hello}");
+    assert_eq!(app.pid(), pid);
+    let again = app.tool("test.destructive", args, Some(key));
+    assert_eq!(
+        again["status"], "pending_confirmation",
+        "the reconnect ended the prompt: {again}"
+    );
+    assert_eq!(again["confirmation_id"], id.as_str(), "{again}");
+
+    drop(app);
+    let mut other = TestApp::start(&env, None, &[]);
+    wait_cancelled(&mut other, &id, "the prompt outlived its app");
+}
+
+/// A switch ends the app's cap prompts of the workspace it left at once, while the app runs:
+/// its next connection names another workspace.
+#[test] // spec: APP-029, ARCH-030
+fn a_switch_cancels_the_cap_prompts_of_the_workspace_left() {
+    let env = TestEnv::new();
+    env.suite_toml_set(MONTHLY_1);
+    let served = env.make_workspace("served");
+    env.register_workspace(&served, true);
+    let _core = core_trusting_testbins(&env, true);
+    let mut app = TestApp::start(&env, None, &[]);
+    let asked = app.tool(
+        "test.destructive",
+        json!({"cost": "5"}),
+        Some("ik_00000000000000a2"),
+    );
+    assert_eq!(asked["status"], "pending_confirmation", "{asked}");
+    let id = asked["confirmation_id"].as_str().unwrap().to_string();
+
+    let id_served = env.workspace_id(&served);
+    let hello = app.reconnect(&id_served);
+    assert_eq!(hello["workspace"]["id"], id_served.as_str(), "{hello}");
+    wait_cancelled(&mut app, &id, "the switch left the prompt pending");
+}

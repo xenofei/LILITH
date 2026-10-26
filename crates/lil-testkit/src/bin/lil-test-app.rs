@@ -7,13 +7,19 @@
 //! default), prints the hello's response as its first stdout line, and
 //! then relays lines both ways: each stdin line goes to the core, each line from the core goes
 //! to stdout. It exits when either side closes (1 when it cannot connect).
+//!
+//! The stdin line `{"lil_test_app": "reconnect", "workspace": "<id>"}` is not relayed: the
+//! app closes its connection, connects again and says hello naming that workspace (the same
+//! one when `workspace` is left out), prints that hello's response, and relays on the new
+//! connection. The process stays the same, as an app's does when its session reconnects.
 
 use std::time::{Duration, Instant};
 
+use futures_util::future::{Either, select};
 use lil_platform::Env;
 use lil_platform::pipe::open_client;
 use lil_testkit::TEST_APP_CAPABILITIES;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 fn fail(message: &str) -> ! {
@@ -51,77 +57,81 @@ fn main() {
         .enable_all()
         .build()
         .unwrap_or_else(|e| fail(&e.to_string()));
-    rt.block_on(relay(&env.pipe_name(), &workspace, &capabilities));
+    rt.block_on(relay(&env.pipe_name(), workspace, &capabilities));
 }
 
-async fn relay(pipe: &str, workspace: &str, capabilities: &[String]) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let client = loop {
-        match open_client(pipe) {
-            Ok(client) => break client,
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(e) => fail(&format!("cannot connect to {pipe}: {e}")),
-        }
-    };
-    let (read, mut to_core) = tokio::io::split(client);
-    let mut from_core = BufReader::new(read);
-    let hello = json!({"jsonrpc": "2.0", "id": 0, "method": lil_protocol::method::HELLO,
-    "params": {
-        "protocol": lil_protocol::PROTOCOL.to_string(),
-        "build_id": "lil-test-app",
-        "schema_hash": lil_protocol::schema_hash(),
-        "capabilities": capabilities,
-        "caller_kind": "ui:test",
-        "non_interactive": false,
-        "workspace": workspace,
-    }});
-    if let Err(e) = send(&mut to_core, &hello.to_string()).await {
-        fail(&format!("cannot send the hello: {e}"));
+/// The workspace a reconnect line names (`Some(None)`: the same one), or `None` for any other
+/// line.
+fn reconnect_request(line: &str) -> Option<Option<String>> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("lil_test_app")? != "reconnect" {
+        return None;
     }
-
-    let mut stdout = tokio::io::stdout();
-    let core_to_stdout = async {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match from_core.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if send(&mut stdout, line.trim_end_matches(['\r', '\n']))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-    let stdin_to_core = async {
-        let mut stdin = BufReader::new(tokio::io::stdin());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stdin.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if send(&mut to_core, line.trim_end_matches(['\r', '\n']))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-    futures_util::future::select(
-        std::pin::pin!(core_to_stdout),
-        std::pin::pin!(stdin_to_core),
+    Some(
+        value
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     )
-    .await;
+}
+
+async fn relay(pipe: &str, mut workspace: String, capabilities: &[String]) {
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    loop {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let client = loop {
+            match open_client(pipe) {
+                Ok(client) => break client,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => fail(&format!("cannot connect to {pipe}: {e}")),
+            }
+        };
+        let (read, mut to_core) = tokio::io::split(client);
+        let mut from_core = BufReader::new(read).lines();
+        let hello = json!({"jsonrpc": "2.0", "id": 0, "method": lil_protocol::method::HELLO,
+        "params": {
+            "protocol": lil_protocol::PROTOCOL.to_string(),
+            "build_id": "lil-test-app",
+            "schema_hash": lil_protocol::schema_hash(),
+            "capabilities": capabilities,
+            "caller_kind": "ui:test",
+            "non_interactive": false,
+            "workspace": workspace,
+        }});
+        if let Err(e) = send(&mut to_core, &hello.to_string()).await {
+            fail(&format!("cannot send the hello: {e}"));
+        }
+        // Both `next_line`s are cancel safe: the one that loses the race loses no line.
+        let next = loop {
+            let from = std::pin::pin!(from_core.next_line());
+            let input = std::pin::pin!(stdin.next_line());
+            match select(from, input).await {
+                Either::Left((Ok(Some(line)), _)) => {
+                    if send(&mut stdout, &line).await.is_err() {
+                        return;
+                    }
+                }
+                Either::Right((Ok(Some(line)), _)) => match reconnect_request(&line) {
+                    Some(next) => break next,
+                    None => {
+                        if send(&mut to_core, &line).await.is_err() {
+                            return;
+                        }
+                    }
+                },
+                // Either side closed (or failed).
+                _ => return,
+            }
+        };
+        if let Some(next) = next {
+            workspace = next;
+        }
+        // Dropping both halves closes this connection before the next one is made.
+        drop((from_core, to_core));
+    }
 }
 
 /// Writes `line` and a `\n`, then flushes.

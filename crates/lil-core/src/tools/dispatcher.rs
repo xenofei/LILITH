@@ -206,6 +206,12 @@ impl Dispatcher {
         let _ = self.inner.errors.set(sink);
     }
 
+    /// Tells the error sink of `error`, an error outcome of `tool` that the router answered
+    /// itself: an `app/*` method (APP-041; Appendix G "Connections").
+    pub fn record_error(&self, tool: &str, error: &ErrorBody) {
+        self.inner.record(tool, error);
+    }
+
     /// The core's jobs: the server registers their handlers, blocker and shutdown step.
     pub fn jobs(&self) -> &Arc<Jobs> {
         &self.inner.jobs
@@ -354,7 +360,14 @@ impl Dispatcher {
 impl Inner {
     /// Tells the error sink of `outcome`, the outcome of a call of `tool`, if it is an error.
     fn record_error(&self, tool: &str, outcome: &Outcome<ToolOutput>) {
-        if let (Outcome::Error { error }, Some(sink)) = (outcome, self.errors.get()) {
+        if let Outcome::Error { error } = outcome {
+            self.record(tool, error);
+        }
+    }
+
+    /// Tells the error sink of `error`, an error outcome of `tool`.
+    fn record(&self, tool: &str, error: &ErrorBody) {
+        if let Some(sink) = self.errors.get() {
             let at_ms = self
                 .clock
                 .utc_now()

@@ -16,8 +16,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use lil_client::blocking::{self, BlockingClient};
-use lil_client::session::{Session, SessionState};
-use lil_client::{ClientConfig, ClientError, DrainOutcome, StartPolicy, mark_gui_thread, mint_id};
+use lil_client::session::{Session, SessionState, UnavailableCause};
+use lil_client::{
+    ClientConfig, ClientError, DrainOutcome, StartFailure, StartPolicy, mark_gui_thread, mint_id,
+};
 use lil_platform::process;
 use lil_protocol::{
     CallerKind, EventKind, EventParams, HelloResult, Outcome, PROTOCOL, ProtocolVersion, ToolOutput,
@@ -191,6 +193,15 @@ fn session_reconnects_and_resubscribes_from_the_last_seq() {
     rt.block_on(async {
         let second = wait_ready(&mut state, Some(&first.instance_id)).await;
         assert_eq!(second.core.pid, second_core.pid());
+        // The new core is marked in the stream first: one reload per topic, the session's own.
+        for topic in topics {
+            let mark = next_event(&mut events).await;
+            assert_eq!(
+                (mark.topic.as_str(), mark.seq, mark.kind),
+                (topic, 0, EventKind::ResyncRequired),
+                "{mark:?}"
+            );
+        }
         let mut got: Vec<(String, u64, u64)> = Vec::new();
         for _ in 0..4 {
             let event = next_event(&mut events).await;
@@ -312,6 +323,12 @@ fn session_gets_a_snapshot_when_the_history_is_gone() {
     rt.block_on(async {
         let second = wait_ready(&mut state, Some(&first.instance_id)).await;
         assert_eq!(second.core.pid, second_core.pid());
+        let mark = next_event(&mut events).await;
+        assert_eq!(
+            (mark.topic.as_str(), mark.seq, mark.kind),
+            ("telemetry", 0, EventKind::ResyncRequired),
+            "the session's reload mark comes first: {mark:?}"
+        );
         let snapshot = next_event(&mut events).await;
         assert_eq!(snapshot.topic, "telemetry");
         assert_eq!(snapshot.kind, EventKind::Snapshot, "{snapshot:?}");
@@ -481,9 +498,17 @@ fn unavailable_when_no_core_can_start() {
     missing.core_exe = env.root().join("no such bin").join("lil-core.exe");
     let rt = runtime();
     rt.block_on(async {
-        for (cfg, says) in [
-            (&cfg, "damaged"),
-            (&missing, "Cannot start the LILITH core"),
+        for (cfg, says, why) in [
+            (
+                &cfg,
+                "damaged",
+                UnavailableCause::StartFailed(StartFailure::StateDamaged),
+            ),
+            (
+                &missing,
+                "Cannot start the LILITH core",
+                UnavailableCause::CannotStart,
+            ),
         ] {
             let session = Session::start(cfg.clone(), Vec::new());
             let mut state = session.state();
@@ -491,10 +516,11 @@ fn unavailable_when_no_core_can_start() {
                 matches!(s, SessionState::Unavailable { .. })
             })
             .await;
-            let SessionState::Unavailable { reason } = seen else {
+            let SessionState::Unavailable { reason, cause } = seen else {
                 unreachable!()
             };
             assert!(reason.contains(says), "{reason}");
+            assert_eq!(cause, why, "{reason}");
             session.close().await;
         }
     });
@@ -512,6 +538,11 @@ fn failed_starts(env: &TestEnv) -> usize {
 /// After a failed start, the session only looks for a core someone else started: one failing
 /// core, not one every 5 s. `retry_now` starts one again; once the person has set the
 /// database aside and a core runs, the session finds it by itself.
+///
+/// The attempts after the failure run on tokio's paused clock, which jumps from one to the
+/// next, so they reach the 5 s cap at no cost in time. The count of failed starts at the end,
+/// taken once the session has gone on to find a core (its attempts run one after another),
+/// would include a start made by any of them.
 #[test] // spec: ARCH-100, CORE-004, ARCH-018
 fn a_failed_start_is_tried_once_until_retry_now() {
     let env = TestEnv::new();
@@ -527,8 +558,10 @@ fn a_failed_start_is_tried_once_until_retry_now() {
             matches!(s, SessionState::Unavailable { .. })
         })
         .await;
-        // The attempts 250, 750, 1750 and 3750 ms after the failure only look for a core.
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        // 30 s of attempts, the last five at the 5 s cap, that only look for a core.
+        tokio::time::pause();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::resume();
         assert_eq!(failed_starts(&env), 1);
         assert!(
             matches!(*state.borrow(), SessionState::Unavailable { .. }),
@@ -561,6 +594,10 @@ fn a_failed_start_is_tried_once_until_retry_now() {
 /// is that start's retry, not a second start. Both are sent before the session's task first
 /// runs (a current-thread runtime), so they reach it while the attempt is under way, with no
 /// timing involved: only the end of the failed start decides.
+///
+/// A second start would follow the first one's failure at once. Its proof is not a quiet
+/// window but what comes after it: the session's attempts run one after another, so by the
+/// time it is ready on a core started for it, every start it made has ended and logged.
 #[test] // spec: ARCH-100, CORE-004, ARCH-018
 fn retries_during_a_start_give_one_start() {
     let env = TestEnv::new();
@@ -568,7 +605,8 @@ fn retries_during_a_start_give_one_start() {
     let db = env.env.suite_state_db();
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     std::fs::write(&db, vec![0xAB_u8; 4096]).unwrap();
-    runtime().block_on(async {
+    let rt = runtime();
+    let (session, mut state) = rt.block_on(async {
         let session = Session::start(cfg.clone(), Vec::new());
         session.retry_now();
         session.retry_now();
@@ -577,11 +615,19 @@ fn retries_during_a_start_give_one_start() {
             matches!(s, SessionState::Unavailable { .. })
         })
         .await;
-        // A second start would follow the first one's failure at once.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(failed_starts(&env), 1, "the retries started another core");
+        (session, state)
+    });
+
+    // The damaged database goes aside, and a core someone else started runs.
+    std::fs::rename(&db, db.with_extension("db.aside")).unwrap();
+    let core = CoreFixture::start(&env);
+    rt.block_on(async {
+        let ready = wait_ready(&mut state, None).await;
+        assert_eq!(ready.core.pid, core.pid(), "the session started a core");
         session.close().await;
     });
+    assert_eq!(failed_starts(&env), 1, "the retries started another core");
+    stop(&cfg);
 }
 
 /// P4a-R33: after each failed attempt the session waits 250 ms, doubling up to 5 s.

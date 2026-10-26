@@ -40,7 +40,7 @@ use lil_platform::process::{
     ProcessHandle, ProcessInfo, ProcessInspector as _, SpawnRequest, SystemInspector,
     current_user_sid, spawn_detached,
 };
-use lil_protocol::codes::{PROTOCOL_INCOMPATIBLE, WORKSPACE_UNKNOWN};
+use lil_protocol::codes::{CORE_DRAINING, PROTOCOL_INCOMPATIBLE, WORKSPACE_UNKNOWN};
 use lil_protocol::{
     CAPABILITIES, DrainResult, HelloParams, HelloResult, NO_WORKSPACE, Outcome, RpcError,
     SubscribeParams, SubscribeResult, ToolCallParams, ToolDescriptor, ToolOutput, ToolsListResult,
@@ -306,7 +306,8 @@ pub enum DrainOutcome {
 /// The hello names no workspace (a stop does not depend on one). A core owned by the current
 /// user is asked even when its executable is not in `server_dirs`: a drain is harmless and
 /// clears a foreign core (ARCH-027). A core whose protocol is newer than this client's refuses
-/// the drain: [`ClientError::Incompatible`].
+/// the drain: [`ClientError::Incompatible`]. A core that is draining already refuses the hello
+/// with `core.draining`, and this waits for it to go.
 pub async fn drain_and_wait(
     cfg: &ClientConfig,
     within: Duration,
@@ -356,6 +357,12 @@ pub async fn drain_and_wait(
             Outcome::Ok(_) => {}
             // The core decides about the drain from the refused connection's major.
             Outcome::Error { error } if error.code == PROTOCOL_INCOMPATIBLE.code => {}
+            // Already shutting down (Appendix G "Connections"): wait for it to go.
+            Outcome::Error { error } if error.code == CORE_DRAINING.code => {
+                drop(conn);
+                wait_gone(&pipe_name, deadline).await?;
+                return Ok(DrainOutcome::Stopped);
+            }
             Outcome::Error { error } => return Err(ClientError::Refused(error)),
             Outcome::PendingConfirmation(_) => return Err(unexpected_pending(method::HELLO)),
         },
@@ -1028,5 +1035,48 @@ mod tests {
             folder_key(Path::new(r"Z:\no such\bin")),
             folder_key(Path::new(r"Z:\no such\other bin"))
         );
+    }
+
+    /// A second `lil core stop` while the core drains: the core refuses its hello with
+    /// `core.draining` (Appendix G "Connections"), and that is a core already stopping, so
+    /// this waits for its pipe to go instead of failing.
+    #[test] // spec: ARCH-023, ARCH-021
+    fn drain_and_wait_takes_a_draining_core_as_stopping() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let env = TestEnv::new();
+        let cfg = ClientConfig::for_env(env.env.clone(), CallerKind::Cli).unwrap();
+        let server = |first| lil_platform::pipe::create_instance(&env.env.pipe_name(), first);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = server(true).expect("fake server");
+            let fake = async {
+                server.connect().await.expect("accept");
+                let (read, mut write) = tokio::io::split(server);
+                let mut lines = BufReader::new(read).lines();
+                let line = lines.next_line().await.unwrap().expect("a hello");
+                let hello: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(hello["method"], method::HELLO, "{hello}");
+                let refusal = lil_protocol::ErrorBody::new(
+                    &CORE_DRAINING,
+                    "The core is shutting down.",
+                    "t_0000000000000001",
+                );
+                let outcome = Outcome::<HelloResult>::Error { error: refusal };
+                let reply = json!({"jsonrpc": "2.0", "id": hello["id"], "result": outcome});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                // Nothing more is asked of it; the core then goes, and its pipe with it.
+                let rest = lines.next_line().await.unwrap();
+                assert!(rest.is_none(), "{rest:?}");
+            };
+            let (drained, ()) = tokio::join!(drain_and_wait(&cfg, Duration::from_secs(30)), fake);
+            assert_eq!(drained.expect("drain_and_wait"), DrainOutcome::Stopped);
+        });
     }
 }
