@@ -26,8 +26,8 @@ use lil_core::jobs::record::{self, JobRow};
 use lil_core::jobs::{
     Admission, Admit, COMPLETION_GRACE, CancelSelector, EngineKind, JobCaller, JobCompletion,
     JobCtx, JobDone, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin, JobSpec,
-    JobStatus, JobSummary, Jobs, Lane, MAX_BACKOFF, MoveTo, PauseReason, Priority, Reservations,
-    SubmittedSlot, Substatus, backoff, cancelled_error,
+    JobStatus, JobSummary, Jobs, Lane, ListOrder, MAX_BACKOFF, MoveTo, PauseReason, Priority,
+    Reservations, SubmittedSlot, Substatus, backoff, cancelled_error,
 };
 use lil_core::lifecycle::{DrainReason, Lifecycle, ShutdownPhase, ShutdownStep};
 use lil_core::pipeline::{RecordBranch, RecordPlan, start_candidate_run};
@@ -72,7 +72,7 @@ struct Seen {
 /// (`retryable` on attempts 1–2, `retryable_always`, `disk_full`, `unknown`, `interrupted`),
 /// `record` (leave a candidate-run record plan), `in_engine: true` (the attempt shows
 /// `queued_in_engine` first), `progress_on` (a gate: once it opens, a gated attempt reports
-/// one progress).
+/// one progress), `structured` (an object whose keys join the result's `structured`).
 #[derive(Default)]
 struct TestHandler {
     seen: Mutex<Seen>,
@@ -191,8 +191,14 @@ impl TestHandler {
             .and_then(Value::as_bool)
             .unwrap_or(false)
             .then(record_plan);
+        let mut structured = json!({"ran": job.attempt});
+        if let Some(Value::Object(extra)) = args.get("structured") {
+            for (k, v) in extra {
+                structured[k] = v.clone();
+            }
+        }
         Ok(JobDone {
-            structured: json!({"ran": job.attempt}),
+            structured,
             artifacts: Vec::new(),
             record,
             windows: Vec::new(),
@@ -2326,6 +2332,184 @@ async fn jobs_list_gives_no_cursor_on_the_last_page() {
     let (last, next) = fx.jobs.list(&fx.ctx(), page(1, next)).await.unwrap();
     assert_eq!((last.len(), next), (1, None));
     assert_ne!(first[0].job_id, last[0].job_id);
+    fx.shutdown().await;
+}
+
+/// Checkpoint A I3 (conformance I-1): a queued job's `queue_position` is its place in its
+/// lane's queue order (class, then `order_key`), and `jobs.list {order: "queue"}` lists the
+/// queued jobs in that order, in pages; a moved job reads back in its new place.
+#[tokio::test(start_paused = true)] // spec: CORE-160, CORE-124
+async fn queue_position_and_queue_order_follow_a_move() {
+    let fx = Fx::suite().await;
+    let running = running_gate(&fx, Lane::Cpu, "never").await;
+    let mut agents = Vec::new();
+    for _ in 0..3 {
+        agents.push(
+            fx.submit(spec(Lane::Cpu, Priority::Agent, json!({})))
+                .await
+                .job_id,
+        );
+    }
+    let user = fx
+        .submit(spec(Lane::Cpu, Priority::User, json!({})))
+        .await
+        .job_id;
+    let rig = &fx;
+    let position = |id: String| async move {
+        rig.jobs
+            .get(&rig.ctx(), &JobId(id))
+            .await
+            .unwrap()
+            .queue_position
+    };
+    assert_eq!(position(running.job_id.clone()).await, None, "it runs");
+    assert_eq!(
+        position(user.clone()).await,
+        Some(0),
+        "a better class first"
+    );
+    for (n, id) in agents.iter().enumerate() {
+        assert_eq!(position(id.clone()).await, Some(n as u32 + 1));
+    }
+    let moved = fx
+        .jobs
+        .move_job(&fx.ctx(), &JobId(agents[2].clone()), MoveTo::Next)
+        .await
+        .unwrap();
+    assert_eq!(moved.queue_position, Some(1));
+    assert_eq!(position(agents[0].clone()).await, Some(2));
+    let queue = |limit: u32, cursor: Option<String>| JobFilter {
+        order: Some(ListOrder::Queue),
+        limit: Some(limit),
+        cursor,
+        ..JobFilter::default()
+    };
+    let ids = |jobs: Vec<JobSummary>| jobs.into_iter().map(|j| j.job_id).collect::<Vec<_>>();
+    let want = vec![
+        user.clone(),
+        agents[2].clone(),
+        agents[0].clone(),
+        agents[1].clone(),
+    ];
+    let (all, next) = fx.jobs.list(&fx.ctx(), queue(100, None)).await.unwrap();
+    assert_eq!((ids(all), next), (want.clone(), None));
+    let (first, next) = fx.jobs.list(&fx.ctx(), queue(3, None)).await.unwrap();
+    assert_eq!(ids(first), want[..3]);
+    let (rest, next) = fx.jobs.list(&fx.ctx(), queue(3, next)).await.unwrap();
+    assert_eq!((ids(rest), next), (want[3..].to_vec(), None));
+    fx.shutdown().await;
+}
+
+/// Checkpoint A I4: a summary leaves out `result.structured.executed_graph`; the row and the
+/// diagnostics bundle's job (`get_with_origin`) keep it.
+#[tokio::test(start_paused = true)] // spec: CORE-130, ARCH-025
+async fn a_summary_leaves_out_the_executed_graph() {
+    let fx = Fx::suite().await;
+    let graph = json!({"1": {"class_type": "SaveImage", "inputs": {}}});
+    let job = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::Agent,
+            json!({"structured": {"executed_graph": graph}}),
+        ))
+        .await;
+    let done = fx.finished(&job.job_id).await;
+    let shown = done.result.unwrap().structured;
+    assert_eq!(shown["ran"], 1, "{shown}");
+    assert!(shown.get("executed_graph").is_none(), "{shown}");
+    let listed = fx
+        .jobs
+        .list(&fx.ctx(), JobFilter::default())
+        .await
+        .unwrap()
+        .0;
+    let listed = &listed[0].result.as_ref().unwrap().structured;
+    assert!(listed.get("executed_graph").is_none(), "{listed}");
+    let row = fx.row(&job.job_id).await;
+    assert_eq!(row.result.unwrap().structured["executed_graph"], graph);
+    let (full, _) = fx
+        .jobs
+        .get_with_origin(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(full.result.unwrap().structured["executed_graph"], graph);
+    fx.shutdown().await;
+}
+
+/// Checkpoint A I4: a `jobs.list` page ends before 3 MiB of summaries, with a cursor, so it
+/// stays under the line cap; the pages together list every job once.
+#[tokio::test(start_paused = true)] // spec: ARCH-025, CORE-146
+async fn a_jobs_list_page_stays_under_the_line_cap() {
+    let fx = Fx::suite().await;
+    let blob = "x".repeat(64 * 1024);
+    let mut made = HashSet::new();
+    for _ in 0..100 {
+        let job = fx
+            .submit(spec(
+                Lane::Cpu,
+                Priority::Agent,
+                json!({"structured": {"blob": blob}}),
+            ))
+            .await;
+        fx.finished(&job.job_id).await;
+        made.insert(job.job_id);
+    }
+    let (mut seen, mut cursor, mut pages) = (HashSet::new(), None, 0);
+    loop {
+        let f = JobFilter {
+            limit: Some(100),
+            cursor: cursor.take(),
+            ..JobFilter::default()
+        };
+        let (jobs, next) = fx.jobs.list(&fx.ctx(), f).await.unwrap();
+        let bytes = serde_json::to_string(&jobs).unwrap().len();
+        assert!(bytes <= 3 * 1024 * 1024, "a page of {bytes} bytes");
+        assert!(!jobs.is_empty());
+        pages += 1;
+        for job in jobs {
+            assert!(seen.insert(job.job_id), "listed twice");
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(pages >= 3, "{pages} pages");
+    assert_eq!(seen, made);
+    fx.shutdown().await;
+}
+
+/// Checkpoint A M3 (conformance M-1): `updated` is kept in whole seconds, so a `since` with a
+/// fractional part also lists the jobs updated in its own second; a whole-second `since`
+/// lists the later ones.
+#[tokio::test(start_paused = true)] // spec: CORE-146
+async fn jobs_list_since_keeps_the_jobs_of_its_own_second() {
+    let fx = Fx::suite().await;
+    let job = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let done = fx.finished(&job.job_id).await;
+    let second = done.updated.strip_suffix('Z').unwrap().to_string();
+    let since = |t: String| JobFilter {
+        since: Some(t),
+        ..JobFilter::default()
+    };
+    let rig = &fx;
+    let listed = |f| async move {
+        rig.jobs
+            .list(&rig.ctx(), f)
+            .await
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|j| j.job_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed(since(format!("{second}.700Z"))).await,
+        [job.job_id.clone()],
+        "updated later in the same second"
+    );
+    assert!(listed(since(format!("{second}.000Z"))).await.is_empty());
+    assert!(listed(since(format!("{second}Z"))).await.is_empty());
     fx.shutdown().await;
 }
 

@@ -48,6 +48,21 @@ pub struct LiveView {
     pub unresponsive: bool,
     /// The reasons holding a job in `queue_paused`.
     pub pause_reasons: Vec<String>,
+    /// Its place in its lane's queue, while it is queued (Appendix G "Queue position").
+    pub queue_position: Option<u32>,
+}
+
+/// What a job's summary leaves out of its result's `structured` (Appendix G: the graph a
+/// `comfy.prompt` ran, kept in the row and a diagnostics bundle's `job.json`).
+pub const SUMMARY_LEAVES_OUT: &str = "executed_graph";
+
+/// `result` as a summary shows it: without [`SUMMARY_LEAVES_OUT`].
+fn shown_result(result: &JobResult) -> JobResult {
+    let mut shown = result.clone();
+    if let Some(structured) = shown.structured.as_object_mut() {
+        structured.remove(SUMMARY_LEAVES_OUT);
+    }
+    shown
 }
 
 /// One `jobs` row.
@@ -148,7 +163,7 @@ impl JobRow {
             watchdog: self.watchdog.clone(),
             vram_unchecked: self.vram_unchecked,
             error: self.error.clone(),
-            result: self.result.clone(),
+            result: self.result.as_ref().map(shown_result),
             retry_of: self.retry_of.clone(),
             trace_id: self.trace_id.clone(),
             batch_id: self.batch_id.clone(),
@@ -171,6 +186,7 @@ impl JobRow {
                 Vec::new()
             },
             estimate: self.estimate.clone(),
+            queue_position: live.and_then(|l| l.queue_position),
         }
     }
 

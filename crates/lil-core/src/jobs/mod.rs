@@ -545,6 +545,10 @@ pub struct JobSummary {
     /// P4a-R40); none for a job of a core without an estimator, or of before plan 4a.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<Estimate>,
+    /// For a job this core holds queued: its 0-based place in its lane's queue, counting the
+    /// lane's queued jobs of every scope (Appendix G "Queue position").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u32>,
 }
 
 /// The summary text of a job whose every node the engine served from its cache (CORE-117).
@@ -1175,6 +1179,20 @@ pub struct JobFilter {
     /// The jobs of this batch.
     #[serde(default)]
     pub batch_id: Option<String>,
+    /// `newest` (the default) or `queue`: the queued jobs this core holds, by lane, then
+    /// `queue_position` (Appendix G).
+    #[serde(default)]
+    pub order: Option<ListOrder>,
+}
+
+/// The order of a `jobs.list` page (Appendix G).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ListOrder {
+    /// Newest first, every job the filter selects.
+    Newest,
+    /// The queued jobs this core holds, by lane (`gpu-heavy` first), then by place.
+    Queue,
 }
 
 #[cfg(test)]

@@ -43,10 +43,10 @@ use super::{
     Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, CancelSelector, DISK_MARGIN_BYTES, EngineKind,
     ExecWindow, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion,
     JobCtx, JobDone, JobEndHook, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin,
-    JobResult, JobSpec, JobStatus, JobSummary, Lane, MAX_ATTEMPTS, MAX_CANCEL_IDS, MAX_WAIT,
-    MoveTo, NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob, Reservations,
-    RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, StartedBy, Substatus, Subtask, Surface,
-    Withdraw, WithdrawOutcome, backoff,
+    JobResult, JobSpec, JobStatus, JobSummary, Lane, ListOrder, MAX_ATTEMPTS, MAX_CANCEL_IDS,
+    MAX_WAIT, MoveTo, NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob,
+    Reservations, RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, StartedBy, Substatus,
+    Subtask, Surface, Withdraw, WithdrawOutcome, backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
@@ -261,11 +261,27 @@ impl Active {
             && !self.info.spec.external_side_effects
     }
 
+    /// Whether the job is queued: it doesn't run (a withdrawn one is queued again while its
+    /// attempt winds down) and isn't ending.
+    fn queued(&self) -> bool {
+        (!self.running || self.withdrawal == Withdrawal::Withdrawn) && !self.completing
+    }
+
+    /// Its place in its lane's queue order (Appendix G "Queue position"): class, then
+    /// requeued at the head of its class, then `order_key`, then `job_id`.
+    fn queue_key(&self) -> (Priority, bool, i64, &str) {
+        (
+            self.info.spec.priority,
+            !self.head,
+            self.order_key,
+            self.info.id.as_str(),
+        )
+    }
+
     /// The reasons that hold this queued job (none for a job that runs or ends; a withdrawn
     /// one is queued again while its attempt winds down).
     fn hold_reasons(&self, lane: &LaneState) -> Vec<String> {
-        let queued = !self.running || self.withdrawal == Withdrawal::Withdrawn;
-        if !queued || self.completing {
+        if !self.queued() {
             return Vec::new();
         }
         let mut reasons = lane.holding(self.info.spec.priority);
@@ -342,6 +358,9 @@ pub(crate) struct Shared {
 pub const STALL_AFTER: Duration = Duration::from_secs(30);
 /// How often the stall rule is checked (P4a-R33).
 pub const STALL_CHECK_EVERY: Duration = Duration::from_secs(5);
+/// The most JSON a `jobs.list` page's jobs take: the page ends before it (Appendix G), so the
+/// result stays under the 4 MiB line cap (ARCH-025).
+pub const LIST_PAGE_BYTES: usize = 3 * 1024 * 1024;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -569,7 +588,60 @@ impl Shared {
             report: Some(a.report.clone()),
             unresponsive: a.unresponsive,
             pause_reasons: a.hold_reasons(&q.lanes[a.info.spec.lane.index()]),
+            queue_position: Self::queue_position(&q, a),
         })
+    }
+
+    /// `a`'s 0-based place among its lane's queued jobs of every scope, when it is queued
+    /// (Appendix G "Queue position").
+    fn queue_position(q: &Queue, a: &Active) -> Option<u32> {
+        if !a.queued() {
+            return None;
+        }
+        let mine = a.queue_key();
+        let ahead = q
+            .jobs
+            .values()
+            .filter(|o| o.info.spec.lane == a.info.spec.lane && o.queued() && o.queue_key() < mine)
+            .count();
+        Some(u32::try_from(ahead).unwrap_or(u32::MAX))
+    }
+
+    /// The ids of `scope`'s jobs this core holds queued, by lane (`gpu-heavy` first), then by
+    /// queue order (`jobs.list {order: "queue"}`).
+    fn queued_in_order(&self, scope: &Scope) -> Vec<String> {
+        let q = self.queue();
+        let key = scope.key();
+        let mut queued: Vec<&Active> = q
+            .jobs
+            .values()
+            .filter(|a| a.queued() && a.info.scope.key() == key)
+            .collect();
+        queued.sort_by(|a, b| {
+            (a.info.spec.lane.index(), a.queue_key())
+                .cmp(&(b.info.spec.lane.index(), b.queue_key()))
+        });
+        queued.into_iter().map(|a| a.info.id.to_string()).collect()
+    }
+
+    /// The summaries of `rows`' first jobs, at most `limit`, ending before their JSON passes
+    /// [`LIST_PAGE_BYTES`] (always at least one when there is one): ARCH-025's line cap.
+    fn page(&self, rows: &[JobRow], limit: usize) -> Vec<JobSummary> {
+        let mut page = Vec::new();
+        let mut bytes = 0;
+        for row in rows.iter().take(limit) {
+            let summary = self.summary(row);
+            let size = serde_json::to_string(&summary)
+                .expect("a job summary serialises")
+                .len()
+                + 1;
+            if !page.is_empty() && bytes + size > LIST_PAGE_BYTES {
+                break;
+            }
+            bytes += size;
+            page.push(summary);
+        }
+        page
     }
 
     fn summary(&self, row: &JobRow) -> JobSummary {
@@ -3011,7 +3083,10 @@ impl Jobs {
             .await
             .map_err(|e| state_unavailable(&e, &caller.trace_id))?
             .ok_or_else(|| job_unknown(id.as_str(), &caller.trace_id))?;
-        Ok((s.summary(&row), row.origin))
+        // The bundle's `job.json` keeps the whole result, the executed graph included.
+        let mut summary = s.summary(&row);
+        summary.result.clone_from(&row.result);
+        Ok((summary, row.origin))
     }
 
     /// The jobs of `caller`'s scope that `f` selects, newest first, and the cursor of the next
@@ -3034,32 +3109,66 @@ impl Jobs {
                 trace_id,
             ));
         }
-        let before = match &f.cursor {
-            None => None,
-            Some(c) => Some(c.parse::<i64>().map_err(|_| {
-                params_invalid(format!("{c:?} is not a jobs.list cursor"), trace_id)
-            })?),
+        let bad_cursor =
+            |c: &str| params_invalid(format!("{c:?} is not a jobs.list cursor"), trace_id);
+        let queue_order = f.order == Some(ListOrder::Queue);
+        let (before, offset) = match &f.cursor {
+            None => (None, 0),
+            Some(c) if queue_order => {
+                let offset = c.strip_prefix('q').and_then(|n| n.parse::<usize>().ok());
+                (None, offset.ok_or_else(|| bad_cursor(c))?)
+            }
+            Some(c) => (Some(c.parse::<i64>().map_err(|_| bad_cursor(c))?), 0),
         };
+        // `updated` is kept in whole seconds: a `since` with a fractional part keeps the jobs
+        // updated in its own second (Appendix G), so the rows updated after the second before.
         let since = match &f.since {
             None => None,
-            Some(t) => Some(rfc3339_ms(t).map(|ms| ms.div_euclid(1000)).ok_or_else(|| {
-                params_invalid(format!("since {t:?} is not an RFC 3339 time"), trace_id)
-            })?),
+            Some(t) => Some(
+                rfc3339_ms(t)
+                    .map(|ms| ms.div_euclid(1000) - i64::from(ms.rem_euclid(1000) != 0))
+                    .ok_or_else(|| {
+                        params_invalid(format!("since {t:?} is not an RFC 3339 time"), trace_id)
+                    })?,
+            ),
         };
         let scope = s.scope_of(caller);
         s.ensure_recovered(&scope)
             .await
             .map_err(|e| state_unavailable(&e, trace_id))?;
+        if queue_order {
+            let order = s.queued_in_order(&scope);
+            let mut f = f.clone();
+            f.ids = Some(match &f.ids {
+                Some(ids) => order
+                    .iter()
+                    .filter(|id| ids.contains(id))
+                    .cloned()
+                    .collect(),
+                None => order.clone(),
+            });
+            let n = u32::try_from(order.len()).unwrap_or(u32::MAX).max(1);
+            let rows = record::list(scope.db(), &f, since, n, None)
+                .await
+                .map_err(|e| state_unavailable(&e, trace_id))?;
+            let mut by_id: HashMap<String, JobRow> =
+                rows.into_iter().map(|r| (r.job_id.clone(), r)).collect();
+            let ordered: Vec<JobRow> = order
+                .iter()
+                .filter_map(|id| by_id.remove(id))
+                .skip(offset)
+                .collect();
+            let page = s.page(&ordered, limit as usize);
+            let next = (page.len() < ordered.len()).then(|| format!("q{}", offset + page.len()));
+            return Ok((page, next));
+        }
         // One row more than the page: there is a next page only when it exists.
-        let mut rows = record::list(scope.db(), &f, since, limit + 1, before)
+        let rows = record::list(scope.db(), &f, since, limit + 1, before)
             .await
             .map_err(|e| state_unavailable(&e, trace_id))?;
-        let more = rows.len() > limit as usize;
-        rows.truncate(limit as usize);
-        let next = more
-            .then(|| rows.last().map(|r| r.seq.to_string()))
-            .flatten();
-        Ok((rows.iter().map(|r| s.summary(r)).collect(), next))
+        let page = s.page(&rows, limit as usize);
+        let next = (page.len() < rows.len()).then(|| rows[page.len() - 1].seq.to_string());
+        Ok((page, next))
     }
 
     /// Waits until job `id` of `caller`'s scope is done, or for `timeout`: the job, and whether

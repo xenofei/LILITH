@@ -172,7 +172,7 @@ fn params_invalid(message: String, trace_id: &str) -> ErrorBody {
 pub fn register_job_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "jobs.list",
-        "Lists jobs, newest first: `status`, `kind`, `project`, `ids`, `since` (RFC 3339: updated later) and `batch_id` filter them; `limit` (1–500, default 100) and `cursor` (the previous page's `next_cursor`) page through them. `lanes` gives each lane's pause.",
+        "Lists jobs, newest first, or with `order: \"queue\"` the queued jobs in queue order (by lane, then `queue_position`): `status`, `kind`, `project`, `ids`, `since` (RFC 3339: updated later) and `batch_id` filter them; `limit` (1–500, default 100; a page may end sooner, under 3 MiB) and `cursor` (the previous page's `next_cursor`) page through them. `lanes` gives each lane's pause.",
         EffectClass::Read,
         JOBS_MODULE,
         |ctx, f: JobFilter| {
