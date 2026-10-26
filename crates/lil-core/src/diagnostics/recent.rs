@@ -29,6 +29,9 @@ pub struct ErrorGroup {
     pub last_message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool: Option<String>,
+    /// The job whose final failure the last error was (its `last_tool` is the job's kind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_job_id: Option<String>,
 }
 
 /// `message` at most `max` characters long: a longer one is cut back to the last space or
@@ -72,6 +75,7 @@ pub fn cut_message(message: &str, max: usize) -> String {
 struct ErrorRecord {
     code: String,
     tool: Option<String>,
+    job_id: Option<String>,
     message: String,
     at_ms: i64,
 }
@@ -84,13 +88,21 @@ pub(crate) struct Ring {
 
 impl Ring {
     /// Keeps an error outcome, forgetting the oldest once [`RECENT_CAPACITY`] are kept.
-    pub(crate) fn push(&mut self, code: &str, tool: Option<&str>, message: &str, at_ms: i64) {
+    pub(crate) fn push(
+        &mut self,
+        code: &str,
+        tool: Option<&str>,
+        job_id: Option<&str>,
+        message: &str,
+        at_ms: i64,
+    ) {
         if self.records.len() == RECENT_CAPACITY {
             self.records.pop_front();
         }
         self.records.push_back(ErrorRecord {
             code: code.to_string(),
             tool: tool.map(str::to_string),
+            job_id: job_id.map(str::to_string),
             message: cut_message(message, STORED_MESSAGE_CHARS),
             at_ms,
         });
@@ -117,6 +129,7 @@ impl Ring {
                     last_at: format_ts(last.at_ms),
                     last_message: last.message.clone(),
                     last_tool: last.tool.clone(),
+                    last_job_id: last.job_id.clone(),
                 };
                 (last.at_ms, newest, group)
             })

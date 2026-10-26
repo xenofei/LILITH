@@ -239,20 +239,7 @@ fn write_bundle(
             None
         }
     };
-    let profiles = |key: &str| {
-        suite_toml
-            .as_deref()
-            .map(|doc| profile_values(doc, key))
-            .unwrap_or_default()
-    };
-    let redactor = Redactor {
-        labels: profiles("label"),
-        profile_dir: Some(env.user_profile().display().to_string()),
-        machine: env.computer_name(),
-        machine_names: env.dns_host_name().into_iter().collect(),
-        names: profiles("config_dir"),
-    }
-    .compile();
+    let redactor = redactor_for(env, suite_toml.as_deref()).compile();
     let mut redactions = 0u32;
     let mut entries: Vec<(String, String)> = Vec::new();
     for (name, mut value) in parts.entries {
@@ -508,4 +495,22 @@ fn zip_time(unix_secs: i64) -> zip::DateTime {
         num(17..19) as u8,
     )
     .unwrap_or_default()
+}
+
+/// What a bundle redacts beyond the fixed rules on this PC: the profile labels and folders of
+/// `suite_toml` (the text of `suite.toml`, when there is one), the user-profile folder and the
+/// computer's names.
+pub(crate) fn redactor_for(env: &Env, suite_toml: Option<&str>) -> Redactor {
+    let profiles = |key: &str| {
+        suite_toml
+            .map(|doc| profile_values(doc, key))
+            .unwrap_or_default()
+    };
+    Redactor {
+        labels: profiles("label"),
+        profile_dir: Some(env.user_profile().display().to_string()),
+        machine: env.computer_name(),
+        machine_names: env.dns_host_name().into_iter().collect(),
+        names: profiles("config_dir"),
+    }
 }

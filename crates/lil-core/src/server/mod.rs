@@ -553,6 +553,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     // it runs the completions of jobs that never started.
     jobs.add_completion(meter.clone());
     jobs.add_completion(caps.clone());
+    // A job's final failure is a recent error (Checkpoint A ruling).
+    jobs.add_completion(diagnostics.clone());
     jobs.set_reservations(caps.clone());
     // A dead core's held reservations, decided by its calls' usage rows before the meter's
     // recovery removes them (CORE-088); then the usage rows a dead core left become `pending`

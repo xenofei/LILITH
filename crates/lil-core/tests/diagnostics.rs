@@ -646,6 +646,46 @@ fn wait_done(pipe: &mut RawPipe, id: &str) -> Value {
     }
 }
 
+/// Checkpoint A ruling (conformance M-4): a job's final failure is a recent error, with its
+/// kind as the tool, its id and its message redacted; a cancelled job adds none.
+#[test] // spec: QA-083, ARCH-121
+fn a_jobs_failure_is_a_recent_error_with_its_id_and_a_redacted_message() {
+    let env = TestEnv::new();
+    let _core = CoreFixture::start(&env);
+    let mut pipe = session(&env, None);
+    let failed = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "fail": "final",
+               "fail_message": "the node said api_key=SECRET-PROBE-41 and gave up"}),
+        Some("job-fail-1"),
+    );
+    let id = failed["job"]["job_id"].as_str().unwrap().to_string();
+    assert_eq!(wait_done(&mut pipe, &id)["status"], "failed");
+    let cancelled = pipe.tool_ok(
+        "test.job",
+        json!({"lane": "cpu", "gated": true}),
+        Some("job-cancel-1"),
+    );
+    let gated = cancelled["job"]["job_id"].as_str().unwrap().to_string();
+    pipe.tool_ok("job.cancel", json!({"job_id": gated}), Some("cancel-1"));
+    assert_eq!(wait_done(&mut pipe, &gated)["status"], "cancelled");
+
+    let recent = pipe.tool_ok("diagnostics.recent", json!({}), None);
+    let errors = recent["errors"].as_array().unwrap();
+    let job_rows: Vec<&Value> = errors
+        .iter()
+        .filter(|g| g.get("last_job_id").is_some())
+        .collect();
+    assert_eq!(job_rows.len(), 1, "only the failure: {recent}");
+    let row = job_rows[0];
+    assert_eq!(row["code"], "params.invalid", "{row}");
+    assert_eq!(row["last_tool"], "test.job", "{row}");
+    assert_eq!(row["last_job_id"], id.as_str(), "{row}");
+    let message = row["last_message"].as_str().unwrap();
+    assert!(!message.contains("SECRET-PROBE-41"), "{message}");
+    assert!(message.contains("<redacted>"), "{message}");
+}
+
 #[test] // spec: QA-084, ARCH-121
 fn bundle_with_a_job_adds_its_summary_and_untrusted_args() {
     let env = TestEnv::new();

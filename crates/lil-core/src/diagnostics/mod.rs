@@ -11,6 +11,10 @@
 //!   every error outcome of a `tools/call` (through `tools`' `ErrorSink`, so `tools` names no
 //!   type of this module); the last [`RECENT_CAPACITY`] are kept in memory, grouped by code,
 //!   and each is published on the `diagnostics` topic as `{kind: "error", code, tool?, at}`.
+//!   A job's final failure is one too (Checkpoint A ruling): as a [`JobCompletion`] it records
+//!   the error with the job's kind as the tool, the job's id, and the message redacted as a
+//!   bundle's entries are; a cancel, a job that never started and a resolved unknown job are
+//!   not failures.
 //! - **The bundle** ([`bundle`]): one zip in `<local dir>\diagnostics\`, written through the
 //!   store's cache writer, never holding a workspace file, every entry redacted
 //!   ([`redact`]). Nothing is sent anywhere (ARCH-122): the bundle leaves the machine only
@@ -31,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lil_platform::{Clock, Env};
-use lil_protocol::{CallerKind, EffectClass, ErrorBody, codes};
+use lil_protocol::{CallerKind, EffectClass, ErrorBody, Outcome, ToolOutput, codes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -44,7 +48,9 @@ pub use redact::Redactor;
 
 use crate::engines::tools::EnginesSlot;
 use crate::events::EventBus;
-use crate::jobs::JobId;
+use crate::jobs::{
+    JobCompletion, JobCtx, JobDone, JobFuture, JobId, is_cancelled, never_started, resolved_unknown,
+};
 use crate::session::Session;
 use crate::telemetry::{Telemetry, format_ts};
 use crate::tools::{ErrorSink, Registry, typed_tool};
@@ -107,13 +113,48 @@ impl Diagnostics {
     /// Keeps an error outcome (at most the last [`RECENT_CAPACITY`]) and publishes it on the
     /// `diagnostics` topic as `{kind: "error", code, tool?, at}`.
     pub fn record_error(&self, code: &str, tool: Option<&str>, message: &str, at_ms: i64) {
-        lock(&self.errors).push(code, tool, message, at_ms);
+        self.record(code, tool, None, message, at_ms);
+    }
+
+    /// [`Diagnostics::record_error`], for a job's final failure too (`job_id`; its event
+    /// carries it).
+    fn record(
+        &self,
+        code: &str,
+        tool: Option<&str>,
+        job_id: Option<&str>,
+        message: &str,
+        at_ms: i64,
+    ) {
+        lock(&self.errors).push(code, tool, job_id, message, at_ms);
         let mut data = json!({"kind": "error", "code": code});
         if let Some(tool) = tool {
             data["tool"] = json!(tool);
         }
+        if let Some(job_id) = job_id {
+            data["job_id"] = json!(job_id);
+        }
         data["at"] = json!(format_ts(at_ms));
         self.events.publish(DIAGNOSTICS_TOPIC, data);
+    }
+
+    /// Records job `job`'s final failure `error` (module docs), its message redacted first.
+    fn record_job_error(&self, job: &JobCtx, error: &ErrorBody) {
+        let suite_toml = std::fs::read_to_string(self.env.suite_toml_to_read()).ok();
+        let (message, _) =
+            bundle::redactor_for(&self.env, suite_toml.as_deref()).text(&error.message);
+        let at_ms = self
+            .clock
+            .utc_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        self.record(
+            &error.code,
+            Some(job.spec.kind),
+            Some(job.id.as_str()),
+            &message,
+            at_ms,
+        );
     }
 
     /// The kept errors, one group per code, the one whose last error is newest first; at most
@@ -135,6 +176,28 @@ impl Diagnostics {
     /// The apps that said hello, by app, with their `build_id`.
     pub(crate) fn apps(&self) -> BTreeMap<String, String> {
         lock(&self.apps).clone()
+    }
+}
+
+impl JobCompletion for Diagnostics {
+    fn completed<'a>(
+        &'a self,
+        job: &'a JobCtx,
+        outcome: &'a Outcome<ToolOutput>,
+        _done: Option<&'a JobDone>,
+    ) -> JobFuture<'a, ()> {
+        Box::pin(async move {
+            let Outcome::Error { error } = outcome else {
+                return;
+            };
+            // Not failures: a cancel, a job that never started, an unknown one you resolved.
+            if is_cancelled(outcome) || never_started(outcome) || resolved_unknown(outcome) {
+                return;
+            }
+            // The redaction reads suite.toml and one short name, as the caps read suite.toml
+            // at each use: brief, and only for a failure.
+            self.record_job_error(job, error);
+        })
     }
 }
 
