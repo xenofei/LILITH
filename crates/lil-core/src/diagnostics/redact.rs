@@ -2,21 +2,19 @@
 //!
 //! [`Compiled::text`] runs these rules over every entry, in order, and then again until
 //! nothing changes, at most [`MAX_PASSES`] times, so a value encoded inside another encoding
-//! goes too; each replacement counts once:
+//! goes too; each replacement counts once. It does so over the text as it came, then, when
+//! the text holds terminal control sequences, strips them and does so again (below), so the
+//! strip never undoes what the first round caught.
 //!
-//! 0. **Terminal control sequences and decoding.** First every terminal control sequence is
-//!    removed: CSI (`ESC [`, parameters, a final byte), OSC (`ESC ]` to a BEL or `ESC \`) and
-//!    any other `ESC` with its intermediate and final bytes, the `ESC` raw or written `\u001b`,
-//!    `\x1b` or `\u{1b}` after any run of `\`; a run of them between two word characters leaves
-//!    a space. Then one level of encoding is decoded: `%5C`, `%2F`, `%3A`, `%40`, `%20`, `%2B`,
-//!    `%3D` and `%25`, percent-encoded UTF-8, and the `\uXXXX` (after any run of `\`), `&#NN;`
-//!    and `&#xHH;` forms of those characters and of non-ASCII ones (a backslash stays escaped
-//!    as `\`), so an encoded path, name or address is seen.
+//! 0. **Decoding.** One level of encoding is decoded: `%5C`, `%2F`, `%3A`, `%40`, `%20`,
+//!    `%2B`, `%3D` and `%25`, percent-encoded UTF-8, and the `\uXXXX` (after any run of `\`),
+//!    `&#NN;` and `&#xHH;` forms of those characters and of non-ASCII ones (a backslash stays
+//!    escaped as `\\`), so an encoded path, name or address is seen.
 //! 1. **Names**: every Claude Code profile label and profile folder (`config_dir`) of
 //!    `suite.toml`, and any other name given, as written or JSON-escaped: `<redacted>`.
 //! 2. **The user-profile folder**: `%USERPROFILE%`, in its long form and its 8.3 short form,
 //!    in any letter case, with any run of `\` or `/` as a separator (so escaped once or twice),
-//!    with or without a `\?\` prefix (owner decision 2026-10-22).
+//!    with or without a `\\?\` prefix (owner decision 2026-10-22).
 //! 3. **SIDs** (`S-1-<n>-<n>…`, any case), whatever follows them: `<sid>`.
 //! 4. **`<scheme>:open/<payload>`** under a suite scheme (also `lil://open/`, and with `/`
 //!    escaped), whether the payload decodes or not: `open/<redacted>`.
@@ -42,18 +40,27 @@
 //!     or `Token`). A flag holding a scrub word (`--api-key`) takes the next argument as its
 //!     value, space-separated or the next element of an array.
 //!
+//! **Terminal control sequences** ([`strip_terminal`]): a CSI (`ESC [`, parameter and
+//! intermediate bytes, a final byte, or up to a placeholder the first round left), an OSC
+//! (`ESC ]` to its terminator: after a raw `ESC` a raw BEL or `ESC \`, after a written one
+//! `\u0007`, `\x07` or a written `ESC \` of the same escape level, never `\a`) and, after a
+//! raw `ESC`, a 2-byte sequence ([`LONE_FINALS`]; before any other byte the `ESC` goes alone).
+//! The `ESC` is the raw byte or `\u001b`, `\x1b` or `\u{1b}` after any run of `\`; `\e`,
+//! `\033`, `%1B` and `&#27;` are one only before a whole CSI. Nothing is put in their place,
+//! so a value they split is whole again; where one stood is a word boundary.
+//!
 //! The known literals of rules 1, 2, 9 and 10 match in any letter case, a run of `\` or `/`
-//! matching any such run; one of [`ANYWHERE_CHARS`] characters or more goes wherever it is,
-//! inside a word too, and a shorter one only as a whole word. No literal is matched inside a
-//! placeholder. Whether a value starts a word is one test for every rule ([`starts_word`]),
-//! which counts an escape right before it as a boundary.
+//! matching any such run (a `config_dir` without a trailing separator or a `\\?\` prefix); one
+//! of [`ANYWHERE_CHARS`] characters or more goes wherever it is, inside a word too, and a
+//! shorter one only as a whole word. No literal is matched inside a placeholder. Whether a
+//! value starts a word is one test for every rule ([`starts_word`]), which counts an escape
+//! right before it as a boundary.
 //!
 //! In `suite.toml` the TOML is read first ([`Redactor::toml`]): every value under a scrub-word
 //! key or table, and each `[[claude_code.profiles]]` `label`; then the rules above over the
 //! whole file, comments included. A `suite.toml` that doesn't parse is redacted line by line,
 //! multi-line values included.
 
-use std::borrow::Cow;
 use std::path::Path;
 
 use lil_platform::names;
@@ -145,11 +152,12 @@ impl Redactor {
         // The more specific form first.
         profiles.sort_by_key(|f| std::cmp::Reverse(f.len()));
         let mut words: Vec<String> = Vec::new();
-        for name in self.labels.iter().chain(&self.names) {
+        let names = self.names.iter().map(|n| path_literal(n));
+        for name in self.labels.iter().cloned().chain(names) {
             if name.trim().is_empty() {
                 continue;
             }
-            let escaped = serde_json::to_string(name).unwrap_or_default();
+            let escaped = serde_json::to_string(&name).unwrap_or_default();
             let escaped = escaped
                 .strip_prefix('"')
                 .and_then(|e| e.strip_suffix('"'))
@@ -185,6 +193,17 @@ impl Redactor {
     }
 }
 
+/// The path literal `name` as it is matched: without a `\\?\` prefix (`\\?\UNC\` becoming the
+/// `\\` it stands for) and without separators at its end.
+fn path_literal(name: &str) -> String {
+    const UNC: &str = r"\\?\UNC\";
+    let name = match name.get(..UNC.len()) {
+        Some(head) if head.eq_ignore_ascii_case(UNC) => format!(r"\\{}", &name[UNC.len()..]),
+        _ => name.strip_prefix(r"\\?\").unwrap_or(name).to_string(),
+    };
+    name.trim_end_matches(['\\', '/']).to_string()
+}
+
 /// Whether `a` and `b` are the same text in any letter case.
 fn same_text(a: &str, b: &str) -> bool {
     a.chars()
@@ -203,45 +222,122 @@ pub(crate) struct Compiled {
     machines: Vec<String>,
 }
 
+/// What one [`Compiled::text`] call carries from rule to rule: how many replacements were made,
+/// and where a stripped terminal control sequence stood (byte offsets, ascending, moved with
+/// every rule's edits). Each of those places is a word boundary ([`starts_word`]).
+#[derive(Debug, Default)]
+struct Cx {
+    n: u32,
+    bounds: Vec<usize>,
+}
+
+impl Cx {
+    /// Whether a stripped sequence stood at byte `i`.
+    fn bound_at(&self, i: usize) -> bool {
+        !self.bounds.is_empty() && self.bounds.binary_search(&i).is_ok()
+    }
+}
+
+/// A rule's output, built from its input `s`: the text it keeps and its replacements, in
+/// order. [`Out::finish`] moves [`Cx::bounds`] with the edits; a boundary inside a replaced
+/// value goes with it.
+struct Out<'a> {
+    s: &'a str,
+    out: String,
+    last: usize,
+    edits: Vec<(usize, usize, usize)>,
+}
+
+impl<'a> Out<'a> {
+    fn new(s: &'a str) -> Self {
+        Out {
+            s,
+            out: String::with_capacity(s.len()),
+            last: 0,
+            edits: Vec::new(),
+        }
+    }
+
+    /// `s[start..end]` (at or after the previous replacement's end) becomes `with`.
+    fn replace(&mut self, start: usize, end: usize, with: &str) {
+        self.out.push_str(&self.s[self.last..start]);
+        self.out.push_str(with);
+        self.edits.push((start, end, with.len()));
+        self.last = end;
+    }
+
+    fn finish(mut self, cx: &mut Cx) -> String {
+        self.out.push_str(&self.s[self.last..]);
+        if !self.edits.is_empty() && !cx.bounds.is_empty() {
+            let edits = &self.edits;
+            cx.bounds.retain_mut(|p| {
+                let mut shift = 0isize;
+                for &(start, end, len) in edits {
+                    if *p <= start {
+                        break;
+                    }
+                    if *p < end {
+                        return false;
+                    }
+                    shift += len as isize - (end - start) as isize;
+                }
+                *p = p.saturating_add_signed(shift);
+                true
+            });
+        }
+        self.out
+    }
+}
+
 impl Compiled {
-    /// [`Redactor::text`] (module docs): the decode-and-redact pass, again until nothing
-    /// changes, at most [`MAX_PASSES`] times, so an encoding nested in another (each pass
-    /// decodes one level) is redacted too.
+    /// [`Redactor::text`] (module docs): the rules over the text as it came; then, when it holds
+    /// terminal control sequences, the rules again over it with them stripped (where each
+    /// stood is a word boundary), so stripping never undoes what the first round caught.
     pub(crate) fn text(&self, s: &str) -> (String, u32) {
-        let mut n = 0;
-        let mut current = self.pass(s, &mut n);
+        let mut cx = Cx::default();
+        let first = self.passes(s, &mut cx);
+        let Some((stripped, bounds)) = strip_terminal(&first) else {
+            return (first, cx.n);
+        };
+        cx.bounds = bounds;
+        let second = self.passes(&stripped, &mut cx);
+        (second, cx.n)
+    }
+
+    /// The decode-and-redact pass, again until nothing changes, at most [`MAX_PASSES`] times,
+    /// so an encoding nested in another (each pass decodes one level) is redacted too.
+    fn passes(&self, s: &str, cx: &mut Cx) -> String {
+        let mut current = self.pass(s, cx);
         for _ in 1..MAX_PASSES {
-            let next = self.pass(&current, &mut n);
+            let next = self.pass(&current, cx);
             if next == current {
                 break;
             }
             current = next;
         }
-        (current, n)
+        current
     }
 
     /// One decode-and-redact pass over `s` (module docs).
-    fn pass(&self, s: &str, n: &mut u32) -> String {
-        let s = strip_terminal(s);
-        let s = decode_escapes(&s);
-        let mut s = s.into_owned();
+    fn pass(&self, s: &str, cx: &mut Cx) -> String {
+        let mut s = decode_escapes(s, cx);
         for word in &self.words {
-            s = replace_literal(&s, word, REDACTED, n);
+            s = replace_literal(&s, word, REDACTED, cx);
         }
-        let s = self.profile(&s, n);
-        let s = sids(&s, n);
-        let s = open_payloads(&s, n);
-        let s = deny_tokens(&s, n);
-        let s = known_tokens(&s, n);
-        let s = targets(&s, n);
-        let mut s = emails(&s, n);
+        let s = self.profile(&s, cx);
+        let s = sids(&s, cx);
+        let s = open_payloads(&s, cx);
+        let s = deny_tokens(&s, cx);
+        let s = known_tokens(&s, cx);
+        let s = targets(&s, cx);
+        let mut s = emails(&s, cx);
         if let Some(user) = &self.user {
-            s = replace_literal(&s, user, USER, n);
+            s = replace_literal(&s, user, USER, cx);
         }
         for form in &self.machines {
-            s = replace_literal(&s, form, MACHINE, n);
+            s = replace_literal(&s, form, MACHINE, cx);
         }
-        keys(&s, n)
+        keys(&s, cx)
     }
 
     /// [`Redactor::toml`].
@@ -259,173 +355,235 @@ impl Compiled {
         (text, n + m)
     }
 
-    fn profile(&self, s: &str, n: &mut u32) -> String {
+    fn profile(&self, s: &str, cx: &mut Cx) -> String {
         if self.profiles.is_empty() {
             return s.to_string();
         }
         let b = s.as_bytes();
-        let mut out = String::with_capacity(s.len());
-        let (mut last, mut i) = (0, 0);
+        let mut out = Out::new(s);
+        let mut i = 0;
         while i < b.len() {
             let candidate = b[i] == b'\\'
                 || b[i] == b'/'
                 || (b[i].is_ascii_alphabetic() && b.get(i + 1) == Some(&b':'));
             if candidate && let Some(end) = self.profiles.iter().find_map(|f| f.match_at(s, i)) {
-                out.push_str(&s[last..i]);
-                out.push_str(PROFILE);
-                *n += 1;
-                last = end;
+                out.replace(i, end, PROFILE);
+                cx.n += 1;
                 i = end;
                 continue;
             }
             i += 1;
         }
-        out.push_str(&s[last..]);
-        out
+        out.finish(cx)
     }
 }
 
-/// An `ESC` at byte `i` of `b`: the raw byte, or `\u001b`, `\x1b` or `\u{1b}` after any run of
-/// `\` (a JSON string, or one inside another). Its end, how many of the run's backslashes
-/// stay (the escapes of other levels, as [`decode_escapes`] keeps them), and whether it was
-/// the raw byte.
-fn esc_at(b: &[u8], i: usize) -> Option<(usize, usize, bool)> {
+/// How an `ESC` was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscForm {
+    /// The raw byte.
+    Raw,
+    /// `\u001b`, `\x1b` or `\u{1b}` after a run of this many `\`: what JSON, Python's `repr`
+    /// and Rust's `Debug` write.
+    Written(usize),
+    /// `\e` or `\033` (after a run of `\`), `%1B` or `&#27;`: spellings of source text, an
+    /// `ESC` only before a whole CSI.
+    Source,
+}
+
+/// An `ESC` found at some byte: where it ends, how many backslashes of the run before it stay
+/// (the escapes of other levels, as [`decode_escapes`] keeps them), and how it was written.
+#[derive(Debug, Clone, Copy)]
+struct Esc {
+    end: usize,
+    keep: usize,
+    form: EscForm,
+}
+
+/// The `ESC` at byte `i` of `b`, in any spelling of [`EscForm`].
+fn esc_at(b: &[u8], i: usize) -> Option<Esc> {
+    let source = |end: usize| Esc {
+        end,
+        keep: 0,
+        form: EscForm::Source,
+    };
     match *b.get(i)? {
-        0x1b => return Some((i + 1, 0, true)),
+        0x1b => {
+            return Some(Esc {
+                end: i + 1,
+                keep: 0,
+                form: EscForm::Raw,
+            });
+        }
+        b'%' => {
+            return b
+                .get(i + 1..i + 3)
+                .filter(|h| h.eq_ignore_ascii_case(b"1b"))
+                .map(|_| source(i + 3));
+        }
+        b'&' => return b[i..].starts_with(b"&#27;").then(|| source(i + 5)),
         b'\\' => {}
         _ => return None,
     }
     let run = b[i..].iter().take_while(|c| **c == b'\\').count();
     let rest = &b[i + run..];
-    let body = if rest.len() >= 5 && rest[0] == b'u' && rest[1..5].eq_ignore_ascii_case(b"001b") {
-        5
-    } else if rest.len() >= 3 && rest[0] == b'x' && rest[1..3].eq_ignore_ascii_case(b"1b") {
-        3
-    } else if rest.starts_with(b"u{") {
-        let digits = rest[2..]
-            .iter()
-            .take_while(|c| c.is_ascii_hexdigit())
-            .count();
-        let hex = std::str::from_utf8(&rest[2..2 + digits]).unwrap_or_default();
-        (digits > 0
-            && rest.get(2 + digits) == Some(&b'}')
-            && u32::from_str_radix(hex, 16) == Ok(0x1b))
-        .then_some(3 + digits)?
-    } else {
-        return None;
-    };
+    let (body, form) =
+        if rest.len() >= 5 && rest[0] == b'u' && rest[1..5].eq_ignore_ascii_case(b"001b") {
+            (5, EscForm::Written(run))
+        } else if rest.len() >= 3 && rest[0] == b'x' && rest[1..3].eq_ignore_ascii_case(b"1b") {
+            (3, EscForm::Written(run))
+        } else if rest.starts_with(b"u{") {
+            let digits = rest[2..]
+                .iter()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .count();
+            let hex = std::str::from_utf8(&rest[2..2 + digits]).unwrap_or_default();
+            let ok = digits > 0
+                && rest.get(2 + digits) == Some(&b'}')
+                && u32::from_str_radix(hex, 16) == Ok(0x1b);
+            (ok.then_some(3 + digits)?, EscForm::Written(run))
+        } else if rest.starts_with(b"033") {
+            (3, EscForm::Source)
+        } else if rest.first() == Some(&b'e') {
+            (1, EscForm::Source)
+        } else {
+            return None;
+        };
     let keep = if run % 2 == 1 { run - 1 } else { run - 2 };
-    Some((i + run + body, keep, false))
+    Some(Esc {
+        end: i + run + body,
+        keep,
+        form,
+    })
 }
 
-/// The end of the string terminator `ESC \` at byte `j`, if one is there: after a raw `ESC`
-/// one `\`, after a written one a `\` written as `\\` (any even run).
-fn st_at(b: &[u8], j: usize) -> Option<usize> {
-    let (end, _, raw) = esc_at(b, j)?;
-    let run = b[end..].iter().take_while(|c| **c == b'\\').count();
-    let take = if raw { run.min(1) } else { run - run % 2 };
-    (take > 0).then_some(end + take)
-}
-
-/// The end of a BEL at byte `j`: the raw byte, or `\u0007`, `\x07` or `\a` after a run of `\`.
-fn bel_at(b: &[u8], j: usize) -> Option<usize> {
-    if b.get(j) == Some(&0x07) {
-        return Some(j + 1);
-    }
-    let run = b.get(j..)?.iter().take_while(|c| **c == b'\\').count();
-    let rest = &b[j + run..];
-    if run == 0 {
-        None
-    } else if rest.starts_with(b"u0007") {
-        Some(j + run + 5)
-    } else if rest.starts_with(b"x07") {
-        Some(j + run + 3)
-    } else if rest.starts_with(b"a") {
-        Some(j + run + 1)
-    } else {
-        None
+/// The end of a string terminator `ESC \` at byte `j` that closes an OSC opened by an `ESC`
+/// written `form`: after a raw `ESC`, a raw one and one `\`; after a written one, a written
+/// one of the same escape level (backslash parity) and a `\` written as `\\`.
+fn st_at(b: &[u8], j: usize, form: EscForm) -> Option<usize> {
+    let esc = esc_at(b, j)?;
+    let run = b[esc.end..].iter().take_while(|c| **c == b'\\').count();
+    match (form, esc.form) {
+        (EscForm::Raw, EscForm::Raw) => (run >= 1).then_some(esc.end + 1),
+        (EscForm::Written(r), EscForm::Written(r2)) if r % 2 == r2 % 2 => {
+            let take = run - run % 2;
+            (take > 0).then_some(esc.end + take)
+        }
+        _ => None,
     }
 }
 
-/// The end of the terminal control sequence whose `ESC` ([`esc_at`]) ends at `p`: a lone
-/// `ESC \`, CSI `[` (parameters, intermediates, a final byte), OSC `]` to its BEL or `ESC \`,
-/// or another `ESC` with its intermediates and final byte; just the `ESC` when what follows is
-/// none of these. A `"` or a `\` never belongs to one, so JSON stays JSON.
-fn sequence_end(b: &[u8], start: usize, p: usize) -> usize {
-    let at = |j: usize| b.get(j).copied();
-    let in_range = |c: Option<u8>, lo: u8, hi: u8| c.is_some_and(|c| (lo..=hi).contains(&c));
-    if let Some(end) = st_at(b, start) {
-        return end;
-    }
-    match at(p) {
-        Some(b'[') => {
-            let mut j = p + 1;
-            while in_range(at(j), 0x30, 0x3f) {
-                j += 1;
-            }
-            while in_range(at(j), 0x20, 0x2f) && at(j) != Some(b'"') {
-                j += 1;
-            }
-            if in_range(at(j), 0x40, 0x7e) && at(j) != Some(b'\\') {
-                j + 1
-            } else {
-                p + 1
+/// The end of the terminator at byte `j` of an OSC opened by an `ESC` written `form`: after a
+/// raw `ESC`, the raw BEL or a raw `ESC \`; after a written one, `\u0007` or `\x07` at the
+/// `ESC`'s own escape level (backslash parity), or a written `ESC \` ([`st_at`]). `\a` is never
+/// a BEL: in log text it is a backslash and a letter, as in `D:\assets`.
+fn osc_end_at(b: &[u8], j: usize, form: EscForm) -> Option<usize> {
+    match form {
+        EscForm::Raw if b.get(j) == Some(&0x07) => return Some(j + 1),
+        EscForm::Written(r) => {
+            let run = b[j..].iter().take_while(|c| **c == b'\\').count();
+            let rest = &b[j + run..];
+            if run > 0 && run % 2 == r % 2 {
+                if rest.starts_with(b"u0007") {
+                    return Some(j + run + 5);
+                }
+                if rest.starts_with(b"x07") {
+                    return Some(j + run + 3);
+                }
             }
         }
-        Some(b']') => {
+        _ => {}
+    }
+    st_at(b, j, form)
+}
+
+/// The end of a whole CSI whose `[` is just before byte `j`: parameter bytes, intermediate
+/// bytes and a final byte (0x40–0x7E). A `"` or a `\` never belongs to one, so JSON stays JSON,
+/// and neither does a placeholder: a CSI whose tail a first-round redaction replaced ends where
+/// the placeholder starts.
+fn csi_end(s: &str, j: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let placeholder = |j: usize| PLACEHOLDERS.iter().any(|p| s[j..].starts_with(p));
+    let mut j = j;
+    while j < b.len() && (0x30..=0x3f).contains(&b[j]) && !placeholder(j) {
+        j += 1;
+    }
+    while j < b.len() && (0x20..=0x2f).contains(&b[j]) && b[j] != b'"' && !placeholder(j) {
+        j += 1;
+    }
+    if j < b.len() && placeholder(j) {
+        return Some(j);
+    }
+    (j < b.len() && (0x40..=0x7e).contains(&b[j]) && b[j] != b'\\').then_some(j + 1)
+}
+
+/// The final bytes of the 2-byte sequences a raw `ESC` starts (`ESC 7`, `ESC c`, `ESC \` …).
+const LONE_FINALS: &[u8] = b"78=>cDEHMNOPZ\\";
+
+/// The end of the terminal control sequence started by `esc` in `s`, if it starts one: a CSI
+/// for every spelling; an OSC to its terminator ([`osc_end_at`]) for a raw or written `ESC`;
+/// for a raw `ESC`, one of [`LONE_FINALS`] after it, or else the `ESC` alone. A written or
+/// source `ESC` that starts none of these is no `ESC`.
+fn sequence_end(s: &str, esc: &Esc) -> Option<usize> {
+    let b = s.as_bytes();
+    let p = esc.end;
+    let raw = esc.form == EscForm::Raw;
+    match b.get(p) {
+        Some(b'[') => csi_end(s, p + 1).or(raw.then_some(p)),
+        Some(b']') if esc.form != EscForm::Source => {
             let mut j = p + 1;
             while j < b.len() && j - p <= MAX_OSC_BYTES && !matches!(b[j], b'"' | b'\n') {
-                if let Some(end) = bel_at(b, j).or_else(|| st_at(b, j)) {
-                    return end;
+                if let Some(end) = osc_end_at(b, j, esc.form) {
+                    return Some(end);
                 }
-                j += 1;
+                // A run of `\` is one escape level: never looked into from its middle.
+                j += b[j..].iter().take_while(|c| **c == b'\\').count().max(1);
             }
-            p + 1
+            raw.then_some(p)
         }
-        _ => {
-            let mut j = p;
-            while in_range(at(j), 0x20, 0x2f) && at(j) != Some(b'"') {
-                j += 1;
-            }
-            if in_range(at(j), 0x30, 0x7e) && at(j) != Some(b'\\') {
-                j + 1
-            } else {
-                p
-            }
-        }
+        Some(c) if raw && LONE_FINALS.contains(c) => Some(p + 1),
+        _ => raw.then_some(p),
     }
 }
 
-/// `s` with every terminal control sequence removed (module docs, rule 0); borrowed when it
-/// has none. A run of them between two word characters leaves a space, so a value right after
-/// one still starts a word.
-fn strip_terminal(s: &str) -> Cow<'_, str> {
-    if !s.contains('\u{1b}') && !s.contains("1b") && !s.contains("1B") {
-        return Cow::Borrowed(s);
+/// `s` with every terminal control sequence removed (module docs, rule 0), and where each run
+/// of them stood (byte offsets in the result, ascending); `None` when it has none. Nothing is
+/// put in their place, so a value a sequence split is whole again.
+fn strip_terminal(s: &str) -> Option<(String, Vec<usize>)> {
+    let maybe = ["\u{1b}", "1b", "1B", "\\e", "\\033", "&#27;"];
+    if !maybe.iter().any(|m| s.contains(m)) {
+        return None;
     }
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
+    let mut bounds: Vec<usize> = Vec::new();
     let (mut last, mut i) = (0, 0);
     while i < b.len() {
-        let Some((p, keep, _)) = esc_at(b, i) else {
-            i += 1;
+        let Some((esc, mut end)) =
+            esc_at(b, i).and_then(|esc| sequence_end(s, &esc).map(|end| (esc, end)))
+        else {
+            // A run of `\` is one escape level: never looked into from its middle.
+            i += b[i..].iter().take_while(|c| **c == b'\\').count().max(1);
             continue;
         };
-        out.push_str(&s[last..i + keep]);
-        let mut end = sequence_end(b, i, p);
+        out.push_str(&s[last..i + esc.keep]);
         // The sequences right after it go with it.
-        while let Some((p, 0, _)) = esc_at(b, end) {
-            end = sequence_end(b, end, p);
+        while let Some(next) = esc_at(b, end).filter(|e| e.keep == 0)
+            && let Some(next_end) = sequence_end(s, &next)
+        {
+            end = next_end;
         }
-        let joins = |c: Option<char>| c.is_some_and(word_char);
-        if joins(out.chars().next_back()) && joins(s[end..].chars().next()) {
-            out.push(' ');
+        if bounds.last() != Some(&out.len()) {
+            bounds.push(out.len());
         }
         last = end;
         i = end;
     }
+    if last == 0 {
+        return None;
+    }
     out.push_str(&s[last..]);
-    Cow::Owned(out)
+    Some((out, bounds))
 }
 
 /// `s` with one level of the encodings of rule 0 decoded (module docs); borrowed when there are
@@ -433,9 +591,9 @@ fn strip_terminal(s: &str) -> Cow<'_, str> {
 /// run of percent-encoded bytes that is UTF-8 decodes to its characters; a `\uXXXX` escape
 /// after any run of `\` (a JSON string inside a JSON string) decodes, the run losing the
 /// backslashes of that escape level; and `&#NN;` / `&#xHH;` decode as the `\u` forms do.
-fn decode_escapes(s: &str) -> Cow<'_, str> {
+fn decode_escapes(s: &str, cx: &mut Cx) -> String {
     if !s.contains('%') && !s.contains("\\u") && !s.contains("&#") {
-        return Cow::Borrowed(s);
+        return s.to_string();
     }
     let b = s.as_bytes();
     let hex = |range: std::ops::Range<usize>| {
@@ -450,17 +608,15 @@ fn decode_escapes(s: &str) -> Cow<'_, str> {
         0xa0.. => char::from_u32(code).map(String::from),
         _ => None,
     };
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i < b.len() {
         if b[i] == b'%'
             && let Some(code) = hex(i + 1..i + 3)
         {
             if code == 0x25 {
-                out.push_str(&s[last..i]);
-                out.push('%');
+                out.replace(i, i + 3, "%");
                 i += 3;
-                last = i;
                 continue;
             }
             if code >= 0x80 {
@@ -474,18 +630,14 @@ fn decode_escapes(s: &str) -> Cow<'_, str> {
                     j += 3;
                 }
                 if let Ok(text) = String::from_utf8(bytes) {
-                    out.push_str(&s[last..i]);
-                    out.push_str(&text);
+                    out.replace(i, j, &text);
                     i = j;
-                    last = i;
                     continue;
                 }
             } else if let Some(text) = decoded(code) {
                 // `%5C` becomes an escaped backslash, so JSON stays JSON.
-                out.push_str(&s[last..i]);
-                out.push_str(&text);
+                out.replace(i, i + 3, &text);
                 i += 3;
-                last = i;
                 continue;
             }
         }
@@ -497,11 +649,8 @@ fn decode_escapes(s: &str) -> Cow<'_, str> {
             {
                 // The escape's own backslashes go: one at its level, the others pairs.
                 let keep = if run % 2 == 1 { run - 1 } else { run - 2 };
-                out.push_str(&s[last..i]);
-                out.push_str(&s[i..i + keep]);
-                out.push_str(&text);
+                out.replace(i, u + 5, &format!("{}{text}", &s[i..i + keep]));
                 i = u + 5;
-                last = i;
                 continue;
             }
             i += run;
@@ -529,17 +678,14 @@ fn decode_escapes(s: &str) -> Cow<'_, str> {
                     .ok()
                     .and_then(decoded)
             {
-                out.push_str(&s[last..i]);
-                out.push_str(&text);
+                out.replace(i, from + digits + 1, &text);
                 i = from + digits + 1;
-                last = i;
                 continue;
             }
         }
         i += 1;
     }
-    out.push_str(&s[last..]);
-    Cow::Owned(out)
+    out.finish(cx)
 }
 
 /// The user-profile folder in one spelling: its drive letter (lower-cased) and its parts.
@@ -648,18 +794,37 @@ fn word_char(c: char) -> bool {
 /// uses: at the text's start, after a character that isn't a word character (as `word`
 /// says), or right after an escape: `\n`, `\r`, `\t`, `\b`, `\f`, `\v`, `\a`, `\e` or `\0`,
 /// `\xXX`, `\uXXXX` or `\UXXXXXXXX` (after any run of `\`), or `%XX`, decoded or not. An
-/// escape is a boundary, so a value at the start of an escaped line is found too. (`\"`,
-/// `\\`, `\/`, `\u{…}`, `&#NN;` and `&#xHH;` end in a character that is no word character
-/// anyway, and a terminal control sequence is stripped first, leaving a space between two
-/// word characters.)
-fn starts_word(s: &str, i: usize, word: impl Fn(char) -> bool) -> bool {
+/// escape is a boundary, so a value at the start of an escaped line is found too. So is the
+/// place a stripped terminal control sequence stood ([`Cx::bounds`]), and the place a CSI's
+/// final byte would go after an `ESC [` and its parameters, so a value a cut sequence runs into
+/// is found before the strip. (`\"`, `\\`, `\/`, `\u{…}`, `&#NN;` and `&#xHH;` end in a
+/// character that is no word character anyway.)
+fn starts_word(s: &str, i: usize, word: impl Fn(char) -> bool, cx: &Cx) -> bool {
     if !s.is_char_boundary(i) {
         return false;
     }
     let Some(prev) = s[..i].chars().next_back() else {
         return true;
     };
-    !word(prev) || after_escape(s.as_bytes(), i)
+    let b = s.as_bytes();
+    !word(prev) || cx.bound_at(i) || after_escape(b, i) || after_csi_head(b, i)
+}
+
+/// Whether byte `i` of `b` comes after an `ESC [` (any spelling) and parameter bytes, where a
+/// CSI's final byte would go.
+fn after_csi_head(b: &[u8], i: usize) -> bool {
+    let mut k = i;
+    while k > 0 && (0x30..=0x3f).contains(&b[k - 1]) {
+        k -= 1;
+    }
+    if k == i || k < 2 || b[k - 1] != b'[' {
+        return false;
+    }
+    let e = k - 1;
+    b[e - 1] == 0x1b
+        || matches!(b[e - 1], b'}' | b';')
+        || b[..e].ends_with(br"\033")
+        || after_escape(b, e)
 }
 
 /// Whether byte `i` of `b` comes right after one of [`starts_word`]'s escapes.
@@ -709,15 +874,15 @@ fn match_literal(s: &str, j: usize, literal: &str) -> Option<usize> {
 /// placeholder: wherever it is when it is [`ANYWHERE_CHARS`] characters or more, else as a
 /// whole word (where it starts or ends with a letter, digit or `_`, it starts a word,
 /// [`starts_word`], and the character after it isn't one).
-fn replace_literal(s: &str, literal: &str, with: &str, n: &mut u32) -> String {
+fn replace_literal(s: &str, literal: &str, with: &str, cx: &mut Cx) -> String {
     let (Some(first), Some(final_char)) = (literal.chars().next(), literal.chars().next_back())
     else {
         return s.to_string();
     };
     let anywhere = literal.chars().count() >= ANYWHERE_CHARS;
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i < s.len() {
         if matches!(b[i], b'%' | b'<')
             && let Some(p) = PLACEHOLDERS.iter().find(|p| s[i..].starts_with(**p))
@@ -732,23 +897,21 @@ fn replace_literal(s: &str, literal: &str, with: &str, n: &mut u32) -> String {
             c.to_lowercase().eq(first.to_lowercase())
         };
         if first_ok
-            && (anywhere || !word_char(first) || starts_word(s, i, word_char))
+            && (anywhere || !word_char(first) || starts_word(s, i, word_char, cx))
             && let Some(end) = match_literal(s, i, literal)
             && (anywhere
                 || !word_char(final_char)
+                || cx.bound_at(end)
                 || !s[end..].chars().next().is_some_and(word_char))
         {
-            out.push_str(&s[last..i]);
-            out.push_str(with);
-            *n += 1;
-            last = end;
+            out.replace(i, end, with);
+            cx.n += 1;
             i = end;
             continue;
         }
         i += c.len_utf8();
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// Whether `key` holds a scrub word (upper-cased).
@@ -759,7 +922,7 @@ fn holds_scrub_word(key: &str) -> bool {
 
 /// Every Windows SID (`S-1-<n>-<n>…`, any case, starting a word) replaced by `<sid>`, whatever
 /// follows it; it ends at the first `-` not followed by a digit (`-dev`, `-test-…` stay).
-fn sids(s: &str, n: &mut u32) -> String {
+fn sids(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let digits = |from: usize| {
         b[from.min(b.len())..]
@@ -767,13 +930,13 @@ fn sids(s: &str, n: &mut u32) -> String {
             .take_while(|c| c.is_ascii_digit())
             .count()
     };
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i + 4 <= b.len() {
         let starts = matches!(b[i], b'S' | b's')
             && b[i + 1] == b'-'
             && b[i + 2] == b'1'
-            && starts_word(s, i, |c| c.is_ascii_alphanumeric());
+            && starts_word(s, i, |c| c.is_ascii_alphanumeric(), cx);
         if starts {
             let mut j = i + 3;
             let mut groups = 0;
@@ -786,25 +949,22 @@ fn sids(s: &str, n: &mut u32) -> String {
                 groups += 1;
             }
             if groups >= 2 {
-                out.push_str(&s[last..i]);
-                out.push_str(SID);
-                *n += 1;
-                last = j;
+                out.replace(i, j, SID);
+                cx.n += 1;
                 i = j;
                 continue;
             }
         }
         i += 1;
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// Every `open/` payload under a suite scheme (`lil`, `lil-dev`, `lil-test-…`, any case,
 /// starting a word) replaced, whether it decodes or not: it is a path, a ref or a name
 /// (APP-020). The scheme may be followed by `//` (`lil://open/…`), and each `/` may be escaped
 /// (`open\/…`); the payload runs over `[A-Za-z0-9+/=_-]`, standard base64 included.
-fn open_payloads(s: &str, n: &mut u32) -> String {
+fn open_payloads(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let scheme_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     // A `/`, escaped with any run of `\` or not: its length.
@@ -817,10 +977,10 @@ fn open_payloads(s: &str, n: &mut u32) -> String {
     };
     let payload_byte =
         |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=' | b'_' | b'-');
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i + 3 <= b.len() {
-        if !(b[i..i + 3].eq_ignore_ascii_case(b"lil") && starts_word(s, i, scheme_char)) {
+        if !(b[i..i + 3].eq_ignore_ascii_case(b"lil") && starts_word(s, i, scheme_char, cx)) {
             i += 1;
             continue;
         }
@@ -868,19 +1028,16 @@ fn open_payloads(s: &str, n: &mut u32) -> String {
             i = from;
             continue;
         }
-        out.push_str(&s[last..from]);
-        out.push_str(REDACTED);
-        *n += 1;
-        last = end;
+        out.replace(from, end, REDACTED);
+        cx.n += 1;
         i = end;
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// `deny/cf_<16 hex>/<32 hex>` with its token replaced; each `/` may be escaped (`\/`, with any
 /// run of `\`).
-fn deny_tokens(s: &str, n: &mut u32) -> String {
+fn deny_tokens(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let hex = |range: std::ops::Range<usize>| {
         b.get(range)
@@ -894,8 +1051,8 @@ fn deny_tokens(s: &str, n: &mut u32) -> String {
             .count();
         (b.get(at + run) == Some(&b'/')).then_some(run + 1)
     };
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i + 4 <= b.len() {
         let id = b[i..i + 4]
             .eq_ignore_ascii_case(b"deny")
@@ -913,18 +1070,15 @@ fn deny_tokens(s: &str, n: &mut u32) -> String {
         {
             let token = id + 16 + len;
             if hex(token..token + 32) {
-                out.push_str(&s[last..token]);
-                out.push_str(REDACTED);
-                *n += 1;
-                last = token + 32;
-                i = last;
+                out.replace(token, token + 32, REDACTED);
+                cx.n += 1;
+                i = token + 32;
                 continue;
             }
         }
         i += 1;
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// A well-known secret format: its prefix, the bytes its body may hold, and the body's
@@ -1031,7 +1185,7 @@ const TOKEN_FORMATS: &[TokenFormat] = &[
 ];
 
 /// Every well-known secret (rule 6) replaced, wherever it is.
-fn known_tokens(s: &str, n: &mut u32) -> String {
+fn known_tokens(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let run = |from: usize, ok: fn(u8) -> bool| {
         b[from.min(b.len())..]
@@ -1039,11 +1193,11 @@ fn known_tokens(s: &str, n: &mut u32) -> String {
             .take_while(|c| ok(**c))
             .count()
     };
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i < b.len() {
         let could_start = matches!(b[i], b'g' | b'h' | b's' | b'A' | b'x' | b'e');
-        if !could_start || !starts_word(s, i, |c| c.is_ascii_alphanumeric() || c == '_') {
+        if !could_start || !starts_word(s, i, |c| c.is_ascii_alphanumeric() || c == '_', cx) {
             i += 1;
             continue;
         }
@@ -1070,30 +1224,27 @@ fn known_tokens(s: &str, n: &mut u32) -> String {
         }
         match end {
             Some(end) => {
-                out.push_str(&s[last..i]);
-                out.push_str(REDACTED);
-                *n += 1;
-                last = end;
+                out.replace(i, end, REDACTED);
+                cx.n += 1;
                 i = end;
             }
             None => i += 1,
         }
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// Every Credential Manager target replaced: the suite's name or its name before the rename
 /// (any case, not inside a longer word), an optional `-<channel>`, `/`, then the name up to a
 /// space, quote, backslash or closing bracket, or, for a quoted target, to its quote.
-fn targets(s: &str, n: &mut u32) -> String {
+fn targets(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i < b.len() {
         let could_start = matches!(b[i], b'L' | b'l' | b'W' | b'w');
-        if !could_start || !starts_word(s, i, |c| c.is_ascii() && word(c as u8)) {
+        if !could_start || !starts_word(s, i, |c| c.is_ascii() && word(c as u8), cx) {
             i += 1;
             continue;
         }
@@ -1167,30 +1318,27 @@ fn targets(s: &str, n: &mut u32) -> String {
             i += 1;
             continue;
         }
-        out.push_str(&s[last..i]);
-        out.push_str(REDACTED);
-        *n += 1;
-        last = end;
+        out.replace(i, end, REDACTED);
+        cx.n += 1;
         i = end;
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// Every e-mail address (`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, leftmost and
 /// longest as a regex finds it) replaced. A local part that would start inside a JSON escape
 /// (`\n…`) starts after it, so the JSON stays JSON.
-fn emails(s: &str, n: &mut u32) -> String {
+fn emails(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let local = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'%' | b'+' | b'-');
     let domain = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-');
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while let Some(off) = b.get(i..).and_then(|r| r.iter().position(|c| *c == b'@')) {
         let at = i + off;
         i = at + 1;
         let mut start = at;
-        while start > last && local(b[start - 1]) {
+        while start > out.last && local(b[start - 1]) {
             start -= 1;
         }
         if start > 0 && b[start - 1] == b'\\' {
@@ -1223,15 +1371,12 @@ fn emails(s: &str, n: &mut u32) -> String {
             }
         }
         if let Some(end) = end {
-            out.push_str(&s[last..start]);
-            out.push_str(REDACTED);
-            *n += 1;
-            last = end;
+            out.replace(start, end, REDACTED);
+            cx.n += 1;
             i = end;
         }
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// How the key before a value was quoted: what a bare value's replacement is wrapped in.
@@ -1251,7 +1396,7 @@ fn escaped_quote_at(b: &[u8], k: usize) -> Option<usize> {
 }
 
 /// Every value under a scrub-word key replaced (rule 11, module docs).
-fn keys(s: &str, n: &mut u32) -> String {
+fn keys(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
     let key_byte = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
     let spaces = |mut k: usize| {
@@ -1260,10 +1405,10 @@ fn keys(s: &str, n: &mut u32) -> String {
         }
         k
     };
-    let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0, 0);
+    let mut out = Out::new(s);
+    let mut i = 0;
     while i < b.len() {
-        if !key_byte(b[i]) || !starts_word(s, i, |c| c.is_ascii() && key_byte(c as u8)) {
+        if !key_byte(b[i]) || !starts_word(s, i, |c| c.is_ascii() && key_byte(c as u8), cx) {
             i += 1;
             continue;
         }
@@ -1309,14 +1454,11 @@ fn keys(s: &str, n: &mut u32) -> String {
         let Some((value_start, value_end, with)) = value else {
             continue;
         };
-        out.push_str(&s[last..value_start]);
-        out.push_str(&with);
-        *n += 1;
-        last = value_end;
+        out.replace(value_start, value_end, &with);
+        cx.n += 1;
         i = value_end;
     }
-    out.push_str(&s[last..]);
-    out
+    out.finish(cx)
 }
 
 /// The argument after a scrub-word flag (`--api-key`) that ends at `k`: the next element of an
@@ -2039,9 +2181,11 @@ mod tests {
         assert_eq!(r.text("xabby and abbys and PC07x and Owls").1, 0);
     }
 
-    /// Terminal control sequences go before the rules, in every spelling of their `ESC`: CSI
-    /// (`ESC [` … a final byte), OSC (`ESC ]` … BEL or `ESC \`) and the other `ESC x` pairs;
-    /// between two letters they leave a space.
+    /// Terminal control sequences go, after a first redaction of the text as it came (so the
+    /// strip never undoes what that caught) and before a second: CSI (`ESC [` … a final byte),
+    /// OSC (`ESC ]` … BEL or `ESC \`, a written BEL only for a written `ESC` of its escape
+    /// level, never `\a`) and, for a raw `ESC`, the real 2-byte sequences; nothing is put in
+    /// their place.
     #[test] // spec: ARCH-121
     fn terminal_control_sequences_are_stripped_first() {
         let r = Redactor {
@@ -2050,6 +2194,73 @@ mod tests {
             machine: Some("PROBEBOX-01".into()),
             ..Redactor::default()
         };
+        let alice = Redactor {
+            profile_dir: Some(r"C:\Users\Fake\alice".into()),
+            names: vec![r"D:\claude\abc-dir".into()],
+            ..Redactor::default()
+        };
+        let alexander = Redactor {
+            profile_dir: Some(r"C:\Users\Fake\alexander".into()),
+            ..Redactor::default()
+        };
+        let ghp = format!("ghp_{}", "Ab1".repeat(12));
+        // An OSC whose body holds a path with `\a` in it ends at its real BEL, never at `\a`;
+        // and a lone `ESC` takes no value's first character with it.
+        for (redactor, text, want) in [
+            (
+                &alice,
+                r#"{"m":"\u001b]0;C:\\Users\\Fake\\alice\\x\u0007 started"}"#.to_string(),
+                r#"{"m":" started"}"#.to_string(),
+            ),
+            (
+                &alice,
+                "\u{1b}]0;C:\\Users\\Fake\\alice\\x\u{7} started".to_string(),
+                " started".to_string(),
+            ),
+            (
+                &alexander,
+                "\u{1b}]0;C:\\Users\\Fake\\alexander\\run.bat\u{7}".to_string(),
+                String::new(),
+            ),
+            (
+                &alexander,
+                r#"{"m":"\u001b]0;Admin: C:\\Users\\Fake\\alexander\u0007"}"#.to_string(),
+                r#"{"m":""}"#.to_string(),
+            ),
+            (
+                &alice,
+                "\u{1b}]0;D:\\claude\\abc-dir\u{7}".to_string(),
+                String::new(),
+            ),
+            (
+                &alexander,
+                "\u{1b}]0;C:\\Users\\Fake\\alexander".to_string(),
+                "]0;%USERPROFILE%".to_string(),
+            ),
+            // No literal to catch the path first: `\a` is still no BEL, and a written BEL of
+            // another escape level (`\\x07`, a backslash and `x07`) ends nothing.
+            (&r, "\u{1b}]0;D:\\art\u{7}ok".to_string(), "ok".to_string()),
+            (
+                &r,
+                r#"{"m":"\u001b]0;D:\\x07dir\u0007ok"}"#.to_string(),
+                r#"{"m":"ok"}"#.to_string(),
+            ),
+            (&r, "\u{1b}probeuser".to_string(), "<user>".to_string()),
+            (
+                &r,
+                "\u{1b}S-1-5-21-111-222-333-1001".to_string(),
+                "<sid>".to_string(),
+            ),
+            (
+                &r,
+                format!(r#"{{"m":"\u001b{ghp}"}}"#),
+                r#"{"m":"\u001b<redacted>"}"#.to_string(),
+            ),
+            (&r, format!("\u{1b}[32{ghp}"), "<redacted>".to_string()),
+        ] {
+            let (out, _) = redactor.text(&text);
+            assert_eq!(out, want, "{text}");
+        }
         for (text, want) in [
             (
                 r#"{"m":"\u001b[3mtoken\u001b[0m\u001b[2m=\u001b[0mhunter2secret"}"#,
@@ -2081,12 +2292,15 @@ mod tests {
             ),
             (
                 r#"{"m":"a\u001b[1mb and c \u001b[1md"}"#,
-                r#"{"m":"a b and c d"}"#,
+                r#"{"m":"ab and c d"}"#,
             ),
+            // A written `ESC` that no CSI follows is no `ESC`.
             (
                 r#"{"m":"\u001b7saved\u001b8 \u001b(Bset"}"#,
-                r#"{"m":"saved set"}"#,
+                r#"{"m":"\u001b7saved\u001b8 \u001b(Bset"}"#,
             ),
+            // A raw one: the real 2-byte sequences go; before any other byte, the `ESC` alone.
+            ("\u{1b}7saved\u{1b}8 \u{1b}(Bset \u{1b}cx", "saved (Bset x"),
             (
                 r#"{"m":"\\u{1b}[32mok\\x1b[0m \\u001b[1mfine"}"#,
                 r#"{"m":"ok fine"}"#,
@@ -2099,6 +2313,118 @@ mod tests {
                 serde_json::from_str::<serde_json::Value>(&out)
                     .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
             }
+        }
+    }
+
+    /// A colour code inside a value is removed with nothing in its place, so the value is
+    /// joined again and goes (as `grep --color` highlights part of a path); where one stood is
+    /// still a word boundary.
+    #[test] // spec: ARCH-121
+    fn a_value_split_by_a_colour_code_is_joined_again() {
+        use base64::Engine as _;
+        let r = Redactor {
+            profile_dir: Some(r"C:\Users\Fake\probeuser".into()),
+            machine: Some("PROBEBOX-01".into()),
+            names: vec![r"D:\claude\owl-dir".into()],
+            ..Redactor::default()
+        };
+        let ab = "Ab1".repeat(12);
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r"C:\Users\Fake\x\y.png");
+        for (text, want) in [
+            (
+                r"C:\Users\Fake\probe\u001b[0muser\x".to_string(),
+                r"%USERPROFILE%\x",
+            ),
+            (
+                "C:\\Users\\Fake\\\u{1b}[01;31m\u{1b}[Kprobe\u{1b}[m\u{1b}[Kuser\\x".to_string(),
+                r"%USERPROFILE%\x",
+            ),
+            (r"PROBE\u001b[1mBOX-01".to_string(), "<machine>"),
+            (r"D:\claude\ow\u001b[0ml-dir".to_string(), "<redacted>"),
+            (format!(r"ghp_Ab1\u001b[0m{ab}"), "<redacted>"),
+            (
+                "pass\u{1b}[0mword=hunter2secret".to_string(),
+                "password=<redacted>",
+            ),
+            (
+                format!("lil:op\u{1b}[0men/{payload}"),
+                "lil:open/<redacted>",
+            ),
+            // Where one stood still starts a word.
+            ("x\u{1b}[1mS-1-5-21-1-2-3-4 y".to_string(), "x<sid> y"),
+        ] {
+            assert_eq!(r.text(&text).0, want, "{text}");
+        }
+    }
+
+    /// `\e`, `\033`, `%1B` and `&#27;` are an `ESC` only with a whole CSI after them; then the
+    /// sequence goes and what follows starts a word. Elsewhere (a path, `\e7`) they stay.
+    #[test] // spec: ARCH-121
+    fn source_spellings_of_esc_go_only_before_a_csi() {
+        use base64::Engine as _;
+        let r = Redactor {
+            profile_dir: Some(r"C:\Users\Fake\probe".into()),
+            machine: Some("PCBOX".into()),
+            ..Redactor::default()
+        };
+        let ghp = format!("ghp_{}", "Ab1".repeat(12));
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r"C:\Users\Fake\x\y.png");
+        for (text, want) in [
+            (format!(r"\e[32m{ghp}"), "<redacted>".to_string()),
+            (format!(r"\033[32m{ghp}"), "<redacted>".to_string()),
+            (format!("%1B[1m{ghp}"), "<redacted>".to_string()),
+            (
+                "%1B[1mS-1-5-21-111-222-333-1001".to_string(),
+                "<sid>".to_string(),
+            ),
+            (
+                "&#27;[1mS-1-5-21-111-222-333-1001".to_string(),
+                "<sid>".to_string(),
+            ),
+            (
+                format!("%1B[0mlil:open/{payload}"),
+                "lil:open/<redacted>".to_string(),
+            ),
+            (r"\e[1mprobe".to_string(), "<user>".to_string()),
+            (r"\033[1mprobe".to_string(), "<user>".to_string()),
+            ("%1B[1mprobe".to_string(), "<user>".to_string()),
+            ("&#27;[1mprobe".to_string(), "<user>".to_string()),
+            (r"\e[1mPCBOX".to_string(), "<machine>".to_string()),
+            // No CSI after them: untouched.
+            (
+                r"D:\eve\x and \e7 and \033x and %1Bz".to_string(),
+                r"D:\eve\x and \e7 and \033x and %1Bz".to_string(),
+            ),
+        ] {
+            assert_eq!(r.text(&text).0, want, "{text}");
+        }
+        let eve = Redactor {
+            profile_dir: Some(r"C:\Users\Fake\eve".into()),
+            ..Redactor::default()
+        };
+        assert_eq!(eve.text(r"C:\Users\Fake\eve\x").0, r"%USERPROFILE%\x");
+    }
+
+    /// A path literal matches without its trailing separator or its `\\?\` (`\\?\UNC\`) prefix.
+    #[test] // spec: ARCH-121
+    fn path_literals_match_without_a_trailing_separator_or_a_verbatim_prefix() {
+        for (name, text) in [
+            (r"D:\claude\owl-dir\", r"open D:\claude\owl-dir now"),
+            (r"D:/claude/owl-dir//", r"open D:\\claude\\owl-dir now"),
+            (r"\\?\D:\claude\owl-dir", r"open D:/claude/owl-dir/x now"),
+            (r"\\?\UNC\srv\share\owl", r"open \\srv\share\owl\x now"),
+        ] {
+            let r = Redactor {
+                names: vec![name.into()],
+                ..Redactor::default()
+            };
+            let (out, n) = r.text(text);
+            assert!(
+                out.starts_with("open <redacted>") && n == 1,
+                "{name}: {text} -> {out}"
+            );
         }
     }
 

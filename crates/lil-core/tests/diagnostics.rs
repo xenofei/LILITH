@@ -1055,13 +1055,57 @@ async fn a_bundle_a_second_later_trims_the_folder_back_to_ten() {
     assert!(!later.ends_with("-2.zip"), "{later}");
 }
 
-/// Sets the file system's creation time of `path` to `ago` before now.
+/// Sets the file system's creation time of `path` to `at`.
 #[allow(clippy::disallowed_methods)]
-fn created_ago(path: &Path, ago: Duration) {
+fn created_at(path: &Path, at: SystemTime) {
     use std::os::windows::fs::FileTimesExt as _;
     let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    file.set_times(std::fs::FileTimes::new().set_created(SystemTime::now() - ago))
+    file.set_times(std::fs::FileTimes::new().set_created(at))
         .unwrap();
+}
+
+/// Sets the file system's creation time of `path` to `ago` before now.
+fn created_ago(path: &Path, ago: Duration) {
+    created_at(path, SystemTime::now() - ago);
+}
+
+/// No bundle removes the one made most recently before it (by creation time), whatever the
+/// clocks say. The production form of a clock moved back: the bundles made while it ran an
+/// hour ahead carry that hour in their names and in their files' creation times, so they stay
+/// young; still, a bundle minutes after the last one never removes it.
+#[tokio::test] // spec: ARCH-121, P4a-R19
+async fn a_bundle_never_removes_the_one_made_just_before_it() {
+    let env = TestEnv::new();
+    let clock = FakeClock::new();
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let d = Diagnostics::new(
+        env.env.clone(),
+        clock.clone(),
+        events.clone(),
+        DiagnosticsSources::default(),
+    );
+    let ctx = common::ctx(&env, lil_protocol::CallerKind::Cli, &events);
+    clock.shift_utc(3600);
+    for _ in 0..10 {
+        let path = d.bundle(&ctx, None).await.unwrap().path;
+        created_at(
+            Path::new(&path),
+            SystemTime::now() + Duration::from_secs(3600),
+        );
+        clock.advance(Duration::from_secs(1));
+    }
+    clock.shift_utc(-3700);
+    // A, then B made "4 minutes" after it, then C "2 minutes" after B.
+    let a = d.bundle(&ctx, None).await.unwrap().path;
+    created_ago(Path::new(&a), Duration::from_secs(240));
+    clock.advance(Duration::from_secs(240));
+    let b = d.bundle(&ctx, None).await.unwrap().path;
+    assert!(Path::new(&a).exists(), "B removed A");
+    created_ago(Path::new(&b), Duration::from_secs(120));
+    clock.advance(Duration::from_secs(120));
+    let c = d.bundle(&ctx, None).await.unwrap().path;
+    assert!(Path::new(&b).exists(), "C removed B");
+    assert!(Path::new(&c).exists(), "{c}");
 }
 
 /// The diagnostics folder's files.

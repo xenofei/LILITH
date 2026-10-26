@@ -21,8 +21,9 @@
 //! taken name, or one this core handed out already, is skipped for the next number. Then the
 //! folder keeps the newest [`KEEP_BUNDLES`] bundles, ordered by time stamp, then number (as a
 //! number); a bundle whose file was made less than [`YOUNG_BUNDLE`] ago (by the file system's
-//! creation time, not its name's time stamp) is never removed, so a burst keeps every bundle
-//! of it, and after the clock moves back no bundle removes the one made before it. A log whose
+//! creation time, not its name's time stamp) is never removed, nor the one created most
+//! recently before the new one, whatever the clocks say, so a burst keeps every bundle of it
+//! and no bundle removes the one made just before it. A log whose
 //! file name a rule changes is named `logs/redacted-<n>.<date>.log`. Nothing is sent anywhere
 //! (ARCH-122).
 
@@ -339,7 +340,7 @@ fn write_bundle(
         set().contains(&key(candidate))
     })?;
     set().insert(key(&path));
-    prune_bundles(env);
+    prune_bundles(env, &path);
     Ok(BundleResult {
         path: path.display().to_string(),
         bytes: bytes.len() as u64,
@@ -379,12 +380,18 @@ fn is_young(path: &Path) -> bool {
         })
 }
 
-/// Keeps the newest [`KEEP_BUNDLES`] bundles of the diagnostics folder: while there are more,
-/// the oldest is removed (by time stamp, then number), but never one made less than
-/// [`YOUNG_BUNDLE`] ago ([`is_young`]), so neither a burst nor a clock moved back makes a
-/// bundle remove one made just before it. Other files are never touched; one that can't be
-/// removed is left.
-fn prune_bundles(env: &Env) {
+/// The file system's creation time of the file at `path`, if it can be read.
+fn created(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.created()).ok()
+}
+
+/// Keeps the newest [`KEEP_BUNDLES`] bundles of the diagnostics folder after the bundle `new`
+/// was written: while there are more, the oldest is removed (by time stamp, then number), but
+/// never one made less than [`YOUNG_BUNDLE`] ago ([`is_young`]), and never the one created most
+/// recently before `new` (by creation time, whatever the clocks and the names say), so no
+/// bundle removes the one made just before it. Other files are never touched; one that can't
+/// be removed is left.
+fn prune_bundles(env: &Env, new: &Path) {
     let dir = env.diagnostics_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -395,13 +402,22 @@ fn prune_bundles(env: &Env) {
         .filter_map(|name| bundle_order(&name).map(|order| (order, name)))
         .collect();
     bundles.sort();
+    let new_name = new.file_name().map(|n| n.to_string_lossy().into_owned());
+    let new_created = created(new).unwrap_or_else(SystemTime::now);
+    let previous = bundles
+        .iter()
+        .filter(|(_, name)| Some(name) != new_name.as_ref())
+        .filter_map(|(_, name)| created(&dir.join(name)).map(|at| (at, name)))
+        .filter(|(at, _)| *at <= new_created)
+        .max()
+        .map(|(_, name)| name.clone());
     let mut excess = bundles.len().saturating_sub(KEEP_BUNDLES);
     for (_, name) in &bundles {
         if excess == 0 {
             break;
         }
         let path = dir.join(name);
-        if is_young(&path) {
+        if Some(name) == previous.as_ref() || is_young(&path) {
             continue;
         }
         match fsops::remove_suite_cache_file(env, &path) {

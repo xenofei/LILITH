@@ -171,7 +171,8 @@ const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the su
     snapshot), the job's arguments with any prompt text, and model file names and workspace \
     paths outside the user-profile folder (the logs). It never holds a workspace file; a bundle \
     made in the same second as another gets a name of its own, the folder keeps the newest 10 \
-    (and every bundle made in the last minute), and nothing is sent anywhere: the bundle leaves \
+    (and every bundle made in the last minute, and the one before the newest), and nothing is \
+    sent anywhere: the bundle leaves \
     this PC only when you hand it on.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
