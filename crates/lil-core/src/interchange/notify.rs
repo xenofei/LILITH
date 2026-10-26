@@ -11,7 +11,9 @@
 //!     channel, so no burst of other events can drop one.
 //!   - `cap_alert` for each `caps` alert (a bus client of its own).
 //!   - `notify.claude_code` ([`Notifier::claude_code`]), an agent's `open_in` and `ui.show`
-//!     ([`Notifier::agent_opened`]) and each recovery that held jobs ([`Notifier::restart_held`]).
+//!     ([`Notifier::agent_opened`]) and each recovery that held jobs not counted in a
+//!     restart-hold toast yet ([`Notifier::restart_held`]; once per held batch, kept in the suite
+//!     `state.db`, owner decision 2026-10-26).
 //!   - No toast is ever a progress toast or updated in place (P4a-R36).
 //! - **As posted** (Checkpoint A walkthrough): every toast's title and body are redacted as a
 //!   diagnostics bundle's entries are (BUG-1), and while the handlers aren't this channel's, a
@@ -72,6 +74,7 @@ use crate::confirm::{Confirm, ListState, NotificationPath};
 use crate::desktop::{DesktopSettingsStore, DesktopWatch, UiApps};
 use crate::events::{ClientId, EventBus};
 use crate::jobs::{BatchJob, JobId, JobStatus, Jobs, Priority, Surface};
+use crate::state::{StateDb, StateError};
 
 /// The notifier's bus client for the `jobs` topic: no connection has it.
 pub const JOBS_CLIENT: ClientId = u64::MAX;
@@ -97,6 +100,8 @@ const MAX_URL_CHARS: usize = 8192;
 /// How a toast's body ends when its target was left out because the handlers aren't this
 /// channel's (Checkpoint A walkthrough, ODD-6).
 pub const OPEN_LILITH: &str = " · Open LILITH to see it";
+/// How many job ids counted in restart-hold toasts the suite `state.db` keeps.
+const RESTART_TOASTS_KEPT: i64 = 4096;
 
 /// The categories (Appendix G).
 pub const JOB_FINISHED: &str = "job_finished";
@@ -192,6 +197,8 @@ pub struct Notifier {
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdSource>,
     confirm: OnceLock<Weak<Confirm>>,
+    /// The suite `state.db`: the job ids counted in restart-hold toasts.
+    state: OnceLock<Arc<StateDb>>,
     jobs: OnceLock<Weak<Jobs>>,
     news: mpsc::UnboundedSender<ConfirmNews>,
     /// Holds the handling of `jobs` events while `true` (the overflow test's lever, on a test
@@ -256,6 +263,7 @@ impl Notifier {
             clock,
             ids,
             confirm: OnceLock::new(),
+            state: OnceLock::new(),
             jobs: OnceLock::new(),
             news,
             jobs_paused: watch::Sender::new(false),
@@ -342,6 +350,12 @@ impl Notifier {
         let _ = self.confirm.set(Arc::downgrade(confirm));
     }
 
+    /// The suite `state.db`, which keeps the job ids counted in restart-hold toasts (once; set
+    /// it before any recovery).
+    pub fn set_state(&self, state: Arc<StateDb>) {
+        let _ = self.state.set(state);
+    }
+
     /// The jobs whose batches it reads: subscribes its `jobs` bus client and starts handling
     /// their events (once; a second call is ignored).
     pub async fn set_jobs(self: &Arc<Self>, jobs: &Arc<Jobs>) {
@@ -393,6 +407,13 @@ impl Notifier {
     #[must_use]
     pub fn pause_job_events(&self, on: bool) -> bool {
         hold_job_events(&self.channel, &self.jobs_paused, on)
+    }
+
+    fn utc_ms(&self) -> i64 {
+        self.clock
+            .utc_now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
     }
 
     fn utc_secs(&self) -> i64 {
@@ -536,16 +557,29 @@ impl Notifier {
         self.post(AGENT_ACTIVITY, &self.ids.id("n"), &text).await
     }
 
-    /// The restart hold (P4a-R41): one `job_failed` toast for a recovery that held `held` jobs,
-    /// launching the first. With `held` 0 nothing is posted (`Unavailable`).
-    pub async fn restart_held(&self, held: usize, first: &JobId) -> NotifyOutcome {
-        if held == 0 {
+    /// The restart hold (P4a-R41): one `job_failed` toast for a recovery that held `held` (in
+    /// queue order), launching the first. Once per held batch (owner decision 2026-10-26): when
+    /// every one of them was counted in a restart-hold toast already, of this run or an earlier
+    /// one, nothing is posted (`Duplicate`); a toast posted counts them all. With none held
+    /// nothing is posted (`Unavailable`). Without the suite `state.db`, or when it fails (logged),
+    /// the toast is posted.
+    pub async fn restart_held(&self, held: &[JobId]) -> NotifyOutcome {
+        let Some(first) = held.first() else {
             return NotifyOutcome::Unavailable;
+        };
+        let ids: Vec<String> = held.iter().map(ToString::to_string).collect();
+        let state = self.state.get().cloned();
+        if let Some(db) = &state {
+            match all_toasted(db, ids.clone()).await {
+                Ok(true) => return NotifyOutcome::Duplicate,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "the restart-hold toasts could not be read"),
+            }
         }
-        let body = if held == 1 {
+        let body = if held.len() == 1 {
             "1 job waits until you resume it in Jobs".to_string()
         } else {
-            format!("{held} jobs wait until you resume them in Jobs")
+            format!("{} jobs wait until you resume them in Jobs", held.len())
         };
         let text = ToastText {
             title: "Jobs held after a restart".to_string(),
@@ -553,8 +587,16 @@ impl Notifier {
             launch: Some(lil_parse::task_url(&self.scheme, first.as_str())),
             actions: ToastActions::None,
         };
-        self.post(JOB_FAILED, &format!("restart_{first}"), &text)
-            .await
+        let outcome = self
+            .post(JOB_FAILED, &format!("restart_{first}"), &text)
+            .await;
+        if outcome == NotifyOutcome::Posted
+            && let Some(db) = &state
+            && let Err(e) = count_toasted(db, ids, self.utc_ms()).await
+        {
+            tracing::warn!(error = %e, "the restart-hold toast could not be recorded");
+        }
+        outcome
     }
 
     /// The end of `batch`: its toast, once. `false` while one of its newest attempts isn't
@@ -874,6 +916,50 @@ fn as_posted(env: &Env, handlers: &HandlersWire, mut text: ToastText) -> ToastTe
         text.body = format!("{}{OPEN_LILITH}", lil_parse::shown_text(&text.body, room));
     }
     text
+}
+
+/// Whether every job of `ids` was counted in a restart-hold toast already.
+async fn all_toasted(db: &StateDb, ids: Vec<String>) -> Result<bool, StateError> {
+    db.call(move |conn| {
+        let mut known = conn
+            .prepare_cached("SELECT 1 FROM restart_hold_toasts WHERE job_id = ?1")
+            .map_err(|e| StateError::Io(e.to_string()))?;
+        for id in &ids {
+            if !known
+                .exists([id])
+                .map_err(|e| StateError::Io(e.to_string()))?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .await
+}
+
+/// Counts `ids` as shown in a restart-hold toast at `at_ms`, keeping the newest
+/// [`RESTART_TOASTS_KEPT`].
+async fn count_toasted(db: &StateDb, ids: Vec<String>, at_ms: i64) -> Result<(), StateError> {
+    db.call(move |conn| {
+        let mut run = || -> rusqlite::Result<()> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for id in &ids {
+                tx.execute(
+                    "INSERT OR REPLACE INTO restart_hold_toasts (job_id, toasted_ms) VALUES (?1, ?2)",
+                    rusqlite::params![id, at_ms],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM restart_hold_toasts WHERE job_id NOT IN \
+                 (SELECT job_id FROM restart_hold_toasts \
+                  ORDER BY toasted_ms DESC, job_id DESC LIMIT ?1)",
+                [RESTART_TOASTS_KEPT],
+            )?;
+            tx.commit()
+        };
+        run().map_err(|e| StateError::Io(e.to_string()))
+    })
+    .await
 }
 
 /// A fresh 128-bit toast token, 32 lowercase hex, from `ids` (two of its 64-bit ids).

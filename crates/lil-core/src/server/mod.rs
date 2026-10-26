@@ -489,16 +489,17 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             }
         }));
     }
-    // One restart-hold toast per recovery that holds jobs (P4a-R41), set before any recovery.
+    // One restart-hold toast per recovery that holds jobs not counted in one yet (P4a-R41;
+    // owner decision 2026-10-26: once per held batch, kept in the suite state.db), set before
+    // any recovery.
+    notifier.set_state(state.suite_db());
     {
         let notifier = notifier.clone();
         jobs.set_restart_hold_sink(Arc::new(move |held: Vec<crate::jobs::JobId>| {
             let notifier = notifier.clone();
             tokio::spawn(async move {
-                if let Some(first) = held.first() {
-                    let outcome = notifier.restart_held(held.len(), first).await;
-                    tracing::info!(held = held.len(), outcome = ?outcome, "the restart hold's toast");
-                }
+                let outcome = notifier.restart_held(&held).await;
+                tracing::info!(held = held.len(), outcome = ?outcome, "the restart hold's toast");
             });
         }));
     }

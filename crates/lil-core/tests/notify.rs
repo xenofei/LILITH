@@ -674,6 +674,76 @@ fn a_restart_hold_posts_one_toast() {
     assert!(posts(&mut p, "job_failed").is_empty());
 }
 
+/// Owner decision 2026-10-26 (Checkpoint A walkthrough): the restart hold's toast comes once
+/// per held batch, across restarts; a later start that holds the same jobs again posts
+/// nothing, and a hold of new jobs posts again.
+#[test] // spec: APP-146, ARCH-022, CORE-160
+fn a_restart_hold_toasts_once_per_held_batch() {
+    let env = TestEnv::new();
+    // Jobs held in a paused lane when `start` drops its core.
+    let held_in = |n: u64| {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut a = app(&env);
+        let paused = a.call("app/queue.pause", json!({}));
+        assert_eq!(paused["result"]["status"], "ok", "{paused}");
+        let mut p = pipe(&env, json!({}));
+        job_ids(&write(
+            &mut p,
+            "test.job",
+            json!({"lane": "gpu-heavy", "batch": n}),
+        ))
+    };
+    let first = held_in(2);
+    {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({}));
+        let toast = until_posts(&mut p, "job_failed", 1).remove(0);
+        assert!(
+            toast["body"]
+                .as_str()
+                .is_some_and(|b| b.starts_with("2 jobs wait until you resume them in Jobs")),
+            "{toast}"
+        );
+    }
+    // The same two held again: no new toast.
+    {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({}));
+        let listed = p.tool_ok("jobs.list", json!({}), None);
+        let held = listed["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|j| j["pause_reasons"] == json!(["restart"]))
+            .count();
+        assert_eq!(held, 2, "held again: {listed}");
+        desktop(
+            &mut p,
+            json!({"toasts": "ready", "shortcut": true, "handlers": true,
+                   "foreground": "other", "fullscreen": "no"}),
+        );
+        fence(&mut p, &env);
+        assert!(
+            posts(&mut p, "job_failed").is_empty(),
+            "{:?}",
+            posts(&mut p, "job_failed")
+        );
+    }
+    // A new job held with them: one toast for the three.
+    let more = held_in(1);
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    let toast = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert!(
+        toast["body"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("3 jobs wait until you resume them in Jobs")),
+        "{toast}"
+    );
+    assert_eq!(toast["tag"], format!("restart_{}", first[0]), "{toast}");
+    assert_ne!(first[0], more[0]);
+}
+
 /// Checkpoint A walkthrough (ODD-6): while the handlers aren't this channel's, a toast with
 /// a target is posted without it, and its text says to open LILITH, the ending always shown.
 #[test] // spec: APP-146, APP-022

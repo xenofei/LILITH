@@ -299,6 +299,14 @@ CREATE TABLE engine_captures (
     PRIMARY KEY (engine, captured_utc)
 );";
 
+/// Suite migration 11: the restart-hold toast once per held batch (owner decision 2026-10-26,
+/// Checkpoint A walkthrough; Appendix G "Restart hold"). Each row is a job counted in a
+/// posted restart-hold toast and when (Unix milliseconds); the newest 4,096 are kept.
+const RESTART_HOLD_TOASTS: &str = "CREATE TABLE restart_hold_toasts (
+    job_id TEXT PRIMARY KEY,
+    toasted_ms INTEGER NOT NULL
+);";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -311,6 +319,7 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     CAPS,
     JOBS_V2,
     ENGINE_RECORDS,
+    RESTART_HOLD_TOASTS,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
@@ -395,7 +404,11 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 10);
+        assert_eq!(SUITE_MIGRATIONS.len(), 11);
+        assert_eq!(
+            SUITE_MIGRATIONS[10], RESTART_HOLD_TOASTS,
+            "appended, never inserted"
+        );
         assert_eq!(
             SUITE_MIGRATIONS[9], ENGINE_RECORDS,
             "appended, never inserted"
