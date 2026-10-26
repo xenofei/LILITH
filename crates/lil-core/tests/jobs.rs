@@ -2475,16 +2475,26 @@ async fn the_queue_orders_cursor_survives_a_change_between_pages() {
         .unwrap();
     let (second, next) = fx.jobs.list(&fx.ctx(), page(next.clone())).await.unwrap();
     assert_eq!((names(second), next), (ids[2..].to_vec(), None));
-    // An interactive job submitted at the queue's front isn't listed again on a later page.
-    fx.submit(spec(
-        Lane::Cpu,
-        Priority::Interactive,
-        json!({"gate": "never"}),
-    ))
-    .await;
-    let (_, after_first) = fx.jobs.list(&fx.ctx(), page(None)).await.unwrap();
-    let (rest, _) = fx.jobs.list(&fx.ctx(), page(after_first)).await.unwrap();
-    assert_eq!(names(rest), ids[2..]);
+    // A job submitted ahead of the cursor between pages is not listed in this pass (a reader
+    // re-reads from the start on its event, Appendix G); the rest are listed once.
+    let (first, after_first) = fx.jobs.list(&fx.ctx(), page(None)).await.unwrap();
+    assert_eq!(names(first), ids[1..3]);
+    let ahead = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::Interactive,
+            json!({"gate": "never"}),
+        ))
+        .await
+        .job_id;
+    let (rest, next) = fx.jobs.list(&fx.ctx(), page(after_first)).await.unwrap();
+    assert_eq!((names(rest), next), (ids[3..].to_vec(), None));
+    let (again, _) = fx.jobs.list(&fx.ctx(), page(None)).await.unwrap();
+    assert_eq!(
+        names(again),
+        [ahead, ids[1].clone()],
+        "a re-read from the start has it"
+    );
     fx.shutdown().await;
 }
 
