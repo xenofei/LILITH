@@ -402,13 +402,19 @@ struct Esc {
     form: EscForm,
 }
 
-/// The length of the run of `\` that starts at each byte of one text, from a single backward
-/// pass, so no scan counts a run again at every byte of it (Checkpoint A ruling: a key before
-/// a long run of `\` took quadratic time). Each scan over a text builds one for that text.
-struct Runs(Vec<u32>);
+/// One text, with the length of the run of `\` that starts at each of its bytes, from a single
+/// backward pass, so no scan counts a run again at every byte of it (Checkpoint A ruling: a key
+/// before a long run of `\` took quadratic time). The table borrows the text it was built from,
+/// and the helpers read both from it, so a table can never index another text (review fix M-7).
+/// Each scan over a text builds one for that text.
+struct Runs<'a> {
+    text: &'a str,
+    from: Vec<u32>,
+}
 
-impl Runs {
-    fn new(b: &[u8]) -> Runs {
+impl<'a> Runs<'a> {
+    fn new(text: &'a str) -> Runs<'a> {
+        let b = text.as_bytes();
         #[cfg(test)]
         RUN_BYTES.with(|n| n.set(n.get() + b.len()));
         let mut from = vec![0u32; b.len() + 1];
@@ -417,12 +423,17 @@ impl Runs {
                 from[i] = from[i + 1].saturating_add(1);
             }
         }
-        Runs(from)
+        Runs { text, from }
+    }
+
+    /// The text's bytes.
+    fn bytes(&self) -> &'a [u8] {
+        self.text.as_bytes()
     }
 
     /// The run of `\` starting at byte `i`; 0 at or past the text's end.
     fn at(&self, i: usize) -> usize {
-        self.0.get(i).map_or(0, |n| *n as usize)
+        self.from.get(i).map_or(0, |n| *n as usize)
     }
 }
 
@@ -433,9 +444,9 @@ thread_local! {
     static RUN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The `ESC` at byte `i` of `b` (whose runs of `\` are `runs`), in any spelling of
-/// [`EscForm`].
-fn esc_at(b: &[u8], runs: &Runs, i: usize) -> Option<Esc> {
+/// The `ESC` at byte `i` of `runs`' text, in any spelling of [`EscForm`].
+fn esc_at(runs: &Runs<'_>, i: usize) -> Option<Esc> {
+    let b = runs.bytes();
     let source = |end: usize| Esc {
         end,
         keep: 0,
@@ -494,8 +505,9 @@ fn esc_at(b: &[u8], runs: &Runs, i: usize) -> Option<Esc> {
 /// The end of a string terminator `ESC \` at byte `j` that closes an OSC opened by an `ESC`
 /// written `form`: after a raw `ESC`, a raw one and one `\`; after a written one, a written
 /// one of the same escape level (backslash parity) and a `\` written as `\\`.
-fn st_at(b: &[u8], runs: &Runs, j: usize, form: EscForm) -> Option<usize> {
-    let esc = esc_at(b, runs, j)?;
+fn st_at(runs: &Runs<'_>, j: usize, form: EscForm) -> Option<usize> {
+    let b = runs.bytes();
+    let esc = esc_at(runs, j)?;
     let run = runs.at(esc.end);
     match (form, esc.form) {
         (EscForm::Raw, EscForm::Raw) => (run >= 1).then_some(esc.end + 1),
@@ -511,7 +523,8 @@ fn st_at(b: &[u8], runs: &Runs, j: usize, form: EscForm) -> Option<usize> {
 /// raw `ESC`, the raw BEL or a raw `ESC \`; after a written one, `\u0007` or `\x07` at the
 /// `ESC`'s own escape level (backslash parity), or a written `ESC \` ([`st_at`]). `\a` is never
 /// a BEL: in log text it is a backslash and a letter, as in `D:\assets`.
-fn osc_end_at(b: &[u8], runs: &Runs, j: usize, form: EscForm) -> Option<usize> {
+fn osc_end_at(runs: &Runs<'_>, j: usize, form: EscForm) -> Option<usize> {
+    let b = runs.bytes();
     match form {
         EscForm::Raw if b.get(j) == Some(&0x07) => return Some(j + 1),
         EscForm::Written(r) => {
@@ -528,7 +541,7 @@ fn osc_end_at(b: &[u8], runs: &Runs, j: usize, form: EscForm) -> Option<usize> {
         }
         _ => {}
     }
-    st_at(b, runs, j, form)
+    st_at(runs, j, form)
 }
 
 /// The end of a whole CSI whose `[` is just before byte `j`: parameter bytes, intermediate
@@ -558,8 +571,8 @@ const LONE_FINALS: &[u8] = b"78=>cDEHMNOPZ\\";
 /// for every spelling; an OSC to its terminator ([`osc_end_at`]) for a raw or written `ESC`;
 /// for a raw `ESC`, one of [`LONE_FINALS`] after it, or else the `ESC` alone. A written or
 /// source `ESC` that starts none of these is no `ESC`.
-fn sequence_end(s: &str, runs: &Runs, esc: &Esc) -> Option<usize> {
-    let b = s.as_bytes();
+fn sequence_end(runs: &Runs<'_>, esc: &Esc) -> Option<usize> {
+    let (s, b) = (runs.text, runs.bytes());
     let p = esc.end;
     let raw = esc.form == EscForm::Raw;
     match b.get(p) {
@@ -567,7 +580,7 @@ fn sequence_end(s: &str, runs: &Runs, esc: &Esc) -> Option<usize> {
         Some(b']') if esc.form != EscForm::Source => {
             let mut j = p + 1;
             while j < b.len() && j - p <= MAX_OSC_BYTES && !matches!(b[j], b'"' | b'\n') {
-                if let Some(end) = osc_end_at(b, runs, j, esc.form) {
+                if let Some(end) = osc_end_at(runs, j, esc.form) {
                     return Some(end);
                 }
                 // A run of `\` is one escape level: never looked into from its middle.
@@ -585,8 +598,8 @@ fn sequence_end(s: &str, runs: &Runs, esc: &Esc) -> Option<usize> {
 /// the only sequence a first-round word steps over (never an `ESC \`, an OSC or any other
 /// CSI), and it is looked for only at a byte that can start an `ESC` spelling, so a run of
 /// `\` is counted once.
-fn plain_sgr_at(s: &str, runs: &Runs, j: usize) -> Option<usize> {
-    let b = s.as_bytes();
+fn plain_sgr_at(runs: &Runs<'_>, j: usize) -> Option<usize> {
+    let b = runs.bytes();
     let starts = match *b.get(j)? {
         0x1b | b'%' | b'&' => true,
         b'\\' => j == 0 || b[j - 1] != b'\\',
@@ -595,7 +608,7 @@ fn plain_sgr_at(s: &str, runs: &Runs, j: usize) -> Option<usize> {
     if !starts {
         return None;
     }
-    let esc = esc_at(b, runs, j)?;
+    let esc = esc_at(runs, j)?;
     if b.get(esc.end) != Some(&b'[') {
         return None;
     }
@@ -616,13 +629,13 @@ fn strip_terminal(s: &str) -> Option<(String, Vec<usize>)> {
         return None;
     }
     let b = s.as_bytes();
-    let runs = Runs::new(b);
+    let runs = Runs::new(s);
     let mut out = String::with_capacity(s.len());
     let mut bounds: Vec<usize> = Vec::new();
     let (mut last, mut i) = (0, 0);
     while i < b.len() {
         let Some((esc, mut end)) =
-            esc_at(b, &runs, i).and_then(|esc| sequence_end(s, &runs, &esc).map(|end| (esc, end)))
+            esc_at(&runs, i).and_then(|esc| sequence_end(&runs, &esc).map(|end| (esc, end)))
         else {
             // A run of `\` is one escape level: never looked into from its middle.
             i += runs.at(i).max(1);
@@ -630,8 +643,8 @@ fn strip_terminal(s: &str) -> Option<(String, Vec<usize>)> {
         };
         out.push_str(&s[last..i + esc.keep]);
         // The sequences right after it go with it.
-        while let Some(next) = esc_at(b, &runs, end).filter(|e| e.keep == 0)
-            && let Some(next_end) = sequence_end(s, &runs, &next)
+        while let Some(next) = esc_at(&runs, end).filter(|e| e.keep == 0)
+            && let Some(next_end) = sequence_end(&runs, &next)
         {
             end = next_end;
         }
@@ -1301,7 +1314,7 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
 /// space, quote, backslash or closing bracket, or, for a quoted target, to its quote.
 fn targets(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
-    let runs = Runs::new(b);
+    let runs = Runs::new(s);
     let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
     let mut out = Out::new(s);
     let mut i = 0;
@@ -1359,7 +1372,7 @@ fn targets(s: &str, cx: &mut Cx) -> String {
             None => loop {
                 let from = end;
                 // A plain SGR is stepped over, never stopped in at its `;`.
-                while let Some(after) = plain_sgr_at(s, &runs, end) {
+                while let Some(after) = plain_sgr_at(&runs, end) {
                     end = after;
                 }
                 while b.get(end).is_some_and(|c| {
@@ -1462,7 +1475,8 @@ enum Quote {
 
 /// The odd run of backslashes followed by `"` at `k`, if one is there: its length (`runs` are
 /// `b`'s).
-fn escaped_quote_at(b: &[u8], runs: &Runs, k: usize) -> Option<usize> {
+fn escaped_quote_at(runs: &Runs<'_>, k: usize) -> Option<usize> {
+    let b = runs.bytes();
     let run = runs.at(k);
     (run % 2 == 1 && b.get(k + run) == Some(&b'"')).then_some(run)
 }
@@ -1470,7 +1484,7 @@ fn escaped_quote_at(b: &[u8], runs: &Runs, k: usize) -> Option<usize> {
 /// Every value under a scrub-word key replaced (rule 11, module docs).
 fn keys(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
-    let runs = Runs::new(b);
+    let runs = Runs::new(s);
     let key_byte = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
     let spaces = |mut k: usize| {
         while matches!(b.get(k), Some(b' ' | b'\t')) {
@@ -1494,7 +1508,7 @@ fn keys(s: &str, cx: &mut Cx) -> String {
             continue;
         }
         let mut k = i;
-        let quote = if let Some(run) = escaped_quote_at(b, &runs, k) {
+        let quote = if let Some(run) = escaped_quote_at(&runs, k) {
             k += run + 1;
             Quote::Escaped(run)
         } else {
@@ -1518,10 +1532,10 @@ fn keys(s: &str, cx: &mut Cx) -> String {
             _ => false,
         };
         let value = if separator {
-            value_at(s, &runs, spaces(k + 1), quote)
+            value_at(&runs, spaces(k + 1), quote)
         } else if key.starts_with('-') || opens_pair(b, start, quote) {
             // A flag's next argument, or a pair's second element (`("API_KEY", "…")`).
-            flag_value(s, &runs, after_key, quote)
+            flag_value(&runs, after_key, quote)
         } else {
             None
         };
@@ -1536,16 +1550,21 @@ fn keys(s: &str, cx: &mut Cx) -> String {
 }
 
 /// Whether the quoted key starting at `start` is the first element of a `Debug` or tuple pair:
-/// its opening quote (escaped as its closing one is) comes right after a `(`, spaces apart.
+/// its opening quote, the same as its closing one (escaped as it is), comes right after a `(`,
+/// spaces apart.
 fn opens_pair(b: &[u8], start: usize, quote: Quote) -> bool {
-    let opening = match quote {
+    let opening: Vec<u8> = match quote {
         Quote::None => return false,
-        Quote::Double | Quote::Single => 1,
-        Quote::Escaped(run) => run + 1,
+        Quote::Double => b"\"".to_vec(),
+        Quote::Single => b"'".to_vec(),
+        Quote::Escaped(run) => [vec![b'\\'; run], vec![b'"']].concat(),
     };
-    let Some(mut j) = start.checked_sub(opening) else {
+    let Some(mut j) = start.checked_sub(opening.len()) else {
         return false;
     };
+    if b.get(j..start) != Some(opening.as_slice()) || (j > 0 && b[j - 1] == b'\\') {
+        return false;
+    }
     while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
         j -= 1;
     }
@@ -1555,8 +1574,8 @@ fn opens_pair(b: &[u8], start: usize, quote: Quote) -> bool {
 /// The argument after a scrub-word flag (`--api-key`) that ends at `k`: the next element of an
 /// array (`"--token", "…"`) or the next space-separated word. Its start, its end and what
 /// replaces it.
-fn flag_value(s: &str, runs: &Runs, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
-    let b = s.as_bytes();
+fn flag_value(runs: &Runs<'_>, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
+    let b = runs.bytes();
     let mut j = k;
     while matches!(b.get(j), Some(b' ' | b'\t')) {
         j += 1;
@@ -1570,28 +1589,28 @@ fn flag_value(s: &str, runs: &Runs, k: usize, quote: Quote) -> Option<(usize, us
         while matches!(b.get(j), Some(b' ' | b'\t')) {
             j += 1;
         }
-        let quoted =
-            matches!(b.get(j), Some(b'"' | b'\'')) || escaped_quote_at(b, runs, j).is_some();
-        return quoted.then(|| value_at(s, runs, j, quote)).flatten();
+        let quoted = matches!(b.get(j), Some(b'"' | b'\'')) || escaped_quote_at(runs, j).is_some();
+        return quoted.then(|| value_at(runs, j, quote)).flatten();
     }
     // Space-separated, and not another flag.
     if j == k || b.get(j).is_none_or(|c| *c == b'-') {
         return None;
     }
-    value_at(s, runs, j, Quote::None)
+    value_at(runs, j, Quote::None)
 }
 
 /// The value starting at byte `k`: its start, its end and what replaces it; `None` for no
 /// value or one that is `<redacted>` already.
-fn value_at(s: &str, runs: &Runs, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
+fn value_at(runs: &Runs<'_>, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
+    let s = runs.text;
     // A value that starts with plain SGRs: they go with it, and what follows them is parsed
     // as a value (quoted, braced or bare).
     let mut lead = k;
-    while let Some(after) = plain_sgr_at(s, runs, lead) {
+    while let Some(after) = plain_sgr_at(runs, lead) {
         lead = after;
     }
     if lead > k {
-        return value_at(s, runs, lead, quote).map(|(_, end, with)| (k, end, with));
+        return value_at(runs, lead, quote).map(|(_, end, with)| (k, end, with));
     }
     let b = s.as_bytes();
     let bare = |inner: &str| match quote {
@@ -1604,7 +1623,7 @@ fn value_at(s: &str, runs: &Runs, k: usize, quote: Quote) -> Option<(usize, usiz
     };
     // A TOML multi-line string (`'''…'''`, `"""…"""`, or `"""` escaped any number of times):
     // to its closing delimiter, or, never closed, to the end of its line.
-    let escaped_triple = escaped_quote_at(b, runs, k).and_then(|run| {
+    let escaped_triple = escaped_quote_at(runs, k).and_then(|run| {
         let one = format!("{}\"", "\\".repeat(run));
         s[k..].starts_with(&one.repeat(3)).then(|| one.repeat(3))
     });
@@ -1625,7 +1644,7 @@ fn value_at(s: &str, runs: &Runs, k: usize, quote: Quote) -> Option<(usize, usiz
         return (s[inner..close] != *REDACTED)
             .then(|| (k, end, format!("{delim}{REDACTED}{delim}")));
     }
-    if let Some(run) = escaped_quote_at(b, runs, k) {
+    if let Some(run) = escaped_quote_at(runs, k) {
         // A string escaped `run` times: to the same run before a `"`.
         let inner = k + run + 1;
         let closing = format!("{}\"", "\\".repeat(run));
@@ -1663,13 +1682,13 @@ fn value_at(s: &str, runs: &Runs, k: usize, quote: Quote) -> Option<(usize, usiz
                         b[j],
                         b',' | b';' | b'}' | b']' | b')' | b'"' | b'\'' | b'&' | b'<' | b'>'
                     )
-                    || (b[j] == b'\\' && escaped_quote_at(b, runs, j).is_some())
+                    || (b[j] == b'\\' && escaped_quote_at(runs, j).is_some())
             };
             let run_end = |from: usize| {
                 let mut j = from;
                 while j < b.len() {
                     // A plain SGR is stepped over, never stopped in at its `;`.
-                    if let Some(after) = plain_sgr_at(s, runs, j) {
+                    if let Some(after) = plain_sgr_at(runs, j) {
                         j = after;
                     } else if stop(j) {
                         break;
@@ -2176,8 +2195,12 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
             }
         }
-        // Not under a scrub word, or not a pair: nothing changes.
+        // Not under a scrub word, or not a pair: nothing changes. A key whose opening quote
+        // is missing or another one isn't a pair's first element (review fix M-7).
         for text in [
+            r#"( API_KEY", "listed")"#,
+            r#"('API_KEY", "listed")"#,
+            r#"(\\"API_KEY\", "listed")"#,
             r#"[("PATH", "C:/bin")]"#,
             r#"call("API_KEY")"#,
             r#"["API_KEY", "listed"]"#,
