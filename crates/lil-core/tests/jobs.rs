@@ -3374,6 +3374,110 @@ async fn queue_state_counts_restart_held() {
     fx.shutdown().await;
 }
 
+/// The first `{kind: "queue"}` event of the cpu lane with `held` and `restart_held`; the
+/// deadline (on the paused clock, it passes once every task waits) is a failure bound only.
+async fn queue_event(fx: &Fx, held: u32, restart_held: u32) -> Value {
+    let found = tokio::time::timeout(
+        Duration::from_secs(30),
+        fx.event_until(|d| {
+            d["kind"] == "queue"
+                && d["state"]["lane"] == "cpu"
+                && d["state"]["held"] == held
+                && d["state"]["restart_held"] == restart_held
+        }),
+    )
+    .await;
+    found
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| panic!("no queue event with held {held}, restart_held {restart_held}"))
+}
+
+/// Checkpoint A I2: the lane's `QueueState` goes out on `jobs` whenever its counts change: a
+/// recovery's restart hold, a held job's cancel, a submission into a paused lane.
+#[tokio::test(start_paused = true)] // spec: CORE-160, ARCH-022
+async fn the_queue_state_is_published_on_every_count_change() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(
+            fx.submit(spec(Lane::Cpu, Priority::Agent, json!({})))
+                .await
+                .job_id,
+        );
+    }
+    let (restarted, _, _) = restart(&fx).await;
+    queue_event(&fx, 3, 3).await;
+    restarted
+        .cancel(&fx.ctx(), &JobId(ids[0].clone()))
+        .await
+        .unwrap();
+    queue_event(&fx, 2, 2).await;
+    restarted.pause(Lane::Cpu, PauseReason::Manual).await;
+    restarted
+        .submit(&fx.ctx(), spec(Lane::Cpu, Priority::Agent, json!({})))
+        .await
+        .unwrap();
+    queue_event(&fx, 3, 2).await;
+    fx.shutdown().await;
+}
+
+/// Checkpoint A M2: a job the core submitted itself (origin `core`, as `comfy.inventory`) is
+/// never held by a restart: it is interrupted, as ARCH-022 says.
+#[tokio::test(start_paused = true)] // spec: ARCH-022, CORE-160
+async fn a_core_job_is_never_held_by_a_restart() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let mut core = fx.ctx();
+    core.origin = None;
+    let own = fx
+        .jobs
+        .submit(&core, spec(Lane::Cpu, Priority::Agent, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        own.origin.as_ref().map(|o| o.surface.wire().to_string()),
+        Some("core".to_string())
+    );
+    let mine = fx.submit(spec(Lane::Cpu, Priority::Agent, json!({}))).await;
+    let (restarted, _, marked) = restart(&fx).await;
+    assert!(marked.contains(&own.job_id), "{marked:?}");
+    assert!(!marked.contains(&mine.job_id), "{marked:?}");
+    assert_eq!(
+        fx.row(&own.job_id).await.substatus,
+        Some(Substatus::Interrupted)
+    );
+    assert_eq!(restarted.queue_state(Lane::Cpu).restart_held, 1);
+    fx.shutdown().await;
+}
+
+/// Checkpoint A M2: `job.cancel {all_mine: true}` from `cli` leaves the core's own jobs.
+#[tokio::test(start_paused = true)] // spec: CORE-146
+async fn all_mine_leaves_the_cores_own_jobs() {
+    let fx = Fx::suite().await;
+    let gate = running_gate(&fx, Lane::Cpu, "never").await;
+    let mut core = fx.ctx();
+    core.origin = None;
+    let own = fx
+        .jobs
+        .submit(&core, spec(Lane::Cpu, Priority::Agent, json!({})))
+        .await
+        .unwrap();
+    let cancelled: Vec<String> = fx
+        .jobs
+        .cancel_selected(&fx.ctx(), CancelSelector::AllMine)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|j| j.job_id)
+        .collect();
+    assert!(cancelled.contains(&gate.job_id), "{cancelled:?}");
+    assert!(!cancelled.contains(&own.job_id), "{cancelled:?}");
+    assert_eq!(fx.finished(&own.job_id).await.status, JobStatus::Succeeded);
+    fx.shutdown().await;
+}
+
 /// P4a-R41: "Resume held jobs" (`app/queue.resume {held_only: true}`) releases the restart's
 /// jobs and keeps your pause: nothing runs until a plain resume.
 #[tokio::test(start_paused = true)] // spec: CORE-160, ARCH-022

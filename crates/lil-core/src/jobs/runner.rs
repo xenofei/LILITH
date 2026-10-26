@@ -45,8 +45,8 @@ use super::{
     JobCtx, JobDone, JobEndHook, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin,
     JobResult, JobSpec, JobStatus, JobSummary, Lane, MAX_ATTEMPTS, MAX_CANCEL_IDS, MAX_WAIT,
     MoveTo, NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob, Reservations,
-    RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, StartedBy, Substatus, Subtask, Withdraw,
-    WithdrawOutcome, backoff,
+    RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, StartedBy, Substatus, Subtask, Surface,
+    Withdraw, WithdrawOutcome, backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
@@ -287,6 +287,9 @@ struct Queue {
     /// The newest core-wide submission key (Appendix G "Queue order"): above every key of
     /// the jobs this core queued.
     last_order: i64,
+    /// Each lane's `QueueState` as `jobs` last got it; `None`: never published, so an idle
+    /// lane's.
+    published: [Option<QueueState>; 2],
 }
 
 /// A state change applies only while the job, as the queue holds it, passes this check.
@@ -733,6 +736,7 @@ impl Shared {
                 "jobs of an earlier core run that never started are held; they run once you resume them"
             );
             held.sort();
+            self.publish_queues();
             let held: Vec<JobId> = held.into_iter().map(|(_, _, id)| id).collect();
             let sink = read(&self.restart_sink);
             if let Some(sink) = sink {
@@ -1389,6 +1393,7 @@ impl Shared {
             }
             self.tell_busy(&mut q);
         }
+        self.publish_queues();
         for (id, scope) in held {
             let shared = self.clone();
             tokio::spawn(async move {
@@ -2056,6 +2061,7 @@ impl Shared {
             self.tell_busy(&mut q);
         }
         lock(&self.locks).remove(info.id.as_str());
+        self.publish_queues();
         self.changed.send_modify(|n| *n += 1);
     }
 
@@ -2437,7 +2443,11 @@ impl Shared {
 
     /// `lane`'s pause now.
     fn queue_state(&self, lane: Lane) -> QueueState {
-        let q = self.queue();
+        Self::lane_state(&self.queue(), lane)
+    }
+
+    /// `lane`'s pause in `q`.
+    fn lane_state(q: &Queue, lane: Lane) -> QueueState {
         let state = &q.lanes[lane.index()];
         let (mut held, mut restart_held) = (0u32, 0u32);
         for a in q.jobs.values().filter(|a| a.info.spec.lane == lane) {
@@ -2461,11 +2471,33 @@ impl Shared {
         }
     }
 
-    /// `{kind: "queue", state}` on `jobs` (Appendix G).
+    /// `{kind: "queue", state}` on `jobs` (Appendix G), when `lane`'s state changed since it
+    /// was last published (Checkpoint A I2). Published under the queue lock, so the events go
+    /// out in the order the states were taken.
     fn publish_queue(&self, lane: Lane) {
-        let state = serde_json::to_value(self.queue_state(lane)).expect("a queue state serialises");
+        let mut q = self.queue();
+        let state = Self::lane_state(&q, lane);
+        let last = &mut q.published[lane.index()];
+        let unchanged = match last {
+            Some(last) => *last == state,
+            None => {
+                state.held == 0 && state.restart_held == 0 && state.withdrawn == 0 && !state.paused
+            }
+        };
+        if unchanged {
+            return;
+        }
+        *last = Some(state.clone());
+        let state = serde_json::to_value(state).expect("a queue state serialises");
         self.events
             .publish("jobs", json!({"kind": "queue", "state": state}));
+    }
+
+    /// [`Shared::publish_queue`] for every lane.
+    fn publish_queues(&self) {
+        for lane in Lane::ALL {
+            self.publish_queue(lane);
+        }
     }
 
     /// Releases `lane`'s jobs a restart holds (P4a-R41); the next pump shows them.
@@ -2654,12 +2686,20 @@ const DIRECTOR_TASK_KIND: &str = "assistant_task";
 
 /// Whether a restart holds `row` (P4a-R41; Appendix G "Restart hold"): a queued job that never
 /// reached an engine (`waiting`, `waiting_for_vram` or `queue_paused`, and no engine id),
-/// other than a director task.
+/// other than a director task and a job the core submitted itself (Checkpoint A M2).
 fn holdable(row: &JobRow) -> bool {
     row.status == JobStatus::Queued
         && never_ran(row.substatus)
         && row.external_id.is_none()
         && row.kind != DIRECTOR_TASK_KIND
+        && !cores_own(row)
+}
+
+/// Whether the core submitted `row`'s job itself (origin `core`, such as `comfy.inventory`).
+fn cores_own(row: &JobRow) -> bool {
+    row.started_by
+        .as_ref()
+        .is_some_and(|s| s.surface == Surface::Core)
 }
 
 /// How a job without a final state is interrupted (ARCH-022, CORE-128).
@@ -3414,9 +3454,11 @@ impl Jobs {
                     .map_err(|e| state_unavailable(&e, trace_id))?
                     .into_iter()
                     .filter(|r| {
-                        r.idem_scope
-                            .as_deref()
-                            .is_some_and(|x| x.starts_with(&mine))
+                        // The core's own jobs are nobody's to cancel this way (Checkpoint A M2).
+                        !cores_own(r)
+                            && r.idem_scope
+                                .as_deref()
+                                .is_some_and(|x| x.starts_with(&mine))
                     })
                     .map(|r| JobId(r.job_id))
                     .collect()
