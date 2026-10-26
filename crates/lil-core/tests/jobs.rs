@@ -2505,7 +2505,7 @@ async fn jobs_list_since_keeps_the_jobs_of_its_own_second() {
     };
     assert_eq!(
         listed(since(format!("{second}.700Z"))).await,
-        [job.job_id.clone()],
+        std::slice::from_ref(&job.job_id),
         "updated later in the same second"
     );
     assert!(listed(since(format!("{second}.000Z"))).await.is_empty());

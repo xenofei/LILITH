@@ -734,6 +734,7 @@ fn suite_cache_leftovers_older_than_a_day_are_swept() {
 /// or a scanner) is replaced once they let go, within the store's backoff, instead of failing
 /// at once.
 #[test] // spec: APP-021, ARCH-074
+#[allow(clippy::disallowed_methods)] // holds the file open without FILE_SHARE_DELETE
 fn a_sharing_violation_on_the_cache_writer_is_retried() {
     use lil_core::store::fsops::write_suite_cache_file;
     use std::os::windows::fs::OpenOptionsExt as _;

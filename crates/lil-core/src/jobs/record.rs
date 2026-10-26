@@ -60,7 +60,7 @@ pub const SUMMARY_LEAVES_OUT: &str = "executed_graph";
 fn shown_result(result: &JobResult) -> JobResult {
     let mut shown = result.clone();
     if let Some(structured) = shown.structured.as_object_mut() {
-        structured.remove(SUMMARY_LEAVES_OUT);
+        lil_schema::remove_key(structured, SUMMARY_LEAVES_OUT);
     }
     shown
 }
