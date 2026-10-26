@@ -12,9 +12,19 @@
 //!   core answers for now (none runs, the connection closed, no answer in time);
 //!   [`SessionState::Incompatible`] for a core of another major protocol, which is left
 //!   running (ARCH-014, APP-036); [`SessionState::Unavailable`] when no core can be used (it
-//!   can't start, isn't trusted, or refused the hello). A `lil/subscribe` gets at most the
-//!   configuration's `start_hard_cap` for its answer; a core that takes longer counts as one
-//!   that didn't answer in time, and its connection is dropped.
+//!   can't start, isn't trusted, or refused the hello), with the cause in a typed form
+//!   ([`UnavailableCause`]). A core that is shutting down refuses the hello with
+//!   `core.draining`: that is [`SessionState::Reconnecting`]. A `lil/subscribe` gets at most
+//!   the configuration's `start_hard_cap` for its answer; a core that takes longer counts as
+//!   one that didn't answer in time, and its connection is dropped. A snapshot can wait for
+//!   the workspace (an `asset:` or `project:` topic while the workspace is reopened or its
+//!   index is rebuilt), and then the setup can run out of that time: the session drops the
+//!   connection and asks again on the next one.
+//! - **A refused hello** whose error says to retry only after a fix or a decision (its `retry`
+//!   is `after_resolve` or `never`, as for `workspace.unsupported` once another workspace is
+//!   the default, or `workspace.unknown`) is not tried again by itself: the state stays
+//!   [`SessionState::Unavailable`] with [`UnavailableCause::Refused`], whose error names the
+//!   fix, until [`Session::retry_now`] or [`Session::set_workspace`].
 //! - **After a failed start** (a core that exited with a start failure, or a core executable
 //!   that could not be launched), the attempts only look for a core someone else started
 //!   ([`StartPolicy::NoStart`]): such a failure needs a person (`lil doctor`, CORE-004), and a
@@ -33,8 +43,21 @@
 //!   another `instance_id` than the last connection's (the core restarted), each last seq
 //!   starts again from 0 first, so the new core replays everything it still holds instead of
 //!   skipping its first events. A topic the new core hasn't published on yet then gets no
-//!   snapshot, so the new `instance_id` in [`SessionState::Ready`] is the app's signal to
-//!   reload everything it built from the old core (ARCH-100).
+//!   snapshot.
+//! - **Reloading** (ARCH-100). When a connection's hello names another core instance or
+//!   another workspace than the last connection whose events reached [`Session::events`], the
+//!   session puts one `resync_required` with seq 0 (the session's own, no core's) for each of
+//!   its topics into the stream, after every event of the old connection and before any of the
+//!   new one's. That is the app's signal to reload what it built from the old core or
+//!   workspace: it reloads each topic on its `resync_required` in the stream, not on
+//!   [`SessionState::Ready`], which comes on another channel and so in no fixed order with the
+//!   events. What follows the mark can still predate the reload: the new connection replays
+//!   from the topics' cursors, and on a switch to another workspace of the same core, topics
+//!   whose names carry no workspace (`jobs`, `project:<slug>`) can still carry the old
+//!   workspace's events. Every event carries full state or asks for a reload, so the models
+//!   converge. A backlog overflow can fold the mark into an ordinary `resync_required` (a seq
+//!   other than 0): every `resync_required` means "reload this topic", and a change of core or
+//!   workspace is also told by the hello in [`SessionState::Ready`].
 //! - **Events** reach [`Session::events`] in the core's order, across reconnects. A topic
 //!   subscribed while there is no connection, or while one is being set up, is subscribed on
 //!   it: the task makes the connection the current one, then subscribes the topics added
@@ -49,19 +72,25 @@
 //!   seqs only rise within a connection, any event at or below the topic's last seq (what the
 //!   newest subscribe was answered with, or the newest event taken). The core may send an
 //!   event just before it answers the unsubscribe, and that one can still arrive in the short
-//!   moment between a subscribe's edit of the topics and its answer. An app that loads a
-//!   topic's state itself ignores the events at or below the seq it loaded at (APP-033).
+//!   moment between a subscribe's edit of the topics and its answer.
+//! - **Loading a topic's state** (APP-033). No tool result carries a topic's seq, and
+//!   [`Session::subscribe`] is live only, so a load with the topic's tool (`asset.get`,
+//!   `jobs.list`, ...) comes in no fixed order with the topic's events. The app loads with the
+//!   tool and then applies every later event: each carries the state it describes in full, or
+//!   tells the app to read it again (`resync_required`).
 //! - **A switch** ([`Session::set_workspace`]) or a lost connection leaves no current
-//!   connection until the next one is established: the old one is no longer read, so calls
-//!   fail with [`ClientError::NotConnected`] meanwhile and topics are recorded for the next
-//!   one, which learns their cursors from its own answers only.
+//!   connection until the next one is established: the old one is closed, so its calls in
+//!   flight end with [`ClientError::Closed`], calls fail with [`ClientError::NotConnected`]
+//!   meanwhile, and topics are recorded for the next one, which learns their cursors from its
+//!   own answers only. The state is [`SessionState::Connecting`] while a switch's connection is
+//!   set up.
 //! - **Calls** ([`Session::call_tool`], [`Session::app_call`]) go out on the current
 //!   connection and the session never sends one again. A call while there is no connection is
 //!   [`ClientError::NotConnected`] at once: nothing was sent, so it is safe to make again. A
-//!   call in flight when the connection is lost ends with [`ClientError::Closed`]: it may have
-//!   run. Retrying after `Closed` is the caller's, with the same idempotency key, so a caller
-//!   that may retry passes its own ([`crate::mint_id`]`("ik")`); `app/*` methods have no key,
-//!   so they are not retried after `Closed`.
+//!   call in flight when the connection is lost or left (a switch) ends with
+//!   [`ClientError::Closed`]: it may have been sent, and may have run, so it is not safe to
+//!   make again. Only `NotConnected` is. After a switch the new connection is in
+//!   another workspace, whose idempotency scope knows nothing of the old call.
 //! - **Switching workspace** (P4a-R34) is a new connection whose hello names the workspace. It
 //!   replaces the current one only once the core accepted it, and it never changes
 //!   `suite.toml`'s default.
@@ -75,10 +104,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use lil_protocol::codes::PARAMS_INVALID;
+use lil_protocol::codes::{CORE_DRAINING, PARAMS_INVALID};
 use lil_protocol::{
-    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, Outcome, ToolOutput, TopicState,
-    is_valid_topic,
+    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, Outcome, RetryPolicy, ToolOutput,
+    TopicState, is_valid_topic,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::error::TrySendError;
@@ -86,7 +115,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::{Client, ClientConfig, ClientError, StartPolicy};
+use crate::{Client, ClientConfig, ClientError, StartFailure, StartPolicy};
 
 /// The first pause before another attempt.
 const BACKOFF_FIRST: Duration = Duration::from_millis(250);
@@ -99,20 +128,41 @@ const EVENTS_CAPACITY: usize = 1024;
 const BACKLOG_MAX: usize = CLIENT_QUEUE;
 
 /// Where the session stands (APP-034, APP-036, ARCH-100).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionState {
-    /// The first attempt is under way.
+    /// The first attempt is under way, or a switch's connection is being set up.
     Connecting,
-    /// Connected and subscribed; the core's hello. Another `instance_id` than the last
-    /// `Ready`'s means the core restarted: reload what was built from the old one.
+    /// Connected and subscribed; the core's hello. When it names another core instance or
+    /// workspace, the stream says so in its order (module docs, "Reloading").
     Ready(Box<HelloResult>),
     /// No core answers for now; `attempt` counts the attempts since the last connection (or
     /// since the start), the next of which follows the backoff.
     Reconnecting { attempt: u32 },
     /// The core speaks another major protocol and was left running (ARCH-014).
     Incompatible { core_protocol: String },
-    /// No core can be used, and why (the client's message).
-    Unavailable { reason: String },
+    /// No core can be used: why, in words (the client's message), and as a cause to act on.
+    Unavailable {
+        reason: String,
+        cause: UnavailableCause,
+    },
+}
+
+/// Why no core can be used ([`SessionState::Unavailable`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnavailableCause {
+    /// A core this session started exited with this failure; it needs a person (`lil doctor`,
+    /// CORE-004), then [`Session::retry_now`].
+    StartFailed(StartFailure),
+    /// The core executable could not be launched.
+    CannotStart,
+    /// The process serving the pipe is not a trusted core (ARCH-027).
+    Untrusted,
+    /// The core refused the hello with this error, its code, fix and data included
+    /// (`workspace.unsupported` names the workspace the core serves). One whose `retry` is
+    /// `after_resolve` or `never` is not tried again by itself (module docs).
+    Refused(Box<ErrorBody>),
+    /// Anything else (a protocol fault, an I/O error); the reason says what.
+    Other,
 }
 
 /// A session with the core (module docs). Dropping it stops its task and closes the
@@ -221,11 +271,10 @@ impl Session {
     /// idempotency key is minted), carrying `trace_id` when given (ARCH-118). Never sent again
     /// by the session (module docs).
     ///
-    /// [`ClientError::NotConnected`]: no connection, nothing was sent. [`ClientError::Closed`]:
-    /// the connection was lost while the call was in flight, so it may have run and its
-    /// outcome is unknown. A caller that may retry after `Closed` passes its own key
-    /// ([`crate::mint_id`]`("ik")`) and retries with that key: a key minted here is never seen
-    /// by the caller.
+    /// [`ClientError::NotConnected`]: no connection, nothing was sent, so it is safe to make
+    /// again. [`ClientError::Closed`]: the connection was lost or left (a switch) while the
+    /// call was in flight, so it may have been sent and may have run, and its outcome is
+    /// unknown: it is not made again (module docs, "Calls").
     pub async fn call_tool(
         &self,
         name: &str,
@@ -402,9 +451,11 @@ impl Session {
     /// A refusal (`workspace.unsupported` for a workspace the core doesn't serve, ARCH-090) is
     /// the error, and the session stays as it was.
     ///
-    /// `Ok` means the core accepted the workspace. If the new connection is lost while its
-    /// topics are subscribed, the session reconnects in that workspace, and [`Session::state`]
-    /// says so. Calls to it run one at a time.
+    /// `Ok` means the core accepted the workspace, and only that: the session has switched,
+    /// and later reconnects name it. Its topics are subscribed on the new connection after
+    /// that; if this fails (the connection is lost, or the core doesn't answer in time), the
+    /// session reconnects in that workspace, and [`Session::state`] says so. Calls to it run
+    /// one at a time.
     pub async fn set_workspace(&self, id: &str) -> Result<HelloResult, ClientError> {
         let _switching = self.shared.switching.lock().await;
         let mut cfg = lock(&self.shared.cfg).clone();
@@ -444,6 +495,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.task.abort();
+        leave_current(&self.shared);
     }
 }
 
@@ -473,16 +525,26 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
     };
     // The core instance of the last connection.
     let mut instance: Option<String> = None;
+    // The core instance and workspace of the last connection whose events reached the app.
+    let mut streamed: Option<(String, Option<String>)> = None;
     // Failed attempts since the last connection, a lost connection counting as one.
     let mut failed: u32 = 0;
     // After a failed start: attempts only look for a core (module docs), and the state they
     // keep showing while none is found.
     let mut attach_only: Option<SessionState> = None;
+    // After a refused hello that waits for a fix (module docs): no attempt until a command.
+    let mut parked = false;
     // A connection `set_workspace` made, to adopt instead of the next attempt.
     let mut offered: Option<(Box<Client>, oneshot::Sender<()>)> = None;
     loop {
         if offered.is_none() && failed > 0 && !ctl.retried {
-            let wait = tokio::time::sleep(backoff(failed));
+            let pause = backoff(failed);
+            let wait = async move {
+                if parked {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(pause).await;
+            };
             match until(wait, &mut ctl, true).await {
                 Step::Done(()) | Step::Retried => {}
                 Step::Switch(client, done) => offered = Some((client, done)),
@@ -493,7 +555,10 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
             attach_only = None;
         }
         let (attempt, done) = match offered.take() {
-            Some((client, done)) => (Ok(*client), Some(done)),
+            Some((client, done)) => {
+                set_state(&shared, SessionState::Connecting);
+                (Ok(*client), Some(done))
+            }
             None => {
                 let mut cfg = lock(&shared.cfg).clone();
                 if attach_only.is_some() {
@@ -515,7 +580,7 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
                     // this one: they run one at a time. This one is no longer read, so it
                     // is no longer current either.
                     Step::Switch(client, next) => {
-                        *lock(&shared.client) = None;
+                        leave_current(&shared);
                         offered = Some((client, next));
                         continue;
                     }
@@ -528,8 +593,9 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
         let live = match live {
             Ok(live) => live,
             Err(e) => {
-                *lock(&shared.client) = None;
+                leave_current(&shared);
                 failed += 1;
+                parked = waits_for_a_fix(&e);
                 let state = state_after(&e, failed);
                 let start_failed = matches!(
                     e,
@@ -556,9 +622,22 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
         };
         failed = 0;
         attach_only = None;
+        parked = false;
+        let hello = live.client.hello();
+        let now = (
+            hello.instance_id.clone(),
+            hello.workspace.as_ref().map(|w| w.id.clone()),
+        );
+        // In the stream after the old connection's events, before the new one's (module
+        // docs, "Reloading").
+        if streamed.as_ref().is_some_and(|before| *before != now) {
+            let topics: Vec<String> = lock(&shared.topics).keys().cloned().collect();
+            ctl.out.reload(topics);
+        }
+        streamed = Some(now);
         shared
             .state
-            .send_replace(SessionState::Ready(Box::new(live.client.hello().clone())));
+            .send_replace(SessionState::Ready(Box::new(hello.clone())));
         if let Some(done) = done {
             let _ = done.send(());
         }
@@ -567,20 +646,41 @@ async fn run(shared: Arc<Shared>, commands: mpsc::UnboundedReceiver<Command>, ou
         ctl.retried = false;
         match interrupt {
             Interrupt::Lost => {
-                *lock(&shared.client) = None;
+                leave_current(&shared);
                 failed = 1;
                 set_state(&shared, SessionState::Reconnecting { attempt: failed });
             }
-            // This connection is no longer read: none is current until the offered one is
+            // This connection is closed: none is current until the offered one is
             // established.
             Interrupt::Switch(client, done) => {
-                *lock(&shared.client) = None;
+                leave_current(&shared);
                 offered = Some((client, done));
             }
             Interrupt::Close => break,
         }
     }
-    *lock(&shared.client) = None;
+    leave_current(&shared);
+}
+
+/// Leaves the current connection, if there is one: none is current from now on, and the one
+/// that was is closed at once, so its calls in flight end with [`ClientError::Closed`] instead
+/// of keeping it open until they are answered.
+fn leave_current(shared: &Shared) {
+    let left = lock(&shared.client).take();
+    if let Some(client) = left {
+        client.conn().shutdown();
+    }
+}
+
+/// Whether `error` is a refused hello that says to retry only after a fix or a decision
+/// (module docs, "A refused hello").
+fn waits_for_a_fix(error: &ClientError) -> bool {
+    match error {
+        ClientError::Refused(body) | ClientError::UnknownWorkspace { error: body, .. } => {
+            matches!(body.retry, RetryPolicy::AfterResolve | RetryPolicy::Never)
+        }
+        _ => false,
+    }
 }
 
 /// A connection the session uses: calls go out on `client`, every event it receives comes in
@@ -742,9 +842,27 @@ fn state_after(error: &ClientError, failed: u32) -> SessionState {
         | ClientError::Timeout
         | ClientError::Closed
         | ClientError::NotConnected => SessionState::Reconnecting { attempt: failed },
+        // A core shutting down: another may run soon.
+        ClientError::Refused(body) if body.code == CORE_DRAINING.code => {
+            SessionState::Reconnecting { attempt: failed }
+        }
         other => SessionState::Unavailable {
             reason: other.to_string(),
+            cause: cause_of(other),
         },
+    }
+}
+
+/// The typed cause of a failed attempt that leaves no core to use.
+fn cause_of(error: &ClientError) -> UnavailableCause {
+    match error {
+        ClientError::StartFailed { kind, .. } => UnavailableCause::StartFailed(*kind),
+        ClientError::CannotStart { .. } => UnavailableCause::CannotStart,
+        ClientError::Untrusted { .. } => UnavailableCause::Untrusted,
+        ClientError::Refused(body) | ClientError::UnknownWorkspace { error: body, .. } => {
+            UnavailableCause::Refused(Box::new(body.clone()))
+        }
+        _ => UnavailableCause::Other,
     }
 }
 
@@ -910,6 +1028,19 @@ impl Outbox {
             }));
     }
 
+    /// One `resync_required` with seq 0 per topic of `topics`, behind every event pushed so
+    /// far (module docs, "Reloading").
+    fn reload(&mut self, topics: Vec<String>) {
+        for topic in topics {
+            self.push(EventParams {
+                topic,
+                seq: 0,
+                kind: EventKind::ResyncRequired,
+                data: Value::Null,
+            });
+        }
+    }
+
     fn has_backlog(&self) -> bool {
         !self.backlog.is_empty()
     }
@@ -968,9 +1099,13 @@ mod tests {
 
     impl FakeCore {
         async fn accept(server: NamedPipeServer, instance: &str) -> FakeCore {
+            FakeCore::accept_with(server, hello_result(instance)).await
+        }
+
+        /// Accepts the connection and answers its hello with `result`.
+        async fn accept_with(server: NamedPipeServer, result: HelloResult) -> FakeCore {
             let (mut fake, hello) = FakeCore::accept_hello(server).await;
-            fake.reply(&hello, &Outcome::Ok(hello_result(instance)))
-                .await;
+            fake.reply(&hello, &Outcome::Ok(result)).await;
             fake
         }
 
@@ -996,6 +1131,12 @@ mod tests {
         async fn reply<T: serde::Serialize>(&mut self, request: &Value, outcome: &Outcome<T>) {
             let line = json!({"jsonrpc": "2.0", "id": request["id"], "result": outcome});
             self.send(&line.to_string()).await;
+        }
+
+        /// [`FakeCore::send`] to a client that may have closed the connection already.
+        async fn try_send(&mut self, line: &str) {
+            let _ = self.write.write_all(format!("{line}\n").as_bytes()).await;
+            let _ = self.write.flush().await;
         }
 
         async fn send(&mut self, line: &str) {
@@ -1063,11 +1204,25 @@ mod tests {
     }
 
     async fn next(events: &mut mpsc::Receiver<EventParams>) -> (String, u64) {
-        let event = tokio::time::timeout(Duration::from_secs(30), events.recv())
+        let event = next_event(events).await;
+        (event.topic, event.seq)
+    }
+
+    async fn next_event(events: &mut mpsc::Receiver<EventParams>) -> EventParams {
+        tokio::time::timeout(Duration::from_secs(30), events.recv())
             .await
             .expect("no event in time")
-            .expect("the stream ended");
-        (event.topic, event.seq)
+            .expect("the stream ended")
+    }
+
+    /// `event` is the session's own `resync_required` for `topic` (module docs, "Reloading").
+    fn assert_reload_mark(event: &EventParams, topic: &str) {
+        assert_eq!(
+            (event.topic.as_str(), event.seq, event.kind),
+            (topic, 0, EventKind::ResyncRequired),
+            "{event:?}"
+        );
+        assert!(event.data.is_null(), "{event:?}");
     }
 
     /// The cursor rule of the module docs, against a fake core that closes the connection
@@ -1113,7 +1268,7 @@ mod tests {
             fake.event("test:r", 5).await;
             assert_eq!(next(&mut events).await, ("test:r".to_string(), 5));
 
-            // Another core instance: from 0 in its numbering.
+            // Another core instance: from 0 in its numbering, after the session's reload mark.
             let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
             drop(fake);
             let mut fake = FakeCore::accept(server, "c_0000000000000002").await;
@@ -1122,6 +1277,7 @@ mod tests {
                 json!({"topics": ["test:r"], "since_seq": {"test:r": 0}})
             );
             fake.event("test:r", 1).await;
+            assert_reload_mark(&next_event(&mut events).await, "test:r");
             assert_eq!(next(&mut events).await, ("test:r".to_string(), 1));
             assert_eq!(session.last_seq("test:r"), Some(1));
             session.close().await;
@@ -1306,6 +1462,8 @@ mod tests {
             let during = async {
                 let mut new = FakeCore::accept(server, "c_0000000000000001").await;
                 let first = new.request("lil/subscribe").await;
+                // The old connection's `Ready` no longer holds: its calls would be refused.
+                assert_eq!(*session.state().borrow(), SessionState::Connecting);
                 tokio::time::timeout(PROMPT, session.subscribe(vec!["test:w".to_string()]))
                     .await
                     .expect("subscribe waited on the connection being replaced")
@@ -1558,7 +1716,7 @@ mod tests {
             let session = Session::start(cfg, Vec::new());
             let mut state = session.state();
             wait_until(&mut state, |s| {
-                matches!(s, SessionState::Unavailable { reason } if reason.contains("Cannot start"))
+                matches!(s, SessionState::Unavailable { reason, .. } if reason.contains("Cannot start"))
             })
             .await;
             let failure = state.borrow().clone();
@@ -1732,8 +1890,8 @@ mod tests {
         });
     }
 
-    /// An answer of a replaced connection to a subscribe that was in flight when the switch
-    /// came sets no cursor: the topic's cursor is the new connection's.
+    /// A subscribe that was in flight on the connection a switch replaces sets no cursor from
+    /// that connection: the topic's cursor is the new connection's.
     #[test] // spec: APP-035, ARCH-100
     fn a_late_answer_of_a_replaced_connection_sets_no_cursor() {
         let env = lil_testkit::TestEnv::new();
@@ -1759,8 +1917,13 @@ mod tests {
                 let mut new = FakeCore::accept(server, "c_0000000000000001").await;
                 let first = new.request("lil/subscribe").await;
                 // The replaced connection answers first, with its own seq, and the call has
-                // taken it before the new connection answers.
-                old.reply_subscribed(&on_old, &[("test:x", 99)]).await;
+                // ended before the new connection answers. The switch has closed that
+                // connection by now, so the answer is lost on the way (one that got in would
+                // set no cursor either).
+                let late = json!({"jsonrpc": "2.0", "id": on_old["id"], "result": {
+                    "status": "ok", "topics": [{"topic": "test:x", "seq": 99}],
+                }});
+                old.try_send(&late.to_string()).await;
                 answered_rx.await.expect("the call ended");
                 new.reply_subscribed(&first, &[("test:x", 7)]).await;
                 new
@@ -1805,7 +1968,8 @@ mod tests {
                     "id": on_old["id"],
                     "error": {"code": -32603, "message": "internal"},
                 });
-                old.send(&fault.to_string()).await;
+                // Lost on the way, as the switch has closed that connection by now.
+                old.try_send(&fault.to_string()).await;
                 answered_rx.await.expect("the call ended");
                 new.reply_subscribed(&first, &[("test:x", 7)]).await;
                 new
@@ -1968,6 +2132,221 @@ mod tests {
             note_live(&session.shared, &answer(2));
             assert_eq!(session.last_seq("test:r"), Some(2));
             session.close().await;
+        });
+    }
+
+    /// A hello answered as `instance` in the workspace `id`.
+    fn hello_in(instance: &str, id: &str) -> HelloResult {
+        HelloResult {
+            workspace: Some(lil_protocol::WorkspaceInfo {
+                id: id.into(),
+                path: r"C:\ws".into(),
+            }),
+            ..hello_result(instance)
+        }
+    }
+
+    /// Waits until the session has taken `topic`'s events up to `seq` from its connection.
+    async fn taken_up_to(session: &Session, topic: &str, seq: u64) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while session.last_seq(topic) != Some(seq) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the session did not take the events in time");
+    }
+
+    /// A core restart while the app is behind: the old core's events are all still to read,
+    /// more than the app's channel holds. The session's reload mark comes after every one of
+    /// them and before the new core's first event, so an app that reloads on it never applies
+    /// an old event to the new state, nor skips a new one.
+    #[test] // spec: ARCH-100, APP-035
+    fn a_new_core_is_marked_in_the_stream_behind_the_old_cores_events() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, vec!["test:r".to_string()]);
+            let mut events = session.events();
+            let mut state = session.state();
+            let mut fake = FakeCore::accept(server, "c_0000000000000001").await;
+            fake.subscribed("test:r", 0).await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+            let old = EVENTS_CAPACITY as u64 + 8;
+            for seq in 1..=old {
+                fake.event("test:r", seq).await;
+            }
+            taken_up_to(&session, "test:r", old).await;
+
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            drop(fake);
+            let mut fake = FakeCore::accept(server, "c_0000000000000002").await;
+            fake.subscribed("test:r", 0).await;
+            fake.event("test:r", 1).await;
+            for seq in 1..=old {
+                assert_eq!(next(&mut events).await, ("test:r".to_string(), seq));
+            }
+            assert_reload_mark(&next_event(&mut events).await, "test:r");
+            assert_eq!(next(&mut events).await, ("test:r".to_string(), 1));
+            session.close().await;
+            drop(fake);
+        });
+    }
+
+    /// A switch to another workspace on the same core is marked in the stream too, before the
+    /// new workspace's events: the topic names (`jobs`, `project:<slug>`) don't say which
+    /// workspace an event is from.
+    #[test] // spec: ARCH-100, ARCH-030
+    fn a_switch_is_marked_in_the_stream() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, vec!["test:r".to_string()]);
+            let mut events = session.events();
+            let mut state = session.state();
+            let mut old = FakeCore::accept(server, "c_0000000000000001").await;
+            old.subscribed("test:r", 0).await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+            old.event("test:r", 1).await;
+            assert_eq!(next(&mut events).await, ("test:r".to_string(), 1));
+
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            let switch = session.set_workspace("0123456789abcdef");
+            let during = async {
+                let hello = hello_in("c_0000000000000001", "0123456789abcdef");
+                let mut new = FakeCore::accept_with(server, hello).await;
+                new.subscribed("test:r", 1).await;
+                new
+            };
+            let (switched, mut new) = tokio::join!(switch, during);
+            switched.expect("set_workspace");
+            new.event("test:r", 2).await;
+            assert_reload_mark(&next_event(&mut events).await, "test:r");
+            assert_eq!(next(&mut events).await, ("test:r".to_string(), 2));
+            session.close().await;
+            drop((old, new));
+        });
+    }
+
+    /// A hello refused with `workspace.unsupported` (another workspace became the default):
+    /// the state carries the error itself, code and all, and the session doesn't try again by
+    /// itself, however long it waits (tokio's paused clock jumps through any backoff), until
+    /// `retry_now`.
+    #[test] // spec: ARCH-100, ARCH-090, APP-034
+    fn a_refused_workspace_is_typed_and_waits_for_a_retry() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, Vec::new());
+            let mut state = session.state();
+            let (mut core, hello) = FakeCore::accept_hello(server).await;
+            let refusal = ErrorBody::new(
+                &lil_protocol::codes::WORKSPACE_UNSUPPORTED,
+                r"This core serves the workspace D:\B only.",
+                "t_0000000000000001",
+            );
+            core.reply(&hello, &Outcome::<HelloResult>::Error { error: refusal })
+                .await;
+            wait_until(&mut state, |s| {
+                matches!(s, SessionState::Unavailable {
+                    cause: UnavailableCause::Refused(error), ..
+                } if error.code == "workspace.unsupported")
+            })
+            .await;
+
+            let next = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            drop(core);
+            tokio::time::pause();
+            let waited = tokio::time::timeout(Duration::from_secs(60), next.connect()).await;
+            tokio::time::resume();
+            assert!(waited.is_err(), "the session tried again by itself");
+            session.retry_now();
+            tokio::time::timeout(PROMPT, next.connect())
+                .await
+                .expect("retry_now made no attempt")
+                .expect("the attempt");
+            session.close().await;
+            drop(next);
+        });
+    }
+
+    /// A core that is shutting down refuses the hello with `core.draining`: no core for now,
+    /// and the next attempt follows by itself.
+    #[test] // spec: ARCH-021, ARCH-100
+    fn a_draining_core_means_reconnecting() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, Vec::new());
+            let mut state = session.state();
+            let (mut core, hello) = FakeCore::accept_hello(server).await;
+            let refusal = ErrorBody::new(
+                &CORE_DRAINING,
+                "The core is shutting down.",
+                "t_0000000000000001",
+            );
+            let next = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            core.reply(&hello, &Outcome::<HelloResult>::Error { error: refusal })
+                .await;
+            // The state the refusal leaves (the next attempt's comes after a backoff).
+            wait_until(&mut state, |s| *s != SessionState::Connecting).await;
+            let after = state.borrow().clone();
+            assert!(
+                matches!(after, SessionState::Reconnecting { attempt: 1 }),
+                "{after:?}"
+            );
+            drop(core);
+            tokio::time::timeout(PROMPT, next.connect())
+                .await
+                .expect("no next attempt")
+                .expect("the attempt");
+            session.close().await;
+            drop(next);
+        });
+    }
+
+    /// A call in flight on the connection a switch replaces ends with `Closed` at once, and
+    /// that connection is closed: neither waits for the old core's answer.
+    #[test] // spec: APP-034, ARCH-100
+    fn a_switch_ends_the_calls_in_flight_on_the_old_connection() {
+        let env = lil_testkit::TestEnv::new();
+        let cfg = fake_config(&env);
+        let pipe = env.env.pipe_name();
+        current_thread().block_on(async {
+            let server = lil_platform::pipe::create_instance(&pipe, true).expect("the pipe");
+            let session = Session::start(cfg, Vec::new());
+            let mut state = session.state();
+            let mut old = FakeCore::accept(server, "c_0000000000000001").await;
+            wait_until(&mut state, |s| matches!(s, SessionState::Ready(_))).await;
+
+            let call = session.call_tool("test.echo", serde_json::Map::new(), None, None);
+            let server = lil_platform::pipe::create_instance(&pipe, false).expect("the pipe");
+            let flow = async {
+                // On the wire, and never answered.
+                old.request("tools/call").await;
+                let switch = session.set_workspace("0123456789abcdef");
+                let during = FakeCore::accept(server, "c_0000000000000001");
+                let (switched, new) = tokio::join!(switch, during);
+                switched.expect("set_workspace");
+                new
+            };
+            let (called, new) = tokio::join!(tokio::time::timeout(PROMPT, call), flow);
+            match called.expect("the call waited for the replaced connection") {
+                Err(ClientError::Closed) => {}
+                other => panic!("expected Closed, got {other:?}"),
+            }
+            let end = tokio::time::timeout(PROMPT, old.lines.next_line()).await;
+            assert!(matches!(end, Ok(Ok(None))), "{end:?}");
+            session.close().await;
+            drop(new);
         });
     }
 }

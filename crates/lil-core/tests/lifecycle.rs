@@ -85,7 +85,7 @@ fn wait_until(what: &str, cond: impl Fn() -> bool) {
     }
 }
 
-#[test] // spec: ARCH-021, ARCH-023
+#[test] // spec: ARCH-021, ARCH-023, ARCH-029, APP-041
 fn draining_core_refuses_new_calls_with_core_draining() {
     let env = TestEnv::new();
     let core = core(&env);
@@ -126,7 +126,22 @@ fn draining_core_refuses_new_calls_with_core_draining() {
     assert_eq!(write["error"]["code"], "core.draining", "{write}");
     let subscribed = other.call("lil/subscribe", json!({"topics": ["test:a"]}));
     assert_eq!(subscribed["result"]["status"], "ok", "{subscribed}");
-    let late = connect(&env, json!({}));
+    // `app/*` methods are admitted as tool calls are (APP-041).
+    let listed = other.call("app/confirmations.list", json!({"state": "pending"}));
+    assert_eq!(listed["result"]["status"], "error", "{listed}");
+    assert_eq!(
+        listed["result"]["error"]["code"], "core.draining",
+        "{listed}"
+    );
+    // A new connection gets no session on a core that admits no calls (Appendix G
+    // "Connections").
+    let mut late = RawPipe::connect(&env);
+    let refused = late.hello(json!({}));
+    assert_eq!(refused["result"]["status"], "error", "{refused}");
+    assert_eq!(
+        refused["result"]["error"]["code"], "core.draining",
+        "{refused}"
+    );
     drop(late);
 
     // The call in flight finishes, then the core stops.
@@ -508,8 +523,10 @@ fn refused_connection_does_not_hold_idle_and_closes_on_drain() {
         refused.wait_closed(DEADLINE),
         "the refused connection stays open"
     );
+    // Still open and answering; a draining core starts no session on it (Appendix G
+    // "Connections"), and it keeps waiting for a hello.
     let still = waiting.hello(json!({}));
-    assert_eq!(still["result"]["status"], "ok", "{still}");
+    assert_eq!(still["result"]["error"]["code"], "core.draining", "{still}");
     assert_eq!(lifecycle.connections(), 2);
 
     core.core().test_gates().open("h");

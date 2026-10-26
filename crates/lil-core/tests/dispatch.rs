@@ -1305,3 +1305,25 @@ async fn job_retry_of_an_interrupted_job_with_side_effects_needs_a_confirmation(
     let again = d.call(ui_session(), retry(&ids[1], "again")).await;
     assert_eq!(code_of(&again), "job.not_retryable");
 }
+
+/// An `app/*` method's error outcome is one of the core's recent errors, as a tool call's is,
+/// with the method as its tool (APP-041; Appendix G "Connections").
+#[test] // spec: APP-041, QA-083
+fn app_method_errors_are_recent_errors() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut pipe = connect(&env, json!({}));
+    let refused = pipe.call("app/caps.set", json!({"monthly": "5"}));
+    assert_eq!(
+        refused["result"]["error"]["code"], "caller.not_allowed",
+        "{refused}"
+    );
+    let recent = pipe.tool("diagnostics.recent", json!({}), None);
+    assert_eq!(recent["status"], "ok", "{recent}");
+    let errors = recent["structured"]["errors"].as_array().expect("errors");
+    let row = errors
+        .iter()
+        .find(|e| e["code"] == "caller.not_allowed")
+        .unwrap_or_else(|| panic!("the app/* error is not a recent error: {recent}"));
+    assert_eq!(row["last_tool"], "app/caps.set", "{row}");
+}

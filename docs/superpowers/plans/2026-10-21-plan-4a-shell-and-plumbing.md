@@ -1048,7 +1048,8 @@ git commit -m "doctor: AUMID shortcut, lil: and .lilref handlers, engine-environ
 - Produces:
 
 ```rust
-pub enum SessionState { Connecting, Ready(Box<HelloResult>), Reconnecting { attempt: u32 }, Incompatible { core_protocol: String }, Unavailable { reason: String } }
+pub enum SessionState { Connecting, Ready(Box<HelloResult>), Reconnecting { attempt: u32 }, Incompatible { core_protocol: String }, Unavailable { reason: String, cause: UnavailableCause } }   // cause from Checkpoint A
+pub enum UnavailableCause { StartFailed(StartFailure), CannotStart, Untrusted, Refused(Box<ErrorBody>), Other }
 pub struct Session;
 impl Session {
     pub fn start(cfg: ClientConfig, topics: Vec<String>) -> Session;           // on the current tokio runtime
