@@ -655,16 +655,15 @@ fn a_restart_hold_posts_one_toast() {
         assert_eq!(held.len(), 1, "{held:?}");
         let toast = &held[0];
         assert_eq!(toast["title"], "Jobs held after a restart", "{toast}");
+        // A test core starts with no handlers: the toast has no target and says so
+        // (Checkpoint A walkthrough, ODD-6).
         assert_eq!(
-            toast["body"], "3 jobs wait until you resume them in Jobs",
+            toast["body"], "3 jobs wait until you resume them in Jobs · Open LILITH to see it",
             "{toast}"
         );
         assert_eq!(toast["tag"], format!("restart_{}", ids[0]), "{toast}");
-        assert_eq!(
-            toast["launch"],
-            format!("{scheme}:task/{}", ids[0]),
-            "{toast}"
-        );
+        assert!(toast.get("launch").is_none(), "{toast}");
+        assert!(!toast["xml"].as_str().unwrap().contains(&scheme), "{toast}");
         write(&mut p, "job.cancel", json!({"all_mine": true}));
     }
     // A start that held none posts nothing.
@@ -673,6 +672,100 @@ fn a_restart_hold_posts_one_toast() {
     ready(&mut p);
     fence(&mut p, &env);
     assert!(posts(&mut p, "job_failed").is_empty());
+}
+
+/// Checkpoint A walkthrough (ODD-6): while the handlers aren't this channel's, a toast with
+/// a target is posted without it, and its text says to open LILITH, the ending always shown.
+#[test] // spec: APP-146, APP-022
+fn without_the_handlers_a_toast_has_no_target_and_says_to_open_lilith() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    desktop(&mut p, json!({"handlers": false}));
+    batch(&mut p, 1);
+    let finished = until_posts(&mut p, "job_finished", 1).remove(0);
+    assert!(finished.get("launch").is_none(), "{finished}");
+    assert_eq!(
+        finished["body"], "test.job · no project · 0 s · Open LILITH to see it",
+        "{finished}"
+    );
+    let failing = write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final", "fail_message": "x".repeat(500)}),
+    );
+    wait_done(&mut p, &job_ids(&failing)[0]);
+    let failed = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert!(failed.get("launch").is_none(), "{failed}");
+    let body = failed["body"].as_str().unwrap();
+    assert!(body.ends_with("x… · Open LILITH to see it"), "{failed}");
+    assert!(body.chars().count() <= 200, "{failed}");
+    // With the handlers back, the target is back.
+    desktop(&mut p, json!({"handlers": true, "clear": true}));
+    let id = batch(&mut p, 1).remove(0);
+    let scheme = env.env.activation_scheme();
+    let back = until_posts(&mut p, "job_finished", 1).remove(0);
+    assert_eq!(back["launch"], format!("{scheme}:task/{id}"), "{back}");
+    assert_eq!(back["body"], "test.job · no project · 0 s", "{back}");
+}
+
+/// Checkpoint A walkthrough (BUG-1): every toast's text goes through the diagnostics
+/// redaction before it is posted: a failed job's error message, an agent's notice.
+#[test] // spec: APP-146, ARCH-121
+fn every_toasts_text_is_redacted() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let key = format!("sk-ant-api03-{}", "FAKEtoastKEY".repeat(3));
+    let (secret, mail) = ("hunter2toastsecret", "toast.owner@example.com");
+    let message =
+        format!("upload failed: api_key={key} Authorization: Bearer {secret} contact {mail}");
+    let failing = write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final", "fail_message": message}),
+    );
+    wait_done(&mut p, &job_ids(&failing)[0]);
+    let failed = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert_eq!(
+        failed["body"],
+        "test.job: upload failed: api_key=<redacted> Authorization: <redacted> contact <redacted>",
+        "{failed}"
+    );
+    write(
+        &mut p,
+        "notify.claude_code",
+        json!({"message": format!("done with {key}"), "title": format!("for {mail}")}),
+    );
+    let notice = until_posts(&mut p, "agent_activity", 1).remove(0);
+    assert_eq!(notice["title"], "Claude Code: for <redacted>", "{notice}");
+    assert_eq!(notice["body"], "done with <redacted>", "{notice}");
+    for toast in [&failed, &notice] {
+        let xml = toast["xml"].as_str().unwrap();
+        for s in [key.as_str(), secret, mail] {
+            assert!(!xml.contains(s), "{s} in {xml}");
+        }
+    }
+}
+
+/// Checkpoint A walkthrough (ODD-5): a call that needs a confirmation and passes a cap names
+/// the cap in its toast too.
+#[test] // spec: APP-146, APP-022, APP-054
+fn a_confirm_and_cap_toast_names_the_cap() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let id = pending_id(&p.tool("test.destructive", json!({"cost": "2"}), Some(&key())));
+    let toast = until_posts(&mut p, "confirmation_waiting", 1).remove(0);
+    assert_eq!(toast["tag"], id.as_str(), "{toast}");
+    assert_eq!(
+        toast["body"], "A script (lil) wants to run test.destructive, over your monthly cap",
+        "{toast}"
+    );
 }
 
 #[test] // spec: APP-146
@@ -819,18 +912,37 @@ fn a_restart_reposts_the_waiting_toasts_and_removes_them_when_answered() {
         let token = deny_token(&mut p, &scheme, &id);
         (id, token)
     };
-    // The next core posts it again, Tag and all (replacing the old toast and its dead Deny),
-    // with a fresh token.
+    // The next core posts it again, Tag and all (replacing the old toast and its dead Deny).
+    // A test core starts with no handlers, so it comes without its target and its Open and
+    // Deny, and says to open LILITH (Checkpoint A walkthrough, ODD-6).
     let _core = core_with(&env, FakeClock::new(), Some(ids), None);
     let mut p = pipe(&env, json!({}));
-    let token = deny_token(&mut p, &scheme, &id);
-    assert_ne!(token, old_token);
+    let toast = until(&format!("the toast of {id} again"), || {
+        posts(&mut p, "confirmation_waiting")
+            .into_iter()
+            .find(|t| t["tag"] == id.as_str())
+    });
+    assert!(toast.get("launch").is_none(), "{toast}");
+    assert!(
+        actions(toast["xml"].as_str().unwrap()).is_empty(),
+        "{toast}"
+    );
+    assert!(!toast["xml"].as_str().unwrap().contains(&scheme), "{toast}");
+    assert_eq!(
+        toast["body"], "A script (lil) wants to run test.destructive · Open LILITH to see it",
+        "{toast}"
+    );
     let mut a = app(&env);
+    let old = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": id, "answer": "deny", "toast_token": old_token}),
+    );
+    assert_eq!(error_code(&old["result"]), "confirm.unknown", "{old}");
     let r = a.call(
         "app/confirmation.answer",
-        json!({"confirmation_id": id, "answer": "deny", "toast_token": token}),
+        json!({"confirmation_id": id, "answer": "deny"}),
     );
-    assert_eq!(r["result"]["status"], "ok", "the new token denies: {r}");
+    assert_eq!(r["result"]["status"], "ok", "the app denies: {r}");
     until(&format!("the toast of {id} removed"), || {
         ops(&mut p)
             .iter()
@@ -1393,7 +1505,9 @@ fn a_workspace_recovered_later_posts_its_own_restart_toast() {
     let toast = until_posts(&mut p, "job_failed", 1).remove(0);
     assert_eq!(toast["title"], "Jobs held after a restart", "{toast}");
     assert_eq!(
-        toast["body"], "2 jobs wait until you resume them in Jobs",
+        // No handlers on a test core until a test sets them (ODD-6).
+        toast["body"],
+        "2 jobs wait until you resume them in Jobs · Open LILITH to see it",
         "{toast}"
     );
     assert_eq!(toast["tag"], format!("restart_{}", ids[0]), "{toast}");

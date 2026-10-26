@@ -13,6 +13,9 @@
 //!   - `notify.claude_code` ([`Notifier::claude_code`]), an agent's `open_in` and `ui.show`
 //!     ([`Notifier::agent_opened`]) and each recovery that held jobs ([`Notifier::restart_held`]).
 //!   - No toast is ever a progress toast or updated in place (P4a-R36).
+//! - **As posted** (Checkpoint A walkthrough): every toast's title and body are redacted as a
+//!   diagnostics bundle's entries are (BUG-1), and while the handlers aren't this channel's, a
+//!   toast with a target is posted without it, its body ending [`OPEN_LILITH`] (ODD-6).
 //! - **When.** A toast is posted only when its category is on, the channel's toasts can post
 //!   (`ready` or `not_yet_shown`) with the shortcut `ok`, and no connected `ui:*` app owns the
 //!   foreground window (P4a-R7); otherwise nothing is posted or queued. While the fullscreen
@@ -64,7 +67,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::toast_xml::{ToastActions, ToastText, cut_token, toast_xml};
+use super::toast_xml::{SHOWN_CHARS, ToastActions, ToastText, cut_token, toast_xml};
 use crate::confirm::{Confirm, ListState, NotificationPath};
 use crate::desktop::{DesktopSettingsStore, DesktopWatch, UiApps};
 use crate::events::{ClientId, EventBus};
@@ -91,6 +94,9 @@ const CORE_STOPPED: &str = "core.draining";
 const ENDED_IN_FRONT_KEPT: usize = 4096;
 /// The longest `lil:` URL argument (Appendix G "`lil:` URLs"): a longer `open` launch is left out.
 const MAX_URL_CHARS: usize = 8192;
+/// How a toast's body ends when its target was left out because the handlers aren't this
+/// channel's (Checkpoint A walkthrough, ODD-6).
+pub const OPEN_LILITH: &str = " · Open LILITH to see it";
 
 /// The categories (Appendix G).
 pub const JOB_FINISHED: &str = "job_finished";
@@ -181,6 +187,8 @@ pub struct Notifier {
     fullscreen: watch::Receiver<bool>,
     apps: Arc<UiApps>,
     scheme: String,
+    /// The redaction's names, profile folder and computer names come from here.
+    env: Env,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdSource>,
     confirm: OnceLock<Weak<Confirm>>,
@@ -244,6 +252,7 @@ impl Notifier {
             apps,
             scheme: env.activation_scheme(),
             channel: env.channel().clone(),
+            env,
             clock,
             ids,
             confirm: OnceLock::new(),
@@ -630,7 +639,12 @@ impl Notifier {
         let open_url = lil_parse::confirm_url(&self.scheme, &view.id);
         let deny_url = lil_parse::deny_url(&self.scheme, &view.id, &token);
         let body = if view.covers.contains(&Cover::Confirm) {
-            format!("{} wants to run {}", who(&view.caller_kind), view.tool)
+            let mut body = format!("{} wants to run {}", who(&view.caller_kind), view.tool);
+            // It names the cap too (Checkpoint A walkthrough, ODD-5).
+            if view.covers.contains(&Cover::Cap) {
+                body.push_str(&format!(", over your {} cap", cap_name(view.cap.as_ref())));
+            }
+            body
         } else {
             format!(
                 "A call would go over your {} cap",
@@ -752,18 +766,14 @@ impl Notifier {
             return NotifyOutcome::CategoryOff;
         }
         let silent = quiet && *self.fullscreen.borrow();
-        let toast = Toast {
-            tag: tag.to_string(),
-            group: category.to_string(),
-            xml: toast_xml(text),
-            silent,
-        };
-        let (settings, watch, apps, desktop) = (
+        let (settings, watch, apps, desktop, env) = (
             self.settings.clone(),
             self.watch.clone(),
             self.apps.clone(),
             self.desktop.clone(),
+            self.env.clone(),
         );
+        let (tag, group, text) = (tag.to_string(), category.to_string(), text.clone());
         let posted = tokio::task::spawn_blocking(move || {
             let path = settings.notification_path(false);
             if !can_post(&path) {
@@ -772,6 +782,12 @@ impl Notifier {
             if watch.foreground_is_one_of(&apps.pids()) {
                 return NotifyOutcome::Foreground;
             }
+            let toast = Toast {
+                tag,
+                group,
+                xml: toast_xml(&as_posted(&env, &path.handlers, text)),
+                silent,
+            };
             match desktop.post(&toast) {
                 Ok(()) => NotifyOutcome::Posted,
                 Err(e) => {
@@ -827,6 +843,30 @@ impl NotificationPath for Notifier {
 fn can_post(path: &PathWire) -> bool {
     matches!(path.toasts, ToastsWire::Ready | ToastsWire::NotYetShown)
         && path.shortcut == ShortcutWire::Ok
+}
+
+/// `text` as it is posted (module docs, "As posted"): its title and body redacted as a
+/// diagnostics bundle's entries are, with this PC's names (a text nothing was redacted from
+/// stays as it was); and, while `handlers` isn't `ok`, a toast with a target without it, its
+/// body cut so that it always ends [`OPEN_LILITH`]. The URLs are never redacted. It reads
+/// `suite.toml` and may ask Windows for a short name: call it off the runtime.
+fn as_posted(env: &Env, handlers: &HandlersWire, mut text: ToastText) -> ToastText {
+    let suite_toml = std::fs::read_to_string(env.suite_toml_to_read()).ok();
+    let redactor = crate::diagnostics::bundle::redactor_for(env, suite_toml.as_deref()).compile();
+    for s in [&mut text.title, &mut text.body] {
+        let (redacted, n) = redactor.text(s);
+        if n > 0 {
+            *s = redacted;
+        }
+    }
+    let targeted = text.launch.is_some() || text.actions != ToastActions::None;
+    if *handlers != HandlersWire::Ok && targeted {
+        text.launch = None;
+        text.actions = ToastActions::None;
+        let room = SHOWN_CHARS - OPEN_LILITH.chars().count();
+        text.body = format!("{}{OPEN_LILITH}", lil_parse::shown_text(&text.body, room));
+    }
+    text
 }
 
 /// A fresh 128-bit toast token, 32 lowercase hex, from `ids` (two of its 64-bit ids).
