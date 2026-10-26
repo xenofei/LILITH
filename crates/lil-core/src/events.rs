@@ -1,16 +1,19 @@
 //! The event bus (ARCH-032, CORE-012) behind `lil/subscribe`, `lil/unsubscribe` and the
 //! `lil/event` notifications. Infrastructure, not a CORE-014 module.
 //!
-//! - **Sequences.** Each topic's `seq` starts at 1 and goes up by one per [`EventBus::publish`].
+//! - **Sequences.** Each topic's `seq` goes up by one per [`EventBus::publish`], from 1 (or,
+//!   for a topic re-created after it was forgotten, from its tombstone or the base below).
 //! - **History.** Each topic keeps its events for [`HISTORY_SECS`] of *monotonic* time (a
 //!   wall-clock jump changes nothing) and at most its [`HISTORY_MAX_EVENTS`] newest events
 //!   (ARCH-032 clarification), pruned on publish and on subscribe (CORE-012). A `preview:`
 //!   topic keeps only its newest event ([`PREVIEW_HISTORY`]): a late subscriber wants only the
 //!   newest frame. A publish also prunes every topic once per [`SWEEP_EVERY`], so a topic
 //!   nothing publishes to any more (a finished job's) holds nothing once its events are
-//!   [`HISTORY_SECS`] old; a topic's seq is kept, so cursors stay valid, except that a per-job
-//!   topic (`job:`, `preview:`) no client follows is forgotten once empty, and a later cursor
-//!   of it is beyond its seq (Appendix G "Events").
+//!   [`HISTORY_SECS`] old; a topic's seq is kept, so cursors stay valid. A per-job topic
+//!   (`job:`, `preview:`) no client follows is forgotten once empty, its seq kept as a
+//!   tombstone ([`TOMBSTONES`] at most): published or subscribed again, it goes on from there.
+//!   A topic with no entry and no tombstone starts above every seq no longer kept, so an old
+//!   cursor of it gets a snapshot or `resync_required`, never a replay (Appendix G "Events").
 //! - **Subscribing with a cursor `s`.** `s` equal to the topic's current seq replays nothing;
 //!   a history that still holds `s+1..=current` replays those events in order; anything else
 //!   (older than the history, or beyond the current seq, such as a cursor from an earlier
@@ -66,6 +69,8 @@ use tokio_util::sync::CancellationToken;
 pub const PREVIEW_HISTORY: usize = 1;
 /// How often a publish prunes every topic's history (Appendix G "Events").
 pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// How many forgotten per-job topics keep their seq as a tombstone (Appendix G "Events").
+pub const TOMBSTONES: usize = 4096;
 
 /// A client of the bus: the connection's `ConnCtx::conn_id`.
 pub type ClientId = u64;
@@ -92,6 +97,76 @@ struct Inner {
     tokens: u64,
     /// When a publish last pruned every topic (monotonic).
     swept: Duration,
+    /// The seqs of the per-job topics the sweep forgot.
+    forgotten: Forgotten,
+}
+
+/// The seqs of forgotten per-job topics, as tombstones (re-review fix I-1): a topic published
+/// or subscribed again continues its numbering from its tombstone, so an old cursor of it is
+/// judged against its real seq. The newest [`TOMBSTONES`] are kept; `base` is the highest seq
+/// of those no longer kept, and a topic with neither a live entry nor a tombstone starts its
+/// numbering there, so a cursor of a topic whose tombstone is gone is always older than its
+/// history (a snapshot or `resync_required`), never a replay that skips events.
+#[derive(Default)]
+struct Forgotten {
+    /// Topic → (its seq, the generation of its entry in `order`).
+    seqs: HashMap<String, (u64, u64)>,
+    /// Forgotten topics, oldest first, with their generation; an entry whose generation
+    /// `seqs` no longer holds is stale and skipped.
+    order: VecDeque<(String, u64)>,
+    generation: u64,
+    base: u64,
+    /// How many are kept; 0 means [`TOMBSTONES`] (a test sets fewer).
+    cap: usize,
+}
+
+impl Forgotten {
+    fn cap(&self) -> usize {
+        if self.cap == 0 { TOMBSTONES } else { self.cap }
+    }
+
+    /// Keeps `topic`'s `seq`; the oldest tombstone beyond the cap goes, raising `base`.
+    fn keep(&mut self, topic: String, seq: u64) {
+        self.generation += 1;
+        self.seqs.insert(topic.clone(), (seq, self.generation));
+        self.order.push_back((topic, self.generation));
+        while self.seqs.len() > self.cap() {
+            let Some((oldest, generation)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .seqs
+                .get(&oldest)
+                .is_some_and(|(_, g)| *g == generation)
+                && let Some((seq, _)) = self.seqs.remove(&oldest)
+            {
+                self.base = self.base.max(seq);
+            }
+        }
+        // Stale entries of revived topics don't pile up.
+        if self.order.len() > 2 * self.cap() {
+            let seqs = &self.seqs;
+            self.order
+                .retain(|(name, g)| seqs.get(name).is_some_and(|(_, kept)| kept == g));
+        }
+    }
+
+    /// The seq a topic without a live entry starts from: its tombstone (taken), else `base`.
+    fn take(&mut self, topic: &str) -> u64 {
+        self.seqs.remove(topic).map_or(self.base, |(seq, _)| seq)
+    }
+}
+
+/// `topic`'s live entry, made from its tombstone or the base when it has none.
+fn live<'t>(
+    topics: &'t mut HashMap<String, Topic>,
+    forgotten: &mut Forgotten,
+    topic: &str,
+) -> &'t mut Topic {
+    topics.entry(topic.to_string()).or_insert_with(|| Topic {
+        seq: forgotten.take(topic),
+        history: VecDeque::new(),
+    })
 }
 
 /// One topic: its current seq and its retained events, oldest first, with consecutive seqs.
@@ -210,7 +285,7 @@ impl EventBus {
         let now = self.clock.monotonic();
         let mut guard = self.lock();
         let inner = &mut *guard;
-        let log = inner.topics.entry(topic.to_string()).or_default();
+        let log = live(&mut inner.topics, &mut inner.forgotten, topic);
         log.seq += 1;
         let seq = log.seq;
         let line = event_line(topic, seq, EventKind::Event, data);
@@ -226,12 +301,17 @@ impl EventBus {
                 prune(&mut other.history, now, history_max(name));
             }
             // A per-job topic no client follows is forgotten once it is empty: a finished
-            // job's topics would otherwise stay for the core's lifetime (review fix M-4).
-            let clients = &inner.clients;
+            // job's topics would otherwise stay for the core's lifetime (review fix M-4). Its
+            // seq stays as a tombstone (re-review fix I-1).
+            let (clients, forgotten) = (&inner.clients, &mut inner.forgotten);
             inner.topics.retain(|name, t| {
-                !(t.history.is_empty()
+                let forget = t.history.is_empty()
                     && (name.starts_with("job:") || name.starts_with("preview:"))
-                    && !clients.values().any(|c| c.topics.contains(name)))
+                    && !clients.values().any(|c| c.topics.contains(name));
+                if forget {
+                    forgotten.keep(name.clone(), t.seq);
+                }
+                !forget
             });
         }
 
@@ -376,13 +456,11 @@ impl EventBus {
             if states.iter().any(|s| &s.topic == topic) {
                 continue;
             }
-            let current = match inner.topics.get_mut(topic) {
-                Some(log) => {
-                    prune(&mut log.history, now, history_max(topic));
-                    log.seq
-                }
-                None => 0,
-            };
+            // A topic without a live entry gets one, from its tombstone or the base: its
+            // cursor is then judged against its real seq (re-review fix I-1).
+            let log = live(&mut inner.topics, &mut inner.forgotten, topic);
+            prune(&mut log.history, now, history_max(topic));
+            let current = log.seq;
             states.push(TopicState {
                 topic: topic.clone(),
                 seq: current,
@@ -508,6 +586,12 @@ impl EventBus {
             .clients
             .get(&client)
             .map_or(0, |c| c.pending.lock().len())
+    }
+
+    /// Keeps at most `n` tombstones (a test of their eviction).
+    #[cfg(test)]
+    fn keep_tombstones(&self, n: usize) {
+        self.lock().forgotten.cap = n;
     }
 
     /// Whether the bus still keeps `topic` (its seq and history).
@@ -1191,16 +1275,101 @@ mod tests {
         assert!(!bus.knows("preview:j_1"));
         assert!(bus.knows("job:j_2"), "a client follows it");
         assert!(bus.knows("test:other"), "not a per-job topic");
-        // A cursor of a forgotten topic is beyond its seq: resync_required, as for another
-        // core's cursor.
+        // Its seq stays as a tombstone: a cursor at it has missed nothing, one ahead of it is
+        // resynced (re-review fix I-1).
         let states = bus
             .subscribe(2, &names(&["job:j_1"]), &cursors(&[("job:j_1", 1)]))
             .await;
-        assert_eq!(states, [state("job:j_1", 0)]);
+        assert_eq!(states, [state("job:j_1", 1)]);
+        assert!(bus.queued_events(2).is_empty());
+        bus.subscribe(3, &names(&["preview:j_1"]), &cursors(&[("preview:j_1", 7)]))
+            .await;
         assert_eq!(
-            bus.queued_events(2),
-            [event("job:j_1", 0, EventKind::ResyncRequired, Value::Null)]
+            bus.queued_events(3),
+            [event(
+                "preview:j_1",
+                1,
+                EventKind::ResyncRequired,
+                Value::Null
+            )]
         );
+    }
+
+    /// Re-review I-1: once a forgotten topic's tombstone is evicted, an old cursor of it gets
+    /// `resync_required`, never a replay: while the topic isn't live, after it is published
+    /// again (its numbering starts above every evicted seq), and for a topic never seen.
+    #[tokio::test] // spec: ARCH-032, CORE-012
+    async fn an_evicted_tombstone_falls_back_to_resync() {
+        let (clock, bus) = bus();
+        bus.keep_tombstones(1);
+        let sweep = || {
+            clock.advance(Duration::from_secs(HISTORY_SECS + 1));
+            bus.publish("jobs", json!("elsewhere"));
+        };
+        for n in 1..=3 {
+            bus.publish("job:j_1", json!(n));
+        }
+        sweep();
+        bus.publish("job:j_2", json!(1));
+        sweep(); // j_2's tombstone evicts j_1's
+        let resynced = |client: ClientId, topic: &str, seq: u64| {
+            assert_eq!(
+                bus.queued_events(client),
+                [event(topic, seq, EventKind::ResyncRequired, Value::Null)],
+                "client {client}"
+            );
+        };
+        // Not live, no tombstone.
+        bus.subscribe(1, &names(&["job:j_1"]), &cursors(&[("job:j_1", 2)]))
+            .await;
+        resynced(1, "job:j_1", 3);
+        bus.drop_client(1);
+        // Published again: on from the evicted seqs, so the old cursor is older than it.
+        for n in 1..=2 {
+            bus.publish("job:j_1", json!({"new": n}));
+        }
+        bus.subscribe(2, &names(&["job:j_1"]), &cursors(&[("job:j_1", 2)]))
+            .await;
+        resynced(2, "job:j_1", 5);
+        // A cursor at the old end has missed nothing: it gets the new events.
+        bus.subscribe(3, &names(&["job:j_1"]), &cursors(&[("job:j_1", 3)]))
+            .await;
+        let seqs: Vec<u64> = bus.queued_events(3).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [4, 5]);
+        // A topic never seen starts at the base too.
+        bus.subscribe(4, &names(&["job:j_9"]), &cursors(&[("job:j_9", 1)]))
+            .await;
+        resynced(4, "job:j_9", 3);
+    }
+
+    /// Re-review I-1 (the reviewer's probe): a client follows `job:j_1` to seq 3 and leaves;
+    /// the topic is forgotten; the job then publishes five events. A client coming back with
+    /// cursor 3 gets all five, numbered on from 3, never just the tail of a new numbering.
+    #[tokio::test] // spec: ARCH-032, CORE-012
+    async fn a_returning_cursor_of_a_forgotten_topic_misses_nothing() {
+        let (clock, bus) = bus();
+        bus.subscribe(1, &names(&["job:j_1"]), &cursors(&[])).await;
+        for n in 1..=3 {
+            bus.publish("job:j_1", json!({"old": n}));
+        }
+        bus.drop_client(1);
+        clock.advance(Duration::from_secs(HISTORY_SECS + 1));
+        bus.publish("jobs", json!("elsewhere"));
+        assert!(!bus.knows("job:j_1"), "forgotten");
+        for n in 1..=5 {
+            bus.publish("job:j_1", json!({"new": n}));
+        }
+        let states = bus
+            .subscribe(2, &names(&["job:j_1"]), &cursors(&[("job:j_1", 3)]))
+            .await;
+        assert_eq!(states, [state("job:j_1", 8)]);
+        let got: Vec<(u64, Value)> = bus
+            .queued_events(2)
+            .into_iter()
+            .map(|e| (e.seq, e.data))
+            .collect();
+        let want: Vec<(u64, Value)> = (1..=5).map(|n| (3 + n, json!({"new": n}))).collect();
+        assert_eq!(got, want);
     }
 
     /// Checkpoint A I1: a `preview:<job_id>` topic keeps only its newest frame.
