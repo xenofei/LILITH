@@ -546,10 +546,31 @@ fn sequence_end(s: &str, esc: &Esc) -> Option<usize> {
     }
 }
 
-/// The end of the terminal control sequence starting at byte `j` of `s`, if one does
-/// ([`esc_at`], [`sequence_end`]): what a bare word steps over in the first round.
-fn control_sequence_at(s: &str, j: usize) -> Option<usize> {
-    esc_at(s.as_bytes(), j).and_then(|esc| sequence_end(s, &esc))
+/// The end of a plain SGR at byte `j` of `s`, if one starts there: an `ESC` in any spelling
+/// ([`esc_at`]), `[`, parameters from `0-9 ; :` only, no intermediate bytes, then `m`. It is
+/// the only sequence a first-round word steps over (never an `ESC \`, an OSC or any other
+/// CSI), and it is looked for only at a byte that can start an `ESC` spelling, so a run of
+/// `\` is counted once.
+fn plain_sgr_at(s: &str, j: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let starts = match *b.get(j)? {
+        0x1b | b'%' | b'&' => true,
+        b'\\' => j == 0 || b[j - 1] != b'\\',
+        _ => false,
+    };
+    if !starts {
+        return None;
+    }
+    let esc = esc_at(b, j)?;
+    if b.get(esc.end) != Some(&b'[') {
+        return None;
+    }
+    let params = b[esc.end + 1..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, b';' | b':'))
+        .count();
+    let m = esc.end + 1 + params;
+    (b.get(m) == Some(&b'm')).then_some(m + 1)
 }
 
 /// `s` with every terminal control sequence removed (module docs, rule 0), and where each run
@@ -1301,8 +1322,8 @@ fn targets(s: &str, cx: &mut Cx) -> String {
             }
             None => loop {
                 let from = end;
-                // A whole control sequence is stepped over, never stopped in at its `;`.
-                while let Some(after) = control_sequence_at(s, end) {
+                // A plain SGR is stepped over, never stopped in at its `;`.
+                while let Some(after) = plain_sgr_at(s, end) {
                     end = after;
                 }
                 while b.get(end).is_some_and(|c| {
@@ -1506,6 +1527,15 @@ fn flag_value(s: &str, k: usize, quote: Quote) -> Option<(usize, usize, String)>
 /// The value starting at byte `k`: its start, its end and what replaces it; `None` for no
 /// value or one that is `<redacted>` already.
 fn value_at(s: &str, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
+    // A value that starts with plain SGRs: they go with it, and what follows them is parsed
+    // as a value (quoted, braced or bare).
+    let mut lead = k;
+    while let Some(after) = plain_sgr_at(s, lead) {
+        lead = after;
+    }
+    if lead > k {
+        return value_at(s, lead, quote).map(|(_, end, with)| (k, end, with));
+    }
     let b = s.as_bytes();
     let bare = |inner: &str| match quote {
         Quote::Double => format!("\"{inner}\""),
@@ -1581,8 +1611,8 @@ fn value_at(s: &str, k: usize, quote: Quote) -> Option<(usize, usize, String)> {
             let run_end = |from: usize| {
                 let mut j = from;
                 while j < b.len() {
-                    // A whole control sequence is stepped over, never stopped in at its `;`.
-                    if let Some(after) = control_sequence_at(s, j) {
+                    // A plain SGR is stepped over, never stopped in at its `;`.
+                    if let Some(after) = plain_sgr_at(s, j) {
                         j = after;
                     } else if stop(j) {
                         break;
@@ -2341,9 +2371,64 @@ mod tests {
                 r#"{"m":"\u001b<redacted>"}"#.to_string(),
             ),
             (&r, format!("\u{1b}[32{ghp}"), "<redacted>".to_string()),
+            // A raw `ESC` before an escaped quote: the word stops at the quote, which keeps its
+            // backslash (the first round steps over no `ESC \`).
+            (
+                &r,
+                "\"{\\\"m\\\":\\\"api_key=\u{1b}\\\"}\"".to_string(),
+                "\"{\\\"m\\\":\\\"api_key=<redacted>\\\"}\"".to_string(),
+            ),
+            (
+                &r,
+                "cred LILITH-dev/\u{1b}\\\"x".to_string(),
+                "cred <redacted>\\\"x".to_string(),
+            ),
+            // A value that starts with plain SGRs is parsed after them: quoted, braced or bare.
+            (
+                &r,
+                "api_key=\u{1b}[32m\"hunter2secret\"".to_string(),
+                "api_key=\"<redacted>\"".to_string(),
+            ),
+            (
+                &r,
+                "api_key=\u{1b}[1m\u{1b}[1;32m'hunter2secret x'".to_string(),
+                "api_key='<redacted>'".to_string(),
+            ),
+            (
+                &r,
+                r#"{"m":"api_key=\u001b[32m\"hunter2secret x\" next"}"#.to_string(),
+                r#"{"m":"api_key=\"<redacted>\" next"}"#.to_string(),
+            ),
+            (
+                &r,
+                "api_key=\u{1b}[1;32m{\"a\":\"hunter2secret\"} next".to_string(),
+                "api_key=<redacted> next".to_string(),
+            ),
         ] {
             let (out, _) = redactor.text(&text);
             assert_eq!(out, want, "{text}");
+        }
+        // Only a plain SGR (`ESC [`, `0-9 ; :`, then `m`) is stepped over: any other sequence,
+        // cut or odd, ends the word where it stopped before, so the key after it keeps its rule.
+        for text in [
+            "api_key=\u{1b}[32 password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1;32 password=\"hunter2secret x\"",
+            "api_key=\u{1b}[ password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1&password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1,password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1)password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1'password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1;password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1]password=\"hunter2secret x\"",
+            "{api_key=\u{1b}[1}password=\"hunter2secret x\"",
+            "api_key=\u{1b}[1;password={\"a\":\"hunter2secret\"}",
+            "token: \u{1b}[32 password=\"hunter2secret x\"",
+            "--api-key \u{1b}[32 password=\"hunter2secret x\"",
+            r#"api_key=\u001b[32 password=\"hunter2secret x\""#,
+            "cred LILITH-dev/\u{1b}[1;password=\"hunter2secret x\"",
+        ] {
+            let (out, n) = r.text(text);
+            assert!(!out.contains("hunter2secret") && n >= 2, "{text} -> {out}");
         }
         for (text, want) in [
             (
