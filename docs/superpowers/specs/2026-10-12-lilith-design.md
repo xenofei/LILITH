@@ -461,7 +461,7 @@ This section describes the modules inside `lil-core`, the headless Rust core ser
 | `backup` | restic backups, destinations, restore (§7.4) | M1 |
 | `sync` | Local commit and push (M1) — commits only when you press Sync or ask, and optionally on app close or when idle (a setting), never silently otherwise; multi-machine sync with collision handling (M1.5) (§7.3) | M1 |
 
-(plan 2 clarification: Appendix D) `desktop` and `diagnostics` are infrastructure inside `lil-core` too, like `server` and `rpc`, and their tools carry the always-available modules `desktop` and `diagnostics` (plan 4a clarification: Appendix G).
+(plan 2 clarification: Appendix D) `desktop` and `diagnostics` are infrastructure inside `lil-core` too, like `server` and `rpc`, and their tools carry the always-available modules `desktop` and `diagnostics` (plan 4a clarification: Appendix G). (plan 4a ruling, 2026-10-26, PR #53) `redact`, the redaction the diagnostics bundle and the toasts share (Appendix G "Diagnostics" and "Toast XML"), is infrastructure too, below both: it names no other `lil-core` module, so the notifier redacts without depending on `diagnostics`, which only the server names.
 
 ### 2.2 Dispatcher pipeline (every tool call, every caller)
 
