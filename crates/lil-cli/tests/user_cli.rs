@@ -156,6 +156,31 @@ fn call_sends_an_app_name_as_that_method() {
     assert_eq!(stdout_json(&listed)["status"], "ok", "{listed:?}");
 }
 
+/// Review M-6: an `app/*` call takes no idempotency key, so `--idempotency-key` with one is a
+/// usage error (exit 2) before any core is involved, never a key dropped silently.
+#[test] // spec: ARCH-016, APP-043
+fn call_refuses_an_idempotency_key_for_an_app_name() {
+    let env = TestEnv::new();
+    let out = env.lil(&[
+        "call",
+        "app/confirmations.list",
+        "{\"state\":\"pending\"}",
+        "--idempotency-key",
+        "ik_app",
+    ]);
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert!(
+        out.stderr
+            .contains("app/confirmations.list takes no idempotency key"),
+        "{out:?}"
+    );
+    assert!(
+        RawPipe::try_connect(&env, Duration::from_secs(1)).is_none(),
+        "a refused call started a core"
+    );
+}
+
 #[test] // spec: ARCH-016, ARCH-035
 fn call_passes_the_idempotency_key() {
     let env = TestEnv::new();

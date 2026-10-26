@@ -1,8 +1,8 @@
 //! `lil call <tool> [<JSON object> | -] [--idempotency-key <k>]` (ARCH-016): prints the
 //! `Outcome` as pretty JSON. Exit 0 for `ok`, 1 for `error`, 4 for `pending_confirmation`.
 //! Without a key, `lil-client` mints one, so the call runs once. An `app/*` name is sent as
-//! that method, with no key, so the core answers it as it answers a `cli` caller
-//! (`caller.not_allowed` for an app's own method).
+//! that method, so the core answers it as it answers a `cli` caller (`caller.not_allowed` for
+//! an app's own method); it takes no key, so `--idempotency-key` with one is a usage error.
 
 use std::io::Read as _;
 
@@ -29,12 +29,20 @@ pub(super) fn run(
              doctor in a terminal.",
         ));
     }
+    let app_method = tool.starts_with(lil_protocol::method::APP_PREFIX);
+    if app_method && key.is_some() {
+        // Never dropped silently (CA-walk review M-6).
+        return Err(cannot_run(format!(
+            "{tool} takes no idempotency key: an app/* call is sent as that method, which has \
+             none. Leave out --idempotency-key."
+        )));
+    }
     let Some(client) = connect(global, UnknownCwdWorkspace::Fail)? else {
         return Ok(EXIT_OK);
     };
     // An `app/*` name is that method, which the core answers for this caller (Checkpoint A
     // walkthrough, ODD-2): never a tool it doesn't know.
-    if tool.starts_with(lil_protocol::method::APP_PREFIX) {
+    if app_method {
         let outcome = client
             .app_call(tool, Value::Object(args))
             .map_err(cannot_run)?;
