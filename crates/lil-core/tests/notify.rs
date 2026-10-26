@@ -877,6 +877,37 @@ fn a_key_split_by_a_control_character_is_redacted_as_shown() {
     );
 }
 
+/// Review M-2: a zero cap's alerts show the spend itself, since no percentage of 0 exists.
+#[test] // spec: APP-146, CORE-089
+fn a_zero_caps_alerts_show_the_spend() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"0\"\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut a = app(&env);
+    let k = key();
+    let call = json!({"provider": "fakeprov", "amount": "2"});
+    let id = pending_id(&a.tool("test.meter_external", call.clone(), Some(&k)));
+    let r = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": id, "answer": "approve", "cap": {"action": "allow_once"}}),
+    );
+    assert_eq!(r["result"]["status"], "ok", "{r}");
+    let done = a.tool("test.meter_external", call, Some(&k));
+    assert_eq!(done["status"], "ok", "{done}");
+    let alerts = until_posts(&mut p, "cap_alert", 3);
+    for (t, pct) in alerts.iter().zip([50, 80, 100]) {
+        let title = t["title"].as_str().unwrap();
+        assert!(
+            title.starts_with("Spent 2 USD against your 0 USD monthly cap (")
+                && title.ends_with(')'),
+            "{t}"
+        );
+        assert_eq!(t["body"], format!("Alert at {pct} %"), "{t}");
+    }
+}
+
 /// Checkpoint A walkthrough (ODD-5): a call that needs a confirmation and passes a cap names
 /// the cap in its toast too.
 #[test] // spec: APP-146, APP-022, APP-054

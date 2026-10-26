@@ -147,6 +147,14 @@ impl NotifyOutcome {
     }
 }
 
+/// The spend a cap alert shows (the `caps` alert event's `spent_pct`, `spent` and `currency`).
+struct Spent<'a> {
+    /// `None` for a cap of 0.
+    pct: Option<u64>,
+    amount: &'a str,
+    currency: &'a str,
+}
+
 /// What the notifier needs from the core.
 pub struct NotifierParts {
     pub desktop: Arc<dyn Desktop>,
@@ -339,12 +347,12 @@ impl Notifier {
                         .get("threshold_pct")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    let spent = p
-                        .data
-                        .get("spent_pct")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(pct);
-                    me.cap_alert(text("cap"), pct, spent, text("period")).await;
+                    let spent = Spent {
+                        pct: p.data.get("spent_pct").and_then(Value::as_u64),
+                        amount: text("spent"),
+                        currency: text("currency"),
+                    };
+                    me.cap_alert(text("cap"), pct, &spent, text("period")).await;
                 }
             }
             events.drop_client(CAPS_CLIENT);
@@ -825,10 +833,20 @@ impl Notifier {
 
     /// A cap alert: "Spending at <spent> % of your <cap> cap (<period>)" / "Alert at <pct> %",
     /// with no launch target: one per threshold crossed, each with the spend as it was
-    /// (owner decision 2026-10-26).
-    async fn cap_alert(&self, cap: &str, pct: u64, spent: u64, period: &str) {
+    /// (owner decision 2026-10-26). A cap of 0 has no percentage: "Spent <amount> <currency>
+    /// against your 0 <currency> <cap> cap (<period>)" (CA-walk review M-2).
+    async fn cap_alert(&self, cap: &str, pct: u64, spent: &Spent<'_>, period: &str) {
+        let title = match spent.pct {
+            Some(p) => format!("Spending at {p} % of your {cap} cap ({period})"),
+            None if !spent.amount.is_empty() => format!(
+                "Spent {} {c} against your 0 {c} {cap} cap ({period})",
+                spent.amount,
+                c = spent.currency
+            ),
+            None => format!("Spending at {pct} % of your {cap} cap ({period})"),
+        };
         let text = ToastText {
-            title: format!("Spending at {spent} % of your {cap} cap ({period})"),
+            title,
             body: format!("Alert at {pct} %"),
             launch: None,
             actions: ToastActions::None,
