@@ -510,6 +510,29 @@ async fn fresh_index_is_wal_and_versioned() {
     assert!(!again.needs_rebuild());
 }
 
+/// Checkpoint A store M5: `projects.list`'s counts come from one grouped count, which agrees
+/// with each project's assets; a project without assets isn't in it.
+#[tokio::test] // spec: APP-111, ARCH-089
+async fn asset_counts_agree_with_each_projects_assets() {
+    let fx = fx();
+    for (project, asset) in [("p", "a"), ("p", "b"), ("p", "c"), ("q", "d")] {
+        fx.write(
+            &format!("projects/{project}/assets/{asset}/{asset}.manifest.json"),
+            &manifest_json(project, asset, json!({})),
+        );
+    }
+    let index = fx.open(Arc::new(SystemProbe));
+    index.rebuild().await.unwrap();
+    let counts = index.asset_counts().await.unwrap();
+    assert_eq!(counts.get("p"), Some(&3));
+    assert_eq!(counts.get("q"), Some(&1));
+    assert_eq!(counts.len(), 2, "{counts:?}");
+    for (project, n) in &counts {
+        let rows = index.assets_of(project).await.unwrap();
+        assert_eq!(u64::try_from(rows.len()).unwrap(), *n, "{project}");
+    }
+}
+
 /// An index.db with one asset in it, closed.
 async fn indexed_once(fx: &Fx) {
     fx.write(

@@ -439,6 +439,12 @@ async fn list(ctx: &CallCtx) -> Result<(ListResult, String), ErrorBody> {
         .ready_result()
         .await
         .map_err(|e| e.to_error(&ctx.trace_id))?;
+    // One grouped count, not every asset row of every project (Checkpoint A store M5).
+    let counts = open
+        .index
+        .asset_counts()
+        .await
+        .map_err(|e| e.to_error(&ctx.trace_id))?;
     let mut projects = Vec::new();
     for slug in slugs {
         // One project whose file can't be read is listed as `unknown`; the others still are.
@@ -455,17 +461,12 @@ async fn list(ctx: &CallCtx) -> Result<(ListResult, String), ErrorBody> {
                 (slug.clone(), "unknown".to_string())
             }
         };
-        let assets = open
-            .index
-            .assets_of(&slug)
-            .await
-            .map_err(|e| e.to_error(&ctx.trace_id))?
-            .len();
+        let assets = counts.get(&slug).copied().unwrap_or(0);
         projects.push(ProjectEntry {
             project: slug,
             name,
             status,
-            assets: u64::try_from(assets).unwrap_or(u64::MAX),
+            assets,
         });
     }
     let summary = format!("{} project(s)", projects.len());
