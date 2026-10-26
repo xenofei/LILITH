@@ -204,16 +204,34 @@ Save the ruleset (**Save changes**). The ruleset described above already has bot
 
 Until both hold, nothing breaks: the check runs on every PR and `lil dev merge` still requires it to pass, but GitHub doesn't refuse a merge made around `lil` (for example through the API with the agent token once the other checks are green).
 
-**Right after the PR that brought this in merges:** PRs that were already open keep the green `protected-test-check` they got from the older `lil`, so until it runs again the agent token could merge them without you. Claude starts a fresh run of the check on every open PR into `main` right after that merge, a normal CI run that changes no setting. The agent token can't press **Re-run** (it has Actions: Read only), so Claude closes and reopens each PR, which starts a new run on the same commit, or pushes a new commit to it. Each one then shows the check red until it is merged with `lil dev merge`. You can also re-run them yourself in the browser: the run's page → **Re-run all jobs**.
+**Right after the PR that brought this in merges:** PRs that were already open keep the green `protected-test-check` they got from the older `lil`, so until it runs again the agent token could merge them without you. Claude starts a fresh run of the check on every open PR into `main` right after that merge, a normal CI run that changes no setting. The agent token can't press **Re-run** (it has Actions: Read only), so Claude closes and reopens each PR, which starts a new run on the same commit, or pushes a new commit to it. Each one then shows the check red until it is merged with `lil dev merge`. You can also re-run them yourself in the browser: the run's page → **Re-run all jobs**. Two cases need you:
 
-**An approval is a standing grant for its commit.** While it stands, that commit can be merged once CI is green, by anyone who can call GitHub's merge API. So `lil dev merge` and `lil dev merge-flow` ask nothing while another required check has already failed on the commit, and when they stop without merging after posting the approval (a CI failure, the 20-minute wait running out, a moved head, an error or Ctrl+C), they dismiss the approval again and say so. If the dismissal fails, the message says the approval still stands: dismiss it on the PR's page (the review's **…** menu → **Dismiss review**).
+- **A PR that stays green after its new run** already has a standing approval from the reviewer App of its head commit, for example from a merge flow that stopped before this change, or from the older merge flow, which approved every PR. Claude tells you which. Either dismiss that approval on the PR's page (the review's **…** menu → **Dismiss review**) and re-run the check, or leave it as your standing grant for that commit.
+- **A PR whose head branch was deleted** can't be reopened. Claude closes it, or pushes to it when the branch still exists elsewhere.
+
+**An approval is a standing grant for its commit.** While `protected-test-check` on that commit is green, anyone who can call GitHub's merge API can merge it once the other checks are green. Dismissing the approval doesn't change that by itself: a dismissal starts no run of the check, so it stays green until it runs again. So `lil dev merge` and `lil dev merge-flow`:
+
+- ask nothing while another required check has already failed on the commit;
+- after you authenticate, wait (up to 20 minutes) until every other required check is green, and post the approval only then; a failure, Ctrl+C or the wait running out before that posts nothing;
+- when they stop without merging after posting it (a CI failure, the 20-minute wait running out, a moved head, an error, Ctrl+C or an internal error), dismiss the App's approvals of that commit (one you gave with `lil dev approve` included), re-run `protected-test-check` so that it reads the dismissal, and wait (up to 20 minutes) until it reports failure. Only then do they say GitHub refuses that commit. If it isn't red yet, the message says so: don't merge that PR from the browser until it is.
+
+If the message says the approval may still stand, dismiss it on the PR's page (the review's **…** menu → **Dismiss review**), then re-run `protected-test-check` (the run's page → **Re-run all jobs**) and check that it ends red.
+
+To stop a merge, press Ctrl+C once and wait for lil's last message; a second Ctrl+C only stops the wait for the red check. Don't close the window while it runs: closing the console window, logging off, sleep or killing the process can't be caught, and then the approval stays until you dismiss it and re-run the check as above.
 
 What it doesn't cover:
 
 - The workflow file a PR's check runs comes from the PR, so a PR that changes `.github/workflows/ci-guard.yml` changes its own check. The agent token can't push workflow changes (section 7, check 4), and the post-merge check judges every push to `main` from `main` and flags a merged PR without the App's approval of its head.
 - Your own full-access login (gh's stored login, git's stored login) can change the ruleset, bypass it or push a workflow change. The guarantee holds only while agents use nothing stronger than the agent token (section 2.7).
 
-**If every PR stays red.** Every merge now depends on the reviewer App (its key, an installation token and its Actions write permission for the re-run) and on CI reading the PR's reviews. If a change on `main` breaks that (a bug in `lil dev guard --pr`, a change to GitHub's reviews API or to the workflow token's permissions), every PR shows `protected-test-check` red, including the PR that fixes it. To get out: in the ruleset on `main`, remove `protected-test-check` from the required checks, merge the fix, then add the check back (source GitHub Actions) at once. While it is removed, GitHub doesn't refuse merges made around `lil`. A check that is red only because it read the reviews just before the approval landed is cured by running the merge again.
+**If every PR stays red.** Every merge now depends on the reviewer App (its key, an installation token and its Actions write permission for the re-run) and on CI reading the PR's reviews. If a change on `main` breaks that (a bug in `lil dev guard --pr`, a change to GitHub's reviews API or to the workflow token's permissions), every PR shows `protected-test-check` red, including the PR that fixes it. To get out:
+
+1. In the ruleset on `main`, remove `protected-test-check` from the required checks.
+2. The fix changes protected guard code, so approve it on its own: `lil dev approve <PR>` (it needs no CI).
+3. Merge it with the PR page's **Merge pull request** button. `lil dev merge` can't merge it: it reads `protected-test-check` from `dev/merge-guard.toml` and waits on it. The post-merge check then finds the App's approval of the PR's head.
+4. Add `protected-test-check` back to the ruleset at once, with source GitHub Actions.
+
+While the check is removed, GitHub doesn't refuse merges made around `lil`. A check that is red only because it read the reviews just before the approval landed is cured by running the merge again.
 
 **Other settings:**
 
@@ -362,7 +380,7 @@ You run every merge (owner decision; standing rule since the rename, recorded 20
 cargo run -q -p lil-cli -- dev merge <PR>
 ```
 
-It shows the PR's head commit, its files, its protected changes and CI on that commit, and asks for your authentication (Windows Hello when enrolled, else the reviewer key's passphrase; `--passphrase` skips Windows Hello). Only then does it post the reviewer App's approval of that commit, protected files or not, re-run `protected-test-check`, wait for CI to pass on that commit and merge it, pinned to that commit (owner decision 2026-10-26). Before that, `protected-test-check` is red on every PR: that is expected. If another required check has already failed on that commit, it asks nothing and says which. If it stops without merging after posting the approval, it dismisses the approval and says so. `lil dev merge-flow` does the same, with an agent's summary and an independent audit shown first.
+It shows the PR's head commit, its files, its protected changes and CI on that commit, and asks for your authentication (Windows Hello when enrolled, else the reviewer key's passphrase; `--passphrase` skips Windows Hello). Then it waits until every other required check is green on that commit, and only then posts the reviewer App's approval of that commit, protected files or not, re-runs `protected-test-check`, waits for it and merges the commit, pinned to it (owner decision 2026-10-26). Before that, `protected-test-check` is red on every PR: that is expected. If another required check has already failed on that commit, it asks nothing and says which. If it stops without merging after posting the approval, it withdraws the approval as section 2.4.1 describes and says exactly what holds. `lil dev merge-flow` does the same, with an agent's summary and an independent audit shown first.
 
 You can still approve protected changes on their own first, with `lil dev approve`, as below.
 
