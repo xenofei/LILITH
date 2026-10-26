@@ -790,40 +790,41 @@ pub fn run_guard(base: &str, head: &str, pr: Option<u64>) -> i32 {
         }
     };
     println!("{}", guard::render_plain(&v));
-    let Some(pr) = pr else {
-        return i32::from(!v.needs_approval.is_empty());
-    };
-    // The reviewer slug comes from the committed settings, never the working tree (R12).
-    let cfg = match committed_config(&repo) {
-        Ok(c) => c,
-        Err(r) => {
-            eprintln!(
-                "lil dev guard: couldn't read the approval, so it doesn't count: {}",
-                explain(&[r])
-            );
-            return 1;
-        }
-    };
-    let client =
-        match github_token().and_then(|token| RestClient::new(&cfg.owner, &cfg.repo, &token)) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "lil dev guard: couldn't read the approval, so it doesn't count: {}",
-                    one_line(&format!("{e:#}"))
-                );
-                return 1;
-            }
+    let approval = |pr: u64| -> std::result::Result<String, String> {
+        let unread = |why: String| {
+            format!("lil dev guard: couldn't read the approval, so it doesn't count: {why}")
         };
-    match pr_approval(&client, &cfg, pr, &head_sha) {
-        Ok(line) => {
-            println!("{line}");
-            0
-        }
-        Err(line) => {
-            eprintln!("{line}");
-            1
-        }
+        // The reviewer slug comes from the committed settings, never the working tree (R12).
+        let cfg = committed_config(&repo).map_err(|r| unread(explain(&[r])))?;
+        let client = github_token()
+            .and_then(|token| RestClient::new(&cfg.owner, &cfg.repo, &token))
+            .map_err(|e| unread(one_line(&format!("{e:#}"))))?;
+        pr_approval(&client, &cfg, pr, &head_sha)
+    };
+    let (code, line) = guard_exit(&v, pr, &approval);
+    match line {
+        Some(line) if code == 0 => println!("{line}"),
+        Some(line) => eprintln!("{line}"),
+        None => {}
+    }
+    code
+}
+
+/// `lil dev guard`'s exit code once the verdict is known, and the line about the approval when
+/// one was read. Without a PR: 0 when nothing needs approval, 1 otherwise. With a PR (CI's
+/// protected-test-check; owner decision 2026-10-26): whatever the verdict, 0 only when
+/// `approval` (the reviewer App's approval of the PR's head, [`pr_approval`]) passes, else 1.
+pub(crate) fn guard_exit(
+    v: &Verdict,
+    pr: Option<u64>,
+    approval: &dyn Fn(u64) -> std::result::Result<String, String>,
+) -> (i32, Option<String>) {
+    let Some(pr) = pr else {
+        return (i32::from(!v.needs_approval.is_empty()), None);
+    };
+    match approval(pr) {
+        Ok(line) => (0, Some(line)),
+        Err(line) => (1, Some(line)),
     }
 }
 
@@ -2114,6 +2115,39 @@ mod tests {
         ));
     }
 
+    /// Review round 1, I-4: the enforcement decision itself. With `--pr`, a change with no
+    /// protected files still fails without the App's approval of the head, and passes with it;
+    /// without `--pr`, only the verdict counts.
+    #[test] // spec: QA-021, QA-036
+    fn guard_with_a_pr_needs_the_approval_even_when_nothing_is_protected() {
+        let clean = Verdict::default();
+        let blocked = protected("", "").unwrap();
+        let approved = green();
+        approved.add_review(PR, BOT, "APPROVED", HEAD);
+        let unapproved = green();
+        let code = |fake: &FakeGitHub, v: &Verdict| {
+            guard_exit(v, Some(PR), &|pr| pr_approval(fake, &cfg(), pr, HEAD)).0
+        };
+        assert_eq!(
+            code(&unapproved, &clean),
+            1,
+            "nothing protected, no approval"
+        );
+        assert_eq!(code(&approved, &clean), 0, "nothing protected, approved");
+        assert_eq!(code(&unapproved, &blocked), 1, "protected, no approval");
+        assert_eq!(code(&approved, &blocked), 0, "protected, approved");
+        let never = |_: u64| -> std::result::Result<String, String> {
+            panic!("no PR: the approval isn't read")
+        };
+        assert_eq!(guard_exit(&clean, None, &never), (0, None));
+        assert_eq!(guard_exit(&blocked, None, &never).0, 1);
+        // The line says why.
+        let (_, line) = guard_exit(&clean, Some(PR), &|pr| {
+            pr_approval(&unapproved, &cfg(), pr, HEAD)
+        });
+        assert!(line.unwrap().contains("Not approved"));
+    }
+
     /// CI's protected-test check on a PR (owner decision 2026-10-26): only the reviewer App's
     /// approval of the PR's current head passes it, protected files or not.
     #[test] // spec: QA-021, QA-036
@@ -2154,6 +2188,11 @@ mod tests {
         let fake = green();
         fake.add_review(PR, BOT, "APPROVED", HEAD);
         fake.add_review(PR, BOT, "CHANGES_REQUESTED", HEAD);
+        assert!(check(&fake).is_err());
+
+        // A dismissed approval doesn't count (GitHub keeps it in the list as DISMISSED).
+        let fake = green();
+        fake.add_review(PR, BOT, "DISMISSED", HEAD);
         assert!(check(&fake).is_err());
 
         // Reviews that can't be read never pass.
