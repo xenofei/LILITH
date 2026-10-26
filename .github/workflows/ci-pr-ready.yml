@@ -96,8 +96,60 @@ jobs:
       - name: Release build
         run: cargo build --workspace --release --locked
 
-      # Plans 2-6 add their PR-ready steps here (QA-071): QtQuickTest, the serialised web view /
-      # clipboard / drag / first-run group, E2E over the pipe, and the real-NTFS reconciler tests.
+      # ---- Qt (plan 4a Task 15: ARCH-114, QA-068, QA-077, QA-078) ----
+      # The Qt pair is installed by naqt every run, uncached: the repository's Actions cache is
+      # full, and the install takes about a minute (Ruling Q-C). Every CMake and CTest command
+      # runs through tools/dev-shell.ps1 (MSVC 14.44, checked; the Qt pair first on PATH).
+      - name: Install the Qt pair with naqt (Qt 6.12.0 + Qt WebEngine 6.140.0)
+        shell: pwsh
+        env:
+          # naqt's rolling `latest` release zip, built from commit 43da90f1 ("Support Qt 6.12"):
+          # only a zip with this sha256 is run (QA-078).
+          NAQT_ZIP_SHA256: 59825326d65895c7f0d57716768e014c5e1f8fb6e1e10244ea1a00acb886cc8f
+        run: |
+          $start = Get-Date
+          $zip = Join-Path $env:RUNNER_TEMP 'naqt.zip'
+          Invoke-WebRequest https://github.com/jdpurcell/naqt/releases/download/latest/naqt.zip -OutFile $zip
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne $env:NAQT_ZIP_SHA256) { Write-Host "::error::naqt.zip sha256 is $sha, not the pinned $env:NAQT_ZIP_SHA256; not running it"; exit 1 }
+          Expand-Archive $zip (Join-Path $env:RUNNER_TEMP 'naqt')
+          $dll = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'naqt') -Recurse -Filter naqt.dll | Select-Object -First 1
+          dotnet $dll.FullName install-qt windows desktop 6.12.0 win64_msvc2022_64 --outputdir C:\Qt `
+            --modules qtwebchannel qtpositioning qtshadertools qtimageformats `
+            --extensions qtwebengine@6.140.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          'LIL_QT_DIR=C:\Qt\6.12.0\msvc2022_64' | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host ("Qt install: {0:N1} min" -f ((Get-Date) - $start).TotalMinutes)
+
+      - name: Check the Qt pair (QA-077)
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/ci/check-qt-pair.ps1
+
+      - name: CMake configure (ci preset)
+        shell: pwsh
+        run: |
+          # Both Windows Server 2025 images ship Ninja 1.13.2; nothing is installed in its place.
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { Write-Host "::error::Ninja is not on the runner image; nothing installs it"; exit 1 }
+          pwsh -NoProfile -File tools/dev-shell.ps1 cmake --preset ci
+
+      - name: CMake build and deploy folder (ci preset)
+        shell: pwsh
+        run: |
+          $start = Get-Date
+          pwsh -NoProfile -File tools/dev-shell.ps1 cmake --build --preset ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Write-Host ("CMake build: {0:N1} min" -f ((Get-Date) - $start).TotalMinutes)
+
+      - name: Qt Quick Tests, offscreen (ci-qml)
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/dev-shell.ps1 ctest --preset ci-qml
+
+      - name: Deploy folder checks (ci-deploy)
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/dev-shell.ps1 ctest --preset ci-deploy
+
+      # Plans 2-6 add their PR-ready steps here (QA-071): the serialised web view / clipboard /
+      # drag / first-run group, E2E over the pipe, and the real-NTFS reconciler tests.
 
   privacy-check-pr:
     name: privacy-check-pr
