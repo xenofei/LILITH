@@ -432,7 +432,7 @@ fn i64_of(v: u64) -> i64 {
 }
 
 /// Adds a step for `status`/`substatus` at `at_utc`, keeping the first and the newest 63.
-fn push_step(
+pub(crate) fn push_step(
     seq: &mut Vec<StatusStep>,
     status: JobStatus,
     substatus: Option<Substatus>,

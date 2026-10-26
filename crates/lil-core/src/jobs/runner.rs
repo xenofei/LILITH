@@ -721,16 +721,22 @@ impl Shared {
     }
 
     /// A job's summary as its submission returns it: one a lane's reason holds already shows
-    /// `queue_paused` with those reasons, as its row does a moment later, so the result never
-    /// says `waiting` first (Checkpoint A walkthrough, ODD-1).
+    /// `queue_paused` with those reasons, its `status_seq` ending in that step, as its row does a
+    /// moment later, so the result never says `waiting` first (Checkpoint A walkthrough, ODD-1).
     fn submitted_summary(&self, row: &JobRow) -> JobSummary {
         let live = self.live_of(&row.job_id);
         let held = live.as_ref().is_some_and(|l| !l.pause_reasons.is_empty());
         if held && row.substatus == Some(Substatus::Waiting) {
-            let shown = JobRow {
+            let mut shown = JobRow {
                 substatus: Some(Substatus::QueuePaused),
                 ..row.clone()
             };
+            record::push_step(
+                &mut shown.status_seq,
+                shown.status,
+                shown.substatus,
+                shown.updated_utc,
+            );
             return shown.summary(live.as_ref());
         }
         row.summary(live.as_ref())

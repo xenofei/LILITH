@@ -3457,6 +3457,22 @@ async fn a_job_submitted_into_a_paused_lane_is_queue_paused_in_its_result() {
         assert_eq!(job.pause_reasons, ["manual"], "{job:?}");
         let listed = until_substatus(&fx, &job.job_id, "queue_paused").await;
         assert_eq!(listed.pause_reasons, job.pause_reasons);
+        // Its status_seq says so too, step for step as jobs.list then shows it.
+        let steps = |j: &JobSummary| -> Vec<(JobStatus, Option<String>)> {
+            j.status_seq
+                .iter()
+                .map(|s| (s.status, s.substatus.clone()))
+                .collect()
+        };
+        assert_eq!(
+            steps(job),
+            [
+                (JobStatus::Queued, Some("waiting".to_string())),
+                (JobStatus::Queued, Some("queue_paused".to_string())),
+            ],
+            "{job:?}"
+        );
+        assert_eq!(steps(&listed), steps(job), "{listed:?}");
     }
     fx.shutdown().await;
 }
