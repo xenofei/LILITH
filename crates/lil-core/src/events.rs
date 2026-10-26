@@ -1,8 +1,9 @@
 //! The event bus (ARCH-032, CORE-012) behind `lil/subscribe`, `lil/unsubscribe` and the
 //! `lil/event` notifications. Infrastructure, not a CORE-014 module.
 //!
-//! - **Sequences.** Each topic's `seq` goes up by one per [`EventBus::publish`], from 1 (or,
-//!   for a topic re-created after it was forgotten, from its tombstone or the base below).
+//! - **Sequences.** Each topic's `seq` goes up by one per [`EventBus::publish`], from 1, or
+//!   from the base below once a tombstone has been evicted (for a topic re-created after it
+//!   was forgotten, from its tombstone).
 //! - **History.** Each topic keeps its events for [`HISTORY_SECS`] of *monotonic* time (a
 //!   wall-clock jump changes nothing) and at most its [`HISTORY_MAX_EVENTS`] newest events
 //!   (ARCH-032 clarification), pruned on publish and on subscribe (CORE-012). A `preview:`
@@ -11,7 +12,9 @@
 //!   nothing publishes to any more (a finished job's) holds nothing once its events are
 //!   [`HISTORY_SECS`] old; a topic's seq is kept, so cursors stay valid. A per-job topic
 //!   (`job:`, `preview:`) no client follows is forgotten once empty, its seq kept as a
-//!   tombstone ([`TOMBSTONES`] at most): published or subscribed again, it goes on from there.
+//!   tombstone ([`TOMBSTONES`] at most): published again, it goes on from there. A subscribe
+//!   makes no entry for a topic nothing publishes on: it is answered from its tombstone or the
+//!   base.
 //!   A topic with no entry and no tombstone starts above every seq no longer kept, so an old
 //!   cursor of it gets a snapshot or `resync_required`, never a replay (Appendix G "Events").
 //! - **Subscribing with a cursor `s`.** `s` equal to the topic's current seq replays nothing;
@@ -151,10 +154,23 @@ impl Forgotten {
         }
     }
 
+    /// The seq of a topic without a live entry: its tombstone, else `base`.
+    fn peek(&self, topic: &str) -> u64 {
+        self.seqs.get(topic).map_or(self.base, |(seq, _)| *seq)
+    }
+
     /// The seq a topic without a live entry starts from: its tombstone (taken), else `base`.
     fn take(&mut self, topic: &str) -> u64 {
         self.seqs.remove(topic).map_or(self.base, |(seq, _)| seq)
     }
+}
+
+/// `topic`'s current seq: its live entry's, else [`Forgotten::peek`]. A subscribe reads it so
+/// and makes no entry: only a publish does (re-review 2 fix M-1).
+fn seq_of(topics: &HashMap<String, Topic>, forgotten: &Forgotten, topic: &str) -> u64 {
+    topics
+        .get(topic)
+        .map_or_else(|| forgotten.peek(topic), |t| t.seq)
 }
 
 /// `topic`'s live entry, made from its tombstone or the base when it has none.
@@ -323,7 +339,13 @@ impl EventBus {
             if client.topics.contains(topic) && !client.snapshots.contains_key(topic) {
                 let overflowed = {
                     let mut queue = client.pending.lock();
-                    enqueue(&mut queue, item.clone(), &client.topics, &inner.topics)
+                    enqueue(
+                        &mut queue,
+                        item.clone(),
+                        &client.topics,
+                        &inner.topics,
+                        &inner.forgotten,
+                    )
                 };
                 if overflowed {
                     tracing::info!(
@@ -397,7 +419,7 @@ impl EventBus {
                 line: event_line(&want.topic, want.s0, EventKind::Snapshot, data),
             }];
             let log = inner.topics.get(&want.topic);
-            let current = log.map_or(0, |l| l.seq);
+            let current = seq_of(&inner.topics, &inner.forgotten, &want.topic);
             if current > want.s0 {
                 let covered = log
                     .and_then(|l| l.history.front())
@@ -421,7 +443,13 @@ impl EventBus {
                 }
             }
             for item in items {
-                if enqueue(&mut queue, item, &entry.topics, &inner.topics) {
+                if enqueue(
+                    &mut queue,
+                    item,
+                    &entry.topics,
+                    &inner.topics,
+                    &inner.forgotten,
+                ) {
                     tracing::info!(
                         client,
                         topic = want.topic.as_str(),
@@ -456,11 +484,16 @@ impl EventBus {
             if states.iter().any(|s| &s.topic == topic) {
                 continue;
             }
-            // A topic without a live entry gets one, from its tombstone or the base: its
-            // cursor is then judged against its real seq (re-review fix I-1).
-            let log = live(&mut inner.topics, &mut inner.forgotten, topic);
-            prune(&mut log.history, now, history_max(topic));
-            let current = log.seq;
+            // A topic without a live entry is answered from its tombstone or the base, so its
+            // cursor is judged against its real seq (re-review fix I-1); no entry is made for
+            // it (re-review 2 fix M-1).
+            let current = match inner.topics.get_mut(topic) {
+                Some(log) => {
+                    prune(&mut log.history, now, history_max(topic));
+                    log.seq
+                }
+                None => inner.forgotten.peek(topic),
+            };
             states.push(TopicState {
                 topic: topic.clone(),
                 seq: current,
@@ -478,7 +511,7 @@ impl EventBus {
                 continue; // live events only
             };
             let log = inner.topics.get(topic);
-            let current = log.map_or(0, |l| l.seq);
+            let current = seq_of(&inner.topics, &inner.forgotten, topic);
             if cursor == current {
                 continue;
             }
@@ -520,7 +553,13 @@ impl EventBus {
                 }
             }
             for item in items {
-                if enqueue(&mut queue, item, &entry.topics, &inner.topics) {
+                if enqueue(
+                    &mut queue,
+                    item,
+                    &entry.topics,
+                    &inner.topics,
+                    &inner.forgotten,
+                ) {
                     tracing::info!(
                         client,
                         topic = topic.as_str(),
@@ -635,6 +674,7 @@ fn enqueue(
     item: Queued,
     subscribed: &BTreeSet<String>,
     logs: &HashMap<String, Topic>,
+    forgotten: &Forgotten,
 ) -> bool {
     if queue.len() < CLIENT_QUEUE {
         queue.push_back(item);
@@ -642,7 +682,7 @@ fn enqueue(
     }
     queue.clear();
     for topic in subscribed {
-        let seq = logs.get(topic).map_or(0, |l| l.seq);
+        let seq = seq_of(logs, forgotten, topic);
         queue.push_back(Queued {
             topic: Arc::from(topic.as_str()),
             line: event_line(topic, seq, EventKind::ResyncRequired, Value::Null),
@@ -1370,6 +1410,38 @@ mod tests {
             .collect();
         let want: Vec<(u64, Value)> = (1..=5).map(|n| (3 + n, json!({"new": n}))).collect();
         assert_eq!(got, want);
+    }
+
+    /// Re-review 2 M-1: a subscribe makes no lasting entry for a topic nothing publishes on:
+    /// it is answered from the tombstones and the base, and the entry is made by the first
+    /// publish, which continues from the tombstone.
+    #[tokio::test] // spec: ARCH-032
+    async fn a_subscribe_makes_no_entry_for_a_topic_nothing_publishes_on() {
+        let (clock, bus) = bus();
+        bus.publish("job:j_1", json!(1));
+        clock.advance(Duration::from_secs(HISTORY_SECS + 1));
+        bus.publish("jobs", json!("elsewhere"));
+        let states = bus
+            .subscribe(
+                1,
+                &names(&["x:never", "job:never", "job:j_1"]),
+                &cursors(&[]),
+            )
+            .await;
+        assert_eq!(
+            states,
+            [
+                state("x:never", 0),
+                state("job:never", 0),
+                state("job:j_1", 1)
+            ]
+        );
+        bus.drop_client(1);
+        for topic in ["x:never", "job:never", "job:j_1"] {
+            assert!(!bus.knows(topic), "{topic}");
+        }
+        assert_eq!(bus.publish("job:j_1", json!(2)), 2, "on from its tombstone");
+        assert!(bus.knows("job:j_1"));
     }
 
     /// Checkpoint A I1: a `preview:<job_id>` topic keeps only its newest frame.

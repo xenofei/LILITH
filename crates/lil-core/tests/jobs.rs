@@ -2445,8 +2445,9 @@ async fn a_restart_held_job_has_no_place_and_is_listed_last() {
     fx.shutdown().await;
 }
 
-/// Review M-1: the queue order's cursor names the last job's place, so a queue that changes
-/// between pages skips and repeats nothing.
+/// Review M-1: the queue order's cursor names the last job's place, so a job that starts, ends
+/// or is cancelled between pages is neither repeated nor skipped; one submitted ahead of the
+/// cursor meanwhile is left to a re-read from the start (Appendix G).
 #[tokio::test(start_paused = true)] // spec: CORE-160
 async fn the_queue_orders_cursor_survives_a_change_between_pages() {
     let fx = Fx::suite().await;
