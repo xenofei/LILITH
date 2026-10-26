@@ -7,6 +7,10 @@
 //! (or an `expect` of the same lint) appears only in `src/store/fsops.rs`, that the file exists,
 //! and that each occurrence attaches to a single function (no module-level or crate-level
 //! blanket allowance, and at most one allowance per function).
+//!
+//! Outside it, by design: SQLite writing its own database files, and the log setup
+//! (`lil_platform::logs`), which writes and prunes its own `<process>.<YYYY-MM-DD>.log` files,
+//! with `lil-core`'s `main.rs` calling `prune_retired` once for the retired `core.<date>.log`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
