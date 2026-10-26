@@ -7,8 +7,8 @@
 //! does: `reviewer_key` (the key file and its age encryption), `reviewer_hello` (enrol, status,
 //! remove, the unlock order and the authenticator) and `merge_flow` (the flow's order and the
 //! merge gate). `lil dev approve`, `lil dev merge` and `lil dev merge-flow` call these same
-//! functions; their wiring (the real flow steps, the authenticator's construction, the gate
-//! `lil dev merge` uses) has its own unit tests in `src/dev/reviewer.rs` and `src/dev/merge.rs`.
+//! functions; their wiring (the real flow steps and the authenticator's construction) has its
+//! own unit tests in `src/dev/reviewer.rs` and `src/dev/merge.rs`.
 
 #[allow(dead_code, reason = "only part of the key module is used here")]
 #[path = "../src/dev/reviewer_key.rs"]
@@ -27,7 +27,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use merge_flow::{AskOnEveryMerge, Facts, MergeFlowSteps, MergeGate, merge_flow};
+use merge_flow::{Facts, MergeFlowSteps, MergeGate, NO_AUDIT, merge_alone, merge_flow};
 use reviewer_hello::{
     Authenticator, CREDENTIAL, FaceSignIn, HelloFile, HelloPlatform, KeyAuthenticator, NoTerminal,
     PassphraseUnlocker, QUOTE, Route, Unlocker, discard_enrolment_beside, enroll, enrolled_hello,
@@ -700,6 +700,8 @@ struct FakeSteps {
     merge_head: Option<String>,
     /// What `post_approval` says about the guard re-run.
     rerun: bool,
+    /// The head of each approval posted.
+    approved: RefCell<Vec<String>>,
 }
 
 impl FakeSteps {
@@ -720,6 +722,7 @@ impl FakeSteps {
             },
             merge_head: None,
             rerun: true,
+            approved: RefCell::default(),
         }
     }
 }
@@ -734,6 +737,7 @@ impl MergeFlowSteps for FakeSteps {
         self.log
             .borrow_mut()
             .push(format!("steps:post_approval {}", facts.pr));
+        self.approved.borrow_mut().push(facts.head.clone());
         Ok(self.rerun)
     }
     fn wait_for_checks(&self, _facts: &Facts, guard_rerun: bool) -> anyhow::Result<()> {
@@ -1160,15 +1164,13 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
         let auth_at = e.iter().position(|x| x == "auth").unwrap();
         assert_eq!(&e[..auth_at], ["steps:facts"], "{e:?}");
         assert_eq!(e.last().unwrap(), "steps:merge");
-        // The approval is posted only when protected files changed, and a failed guard check is
-        // waited on only after its re-run was asked for (M8).
-        assert_eq!(
-            e.iter().any(|x| x.starts_with("steps:post_approval")),
-            !protected.is_empty(),
+        // The approval is posted on every merge, protected files or not (owner decision
+        // 2026-10-26), and a failed guard check is waited on after its re-run was asked for (M8).
+        assert!(e.contains(&"steps:post_approval 42".to_string()), "{e:?}");
+        assert!(
+            e.contains(&"steps:wait_for_checks rerun=true".to_string()),
             "{e:?}"
         );
-        let wait = format!("steps:wait_for_checks rerun={}", !protected.is_empty());
-        assert!(e.contains(&wait), "{e:?}");
     }
     // The real authenticator shows both texts before it unlocks anything.
     let home = Home::with_key();
@@ -1193,19 +1195,31 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
 
 #[test] // spec: QA-036
 fn merge_flow_merges_nothing_without_authentication() {
-    for answer in [
-        KeyError::Cancelled,
-        KeyError::WrongPassphrase,
-        KeyError::Unavailable,
-        KeyError::Damaged,
-    ] {
-        let l = log();
-        let auth = FakeAuth::new(&l, Err(answer));
-        let steps = FakeSteps::new(&l, &["the protected file `x` was modified."]);
-        let e = merge_flow("s", "a", &steps, &auth).unwrap_err();
-        let e = format!("{e:#}");
-        assert!(e.contains("nothing was approved or merged"), "{e}");
-        assert_eq!(events(&l), ["steps:facts", "auth"], "{answer:?}");
+    // Neither the flow nor `lil dev merge` on its own approves or merges anything without your
+    // authentication, protected files or not.
+    for protected in [&["the protected file `x` was modified."][..], &[]] {
+        for alone in [false, true] {
+            for answer in [
+                KeyError::Cancelled,
+                KeyError::WrongPassphrase,
+                KeyError::Unavailable,
+                KeyError::Damaged,
+            ] {
+                let l = log();
+                let auth = FakeAuth::new(&l, Err(answer));
+                let steps = FakeSteps::new(&l, protected);
+                let e = if alone {
+                    merge_alone(&steps, &auth)
+                } else {
+                    merge_flow("s", "a", &steps, &auth)
+                }
+                .unwrap_err();
+                let e = format!("{e:#}");
+                assert!(e.contains("nothing was approved or merged"), "{e}");
+                assert_eq!(events(&l), ["steps:facts", "auth"], "{answer:?}");
+                assert!(steps.approved.borrow().is_empty());
+            }
+        }
     }
     // The flow's authentication covers only the head it showed: a merge of another head is
     // refused by the gate.
@@ -1217,34 +1231,85 @@ fn merge_flow_merges_nothing_without_authentication() {
     assert!(!events(&l).contains(&"steps:merge".to_string()));
 }
 
+/// Owner decision 2026-10-26 (enforce on GitHub): every merge, protected files or not and
+/// whether or not the App approved the head before, posts the reviewer App's approval of exactly
+/// the head you authenticated, after your authentication and before the CI wait and the merge.
+/// The merge itself is let through only for that head.
+#[test] // spec: QA-036, QA-021
+fn every_merge_posts_the_approval_of_the_head_you_authenticated() {
+    const HEAD: &str = "1234567890abcdef1234567890abcdef12345678";
+    for protected in [&["the protected file `x` was modified."][..], &[]] {
+        for already_approved in [false, true] {
+            for alone in [false, true] {
+                let l = log();
+                let auth = FakeAuth::new(&l, Ok(()));
+                let mut steps = FakeSteps::new(&l, protected);
+                steps.facts.already_approved = already_approved;
+                let merged = if alone {
+                    merge_alone(&steps, &auth)
+                } else {
+                    merge_flow("s", "a", &steps, &auth)
+                };
+                assert_eq!(merged.unwrap(), "feedface");
+                assert_eq!(
+                    events(&l),
+                    [
+                        "steps:facts",
+                        "auth",
+                        "steps:post_approval 42",
+                        "steps:wait_for_checks rerun=true",
+                        "steps:merge",
+                    ],
+                    "protected {protected:?}, approved {already_approved}, alone {alone}"
+                );
+                assert_eq!(steps.approved.borrow().as_slice(), [HEAD]);
+            }
+        }
+    }
+    // The head is pinned: after the approval, a merge of another head is refused.
+    for alone in [false, true] {
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let mut steps = FakeSteps::new(&l, &[]);
+        steps.merge_head = Some("0000000000000000000000000000000000000abc".into());
+        let e = if alone {
+            merge_alone(&steps, &auth)
+        } else {
+            merge_flow("s", "a", &steps, &auth)
+        }
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("nothing was merged"), "{e:#}");
+        assert_eq!(steps.approved.borrow().as_slice(), [HEAD]);
+        assert!(!events(&l).contains(&"steps:merge".to_string()));
+    }
+}
+
+/// `lil dev merge` on its own is the flow without an agent's summary or audit: it shows lil's
+/// facts, says there is no audit, and asks for your authentication once per merge.
 #[test] // spec: QA-036
 fn dev_merge_asks_for_authentication_on_every_merge() {
-    // `lil dev merge` on its own: every merge, protected files or not, asks the owner.
-    let l = log();
-    let auth = FakeAuth::new(&l, Ok(()));
-    let gate = AskOnEveryMerge::new(&auth);
-    for pr in [1, 2, 3] {
-        gate.authorize(&subject(pr, "1234567890abcdef1234567890abcdef12345678"))
-            .unwrap();
-    }
-    assert_eq!(events(&l), ["auth", "auth", "auth"]);
-    let seen = auth.seen.borrow();
-    assert!(seen[0].0.contains("PR #1"), "{:?}", seen[0]);
-    assert!(seen[2].0.contains("1234567"), "{:?}", seen[2]);
-    assert!(!seen[0].1.is_empty(), "the audit slot says there is none");
-    // Re-review m5: which PR it is, and into which branch.
-    for detail in ["Add the thing", "an-agent", "Into main"] {
-        assert!(seen[0].0.contains(detail), "{detail}: {:?}", seen[0]);
-    }
-    drop(seen);
-
-    for answer in [KeyError::Cancelled, KeyError::WrongPassphrase] {
-        let auth = FakeAuth::new(&log(), Err(answer));
-        let gate = AskOnEveryMerge::new(&auth);
-        let e = gate
-            .authorize(&subject(7, "1234567890abcdef1234567890abcdef12345678"))
-            .unwrap_err();
-        assert!(e.contains("nothing was merged"), "{e}");
+    for protected in [&["the protected file `x` was modified."][..], &[]] {
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let steps = FakeSteps::new(&l, protected);
+        for _ in 0..3 {
+            merge_alone(&steps, &auth).unwrap();
+        }
+        let seen = auth.seen.borrow();
+        assert_eq!(seen.len(), 3, "once per merge");
+        let (summary, audit) = &seen[0];
+        for detail in [
+            "PR #42",
+            "1234567",
+            "Add the thing",
+            "an-agent",
+            "main",
+            "README.md",
+        ] {
+            assert!(summary.contains(detail), "{detail}: {summary}");
+        }
+        assert!(summary.contains("lil dev merge"), "{summary}");
+        assert_eq!(audit, NO_AUDIT);
     }
 }
 

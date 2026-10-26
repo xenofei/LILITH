@@ -32,19 +32,25 @@
 //! review by the App on that commit cancels an earlier approval. No other login counts, a
 //! person's included.
 //!
-//! **Your authentication** (QA-036 as amended 2026-10-23, P4a-R38): once every other condition
-//! held, [`merge_pr`] asks its [`MergeGate`] last, just before GitHub is asked to merge, on every
-//! merge, protected files or not. `lil dev merge` on its own asks you (Windows Hello when
-//! enrolled, then the reviewer key's passphrase); `lil dev merge-flow` has already asked, for
-//! that PR and head only. A refusal merges nothing.
+//! **Your authentication** (QA-036 as amended 2026-10-23 and 2026-10-26, P4a-R38): `lil dev
+//! merge` and `lil dev merge-flow` are the same flow (`merge_flow.rs`): they read the PR, ask you
+//! (Windows Hello when enrolled, then the reviewer key's passphrase), post the reviewer App's
+//! approval of the head you were shown, wait for CI and only then call [`merge_pr`]. Once every
+//! other condition held, [`merge_pr`] asks its [`MergeGate`] last, just before GitHub is asked
+//! to merge; the flow's gate lets through only the PR and head you authenticated for. A refusal
+//! merges nothing.
+//!
+//! **The protected-test check on a PR** ([`run_guard`] with `--pr`, CI's `ci-guard.yml`; owner
+//! decision 2026-10-26): it passes only when the reviewer App approved the PR's head commit,
+//! whether or not protected files changed ([`pr_approval`]). The ruleset on `main` requires that
+//! check, so GitHub refuses a merge you didn't authenticate.
 
 use super::agent_access::GIT_CREDENTIAL_HELPER;
 use super::github::{
     BASE_BRANCH, CheckState, GitHubApi, MergeOutcome, RestClient, Review, github_token,
 };
 use super::guard::{self, Verdict};
-use super::merge_flow::{AskOnEveryMerge, MergeGate, MergeSubject};
-use super::reviewer_hello::Authenticator;
+use super::merge_flow::{MergeGate, MergeSubject};
 use super::root;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -338,9 +344,9 @@ pub fn merge_conditions(
     }
 }
 
-/// Checks [`merge_conditions`], then asks `gate` for your authentication (every merge, protected
-/// files or not: QA-036, P4a-R38), then asks GitHub to merge pinned to the checked SHA. Returns
-/// the merge commit's SHA.
+/// Checks [`merge_conditions`], then asks `gate` (the flow's: only the PR and head you
+/// authenticated for; QA-036, P4a-R38), then asks GitHub to merge pinned to the checked SHA.
+/// Returns the merge commit's SHA.
 pub fn merge_pr(
     cfg: &MergeGuardConfig,
     gh: &dyn GitHubApi,
@@ -717,85 +723,49 @@ pub(crate) fn merge_in_repo<'g>(
     )
 }
 
-/// `lil dev merge`'s merge: [`merge_in_repo`] with the gate that asks `auth` on every merge,
-/// protected files or not (QA-036, P4a-R38).
-pub(crate) fn merge_asking<'g>(
-    repo: &Path,
-    pr: u64,
-    checked: &MergeGuardConfig,
-    hooks_path_configured: Option<String>,
-    github: &dyn Fn(&MergeGuardConfig) -> Result<Box<dyn GitHubApi + 'g>>,
-    auth: &dyn Authenticator,
-) -> Result<String, Vec<Refusal>> {
-    merge_in_repo(
-        repo,
-        pr,
-        checked,
-        hooks_path_configured,
-        github,
-        &AskOnEveryMerge::new(auth),
-    )
-}
-
-fn refuse(header: &str, refusals: &[Refusal]) -> i32 {
-    eprintln!("{header}");
-    for line in explain(refusals).lines() {
-        eprintln!("  - {line}");
-    }
-    1
-}
-
-/// `lil dev merge <pr> [--passphrase]`: exit 0 when merged, 1 when refused. With
-/// `passphrase_only`, Windows Hello is skipped and the passphrase is asked at the terminal.
+/// `lil dev merge <pr> [--passphrase]`: exit 0 when merged, 1 when refused. It is the merge flow
+/// without an agent's summary or audit (`reviewer::run_merge_alone`): it reads the PR, asks for
+/// your authentication, posts the reviewer App's approval of that head, waits for CI and merges
+/// that head (QA-036). With `passphrase_only`, Windows Hello is skipped and the passphrase is
+/// asked at the terminal.
 pub fn run_merge(pr: u64, passphrase_only: bool) -> i32 {
-    let header = format!("lil dev merge refused PR #{pr}:");
-    let repo = match root::repo_root() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{header}");
-            eprintln!("  - {e}");
-            return 1;
-        }
-    };
-    // QA-034: the committed settings and the hooks come first, before any network call.
-    let (cfg, hooks) = match preflight(&repo) {
-        Ok(x) => x,
-        Err(refusals) => return refuse(&header, &refusals),
-    };
-    // R13: only fetch from, and merge through, the repo the settings name.
-    if let Err(r) = check_origin(&repo, &cfg) {
-        return refuse(&header, &[r]);
-    }
-    let github = |cfg: &MergeGuardConfig| -> Result<Box<dyn GitHubApi>> {
-        Ok(Box::new(RestClient::new(
-            &cfg.owner,
-            &cfg.repo,
-            &github_token()?,
-        )?))
-    };
-    // QA-036, P4a-R38: every merge asks for your authentication (Windows Hello when enrolled,
-    // then the passphrase), after every other condition held. The key is loaded first, so a
-    // missing one is refused before any network call.
-    let what = format!("merge PR #{pr}");
-    let merged = super::reviewer::with_owner_authenticator(&what, passphrase_only, |_, auth| {
-        merge_asking(&repo, pr, &cfg, hooks, &github, auth)
-    });
-    match merged {
-        Ok(Ok(merge_sha)) => {
-            println!("Merged PR #{pr} (merge commit {}).", short(&merge_sha));
-            0
-        }
-        Ok(Err(refusals)) => refuse(&header, &refusals),
-        Err(e) => refuse(
-            &header,
-            &[Refusal::NotAuthenticated(one_line(&format!("{e:#}")))],
-        ),
+    super::reviewer::run_merge_alone(pr, passphrase_only)
+}
+
+/// CI's protected-test check on PR `pr` (`lil dev guard --pr`; QA-021 as amended, owner decision
+/// 2026-10-26): it passes only when the reviewer App's latest review of `head` on that PR is an
+/// approval, whether or not protected files changed. An approval of an older head, or by any
+/// other login, doesn't count; neither does one that couldn't be read. `Ok` is the line printed
+/// when it passes, `Err` the line when it fails.
+pub(crate) fn pr_approval(
+    gh: &dyn GitHubApi,
+    cfg: &MergeGuardConfig,
+    pr: u64,
+    head: &str,
+) -> std::result::Result<String, String> {
+    let login = cfg.reviewer_login();
+    match gh.reviews(pr) {
+        Ok(reviews) if app_approved(&reviews, &login, head) => Ok(format!(
+            "Approved: {login} approved {} on PR #{pr}.",
+            short(head)
+        )),
+        Ok(_) => Err(format!(
+            "Not approved: {login} hasn't approved {} on PR #{pr}. Every merge into {} needs that approval; `lil dev merge` and `lil dev merge-flow` post it after the owner's authentication.",
+            short(head),
+            cfg.base_branch
+        )),
+        Err(e) => Err(format!(
+            "lil dev guard: couldn't read the approval, so it doesn't count: {}",
+            one_line(&format!("{e:#}"))
+        )),
     }
 }
 
-/// `lil dev guard --base <ref> --head <ref> [--pr <n>]`: prints the verdict. Exit 0 when nothing
-/// needs approval (or, with `--pr`, the reviewer App approved the head commit), 1 on unapproved
-/// blockers (including when the approval could not be read), 2 when the guard could not run.
+/// `lil dev guard --base <ref> --head <ref> [--pr <n>]`: prints the verdict. Without `--pr`: exit
+/// 0 when nothing needs approval, 1 on blockers. With `--pr` (CI's protected-test check): exit 0
+/// only when the reviewer App approved the head commit on that PR, protected files or not
+/// ([`pr_approval`]), else 1 (including when the approval could not be read). 2 when the guard
+/// could not run.
 pub fn run_guard(base: &str, head: &str, pr: Option<u64>) -> i32 {
     let repo = match root::repo_root() {
         Ok(r) => r,
@@ -820,11 +790,8 @@ pub fn run_guard(base: &str, head: &str, pr: Option<u64>) -> i32 {
         }
     };
     println!("{}", guard::render_plain(&v));
-    if v.needs_approval.is_empty() {
-        return 0;
-    }
     let Some(pr) = pr else {
-        return 1;
+        return i32::from(!v.needs_approval.is_empty());
     };
     // The reviewer slug comes from the committed settings, never the working tree (R12).
     let cfg = match committed_config(&repo) {
@@ -837,31 +804,24 @@ pub fn run_guard(base: &str, head: &str, pr: Option<u64>) -> i32 {
             return 1;
         }
     };
-    let login = cfg.reviewer_login();
-    let approved = github_token()
-        .and_then(|token| RestClient::new(&cfg.owner, &cfg.repo, &token))
-        .and_then(|client| client.reviews(pr))
-        .map(|reviews| app_approved(&reviews, &login, &head_sha));
-    match approved {
-        Ok(true) => {
-            println!(
-                "Approved: {login} approved {} on PR #{pr}.",
-                short(&head_sha)
-            );
+    let client =
+        match github_token().and_then(|token| RestClient::new(&cfg.owner, &cfg.repo, &token)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "lil dev guard: couldn't read the approval, so it doesn't count: {}",
+                    one_line(&format!("{e:#}"))
+                );
+                return 1;
+            }
+        };
+    match pr_approval(&client, &cfg, pr, &head_sha) {
+        Ok(line) => {
+            println!("{line}");
             0
         }
-        Ok(false) => {
-            println!(
-                "Not approved: {login} hasn't approved {} on PR #{pr}.",
-                short(&head_sha)
-            );
-            1
-        }
-        Err(e) => {
-            eprintln!(
-                "lil dev guard: couldn't read the approval, so it doesn't count: {}",
-                one_line(&format!("{e:#}"))
-            );
+        Err(line) => {
+            eprintln!("{line}");
             1
         }
     }
@@ -2154,69 +2114,52 @@ mod tests {
         ));
     }
 
-    /// An `Authenticator` that records what it was asked and answers `answer`.
-    struct RecordingAuth {
-        asked: RefCell<Vec<String>>,
-        answer: std::result::Result<(), crate::dev::reviewer_key::KeyError>,
-    }
+    /// CI's protected-test check on a PR (owner decision 2026-10-26): only the reviewer App's
+    /// approval of the PR's current head passes it, protected files or not.
+    #[test] // spec: QA-021, QA-036
+    fn the_pr_check_passes_only_on_the_apps_approval_of_the_head() {
+        let check = |fake: &dyn GitHubApi| pr_approval(fake, &cfg(), PR, HEAD);
 
-    impl Authenticator for RecordingAuth {
-        fn authenticate(
-            &self,
-            summary: &str,
-            _audit: &str,
-        ) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, crate::dev::reviewer_key::KeyError>
-        {
-            self.asked.borrow_mut().push(summary.to_string());
-            self.answer
-                .map(|()| zeroize::Zeroizing::new(b"pem".to_vec()))
-        }
-    }
+        // Approved at the head: passes.
+        let fake = green();
+        fake.add_review(PR, BOT, "APPROVED", HEAD);
+        let line = check(&fake).unwrap();
+        assert!(line.contains(BOT) && line.contains(short(HEAD)), "{line}");
 
-    /// `lil dev merge`'s merge (`merge_asking`, what `run_merge` calls) asks your authentication
-    /// once, about the checked head, after every other condition held; without it nothing is
-    /// merged (QA-036, P4a-R38; Task 28 review, I3).
-    #[test] // spec: QA-036
-    fn dev_merge_uses_the_gate_that_asks_you_on_every_merge() {
-        use crate::dev::reviewer_key::KeyError;
-        for answer in [
-            Ok(()),
-            Err(KeyError::Cancelled),
-            Err(KeyError::WrongPassphrase),
+        // No review at all: fails, and says how the approval is given.
+        let fake = green();
+        let line = check(&fake).unwrap_err();
+        assert!(line.contains("Not approved"), "{line}");
+        assert!(line.contains("lil dev merge"), "{line}");
+
+        // Approved at an older head only: a new push needs a new approval.
+        let fake = green();
+        fake.add_review(PR, BOT, "APPROVED", OLD);
+        assert!(check(&fake).is_err());
+
+        // Approved by anyone but the App: people, other Apps, lookalikes.
+        let fake = green();
+        for login in [
+            "octocat",
+            "lilith-reviewer",
+            "github-actions[bot]",
+            "lilith-reviewer-next[bot]",
+            "Lilith-Reviewer[bot]",
         ] {
-            let f = fixture();
-            let fake = FakeGitHub::new();
-            fake.add_pr(42, &f.head, "main");
-            for name in cfg().required_checks {
-                fake.set_check(&f.head, &name, CheckState::Success);
-            }
-            fake.add_review(42, BOT, "APPROVED", &f.head);
-            let github =
-                |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> { Ok(boxed(&fake)) };
-            let auth = RecordingAuth {
-                asked: RefCell::default(),
-                answer,
-            };
-            let r = merge_asking(&f.work, 42, &cfg(), hooks(), &github, &auth);
-            let asked = auth.asked.borrow().clone();
-            assert_eq!(asked.len(), 1, "{asked:?}");
-            assert!(asked[0].contains("PR #42"), "{asked:?}");
-            assert!(asked[0].contains(&f.head), "{asked:?}");
-            // Re-review m5: the PR's title and author, and the configured base branch.
-            for detail in ["PR 42's title", "an-author", "Into main"] {
-                assert!(asked[0].contains(detail), "{detail}: {asked:?}");
-            }
-            match answer {
-                Ok(()) => {
-                    assert_eq!(r, Ok(format!("merge-of-{}", f.head)));
-                    assert_eq!(fake.pr(42).unwrap().state, "closed");
-                }
-                Err(_) => {
-                    let r = refusals(r);
-                    assert!(matches!(&r[..], [Refusal::NotAuthenticated(_)]), "{r:?}");
-                    assert_eq!(fake.pr(42).unwrap().state, "open");
-                }
-            }
+            fake.add_review(PR, login, "APPROVED", HEAD);
         }
+        assert!(check(&fake).is_err());
+
+        // A later non-approval by the App on that head cancels its approval.
+        let fake = green();
+        fake.add_review(PR, BOT, "APPROVED", HEAD);
+        fake.add_review(PR, BOT, "CHANGES_REQUESTED", HEAD);
+        assert!(check(&fake).is_err());
+
+        // Reviews that can't be read never pass.
+        let fake = green();
+        fake.add_review(PR, BOT, "APPROVED", HEAD);
+        let line = check(&Scripted::failing(&fake, "reviews")).unwrap_err();
+        assert!(line.contains("doesn't count"), "{line}");
     }
 }

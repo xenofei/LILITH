@@ -1,19 +1,24 @@
-//! The one-click merge flow and the merge gate (QA-036 as amended 2026-10-23, P4a-R38; plan 4a
-//! Task 28).
+//! The one-click merge flow and the merge gate (QA-036 as amended 2026-10-23 and 2026-10-26,
+//! P4a-R38; plan 4a Task 28).
 //!
 //! **`lil dev merge-flow <PR> --summary <file> --audit <file>`.** An agent may prepare and run it
 //! for a PR you approved on its card. It reads what lil itself can check about the PR
 //! ([`Facts`]: the head commit, the files, the protected changes, CI on that exact head), shows
 //! you that with the agent's summary and the independent audit (a review written by an agent
 //! that didn't make the change), and asks for your authentication: Windows Hello first, then the
-//! passphrase ([`Authenticator`]). Only after it succeeds does it post the reviewer approval
-//! (when protected files changed), wait for CI on that head, and merge through `lil dev merge`'s
-//! checks. Without your authentication nothing is approved or merged ([`merge_flow`]).
+//! passphrase ([`Authenticator`]). Only after it succeeds does it post the reviewer App's
+//! approval of that head, wait for CI on that head, and merge through `lil dev merge`'s checks.
+//! Without your authentication nothing is approved or merged ([`merge_flow`]).
+//! `lil dev merge <PR>` run on its own is the same flow without the summary and the audit
+//! ([`merge_alone`]).
 //!
-//! **Every merge asks for your authentication** ([`MergeGate`]), whoever runs it and whether or
-//! not the PR touches protected files: `lil dev merge` run on its own asks on every merge
-//! ([`AskOnEveryMerge`]); the flow's merge is let through only for the PR and the exact head you
-//! authenticated for ([`Authenticated`], which only [`merge_flow`] can make).
+//! **Every merge asks for your authentication, and GitHub enforces it** (owner decision
+//! 2026-10-26): whoever runs it and whether or not the PR touches protected files, the approval
+//! is posted only after you authenticated, and the protected-test check, which the ruleset on
+//! `main` requires, fails on a PR whose head the reviewer App hasn't approved (QA-021). The App's
+//! key is unlocked only by your authentication, so the agent token alone can't merge. The merge
+//! itself is let through only for the PR and the exact head you authenticated for
+//! ([`Authenticated`], which only the flow can make).
 //!
 //! This module needs no GitHub and no git: the steps that do are behind [`MergeFlowSteps`] (the
 //! real ones are `reviewer.rs`'s), so `tests/reviewer_hello.rs` compiles it on its own.
@@ -40,11 +45,12 @@ pub struct Facts {
     pub head: String,
     /// The files the PR changes against `origin/main`.
     pub files: Vec<String>,
-    /// One plain line per protected change that needs the reviewer approval; empty when none.
+    /// One plain line per protected change; empty when none.
     pub protected: Vec<String>,
     /// Each required CI check on `head`, with its state.
     pub checks: Vec<(String, String)>,
-    /// Whether the reviewer App already approved `head`.
+    /// Whether the reviewer App already approved `head` (shown only: every merge posts the
+    /// approval again).
     pub already_approved: bool,
 }
 
@@ -78,13 +84,18 @@ pub fn render_facts(facts: &Facts) -> String {
     if facts.protected.is_empty() {
         out.push_str("Protected files: none changed.\n");
     } else {
-        out.push_str("Protected changes (merging them posts the reviewer approval):\n");
+        out.push_str("Protected changes:\n");
         for p in &facts.protected {
             let _ = writeln!(out, "  {p}");
         }
-        if facts.already_approved {
-            out.push_str("  (the reviewer App already approved this commit)\n");
-        }
+    }
+    let _ = writeln!(
+        out,
+        "Merging first posts the reviewer App's approval of {}: protected-test-check needs it on every PR.",
+        short(&facts.head)
+    );
+    if facts.already_approved {
+        out.push_str("  (the reviewer App already approved this commit)\n");
     }
     let _ = writeln!(out, "CI on {}:", short(&facts.head));
     for (name, state) in &facts.checks {
@@ -111,45 +122,8 @@ pub trait MergeGate {
     fn authorize(&self, subject: &MergeSubject) -> std::result::Result<(), String>;
 }
 
-/// `lil dev merge` on its own: asks you to authenticate on every merge, protected files or not.
-pub struct AskOnEveryMerge<'a> {
-    auth: &'a dyn Authenticator,
-}
-
-impl<'a> AskOnEveryMerge<'a> {
-    pub fn new(auth: &'a dyn Authenticator) -> Self {
-        Self { auth }
-    }
-}
-
-impl MergeGate for AskOnEveryMerge<'_> {
-    fn authorize(&self, s: &MergeSubject) -> std::result::Result<(), String> {
-        let given = |t: &str| {
-            if t.is_empty() {
-                "(not given)".to_string()
-            } else {
-                t.to_string()
-            }
-        };
-        // Re-review m5: which PR it is, and into which branch.
-        let summary = format!(
-            "Merge PR #{}: {}\nAuthor: {}\nInto {} at {} (head commit {}).\nCI is green on that commit, and protected changes, if any, carry the reviewer approval.",
-            s.pr,
-            given(s.title),
-            given(s.author),
-            s.base_branch,
-            short(s.head),
-            s.head
-        );
-        self.auth
-            .authenticate(&summary, NO_AUDIT)
-            .map(drop)
-            .map_err(|e| format!("every merge needs your authentication, and it didn't succeed ({e}); nothing was merged"))
-    }
-}
-
-/// The flow's authentication, already given for exactly one PR and head. Only [`merge_flow`]
-/// makes one, after you authenticated.
+/// The flow's authentication, already given for exactly one PR and head. Only the flow
+/// ([`merge_flow`], [`merge_alone`]) makes one, after you authenticated.
 pub struct Authenticated {
     pr: u64,
     head: String,
@@ -175,8 +149,9 @@ impl MergeGate for Authenticated {
 pub trait MergeFlowSteps {
     /// Reads the PR (read-only; nothing is posted or changed).
     fn facts(&self) -> Result<Facts>;
-    /// Posts the reviewer App's approval of `facts.head`, signed with the unlocked key. `true`
-    /// when GitHub accepted a re-run of the guard check, which then turns green.
+    /// Posts the reviewer App's approval of `facts.head`, signed with the unlocked key, on
+    /// every merge. `true` when GitHub accepted a re-run of the guard check, which then turns
+    /// green.
     fn post_approval(&self, pem: &[u8], facts: &Facts) -> Result<bool>;
     /// Waits for every required CI check on `facts.head` to pass. A failed guard check is
     /// waited on only when `guard_rerun` (the approval just asked for its re-run); any other
@@ -231,33 +206,54 @@ pub fn capped(text: &str, max_lines: usize, max_chars: usize) -> (String, Option
 }
 
 /// The flow: the facts, then your authentication with the summary and the audit shown first,
-/// then (only after it succeeded) the approval when protected files changed, CI, and the merge.
-/// Returns the merge commit.
+/// then (only after it succeeded) the reviewer App's approval of the shown head, CI, and the
+/// merge of that head. Returns the merge commit.
 pub fn merge_flow(
     summary: &str,
     audit: &str,
     steps: &dyn MergeFlowSteps,
     auth: &dyn Authenticator,
 ) -> Result<String> {
+    flow(Some(summary), audit, steps, auth)
+}
+
+/// `lil dev merge <PR>` run on its own: the flow with no agent summary and no audit
+/// ([`NO_AUDIT`]). It asks for your authentication on every merge, protected files or not.
+pub fn merge_alone(steps: &dyn MergeFlowSteps, auth: &dyn Authenticator) -> Result<String> {
+    flow(None, NO_AUDIT, steps, auth)
+}
+
+fn flow(
+    summary: Option<&str>,
+    audit: &str,
+    steps: &dyn MergeFlowSteps,
+    auth: &dyn Authenticator,
+) -> Result<String> {
     let facts = steps.facts()?;
-    let (kept, cut) = capped(summary, SUMMARY_LINES, SUMMARY_CHARS);
-    let mut shown = format!(
-        "{}\nSummary of the change (written by the agent that ran the flow):\n{}",
-        render_facts(&facts),
-        quoted(&kept)
-    );
-    if let Some(cut) = cut {
-        shown.push_str(&cut);
-        shown.push('\n');
+    let mut shown = render_facts(&facts);
+    match summary {
+        Some(summary) => {
+            let (kept, cut) = capped(summary, SUMMARY_LINES, SUMMARY_CHARS);
+            let _ = write!(
+                shown,
+                "\nSummary of the change (written by the agent that ran the flow):\n{}",
+                quoted(&kept)
+            );
+            if let Some(cut) = cut {
+                shown.push_str(&cut);
+                shown.push('\n');
+            }
+        }
+        None => shown.push_str(
+            "\nSummary of the change: (none: `lil dev merge` was run on its own; `lil dev merge-flow` adds the agent's summary)\n",
+        ),
     }
     let pem = auth
         .authenticate(&shown, audit)
         .map_err(|e| anyhow!("{e}; nothing was approved or merged"))?;
-    let guard_rerun = if !facts.protected.is_empty() && !facts.already_approved {
-        steps.post_approval(&pem, &facts)?
-    } else {
-        false
-    };
+    // Every merge, protected files or not (owner decision 2026-10-26): the protected-test check
+    // passes only once the App approved this exact head.
+    let guard_rerun = steps.post_approval(&pem, &facts)?;
     drop(pem);
     steps.wait_for_checks(&facts, guard_rerun)?;
     let gate = Authenticated {

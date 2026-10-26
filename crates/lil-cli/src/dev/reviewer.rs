@@ -62,8 +62,10 @@
 //! key with it first and asks for the passphrase only when Hello is cancelled or fails; the
 //! passphrase file stays. The key file and its encryption are in `reviewer_key.rs`.
 //! [`with_owner_authenticator`] is the authentication every `lil dev merge` and every
-//! `lil dev merge-flow` asks for, and [`run_merge_flow`] wires the flow (`merge_flow.rs`) to git
-//! and GitHub; the flow posts the approval with [`approve_with_key`] after you authenticated.
+//! `lil dev merge-flow` asks for, and [`run_merge_flow`] and [`run_merge_alone`] wire the flow
+//! (`merge_flow.rs`) to git and GitHub; the flow posts the approval with [`approve_with_key`]
+//! after you authenticated, on every merge, protected files or not (owner decision 2026-10-26:
+//! the protected-test check needs it on every PR).
 
 use super::github::{API_BASE, CheckState, GitHubApi, PrInfo, WorkflowRun};
 use super::guard;
@@ -71,7 +73,7 @@ use super::merge::{
     self, MergeGuardConfig, blocker_lines, check_origin, committed_config, explain, fetch,
     is_commit_sha, one_line, short,
 };
-use super::merge_flow::{Facts, MergeFlowSteps, MergeGate, merge_flow};
+use super::merge_flow::{Facts, MergeFlowSteps, MergeGate, merge_alone, merge_flow};
 use super::reviewer_hello::{
     Authenticator, HelloPlatform, KeyAuthenticator, NoTerminal, PassphraseUnlocker, Unlocker,
     WindowsHello, enrolled_hello, unlock_reviewer_key,
@@ -438,6 +440,8 @@ pub(crate) enum ApprovedVia {
     Approve,
     /// `lil dev merge-flow`, after Windows Hello or the passphrase.
     MergeFlow,
+    /// `lil dev merge` on its own, after Windows Hello or the passphrase.
+    Merge,
 }
 
 /// The approval review's body for `lil dev approve`. Control characters are escaped (R23).
@@ -453,12 +457,21 @@ pub(crate) fn review_body_via(head: &str, summary: &str, via: ApprovedVia) -> St
         ApprovedVia::MergeFlow => {
             "with `lil dev merge-flow` after their own Windows Hello or passphrase authentication"
         }
+        ApprovedVia::Merge => {
+            "with `lil dev merge` after their own Windows Hello or passphrase authentication"
+        }
     };
     let mut body = format!(
-        "Approved by the repo owner {how}, for commit {} only.\n\nProtected changes approved:\n",
+        "Approved by the repo owner {how}, for commit {} only.\n\n",
         guard::escape_controls(head)
     );
-    for line in summary_lines(summary) {
+    let mut lines = summary_lines(summary).peekable();
+    if lines.peek().is_none() {
+        body.push_str("No protected files changed; every merge into main carries this approval.\n");
+    } else {
+        body.push_str("Protected changes approved:\n");
+    }
+    for line in lines {
         body.push_str(&format!("- {line}\n"));
     }
     body
@@ -1313,6 +1326,8 @@ struct FlowSteps<'a, 'g> {
     now_unix: &'a dyn Fn() -> i64,
     /// The fresh settings and the client `facts` built, for the later steps.
     state: std::cell::RefCell<Option<(MergeGuardConfig, Box<dyn GitHubApi + 'g>)>>,
+    /// Which command posts the approval, as its review body says.
+    via: ApprovedVia,
 }
 
 impl FlowSteps<'_, '_> {
@@ -1403,9 +1418,14 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 short(&head)
             )
         })?;
-        let protected = blocker_lines(&verdict);
-        let already_approved = !protected.is_empty()
-            && merge::app_approved(&gh.reviews(self.pr)?, &cfg.reviewer_login(), &head);
+        // Empty when nothing protected changed (`blocker_lines` would say so in a line).
+        let protected = if verdict.needs_approval.is_empty() {
+            Vec::new()
+        } else {
+            blocker_lines(&verdict)
+        };
+        let already_approved =
+            merge::app_approved(&gh.reviews(self.pr)?, &cfg.reviewer_login(), &head);
         let mut checks = Vec::new();
         for name in &cfg.required_checks {
             let state = gh
@@ -1446,7 +1466,7 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 (self.now_unix)(),
                 &facts.head,
                 self.pause,
-                ApprovedVia::MergeFlow,
+                self.via,
             )
         })?;
         println!(
@@ -1526,28 +1546,53 @@ pub fn run_merge_flow(
     audit_path: &Path,
     passphrase_only: bool,
 ) -> i32 {
-    let refuse = |message: &str| {
-        eprintln!(
-            "lil dev merge-flow refused PR #{pr}: {}",
-            guard::escape_controls(&one_line(message))
-        );
-        1
-    };
     // Local checks first, before any network call.
     let texts = read_flow_text(summary_path, "summary")
         .and_then(|summary| Ok((summary, read_flow_text(audit_path, "audit")?)));
-    let (summary, audit) = match texts {
+    let texts = match texts {
         Ok(t) => t,
-        Err(e) => return refuse(&format!("{e:#}")),
+        Err(e) => {
+            eprintln!(
+                "lil dev merge-flow refused PR #{pr}: {}",
+                guard::escape_controls(&one_line(&format!("{e:#}")))
+            );
+            return 1;
+        }
+    };
+    run_flow(pr, Some(texts), passphrase_only)
+}
+
+/// `lil dev merge <pr> [--passphrase]`: the flow without an agent's summary or audit. Exit 0 when
+/// merged, 1 otherwise.
+pub fn run_merge_alone(pr: u64, passphrase_only: bool) -> i32 {
+    run_flow(pr, None, passphrase_only)
+}
+
+/// The flow's wiring: `texts` is the summary and the audit for `lil dev merge-flow`, `None` for
+/// `lil dev merge` on its own.
+fn run_flow(pr: u64, texts: Option<(String, String)>, passphrase_only: bool) -> i32 {
+    let command = if texts.is_some() {
+        "lil dev merge-flow"
+    } else {
+        "lil dev merge"
+    };
+    let refuse = |message: &str| {
+        eprintln!(
+            "{command} refused PR #{pr}: {}",
+            guard::escape_controls(&one_line(message))
+        );
+        1
     };
     let repo = match super::root::repo_root() {
         Ok(r) => r,
         Err(e) => return refuse(&e),
     };
+    // QA-034: the committed settings and the hooks come first, before any network call.
     let (checked, hooks) = match merge::preflight(&repo) {
         Ok(x) => x,
         Err(refusals) => return refuse(&explain(&refusals)),
     };
+    // R13: only fetch from, and merge through, the repo the settings name.
     if let Err(r) = check_origin(&repo, &checked) {
         return refuse(&explain(&[r]));
     }
@@ -1571,8 +1616,16 @@ pub fn run_merge_flow(
             pause: &std::thread::sleep,
             now_unix: &unix_now,
             state: std::cell::RefCell::new(None),
+            via: if texts.is_some() {
+                ApprovedVia::MergeFlow
+            } else {
+                ApprovedVia::Merge
+            },
         };
-        merge_flow(&summary, &audit, &steps, auth)
+        match &texts {
+            Some((summary, audit)) => merge_flow(summary, audit, &steps, auth),
+            None => merge_alone(&steps, auth),
+        }
     });
     match outcome {
         Ok(Ok(merge_sha)) => {
@@ -3890,6 +3943,7 @@ mod tests {
             pause,
             now_unix: &|| NOW,
             state: std::cell::RefCell::new(None),
+            via: ApprovedVia::MergeFlow,
         }
     }
 
@@ -3916,6 +3970,49 @@ mod tests {
             posted[0].body
         );
         assert_eq!(fake.pr(42).unwrap().state, "closed");
+    }
+
+    /// Owner decision 2026-10-26: a PR that changes no protected file gets the reviewer App's
+    /// approval of its head too, from `lil dev merge` on its own and from the flow, and then
+    /// merges at that head.
+    #[test] // spec: QA-036, QA-021
+    fn an_ordinary_pr_gets_the_approval_of_its_head_then_merges() {
+        for alone in [true, false] {
+            let (_tmp, work, _, docs) = glue_fixture();
+            let fake = FakeGitHub::new();
+            fake.add_pr(43, &docs, "main");
+            green(&fake, &docs);
+            let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+                Ok(Box::new(FakeRef(&fake)))
+            };
+            let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+            let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+            steps.pr = 43;
+            assert!(steps.facts().unwrap().protected.is_empty());
+            let merged = if alone {
+                steps.via = ApprovedVia::Merge;
+                merge_alone(&steps, &KeyAuth)
+            } else {
+                merge_flow("docs only", "the audit", &steps, &KeyAuth)
+            }
+            .unwrap();
+            assert_eq!(merged, format!("merge-of-{docs}"));
+            let posted = fake.posted_reviews();
+            assert_eq!(posted.len(), 1, "alone {alone}");
+            assert_eq!(posted[0].sha, docs);
+            let command = if alone {
+                "`lil dev merge` after"
+            } else {
+                "`lil dev merge-flow` after"
+            };
+            assert!(posted[0].body.contains(command), "{}", posted[0].body);
+            assert!(
+                posted[0].body.contains("No protected files changed"),
+                "{}",
+                posted[0].body
+            );
+            assert_eq!(fake.pr(43).unwrap().state, "closed");
+        }
     }
 
     #[test] // spec: QA-036, QA-020
