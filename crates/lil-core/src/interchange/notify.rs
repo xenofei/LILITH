@@ -971,11 +971,12 @@ fn can_post(path: &PathWire) -> bool {
         && path.shortcut == ShortcutWire::Ok
 }
 
-/// `text` as it is posted (module docs, "As posted"): its title and body as the toast shows
-/// them ([`shown_plain`]), then redacted as a diagnostics bundle's entries are, with this PC's
-/// names, redaction always last ([`settled`]); and, while `handlers` isn't `ok`, a toast with a
-/// target without it, its body cut so that it always ends [`OPEN_LILITH`]. The URLs are never
-/// redacted. It reads `suite.toml` and may ask Windows for a short name: call it off the
+/// `text` as it is posted (module docs, "As posted"): its title and body redacted as a
+/// diagnostics bundle's entries are, with this PC's names, as they came, as the toast shows
+/// them and once more after the cut ([`settled`]); and, while `handlers` isn't `ok`, a toast
+/// with a target without it, its body cut so that it always ends [`OPEN_LILITH`]. The title
+/// and the body are redacted apart (a key split between them is a known limit). The URLs are
+/// never redacted. It reads `suite.toml` and may ask Windows for a short name: call it off the
 /// runtime.
 fn as_posted(env: &Env, handlers: &HandlersWire, mut text: ToastText) -> ToastText {
     let suite_toml = std::fs::read_to_string(env.suite_toml_to_read()).ok();
@@ -995,24 +996,38 @@ fn as_posted(env: &Env, handlers: &HandlersWire, mut text: ToastText) -> ToastTe
     text
 }
 
-/// `s` as a toast shows it, at most `max` `char`s, redacted last (CA-walk review I-1): it is
-/// normalised first ([`shown_plain`], so a control character inside a key goes and the key is
-/// whole), then redacted; when that changed it and its result isn't normal any more, again,
-/// at most [`SETTLE_ROUNDS`] times. A text that doesn't settle is shown as `<redacted>`.
+/// `s` as a toast shows it, at most `max` `char`s, redacted in three steps (CA-walk review
+/// I-1 and re-review I-A, M-A, M-B; Appendix G "Toast XML"):
+/// 1. as it came, so a terminal sequence still bounds a key (or goes from inside one) and a
+///    key the cut would run through is redacted whole;
+/// 2. without its default-ignorable characters ([`lil_parse::without_default_ignorables`]),
+///    normalised with no cut ([`shown_plain`]: a control character inside a key goes, and the
+///    key is whole) and redacted, until both leave it as it is ([`settle`]);
+/// 3. cut to `max`, which only removes text, and settled once more.
+///
+/// A text that doesn't settle is shown as `<redacted>`.
 fn settled(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> String {
-    let mut shown = shown_plain(s, max);
+    let (came, n) = redact(s);
+    let came = if n > 0 { came } else { s.to_string() };
+    settle(&came, usize::MAX, redact)
+        .and_then(|whole| settle(&whole, max, redact))
+        .unwrap_or_else(|| crate::diagnostics::redact::REDACTED.to_string())
+}
+
+/// `s` normalised to at most `max` `char`s ([`lil_parse::without_default_ignorables`], then
+/// [`shown_plain`]) and redacted, again until normalising and redaction both leave it as it
+/// is; `None` when it hasn't after [`SETTLE_ROUNDS`] rounds.
+fn settle(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> Option<String> {
+    let norm = |t: &str| shown_plain(&lil_parse::without_default_ignorables(t), max);
+    let mut shown = norm(s);
     for _ in 0..SETTLE_ROUNDS {
         let (redacted, n) = redact(&shown);
         if n == 0 {
-            return shown;
+            return Some(shown);
         }
-        let again = shown_plain(&redacted, max);
-        if again == redacted {
-            return redacted;
-        }
-        shown = again;
+        shown = norm(&redacted);
     }
-    crate::diagnostics::redact::REDACTED.to_string()
+    None
 }
 
 /// Whether every job of `ids` was counted in a restart-hold toast already.

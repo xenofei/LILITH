@@ -880,6 +880,131 @@ fn a_key_split_by_a_control_character_is_redacted_as_shown() {
     );
 }
 
+/// The body of the `notify.claude_code` notice whose body starts `<tag>: `, posted.
+fn notice_body(p: &mut RawPipe, tag: &str) -> String {
+    let head = format!("{tag}: ");
+    until(&format!("the {tag} notice"), || {
+        posts(p, "agent_activity").into_iter().find_map(|t| {
+            t["body"]
+                .as_str()
+                .filter(|b| b.starts_with(&head))
+                .map(str::to_string)
+        })
+    })
+}
+
+/// Re-review I-A: a key the 200-character cut runs through is redacted whole, as it came,
+/// before the cut, so no head of it is left in the toast.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_across_the_cut_is_redacted_whole() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut leaks = Vec::new();
+    for (tag, pad, key) in [
+        ("ghp", 37, format!("ghp_{}", "A1".repeat(18))),
+        ("age", 32, format!("AGE-SECRET-KEY-1{}", "G7".repeat(29))),
+        ("akia", 37, "AKIAQ3EXAMPLE7FAKE99".to_string()),
+    ] {
+        // The key starts at character 185 (160 for the age key), so the cut runs through it.
+        let message = format!("{tag}: {}{key} and more", "word ".repeat(pad - 1));
+        write(&mut p, "notify.claude_code", json!({ "message": message }));
+        let body = notice_body(&mut p, tag);
+        assert!(body.chars().count() <= 200, "{tag}: {body}");
+        if body.contains(&key[..8]) || !body.contains("<redact") {
+            leaks.push(body);
+        }
+    }
+    assert!(leaks.is_empty(), "a head of a key is left: {leaks:#?}");
+}
+
+/// Re-review I-A: a terminal sequence still bounds a key, and one inside a key doesn't hide
+/// it: an ANSI-coloured AWS key id and Slack token, and a GitHub token a CSI splits.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_coloured_or_csi_split_key_is_redacted() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut leaks = Vec::new();
+    for (tag, text, secret) in [
+        (
+            "akia",
+            "error: \u{1b}[31mAKIAQ3EXAMPLE7FAKE99\u{1b}[0m done",
+            "Q3EXAMPLE7FAKE99",
+        ),
+        (
+            "xoxb",
+            "token \u{1b}[32mxoxb-1234567890-abcdefghijklmnop\u{1b}[0m set",
+            "abcdefghijklmnop",
+        ),
+        (
+            "csi",
+            "push ghp_Z9yX8\u{1b}[0mwV7uT6sR5qP4oN3mL2kJ1 failed",
+            "wV7uT6sR5qP4oN3mL2kJ1",
+        ),
+    ] {
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({ "message": format!("{tag}: {text}") }),
+        );
+        let body = notice_body(&mut p, tag);
+        if body.contains(secret) || !body.contains("<redacted>") {
+            leaks.push(body);
+        }
+    }
+    assert!(leaks.is_empty(), "{leaks:#?}");
+}
+
+/// Re-review M-A: a Unicode default-ignorable character inside a key (a format control, a
+/// variation selector, a filler, a tag character) is removed before the toast's text is
+/// redacted, so it can't hide the key; the bidirectional controls are still shown as markers.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn an_invisible_character_inside_a_key_is_removed_and_the_key_redacted() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let half = "A1".repeat(9);
+    let mut leaks = Vec::new();
+    for (i, c) in [
+        '\u{200b}',
+        '\u{2060}',
+        '\u{ad}',
+        '\u{34f}',
+        '\u{180e}',
+        '\u{2062}',
+        '\u{fe0f}',
+        '\u{3164}',
+        '\u{e0041}',
+        '\u{feff}',
+        '\u{200c}',
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tag = format!("i{i}");
+        let message = format!("{tag}: upload failed: ghp_{half}{c}{half}");
+        write(&mut p, "notify.claude_code", json!({ "message": message }));
+        let body = notice_body(&mut p, &tag);
+        if body != format!("{tag}: upload failed: <redacted>") {
+            leaks.push(format!("U+{:04X}: {body}", u32::from(c)));
+        }
+    }
+    assert!(leaks.is_empty(), "{leaks:#?}");
+    write(
+        &mut p,
+        "notify.claude_code",
+        json!({"message": "bidi: a\u{202e}b"}),
+    );
+    assert_eq!(
+        notice_body(&mut p, "bidi"),
+        "bidi: a\u{27e8}U+202E\u{27e9}b"
+    );
+}
+
 /// Review M-2: a zero cap's alerts show the spend itself, since no percentage of 0 exists.
 #[test] // spec: APP-146, CORE-089
 fn a_zero_caps_alerts_show_the_spend() {
