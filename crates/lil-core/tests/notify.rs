@@ -1306,8 +1306,8 @@ fn cap_alert_posts_once_per_threshold() {
     let _core = core(&env);
     let mut p = pipe(&env, json!({"non_interactive": true}));
     ready(&mut p);
-    // 60 %, 70 %, 85 %, 100 %.
-    for amount in ["0.6", "0.1", "0.15", "0.15"] {
+    // 30 %, then 95 % (past 50 % and 80 % at once), then 100 %.
+    for amount in ["0.3", "0.65", "0.05"] {
         write(
             &mut p,
             "test.meter_external",
@@ -1315,21 +1315,32 @@ fn cap_alert_posts_once_per_threshold() {
         );
     }
     let alerts = until_posts(&mut p, "cap_alert", 3);
-    let titles: Vec<&str> = alerts
+    // Owner decision 2026-10-26 (Checkpoint A walkthrough): one toast per threshold, each
+    // with the spend as it was then.
+    let text = |t: &Value, k: &str| t[k].as_str().unwrap().to_string();
+    let period = text(&alerts[0], "title")
+        .rsplit_once('(')
+        .and_then(|(_, p)| p.strip_suffix(')'))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("{alerts:?}"));
+    assert!(
+        period.len() == 7 && period.as_bytes()[4] == b'-',
+        "{period}"
+    );
+    let shown: Vec<(String, String)> = alerts
         .iter()
-        .map(|t| t["title"].as_str().unwrap())
+        .map(|t| (text(t, "title"), text(t, "body")))
         .collect();
+    let spending = |pct: u32| format!("Spending at {pct} % of your monthly cap ({period})");
     assert_eq!(
-        titles,
-        ["Spending at 50 %", "Spending at 80 %", "Spending at 100 %"]
+        shown,
+        [
+            (spending(95), "Alert at 50 %".to_string()),
+            (spending(95), "Alert at 80 %".to_string()),
+            (spending(100), "Alert at 100 %".to_string()),
+        ]
     );
     for t in &alerts {
-        assert!(
-            t["body"]
-                .as_str()
-                .is_some_and(|b| b.starts_with("monthly cap, ")),
-            "{t}"
-        );
         assert!(t.get("launch").is_none(), "no target: {t}");
     }
     let tags: std::collections::HashSet<&str> =

@@ -324,7 +324,12 @@ impl Notifier {
                         .get("threshold_pct")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    me.cap_alert(text("cap"), pct, text("period")).await;
+                    let spent = p
+                        .data
+                        .get("spent_pct")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(pct);
+                    me.cap_alert(text("cap"), pct, spent, text("period")).await;
                 }
             }
             events.drop_client(CAPS_CLIENT);
@@ -740,11 +745,13 @@ impl Notifier {
         }
     }
 
-    /// A cap alert: "Spending at <pct> %" / "<cap> cap, <period>", with no launch target.
-    async fn cap_alert(&self, cap: &str, pct: u64, period: &str) {
+    /// A cap alert: "Spending at <spent> % of your <cap> cap (<period>)" / "Alert at <pct> %",
+    /// with no launch target: one per threshold crossed, each with the spend as it was
+    /// (owner decision 2026-10-26).
+    async fn cap_alert(&self, cap: &str, pct: u64, spent: u64, period: &str) {
         let text = ToastText {
-            title: format!("Spending at {pct} %"),
-            body: format!("{cap} cap, {period}"),
+            title: format!("Spending at {spent} % of your {cap} cap ({period})"),
+            body: format!("Alert at {pct} %"),
             launch: None,
             actions: ToastActions::None,
         };
