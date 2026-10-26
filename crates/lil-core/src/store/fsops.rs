@@ -722,6 +722,29 @@ mod tests {
 
     /// Review N3: the old file at the backup name is removed only once the new file is in
     /// place; a failed replace puts it back, and when that fails too it is kept.
+    /// Review M-5: the cache writer's retry, deterministically: a sharing violation (32, 33
+    /// or 1224) is tried again until the call works; any other error ends it at once.
+    #[test] // spec: APP-021, ARCH-074
+    fn a_sharing_violation_is_retried_and_nothing_else_is() {
+        let mut errors = vec![32, 33, 1224].into_iter();
+        let mut calls = 0;
+        let done = retry_sharing(|| {
+            calls += 1;
+            errors
+                .next()
+                .map_or(Ok(()), |code| Err(std::io::Error::from_raw_os_error(code)))
+        });
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(calls, 4, "three violations, then the call that worked");
+        let mut calls = 0;
+        let denied = retry_sharing(|| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(denied.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(calls, 1, "access denied is no sharing violation");
+    }
+
     #[test] // spec: APP-021, ARCH-119
     #[allow(clippy::disallowed_methods)] // plants the old file at its backup name
     fn a_failed_restore_keeps_the_old_file() {

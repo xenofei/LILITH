@@ -732,7 +732,9 @@ fn suite_cache_leftovers_older_than_a_day_are_swept() {
 
 /// Checkpoint A store M3: a `.lilref` someone holds open without `FILE_SHARE_DELETE` (a reader
 /// or a scanner) is replaced once they let go, within the store's backoff, instead of failing
-/// at once.
+/// at once. A smoke test of the real files: whether the writer meets the held file first rests
+/// on timing, so the retry itself is tested deterministically by `fsops`'
+/// `a_sharing_violation_is_retried_and_nothing_else_is` (review M-5).
 #[test] // spec: APP-021, ARCH-074
 #[allow(clippy::disallowed_methods)] // holds the file open without FILE_SHARE_DELETE
 fn a_sharing_violation_on_the_cache_writer_is_retried() {
