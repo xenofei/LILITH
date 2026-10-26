@@ -127,6 +127,9 @@ impl Diagnostics {
         message: &str,
         at_ms: i64,
     ) {
+        // The redaction reads suite.toml and asks Windows for one short name, for every error
+        // kept (a tool call's or a job's), as the caps read suite.toml at each use: brief, and
+        // only on an error path.
         let suite_toml = std::fs::read_to_string(self.env.suite_toml_to_read()).ok();
         let (message, _) = bundle::redactor_for(&self.env, suite_toml.as_deref()).text(message);
         lock(&self.errors).push(code, tool, job_id, &message, at_ms);
@@ -194,8 +197,6 @@ impl JobCompletion for Diagnostics {
             if is_cancelled(outcome) || never_started(outcome) || resolved_unknown(outcome) {
                 return;
             }
-            // The redaction reads suite.toml and one short name, as the caps read suite.toml
-            // at each use: brief, and only for a failure.
             self.record_job_error(job, error);
         })
     }
@@ -220,7 +221,8 @@ impl ConnObserver for Diagnostics {
 const RECENT_DESCRIPTION: &str = "Returns the core's recent errors grouped by code, the code \
     whose last error is newest first: for each, the code, how many of the core's last 1,000 \
     error outcomes had it, when the first and the last of them were (RFC 3339 UTC), the last \
-    one's message (redacted as a diagnostics bundle is) and the tool it came from, or for a     job's failure the job's kind and id. `limit` is 1-200 (default 50).";
+    one's message (redacted as a diagnostics bundle is) and the tool it came from, or for a \
+    job's failure the job's kind and id. `limit` is 1-200 (default 50).";
 
 const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the suite's \
     diagnostics folder, and returns its path, its size in bytes, the files in it and how many \

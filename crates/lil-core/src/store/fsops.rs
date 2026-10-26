@@ -720,8 +720,6 @@ pub fn append_locked(
 mod tests {
     use super::*;
 
-    /// Review N3: the old file at the backup name is removed only once the new file is in
-    /// place; a failed replace puts it back, and when that fails too it is kept.
     /// Review M-5: the cache writer's retry, deterministically: a sharing violation (32, 33
     /// or 1224) is tried again until the call works; any other error ends it at once.
     #[test] // spec: APP-021, ARCH-074
@@ -745,6 +743,8 @@ mod tests {
         assert_eq!(calls, 1, "access denied is no sharing violation");
     }
 
+    /// Review N3: the old file at the backup name is removed only once the new file is in
+    /// place; a failed replace puts it back, and when that fails too it is kept.
     #[test] // spec: APP-021, ARCH-119
     #[allow(clippy::disallowed_methods)] // plants the old file at its backup name
     fn a_failed_restore_keeps_the_old_file() {
