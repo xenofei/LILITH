@@ -882,6 +882,31 @@ pub async fn open_rows(db: &StateDb) -> Result<Vec<JobRow>, StateError> {
     .await
 }
 
+/// [`COLUMNS`] with the job's arguments and its tool call's arguments read as NULL: what a
+/// summary never shows (a `comfy.prompt`'s whole graph).
+fn brief_columns() -> String {
+    let brief = COLUMNS
+        .replacen("module, args, ", "module, NULL, ", 1)
+        .replacen("tool, tool_args, ", "tool, NULL, ", 1);
+    debug_assert_eq!(brief.matches("NULL").count(), 2, "{brief}");
+    brief
+}
+
+/// [`list`], each row without its arguments (`args` and the origin's `arguments` are
+/// `null`): enough for its summary (`jobs.list`; review fix M-2).
+///
+/// # Errors
+/// As [`list`].
+pub async fn list_brief(
+    db: &StateDb,
+    f: &JobFilter,
+    since: Option<i64>,
+    limit: u32,
+    before: Option<i64>,
+) -> Result<Vec<JobRow>, StateError> {
+    list_columns(db, f, since, limit, before, brief_columns()).await
+}
+
 /// The rows `f` selects, newest first, at most `limit`, before the cursor `before` (a `seq`).
 /// `since` is Unix seconds: the rows whose `updated` is later.
 pub async fn list(
@@ -891,10 +916,22 @@ pub async fn list(
     limit: u32,
     before: Option<i64>,
 ) -> Result<Vec<JobRow>, StateError> {
+    list_columns(db, f, since, limit, before, COLUMNS.to_string()).await
+}
+
+/// [`list`] reading `columns` (in [`COLUMNS`]' order).
+async fn list_columns(
+    db: &StateDb,
+    f: &JobFilter,
+    since: Option<i64>,
+    limit: u32,
+    before: Option<i64>,
+    columns: String,
+) -> Result<Vec<JobRow>, StateError> {
     let f = f.clone();
     db.call(move |conn| {
         let run = || -> rusqlite::Result<Vec<JobRow>> {
-            let mut sql_text = format!("SELECT {COLUMNS} FROM jobs WHERE 1 = 1");
+            let mut sql_text = format!("SELECT {columns} FROM jobs WHERE 1 = 1");
             let mut values: Vec<rusqlite::types::Value> = Vec::new();
             let mut bind = |sql_text: &mut String, clause: &str, v: rusqlite::types::Value| {
                 values.push(v);

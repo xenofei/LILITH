@@ -2400,6 +2400,122 @@ async fn queue_position_and_queue_order_follow_a_move() {
     fx.shutdown().await;
 }
 
+/// Review I-1: a job a restart holds is never picked until it is released, so it has no
+/// `queue_position`, isn't counted ahead of a job submitted after it, and the queue order lists
+/// it after the runnable jobs of its lane.
+#[tokio::test(start_paused = true)] // spec: CORE-160, ARCH-022
+async fn a_restart_held_job_has_no_place_and_is_listed_last() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let held = fx
+        .submit(spec(Lane::Cpu, Priority::User, json!({})))
+        .await
+        .job_id;
+    let (restarted, fresh, _) = restart(&fx).await;
+    let gate = restarted
+        .submit(&fx.ctx(), gated(Lane::Cpu, Priority::Agent, "never"))
+        .await
+        .unwrap();
+    fresh.until_started(&gate.job_id).await;
+    let later = restarted
+        .submit(&fx.ctx(), spec(Lane::Cpu, Priority::User, json!({})))
+        .await
+        .unwrap()
+        .job_id;
+    let place = |id: &str| {
+        let restarted = restarted.clone();
+        let (ctx, id) = (fx.ctx(), JobId(id.to_string()));
+        async move { restarted.get(&ctx, &id).await.unwrap().queue_position }
+    };
+    assert_eq!(place(&held).await, None, "held after a restart");
+    assert_eq!(place(&later).await, Some(0), "next to run");
+    let f = JobFilter {
+        order: Some(ListOrder::Queue),
+        ..JobFilter::default()
+    };
+    let listed: Vec<(String, Option<u32>)> = restarted
+        .list(&fx.ctx(), f)
+        .await
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|j| (j.job_id, j.queue_position))
+        .collect();
+    assert_eq!(listed, [(later, Some(0)), (held, None)]);
+    fx.shutdown().await;
+}
+
+/// Review M-1: the queue order's cursor names the last job's place, so a queue that changes
+/// between pages skips and repeats nothing.
+#[tokio::test(start_paused = true)] // spec: CORE-160
+async fn the_queue_orders_cursor_survives_a_change_between_pages() {
+    let fx = Fx::suite().await;
+    running_gate(&fx, Lane::Cpu, "never").await;
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ids.push(
+            fx.submit(spec(Lane::Cpu, Priority::Agent, json!({})))
+                .await
+                .job_id,
+        );
+    }
+    let page = |cursor: Option<String>| JobFilter {
+        order: Some(ListOrder::Queue),
+        limit: Some(2),
+        cursor,
+        ..JobFilter::default()
+    };
+    let names = |jobs: Vec<JobSummary>| jobs.into_iter().map(|j| j.job_id).collect::<Vec<_>>();
+    let (first, next) = fx.jobs.list(&fx.ctx(), page(None)).await.unwrap();
+    assert_eq!(names(first), ids[..2]);
+    // The first job leaves the queue: every place behind it moves up one.
+    fx.jobs
+        .cancel(&fx.ctx(), &JobId(ids[0].clone()))
+        .await
+        .unwrap();
+    let (second, next) = fx.jobs.list(&fx.ctx(), page(next.clone())).await.unwrap();
+    assert_eq!((names(second), next), (ids[2..].to_vec(), None));
+    // An interactive job submitted at the queue's front isn't listed again on a later page.
+    fx.submit(spec(
+        Lane::Cpu,
+        Priority::Interactive,
+        json!({"gate": "never"}),
+    ))
+    .await;
+    let (_, after_first) = fx.jobs.list(&fx.ctx(), page(None)).await.unwrap();
+    let (rest, _) = fx.jobs.list(&fx.ctx(), page(after_first)).await.unwrap();
+    assert_eq!(names(rest), ids[2..]);
+    fx.shutdown().await;
+}
+
+/// Review M-2: a jobs.list page reads its rows without their arguments (a `comfy.prompt`'s
+/// whole graph), which no summary shows.
+#[tokio::test(start_paused = true)] // spec: CORE-146
+async fn a_list_reads_rows_without_their_arguments() {
+    let fx = Fx::suite().await;
+    let job = fx
+        .submit(spec(Lane::Cpu, Priority::Agent, json!({"big": "x"})))
+        .await;
+    fx.finished(&job.job_id).await;
+    let db = fx.states.suite_db();
+    let full = record::list(&db, &JobFilter::default(), None, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(full[0].args["big"], "x");
+    assert!(full[0].origin.is_some());
+    let brief = record::list_brief(&db, &JobFilter::default(), None, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(brief[0].args, Value::Null);
+    assert_eq!(brief[0].origin.as_ref().unwrap().arguments, Value::Null);
+    assert_eq!(
+        brief[0].summary(None),
+        full[0].summary(None),
+        "the summary is the same"
+    );
+    fx.shutdown().await;
+}
+
 /// Checkpoint A I4: a summary leaves out `result.structured.executed_graph`; the row and the
 /// diagnostics bundle's job (`get_with_origin`) keep it.
 #[tokio::test(start_paused = true)] // spec: CORE-130, ARCH-025
@@ -2433,6 +2549,14 @@ async fn a_summary_leaves_out_the_executed_graph() {
         .await
         .unwrap();
     assert_eq!(full.result.unwrap().structured["executed_graph"], graph);
+    // Review M-9: `get` serves the summary as every other path does.
+    let got = fx
+        .jobs
+        .get(&fx.ctx(), &JobId(job.job_id.clone()))
+        .await
+        .unwrap();
+    let got = got.result.unwrap().structured;
+    assert!(got.get("executed_graph").is_none(), "{got}");
     fx.shutdown().await;
 }
 

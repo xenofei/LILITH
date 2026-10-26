@@ -278,6 +278,20 @@ impl Active {
         )
     }
 
+    /// Its place in `jobs.list {order: "queue"}`: its lane, then a job a restart holds after
+    /// the others, then [`Active::queue_key`].
+    fn place(&self) -> QueuePlace {
+        let (priority, not_head, order_key, job_id) = self.queue_key();
+        QueuePlace {
+            lane: self.info.spec.lane.index(),
+            held: self.restart_held,
+            priority,
+            not_head,
+            order_key,
+            job_id: job_id.to_string(),
+        }
+    }
+
     /// The reasons that hold this queued job (none for a job that runs or ends; a withdrawn
     /// one is queued again while its attempt winds down).
     fn hold_reasons(&self, lane: &LaneState) -> Vec<String> {
@@ -306,6 +320,62 @@ struct Queue {
     /// Each lane's `QueueState` as `jobs` last got it; `None`: never published, so an idle
     /// lane's.
     published: [Option<QueueState>; 2],
+}
+
+/// A queued job's place in `jobs.list {order: "queue"}`, compared field by field in this
+/// order; its text form is the queue order's cursor (`q.<lane>.<held>.<class>.<not head>.
+/// <order_key>.<job_id>`), so a page goes on after the last job's place even when the queue
+/// changed meanwhile (review fix M-1).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct QueuePlace {
+    lane: usize,
+    /// Held by a restart: listed after the lane's other jobs.
+    held: bool,
+    priority: Priority,
+    not_head: bool,
+    order_key: i64,
+    job_id: String,
+}
+
+impl QueuePlace {
+    fn cursor(&self) -> String {
+        format!(
+            "q.{}.{}.{}.{}.{}.{}",
+            self.lane,
+            u8::from(self.held),
+            self.priority.wire(),
+            u8::from(self.not_head),
+            self.order_key,
+            self.job_id
+        )
+    }
+
+    fn parse(cursor: &str) -> Option<QueuePlace> {
+        let mut parts = cursor.strip_prefix("q.")?.splitn(6, '.');
+        let flag = |p: Option<&str>| match p? {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        };
+        let lane = parts
+            .next()?
+            .parse()
+            .ok()
+            .filter(|l: &usize| *l < Lane::ALL.len())?;
+        let held = flag(parts.next())?;
+        let priority = Priority::parse(parts.next()?)?;
+        let not_head = flag(parts.next())?;
+        let order_key = parts.next()?.parse().ok()?;
+        let job_id = parts.next().filter(|id| !id.is_empty())?.to_string();
+        Some(QueuePlace {
+            lane,
+            held,
+            priority,
+            not_head,
+            order_key,
+            job_id,
+        })
+    }
 }
 
 /// A state change applies only while the job, as the queue holds it, passes this check.
@@ -592,36 +662,38 @@ impl Shared {
         })
     }
 
-    /// `a`'s 0-based place among its lane's queued jobs of every scope, when it is queued
-    /// (Appendix G "Queue position").
+    /// `a`'s 0-based place among its lane's queued jobs of every scope that the lane
+    /// dispatches in their turn, when it is one of them (Appendix G "Queue position"): a job a
+    /// restart holds is never picked until it is released, so it has no place and isn't
+    /// counted ahead of another (review fix I-1); a lane reason holds every job of its classes
+    /// alike, so a job it holds keeps its place.
     fn queue_position(q: &Queue, a: &Active) -> Option<u32> {
-        if !a.queued() {
+        let in_turn = |o: &Active| o.queued() && !o.restart_held;
+        if !in_turn(a) {
             return None;
         }
         let mine = a.queue_key();
         let ahead = q
             .jobs
             .values()
-            .filter(|o| o.info.spec.lane == a.info.spec.lane && o.queued() && o.queue_key() < mine)
+            .filter(|o| o.info.spec.lane == a.info.spec.lane && in_turn(o) && o.queue_key() < mine)
             .count();
         Some(u32::try_from(ahead).unwrap_or(u32::MAX))
     }
 
-    /// The ids of `scope`'s jobs this core holds queued, by lane (`gpu-heavy` first), then by
-    /// queue order (`jobs.list {order: "queue"}`).
-    fn queued_in_order(&self, scope: &Scope) -> Vec<String> {
+    /// `scope`'s jobs this core holds queued, with their places, in `jobs.list {order:
+    /// "queue"}` order ([`QueuePlace`]).
+    fn queued_in_order(&self, scope: &Scope) -> Vec<(QueuePlace, String)> {
         let q = self.queue();
         let key = scope.key();
-        let mut queued: Vec<&Active> = q
+        let mut queued: Vec<(QueuePlace, String)> = q
             .jobs
             .values()
             .filter(|a| a.queued() && a.info.scope.key() == key)
+            .map(|a| (a.place(), a.info.id.to_string()))
             .collect();
-        queued.sort_by(|a, b| {
-            (a.info.spec.lane.index(), a.queue_key())
-                .cmp(&(b.info.spec.lane.index(), b.queue_key()))
-        });
-        queued.into_iter().map(|a| a.info.id.to_string()).collect()
+        queued.sort();
+        queued
     }
 
     /// The summaries of `rows`' first jobs, at most `limit`, ending before their JSON passes
@@ -3059,9 +3131,22 @@ impl Jobs {
     /// # Errors
     /// `job.unknown`; `state.unavailable`.
     pub async fn get(&self, caller: &JobCaller, id: &JobId) -> Result<JobSummary, ErrorBody> {
-        self.get_with_origin(caller, id)
+        let s = &self.shared;
+        let row = self.row_of(caller, id).await?;
+        Ok(s.summary(&row))
+    }
+
+    /// Job `id`'s row in `caller`'s scope, after its recovery.
+    async fn row_of(&self, caller: &JobCaller, id: &JobId) -> Result<JobRow, ErrorBody> {
+        let s = &self.shared;
+        let scope = s.scope_of(caller);
+        s.ensure_recovered(&scope)
             .await
-            .map(|(summary, _)| summary)
+            .map_err(|e| state_unavailable(&e, &caller.trace_id))?;
+        record::get(scope.db(), id.as_str())
+            .await
+            .map_err(|e| state_unavailable(&e, &caller.trace_id))?
+            .ok_or_else(|| job_unknown(id.as_str(), &caller.trace_id))
     }
 
     /// [`Jobs::get`], with the tool call that made the job when one did: the diagnostics
@@ -3075,15 +3160,9 @@ impl Jobs {
         id: &JobId,
     ) -> Result<(JobSummary, Option<JobOrigin>), ErrorBody> {
         let s = &self.shared;
-        let scope = s.scope_of(caller);
-        s.ensure_recovered(&scope)
-            .await
-            .map_err(|e| state_unavailable(&e, &caller.trace_id))?;
-        let row = record::get(scope.db(), id.as_str())
-            .await
-            .map_err(|e| state_unavailable(&e, &caller.trace_id))?
-            .ok_or_else(|| job_unknown(id.as_str(), &caller.trace_id))?;
-        // The bundle's `job.json` keeps the whole result, the executed graph included.
+        let row = self.row_of(caller, id).await?;
+        // The bundle's `job.json` keeps the whole result, the executed graph included: the
+        // one summary that does (review fix M-9; `get` serves the shown one).
         let mut summary = s.summary(&row);
         summary.result.clone_from(&row.result);
         Ok((summary, row.origin))
@@ -3112,13 +3191,13 @@ impl Jobs {
         let bad_cursor =
             |c: &str| params_invalid(format!("{c:?} is not a jobs.list cursor"), trace_id);
         let queue_order = f.order == Some(ListOrder::Queue);
-        let (before, offset) = match &f.cursor {
-            None => (None, 0),
-            Some(c) if queue_order => {
-                let offset = c.strip_prefix('q').and_then(|n| n.parse::<usize>().ok());
-                (None, offset.ok_or_else(|| bad_cursor(c))?)
-            }
-            Some(c) => (Some(c.parse::<i64>().map_err(|_| bad_cursor(c))?), 0),
+        let (before, after) = match &f.cursor {
+            None => (None, None),
+            Some(c) if queue_order => (
+                None,
+                Some(QueuePlace::parse(c).ok_or_else(|| bad_cursor(c))?),
+            ),
+            Some(c) => (Some(c.parse::<i64>().map_err(|_| bad_cursor(c))?), None),
         };
         // `updated` is kept in whole seconds: a `since` with a fractional part keeps the jobs
         // updated in its own second (Appendix G), so the rows updated after the second before.
@@ -3137,33 +3216,43 @@ impl Jobs {
             .await
             .map_err(|e| state_unavailable(&e, trace_id))?;
         if queue_order {
-            let order = s.queued_in_order(&scope);
-            let mut f = f.clone();
-            f.ids = Some(match &f.ids {
-                Some(ids) => order
-                    .iter()
-                    .filter(|id| ids.contains(id))
-                    .cloned()
-                    .collect(),
-                None => order.clone(),
-            });
-            let n = u32::try_from(order.len()).unwrap_or(u32::MAX).max(1);
-            let rows = record::list(scope.db(), &f, since, n, None)
-                .await
-                .map_err(|e| state_unavailable(&e, trace_id))?;
-            let mut by_id: HashMap<String, JobRow> =
-                rows.into_iter().map(|r| (r.job_id.clone(), r)).collect();
-            let ordered: Vec<JobRow> = order
-                .iter()
-                .filter_map(|id| by_id.remove(id))
-                .skip(offset)
+            // The jobs after the cursor's place, read a page (and one more) at a time and only
+            // those, without their arguments (review fixes M-1, M-2).
+            let wanted: Vec<(QueuePlace, String)> = s
+                .queued_in_order(&scope)
+                .into_iter()
+                .filter(|(place, id)| {
+                    after.as_ref().is_none_or(|a| place > a)
+                        && f.ids.as_ref().is_none_or(|ids| ids.contains(id))
+                })
                 .collect();
-            let page = s.page(&ordered, limit as usize);
-            let next = (page.len() < ordered.len()).then(|| format!("q{}", offset + page.len()));
+            let want = limit as usize + 1;
+            let (mut rows, mut places) = (Vec::new(), Vec::new());
+            for chunk in wanted.chunks(want) {
+                let mut cf = f.clone();
+                cf.ids = Some(chunk.iter().map(|(_, id)| id.clone()).collect());
+                let n = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
+                let read = record::list_brief(scope.db(), &cf, since, n, None)
+                    .await
+                    .map_err(|e| state_unavailable(&e, trace_id))?;
+                let mut by_id: HashMap<String, JobRow> =
+                    read.into_iter().map(|r| (r.job_id.clone(), r)).collect();
+                for (place, id) in chunk {
+                    if let Some(row) = by_id.remove(id) {
+                        rows.push(row);
+                        places.push(place);
+                    }
+                }
+                if rows.len() >= want {
+                    break;
+                }
+            }
+            let page = s.page(&rows, limit as usize);
+            let next = (page.len() < rows.len()).then(|| places[page.len() - 1].cursor());
             return Ok((page, next));
         }
         // One row more than the page: there is a next page only when it exists.
-        let rows = record::list(scope.db(), &f, since, limit + 1, before)
+        let rows = record::list_brief(scope.db(), &f, since, limit + 1, before)
             .await
             .map_err(|e| state_unavailable(&e, trace_id))?;
         let page = s.page(&rows, limit as usize);
