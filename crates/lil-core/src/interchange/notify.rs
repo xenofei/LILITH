@@ -71,7 +71,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::toast_xml::{SHOWN_CHARS, ToastActions, ToastText, cut_token, toast_xml};
+use super::toast_xml::{SHOWN_CHARS, ToastActions, ToastText, cut_token, shown_plain, toast_xml};
 use crate::confirm::{Confirm, ListState, NotificationPath};
 use crate::desktop::{DesktopSettingsStore, DesktopWatch, UiApps};
 use crate::events::{ClientId, EventBus};
@@ -102,6 +102,8 @@ const MAX_URL_CHARS: usize = 8192;
 /// How a toast's body ends when its target was left out because the handlers aren't this
 /// channel's (Checkpoint A walkthrough, ODD-6).
 pub const OPEN_LILITH: &str = " · Open LILITH to see it";
+/// How many times a toast's text is normalised and redacted at most before it settles.
+const SETTLE_ROUNDS: usize = 4;
 /// How many job ids counted in restart-hold toasts the suite `state.db` keeps.
 const RESTART_TOASTS_KEPT: i64 = 4096;
 
@@ -946,28 +948,48 @@ fn can_post(path: &PathWire) -> bool {
         && path.shortcut == ShortcutWire::Ok
 }
 
-/// `text` as it is posted (module docs, "As posted"): its title and body redacted as a
-/// diagnostics bundle's entries are, with this PC's names (a text nothing was redacted from
-/// stays as it was); and, while `handlers` isn't `ok`, a toast with a target without it, its
-/// body cut so that it always ends [`OPEN_LILITH`]. The URLs are never redacted. It reads
-/// `suite.toml` and may ask Windows for a short name: call it off the runtime.
+/// `text` as it is posted (module docs, "As posted"): its title and body as the toast shows
+/// them ([`shown_plain`]), then redacted as a diagnostics bundle's entries are, with this PC's
+/// names, redaction always last ([`settled`]); and, while `handlers` isn't `ok`, a toast with a
+/// target without it, its body cut so that it always ends [`OPEN_LILITH`]. The URLs are never
+/// redacted. It reads `suite.toml` and may ask Windows for a short name: call it off the
+/// runtime.
 fn as_posted(env: &Env, handlers: &HandlersWire, mut text: ToastText) -> ToastText {
     let suite_toml = std::fs::read_to_string(env.suite_toml_to_read()).ok();
     let redactor = crate::diagnostics::bundle::redactor_for(env, suite_toml.as_deref()).compile();
-    for s in [&mut text.title, &mut text.body] {
-        let (redacted, n) = redactor.text(s);
-        if n > 0 {
-            *s = redacted;
-        }
-    }
+    let redact = |s: &str| redactor.text(s);
     let targeted = text.launch.is_some() || text.actions != ToastActions::None;
-    if *handlers != HandlersWire::Ok && targeted {
+    let bare = *handlers != HandlersWire::Ok && targeted;
+    text.title = settled(&text.title, SHOWN_CHARS, &redact);
+    if bare {
         text.launch = None;
         text.actions = ToastActions::None;
         let room = SHOWN_CHARS - OPEN_LILITH.chars().count();
-        text.body = format!("{}{OPEN_LILITH}", lil_parse::shown_text(&text.body, room));
+        text.body = format!("{}{OPEN_LILITH}", settled(&text.body, room, &redact));
+    } else {
+        text.body = settled(&text.body, SHOWN_CHARS, &redact);
     }
     text
+}
+
+/// `s` as a toast shows it, at most `max` `char`s, redacted last (CA-walk review I-1): it is
+/// normalised first ([`shown_plain`], so a control character inside a key goes and the key is
+/// whole), then redacted; when that changed it and its result isn't normal any more, again,
+/// at most [`SETTLE_ROUNDS`] times. A text that doesn't settle is shown as `<redacted>`.
+fn settled(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> String {
+    let mut shown = shown_plain(s, max);
+    for _ in 0..SETTLE_ROUNDS {
+        let (redacted, n) = redact(&shown);
+        if n == 0 {
+            return shown;
+        }
+        let again = shown_plain(&redacted, max);
+        if again == redacted {
+            return redacted;
+        }
+        shown = again;
+    }
+    crate::diagnostics::redact::REDACTED.to_string()
 }
 
 /// Whether every job of `ids` was counted in a restart-hold toast already.

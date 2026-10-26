@@ -820,6 +820,63 @@ fn every_toasts_text_is_redacted() {
     }
 }
 
+/// Review I-1: a key that a control character splits is redacted as the toast shows it. The
+/// text is normalised first (the control goes, joining the key) and the result redacted, so
+/// the join never puts the key back in clear: BEL, NUL, NEL and DEL.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_split_by_a_control_character_is_redacted_as_shown() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let tail = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef";
+    let cases = [
+        (format!("sk-ant-api03-ABCD\u{7}{tail}"), "BEL"),
+        (format!("sk-ant-\u{0}api03-{tail}"), "NUL"),
+        (format!("ghp_\u{85}{}", "A1".repeat(18)), "NEL"),
+        (
+            format!("hf_{}\u{7f}{}", "d4".repeat(8), "d4".repeat(9)),
+            "DEL",
+        ),
+    ];
+    for (i, (split, name)) in cases.iter().enumerate() {
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({"message": format!("{i}: upload failed: {split}")}),
+        );
+        let joined: String = split.chars().filter(|c| !c.is_control()).collect();
+        let toast = until(&format!("the {name} notice"), || {
+            posts(&mut p, "agent_activity").into_iter().find(|t| {
+                t["body"]
+                    .as_str()
+                    .is_some_and(|b| b.starts_with(&format!("{i}: ")))
+            })
+        });
+        assert_eq!(
+            toast["body"],
+            format!("{i}: upload failed: <redacted>"),
+            "{name}: {toast}"
+        );
+        assert!(
+            !toast["xml"].as_str().unwrap().contains(&joined[4..]),
+            "{name}: {toast}"
+        );
+    }
+    // A failed job's message too.
+    let failing = write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final", "fail_message": format!("upload failed: {}", cases[0].0)}),
+    );
+    wait_done(&mut p, &job_ids(&failing)[0]);
+    let failed = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert_eq!(
+        failed["body"], "test.job: upload failed: <redacted>",
+        "{failed}"
+    );
+}
+
 /// Checkpoint A walkthrough (ODD-5): a call that needs a confirmation and passes a cap names
 /// the cap in its toast too.
 #[test] // spec: APP-146, APP-022, APP-054

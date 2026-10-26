@@ -53,15 +53,20 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// The text of a `<text>` element: shown, without the characters XML 1.0 doesn't allow
-/// (U+FFFE, U+FFFF; `shown_text` already removed the controls), then escaped (plan 4a
-/// clarification, 2026-10-25).
-fn shown(s: &str) -> String {
-    let text: String = lil_parse::shown_text(s, SHOWN_CHARS)
+/// `s` as a toast shows it, at most `max` `char`s: [`lil_parse::shown_text`], without the
+/// characters XML 1.0 doesn't allow (U+FFFE, U+FFFF; `shown_text` already removed the
+/// controls). Text it returns is returned as it is, so the notifier redacts this form last.
+pub(crate) fn shown_plain(s: &str, max: usize) -> String {
+    lil_parse::shown_text(s, max)
         .chars()
         .filter(|c| xml_char(*c))
-        .collect();
-    escape(&text)
+        .collect()
+}
+
+/// The text of a `<text>` element: [`shown_plain`], then escaped (plan 4a clarification,
+/// 2026-10-25).
+fn shown(s: &str) -> String {
+    escape(&shown_plain(s, SHOWN_CHARS))
 }
 
 /// Whether XML 1.0 allows `c` (its `Char` production; a Rust `char` is never a surrogate).
