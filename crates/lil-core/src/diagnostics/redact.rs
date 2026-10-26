@@ -38,7 +38,9 @@
 //!     its line, the bracketed JSON, a `Debug` call such as `Some("…")` or `Secret("…")` to its
 //!     closing parenthesis, or the word after it (two words after `Bearer`, `Basic`, `Digest`
 //!     or `Token`). A flag holding a scrub word (`--api-key`) takes the next argument as its
-//!     value, space-separated or the next element of an array.
+//!     value, space-separated or the next element of an array; a `Debug` or tuple pair whose
+//!     quoted first element holds a scrub word (`("API_KEY", "…")`) its quoted second element
+//!     (Checkpoint A ruling).
 //!
 //! **Terminal control sequences** ([`strip_terminal`]): a CSI (`ESC [`, parameter and
 //! intermediate bytes, a final byte, or up to a placeholder the first round left), an OSC
@@ -1481,7 +1483,8 @@ fn keys(s: &str, cx: &mut Cx) -> String {
         };
         let value = if separator {
             value_at(s, spaces(k + 1), quote)
-        } else if key.starts_with('-') {
+        } else if key.starts_with('-') || opens_pair(b, start, quote) {
+            // A flag's next argument, or a pair's second element (`("API_KEY", "…")`).
             flag_value(s, after_key, quote)
         } else {
             None
@@ -1494,6 +1497,23 @@ fn keys(s: &str, cx: &mut Cx) -> String {
         i = value_end;
     }
     out.finish(cx)
+}
+
+/// Whether the quoted key starting at `start` is the first element of a `Debug` or tuple pair:
+/// its opening quote (escaped as its closing one is) comes right after a `(`, spaces apart.
+fn opens_pair(b: &[u8], start: usize, quote: Quote) -> bool {
+    let opening = match quote {
+        Quote::None => return false,
+        Quote::Double | Quote::Single => 1,
+        Quote::Escaped(run) => run + 1,
+    };
+    let Some(mut j) = start.checked_sub(opening) else {
+        return false;
+    };
+    while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
+        j -= 1;
+    }
+    j > 0 && b[j - 1] == b'('
 }
 
 /// The argument after a scrub-word flag (`--api-key`) that ends at `k`: the next element of an
@@ -2069,6 +2089,45 @@ mod tests {
             }
         }
         assert_eq!(r.text("--token --verbose").1, 0, "a flag is no value");
+    }
+
+    /// Checkpoint A ruling (the PR #49 carry): a `Debug` or tuple pair whose quoted first
+    /// element holds a scrub word has its quoted second element redacted, escaped or not; the
+    /// shapes Appendix G lists as known limits keep their value.
+    #[test] // spec: ARCH-121
+    fn a_tuple_pair_under_a_scrub_word_loses_its_value() {
+        let r = Redactor::default();
+        for (text, secret) in [
+            (
+                r#"env: [("API_KEY", "PROBE-T1"), ("PATH", "C:/bin")]"#,
+                "PROBE-T1",
+            ),
+            (r#"("token" , 'PROBE-T2')"#, "PROBE-T2"),
+            (r#"{"m":"env [(\"HF_TOKEN\", \"PROBE-T3\")]"}"#, "PROBE-T3"),
+            (
+                r#"{"m":"[(\\\"SECRET\\\", \\\"PROBE-T4\\\")]"}"#,
+                "PROBE-T4",
+            ),
+        ] {
+            let (out, n) = r.text(text);
+            assert!(!out.contains(secret), "{text} -> {out}");
+            assert_eq!(n, 1, "{text} -> {out}");
+            if text.starts_with('{') {
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {text} -> {out}"));
+            }
+        }
+        // Not under a scrub word, or not a pair: nothing changes.
+        for text in [
+            r#"[("PATH", "C:/bin")]"#,
+            r#"call("API_KEY")"#,
+            r#"["API_KEY", "listed"]"#,
+        ] {
+            assert_eq!(r.text(text), (text.to_string(), 0), "{text}");
+        }
+        // Known limits (Appendix G): a value that isn't a quoted string stays.
+        let limit = r#"("TOKEN", 42)"#;
+        assert_eq!(r.text(limit), (limit.to_string(), 0));
     }
 
     /// A known literal of 6 characters or more goes wherever it is, inside a word and inside
