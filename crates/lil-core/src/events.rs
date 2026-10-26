@@ -4,7 +4,12 @@
 //! - **Sequences.** Each topic's `seq` starts at 1 and goes up by one per [`EventBus::publish`].
 //! - **History.** Each topic keeps its events for [`HISTORY_SECS`] of *monotonic* time (a
 //!   wall-clock jump changes nothing) and at most its [`HISTORY_MAX_EVENTS`] newest events
-//!   (ARCH-032 clarification), pruned on publish and on subscribe (CORE-012).
+//!   (ARCH-032 clarification), pruned on publish and on subscribe (CORE-012). A `preview:`
+//!   topic keeps only its newest event ([`PREVIEW_HISTORY`]): a late subscriber wants only the
+//!   newest frame. A publish also prunes every topic once per [`SWEEP_EVERY`], so a topic
+//!   nothing publishes to any more (a finished job's) holds nothing once its events are
+//!   [`HISTORY_SECS`] old; a topic's seq is never forgotten, so cursors stay valid (Appendix G
+//!   "Events").
 //! - **Subscribing with a cursor `s`.** `s` equal to the topic's current seq replays nothing;
 //!   a history that still holds `s+1..=current` replays those events in order; anything else
 //!   (older than the history, or beyond the current seq, such as a cursor from an earlier
@@ -56,6 +61,11 @@ use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
+/// The history a `preview:` topic keeps (Appendix G "Events").
+pub const PREVIEW_HISTORY: usize = 1;
+/// How often a publish prunes every topic's history (Appendix G "Events").
+pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
 /// A client of the bus: the connection's `ConnCtx::conn_id`.
 pub type ClientId = u64;
 
@@ -79,6 +89,8 @@ struct Inner {
     providers: Vec<(String, Arc<dyn SnapshotProvider>)>,
     /// The last token handed to a pending snapshot.
     tokens: u64,
+    /// When a publish last pruned every topic (monotonic).
+    swept: Duration,
 }
 
 /// One topic: its current seq and its retained events, oldest first, with consecutive seqs.
@@ -206,7 +218,13 @@ impl EventBus {
             seq,
             line: line.clone(),
         });
-        prune(&mut log.history, now);
+        prune(&mut log.history, now, history_max(topic));
+        if now.saturating_sub(inner.swept) >= SWEEP_EVERY {
+            inner.swept = now;
+            for (name, other) in &mut inner.topics {
+                prune(&mut other.history, now, history_max(name));
+            }
+        }
 
         let item = Queued {
             topic: Arc::from(topic),
@@ -351,7 +369,7 @@ impl EventBus {
             }
             let current = match inner.topics.get_mut(topic) {
                 Some(log) => {
-                    prune(&mut log.history, now);
+                    prune(&mut log.history, now, history_max(topic));
                     log.seq
                 }
                 None => 0,
@@ -483,6 +501,12 @@ impl EventBus {
             .map_or(0, |c| c.pending.lock().len())
     }
 
+    /// How many events `topic`'s history holds now.
+    #[cfg(test)]
+    fn retained(&self, topic: &str) -> usize {
+        self.lock().topics.get(topic).map_or(0, |t| t.history.len())
+    }
+
     /// The events waiting in `client`'s queue.
     #[cfg(test)]
     fn queued_events(&self, client: ClientId) -> Vec<EventParams> {
@@ -528,9 +552,19 @@ fn enqueue(
     true
 }
 
+/// The most events `topic`'s history keeps: [`PREVIEW_HISTORY`] for a `preview:` topic, else
+/// [`HISTORY_MAX_EVENTS`].
+fn history_max(topic: &str) -> usize {
+    if topic.starts_with("preview:") {
+        PREVIEW_HISTORY
+    } else {
+        HISTORY_MAX_EVENTS
+    }
+}
+
 /// Drops the events older than [`HISTORY_SECS`] of monotonic time at `now`, then the oldest
-/// beyond [`HISTORY_MAX_EVENTS`].
-fn prune(history: &mut VecDeque<Retained>, now: Duration) {
+/// beyond `max`.
+fn prune(history: &mut VecDeque<Retained>, now: Duration, max: usize) {
     let keep = Duration::from_secs(HISTORY_SECS);
     while history
         .front()
@@ -538,7 +572,7 @@ fn prune(history: &mut VecDeque<Retained>, now: Duration) {
     {
         history.pop_front();
     }
-    while history.len() > HISTORY_MAX_EVENTS {
+    while history.len() > max {
         history.pop_front();
     }
 }
@@ -1101,6 +1135,49 @@ mod tests {
             .await;
         assert_eq!(states, [state("test:a", 3)]);
         assert_eq!(bus.queued(1), 4);
+    }
+
+    /// Checkpoint A I1: a topic nothing publishes to any more (a finished job's `job:` and
+    /// `preview:` topics) is pruned by the sweep a publish on another topic runs; its seq stays.
+    #[tokio::test] // spec: ARCH-032, CORE-012
+    async fn a_quiet_topics_history_is_swept_by_a_publish_elsewhere() {
+        let (clock, bus) = bus();
+        for n in 0..5 {
+            bus.publish("job:j_1", json!(n));
+        }
+        assert_eq!(bus.retained("job:j_1"), 5);
+        clock.advance(Duration::from_secs(HISTORY_SECS + 1));
+        bus.publish("jobs", json!("elsewhere"));
+        assert_eq!(
+            bus.retained("job:j_1"),
+            0,
+            "swept without a publish of its own"
+        );
+        assert_eq!(bus.retained("jobs"), 1);
+        let states = bus.subscribe(1, &names(&["job:j_1"]), &cursors(&[])).await;
+        assert_eq!(states, [state("job:j_1", 5)], "the seq is kept");
+        assert_eq!(bus.publish("job:j_1", json!(5)), 6);
+    }
+
+    /// Checkpoint A I1: a `preview:<job_id>` topic keeps only its newest frame.
+    #[tokio::test] // spec: ARCH-032
+    async fn a_preview_topic_keeps_only_its_newest_frame() {
+        let (_clock, bus) = bus();
+        for n in 1..=3 {
+            bus.publish("preview:j_1", json!({"n": n}));
+        }
+        assert_eq!(bus.retained("preview:j_1"), 1);
+        bus.subscribe(1, &names(&["preview:j_1"]), &cursors(&[("preview:j_1", 2)]))
+            .await;
+        assert_eq!(
+            bus.queued_events(1),
+            [event("preview:j_1", 3, EventKind::Event, json!({"n": 3}))]
+        );
+        // Other topics keep their whole history.
+        for n in 1..=3 {
+            bus.publish("job:j_1", json!(n));
+        }
+        assert_eq!(bus.retained("job:j_1"), 3);
     }
 
     #[tokio::test] // spec: CORE-012, QA-031
