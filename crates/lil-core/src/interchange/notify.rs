@@ -737,8 +737,9 @@ impl Notifier {
         } else {
             confirm.forget_toast_token(&view.id, &token);
             tracing::info!(confirmation = %view.id, outcome = ?outcome, "no confirmation toast");
-            // An earlier run's toast of it is still there with a dead Deny: it goes.
-            if !reconciling {
+            // An earlier run's toast of it is still there with a dead Deny: it goes. A bare
+            // toast of this run stays, as it was (CA-walk review M-3).
+            if !reconciling || bare {
                 return;
             }
             let desktop = self.desktop.clone();
@@ -816,6 +817,10 @@ impl Notifier {
                 self.remove_toast(&tag).await;
             }
         }
+        tracing::info!(
+            pending = pending.len(),
+            "the confirmation toasts were reconciled"
+        );
     }
 
     /// A cap alert: "Spending at <spent> % of your <cap> cap (<period>)" / "Alert at <pct> %",

@@ -1144,6 +1144,57 @@ fn a_reposted_toast_gets_its_buttons_and_a_fresh_token_once_the_handlers_are_bac
     });
 }
 
+/// Review M-3: a repost of a bare confirmation toast that fails (here Windows' toasts are
+/// turned off for the app as the handlers come back) leaves the bare toast where it is. Each
+/// reconcile is logged once it is done, so the check waits for it, not for time.
+#[test] // spec: APP-146, APP-022, ARCH-055
+fn a_failed_repost_keeps_the_bare_toast() {
+    let logs = capture_logs();
+    let reconciled = || {
+        logs.text()
+            .lines()
+            .filter(|l| l.contains("the confirmation toasts were reconciled"))
+            .count()
+    };
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let id = {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({}));
+        ready(&mut p);
+        let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        deny_token(&mut p, &scheme, &id);
+        id
+    };
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    let bare = until("the bare repost", || {
+        posts(&mut p, "confirmation_waiting")
+            .into_iter()
+            .find(|t| t["tag"] == id.as_str())
+    });
+    assert!(actions(bare["xml"].as_str().unwrap()).is_empty(), "{bare}");
+    // Both starts' reconciles are done.
+    until("two reconciles", || (reconciled() >= 2).then_some(()));
+    let before = reconciled();
+    let a = app(&env);
+    desktop(
+        &mut p,
+        json!({"handlers": true, "toasts": "disabled_for_app"}),
+    );
+    drop(a);
+    until("the reconcile after the app closed", || {
+        (reconciled() > before).then_some(())
+    });
+    assert!(
+        !ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == id.as_str()),
+        "the bare toast stays: {:?}",
+        ops(&mut p)
+    );
+}
+
 #[test] // spec: APP-146, ARCH-055, APP-022
 fn a_toast_held_back_while_the_app_was_in_front_goes_out_when_it_closes() {
     let env = TestEnv::new();
