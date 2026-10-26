@@ -688,8 +688,9 @@ fn lilref_write_stays_in_the_cache_folder() {
     }
 }
 
-/// Review M2: a crash's temp and backup files older than a day are swept when the folder is
-/// written next; newer ones, and other files, stay.
+/// Review M2: a crash's temp files older than a day are swept when the folder is written
+/// next; newer ones, and other files, stay. A backup file is never swept (Checkpoint A store
+/// M1): one is left only when a failed replace couldn't put the old file back, the only copy.
 #[test] // spec: APP-021, ARCH-119
 #[allow(clippy::disallowed_methods)] // ages the leftovers it plants
 fn suite_cache_leftovers_older_than_a_day_are_swept() {
@@ -720,12 +721,60 @@ fn suite_cache_leftovers_older_than_a_day_are_swept() {
     assert_eq!(
         left,
         [
+            ".a.lilref.1-2.bak",
             ".b.lilref.1-3.tmp",
             ".someone-else.tmp",
             "c.lilref",
             "old.lilref"
         ]
     );
+}
+
+/// Checkpoint A store M3: a `.lilref` someone holds open without `FILE_SHARE_DELETE` (a reader
+/// or a scanner) is replaced once they let go, within the store's backoff, instead of failing
+/// at once.
+#[test] // spec: APP-021, ARCH-074
+fn a_sharing_violation_on_the_cache_writer_is_retried() {
+    use lil_core::store::fsops::write_suite_cache_file;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let env = TestEnv::new();
+    let cache = env.env.lilref_dir();
+    write_suite_cache_file(&env.env, &cache.join("a.lilref"), b"one").unwrap();
+    // FILE_SHARE_READ only.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(cache.join("a.lilref"))
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let reader = std::thread::spawn(move || {
+        // Held until the writer is under way (a failure bound, not a measurement).
+        let _ = rx.recv_timeout(Duration::from_millis(300));
+        drop(held);
+    });
+    let written = write_suite_cache_file(&env.env, &cache.join("a.lilref"), b"two");
+    drop(tx);
+    reader.join().unwrap();
+    written.unwrap();
+    assert_eq!(std::fs::read(cache.join("a.lilref")).unwrap(), b"two");
+    assert_eq!(names_in(&cache), ["a.lilref"], "no temp or backup left");
+}
+
+/// Checkpoint A store M3: a temp file a crashed core left under this process's pid (Windows
+/// reuses pids) doesn't block the next write: its name is skipped.
+#[test] // spec: APP-021, ARCH-074
+fn a_crashed_cores_temp_name_is_skipped() {
+    use lil_core::store::fsops::write_suite_cache_file;
+    let env = TestEnv::new();
+    let cache = env.env.lilref_dir();
+    for n in 1..=5 {
+        write_file(
+            &cache.join(format!(".a.lilref.{}-{n}.tmp", std::process::id())),
+            b"left",
+        );
+    }
+    write_suite_cache_file(&env.env, &cache.join("a.lilref"), b"new").unwrap();
+    assert_eq!(std::fs::read(cache.join("a.lilref")).unwrap(), b"new");
 }
 
 /// The interchange rows (CORE-146; Appendix G): `handlers.for`, `open_in` and `ui.show` read,

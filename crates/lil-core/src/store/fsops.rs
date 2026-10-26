@@ -117,10 +117,12 @@ pub fn write_new_file(
 /// `.lilref` cache ([`Env::lilref_dir`], APP-021) or the diagnostics folder
 /// ([`Env::diagnostics_dir`], ARCH-119). The folder is made; the data goes to a new temp file
 /// beside the target (flushed to disk), which is moved to the target's name, or replaces the
-/// file there (`ReplaceFileW`, its backup then removed). Whatever fails, the temp file is
-/// removed again, and a file `ReplaceFileW` had already moved to the backup name is moved
-/// back when nothing took its place. Temp and backup files of this function older than a day
-/// (a crash's leftovers) are removed from the folder first.
+/// file there (`ReplaceFileW`, its backup then removed; a sharing violation, a reader or a
+/// scanner holding the file, is retried with the store's backoff). Whatever fails, the temp
+/// file is removed again, and a file `ReplaceFileW` had already moved to the backup name is
+/// moved back when nothing took its place; when that fails too, the backup is kept, and no
+/// sweep ever removes it. Temp files of this function older than a day (a crash's leftovers)
+/// are removed from the folder first, and a temp name one of them holds is skipped.
 ///
 /// Refused with `PermissionDenied` before anything is written or made: a relative path, a
 /// path with a `.` or `..` part, a path whose folder isn't one of the two (compared with
@@ -141,7 +143,7 @@ pub fn write_suite_cache_file(
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // `.<name>.<pid>-<n>.bak`, beside the temp file.
             let backup = temp.with_extension("bak");
-            let replaced = replace(path, &temp, &backup);
+            let replaced = retry_sharing(|| replace(path, &temp, &backup));
             settle_replace(path, &backup, replaced, move_new)
         }
         other => other,
@@ -229,13 +231,45 @@ fn cache_temp<'p>(
 ) -> std::io::Result<(&'p Path, PathBuf)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    /// How many taken temp names are skipped before the write gives up.
+    const TRIES: u32 = 1000;
     let (dir, name) = check_cache_path(env, path)?;
     ensure_dir(dir)?;
     sweep_leftovers(dir);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
-    let temp = write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none())?;
-    Ok((dir, temp))
+    let mut tries = 0;
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
+        match write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none()) {
+            // A crashed core's leftover under a pid Windows gave this process again.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < TRIES => {
+                tries += 1;
+            }
+            written => return Ok((dir, written?)),
+        }
+    }
+}
+
+/// Runs `f` again while it fails with a sharing violation, with the store's backoff
+/// ([`super::write::RETRY_FIRST`] doubling to [`super::write::RETRY_CAP`], for
+/// [`super::write::RETRY_BUDGET`] in all); on a blocking thread, since it sleeps.
+fn retry_sharing(mut f: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    use super::write::{RETRY_BUDGET, RETRY_CAP, RETRY_FIRST};
+    let start = std::time::Instant::now();
+    let mut pause = RETRY_FIRST;
+    loop {
+        match f() {
+            Err(e)
+                if lil_platform::fs::classify(&e)
+                    == lil_platform::fs::RetryClass::SharingViolation
+                    && start.elapsed() < RETRY_BUDGET =>
+            {
+                std::thread::sleep(pause.min(RETRY_BUDGET.saturating_sub(start.elapsed())));
+                pause = (pause * 2).min(RETRY_CAP);
+            }
+            other => return other,
+        }
+    }
 }
 
 /// `path`'s folder and file name, when it is a file directly in the `.lilref` cache or the
@@ -385,8 +419,10 @@ fn own_leftover(name: &str) -> bool {
             .is_some_and(|(pid, n)| decimal(pid) && decimal(n))
 }
 
-/// Removes [`write_suite_cache_file`]'s temp and backup files ([`own_leftover`]) older than a
-/// day from `dir`: what a crash between writing and moving left.
+/// Removes [`write_suite_cache_file`]'s temp files ([`own_leftover`], `.tmp`) older than a day
+/// from `dir`: what a crash between writing and moving left. A backup (`.bak`) is never
+/// removed: one is left only when a failed replace couldn't put the old file back, and its
+/// mtime is the old file's, so its age says nothing (Checkpoint A store M1).
 #[allow(clippy::disallowed_methods)]
 fn sweep_leftovers(dir: &Path) {
     const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -396,7 +432,7 @@ fn sweep_leftovers(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !own_leftover(&name) {
+        if !own_leftover(&name) || !name.ends_with(".tmp") {
             continue;
         }
         let old = entry
@@ -702,6 +738,21 @@ mod tests {
         assert!(settle_replace(&path, &backup, failed(), cannot).is_err());
         assert_eq!(std::fs::read(&backup).unwrap(), b"old");
         assert!(!path.exists());
+        // A rename keeps the old file's mtime, so the backup can look days old: the sweep of
+        // the next write keeps it all the same (Checkpoint A store M1).
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&backup)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+        sweep_leftovers(dir.path());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old", "never swept");
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        assert!(settle_replace(&path, &backup, failed(), cannot).is_err());
 
         // The restore works: the old file is back at its name.
         assert!(settle_replace(&path, &backup, failed(), move_new).is_err());
