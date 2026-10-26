@@ -163,6 +163,27 @@ struct EstimateArgs {
     args: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `job.wait`'s summary text. A job a reason holds says so, and for `restart` or `manual`
+/// that it waits until you resume it in Jobs (Appendix G "Restart hold"), so an agent knows
+/// that polling it won't help.
+fn wait_summary(job: &JobSummary, done: bool) -> String {
+    if done && job.all_cached {
+        return NOTHING_CHANGED.to_string();
+    }
+    let mut text = format!("job {} is {}", job.job_id, job.status.wire());
+    if !job.pause_reasons.is_empty() {
+        text.push_str(&format!(", held ({})", job.pause_reasons.join(", ")));
+        if job
+            .pause_reasons
+            .iter()
+            .any(|r| r == "restart" || r == "manual")
+        {
+            text.push_str(": it waits until you resume it in Jobs");
+        }
+    }
+    text
+}
+
 fn params_invalid(message: String, trace_id: &str) -> ErrorBody {
     ErrorBody::new(&codes::PARAMS_INVALID, message, trace_id)
 }
@@ -209,11 +230,7 @@ pub fn register_job_tools(reg: &mut Registry) {
                     .jobs
                     .wait(&ctx.job_caller(), &JobId(args.job_id), timeout)
                     .await?;
-                let summary = if done && job.all_cached {
-                    NOTHING_CHANGED.to_string()
-                } else {
-                    format!("job {} is {}", job.job_id, job.status.wire())
-                };
+                let summary = wait_summary(&job, done);
                 Ok((WaitResult { job, done }, summary))
             })
         },
@@ -353,4 +370,41 @@ pub fn register_job_tools(reg: &mut Registry) {
             })
         },
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(substatus: &str, reasons: &[&str]) -> JobSummary {
+        serde_json::from_value(serde_json::json!({
+            "job_id": "j_1", "kind": "t.job", "lane": "cpu", "priority": "agent",
+            "status": "queued", "substatus": substatus, "created": "2026-10-26T00:00:00Z",
+            "updated": "2026-10-26T00:00:00Z", "attempt": 1, "trace_id": "t_1",
+            "batch_id": "b_1", "index": 0, "pause_reasons": reasons,
+        }))
+        .expect("a summary")
+    }
+
+    /// Checkpoint A M6: `job.wait` on a held job says what it waits for, so an agent stops
+    /// polling a job only you can release.
+    #[test] // spec: AI-113, CORE-160
+    fn a_held_jobs_wait_says_who_it_waits_for() {
+        assert_eq!(
+            wait_summary(&job("queue_paused", &["restart"]), false),
+            "job j_1 is queued, held (restart): it waits until you resume it in Jobs"
+        );
+        assert_eq!(
+            wait_summary(&job("queue_paused", &["fullscreen", "manual"]), false),
+            "job j_1 is queued, held (fullscreen, manual): it waits until you resume it in Jobs"
+        );
+        assert_eq!(
+            wait_summary(&job("queue_paused", &["fullscreen"]), false),
+            "job j_1 is queued, held (fullscreen)"
+        );
+        assert_eq!(
+            wait_summary(&job("waiting", &[]), false),
+            "job j_1 is queued"
+        );
+    }
 }
