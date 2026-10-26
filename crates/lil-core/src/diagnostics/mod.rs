@@ -12,9 +12,9 @@
 //!   type of this module); the last [`RECENT_CAPACITY`] are kept in memory, grouped by code,
 //!   and each is published on the `diagnostics` topic as `{kind: "error", code, tool?, at}`.
 //!   A job's final failure is one too (Checkpoint A ruling): as a [`JobCompletion`] it records
-//!   the error with the job's kind as the tool, the job's id, and the message redacted as a
-//!   bundle's entries are; a cancel, a job that never started and a resolved unknown job are
-//!   not failures.
+//!   the error with the job's kind as the tool and the job's id; a cancel, a job that never
+//!   started and a resolved unknown job are not failures. Every message is kept redacted as a
+//!   bundle's entries are (review fix M-6).
 //! - **The bundle** ([`bundle`]): one zip in `<local dir>\diagnostics\`, written through the
 //!   store's cache writer, never holding a workspace file, every entry redacted
 //!   ([`redact`]). Nothing is sent anywhere (ARCH-122): the bundle leaves the machine only
@@ -117,7 +117,8 @@ impl Diagnostics {
     }
 
     /// [`Diagnostics::record_error`], for a job's final failure too (`job_id`; its event
-    /// carries it).
+    /// carries it). The message is kept redacted as a bundle's entries are, whichever path it
+    /// came by (review fix M-6), so every row of `diagnostics.recent` reads the same way.
     fn record(
         &self,
         code: &str,
@@ -126,7 +127,9 @@ impl Diagnostics {
         message: &str,
         at_ms: i64,
     ) {
-        lock(&self.errors).push(code, tool, job_id, message, at_ms);
+        let suite_toml = std::fs::read_to_string(self.env.suite_toml_to_read()).ok();
+        let (message, _) = bundle::redactor_for(&self.env, suite_toml.as_deref()).text(message);
+        lock(&self.errors).push(code, tool, job_id, &message, at_ms);
         let mut data = json!({"kind": "error", "code": code});
         if let Some(tool) = tool {
             data["tool"] = json!(tool);
@@ -138,11 +141,8 @@ impl Diagnostics {
         self.events.publish(DIAGNOSTICS_TOPIC, data);
     }
 
-    /// Records job `job`'s final failure `error` (module docs), its message redacted first.
+    /// Records job `job`'s final failure `error` (module docs).
     fn record_job_error(&self, job: &JobCtx, error: &ErrorBody) {
-        let suite_toml = std::fs::read_to_string(self.env.suite_toml_to_read()).ok();
-        let (message, _) =
-            bundle::redactor_for(&self.env, suite_toml.as_deref()).text(&error.message);
         let at_ms = self
             .clock
             .utc_now()
@@ -152,7 +152,7 @@ impl Diagnostics {
             &error.code,
             Some(job.spec.kind),
             Some(job.id.as_str()),
-            &message,
+            &error.message,
             at_ms,
         );
     }
@@ -220,7 +220,7 @@ impl ConnObserver for Diagnostics {
 const RECENT_DESCRIPTION: &str = "Returns the core's recent errors grouped by code, the code \
     whose last error is newest first: for each, the code, how many of the core's last 1,000 \
     error outcomes had it, when the first and the last of them were (RFC 3339 UTC), the last \
-    one's message and the tool it came from. `limit` is 1-200 (default 50).";
+    one's message (redacted as a diagnostics bundle is) and the tool it came from, or for a     job's failure the job's kind and id. `limit` is 1-200 (default 50).";
 
 const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the suite's \
     diagnostics folder, and returns its path, its size in bytes, the files in it and how many \

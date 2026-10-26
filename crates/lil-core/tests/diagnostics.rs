@@ -328,6 +328,25 @@ fn recent_groups_by_code_newest_first_over_the_last_1000() {
     assert_eq!(d.recent(1).len(), 1);
 }
 
+/// Review M-6: a tool call's error message is kept redacted, as a job's is, so every row of
+/// `diagnostics.recent` reads the same way.
+#[test] // spec: ARCH-121, QA-083
+fn a_tool_calls_error_message_is_kept_redacted() {
+    let env = TestEnv::new();
+    let d = diagnostics(&env, &Arc::new(EventBus::new(FakeClock::new())));
+    let profile = env.env.user_profile().display().to_string();
+    d.record_error(
+        "store.io",
+        Some("x.tool"),
+        &format!("token: SECRET-PROBE-62 in {profile}\\notes.txt"),
+        1_790_000_000_000,
+    );
+    let message = &d.recent(1)[0].last_message;
+    assert!(!message.contains("SECRET-PROBE-62"), "{message}");
+    assert!(!message.contains(&profile), "{message}");
+    assert!(message.contains("%USERPROFILE%"), "{message}");
+}
+
 #[tokio::test] // spec: ARCH-121, QA-083
 async fn each_error_is_published_on_the_diagnostics_topic() {
     let env = TestEnv::new();
