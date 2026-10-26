@@ -506,7 +506,6 @@ fn esc_at(runs: &Runs<'_>, i: usize) -> Option<Esc> {
 /// written `form`: after a raw `ESC`, a raw one and one `\`; after a written one, a written
 /// one of the same escape level (backslash parity) and a `\` written as `\\`.
 fn st_at(runs: &Runs<'_>, j: usize, form: EscForm) -> Option<usize> {
-    let b = runs.bytes();
     let esc = esc_at(runs, j)?;
     let run = runs.at(esc.end);
     match (form, esc.form) {
