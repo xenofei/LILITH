@@ -18,4 +18,4 @@ pub use lil_url::{
     LilUrl, UrlRefusal, confirm_url, deny_url, open_url, parse_lil_url, strip_argument, task_url,
 };
 pub use model_header::{Family, HeaderError, gguf_family, safetensors_family};
-pub use text::{shown_text, without_default_ignorables};
+pub use text::{is_invisible, shown_text, without_default_ignorables};

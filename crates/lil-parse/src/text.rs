@@ -76,6 +76,13 @@ pub fn without_default_ignorables(s: &str) -> String {
     out
 }
 
+/// Whether `c` is a character a reader can't see that can split a word: a
+/// `Default_Ignorable_Code_Point` other than the bidirectional controls [`shown_text`] shows
+/// as markers (PR #53 audit: the redaction's splitters).
+pub fn is_invisible(c: char) -> bool {
+    is_default_ignorable(c) && !is_bidi_control(c)
+}
+
 /// The bidirectional controls [`shown_text`] shows as markers.
 fn is_bidi_control(c: char) -> bool {
     matches!(

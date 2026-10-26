@@ -26,7 +26,12 @@
 //!    JWT-shaped tokens (`eyJ….….…`): where a word starts, and glued to a word too
 //!    (`j_sk-ant-…`; Checkpoint A walkthrough) with a body of [`GLUED_BODY`] or more that
 //!    looks like a secret ([`looks_secret`]; a JWT needs only the length). Each body is read
-//!    once, so the work grows linearly with the text.
+//!    once, so the work grows linearly with the text. A token's placeholder also takes the rest
+//!    of the token one splitter cut off ([`tail_end`], PR #53 audit): a run of
+//!    [`TAIL_CHARS`] or more of `A-Z a-z 0-9 _ -` across exactly one control character (CR LF
+//!    as one), its written escape, a terminal control sequence (raw or written, or where one
+//!    was removed) or an invisible character, and any SGR leftover `[…m` between them. Only a
+//!    token's placeholder does, as the token is matched, so no other rule's value is touched.
 //! 7. **Credential Manager targets**: [`names::APP_NAME`] or [`names::LEGACY_APP_NAME`], an
 //!    optional `-<channel>`, then `/<name>`, in any letter case; a quoted target to its quote.
 //! 8. **E-mail addresses** (`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`).
@@ -1301,6 +1306,8 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
         TOKEN_BYTES.with(|t| t.set(t.get() + n + 1));
         n
     };
+    // The text's runs of `\`, read once and only when a token's rest is looked for.
+    let mut runs: Option<Runs<'_>> = None;
     // Where each format's last long glued body that failed ends, and the JWT's.
     let mut dead = [0usize; TOKEN_FORMATS.len()];
     let mut jwt_dead = 0usize;
@@ -1364,6 +1371,9 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
         }
         match end {
             Some(end) => {
+                // The rest of the token, when one splitter cut it (PR #53 audit).
+                let runs = runs.get_or_insert_with(|| Runs::new(s));
+                let end = tail_end(s, end, cx, Some(runs), false).unwrap_or(end);
                 out.replace(i, end, REDACTED);
                 cx.n += 1;
                 i = end;
@@ -1372,6 +1382,132 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
         }
     }
     out.finish(cx)
+}
+
+/// The shortest rest of a token that a placeholder takes across a splitter ([`tail_end`]).
+pub const TAIL_CHARS: usize = 8;
+
+/// The end of one splitter at byte `i` of `s` (PR #53 audit): where a removed terminal control
+/// sequence stood ([`Cx::bounds`], no bytes); a control character (CR LF as one); one terminal
+/// control sequence, raw or written ([`esc_at`], [`sequence_end`], over `runs`); an invisible
+/// character ([`lil_parse::is_invisible`]); or, after any run of `\`, the written escape of a
+/// control character (`\n`, `\r`, `\r\n` at one escape level, `\t`, `\b`, `\f`, `\a`, `\v`,
+/// `\e`, `\0`, `\xXX`, `\uXXXX`, `\u{…}`) or of an invisible one.
+fn splitter_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>) -> Option<usize> {
+    if cx.bound_at(i) {
+        return Some(i);
+    }
+    let b = s.as_bytes();
+    let c = s.get(i..)?.chars().next()?;
+    if c == '\r' && b.get(i + 1) == Some(&b'\n') {
+        return Some(i + 2);
+    }
+    if let Some(runs) = runs
+        && let Some(end) = esc_at(runs, i).and_then(|esc| sequence_end(runs, &esc))
+    {
+        return Some(end);
+    }
+    if c.is_control() || lil_parse::is_invisible(c) {
+        return Some(i + c.len_utf8());
+    }
+    if c != '\\' {
+        return None;
+    }
+    let run = b[i..].iter().take_while(|x| **x == b'\\').count();
+    let j = i + run;
+    let hidden = |code: u32| {
+        char::from_u32(code).is_some_and(|c| c.is_control() || lil_parse::is_invisible(c))
+    };
+    let hex = |from: usize, len: usize| {
+        b.get(from..from + len)
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|_| u32::from_str_radix(&s[from..from + len], 16).ok())
+    };
+    match b.get(j)? {
+        b'n' | b't' | b'b' | b'f' | b'a' | b'v' | b'e' | b'0' => Some(j + 1),
+        b'r' => {
+            // `\r\n` at one escape level is one line break.
+            let k = j + 1;
+            let again = b.get(k..k + run) == Some(&b[i..j]) && b.get(k + run) == Some(&b'n');
+            Some(if again { k + run + 1 } else { k })
+        }
+        b'x' => hex(j + 1, 2).filter(|c| hidden(*c)).map(|_| j + 3),
+        b'u' if b.get(j + 1) == Some(&b'{') => {
+            let digits = b[j + 2..]
+                .iter()
+                .take_while(|h| h.is_ascii_hexdigit())
+                .count();
+            ((1..=6).contains(&digits) && b.get(j + 2 + digits) == Some(&b'}'))
+                .then(|| hex(j + 2, digits))
+                .flatten()
+                .filter(|c| hidden(*c))
+                .map(|_| j + 3 + digits)
+        }
+        b'u' => hex(j + 1, 4).filter(|c| hidden(*c)).map(|_| j + 5),
+        _ => None,
+    }
+}
+
+/// The end of an SGR's leftover `[` parameters `m` at byte `j` of `b` (its `ESC` gone).
+fn sgr_leftover_end(b: &[u8], j: usize) -> Option<usize> {
+    if b.get(j) != Some(&b'[') {
+        return None;
+    }
+    let params = b[j + 1..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, b';' | b':'))
+        .count();
+    (b.get(j + 1 + params) == Some(&b'm')).then_some(j + 2 + params)
+}
+
+/// Where the rest of a token one splitter cut off ends, when its placeholder ends at byte `i`
+/// of `s` (PR #53 audit): across exactly one splitter ([`splitter_end`]) and any SGR leftover
+/// ([`sgr_leftover_end`]), or, with `direct`, right after it, a run of [`TAIL_CHARS`] or more
+/// of `A-Z a-z 0-9 _ -`. `None` when there is none, so a word after a space always stays.
+fn tail_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>, direct: bool) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut j = i;
+    let mut crossed = false;
+    if let Some(k) = splitter_end(s, j, cx, runs) {
+        (j, crossed) = (k, true);
+    }
+    if let Some(k) = sgr_leftover_end(b, j) {
+        (j, crossed) = (k, true);
+    }
+    if !crossed && !direct {
+        return None;
+    }
+    let run = b[j.min(b.len())..]
+        .iter()
+        .take_while(|c| alnum_dash_under(**c))
+        .count();
+    (run >= TAIL_CHARS).then_some(j + run)
+}
+
+/// `s` with each run of [`TAIL_CHARS`] or more of `A-Z a-z 0-9 _ -` (and any SGR leftover
+/// `[…m` before it) glued right after a `<redacted>` taken into it, and how many were: the
+/// toast path's step after each normalising, which removed the splitter between them (PR #53
+/// audit).
+pub(crate) fn glued_tails(s: &str) -> (String, u32) {
+    let mut cx = Cx::default();
+    if !s.contains(REDACTED) {
+        return (s.to_string(), 0);
+    }
+    let mut out = Out::new(s);
+    let mut from = 0;
+    while let Some(at) = s[from..].find(REDACTED).map(|k| from + k) {
+        let after = at + REDACTED.len();
+        match tail_end(s, after, &cx, None, true) {
+            Some(end) => {
+                out.replace(at, end, REDACTED);
+                cx.n += 1;
+                from = end;
+            }
+            None => from = after,
+        }
+    }
+    let n = cx.n;
+    (out.finish(&mut cx), n)
 }
 
 /// Every Credential Manager target replaced: the suite's name or its name before the rename
@@ -2309,6 +2445,113 @@ mod tests {
         assert!(
             large <= small * 5,
             "{small} bytes for 10,000, {large} for 40,000"
+        );
+    }
+
+    /// The long, variable-length key formats of the PR #53 audit, with fake bodies.
+    fn split_keys() -> Vec<(&'static str, String, String)> {
+        // A fixed pseudo-random run of letters and digits (no real key).
+        let fake = |len: usize, mut seed: u64| -> String {
+            const SET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            (0..len)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    SET[usize::try_from(seed >> 33).unwrap() % SET.len()] as char
+                })
+                .collect()
+        };
+        vec![
+            (
+                "sk-ant",
+                "sk-ant-".to_string(),
+                format!("api03-{}", fake(89, 1)),
+            ),
+            ("sk-proj", "sk-proj-".to_string(), fake(120, 2)),
+            ("sk", "sk-".to_string(), fake(48, 3)),
+            (
+                "github_pat",
+                "github_pat_".to_string(),
+                format!("11{}_{}", fake(22, 4), fake(59, 5)),
+            ),
+            (
+                "xoxb",
+                "xoxb-".to_string(),
+                format!("2718281828-3141592653589-{}", fake(24, 6)),
+            ),
+        ]
+    }
+
+    /// The splitters of the PR #53 audit: a control character, a line break, a terminal control
+    /// sequence and an invisible character.
+    const SPLITTERS: [(&str, &str); 7] = [
+        ("BEL", "\u{7}"),
+        ("LF", "\n"),
+        ("CRLF", "\r\n"),
+        ("SGR", "\u{1b}[0m"),
+        ("OSC8", "\u{1b}]8;;https://example.com/x\u{1b}\\"),
+        ("ZWSP", "\u{200b}"),
+        ("SHY", "\u{ad}"),
+    ];
+
+    /// Each key split at 1/2 and 3/4 of its body by each splitter: `(name, split key)`.
+    fn split_cases() -> Vec<(String, String)> {
+        let mut cases = Vec::new();
+        for (format, prefix, body) in split_keys() {
+            for (num, den) in [(1, 2), (3, 4)] {
+                let at = body.len() * num / den;
+                for (splitter, text) in SPLITTERS {
+                    cases.push((
+                        format!("{format} {num}/{den} {splitter}"),
+                        format!("{prefix}{}{text}{}", &body[..at], &body[at..]),
+                    ));
+                }
+            }
+        }
+        cases
+    }
+
+    /// The PR #53 audit: a long key split deep inside by one splitter loses its tail with its
+    /// head, in a log line as it came and as JSON writes it (`\u0007`, `\n`, `\u001b[0m` …).
+    #[test] // spec: ARCH-121
+    fn a_key_split_by_one_splitter_goes_whole_in_a_log_line() {
+        let r = Redactor::default();
+        let mut leaks = Vec::new();
+        for (name, key) in split_cases() {
+            let raw = format!("upload failed: {key} end");
+            let (out, _) = r.text(&raw);
+            if out != "upload failed: <redacted> end" {
+                leaks.push(format!("{name} raw: {out:?}"));
+            }
+            let line = serde_json::json!({"level": "ERROR", "message": raw}).to_string();
+            let (out, _) = r.text(&line);
+            let message = serde_json::from_str::<serde_json::Value>(&out)
+                .map(|v| v["message"].as_str().unwrap_or_default().to_string())
+                .unwrap_or_else(|e| format!("not JSON ({e}): {out}"));
+            if message != "upload failed: <redacted> end" {
+                leaks.push(format!("{name} json: {message:?}"));
+            }
+        }
+        assert!(leaks.is_empty(), "{} leaks: {leaks:#?}", leaks.len());
+    }
+
+    /// The PR #53 audit's fix never takes ordinary words: after a placeholder, separated by a
+    /// space, they stay.
+    #[test] // spec: ARCH-121
+    fn words_after_a_placeholder_and_a_space_stay() {
+        let r = Redactor::default();
+        for (_, prefix, body) in split_keys() {
+            let text = format!("{prefix}{body} continues_here_ok and-more-words-here");
+            assert_eq!(
+                r.text(&text).0,
+                "<redacted> continues_here_ok and-more-words-here",
+                "{text}"
+            );
+        }
+        assert_eq!(
+            r.text("api_key=hunter2 then_ordinary_words").0,
+            "api_key=<redacted> then_ordinary_words"
         );
     }
 
