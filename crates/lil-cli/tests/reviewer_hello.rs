@@ -702,6 +702,12 @@ struct FakeSteps {
     rerun: bool,
     /// The head of each approval posted.
     approved: RefCell<Vec<String>>,
+    /// Makes `wait_for_checks` fail with this.
+    wait_error: Option<&'static str>,
+    /// Makes `merge` fail with this after the gate let it through.
+    merge_error: Option<&'static str>,
+    /// Makes `withdraw_approval` fail.
+    withdraw_fails: bool,
 }
 
 impl FakeSteps {
@@ -723,6 +729,9 @@ impl FakeSteps {
             merge_head: None,
             rerun: true,
             approved: RefCell::default(),
+            wait_error: None,
+            merge_error: None,
+            withdraw_fails: false,
         }
     }
 }
@@ -744,14 +753,30 @@ impl MergeFlowSteps for FakeSteps {
         self.log
             .borrow_mut()
             .push(format!("steps:wait_for_checks rerun={guard_rerun}"));
-        Ok(())
+        match self.wait_error {
+            Some(e) => Err(anyhow::anyhow!("{e}")),
+            None => Ok(()),
+        }
     }
     fn merge(&self, gate: &dyn MergeGate) -> anyhow::Result<String> {
         let head = self.merge_head.as_deref().unwrap_or(&self.facts.head);
         gate.authorize(&subject(self.facts.pr, head))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(e) = self.merge_error {
+            return Err(anyhow::anyhow!("{e}"));
+        }
         self.log.borrow_mut().push("steps:merge".into());
         Ok("feedface".into())
+    }
+    fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<()> {
+        assert_eq!(pem, PEM);
+        self.log
+            .borrow_mut()
+            .push(format!("steps:withdraw {}", &facts.head[..7]));
+        if self.withdraw_fails {
+            anyhow::bail!("HTTP 403 from GitHub");
+        }
+        Ok(())
     }
 }
 
@@ -1218,6 +1243,7 @@ fn merge_flow_merges_nothing_without_authentication() {
                 assert!(e.contains("nothing was approved or merged"), "{e}");
                 assert_eq!(events(&l), ["steps:facts", "auth"], "{answer:?}");
                 assert!(steps.approved.borrow().is_empty());
+                assert!(!e.contains("withdrawn"), "{e}");
             }
         }
     }
@@ -1281,7 +1307,117 @@ fn every_merge_posts_the_approval_of_the_head_you_authenticated() {
         assert!(format!("{e:#}").contains("nothing was merged"), "{e:#}");
         assert_eq!(steps.approved.borrow().as_slice(), [HEAD]);
         assert!(!events(&l).contains(&"steps:merge".to_string()));
+        assert_eq!(events(&l).last().unwrap(), "steps:withdraw 1234567");
     }
+}
+
+/// Review round 1, I-3: an approval is a standing grant for its commit, so the flow asks for
+/// nothing while another required check has already failed. A failed guard check alone, and
+/// checks still running or not yet reported, don't stop it.
+#[test] // spec: QA-033, QA-036
+fn a_failed_check_stops_the_flow_before_anything_is_asked() {
+    for alone in [false, true] {
+        for failed in ["failure", "cancelled", "skipped"] {
+            let l = log();
+            let auth = FakeAuth::new(&l, Ok(()));
+            let mut steps = FakeSteps::new(&l, &[]);
+            steps.facts.checks = vec![
+                ("protected-test-check".into(), "failure".into()),
+                ("every-push".into(), "success".into()),
+                ("pr-ready".into(), failed.into()),
+            ];
+            let e = if alone {
+                merge_alone(&steps, &auth)
+            } else {
+                merge_flow("s", "a", &steps, &auth)
+            }
+            .unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains("pr-ready") && e.contains(failed), "{e}");
+            assert!(e.contains("nothing was asked, approved or merged"), "{e}");
+            assert_eq!(events(&l), ["steps:facts"], "{failed}");
+        }
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let mut steps = FakeSteps::new(&l, &[]);
+        steps.facts.checks = vec![
+            ("protected-test-check".into(), "failure".into()),
+            ("every-push".into(), "pending".into()),
+            ("pr-ready".into(), "missing".into()),
+        ];
+        if alone {
+            merge_alone(&steps, &auth)
+        } else {
+            merge_flow("s", "a", &steps, &auth)
+        }
+        .unwrap();
+        assert_eq!(events(&l).last().unwrap(), "steps:merge");
+    }
+}
+
+/// Review round 1, I-3: every exit that doesn't merge, once the approval is posted, withdraws
+/// it and says so: a CI failure or the wait running out, a gate refusal (a moved head), a failed
+/// merge call. A failed withdrawal says the approval still stands. A merge withdraws nothing.
+#[test] // spec: QA-033, QA-036
+fn every_exit_without_a_merge_after_the_approval_withdraws_it() {
+    type Setup = fn(&mut FakeSteps);
+    let paths: [(&str, Setup); 4] = [
+        ("a CI failure", |s| {
+            s.wait_error = Some("CI check every-push finished as failure; nothing was merged")
+        }),
+        ("the wait running out", |s| {
+            s.wait_error = Some("CI isn't green after 20 minutes; nothing was merged")
+        }),
+        ("a moved head", |s| {
+            s.merge_head = Some("0000000000000000000000000000000000000abc".into())
+        }),
+        ("a refused merge", |s| {
+            s.merge_error = Some("GitHub won't merge the PR: not mergeable")
+        }),
+    ];
+    for alone in [false, true] {
+        for (what, setup) in paths {
+            for withdraw_fails in [false, true] {
+                let l = log();
+                let auth = FakeAuth::new(&l, Ok(()));
+                let mut steps = FakeSteps::new(&l, &[]);
+                setup(&mut steps);
+                steps.withdraw_fails = withdraw_fails;
+                let e = if alone {
+                    merge_alone(&steps, &auth)
+                } else {
+                    merge_flow("s", "a", &steps, &auth)
+                }
+                .unwrap_err();
+                let e = format!("{e:#}");
+                let ev = events(&l);
+                assert_eq!(
+                    ev.last().unwrap(),
+                    "steps:withdraw 1234567",
+                    "{what}: {ev:?}"
+                );
+                assert_eq!(
+                    ev.iter()
+                        .filter(|x| x.starts_with("steps:withdraw"))
+                        .count(),
+                    1,
+                    "{what}"
+                );
+                assert!(!ev.contains(&"steps:merge".to_string()), "{what}");
+                if withdraw_fails {
+                    assert!(e.contains("could NOT be withdrawn"), "{what}: {e}");
+                    assert!(e.contains("still stands"), "{what}: {e}");
+                } else {
+                    assert!(e.contains("was withdrawn"), "{what}: {e}");
+                }
+            }
+        }
+    }
+    // A merge withdraws nothing.
+    let l = log();
+    let steps = FakeSteps::new(&l, &[]);
+    merge_alone(&steps, &FakeAuth::new(&l, Ok(()))).unwrap();
+    assert!(!events(&l).iter().any(|x| x.starts_with("steps:withdraw")));
 }
 
 /// `lil dev merge` on its own is the flow without an agent's summary or audit: it shows lil's
@@ -1303,7 +1439,7 @@ fn dev_merge_asks_for_authentication_on_every_merge() {
             "1234567",
             "Add the thing",
             "an-agent",
-            "main",
+            "Into main",
             "README.md",
         ] {
             assert!(summary.contains(detail), "{detail}: {summary}");

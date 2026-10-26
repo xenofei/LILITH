@@ -147,13 +147,17 @@ pub enum DevCommand {
     ///      have all passed on that exact commit. A check that is missing, still
     ///      running or failed means no merge.
     ///   2. The reviewer app (named in dev/merge-guard.toml) has approved that exact
-    ///      commit. A human approval, or an approval of an older commit, doesn't count.
+    ///      commit: protected-test-check needs it on every PR, and lil checks it again
+    ///      itself for protected changes. A human approval, or an approval of an older
+    ///      commit, doesn't count.
     ///   3. The merge is pinned: GitHub is asked to merge only the commit you
     ///      authenticated, so a push after it makes the merge fail instead of slipping in.
     ///
-    /// Draft PRs, closed PRs and PRs into another branch are refused. If anything can't
-    /// be checked (a network or git error), it refuses. Every refusal says, in plain
-    /// words, which condition failed.
+    /// It asks nothing when a required check other than protected-test-check has
+    /// already failed. When it stops without merging after posting the approval, it
+    /// dismisses the approval again and says so. Draft PRs, closed PRs and PRs into
+    /// another branch are refused. If anything can't be checked (a network or git
+    /// error), it refuses. Every refusal says, in plain words, which condition failed.
     #[command(verbatim_doc_comment)]
     Merge {
         /// The pull request number.

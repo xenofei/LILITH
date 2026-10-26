@@ -73,7 +73,7 @@ use super::merge::{
     self, MergeGuardConfig, blocker_lines, check_origin, committed_config, explain, fetch,
     is_commit_sha, one_line, short,
 };
-use super::merge_flow::{Facts, MergeFlowSteps, MergeGate, merge_alone, merge_flow};
+use super::merge_flow::{Facts, GUARD_CHECK, MergeFlowSteps, MergeGate, merge_alone, merge_flow};
 use super::reviewer_hello::{
     Authenticator, HelloPlatform, KeyAuthenticator, NoTerminal, PassphraseUnlocker, Unlocker,
     WindowsHello, enrolled_hello, unlock_reviewer_key,
@@ -621,6 +621,51 @@ pub(crate) fn approve_with_key(
     // review is posted.
     drop(token);
     outcome
+}
+
+/// The body of the dismissal when the merge flow withdraws its approval.
+const WITHDRAWN: &str = "Withdrawn by lil: the merge flow stopped without merging this commit after the repo owner authenticated it, so the approval doesn't stand for a later merge.";
+
+/// Withdraws the reviewer App's approval of `head` on PR `pr` (review round 1, I-3): a fresh
+/// App JWT and a review-only installation token (revoked on every path), then every approval by
+/// the App on that commit is dismissed. `Ok` only when the reviews, read again, no longer show
+/// the App's approval of `head`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "approve_with_key's arguments for the same App calls"
+)]
+pub(crate) fn withdraw_with_key(
+    pr: u64,
+    cfg: &MergeGuardConfig,
+    gh: &dyn GitHubApi,
+    key_file: &ReviewerKeyFile,
+    pem: &[u8],
+    tokens: &dyn InstallationTokens,
+    now_unix: i64,
+    head: &str,
+) -> Result<()> {
+    let jwt = Zeroizing::new(app_jwt(key_file.app_id, pem, now_unix)?);
+    let token = tokens
+        .exchange(
+            &jwt,
+            key_file.installation_id,
+            &cfg.repo,
+            TokenScope::ReviewOnly,
+        )
+        .context("exchanging the App JWT for an installation token")?;
+    let token = RevokeOnDrop::new(tokens, token);
+    drop(jwt);
+    let login = cfg.reviewer_login();
+    gh.dismiss_approvals_as_app(pr, head, &login, WITHDRAWN, token.secret())
+        .context("dismissing the approval failed")?;
+    drop(token);
+    let reviews = gh
+        .reviews(pr)
+        .context("re-reading the reviews after the dismissal failed")?;
+    if merge::app_approved(&reviews, &login, head) {
+        bail!("GitHub still shows {login}'s approval of {}", short(head));
+    }
+    Ok(())
 }
 
 /// An installation token that is revoked when this is dropped: after a normal return, an
@@ -1271,9 +1316,6 @@ const MAX_FLOW_TEXT: u64 = 64 * 1024;
 const CHECKS_WAIT: Duration = Duration::from_secs(20 * 60);
 /// How often it looks.
 const CHECKS_POLL: Duration = Duration::from_secs(15);
-/// The check that the approval's guard re-run turns green, when it asked for one; a failure of
-/// any other check stops the wait at once.
-const GUARD_CHECK: &str = "protected-test-check";
 
 /// A summary or audit file: UTF-8, not empty, at most [`MAX_FLOW_TEXT`] bytes.
 fn read_flow_text(path: &Path, what: &str) -> Result<String> {
@@ -1328,6 +1370,11 @@ struct FlowSteps<'a, 'g> {
     state: std::cell::RefCell<Option<(MergeGuardConfig, Box<dyn GitHubApi + 'g>)>>,
     /// Which command posts the approval, as its review body says.
     via: ApprovedVia,
+    /// Starts recording Ctrl+C instead of ending the process, once the approval is about to be
+    /// posted (`lil_platform::interrupt` for real), so the flow can withdraw it before it exits.
+    catch_interrupts: &'a dyn Fn(),
+    /// Whether Ctrl+C came since then.
+    interrupted: &'a dyn Fn() -> bool,
 }
 
 impl FlowSteps<'_, '_> {
@@ -1452,6 +1499,7 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
     }
 
     fn post_approval(&self, pem: &[u8], facts: &Facts) -> Result<bool> {
+        (self.catch_interrupts)();
         // Pinned to the head you were shown (`facts.head`), never a re-read one.
         let rerun = self.with_gh(|cfg, gh| {
             approve_with_key(
@@ -1487,6 +1535,9 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
         self.with_gh(|cfg, gh| {
             let mut waited = Duration::ZERO;
             loop {
+                if (self.interrupted)() {
+                    bail!("stopped by Ctrl+C while waiting for CI; nothing was merged");
+                }
                 let mut waiting = Vec::new();
                 for name in &cfg.required_checks {
                     match gh.check(&facts.head, name)? {
@@ -1534,6 +1585,21 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
             gate,
         )
         .map_err(|refusals| anyhow!(explain(&refusals)))
+    }
+
+    fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> Result<()> {
+        self.with_gh(|cfg, gh| {
+            withdraw_with_key(
+                self.pr,
+                cfg,
+                gh,
+                self.key_file,
+                pem,
+                self.tokens,
+                (self.now_unix)(),
+                &facts.head,
+            )
+        })
     }
 }
 
@@ -1621,6 +1687,14 @@ fn run_flow(pr: u64, texts: Option<(String, String)>, passphrase_only: bool) -> 
             } else {
                 ApprovedVia::Merge
             },
+            catch_interrupts: &|| {
+                if let Err(e) = lil_platform::interrupt::catch_interrupts() {
+                    eprintln!(
+                        "Ctrl+C can't be caught ({e}); if you stop the merge with it, dismiss the approval on the PR's page."
+                    );
+                }
+            },
+            interrupted: &lil_platform::interrupt::interrupted,
         };
         match &texts {
             Some((summary, audit)) => merge_flow(summary, audit, &steps, auth),
@@ -3327,6 +3401,17 @@ mod tests {
         fn app_slug(&self, jwt: &str) -> Result<String> {
             self.fake.app_slug(jwt)
         }
+        fn dismiss_approvals_as_app(
+            &self,
+            n: u64,
+            sha: &str,
+            login: &str,
+            message: &str,
+            token: &str,
+        ) -> Result<usize> {
+            self.fake
+                .dismiss_approvals_as_app(n, sha, login, message, token)
+        }
     }
 
     #[test] // spec: QA-020
@@ -3503,6 +3588,17 @@ mod tests {
         }
         fn app_slug(&self, jwt: &str) -> Result<String> {
             self.0.app_slug(jwt)
+        }
+        fn dismiss_approvals_as_app(
+            &self,
+            n: u64,
+            sha: &str,
+            login: &str,
+            message: &str,
+            token: &str,
+        ) -> Result<usize> {
+            self.0
+                .dismiss_approvals_as_app(n, sha, login, message, token)
         }
     }
 
@@ -3916,6 +4012,17 @@ mod tests {
         fn app_slug(&self, jwt: &str) -> Result<String> {
             self.fake.app_slug(jwt)
         }
+        fn dismiss_approvals_as_app(
+            &self,
+            n: u64,
+            sha: &str,
+            login: &str,
+            message: &str,
+            token: &str,
+        ) -> Result<usize> {
+            self.fake
+                .dismiss_approvals_as_app(n, sha, login, message, token)
+        }
     }
 
     fn green(fake: &FakeGitHub, head: &str) {
@@ -3944,6 +4051,8 @@ mod tests {
             now_unix: &|| NOW,
             state: std::cell::RefCell::new(None),
             via: ApprovedVia::MergeFlow,
+            catch_interrupts: &|| {},
+            interrupted: &|| false,
         }
     }
 
@@ -4015,6 +4124,86 @@ mod tests {
         }
     }
 
+    /// Review round 1, I-3, through the real steps: a failed check stops the flow before the
+    /// approval; a CI failure after it, the wait running out and Ctrl+C each dismiss it again,
+    /// and a failed dismissal says the approval stands.
+    #[test] // spec: QA-033, QA-036
+    fn a_flow_that_stops_after_the_approval_dismisses_it() {
+        const BOT: &str = "lilith-reviewer[bot]";
+        enum Stop {
+            CiFails,
+            WaitRunsOut,
+            CtrlC,
+        }
+        for (stop, dismiss_fails) in [
+            (Stop::CiFails, false),
+            (Stop::WaitRunsOut, false),
+            (Stop::CtrlC, false),
+            (Stop::CiFails, true),
+        ] {
+            let (_tmp, work, _, docs) = glue_fixture();
+            let fake = FakeGitHub::new();
+            fake.add_pr(43, &docs, "main");
+            green(&fake, &docs);
+            // Still running when you are asked, so the flow goes ahead.
+            fake.set_check(&docs, "pr-ready", CheckState::Pending);
+            if dismiss_fails {
+                fake.set_dismiss_error("HTTP 403: Resource not accessible by integration");
+            }
+            let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+                Ok(Box::new(FakeRef(&fake)))
+            };
+            let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+            let fail_ci = || {
+                if matches!(stop, Stop::CiFails) {
+                    fake.set_check(&docs, "pr-ready", CheckState::Failure("failure".into()));
+                }
+            };
+            let pause = |_: Duration| fail_ci();
+            let caught = std::cell::Cell::new(false);
+            let catch = || caught.set(true);
+            let ctrl_c = || matches!(stop, Stop::CtrlC) && caught.get();
+            let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+            steps.pr = 43;
+            steps.catch_interrupts = &catch;
+            steps.interrupted = &ctrl_c;
+            let e = format!("{:#}", merge_alone(&steps, &KeyAuth).unwrap_err());
+            match stop {
+                Stop::CiFails => assert!(e.contains("pr-ready finished as failure"), "{e}"),
+                Stop::WaitRunsOut => assert!(e.contains("after 20 minutes"), "{e}"),
+                Stop::CtrlC => assert!(e.contains("Ctrl+C"), "{e}"),
+            }
+            assert!(caught.get(), "Ctrl+C wasn't caught before the approval");
+            assert_eq!(fake.posted_reviews().len(), 1);
+            assert_eq!(fake.pr(43).unwrap().state, "open");
+            let standing = merge::app_approved(&fake.reviews(43).unwrap(), BOT, &docs);
+            if dismiss_fails {
+                assert!(e.contains("still stands"), "{e}");
+                assert!(standing);
+            } else {
+                assert!(e.contains("was withdrawn"), "{e}");
+                assert!(!standing, "the approval still stands: {e}");
+            }
+        }
+
+        // A check that already failed: nothing is asked, posted or dismissed.
+        let (_tmp, work, _, docs) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(43, &docs, "main");
+        green(&fake, &docs);
+        fake.set_check(&docs, "every-push", CheckState::Failure("failure".into()));
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+        steps.pr = 43;
+        let e = format!("{:#}", merge_alone(&steps, &KeyAuth).unwrap_err());
+        assert!(e.contains("nothing was asked, approved or merged"), "{e}");
+        assert!(fake.posted_reviews().is_empty());
+        assert!(exchange.calls.borrow().is_empty(), "the key was used");
+    }
+
     #[test] // spec: QA-036, QA-020
     fn a_head_that_moves_after_the_facts_gets_no_approval() {
         let (_tmp, work, protected, _) = glue_fixture();
@@ -4078,6 +4267,13 @@ mod tests {
         assert!(e.contains("Not authenticated"), "{e}");
         assert!(e.contains(short(&protected)), "{e}");
         assert_eq!(fake.posted_reviews()[0].sha, protected);
+        // Review round 1, I-3: the approval of the head you authenticated is withdrawn.
+        assert!(e.contains("was withdrawn"), "{e}");
+        assert!(!merge::app_approved(
+            &fake.reviews(42).unwrap(),
+            "lilith-reviewer[bot]",
+            &protected
+        ));
         assert_eq!(
             fake.pr(42).unwrap().state,
             "open",

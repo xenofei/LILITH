@@ -9,6 +9,13 @@
 //! passphrase ([`Authenticator`]). Only after it succeeds does it post the reviewer App's
 //! approval of that head, wait for CI on that head, and merge through `lil dev merge`'s checks.
 //! Without your authentication nothing is approved or merged ([`merge_flow`]).
+//!
+//! **An approval is a standing grant for its commit** (review round 1): while it stands, that
+//! commit can be merged once CI is green by anyone who can call GitHub's merge API. So the flow
+//! asks for nothing while another required check has already failed ([`failed_check`]), and
+//! any exit after the approval that doesn't merge (a CI failure, the wait running out, a moved
+//! head, an error, Ctrl+C) withdraws it again ([`MergeFlowSteps::withdraw_approval`]) and says
+//! so, or says that it still stands when the withdrawal failed.
 //! `lil dev merge <PR>` run on its own is the same flow without the summary and the audit
 //! ([`merge_alone`]).
 //!
@@ -24,8 +31,12 @@
 //! real ones are `reviewer.rs`'s), so `tests/reviewer_hello.rs` compiles it on its own.
 
 use super::reviewer_hello::{Authenticator, quoted};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::fmt::Write as _;
+
+/// The check the approval turns green (`ci-guard.yml`'s job name). A failure of any other
+/// required check refuses the merge before you are asked anything.
+pub const GUARD_CHECK: &str = "protected-test-check";
 
 /// What the audit slot says when `lil dev merge` runs on its own.
 pub const NO_AUDIT: &str =
@@ -159,6 +170,21 @@ pub trait MergeFlowSteps {
     fn wait_for_checks(&self, facts: &Facts, guard_rerun: bool) -> Result<()>;
     /// Merges through `lil dev merge`'s checks, which ask `gate` last.
     fn merge(&self, gate: &dyn MergeGate) -> Result<String>;
+    /// Dismisses the reviewer App's approval of `facts.head`, signed with the unlocked key: the
+    /// flow stopped without merging after posting it. `Ok` only when GitHub no longer shows it.
+    fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> Result<()>;
+}
+
+/// The first required check other than [`GUARD_CHECK`] that already finished as anything but
+/// success, with its state. Pending and not yet reported checks may still pass.
+pub fn failed_check(facts: &Facts) -> Option<(&str, &str)> {
+    facts
+        .checks
+        .iter()
+        .find(|(name, state)| {
+            name != GUARD_CHECK && !matches!(state.as_str(), "success" | "pending" | "missing")
+        })
+        .map(|(n, s)| (n.as_str(), s.as_str()))
 }
 
 /// How many lines of the agent's summary are shown (re-review m3): a long one mustn't bury the
@@ -230,6 +256,14 @@ fn flow(
     auth: &dyn Authenticator,
 ) -> Result<String> {
     let facts = steps.facts()?;
+    // An approval is a standing grant for that commit (review round 1, I-3): it is posted only
+    // when the merge can follow, so a failed check stops the flow before you are asked.
+    if let Some((name, state)) = failed_check(&facts) {
+        bail!(
+            "CI check {name} finished as {state} on {}; nothing was asked, approved or merged. Fix it, then run the merge again",
+            short(&facts.head)
+        );
+    }
     let mut shown = render_facts(&facts);
     match summary {
         Some(summary) => {
@@ -254,11 +288,26 @@ fn flow(
     // Every merge, protected files or not (owner decision 2026-10-26): the protected-test check
     // passes only once the App approved this exact head.
     let guard_rerun = steps.post_approval(&pem, &facts)?;
-    drop(pem);
-    steps.wait_for_checks(&facts, guard_rerun)?;
     let gate = Authenticated {
         pr: facts.pr,
         head: facts.head.clone(),
     };
-    steps.merge(&gate)
+    let merged = steps
+        .wait_for_checks(&facts, guard_rerun)
+        .and_then(|()| steps.merge(&gate));
+    // Any exit that doesn't merge, once the approval is posted, withdraws it again: otherwise
+    // that commit could be merged later, by anyone who can call the merge API, without you. The
+    // key stays unlocked until then, for that one call.
+    let outcome = merged.map_err(|e| match steps.withdraw_approval(&pem, &facts) {
+        Ok(()) => anyhow!(
+            "{e:#}; the reviewer App's approval of {} was withdrawn (dismissed), so that commit can't be merged without your authentication again",
+            short(&facts.head)
+        ),
+        Err(w) => anyhow!(
+            "{e:#}; the reviewer App's approval of {} could NOT be withdrawn ({w:#}), so it still stands: anyone who can call GitHub's merge API can merge that commit once CI is green. Dismiss the approval on the PR's page",
+            short(&facts.head)
+        ),
+    });
+    drop(pem);
+    outcome
 }
