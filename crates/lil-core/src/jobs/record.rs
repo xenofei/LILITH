@@ -885,12 +885,26 @@ pub async fn open_rows(db: &StateDb) -> Result<Vec<JobRow>, StateError> {
 /// [`COLUMNS`] with the job's arguments and its tool call's arguments read as NULL: what a
 /// summary never shows (a `comfy.prompt`'s whole graph).
 fn brief_columns() -> String {
-    let brief = COLUMNS
-        .replacen("module, args, ", "module, NULL, ", 1)
-        .replacen("tool, tool_args, ", "tool, NULL, ", 1);
-    debug_assert_eq!(brief.matches("NULL").count(), 2, "{brief}");
-    brief
+    let columns: Vec<&str> = COLUMNS
+        .split(',')
+        .map(|c| match c.trim() {
+            "args" | "tool_args" => "NULL",
+            other => other,
+        })
+        .collect();
+    assert_eq!(
+        columns.iter().filter(|c| **c == "NULL").count(),
+        2,
+        "COLUMNS names args and tool_args"
+    );
+    columns.join(", ")
 }
+
+/// The reads of [`list_columns`] in this test run: `(the database's address, whether every
+/// column was read, how many rows)`, so a test can see what a listing read.
+#[cfg(test)]
+pub(crate) static ROW_READS: std::sync::Mutex<Vec<(usize, bool, usize)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// [`list`], each row without its arguments (`args` and the origin's `arguments` are
 /// `null`): enough for its summary (`jobs.list`; review fix M-2).
@@ -928,51 +942,60 @@ async fn list_columns(
     before: Option<i64>,
     columns: String,
 ) -> Result<Vec<JobRow>, StateError> {
+    #[cfg(test)]
+    let full = columns == COLUMNS;
     let f = f.clone();
-    db.call(move |conn| {
-        let run = || -> rusqlite::Result<Vec<JobRow>> {
-            let mut sql_text = format!("SELECT {columns} FROM jobs WHERE 1 = 1");
-            let mut values: Vec<rusqlite::types::Value> = Vec::new();
-            let mut bind = |sql_text: &mut String, clause: &str, v: rusqlite::types::Value| {
-                values.push(v);
-                sql_text.push_str(&format!(" AND {clause} ?{}", values.len()));
+    let rows = db
+        .call(move |conn| {
+            let run = || -> rusqlite::Result<Vec<JobRow>> {
+                let mut sql_text = format!("SELECT {columns} FROM jobs WHERE 1 = 1");
+                let mut values: Vec<rusqlite::types::Value> = Vec::new();
+                let mut bind = |sql_text: &mut String, clause: &str, v: rusqlite::types::Value| {
+                    values.push(v);
+                    sql_text.push_str(&format!(" AND {clause} ?{}", values.len()));
+                };
+                if let Some(status) = f.status {
+                    bind(&mut sql_text, "status =", status.wire().to_string().into());
+                }
+                if let Some(kind) = &f.kind {
+                    bind(&mut sql_text, "kind =", kind.clone().into());
+                }
+                if let Some(project) = &f.project {
+                    bind(&mut sql_text, "project =", project.clone().into());
+                }
+                if let Some(batch_id) = &f.batch_id {
+                    bind(&mut sql_text, "batch_id =", batch_id.clone().into());
+                }
+                if let Some(since) = since {
+                    bind(&mut sql_text, "updated_utc >", since.into());
+                }
+                if let Some(before) = before {
+                    bind(&mut sql_text, "seq <", before.into());
+                }
+                if let Some(ids) = &f.ids {
+                    let ids = serde_json::to_string(ids).expect("ids serialise");
+                    bind(
+                        &mut sql_text,
+                        "job_id IN (SELECT value FROM json_each(",
+                        ids.into(),
+                    );
+                    sql_text.push_str("))");
+                }
+                values.push(i64::from(limit).into());
+                sql_text.push_str(&format!(" ORDER BY seq DESC LIMIT ?{}", values.len()));
+                conn.prepare(&sql_text)?
+                    .query_map(rusqlite::params_from_iter(values), row)?
+                    .collect()
             };
-            if let Some(status) = f.status {
-                bind(&mut sql_text, "status =", status.wire().to_string().into());
-            }
-            if let Some(kind) = &f.kind {
-                bind(&mut sql_text, "kind =", kind.clone().into());
-            }
-            if let Some(project) = &f.project {
-                bind(&mut sql_text, "project =", project.clone().into());
-            }
-            if let Some(batch_id) = &f.batch_id {
-                bind(&mut sql_text, "batch_id =", batch_id.clone().into());
-            }
-            if let Some(since) = since {
-                bind(&mut sql_text, "updated_utc >", since.into());
-            }
-            if let Some(before) = before {
-                bind(&mut sql_text, "seq <", before.into());
-            }
-            if let Some(ids) = &f.ids {
-                let ids = serde_json::to_string(ids).expect("ids serialise");
-                bind(
-                    &mut sql_text,
-                    "job_id IN (SELECT value FROM json_each(",
-                    ids.into(),
-                );
-                sql_text.push_str("))");
-            }
-            values.push(i64::from(limit).into());
-            sql_text.push_str(&format!(" ORDER BY seq DESC LIMIT ?{}", values.len()));
-            conn.prepare(&sql_text)?
-                .query_map(rusqlite::params_from_iter(values), row)?
-                .collect()
-        };
-        run().map_err(|e| sql(&e))
-    })
-    .await
+            run().map_err(|e| sql(&e))
+        })
+        .await?;
+    #[cfg(test)]
+    ROW_READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((std::ptr::from_ref(db) as usize, full, rows.len()));
+    Ok(rows)
 }
 
 #[cfg(test)]

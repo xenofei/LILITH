@@ -4217,6 +4217,67 @@ mod tests {
         }
     }
 
+    /// Re-review M-2: `jobs.list` reads its rows without their arguments, in both orders, and
+    /// a queue-order page reads at most `limit + 1` rows, whatever the queue holds.
+    #[tokio::test(start_paused = true)] // spec: CORE-146, ARCH-025
+    async fn a_list_reads_brief_rows_and_a_queue_page_only_its_own() {
+        let env = TestEnv::new();
+        let states = Arc::new(StateRegistry::open(&env.env, Arc::new(|_: &str| {})).unwrap());
+        let clock: Arc<dyn Clock> = FakeClock::new();
+        let events = Arc::new(EventBus::new(clock.clone()));
+        let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
+        let hub = WorkspaceHub::new(
+            env.env.clone(),
+            states.clone(),
+            events.clone(),
+            clock.clone(),
+            ids.clone(),
+            FailPoints::none(),
+            Arc::new(SystemProbe),
+            Default::default(),
+        );
+        let jobs = Jobs::new(states.clone(), hub, events, clock, ids, FailPoints::none());
+        jobs.register(Arc::new(Hold));
+        for _ in 0..8 {
+            jobs.submit(&caller(None), hold()).await.unwrap();
+        }
+        let db = std::ptr::from_ref(&*states.suite_db()) as usize;
+        let reads = || -> Vec<(bool, usize)> {
+            let mut all = record::ROW_READS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mine = all
+                .iter()
+                .filter(|(at, _, _)| *at == db)
+                .map(|(_, full, rows)| (*full, *rows))
+                .collect();
+            all.retain(|(at, _, _)| *at != db);
+            mine
+        };
+        reads();
+        let queue = JobFilter {
+            order: Some(ListOrder::Queue),
+            limit: Some(2),
+            ..JobFilter::default()
+        };
+        let (page, next) = jobs.list(&caller(None), queue).await.unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(next.is_some());
+        let read = reads();
+        assert!(read.iter().all(|(full, _)| !full), "{read:?}");
+        assert!(
+            read.iter().map(|(_, rows)| rows).sum::<usize>() <= 3,
+            "{read:?}"
+        );
+        let newest = JobFilter {
+            limit: Some(2),
+            ..JobFilter::default()
+        };
+        jobs.list(&caller(None), newest).await.unwrap();
+        let read = reads();
+        assert_eq!(read, [(false, 3)]);
+    }
+
     /// N2: a cancel of a queued job that races the shutdown step (its end has begun when the
     /// step closes the queue) still ends the job at once as cancelled, with its completions
     /// releasing the reservation; the step doesn't wait out its grace for it.
