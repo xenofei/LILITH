@@ -13,7 +13,13 @@
       }
     },
     { "name": "dev", "inherits": "base", "displayName": "Development (build/dev)" },
-    { "name": "ci", "inherits": "base", "displayName": "CI (build/ci)" }
+    {
+      "name": "ci",
+      "inherits": "base",
+      "displayName": "CI (build/ci)",
+      "description": "Takes lil-core, lil and lil-mcp from target/release: run cargo build --workspace --release --locked first.",
+      "cacheVariables": { "LIL_RUST_BIN_DIR": "${sourceDir}/target/release" }
+    }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev", "targets": ["all", "deploy"] },

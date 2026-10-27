@@ -66,10 +66,31 @@ set(LIL_KDDW_QML_DIR ${kddockwidgets_SOURCE_DIR}/src/qtquick/views/qml)
 
 # The Rust programs the deploy folder carries (Corrosion names them after their [[bin]]: lil,
 # not lil-cli), built against the workspace's Cargo.lock.
-corrosion_import_crate(
-    MANIFEST_PATH ${CMAKE_SOURCE_DIR}/Cargo.toml
-    CRATES lil-core lil-cli lil-mcp
-    LOCKED)
+# LIL_RUST_BIN_DIR (the ci preset sets it to target/release): take the three programs from that
+# folder, where the same CI job's `cargo build --workspace --release --locked` step has just
+# built them, instead of building them a second time through Corrosion in its own target folder
+# (Corrosion always passes --target and its own --target-dir, so it can't reuse that build). They
+# then carry the workspace's unified features rather than each package's own. The targets keep
+# Corrosion's names, so the deploy target depends on them either way. lil_qt is still built
+# below, by cxx-qt-cmake, which has to drive its build.
+set(LIL_RUST_BIN_DIR "" CACHE PATH "Folder with release builds of lil-core.exe, lil.exe and lil-mcp.exe to use instead of building them (empty: Corrosion builds them)")
+if(LIL_RUST_BIN_DIR)
+    foreach(bin lil-core lil lil-mcp)
+        if(NOT EXISTS "${LIL_RUST_BIN_DIR}/${bin}.exe")
+            message(FATAL_ERROR "${LIL_RUST_BIN_DIR}/${bin}.exe doesn't exist: run `cargo build --workspace --release --locked` first, or leave LIL_RUST_BIN_DIR empty.")
+        endif()
+        add_custom_target(cargo-build_${bin} ALL
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LIL_RUST_BIN_DIR}/${bin}.exe" "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${bin}.exe"
+            COMMENT "Copying the prebuilt ${bin}.exe from ${LIL_RUST_BIN_DIR}"
+            VERBATIM)
+    endforeach()
+else()
+    corrosion_import_crate(
+        MANIFEST_PATH ${CMAKE_SOURCE_DIR}/Cargo.toml
+        CRATES lil-core lil-cli lil-mcp
+        LOCKED)
+endif()
 
 # lil_qt with its `qt` feature: the static library and the Lilith.Core QML module (P4a-R1).
 cxx_qt_import_crate(
