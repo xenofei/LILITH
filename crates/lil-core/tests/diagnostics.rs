@@ -1276,15 +1276,18 @@ fn read_tail_keeps_the_newest_bytes_from_a_line_start() {
     assert_eq!(String::from_utf8(read_tail(&one, 5).unwrap()).unwrap(), "");
 }
 
-/// The diagnostics module can't send anything: it names no network API (ARCH-122).
+/// The diagnostics module can't send anything: it names no network API (ARCH-122), and nor
+/// does the redaction it uses, its own module since PR #53 (`src/redact.rs`).
 #[test] // spec: ARCH-122, QA-085
 fn the_diagnostics_module_names_no_network_api() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("diagnostics");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let dir = src.join("diagnostics");
     let mut read = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
+    let files = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .chain(std::iter::once(src.join("redact.rs")));
+    for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
         read += 1;
         for api in [

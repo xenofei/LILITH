@@ -1,4 +1,6 @@
-//! The diagnostics bundle's redaction (ARCH-121, QA-084, AI-092; Appendix G "Diagnostics").
+//! The redaction the diagnostics bundle and the toasts share (ARCH-121, QA-084, AI-092;
+//! Appendix G "Diagnostics" and "Toast XML"). It is infrastructure below both and names no
+//! other module of the crate, so the notifier redacts without naming `diagnostics` (PR #53).
 //!
 //! [`Compiled::text`] runs these rules over every entry, in order, and then again until
 //! nothing changes, at most [`MAX_PASSES`] times, so a value encoded inside another encoding
@@ -73,7 +75,7 @@
 
 use std::path::Path;
 
-use lil_platform::names;
+use lil_platform::{Env, names};
 
 /// How many decode-and-redact passes [`Redactor::text`] makes at most.
 pub const MAX_PASSES: usize = 3;
@@ -200,6 +202,24 @@ impl Redactor {
             user,
             machines,
         }
+    }
+}
+
+/// What a bundle redacts beyond the fixed rules on this PC: the profile labels and folders of
+/// `suite_toml` (the text of `suite.toml`, when there is one), the user-profile folder and the
+/// computer's names.
+pub(crate) fn redactor_for(env: &Env, suite_toml: Option<&str>) -> Redactor {
+    let profiles = |key: &str| {
+        suite_toml
+            .map(|doc| profile_values(doc, key))
+            .unwrap_or_default()
+    };
+    Redactor {
+        labels: profiles("label"),
+        profile_dir: Some(env.user_profile().display().to_string()),
+        machine: env.computer_name(),
+        machine_names: env.dns_host_name().into_iter().collect(),
+        names: profiles("config_dir"),
     }
 }
 

@@ -11,11 +11,13 @@
 //! `meter` item either (`JobCompletion` is how `meter` hears of a job). `confirm` uses `tools`
 //! (it is the confirm stage), and neither `tools` nor `jobs` uses it.
 //! `interchange` and `docs` (the handler registry and the holds) are used by no other module but
-//! `server`, which builds every module and wires them together.
+//! `server`, which builds every module and wires them together. `redact`, the redaction the
+//! diagnostics bundle and the toasts share, names no other module of the crate, so the
+//! notifier (`interchange`) redacts without naming `diagnostics` (PR #53).
 //!
 //! Every module of the crate is scanned, the infrastructure ones too (`state`, `workspace`,
 //! `server`, `transport`, `rpc`, `config`, `events`, `identity`, `lifecycle`, `session`,
-//! `desktop`, `diagnostics`), and
+//! `desktop`, `diagnostics`, `redact`), and
 //! the list is checked against `src/lib.rs`, so a new module can't be missed. The store names
 //! none of them: it defines `StoreRows`, which `state` implements, and `Access`, which
 //! `workspace` re-exports; `state` holds `WorkspaceRef`. The connection types (`ConnCtx`,
@@ -40,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 /// Every module of the crate (`pub mod` in `src/lib.rs`): the CORE-014 modules and the
 /// infrastructure.
-const MODULES: [&str; 28] = [
+const MODULES: [&str; 29] = [
     "store",
     "index",
     "watch",
@@ -69,6 +71,7 @@ const MODULES: [&str; 28] = [
     "session",
     "desktop",
     "diagnostics",
+    "redact",
 ];
 
 /// The modules `src/lib.rs` declares, at any visibility: `mod`, `pub mod`, `pub(crate) mod`,
@@ -528,6 +531,14 @@ fn module_dependencies_are_acyclic_and_store_depends_on_no_consumer() {
         .collect();
     assert_eq!(users, ["server"], "{users:?} use diagnostics");
     assert!(graph["diagnostics"].contains("tools"), "{graph:?}");
+    // The redaction sits below both of its users and names no module of the crate (PR #53).
+    assert!(
+        graph["redact"].is_empty(),
+        "redact uses {:?}",
+        graph["redact"]
+    );
+    assert!(graph["diagnostics"].contains("redact"), "{graph:?}");
+    assert!(graph["interchange"].contains("redact"), "{graph:?}");
     // `resources` is registered by the server like `engines`: no other module names it, and it
     // uses `tools` (the call context and the registry) and the store.
     for module in graph.keys().filter(|m| *m != "resources" && *m != "server") {

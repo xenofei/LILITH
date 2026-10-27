@@ -17,7 +17,7 @@
 //!   bundle's entries are (review fix M-6).
 //! - **The bundle** ([`bundle`]): one zip in `<local dir>\diagnostics\`, written through the
 //!   store's cache writer, never holding a workspace file, every entry redacted
-//!   ([`redact`]). Nothing is sent anywhere (ARCH-122): the bundle leaves the machine only
+//!   ([`crate::redact`]). Nothing is sent anywhere (ARCH-122): the bundle leaves the machine only
 //!   when you hand it on.
 //! - **Versions**: the apps whose `core/hello` this core answered, by app, with the
 //!   `build_id` each gave (a [`ConnObserver`]).
@@ -28,7 +28,6 @@
 
 pub mod bundle;
 pub mod recent;
-pub mod redact;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -40,11 +39,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+pub use crate::redact::Redactor;
 pub use bundle::{BundleResult, LOG_TAIL_BYTES};
 pub use recent::{
     DEFAULT_RECENT, ErrorGroup, MAX_MESSAGE_CHARS, MAX_RECENT, RECENT_CAPACITY, cut_message,
 };
-pub use redact::Redactor;
 
 use crate::engines::tools::EnginesSlot;
 use crate::events::EventBus;
@@ -131,7 +130,8 @@ impl Diagnostics {
         // kept (a tool call's or a job's), as the caps read suite.toml at each use: brief, and
         // only on an error path.
         let suite_toml = std::fs::read_to_string(self.env.suite_toml_to_read()).ok();
-        let (message, _) = bundle::redactor_for(&self.env, suite_toml.as_deref()).text(message);
+        let (message, _) =
+            crate::redact::redactor_for(&self.env, suite_toml.as_deref()).text(message);
         lock(&self.errors).push(code, tool, job_id, &message, at_ms);
         let mut data = json!({"kind": "error", "code": code});
         if let Some(tool) = tool {

@@ -5,7 +5,7 @@
 //! - `manifest.json`: `{bundle: 1, created, build_id, channel, protocol}`;
 //! - `versions.json`: the core, each app that said hello, ComfyUI, the Qt pair and
 //!   KDDockWidgets (`null`: protocol 1.2 carries no such version) and the driver;
-//! - `suite.toml`, redacted ([`Redactor::toml`]), left out when there is none;
+//! - `suite.toml`, redacted ([`crate::redact::Redactor::toml`]), left out when there is none;
 //! - `errors.json`: `diagnostics.recent` with limit 200;
 //! - `hardware.json`: the telemetry `Snapshot`;
 //! - `engines.json`: `{status: engines.status, environment: engines.environment}`;
@@ -14,7 +14,7 @@
 //!   [`LOGS_TOTAL_BYTES`] in all (`lil-core`'s first, then by name);
 //! - with a job, `job.json`: `{job, tool, arguments, untrusted: true}`.
 //!
-//! Never a workspace file. Every entry is redacted ([`super::redact`]); `redactions` counts
+//! Never a workspace file. Every entry is redacted ([`crate::redact`]); `redactions` counts
 //! the replacements. The zip is built in memory and written by the store's cache writer
 //! (`fsops::write_new_suite_cache_file`: a temp file in the diagnostics folder, then a move
 //! that never replaces), so nothing is written anywhere else. No path is handed out twice: a
@@ -39,10 +39,10 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::redact::{Compiled, Redactor, profile_values};
 use super::{Diagnostics, MAX_MESSAGE_CHARS, MAX_RECENT, cut_message};
 use crate::engines::comfyui::environment;
 use crate::jobs::JobId;
+use crate::redact::{Compiled, redactor_for};
 use crate::store::fsops;
 use crate::tools::CallCtx;
 
@@ -495,22 +495,4 @@ fn zip_time(unix_secs: i64) -> zip::DateTime {
         num(17..19) as u8,
     )
     .unwrap_or_default()
-}
-
-/// What a bundle redacts beyond the fixed rules on this PC: the profile labels and folders of
-/// `suite_toml` (the text of `suite.toml`, when there is one), the user-profile folder and the
-/// computer's names.
-pub(crate) fn redactor_for(env: &Env, suite_toml: Option<&str>) -> Redactor {
-    let profiles = |key: &str| {
-        suite_toml
-            .map(|doc| profile_values(doc, key))
-            .unwrap_or_default()
-    };
-    Redactor {
-        labels: profiles("label"),
-        profile_dir: Some(env.user_profile().display().to_string()),
-        machine: env.computer_name(),
-        machine_names: env.dns_host_name().into_iter().collect(),
-        names: profiles("config_dir"),
-    }
 }

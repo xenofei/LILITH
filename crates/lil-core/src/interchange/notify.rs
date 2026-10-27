@@ -980,7 +980,7 @@ fn can_post(path: &PathWire) -> bool {
 /// runtime.
 fn as_posted(env: &Env, handlers: &HandlersWire, mut text: ToastText) -> ToastText {
     let suite_toml = std::fs::read_to_string(env.suite_toml_to_read()).ok();
-    let redactor = crate::diagnostics::bundle::redactor_for(env, suite_toml.as_deref()).compile();
+    let redactor = crate::redact::redactor_for(env, suite_toml.as_deref()).compile();
     let redact = |s: &str| redactor.text(s);
     let targeted = text.launch.is_some() || text.actions != ToastActions::None;
     let bare = *handlers != HandlersWire::Ok && targeted;
@@ -1011,7 +1011,7 @@ fn settled(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> Strin
     let came = if n > 0 { came } else { s.to_string() };
     settle(&came, usize::MAX, redact)
         .and_then(|whole| settle(&whole, max, redact))
-        .unwrap_or_else(|| crate::diagnostics::redact::REDACTED.to_string())
+        .unwrap_or_else(|| crate::redact::REDACTED.to_string())
 }
 
 /// `s` normalised to at most `max` `char`s ([`lil_parse::without_default_ignorables`], then
@@ -1022,7 +1022,7 @@ fn settle(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> Option
     // splitter between them is gone (PR #53 audit).
     let norm = |t: &str| {
         let shown = shown_plain(&lil_parse::without_default_ignorables(t), max);
-        crate::diagnostics::redact::glued_tails(&shown).0
+        crate::redact::glued_tails(&shown).0
     };
     let mut shown = norm(s);
     for _ in 0..SETTLE_ROUNDS {
