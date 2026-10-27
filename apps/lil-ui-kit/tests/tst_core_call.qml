@@ -129,8 +129,9 @@ TestCase {
         verify(!core.cancel("rq_unknown"), "an unknown id is false")
     }
 
-    // Review I-2: a call dies with its owner. Neither a plain call nor one waiting on its
-    // confirmation runs a handler after the owner is destroyed, and both are cancelled.
+    // Review I-2, with the ruling on APP-029: no handler runs after the owner is destroyed. A
+    // plain call is cancelled; one waiting on its confirmation is detached: the user's approval
+    // still resends it once, with its retry token, and its result reaches no callback.
     function test_a_destroyed_owner_drops_its_calls() {
         const core = fake()
         const owner = ownerComponent.createObject(tc)
@@ -141,13 +142,22 @@ TestCase {
         compare(got.pending.length, 1)
 
         owner.destroy()
-        tryVerify(() => core.cancelled.length === 2, 5000, "both calls are cancelled")
-        verify(core.cancelled.indexOf(plain.id) >= 0 && core.cancelled.indexOf(waiting.id) >= 0)
-        // Whatever comes later reaches nobody, and the approval resends nothing.
+        tryVerify(() => core.cancelled.length === 1, 5000, "the plain call is cancelled")
+        compare(core.cancelled, [plain.id])
+        wait(50)
+        compare(core.cancelled, [plain.id], "the waiting call is detached, not cancelled")
+
+        // The user approves: Core resends the detached call once, with its retry token.
         core.respond(plain.id, {status: "ok", structured: {text: "late"}, artifacts: [], summary_text: ""})
         core.emit("confirmations", "event",
                   {kind: "answered", confirmation: {id: "cf_0000000000000001", state: "approved"}})
-        compare(core.resends.length, 0)
+        compare(core.resends.length, 1)
+        compare(core.resends[0].id, waiting.id)
+        compare(core.resends[0].retryToken, "ik_00000000000000a1")
+        // Its result closes the request and reaches no callback.
+        verify(core.respond(waiting.id, {status: "ok", structured: {count: 1}, artifacts: [],
+                                         summary_text: "run 1"}), "the request was still open")
+        compare(got.ok.length + got.error.length, 0)
         // Even a signal sent straight to the callbacks' ids runs none of them.
         core.callFinished(plain.id, JSON.stringify({structured: {}}))
         core.callFailed(waiting.id, JSON.stringify({code: "confirm.denied"}))

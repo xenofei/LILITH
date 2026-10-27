@@ -25,15 +25,19 @@
 //
 // A call belongs to its `owner`, the object whose handlers it runs (a panel, a delegate): the
 // callbacks are connected with the owner as their receiver, so once the owner is destroyed none
-// of them runs, and a call still open is cancelled (Core drops its request, a pending one
-// included; an OwnerWatch child of the owner tells it). An owner that can't hold that child (not
-// a QML object) is refused before anything is sent.
+// of them runs (an OwnerWatch child of the owner tells the call). What happens to the call then
+// (APP-029, plan 4a ruling, 2026-10-26):
+// - waiting on its confirmation (a tool call with autoRetry): it is detached, not cancelled. The
+//   confirmation stays answerable (the Confirmations panel, a notification); an approval still
+//   makes Core send it once with its retry token, since the approval means "do it", and its
+//   result shows wherever the core reports it (jobs, toasts). A denial or an expiry ends it;
+// - anything else still open: it is cancelled, and Core drops its request.
+// An owner that can't hold the watch (not a QML object) is refused before anything is sent.
 //
-// A cancelled call is never sent again, also when it was waiting on a confirmation: that
-// confirmation stays answerable (the Confirmations panel, a notification), and approving it then
-// runs nothing. A cancel just after an approval can come after Core's resend reached the core;
-// the call then runs and its result is dropped. A panel that must see such a call through keeps
-// it in an owner that outlives the panel.
+// `cancel()` itself always cancels, a call waiting on its confirmation included: that call is
+// never sent again, and approving its confirmation then runs nothing. A cancel just after an
+// approval can come after Core's resend reached the core; the call then runs and its result is
+// dropped.
 //
 // A panel follows a topic only through `subscribe`: Core counts its subscribers per topic, and
 // each subscription unsubscribes exactly once, when it is ended or its owner is destroyed, so a
@@ -112,6 +116,8 @@ function track(core, id, h, endsAtPending, watcher) {
     const autoRetry = !endsAtPending && (h.autoRetry === undefined ? true : h.autoRetry)
     const owner = h.owner
     let open = true
+    // Waiting on its confirmation for Core's automatic retry.
+    let waiting = false
 
     function close() {
         if (!open)
@@ -152,17 +158,22 @@ function track(core, id, h, endsAtPending, watcher) {
             // An app call's request has ended already; a tool call's is given up.
             if (!endsAtPending)
                 core.cancel(id)
+        } else {
+            waiting = true
         }
         if (h.pending)
             h.pending(pending)
     }
     // The owner is going: none of its handlers runs again (Qt drops the connections whose
-    // receiver it is), and Core forgets the request.
+    // receiver it is). A call waiting on its confirmation is detached: Core keeps it, and an
+    // approval still sends it. Any other is cancelled, and Core forgets the request.
     function onOwnerGone() {
         if (!open)
             return
         open = false
         watcher = null
+        if (waiting)
+            return
         try {
             core.cancel(id)
         } catch (e) {

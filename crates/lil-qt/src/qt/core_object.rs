@@ -17,7 +17,10 @@
 //!   on its confirmation is never sent again: the confirmation stays answerable (the
 //!   Confirmations panel, a notification), and approving it runs nothing; a cancel just after
 //!   an approval can come after the resend reached the core, which then runs the call once.
-//!   QML makes calls through `CoreCall.js`, which cancels a call when its owner is destroyed.
+//!   QML makes calls through `CoreCall.js`. When a call's owner is destroyed, CoreCall drops its
+//!   callbacks; a call waiting on its confirmation is then detached, not cancelled (APP-029):
+//!   Core keeps the request, an approval still resends it once, and its outcome, signalled to
+//!   nobody, closes the request. Any other open call is cancelled.
 //! - **Events:** `subscribe(topic)` and `unsubscribe(topic)`, counted per topic: each
 //!   subscriber unsubscribes only itself, so they come in pairs. A panel follows a topic only
 //!   through `CoreCall.subscribe(core, topic, owner, onEvent)`, which unsubscribes once, when it
