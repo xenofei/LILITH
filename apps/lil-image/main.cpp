@@ -32,7 +32,8 @@
 // and reads the `core_object` line, which says the deployed Lilith.Core module loaded.
 // The shell (APP-001, P4a-R16): ShellWindow gets Core and the app's state folder
 // (lil_qt::app_state_dir), where it restores and saves its layout. The GUI-thread stall watchdog
-// logs stalls (lilshim/StallWatchdog.h), and the font database is filled off the GUI thread.
+// logs stalls once the window is interactive (lilshim/StallWatchdog.h), and the font database is
+// filled off the GUI thread.
 //
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
@@ -179,9 +180,8 @@ int main(int, char **)
 
     lilshim::installLogBridge();
     lilshim::setLogSink(&toAppLog);
-    // The GUI-thread stall watchdog, and the font database filled off the GUI thread before the
-    // first show (spike 10 §8, follow-ups 3 and 4).
-    lilshim::startStallWatchdog();
+    // The font database, filled off the GUI thread before the first show (spike 10 §8,
+    // follow-up 4).
     lilshim::warmFonts();
     // env_left: what step 2 left of the cleared variables (none); the deploy check reads it,
     // with the platform, the import paths and the first frame's graphics API.
@@ -269,6 +269,9 @@ int main(int, char **)
                           {{"ms", ms},
                            {"webengine_loaded", lilshim::isModuleLoaded(QStringLiteral("Qt6WebEngineCore.dll"))}});
         lil_qt::note_start_time("interactive", ms);
+        // The GUI-thread stall watchdog (spike 10 §8, follow-up 3), from here on: the start's own
+        // loading isn't a stall.
+        lilshim::startStallWatchdog();
         reached();
     });
 

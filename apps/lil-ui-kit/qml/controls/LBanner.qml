@@ -1,6 +1,7 @@
 // A banner across the top of a view (APP-156): role AlertMessage, its text as its accessible
 // name, in the tab chain. show(text) shows it and announces the text (Accessible.announce, which
-// UI Automation raises as a notification); Escape, or its Close button, closes it.
+// UI Automation raises as a notification; show(text, false) leaves the announcement to a later
+// announce()); Escape, or its Dismiss button, closes it.
 import QtQuick
 import Lilith.UiKit
 
@@ -15,10 +16,15 @@ Item {
 
     signal closed()
 
-    function show(message) {
+    function show(message, announceNow) {
         if (message !== undefined)
             text = message
         visible = true
+        if (announceNow !== false)
+            announce()
+    }
+
+    function announce() {
         Accessible.announce(text)
     }
 
@@ -80,7 +86,7 @@ Item {
             visible: root.closable
             anchors.verticalCenter: parent.verticalCenter
             glyph: "×"
-            text: "Close"
+            text: "Dismiss"
             onClicked: root.close()
         }
     }

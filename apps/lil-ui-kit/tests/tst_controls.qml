@@ -72,15 +72,15 @@ TestCase {
         keyClick(Qt.Key_B)
         compare(p.field.text, "ab", "the field takes typing")
 
-        // Tab order: banner, its Close button, then the controls in order.
+        // Tab order: banner, its Dismiss button, then the controls in order.
         focusOn(p.banner)
         keyClick(Qt.Key_Tab)
         keyClick(Qt.Key_Tab)
-        tryVerify(() => p.button.activeFocus, 2000, "Tab reaches the button after the banner's Close button")
+        tryVerify(() => p.button.activeFocus, 2000, "Tab reaches the button after the banner's Dismiss button")
         keyClick(Qt.Key_Tab)
         tryVerify(() => p.iconButton.activeFocus, 2000, "then the icon button")
 
-        // Escape closes the banner, from the banner or from its Close button.
+        // Escape closes the banner, from the banner or from its Dismiss button.
         focusOn(p.banner)
         keyClick(Qt.Key_Escape)
         verify(!p.banner.visible, "Escape closes the banner")
@@ -88,9 +88,9 @@ TestCase {
         p.banner.show()
         focusOn(p.banner)
         keyClick(Qt.Key_Tab)
-        tryVerify(() => p.banner.closeButton.activeFocus, 2000, "Tab goes to the banner's Close button")
+        tryVerify(() => p.banner.closeButton.activeFocus, 2000, "Tab goes to the banner's Dismiss button")
         keyClick(Qt.Key_Space)
-        verify(!p.banner.visible, "its Close button closes it")
+        verify(!p.banner.visible, "its Dismiss button closes it")
         compare(p.closed, 2)
     }
 }

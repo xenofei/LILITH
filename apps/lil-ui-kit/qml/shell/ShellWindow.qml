@@ -11,7 +11,8 @@
 //
 // Keys (APP-011): the plan 4a shortcut map (ShellState.shortcuts), all global: one per panel,
 // F6 and Shift+F6 to the next and previous panel, and Ctrl+Shift+P, which emits
-// gpuPauseToggleRequested() for the top bar's pause control (Task 20).
+// gpuPauseToggleRequested() for the top bar's pause control (Task 20). Closing a panel announces
+// the key that opens it again (Accessible.announce, a UI Automation notification).
 import QtQuick
 import com.kdab.dockwidgets 2.0 as KDDW
 import Lilith.Core
@@ -33,7 +34,12 @@ Window {
     readonly property var docks: ({})
     // How the layout opened: "restored", "default", or "default_after_bad" (a file was set aside).
     property string layoutOpened
+    // The plan 4a shortcut map: [{keys, action, scope}].
+    readonly property var bindings: JSON.parse(ShellState.shortcuts())
     property string _lastSaved
+    // True while the shell itself opens or closes docks (the restore, the Default layout, the
+    // window's close), which aren't announced.
+    property bool _settling: true
 
     signal gpuPauseToggleRequested()
 
@@ -64,7 +70,7 @@ Window {
     }
 
     Instantiator {
-        model: JSON.parse(ShellState.shortcuts())
+        model: root.bindings
         delegate: Shortcut {
             required property var modelData
             sequence: modelData.keys
@@ -85,15 +91,30 @@ Window {
     Connections {
         target: DockLayout
         function onMainWindowClosing(name) {
-            if (name === dockingArea.uniqueName)
-                root.saveLayout()
+            if (name !== dockingArea.uniqueName)
+                return
+            root._settling = true
+            root.saveLayout()
         }
     }
 
-    // The banner is announced once the window is on screen, so a screen reader hears it.
+    // The layout banner shows with the window and is announced a second later: Qt starts its
+    // accessibility only when a screen reader first asks the new window for it, so an
+    // announcement made as the window first shows can be lost (Step 2b found it was).
     onVisibleChanged: {
-        if (visible && layoutBanner.text !== "" && !layoutBanner.visible)
-            layoutBanner.show()
+        if (visible && layoutBanner.text !== "" && !layoutBanner.visible) {
+            layoutBanner.show(undefined, false)
+            bannerAnnouncement.start()
+        }
+    }
+
+    Timer {
+        id: bannerAnnouncement
+        interval: 1000
+        onTriggered: {
+            if (layoutBanner.visible)
+                layoutBanner.announce()
+        }
     }
 
     Component.onCompleted: {
@@ -101,6 +122,7 @@ Window {
         for (const panel of Panels.all)
             createDock(panel.id)
         restoreLayout()
+        _settling = false
     }
 
     // KDDockWidgets keeps a dock (and its unique name) after its QML item goes, so the shell
@@ -121,6 +143,7 @@ Window {
             return null
         const dock = dockComponent.createObject(root, {panel: panel, core: root.core})
         docks[id] = dock
+        dock.isOpenChanged.connect(() => root.panelOpenChanged(dock))
         return dock
     }
 
@@ -196,6 +219,16 @@ Window {
         if (why === "")
             _lastSaved = text
         return why
+    }
+
+    // A panel you close says how to bring it back (APP-156): "Home closed. Ctrl+1 opens it
+    // again."
+    function panelOpenChanged(dock) {
+        if (_settling || dock.isOpen)
+            return
+        const binding = bindings.find(b => b.action === dock.panel.action)
+        dockingArea.Accessible.announce(dock.panel.title + " closed."
+                                        + (binding ? " " + binding.keys + " opens it again." : ""))
     }
 
     function showPanel(id) {
