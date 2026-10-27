@@ -25,11 +25,24 @@ qt = ["dep:cxx", "dep:cxx-qt", "dep:cxx-qt-lib", "dep:cxx-qt-build"]
 cxx = { workspace = true, optional = true }
 cxx-qt = { workspace = true, optional = true }
 cxx-qt-lib = { workspace = true, optional = true }
+lil-client = { path = "../lil-client" }
+lil-parse = { path = "../lil-parse" }
 lil-platform = { path = "../lil-platform" }
 lil-protocol = { path = "../lil-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+# rt-multi-thread: the background runtime that owns the session (APP-024); macros: `select!`
+# in its event pump.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tracing.workspace = true
 
 [build-dependencies]
 cxx-qt-build = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The e2e tests (feature `qt`): a real test-channel core.
+lil-testkit = { path = "../lil-testkit" }
+tempfile.workspace = true

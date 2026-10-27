@@ -5,8 +5,11 @@
 
 .DESCRIPTION
   1. Measures the folder (every file, in MiB) against the budget: test-params.toml's
-     [budgets] deploy_folder_mib once Task 29 adds it; until then 365.3 MiB, Task 0's trimmed
-     332.1 MiB plus 10 % (spike 10 §8.2).
+     [budgets] deploy_folder_mib once Task 29 adds it; until then an interim budget, the latest
+     legitimate measurement plus 10 % (plan 4a ruling, 2026-10-26): 397.1 MiB, Task 16's
+     361.0 MiB plus 10 % (it was 365.3, Task 0's trimmed 332.1 MiB plus 10 %, spike 10 §8.2). A
+     later task that grows the deploy legitimately re-measures it, updates this value and says
+     so in its PR body.
   2. Starts the deployed lil-image.exe with spike 02's stripped environment (every PATH folder of
      Qt, Visual Studio, MSVC or the Windows Kits removed, the developer-environment variables
      unset) plus a hostile one: a value for every prefix lil-image clears (Checkpoint A I-3), as
@@ -21,8 +24,10 @@
   3. Passes when the smoke run exits 0 within -TimeoutSec; its log (JSON lines on stderr) has a
      `start` with platform `windows`, no variable left to clear and the probe DLL not found (the
      DLL search lockdown), import paths without the hostile folder, a `first_frame` whose
-     graphics API isn't OpenGL, and an `interactive` with WebEngine not loaded (APP-137); it
-     never took the foreground; and the folder is within budget.
+     graphics API isn't OpenGL, an `interactive` with WebEngine not loaded (APP-137), and a
+     `core_object` saying the deployed Lilith.Core module made its Core (with no session under
+     --smoke-exit, so no core is started); it never took the foreground; and the folder is
+     within budget.
   Off a GitHub runner both launches run inside the hands-off pop-up's window (tools/sandbox/
   hands-off.ps1: 10 s of warning, then a countdown), since a regression could open a window on
   this PC's screen; -NoHandsOff skips it.
@@ -44,7 +49,8 @@ $failures = [System.Collections.Generic.List[string]]::new()
 
 # 1. Size.
 if ($BudgetMiB -le 0) {
-    $BudgetMiB = 365.3
+    # The interim budget (see the description): Task 16's 361.0 MiB plus 10 %.
+    $BudgetMiB = 397.1
     $params = Join-Path $Repo 'test-params.toml'
     if (Test-Path -LiteralPath $params) {
         $line = Select-String -LiteralPath $params -Pattern '^\s*deploy_folder_mib\s*=\s*([0-9.]+)' | Select-Object -First 1
@@ -201,6 +207,9 @@ if (-not $first) { $failures.Add('no first_frame event') }
 elseif ($first.graphics_api -eq 'opengl') { $failures.Add('the scene graph used OpenGL: QSG_RHI_BACKEND wasn''t cleared') }
 if (-not $inter) { $failures.Add('no interactive event') }
 elseif ($inter.webengine_loaded -ne $false) { $failures.Add('Qt6WebEngineCore.dll was loaded at interactive (APP-137)') }
+$coreObject = $events | Where-Object { $_.event -eq 'core_object' } | Select-Object -First 1
+if (-not $coreObject) { $failures.Add('no core_object event') }
+elseif ($coreObject.loaded -ne $true) { $failures.Add('the Lilith.Core module did not make its Core') }
 if ($foreground -gt 0) { $failures.Add("lil-image.exe took the foreground with --no-activate ($foreground samples)") }
 
 Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -23,6 +23,14 @@
 // So it runs from a deploy folder (build/<preset>/deploy), never from bin/: its own folder is
 // where Qt's platform plugin must be.
 //
+// Logs (ARCH-117, ARCH-119): once the environment is clean, lil_qt::init_logs starts the app's
+// log, <logs dir>\lil-image.<date>.log, with the panic hook; every line of the Qt log bridge, Qt's
+// own messages among them (with their qt_category), goes there as well as to stderr.
+// The core session (APP-024): lil_qt::serve_core makes the QML singleton Core connect as
+// ui:image, starting a core if none runs, and the engine makes Core at once. Under --smoke-exit
+// Core is made without a session, so it starts no core: the deploy check measures the start
+// and reads the `core_object` line, which says the deployed Lilith.Core module loaded.
+//
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
 // idle (tools/deploy/check-deploy.ps1). The log bridge writes `first_frame` and `interactive` as
@@ -101,6 +109,12 @@ QString fromRust(const rust::String &s)
     return QString::fromUtf8(s.data(), qsizetype(s.size()));
 }
 
+// The log bridge's sink: each line into the app's log (lil_qt::log_line).
+void toAppLog(const char *line, qsizetype size)
+{
+    lil_qt::log_line(rust::Str(line, size_t(size)));
+}
+
 QString graphicsApiName(QQuickWindow *window)
 {
     const QSGRendererInterface *ri = window->rendererInterface();
@@ -134,6 +148,11 @@ int main(int, char **)
             return refuse("LILITH didn't start: an environment variable Qt reads couldn't be cleared.");
     }
 
+    // The app's log, now that nothing it reads can be redirected.
+    const rust::String logsFailed = lil_qt::init_logs();
+    if (!logsFailed.empty())
+        std::fprintf(stderr, "LILITH's log didn't start: %s\n", std::string(logsFailed).c_str());
+
     // 3. Names, attributes and the library path, before the application object exists.
     QCoreApplication::setOrganizationName(fromRust(plan.org));
     QCoreApplication::setApplicationName(fromRust(plan.app));
@@ -152,6 +171,7 @@ int main(int, char **)
     QGuiApplication app(qtArgc, qtArgv.data());
 
     lilshim::installLogBridge();
+    lilshim::setLogSink(&toAppLog);
     // env_left: what step 2 left of the cleared variables (none); the deploy check reads it,
     // with the platform, the import paths and the first frame's graphics API.
     QJsonArray envLeft;
@@ -178,6 +198,15 @@ int main(int, char **)
     lilshim::logEvent(QStringLiteral("qml_import_paths"),
                       {{"paths", QJsonArray::fromStringList(engine.importPathList())}});
     KDDockWidgets::QtQuick::Platform::instance()->setQmlEngine(&engine);
+
+    // The core session: Core is made now, connected, rather than when QML first reads it.
+    if (!plan.smoke_exit) {
+        const rust::String why = lil_qt::serve_core();
+        if (!why.empty())
+            lilshim::logEvent(QStringLiteral("error"), {{"what", "no core session"}, {"why", fromRust(why)}});
+    }
+    const bool coreLoaded = engine.singletonInstance<QObject *>("Lilith.Core", "Core") != nullptr;
+    lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", coreLoaded}});
     engine.loadFromModule("Lilith.UiKit", "ShellWindow");
     auto *window = engine.rootObjects().isEmpty()
                        ? nullptr
@@ -200,9 +229,10 @@ int main(int, char **)
     *frameOnce = QObject::connect(window, &QQuickWindow::frameSwapped, window, [frameOnce, reached, window] {
         QObject::disconnect(*frameOnce);
         delete frameOnce;
+        const double ms = lilshim::msSinceProcessStart();
         lilshim::logEvent(QStringLiteral("first_frame"),
-                          {{"ms", lilshim::msSinceProcessStart()},
-                           {"graphics_api", graphicsApiName(window)}});
+                          {{"ms", ms}, {"graphics_api", graphicsApiName(window)}});
+        lil_qt::note_start_time("first_frame", ms);
         reached();
     }, Qt::DirectConnection);
 
@@ -215,9 +245,11 @@ int main(int, char **)
         QObject::disconnect(*idleOnce);
         delete idleOnce;
         // APP-137: WebEngine isn't in the process at this point.
+        const double ms = lilshim::msSinceProcessStart();
         lilshim::logEvent(QStringLiteral("interactive"),
-                          {{"ms", lilshim::msSinceProcessStart()},
+                          {{"ms", ms},
                            {"webengine_loaded", lilshim::isModuleLoaded(QStringLiteral("Qt6WebEngineCore.dll"))}});
+        lil_qt::note_start_time("interactive", ms);
         reached();
     });
 
