@@ -31,7 +31,8 @@
 //!   task, so an unsubscribe and a subscribe of the same topic in a row end subscribed. The
 //!   followed topics' events reach QML through the throttle ([`Coalescer`], APP-027); a topic
 //!   no longer followed loses its waiting update. `confirmations` reaches QML only when QML
-//!   subscribed to it.
+//!   subscribed to it. Before the throttle, each event goes through the live-preview feed
+//!   ([`super::preview_feed`]), which takes a preview's frame out of it for the image provider.
 //! - **Shutdown.** Dropping the runtime gives its tasks 100 ms to end; the session is dropped
 //!   with the last of them, which closes its connection.
 
@@ -632,6 +633,8 @@ async fn pump(
                 if !shared.follows(&ev.topic) {
                     continue;
                 }
+                let mut ev = ev;
+                super::preview_feed::on_event(&mut ev);
                 for ev in throttle.push(ev, std::time::Instant::now()) {
                     shared.gui.push(Delivery::Event(ev));
                 }
@@ -643,7 +646,10 @@ async fn pump(
                     }
                 }
             }
-            Some(topic) = forgotten.recv() => throttle.forget(&topic),
+            Some(topic) = forgotten.recv() => {
+                throttle.forget(&topic);
+                super::preview_feed::forgotten(&topic);
+            }
         }
     }
 }

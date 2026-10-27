@@ -7,6 +7,8 @@ fn main() {
         .file("src/qt/core_object.rs")
         .cpp_file("src/qt/core_helpers.cpp")
         .file("src/qt/json_list_model.rs")
+        .file("src/qt/preview_feed.rs")
         .cpp_file("src/qt/core_link.cpp")
+        .cpp_file("src/qt/preview_sink.cpp")
         .build();
 }

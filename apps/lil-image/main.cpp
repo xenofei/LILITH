@@ -40,8 +40,10 @@
 #include "lilshim/Activation.h"
 #include "lilshim/DockFactory.h"
 #include "lilshim/LogBridge.h"
+#include "lilshim/PreviewProvider.h"
 
 #include "lil_qt/src/qt/mod.cxxqt.h"
+#include "lil_qt/src/qt/preview_sink.h"
 
 #include <kddockwidgets/Config.h>
 #include <kddockwidgets/qtquick/Platform.h>
@@ -194,7 +196,12 @@ int main(int, char **)
     KDDockWidgets::initFrontend(KDDockWidgets::FrontendType::QtQuick);
     lilshim::DockFactory::install();
 
+    // Live previews (APP-031): the bridge's frames go to the shim's provider, before the session
+    // starts.
+    lil_qt::setPreviewSink(&lilshim::putPreviewFrame, &lilshim::dropPreviewFrame);
+
     QQmlApplicationEngine engine;
+    engine.addImageProvider(QStringLiteral("lilpreview"), new lilshim::PreviewProvider);
     lilshim::logEvent(QStringLiteral("qml_import_paths"),
                       {{"paths", QJsonArray::fromStringList(engine.importPathList())}});
     KDDockWidgets::QtQuick::Platform::instance()->setQmlEngine(&engine);

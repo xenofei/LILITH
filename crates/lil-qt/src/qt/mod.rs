@@ -1,7 +1,8 @@
 //! The cxx-qt bridge (feature `qt`): the `Lilith.Core` QML module ([`core_object`], on the
-//! background [`runtime`], with the list models of [`json_list_model`]), and the calls
-//! `apps/lil-image/main.cpp` makes: the boot plan before Qt starts, the app's log (ARCH-117,
-//! ARCH-119), the Qt log lines, the start times and the core session.
+//! background [`runtime`], with the list models of [`json_list_model`] and the live-preview feed
+//! of [`preview_feed`]), and the calls `apps/lil-image/main.cpp` makes: the boot plan before
+//! Qt starts, the app's log (ARCH-117, ARCH-119), the Qt log lines, the start times and the
+//! core session.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -10,6 +11,7 @@ use lil_protocol::CallerKind;
 
 pub mod core_object;
 pub mod json_list_model;
+pub mod preview_feed;
 pub mod runtime;
 
 #[cxx_qt::bridge]

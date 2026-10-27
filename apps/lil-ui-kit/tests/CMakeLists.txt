@@ -32,6 +32,7 @@ lil_qml_test(lazy_web tst_lazy_web.qml)
 lil_qml_test(tst_core_call tst_core_call.qml)
 lil_qml_test(tst_json_list_model tst_json_list_model.qml)
 lil_qml_test(tst_event_log tst_event_log.qml)
+lil_qml_test(tst_preview tst_preview.qml)
 
 # lil_qt's e2e tests (crates/lil-qt/tests/e2e.rs) against a real test-channel core. Corrosion
 # builds no test targets, so cargo builds and runs them, with QMAKE naming the Qt pair's qmake
