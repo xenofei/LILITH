@@ -41,9 +41,24 @@ const JUDGES: [(&str, &str); 4] = [
 /// they name `-p lil-cli` and no other package.
 const TREE_BUILDERS: [(&str, &str); 3] = [
     ("ci-push.yml", "every-push"),
-    ("ci-pr-ready.yml", "pr-ready"),
+    ("ci-pr-ready.yml", "pr-ready-rust"),
     ("post-merge.yml", "post-merge-tests"),
 ];
+
+/// The jobs whose results `pr-ready` gathers (R38), in its `needs` order, and the variable its
+/// one step reads each result from.
+const PR_READY_WORK: [(&str, &str); 2] = [
+    ("pr-ready-rust", "RUST_RESULT"),
+    ("pr-ready-qt", "QT_RESULT"),
+];
+
+/// The script of `pr-ready`'s one step: it fails unless every work job's result is `success`.
+const PR_READY_GATE: &str = "echo \"pr-ready-rust: $RUST_RESULT; pr-ready-qt: $QT_RESULT\"
+if [ \"$RUST_RESULT\" != \"success\" ] || [ \"$QT_RESULT\" != \"success\" ]; then
+  echo \"::error::pr-ready passes only when pr-ready-rust and pr-ready-qt both succeed.\"
+  exit 1
+fi
+";
 
 /// The name of the step that picks the CLI crate a judge builds (D7).
 const PICK_STEP: &str = "Pick the CLI crate";
@@ -198,7 +213,15 @@ fn workflow_files_parse_and_name_jobs() {
     }
     let expected_jobs: [(&str, &[&str]); 5] = [
         ("ci-push.yml", &["every-push", "privacy-check"]),
-        ("ci-pr-ready.yml", &["pr-ready", "privacy-check-pr"]),
+        (
+            "ci-pr-ready.yml",
+            &[
+                "pr-ready-rust",
+                "pr-ready-qt",
+                "pr-ready",
+                "privacy-check-pr",
+            ],
+        ),
         ("ci-guard.yml", &["protected-test-check"]),
         ("nightly.yml", &["nightly"]),
         ("post-merge.yml", &["post-merge-tests", "post-merge-check"]),
@@ -1077,33 +1100,129 @@ fn workflow_every_push_and_pr_ready_shape() {
         str_list(&ready["on"]["pull_request"]["types"]),
         ["opened", "synchronize", "reopened", "ready_for_review"]
     );
-    let job = &ready["jobs"]["pr-ready"];
     // R38: a skipped job counts as passing for GitHub's required checks, so a draft must fail
-    // pr-ready, not skip it. The job always runs, and its first step fails on a draft.
+    // pr-ready, not skip it, and so must a failed half. The work runs in the jobs of
+    // PR_READY_WORK; each always runs, and its first step fails on a draft.
+    let work: Vec<&str> = PR_READY_WORK.iter().map(|(id, _)| *id).collect();
+    for id in &work {
+        let job = &ready["jobs"][*id];
+        assert!(
+            job["if"].is_badvalue(),
+            "{id} must not be skipped: {:?}",
+            job["if"]
+        );
+        // pr-ready reads `needs.<id>.result`, and a job-level continue-on-error makes a failed
+        // job's result `success`; a matrix would make it the legs' combined result.
+        assert!(
+            job["continue-on-error"].is_badvalue(),
+            "{id}: a work job may not continue on error: {:?}",
+            job["continue-on-error"]
+        );
+        assert!(
+            job["strategy"].is_badvalue(),
+            "{id}: a work job has no strategy (matrix): {:?}",
+            job["strategy"]
+        );
+        // Its own group, so the two work jobs never cancel each other.
+        assert_eq!(
+            s(&job["concurrency"]["group"]),
+            format!("{id}-${{{{ github.event.pull_request.number }}}}")
+        );
+        assert_eq!(
+            job["concurrency"]["cancel-in-progress"].as_bool(),
+            Some(true)
+        );
+        let first = &steps(job)[0];
+        assert!(
+            uses(first).is_empty(),
+            "{id}: the draft check comes before the checkout"
+        );
+        assert_eq!(
+            s(&first["env"]["DRAFT"]),
+            "${{ github.event.pull_request.draft }}"
+        );
+        assert!(first["if"].is_badvalue() && first["continue-on-error"].is_badvalue());
+        assert!(
+            run(first).contains("if [ \"$DRAFT\" != \"false\" ]; then"),
+            "{}",
+            run(first)
+        );
+        assert_eq!(run(first).matches("exit 1").count(), 1, "{}", run(first));
+        // Every step runs, and none can hide its failure: no step `if`, no continue-on-error
+        // and no `||` in a script (`cmd || true` would still contain the command).
+        for st in steps(job) {
+            assert!(
+                st["if"].is_badvalue(),
+                "{id}: a work step is conditional: {st:?}"
+            );
+            assert!(
+                st["continue-on-error"].is_badvalue(),
+                "{id}: a step may not fail quietly: {st:?}"
+            );
+            assert!(
+                !run(&st).contains("||"),
+                "{id}: a script may not use `||`: {}",
+                run(&st)
+            );
+        }
+    }
+    // Every job in the file but privacy-check-pr (not required here) is pr-ready or one it
+    // waits for, so a job added later can't be left out of the gate.
+    let ids: Vec<String> = jobs(&ready)
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| id != "pr-ready" && id != "privacy-check-pr")
+        .collect();
+    assert_eq!(ids, work);
+
+    // The gate: pr-ready always runs (a skipped pr-ready would pass), waits for every work
+    // job, runs no PR code (no checkout, no action, no token permissions, no secrets) and has
+    // one step, which fails unless every result is exactly `success` (checked by running it in
+    // pr_ready_gate_fails_unless_every_work_job_succeeded).
+    let gate = &ready["jobs"]["pr-ready"];
+    assert_eq!(s(&gate["if"]), "always()");
+    assert_eq!(str_list(&gate["needs"]), work);
     assert!(
-        job["if"].is_badvalue(),
-        "pr-ready must not be skipped: {:?}",
-        job["if"]
+        gate["permissions"].as_hash().is_some_and(|p| p.is_empty()),
+        "pr-ready: permissions must be {{}}"
     );
-    let first = &steps(job)[0];
-    assert!(
-        uses(first).is_empty(),
-        "the draft check comes before the checkout"
-    );
+    assert!(gate["env"].is_badvalue() && gate["continue-on-error"].is_badvalue());
+    let gate_steps = steps(gate);
+    assert_eq!(gate_steps.len(), 1, "pr-ready has one step");
+    let step = &gate_steps[0];
+    assert!(uses(step).is_empty());
+    assert!(step["if"].is_badvalue() && step["continue-on-error"].is_badvalue());
+    let env = step["env"]
+        .as_hash()
+        .expect("pr-ready's step reads the results from env");
+    assert_eq!(env.len(), PR_READY_WORK.len());
+    for (id, var) in PR_READY_WORK {
+        assert_eq!(
+            s(&step["env"][var]),
+            format!("${{{{ needs.{id}.result }}}}"),
+            "pr-ready: {var}"
+        );
+    }
+    assert_eq!(run(step), PR_READY_GATE);
+
+    let qt = steps(&ready["jobs"]["pr-ready-qt"]);
+    // The ci preset copies the release build's programs (LIL_RUST_BIN_DIR), so the release
+    // build runs in the Qt job, through the dev shell, before CMake is configured.
+    let release = step_named(&qt, "Release build");
     assert_eq!(
-        s(&first["env"]["DRAFT"]),
-        "${{ github.event.pull_request.draft }}"
+        run(&qt[release]),
+        "pwsh -NoProfile -File tools/dev-shell.ps1 cargo build --workspace --release --locked"
     );
-    assert!(first["if"].is_badvalue() && first["continue-on-error"].is_badvalue());
-    assert!(
-        run(first).contains("if [ \"$DRAFT\" != \"false\" ]; then"),
-        "{}",
-        run(first)
-    );
-    assert_eq!(run(first).matches("exit 1").count(), 1, "{}", run(first));
-    let scripts: String = steps(job)
+    assert!(release < step_named(&qt, "CMake configure (ci preset)"));
+    for id in &work {
+        let mut bad = Vec::new();
+        package_flag(&ready["jobs"][*id], &mut bad);
+        assert!(bad.is_empty(), "{id}: {bad:?}");
+    }
+    let scripts: String = work
         .iter()
-        .map(|st| run(st).to_string())
+        .flat_map(|id| steps(&ready["jobs"][*id]))
+        .map(|st| run(&st).to_string())
         .collect::<Vec<_>>()
         .join("\n");
     for needed in [
@@ -1138,6 +1257,43 @@ fn workflow_every_push_and_pr_ready_shape() {
         nightly["concurrency"]["cancel-in-progress"].as_bool(),
         Some(true)
     );
+}
+
+/// R38: pr-ready's one step, run with `sh` the way the job runs it, passes only when every work
+/// job's result is `success`: a failed, cancelled or skipped half (or a missing result) fails
+/// it. Skips when there is no `sh` on PATH, except in GitHub Actions, where it fails instead.
+#[test]
+fn pr_ready_gate_fails_unless_every_work_job_succeeded() {
+    use std::process::Command;
+    let (_, ready) = get("ci-pr-ready.yml");
+    let script = run(&steps(&ready["jobs"]["pr-ready"])[0]).to_string();
+    assert_eq!(script, PR_READY_GATE);
+    let sh = Command::new("sh").args(["-c", "exit 0"]).status();
+    if !sh.is_ok_and(|s| s.success()) {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "no `sh` on PATH in CI, so pr-ready's step wasn't run"
+        );
+        eprintln!("SKIPPED: no `sh` on PATH, so pr-ready's step can't be run here");
+        return;
+    }
+    let results = ["success", "failure", "cancelled", "skipped", ""];
+    for rust in results {
+        for qt in results {
+            let out = Command::new("sh")
+                .args(["-c", &script])
+                .env(PR_READY_WORK[0].1, rust)
+                .env(PR_READY_WORK[1].1, qt)
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.success(),
+                rust == "success" && qt == "success",
+                "pr-ready-rust {rust:?}, pr-ready-qt {qt:?}: {:?}",
+                out.status
+            );
+        }
+    }
 }
 
 /// R38: the CLI refuses to work on a repository other than the checkout it was built from, so
