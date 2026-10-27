@@ -223,9 +223,11 @@ int main(int, char **)
     }
     QObject *core = engine.singletonInstance<QObject *>("Lilith.Core", "Core");
     lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", core != nullptr}});
-    // The shell takes the core and the app's state folder, where its layout lives (P4a-R16).
+    // The shell takes the core and the app's state folder, where its layout lives (P4a-R16);
+    // under --smoke-exit none, so the deploy check neither reads nor writes the app's state.
+    const QString stateDir = plan.smoke_exit ? QString() : fromRust(lil_qt::app_state_dir());
     engine.setInitialProperties({{QStringLiteral("core"), QVariant::fromValue(core)},
-                                 {QStringLiteral("stateDir"), fromRust(lil_qt::app_state_dir())}});
+                                 {QStringLiteral("stateDir"), stateDir}});
     engine.loadFromModule("Lilith.UiKit", "ShellWindow");
     auto *window = engine.rootObjects().isEmpty()
                        ? nullptr
