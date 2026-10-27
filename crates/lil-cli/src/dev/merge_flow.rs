@@ -7,7 +7,9 @@
 //! waits, with nothing unlocked and nothing asked, until every other required check on that head
 //! is green ([`Wait::BeforeAuth`], owner decision 2026-10-27: CI takes longer than a wait with the
 //! key unlocked should last), and reads the PR again. A failure, a moved head, a PR that is no
-//! longer open, Ctrl+C or the wait running out until then asks nothing. Only then does it show
+//! longer open, Ctrl+C during the wait or the wait running out asks nothing; from the end of the
+//! wait until you have authenticated, Ctrl+C ends lil at once, as it did before (review I-1).
+//! Only then does it show
 //! you what it read the second time with the agent's summary and the independent audit (a review
 //! written by an agent that didn't make the change), and ask for your authentication: Windows
 //! Hello first, then the passphrase ([`Authenticator`]). Only after it succeeds does it check
@@ -183,6 +185,9 @@ pub trait MergeFlowSteps {
     /// exactly what holds now (withdrawn and the guard check red, withdrawn but the check not
     /// red yet, or nothing to withdraw); `Err` when the approval may still stand.
     fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> Result<String>;
+    /// Whether Ctrl+C came while lil was catching it. The flow looks right before it asks for
+    /// your authentication.
+    fn interrupted(&self) -> bool;
 }
 
 /// Which checks [`MergeFlowSteps::wait_for_checks`] waits for.
@@ -346,6 +351,13 @@ fn flow(
         None => shown.push_str(
             "\nSummary of the change: (none: `lil dev merge` was run on its own; `lil dev merge-flow` adds the agent's summary)\n",
         ),
+    }
+    // Review I-1: a Ctrl+C that came after the wait's last look still stops the flow before you
+    // are asked (from the end of that wait, Ctrl+C ends lil at once).
+    if steps.interrupted() {
+        bail!(
+            "stopped by Ctrl+C before your authentication; nothing was asked, approved or merged"
+        );
     }
     let pem = auth
         .authenticate(&shown, audit)

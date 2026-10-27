@@ -721,6 +721,10 @@ struct FakeSteps {
     merge_error: Option<&'static str>,
     /// Makes `withdraw_approval` fail.
     withdraw_fails: bool,
+    /// Ctrl+C comes during the second read of the facts.
+    ctrl_c_on_reread: bool,
+    /// Whether Ctrl+C came.
+    ctrl_c: std::cell::Cell<bool>,
 }
 
 impl FakeSteps {
@@ -751,6 +755,8 @@ impl FakeSteps {
             merge_panics: false,
             merge_error: None,
             withdraw_fails: false,
+            ctrl_c_on_reread: false,
+            ctrl_c: std::cell::Cell::new(false),
         }
     }
 }
@@ -760,6 +766,9 @@ impl MergeFlowSteps for FakeSteps {
         self.log.borrow_mut().push("steps:facts".into());
         let reads = self.reads.get();
         self.reads.set(reads + 1);
+        if reads > 0 && self.ctrl_c_on_reread {
+            self.ctrl_c.set(true);
+        }
         match &self.reread {
             Some(Ok(facts)) if reads > 0 => Ok(facts.clone()),
             Some(Err(e)) if reads > 0 => Err(anyhow::anyhow!("{e}")),
@@ -799,6 +808,9 @@ impl MergeFlowSteps for FakeSteps {
         assert!(!self.merge_panics, "a bug in the merge step");
         self.log.borrow_mut().push("steps:merge".into());
         Ok("feedface".into())
+    }
+    fn interrupted(&self) -> bool {
+        self.ctrl_c.get()
     }
     fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<String> {
         assert_eq!(pem, PEM);
@@ -1502,6 +1514,34 @@ fn a_stop_during_the_wait_before_authentication_asks_nothing() {
             assert!(auth.seen.borrow().is_empty(), "asked: {error}");
             assert!(steps.approved.borrow().is_empty());
         }
+    }
+}
+
+/// Review I-1: a Ctrl+C that comes during the second read, after the wait for CI, stops the flow
+/// before you are asked; the authenticator is never called.
+#[test] // spec: QA-033
+fn a_ctrl_c_during_the_second_read_never_asks() {
+    for alone in [false, true] {
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let mut steps = FakeSteps::new(&l, &[]);
+        steps.ctrl_c_on_reread = true;
+        let e = if alone {
+            merge_alone(&steps, &auth)
+        } else {
+            merge_flow("s", "a", &steps, &auth)
+        }
+        .unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "stopped by Ctrl+C before your authentication; nothing was asked, approved or merged"
+        );
+        assert!(auth.seen.borrow().is_empty(), "asked after Ctrl+C");
+        assert_eq!(
+            events(&l),
+            ["steps:facts", "steps:wait before-auth", "steps:facts"]
+        );
+        assert!(steps.approved.borrow().is_empty());
     }
 }
 

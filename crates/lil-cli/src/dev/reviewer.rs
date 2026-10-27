@@ -1624,10 +1624,14 @@ struct FlowSteps<'a, 'g> {
     state: std::cell::RefCell<Option<(MergeGuardConfig, Box<dyn GitHubApi + 'g>)>>,
     /// Which command posts the approval, as its review body says.
     via: ApprovedVia,
-    /// Starts recording Ctrl+C instead of ending the process, once you authenticated
-    /// (`lil_platform::interrupt` for real), so the flow can stop cleanly and withdraw an
-    /// approval it posted.
-    catch_interrupts: &'a dyn Fn(),
+    /// Starts recording Ctrl+C instead of ending the process at the start of each CI wait
+    /// (`lil_platform::interrupt` for real), so the flow can stop cleanly, say that nothing was
+    /// asked, and withdraw an approval it posted.
+    catch_interrupts: &'a dyn Fn(Wait),
+    /// Undoes `catch_interrupts` once the wait before your authentication is over, so that
+    /// Ctrl+C at the Merge window, Windows Hello or the passphrase prompt ends lil at once, as
+    /// it did before that wait existed (review I-1).
+    release_interrupts: &'a dyn Fn(),
     /// How many times Ctrl+C came since then.
     interrupts: &'a dyn Fn() -> u32,
 }
@@ -1808,7 +1812,7 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
     }
 
     fn wait_for_checks(&self, facts: &Facts, wait: Wait) -> Result<()> {
-        (self.catch_interrupts)();
+        (self.catch_interrupts)(wait);
         // Before your authentication nothing is asked yet, and before the approval nothing is
         // posted yet; after it, a stop withdraws it.
         let (nothing, stopping) = match wait {
@@ -1829,7 +1833,7 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
             Wait::BeforeAuth => CI_WAIT_BEFORE_AUTH,
             Wait::Others | Wait::Guard { .. } => CHECKS_WAIT,
         };
-        self.with_gh(|cfg, gh| {
+        let result = self.with_gh(|cfg, gh| {
             let mut waited = Duration::ZERO;
             loop {
                 if (self.interrupts)() > 0 {
@@ -1873,7 +1877,11 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 self.sleep_watching(CHECKS_POLL, 0);
                 waited += CHECKS_POLL;
             }
-        })
+        });
+        if wait == Wait::BeforeAuth && result.is_ok() {
+            (self.release_interrupts)();
+        }
+        result
     }
 
     fn merge(&self, gate: &dyn MergeGate) -> Result<String> {
@@ -1890,6 +1898,10 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
             gate,
         )
         .map_err(|refusals| anyhow!(explain(&refusals)))
+    }
+
+    fn interrupted(&self) -> bool {
+        (self.interrupts)() > 0
     }
 
     fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> Result<String> {
@@ -1996,15 +2008,27 @@ fn run_flow(pr: u64, texts: Option<(String, String)>, passphrase_only: bool) -> 
             } else {
                 ApprovedVia::Merge
             },
-            catch_interrupts: &|| {
-                lil_platform::interrupt::say_on_repeat(
-                    "Ctrl+C again: lil is stopping the merge and withdrawing the reviewer App's approval if it was posted. Wait for its last message, and don't close this window.".into(),
-                );
-                if let Err(e) = lil_platform::interrupt::catch_interrupts() {
+            catch_interrupts: &|wait| {
+                // Before your authentication there is nothing to withdraw, and a Ctrl+C that
+                // can't be caught just ends lil.
+                let before = wait == Wait::BeforeAuth;
+                if !before {
+                    lil_platform::interrupt::say_on_repeat(
+                        "Ctrl+C again: lil is stopping the merge and withdrawing the reviewer App's approval if it was posted. Wait for its last message, and don't close this window.".into(),
+                    );
+                }
+                if let Err(e) = lil_platform::interrupt::catch_interrupts()
+                    && !before
+                {
                     eprintln!(
                         "Ctrl+C can't be caught ({e}); if you stop the merge with it, dismiss the approval on the PR's page and re-run protected-test-check."
                     );
                 }
+            },
+            // If this fails, Ctrl+C stays caught: the flow then stops before it asks, or right
+            // after your authentication, and nothing is approved or merged.
+            release_interrupts: &|| {
+                let _ = lil_platform::interrupt::release_interrupts();
             },
             interrupts: &lil_platform::interrupt::interrupt_count,
         };
@@ -4363,7 +4387,8 @@ mod tests {
             now_unix: &|| NOW,
             state: std::cell::RefCell::new(None),
             via: ApprovedVia::MergeFlow,
-            catch_interrupts: &|| {},
+            catch_interrupts: &|_| {},
+            release_interrupts: &|| {},
             interrupts: &|| 0,
         }
     }
@@ -4504,7 +4529,7 @@ mod tests {
                 }
             };
             let caught = std::cell::Cell::new(false);
-            let catch = || caught.set(true);
+            let catch = |_: Wait| caught.set(true);
             let ctrl_c = || -> u32 {
                 let posted = !fake.posted_reviews().is_empty();
                 match stop {
@@ -5055,7 +5080,7 @@ mod tests {
             let pauses = std::cell::Cell::new(0usize);
             let pause = |_: Duration| pauses.set(pauses.get() + 1);
             let caught = std::cell::Cell::new(false);
-            let catch = || caught.set(true);
+            let catch = |_: Wait| caught.set(true);
             let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
             steps.catch_interrupts = &catch;
             let facts = steps.facts().unwrap();
@@ -5112,6 +5137,51 @@ mod tests {
         assert!(e.contains("nothing was asked, approved or merged"), "{e}");
         assert!(exchange.calls.borrow().is_empty(), "the key was used");
         assert!(fake.posted_reviews().is_empty());
+    }
+
+    /// Review I-1: Ctrl+C is caught during each CI wait, and released when the wait before your
+    /// authentication ends, so that Ctrl+C at the prompts ends lil at once. The waits after
+    /// your authentication keep it caught, so a stop can withdraw the approval.
+    #[test] // spec: QA-033
+    fn ctrl_c_is_released_after_the_wait_before_authentication() {
+        let (_tmp, work, protected, _) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let log = RefCell::new(Vec::new());
+        let catch = |wait: Wait| log.borrow_mut().push(format!("catch {wait:?}"));
+        let release = || log.borrow_mut().push("release".to_string());
+        let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+        steps.catch_interrupts = &catch;
+        steps.release_interrupts = &release;
+        let facts = steps.facts().unwrap();
+        steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap();
+        steps.wait_for_checks(&facts, Wait::Others).unwrap();
+        steps
+            .wait_for_checks(&facts, Wait::Guard { rerun: true })
+            .unwrap();
+        assert_eq!(
+            *log.borrow(),
+            [
+                "catch BeforeAuth",
+                "release",
+                "catch Others",
+                "catch Guard { rerun: true }"
+            ]
+        );
+        // A stop during that wait keeps it caught: lil says what holds, then ends.
+        log.borrow_mut().clear();
+        fake.set_check(
+            &protected,
+            "pr-ready",
+            CheckState::Failure("failure".into()),
+        );
+        assert!(steps.wait_for_checks(&facts, Wait::BeforeAuth).is_err());
+        assert_eq!(*log.borrow(), ["catch BeforeAuth"]);
     }
 
     /// A key that is never asked for: the flow must stop before your authentication.
