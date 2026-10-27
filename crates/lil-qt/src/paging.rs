@@ -105,6 +105,11 @@ impl Rows {
         self.rows.get(row)
     }
 
+    /// Whether a row with id `id` is held.
+    pub fn contains(&self, id: &str) -> bool {
+        self.index.contains_key(id)
+    }
+
     /// Inserts `row` first when its id is new, else updates it in place; `None` when it has no
     /// id under `id_key`, or when it is older than the row held (module docs).
     pub fn upsert(&mut self, row: Value, id_key: &str) -> Option<Change> {

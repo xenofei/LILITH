@@ -6,5 +6,7 @@ fn main() {
         .file("src/qt/mod.rs")
         .file("src/qt/core_object.rs")
         .cpp_file("src/qt/core_helpers.cpp")
+        .file("src/qt/json_list_model.rs")
+        .cpp_file("src/qt/core_link.cpp")
         .build();
 }
