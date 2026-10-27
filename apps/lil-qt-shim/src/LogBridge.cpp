@@ -4,6 +4,7 @@
 #include <QMutex>
 #include <QMutexLocker>
 
+#include <atomic>
 #include <cstdio>
 
 #ifndef NOMINMAX
@@ -17,6 +18,7 @@
 namespace {
 
 QMutex s_writeLock;
+std::atomic<lilshim::LogSink> s_sink{nullptr};
 
 quint64 ticks(const FILETIME &ft)
 {
@@ -25,9 +27,12 @@ quint64 ticks(const FILETIME &ft)
 
 void writeLine(const QJsonObject &line)
 {
-    const QByteArray text = QJsonDocument(line).toJson(QJsonDocument::Compact) + '\n';
+    const QByteArray text = QJsonDocument(line).toJson(QJsonDocument::Compact);
     QMutexLocker lock(&s_writeLock);
+    if (const lilshim::LogSink sink = s_sink.load())
+        sink(text.constData(), text.size());
     std::fwrite(text.constData(), 1, size_t(text.size()), stderr);
+    std::fputc('\n', stderr);
     std::fflush(stderr);
 }
 
@@ -58,6 +63,11 @@ namespace lilshim {
 void installLogBridge()
 {
     qInstallMessageHandler(handler);
+}
+
+void setLogSink(LogSink sink)
+{
+    s_sink.store(sink);
 }
 
 void logEvent(const QString &event, const QJsonObject &fields)

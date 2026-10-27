@@ -4,5 +4,7 @@ fn main() {
     #[cfg(feature = "qt")]
     cxx_qt_build::CxxQtBuilder::new_qml_module(cxx_qt_build::QmlModule::new("Lilith.Core"))
         .file("src/qt/mod.rs")
+        .file("src/qt/core_object.rs")
+        .cpp_file("src/qt/core_helpers.cpp")
         .build();
 }

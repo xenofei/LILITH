@@ -9,7 +9,8 @@ qt_add_qml_module(lil-ui-kit
     STATIC
     QML_FILES
         qml/Theme.qml
-        qml/shell/ShellWindow.qml)
+        qml/shell/ShellWindow.qml
+        qml/core/CoreCall.js)
 target_link_libraries(lil-ui-kit PRIVATE Qt6::Quick)
 
 add_subdirectory(tests)

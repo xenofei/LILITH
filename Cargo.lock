@@ -1984,8 +1984,16 @@ dependencies = [
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
+ "lil-client",
+ "lil-parse",
  "lil-platform",
  "lil-protocol",
+ "lil-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
