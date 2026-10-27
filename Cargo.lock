@@ -1989,6 +1989,7 @@ dependencies = [
  "lil-parse",
  "lil-platform",
  "lil-protocol",
+ "lil-schema",
  "lil-testkit",
  "serde",
  "serde_json",

@@ -31,10 +31,13 @@ extern crate cxx_qt_lib;
 #[cfg(feature = "qt")]
 pub mod qt;
 
+pub mod app_state;
+pub mod layout_file;
 pub mod paging;
 pub mod preview;
 pub mod requests;
 pub mod retry;
+pub mod shortcuts;
 pub mod throttle;
 pub mod topics;
 

@@ -31,6 +31,7 @@ lil-client = { path = "../lil-client" }
 lil-parse = { path = "../lil-parse" }
 lil-platform = { path = "../lil-platform" }
 lil-protocol = { path = "../lil-protocol" }
+lil-schema = { path = "../lil-schema" }
 serde.workspace = true
 serde_json.workspace = true
 # rt-multi-thread: the background runtime that owns the session (APP-024); macros: `select!`
