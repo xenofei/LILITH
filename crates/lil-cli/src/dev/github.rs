@@ -7,7 +7,7 @@
 //! | Method | Endpoint |
 //! |---|---|
 //! | `pr` | `GET /repos/{o}/{r}/pulls/{n}` |
-//! | `check` | `GET /repos/{o}/{r}/commits/{sha}/check-runs?check_name={name}&filter=latest`, trusting only runs from the `github-actions` app |
+//! | `check` | `GET /repos/{o}/{r}/commits/{sha}/check-runs?check_name={name}&filter=latest`, trusting only runs from the `github-actions` app; when the latest one failed, also `GET /repos/{o}/{r}/actions/runs?head_sha={sha}&per_page=100`, following `Link: rel="next"` |
 //! | `reviews` | `GET /repos/{o}/{r}/pulls/{n}/reviews?per_page=100`, following `Link: rel="next"` |
 //! | `merge` | `PUT /repos/{o}/{r}/pulls/{n}/merge` with `{"sha", "merge_method": "merge"}` |
 //! | `post_review_as_app` | `POST /repos/{o}/{r}/pulls/{n}/reviews` with the installation token |
@@ -64,6 +64,11 @@ pub struct CommitPull {
 pub enum CheckState {
     Success,
     Pending,
+    /// The latest trusted run finished as anything but success, but a newer run of its workflow
+    /// on the same commit hasn't finished yet (a re-run, or a new run after the PR was reopened
+    /// or marked ready for review; ci-time review I-1). It reads as pending, never as success:
+    /// the newest result decides.
+    Rerunning,
     /// Carries GitHub's `conclusion` (`failure`, `neutral`, `skipped`, `cancelled`, ...).
     Failure(String),
     Missing,
@@ -110,7 +115,8 @@ pub struct WorkflowRun {
 
 pub trait GitHubApi {
     fn pr(&self, number: u64) -> Result<PrInfo>;
-    /// The most recent check run named `name` on `sha`.
+    /// The most recent check run named `name` on `sha`; a failure while a newer run of its
+    /// workflow is in progress is [`CheckState::Rerunning`] ([`check_state`]).
     fn check(&self, sha: &str, name: &str) -> Result<CheckState>;
     /// Every review on the PR (all pages).
     fn reviews(&self, number: u64) -> Result<Vec<Review>>;
@@ -203,6 +209,17 @@ pub fn build_check_runs_request(
         format!(
             "/repos/{owner}/{repo}/commits/{sha}/check-runs?check_name={}&filter=latest",
             percent_encode(name)
+        ),
+    )
+}
+
+/// `GET .../actions/runs?head_sha=`: every workflow run on commit `sha`, newest first.
+pub fn build_commit_runs_request(owner: &str, repo: &str, sha: &str) -> (Method, String) {
+    (
+        Method::GET,
+        format!(
+            "/repos/{owner}/{repo}/actions/runs?head_sha={}&per_page=100",
+            percent_encode(sha)
         ),
     )
 }
@@ -341,24 +358,121 @@ pub const TRUSTED_CHECK_APP_SLUG: &str = "github-actions";
 /// list (or one holding only foreign runs) is `Missing`. A body without a `check_runs` array
 /// (HTML, garbage, an error object) is an error, never `Missing`.
 pub fn parse_check_state(v: &Value) -> Result<CheckState> {
+    Ok(latest_trusted_run(v)?.map_or(CheckState::Missing, run_state))
+}
+
+/// The trusted run with the highest id in a check-runs response, if any.
+fn latest_trusted_run(v: &Value) -> Result<Option<&Value>> {
     let runs = v["check_runs"]
         .as_array()
         .ok_or_else(|| anyhow!("check-runs response has no `check_runs` array"))?;
-    let latest = runs
+    Ok(runs
         .iter()
         .filter(|r| r.pointer("/app/slug").and_then(Value::as_str) == Some(TRUSTED_CHECK_APP_SLUG))
-        .max_by_key(|r| r["id"].as_u64().unwrap_or(0));
-    let Some(run) = latest else {
-        return Ok(CheckState::Missing);
-    };
+        .max_by_key(|r| r["id"].as_u64().unwrap_or(0)))
+}
+
+fn run_state(run: &Value) -> CheckState {
     if run["status"].as_str() != Some("completed") {
-        return Ok(CheckState::Pending);
+        return CheckState::Pending;
     }
-    Ok(match run["conclusion"].as_str() {
+    match run["conclusion"].as_str() {
         Some("success") => CheckState::Success,
         Some(other) => CheckState::Failure(other.to_owned()),
         None => CheckState::Failure("none".to_owned()),
-    })
+    }
+}
+
+/// A check's state from its check-runs response, as [`parse_check_state`], except that a failure
+/// reads as [`CheckState::Rerunning`] while [`newer_run_in_progress`] says a newer run of its
+/// workflow hasn't finished (ci-time review I-1). `commit_runs` (the
+/// [`build_commit_runs_request`] pages) is asked for only then. It never turns a failure into a
+/// success, and it fails closed: when `commit_runs` fails or its answer can't be read, the
+/// failure stands.
+pub fn check_state(
+    check_runs: &Value,
+    sha: &str,
+    commit_runs: impl FnOnce() -> Result<Vec<Value>>,
+) -> Result<CheckState> {
+    let state = parse_check_state(check_runs)?;
+    let (CheckState::Failure(_), Some(run)) = (&state, latest_trusted_run(check_runs)?) else {
+        return Ok(state);
+    };
+    match commit_runs().and_then(|pages| newer_run_in_progress(run, &pages, sha)) {
+        Ok(true) => Ok(CheckState::Rerunning),
+        Ok(false) | Err(_) => Ok(state),
+    }
+}
+
+/// A timestamp as GitHub writes it, `YYYY-MM-DDTHH:MM:SSZ`, so that two compare as strings.
+fn github_time(v: &Value) -> Option<&str> {
+    let s = v.as_str()?;
+    let shape = s.len() == 20
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b'T',
+            13 | 16 => b == b':',
+            19 => b == b'Z',
+            _ => b.is_ascii_digit(),
+        });
+    shape.then_some(s)
+}
+
+/// Whether a newer run of the workflow that `failed` (a trusted check run on `sha` that finished
+/// as anything but success) belongs to hasn't finished: a later workflow run of the same
+/// workflow on `sha`, or a new attempt of its own workflow run started after `failed` completed.
+/// `pages` are [`build_commit_runs_request`] pages. The workflow run is found by `failed`'s check
+/// suite. Anything malformed, or no workflow run with that check suite, is an error.
+pub fn newer_run_in_progress(failed: &Value, pages: &[Value], sha: &str) -> Result<bool> {
+    struct Run<'a> {
+        id: u64,
+        workflow_id: u64,
+        check_suite_id: u64,
+        head_sha: &'a str,
+        status: &'a str,
+        started: &'a str,
+    }
+    let suite = failed
+        .pointer("/check_suite/id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("the check run has no check suite id"))?;
+    let completed = github_time(&failed["completed_at"])
+        .ok_or_else(|| anyhow!("the check run has no completed_at time"))?;
+    let mut runs = Vec::new();
+    for page in pages {
+        let list = page["workflow_runs"]
+            .as_array()
+            .ok_or_else(|| anyhow!("workflow-runs response has no `workflow_runs` array"))?;
+        for r in list {
+            let num = |k: &str| {
+                r[k].as_u64()
+                    .ok_or_else(|| anyhow!("a workflow run has no numeric `{k}`"))
+            };
+            let text = |k: &str| {
+                r[k].as_str()
+                    .ok_or_else(|| anyhow!("a workflow run has no `{k}`"))
+            };
+            runs.push(Run {
+                id: num("id")?,
+                workflow_id: num("workflow_id")?,
+                check_suite_id: num("check_suite_id")?,
+                head_sha: text("head_sha")?,
+                status: text("status")?,
+                started: github_time(&r["run_started_at"])
+                    .ok_or_else(|| anyhow!("a workflow run has no run_started_at time"))?,
+            });
+        }
+    }
+    let own = runs
+        .iter()
+        .find(|r| r.check_suite_id == suite)
+        .ok_or_else(|| anyhow!("no workflow run on {sha} has check suite {suite}"))?;
+    Ok(runs.iter().any(|r| {
+        r.workflow_id == own.workflow_id
+            && r.head_sha == sha
+            && r.status != "completed"
+            && (r.id > own.id || (r.id == own.id && r.started > completed))
+    }))
 }
 
 /// The `slug` of a `GET /app` response. Fails closed: a missing, empty or non-string slug is an
@@ -665,7 +779,11 @@ impl GitHubApi for RestClient {
         let url = self.abs(&path);
         let (status, _, body) = self.send(m.clone(), &url, None, &self.token)?;
         Self::expect_ok(&m, &url, status, &body)?;
-        parse_check_state(&body).with_context(|| format!("{m} {url} (HTTP {status})"))
+        check_state(&body, sha, || {
+            let (_, path) = build_commit_runs_request(&self.owner, &self.repo, sha);
+            self.get_pages(&path, &format!("workflow runs on {sha}"))
+        })
+        .with_context(|| format!("{m} {url} (HTTP {status})"))
     }
 
     fn reviews(&self, number: u64) -> Result<Vec<Review>> {
@@ -1321,6 +1439,243 @@ mod tests {
             {"id": 6, "status": "completed", "conclusion": "success", "app": null},
         ]});
         assert_eq!(parse_check_state(&v).unwrap(), CheckState::Missing);
+    }
+
+    /// A trusted check run in check suite `suite`.
+    fn suite_run(
+        id: u64,
+        suite: u64,
+        status: &str,
+        conclusion: Option<&str>,
+        completed: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({"id": id, "status": status, "conclusion": conclusion,
+            "completed_at": completed, "check_suite": {"id": suite},
+            "app": {"slug": "github-actions"}})
+    }
+
+    /// A workflow run on `sha1` as `GET .../actions/runs?head_sha=` lists it.
+    fn commit_run(
+        id: u64,
+        workflow: u64,
+        suite: u64,
+        status: &str,
+        started: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({"id": id, "workflow_id": workflow, "check_suite_id": suite,
+            "head_sha": "sha1", "status": status, "run_started_at": started})
+    }
+
+    fn page(runs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"total_count": runs.len(), "workflow_runs": runs})]
+    }
+
+    const T0: &str = "2026-10-27T00:30:00Z";
+    const FAILED_AT: &str = "2026-10-27T01:00:00Z";
+    const LATER: &str = "2026-10-27T01:05:00Z";
+
+    /// pr-ready's failure (check run 10, check suite 500 of workflow run 1, workflow 77).
+    fn old_failure() -> serde_json::Value {
+        serde_json::json!({"check_runs": [
+            suite_run(10, 500, "completed", Some("failure"), FAILED_AT)
+        ]})
+    }
+
+    fn own_run_done() -> serde_json::Value {
+        commit_run(1, 77, 500, "completed", T0)
+    }
+
+    /// ci-time review I-1: a failure reads as pending only while a newer run of its own
+    /// workflow is in progress on the same commit, and never as success.
+    #[test] // spec: QA-033
+    fn a_failure_with_a_newer_run_of_its_workflow_in_progress_is_rerunning() {
+        let state = |checks: &serde_json::Value, runs: Vec<serde_json::Value>| {
+            check_state(checks, "sha1", || Ok(page(runs))).unwrap()
+        };
+        let failure = CheckState::Failure("failure".into());
+        // A newer workflow run of the same workflow (a reopened PR, a draft marked ready).
+        let newer = commit_run(2, 77, 600, "in_progress", LATER);
+        assert_eq!(
+            state(&old_failure(), vec![newer.clone(), own_run_done()]),
+            CheckState::Rerunning
+        );
+        let queued = commit_run(2, 77, 600, "queued", LATER);
+        assert_eq!(
+            state(&old_failure(), vec![queued, own_run_done()]),
+            CheckState::Rerunning
+        );
+        // A new attempt of its own run ("Re-run failed jobs"), started after the failure.
+        let attempt = commit_run(1, 77, 500, "in_progress", LATER);
+        assert_eq!(state(&old_failure(), vec![attempt]), CheckState::Rerunning);
+        // Its own attempt still finishing other jobs is not a newer run.
+        let same_attempt = commit_run(1, 77, 500, "in_progress", T0);
+        assert_eq!(state(&old_failure(), vec![same_attempt]), failure);
+        // The newer run finished as failure: its check run is the latest, and it stands.
+        let both_failed = serde_json::json!({"check_runs": [
+            suite_run(10, 500, "completed", Some("failure"), FAILED_AT),
+            suite_run(20, 600, "completed", Some("failure"), "2026-10-27T02:00:00Z"),
+        ]});
+        let newer_done = commit_run(2, 77, 600, "completed", LATER);
+        assert_eq!(
+            state(&both_failed, vec![newer_done, own_run_done()]),
+            failure
+        );
+        // The newer run passed: success, read without the lookup.
+        let passed = serde_json::json!({"check_runs": [
+            suite_run(10, 500, "completed", Some("failure"), FAILED_AT),
+            suite_run(20, 600, "completed", Some("success"), "2026-10-27T02:00:00Z"),
+        ]});
+        let no_lookup = || -> Result<Vec<serde_json::Value>> { panic!("looked up") };
+        assert_eq!(
+            check_state(&passed, "sha1", no_lookup).unwrap(),
+            CheckState::Success
+        );
+        // Nothing newer: the failure stands.
+        assert_eq!(state(&old_failure(), vec![own_run_done()]), failure);
+        // A newer run of a different workflow, or on another commit, doesn't count.
+        let other_workflow = commit_run(2, 88, 600, "in_progress", LATER);
+        assert_eq!(
+            state(&old_failure(), vec![other_workflow, own_run_done()]),
+            failure
+        );
+        let mut other_commit = newer.clone();
+        other_commit["head_sha"] = "sha2".into();
+        assert_eq!(
+            state(&old_failure(), vec![other_commit, own_run_done()]),
+            failure
+        );
+        // An older run of the same workflow still in progress doesn't either.
+        let older = commit_run(0, 77, 400, "in_progress", T0);
+        assert_eq!(state(&old_failure(), vec![older, own_run_done()]), failure);
+        // Every other conclusion that isn't success is treated the same way.
+        let cancelled = serde_json::json!({"check_runs": [
+            suite_run(10, 500, "completed", Some("cancelled"), FAILED_AT)
+        ]});
+        assert_eq!(
+            state(&cancelled, vec![newer.clone(), own_run_done()]),
+            CheckState::Rerunning
+        );
+    }
+
+    /// ci-time review I-1: only trusted check runs count, and the lookup fails closed: when it
+    /// fails or can't be read, the failure stands.
+    #[test] // spec: QA-033
+    fn the_newer_run_lookup_trusts_only_actions_and_fails_closed() {
+        let failure = CheckState::Failure("failure".into());
+        let newer = commit_run(2, 77, 600, "in_progress", LATER);
+        let no_lookup = || -> Result<Vec<serde_json::Value>> { panic!("looked up") };
+        // A foreign in-progress run neither masks the failure nor makes it pending.
+        let foreign = serde_json::json!({"check_runs": [
+            suite_run(10, 500, "completed", Some("failure"), FAILED_AT),
+            {"id": 99, "status": "in_progress", "conclusion": null, "check_suite": {"id": 600},
+             "app": {"slug": "evil-app"}},
+        ]});
+        assert_eq!(
+            check_state(&foreign, "sha1", || Ok(page(vec![own_run_done()]))).unwrap(),
+            failure
+        );
+        // A foreign failure is never looked up, and only foreign runs are missing.
+        let only_foreign = serde_json::json!({"check_runs": [
+            {"id": 99, "status": "completed", "conclusion": "failure",
+             "completed_at": FAILED_AT, "check_suite": {"id": 600}, "app": {"slug": "evil-app"}},
+        ]});
+        assert_eq!(
+            check_state(&only_foreign, "sha1", no_lookup).unwrap(),
+            CheckState::Missing
+        );
+        // The lookup fails.
+        let failed_lookup = || -> Result<Vec<serde_json::Value>> { bail!("HTTP 403") };
+        assert_eq!(
+            check_state(&old_failure(), "sha1", failed_lookup).unwrap(),
+            failure
+        );
+        // Its answer can't be read, or doesn't hold the failed run's check suite.
+        let mut no_suite_run = newer.clone();
+        no_suite_run["check_suite_id"] = serde_json::Value::Null;
+        let mut bad_time = own_run_done();
+        bad_time["run_started_at"] = "yesterday".into();
+        let mut no_workflow = own_run_done();
+        no_workflow.as_object_mut().unwrap().remove("workflow_id");
+        for pages in [
+            vec![serde_json::json!({"message": "Bad credentials"})],
+            vec![serde_json::Value::Null],
+            page(vec![newer.clone()]),
+            page(vec![newer.clone(), no_suite_run, own_run_done()]),
+            page(vec![newer.clone(), bad_time]),
+            page(vec![newer.clone(), no_workflow]),
+        ] {
+            assert_eq!(
+                check_state(&old_failure(), "sha1", || Ok(pages.clone())).unwrap(),
+                failure,
+                "{pages:?}"
+            );
+        }
+        // The failed run itself lacks its check suite or its completion time.
+        for broken in [
+            serde_json::json!({"id": 10, "status": "completed", "conclusion": "failure",
+                "completed_at": FAILED_AT, "app": {"slug": "github-actions"}}),
+            serde_json::json!({"id": 10, "status": "completed", "conclusion": "failure",
+                "check_suite": {"id": 500}, "app": {"slug": "github-actions"}}),
+        ] {
+            let checks = serde_json::json!({"check_runs": [broken]});
+            assert_eq!(
+                check_state(&checks, "sha1", || Ok(page(vec![
+                    newer.clone(),
+                    own_run_done()
+                ])))
+                .unwrap(),
+                failure
+            );
+        }
+        // A garbage check-runs response is still an error, never a lookup.
+        assert!(check_state(&serde_json::json!({}), "sha1", no_lookup).is_err());
+    }
+
+    #[test]
+    fn commit_runs_request_path() {
+        assert_eq!(
+            build_commit_runs_request("o", "r", "abc"),
+            (
+                Method::GET,
+                "/repos/o/r/actions/runs?head_sha=abc&per_page=100".to_owned()
+            )
+        );
+    }
+
+    /// The fake reads check-runs responses as the real client does, and looks the workflow runs
+    /// up only after a failure.
+    #[test] // spec: QA-033
+    fn fake_reads_a_failure_with_a_newer_run_as_rerunning() {
+        let fake = FakeGitHub::new();
+        fake.set_check_runs("sha1", "pr-ready", old_failure());
+        fake.set_commit_runs(
+            "sha1",
+            page(vec![
+                commit_run(2, 77, 600, "in_progress", LATER),
+                own_run_done(),
+            ])
+            .remove(0),
+        );
+        assert_eq!(
+            fake.check("sha1", "pr-ready").unwrap(),
+            CheckState::Rerunning
+        );
+        assert_eq!(fake.events(), ["commit_runs"]);
+        fake.fail_commit_runs("HTTP 403: Resource not accessible");
+        assert_eq!(
+            fake.check("sha1", "pr-ready").unwrap(),
+            CheckState::Failure("failure".into())
+        );
+        fake.set_check_runs(
+            "sha1",
+            "every-push",
+            serde_json::json!({"check_runs": [suite_run(5, 1, "completed", Some("success"), T0)]}),
+        );
+        assert_eq!(
+            fake.check("sha1", "every-push").unwrap(),
+            CheckState::Success
+        );
+        assert_eq!(fake.events(), ["commit_runs", "commit_runs"]);
     }
 
     #[test]

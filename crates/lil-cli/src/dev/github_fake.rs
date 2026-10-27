@@ -1,8 +1,11 @@
 //! In-memory [`GitHubApi`] for tests. Script it with the setters, then pass `&fake` wherever a
 //! `&dyn GitHubApi` is expected.
 
-use super::github::{CheckState, CommitPull, GitHubApi, MergeOutcome, PrInfo, Review, WorkflowRun};
+use super::github::{
+    CheckState, CommitPull, GitHubApi, MergeOutcome, PrInfo, Review, WorkflowRun, check_state,
+};
 use anyhow::{Result, anyhow};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -20,6 +23,13 @@ struct State {
     prs: HashMap<u64, PrInfo>,
     /// (sha, check name) -> state
     checks: HashMap<(String, String), CheckState>,
+    /// (sha, check name) -> a check-runs response, read as the real client reads it
+    /// ([`check_state`]); it wins over `checks`.
+    check_runs: HashMap<(String, String), Value>,
+    /// commit sha -> the workflow-runs page that [`check_state`] looks up after a failure.
+    commit_runs: HashMap<String, Value>,
+    /// The error that lookup answers with.
+    commit_runs_error: Option<String>,
     reviews: HashMap<u64, Vec<Review>>,
     not_mergeable: HashMap<u64, String>,
     posted: Vec<PostedReview>,
@@ -121,6 +131,23 @@ impl FakeGitHub {
 
     pub fn set_check(&self, sha: &str, name: &str, state: CheckState) {
         self.lock().checks.insert((sha.into(), name.into()), state);
+    }
+
+    /// Answers `check(sha, name)` from the check-runs response `body`, as GitHub would send it.
+    pub fn set_check_runs(&self, sha: &str, name: &str, body: Value) {
+        self.lock()
+            .check_runs
+            .insert((sha.into(), name.into()), body);
+    }
+
+    /// The workflow-runs page (`GET .../actions/runs?head_sha=`) for commit `sha`.
+    pub fn set_commit_runs(&self, sha: &str, page: Value) {
+        self.lock().commit_runs.insert(sha.into(), page);
+    }
+
+    /// Makes the workflow-runs lookup after a failed check answer with an error.
+    pub fn fail_commit_runs(&self, message: &str) {
+        self.lock().commit_runs_error = Some(message.into());
     }
 
     pub fn add_review(&self, number: u64, login: &str, state: &str, commit_id: &str) {
@@ -245,6 +272,25 @@ impl GitHubApi for FakeGitHub {
     }
 
     fn check(&self, sha: &str, name: &str) -> Result<CheckState> {
+        let raw = self
+            .lock()
+            .check_runs
+            .get(&(sha.into(), name.into()))
+            .cloned();
+        if let Some(body) = raw {
+            // Like the real client: the workflow runs are looked up only after a failure.
+            return check_state(&body, sha, || {
+                let mut st = self.lock();
+                st.events.push("commit_runs".into());
+                if let Some(msg) = &st.commit_runs_error {
+                    return Err(anyhow!("fake: {msg}"));
+                }
+                let page = st.commit_runs.get(sha).cloned();
+                Ok(vec![page.unwrap_or_else(
+                    || serde_json::json!({"total_count": 0, "workflow_runs": []}),
+                )])
+            });
+        }
         Ok(self
             .lock()
             .checks

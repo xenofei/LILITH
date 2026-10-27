@@ -74,7 +74,7 @@ use super::merge::{
     is_commit_sha, one_line, short,
 };
 use super::merge_flow::{
-    Facts, GUARD_CHECK, MergeFlowSteps, MergeGate, Wait, merge_alone, merge_flow,
+    Facts, GUARD_CHECK, MergeFlowSteps, MergeGate, PENDING_NEWER_RUN, Wait, merge_alone, merge_flow,
 };
 use super::reviewer_hello::{
     Authenticator, HelloPlatform, KeyAuthenticator, NoTerminal, PassphraseUnlocker, Unlocker,
@@ -1542,8 +1542,13 @@ pub fn run_approve(pr: u64, passphrase_only: bool) -> i32 {
 
 /// The longest summary or audit file the flow reads.
 const MAX_FLOW_TEXT: u64 = 64 * 1024;
-/// How long the flow waits for CI on the head (after posting the approval, the guard re-runs).
+/// How long the flow waits for CI on the head once you authenticated (after posting the
+/// approval, the guard re-runs). It bounds how long the App's key stays unlocked.
 const CHECKS_WAIT: Duration = Duration::from_secs(20 * 60);
+/// How long the flow waits for CI before it asks for your authentication (owner decision
+/// 2026-10-27), with nothing unlocked: pr-ready's work jobs time out at 90 minutes, and this
+/// leaves room for queueing.
+const CI_WAIT_BEFORE_AUTH: Duration = Duration::from_secs(100 * 60);
 /// How often it looks.
 const CHECKS_POLL: Duration = Duration::from_secs(15);
 /// How long it sleeps between two looks at Ctrl+C.
@@ -1576,9 +1581,26 @@ fn check_state_name(state: &CheckState) -> String {
     match state {
         CheckState::Success => "success".into(),
         CheckState::Pending => "pending".into(),
+        CheckState::Rerunning => PENDING_NEWER_RUN.into(),
         CheckState::Missing => "missing".into(),
         CheckState::Failure(c) => c.clone(),
     }
+}
+
+/// The line the CI wait prints once a minute: what it waits for, and before your
+/// authentication that nothing is unlocked or asked yet.
+fn waiting_line(wait: Wait, head: &str, waiting: &[String]) -> String {
+    let before = match wait {
+        Wait::BeforeAuth => {
+            " before asking for your authentication (nothing is unlocked; Ctrl+C is safe)"
+        }
+        Wait::Others | Wait::Guard { .. } => "",
+    };
+    format!(
+        "Waiting for CI on {}{before}: {}",
+        short(head),
+        waiting.join(", ")
+    )
 }
 
 type GitHubFor<'g> = dyn Fn(&MergeGuardConfig) -> Result<Box<dyn GitHubApi + 'g>> + 'g;
@@ -1660,6 +1682,13 @@ impl FlowSteps<'_, '_> {
 
 impl MergeFlowSteps for FlowSteps<'_, '_> {
     fn facts(&self) -> Result<Facts> {
+        // The facts are read again after the wait for CI, which catches Ctrl+C: one that came
+        // after its last look still stops the flow before you are asked.
+        if (self.interrupts)() > 0 {
+            bail!(
+                "stopped by Ctrl+C before your authentication; nothing was asked, approved or merged"
+            );
+        }
         let base_branch = &self.checked.base_branch;
         fetch(
             self.repo,
@@ -1780,8 +1809,13 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
 
     fn wait_for_checks(&self, facts: &Facts, wait: Wait) -> Result<()> {
         (self.catch_interrupts)();
-        // Before the approval nothing is posted yet; after it, a stop withdraws it.
+        // Before your authentication nothing is asked yet, and before the approval nothing is
+        // posted yet; after it, a stop withdraws it.
         let (nothing, stopping) = match wait {
+            Wait::BeforeAuth => (
+                "nothing was asked, approved or merged",
+                "Ctrl+C: stopping the merge; nothing was asked, approved or merged.",
+            ),
             Wait::Others => (
                 "nothing was approved or merged",
                 "Ctrl+C: stopping the merge; nothing was approved.",
@@ -1790,6 +1824,10 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 "nothing was merged",
                 "Ctrl+C: stopping the merge and withdrawing the reviewer App's approval. Wait for lil's last message, and don't close this window.",
             ),
+        };
+        let limit = match wait {
+            Wait::BeforeAuth => CI_WAIT_BEFORE_AUTH,
+            Wait::Others | Wait::Guard { .. } => CHECKS_WAIT,
         };
         self.with_gh(|cfg, gh| {
             let mut waited = Duration::ZERO;
@@ -1802,9 +1840,9 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 for name in &cfg.required_checks {
                     let guard = name == GUARD_CHECK;
                     let rerun = match wait {
-                        Wait::Others if guard => continue,
+                        Wait::BeforeAuth | Wait::Others if guard => continue,
                         Wait::Guard { .. } if !guard => continue,
-                        Wait::Others => false,
+                        Wait::BeforeAuth | Wait::Others => false,
                         Wait::Guard { rerun } => rerun,
                     };
                     match gh.check(&facts.head, name)? {
@@ -1821,20 +1859,16 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 if waiting.is_empty() {
                     return Ok(());
                 }
-                if waited >= CHECKS_WAIT {
+                if waited >= limit {
                     bail!(
                         "CI isn't green on {} after {} minutes ({}); {nothing}. Run the merge again once it is",
                         short(&facts.head),
-                        CHECKS_WAIT.as_secs() / 60,
+                        limit.as_secs() / 60,
                         waiting.join(", ")
                     );
                 }
                 if waited.as_secs().is_multiple_of(60) {
-                    eprintln!(
-                        "Waiting for CI on {}: {}",
-                        short(&facts.head),
-                        waiting.join(", ")
-                    );
+                    eprintln!("{}", waiting_line(wait, &facts.head, &waiting));
                 }
                 self.sleep_watching(CHECKS_POLL, 0);
                 waited += CHECKS_POLL;
@@ -4965,6 +4999,261 @@ mod tests {
         );
         assert!(e.contains("every-push"), "{e}");
         assert_eq!(pauses.get(), 0);
+    }
+
+    /// Owner decision 2026-10-27: the wait before your authentication says that nothing is
+    /// unlocked or asked yet; the waits after it keep their line.
+    #[test] // spec: QA-033
+    fn the_wait_before_authentication_says_nothing_is_unlocked() {
+        let waiting = ["pr-ready: pending (a newer run is in progress)".to_string()];
+        assert_eq!(
+            waiting_line(Wait::BeforeAuth, HEAD, &waiting),
+            "Waiting for CI on 1234567 before asking for your authentication (nothing is unlocked; Ctrl+C is safe): pr-ready: pending (a newer run is in progress)"
+        );
+        for wait in [Wait::Others, Wait::Guard { rerun: true }] {
+            assert_eq!(
+                waiting_line(wait, HEAD, &waiting),
+                "Waiting for CI on 1234567: pr-ready: pending (a newer run is in progress)"
+            );
+        }
+    }
+
+    /// Owner decision 2026-10-27: before your authentication the flow waits up to 100 minutes
+    /// (nothing is unlocked); after it the waits stay at 20 minutes, which bound how long the
+    /// App's key is unlocked. A failure or Ctrl+C during the first wait stops it at once, and
+    /// each stop says nothing was asked.
+    #[test] // spec: QA-033
+    fn the_wait_before_authentication_has_its_own_limit_and_asks_nothing() {
+        assert_eq!(CI_WAIT_BEFORE_AUTH, Duration::from_secs(100 * 60));
+        assert_eq!(CHECKS_WAIT, Duration::from_secs(20 * 60));
+        let (_tmp, work, protected, _) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        fake.set_check(&protected, "pr-ready", CheckState::Pending);
+        // A red guard check is not waited for before the approval.
+        fake.set_check(
+            &protected,
+            GUARD_CHECK,
+            CheckState::Failure("failure".into()),
+        );
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let slices_per_poll = (CHECKS_POLL.as_millis() / SLICE.as_millis()) as usize;
+
+        // The wait runs out after 100 minutes before your authentication, 20 after it.
+        for (wait, minutes, nothing) in [
+            (
+                Wait::BeforeAuth,
+                100,
+                "; nothing was asked, approved or merged.",
+            ),
+            (Wait::Others, 20, "; nothing was approved or merged."),
+        ] {
+            let pauses = std::cell::Cell::new(0usize);
+            let pause = |_: Duration| pauses.set(pauses.get() + 1);
+            let caught = std::cell::Cell::new(false);
+            let catch = || caught.set(true);
+            let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+            steps.catch_interrupts = &catch;
+            let facts = steps.facts().unwrap();
+            let e = format!("{:#}", steps.wait_for_checks(&facts, wait).unwrap_err());
+            assert!(
+                e.contains(&format!(
+                    "after {minutes} minutes (pr-ready: pending){nothing}"
+                )),
+                "{e}"
+            );
+            let polls = (minutes * 60 / CHECKS_POLL.as_secs()) as usize;
+            assert_eq!(pauses.get(), polls * slices_per_poll, "{wait:?}");
+            assert!(caught.get(), "Ctrl+C wasn't caught: {wait:?}");
+        }
+
+        // A failure ends it at once.
+        let steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+        let facts = steps.facts().unwrap();
+        fake.set_check(
+            &protected,
+            "pr-ready",
+            CheckState::Failure("failure".into()),
+        );
+        let e = format!(
+            "{:#}",
+            steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap_err()
+        );
+        assert_eq!(
+            e,
+            format!(
+                "CI check pr-ready finished as failure on {}; nothing was asked, approved or merged",
+                short(&protected)
+            )
+        );
+
+        // Ctrl+C wakes it within one slice, and the facts aren't read again after it.
+        fake.set_check(&protected, "pr-ready", CheckState::Pending);
+        let pauses = std::cell::Cell::new(0u32);
+        let pause = |_: Duration| pauses.set(pauses.get() + 1);
+        let ctrl_c = || u32::from(pauses.get() > 0);
+        let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+        steps.interrupts = &ctrl_c;
+        let facts = steps.facts().unwrap();
+        let e = format!(
+            "{:#}",
+            steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap_err()
+        );
+        assert_eq!(
+            e,
+            "stopped by Ctrl+C while waiting for CI; nothing was asked, approved or merged"
+        );
+        assert_eq!(pauses.get(), 1);
+        let e = format!("{:#}", steps.facts().unwrap_err());
+        assert!(e.contains("nothing was asked, approved or merged"), "{e}");
+        assert!(exchange.calls.borrow().is_empty(), "the key was used");
+        assert!(fake.posted_reviews().is_empty());
+    }
+
+    /// A key that is never asked for: the flow must stop before your authentication.
+    struct NeverAsked;
+
+    impl Authenticator for NeverAsked {
+        fn authenticate(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<Zeroizing<Vec<u8>>, KeyError> {
+            panic!("asked for your authentication")
+        }
+    }
+
+    /// Owner decision 2026-10-27, through the real steps: the flow waits for CI before it asks,
+    /// then merges; a head that moves during the wait asks nothing.
+    #[test] // spec: QA-033, QA-036
+    fn the_flow_waits_for_ci_before_it_asks_and_stops_on_a_moved_head() {
+        // CI turns green during the wait: asked once, then merged.
+        let (tmp, work, protected, _) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        fake.set_check(&protected, "pr-ready", CheckState::Pending);
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let pause = |_: Duration| fake.set_check(&protected, "pr-ready", CheckState::Success);
+        let steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+        let merged = merge_flow("the change", "the audit", &steps, &KeyAuth).unwrap();
+        assert_eq!(merged, format!("merge-of-{protected}"));
+
+        // The head moves during the wait: nothing is asked, posted or unlocked.
+        let other = tmp.path().join("other");
+        git_t(&other, &["checkout", "-q", "protected"]);
+        write_t(&other, "README.md", "moved\n");
+        let moved = commit_t(&other, "a later push");
+        git_t(
+            &other,
+            &["push", "-q", "-f", "origin", "HEAD:refs/pull/42/head"],
+        );
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        green(&fake, &moved);
+        fake.set_check(&protected, "pr-ready", CheckState::Pending);
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let exchange = Exchange::default();
+        let pause = |_: Duration| {
+            fake.set_check(&protected, "pr-ready", CheckState::Success);
+            fake.set_head(42, &moved);
+        };
+        let steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+        let e = format!(
+            "{:#}",
+            merge_flow("the change", "the audit", &steps, &NeverAsked).unwrap_err()
+        );
+        assert!(
+            e.contains(&format!(
+                "PR #42 moved from {} to {} while waiting for CI; the summary and audit were for {}; nothing was asked, approved or merged",
+                short(&protected),
+                short(&moved),
+                short(&protected)
+            )),
+            "{e}"
+        );
+        assert!(fake.posted_reviews().is_empty());
+        assert!(exchange.calls.borrow().is_empty(), "the key was used");
+        assert_eq!(fake.pr(42).unwrap().state, "open");
+    }
+
+    /// ci-time review I-1, through the real steps: a `pr-ready` that failed on an earlier run
+    /// reads as pending while a newer run of its workflow is in progress on the same commit, so
+    /// the flow waits for it instead of stopping; without a newer run the failure stops it, and
+    /// nothing is asked.
+    #[test] // spec: QA-033
+    fn a_failure_with_a_newer_run_in_progress_is_waited_for() {
+        let failed = |docs: &str| {
+            serde_json::json!({"check_runs": [{
+                "id": 10, "status": "completed", "conclusion": "failure",
+                "completed_at": "2026-10-27T01:00:00Z", "check_suite": {"id": 500},
+                "app": {"slug": "github-actions"}, "head_sha": docs,
+            }]})
+        };
+        let runs = |docs: &str, newer: &str| {
+            serde_json::json!({"workflow_runs": [
+                {"id": 2, "workflow_id": 77, "check_suite_id": 600, "head_sha": docs,
+                 "status": newer, "run_started_at": "2026-10-27T01:05:00Z"},
+                {"id": 1, "workflow_id": 77, "check_suite_id": 500, "head_sha": docs,
+                 "status": "completed", "run_started_at": "2026-10-27T00:30:00Z"},
+            ]})
+        };
+        for newer in ["in_progress", "completed"] {
+            let (_tmp, work, _, docs) = glue_fixture();
+            let fake = FakeGitHub::new();
+            fake.add_pr(43, &docs, "main");
+            green(&fake, &docs);
+            fake.set_check_runs(&docs, "pr-ready", failed(&docs));
+            fake.set_commit_runs(&docs, runs(&docs, newer));
+            let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+                Ok(Box::new(FakeRef(&fake)))
+            };
+            let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+            // The newer run's pr-ready passes.
+            let pause = |_: Duration| {
+                fake.set_check_runs(
+                    &docs,
+                    "pr-ready",
+                    serde_json::json!({"check_runs": [{
+                        "id": 20, "status": "completed", "conclusion": "success",
+                        "app": {"slug": "github-actions"},
+                    }]}),
+                )
+            };
+            let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+            steps.pr = 43;
+            let checks = steps.facts().unwrap().checks;
+            if newer == "in_progress" {
+                assert!(
+                    checks.contains(&(
+                        "pr-ready".to_string(),
+                        "pending (a newer run is in progress)".to_string()
+                    )),
+                    "{checks:?}"
+                );
+                let merged = merge_alone(&steps, &KeyAuth).unwrap();
+                assert_eq!(merged, format!("merge-of-{docs}"));
+            } else {
+                assert!(
+                    checks.contains(&("pr-ready".to_string(), "failure".to_string())),
+                    "{checks:?}"
+                );
+                let e = format!("{:#}", merge_alone(&steps, &NeverAsked).unwrap_err());
+                assert!(e.contains("CI check pr-ready finished as failure"), "{e}");
+                assert!(e.contains("nothing was asked, approved or merged"), "{e}");
+                assert!(fake.posted_reviews().is_empty());
+            }
+        }
     }
 
     #[test] // spec: QA-088
