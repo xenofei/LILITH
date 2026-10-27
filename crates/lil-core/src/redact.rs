@@ -32,8 +32,11 @@
 //!    of the token one splitter cut off ([`tail_end`], PR #53 audit): a run of
 //!    [`TAIL_CHARS`] or more of `A-Z a-z 0-9 _ -` across exactly one control character (CR LF
 //!    as one), its written escape, a terminal control sequence (raw or written, or where one
-//!    was removed) or an invisible character, and any SGR leftover `[…m` between them. Only a
-//!    token's placeholder does, as the token is matched, so no other rule's value is touched.
+//!    was removed), an invisible character or U+FFFE or U+FFFF (two of these in a row as
+//!    one), and any SGR leftover `[…m` between them ([`cut_end`]). Only a token's placeholder
+//!    does, as the token is matched, so no other rule's value is touched. A prefix whose body
+//!    such a cut ends too soon is read on across it, and goes with the body's characters after
+//!    it when the two parts together are long enough (PR #53 re-audit).
 //! 7. **Credential Manager targets**: [`names::APP_NAME`] or [`names::LEGACY_APP_NAME`], an
 //!    optional `-<channel>`, then `/<name>`, in any letter case; a quoted target to its quote.
 //! 8. **E-mail addresses** (`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`).
@@ -1210,6 +1213,37 @@ fn upper_digit(c: u8) -> bool {
     c.is_ascii_uppercase() || c.is_ascii_digit()
 }
 
+/// How many bytes of `b` from `from` `ok` holds, counted in [`known_tokens`]' work.
+fn body_run(b: &[u8], from: usize, ok: fn(u8) -> bool) -> usize {
+    let n = b[from.min(b.len())..]
+        .iter()
+        .take_while(|c| ok(**c))
+        .count();
+    #[cfg(test)]
+    TOKEN_BYTES.with(|t| t.set(t.get() + n + 1));
+    n
+}
+
+/// A byte a JWT-shaped token may hold: base64url or the `.` between its parts.
+fn jwt_byte(c: u8) -> bool {
+    alnum_dash_under(c) || c == b'.'
+}
+
+/// The end of the JWT-shaped token at the start of `b` (`eyJ`…): three base64url parts, the
+/// first 10 bytes or more, the others 8 or more; else the first part's length.
+fn jwt_at(b: &[u8]) -> Result<usize, usize> {
+    let one = body_run(b, 0, alnum_dash_under);
+    let two = (b.get(one) == Some(&b'.')).then(|| body_run(b, one + 1, alnum_dash_under));
+    let three = two.filter(|t| *t >= 8).and_then(|t| {
+        let at = one + 1 + t;
+        (b.get(at) == Some(&b'.')).then(|| (at, body_run(b, at + 1, alnum_dash_under)))
+    });
+    match three {
+        Some((at, len)) if one >= 10 && len >= 8 => Ok(at + 1 + len),
+        _ => Err(one),
+    }
+}
+
 /// Rule 6's formats (module docs); the longer prefix of two that overlap first.
 const TOKEN_FORMATS: &[TokenFormat] = &[
     TokenFormat {
@@ -1314,23 +1348,20 @@ fn looks_secret(body: &[u8]) -> bool {
 /// word with a body of [`GLUED_BODY`] or more that looks like a secret. A body is read only at
 /// its format's prefix, and once a long glued body fails, no later glued start inside it is
 /// read again (its body is a suffix of the one that failed, so it fails too): the work is
-/// linear in the text (CA-walk review).
+/// linear in the text (CA-walk review). A body one splitter cuts before it is long enough
+/// ([`cut_end`]) is read on across it, once per cut (PR #53 re-audit).
 fn known_tokens(s: &str, cx: &mut Cx) -> String {
     let b = s.as_bytes();
-    let run = |from: usize, ok: fn(u8) -> bool| {
-        let n = b[from.min(b.len())..]
-            .iter()
-            .take_while(|c| ok(**c))
-            .count();
-        #[cfg(test)]
-        TOKEN_BYTES.with(|t| t.set(t.get() + n + 1));
-        n
-    };
+    let run = |from: usize, ok: fn(u8) -> bool| body_run(b, from, ok);
     // The text's runs of `\`, read once and only when a token's rest is looked for.
     let mut runs: Option<Runs<'_>> = None;
     // Where each format's last long glued body that failed ends, and the JWT's.
     let mut dead = [0usize; TOKEN_FORMATS.len()];
     let mut jwt_dead = 0usize;
+    // Where each format's last glued body read on across a cut, and the JWT's, was cut.
+    let mut cut_dead = [usize::MAX; TOKEN_FORMATS.len()];
+    let mut jwt_cut_dead = usize::MAX;
+    let mut jwt_run_end = 0usize;
     let mut out = Out::new(s);
     let mut i = 0;
     while i < b.len() {
@@ -1357,36 +1388,67 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
                 continue;
             }
             let len = run(body, f.body);
-            if word {
-                if len >= f.min {
-                    end = Some(body + len);
-                    break;
-                }
-            } else if len >= f.min.max(GLUED_BODY) {
-                if looks_secret(&b[body..body + len]) {
+            let least = if word { f.min } else { f.min.max(GLUED_BODY) };
+            if len >= least {
+                if word || looks_secret(&b[body..body + len]) {
                     end = Some(body + len);
                     break;
                 }
                 dead[k] = body + len;
+            } else if word || body + len != cut_dead[k] {
+                // Cut before it is long enough: the body read on across one splitter (PR #53
+                // re-audit), the two parts together long enough.
+                let cut = body + len;
+                if let Some(q) = cut_at(s, cut, cx, &mut runs) {
+                    let more = run(q, f.body);
+                    let whole = len + more >= least
+                        && (word || looks_secret(&[&b[body..cut], &b[q..q + more]].concat()));
+                    if whole {
+                        end = Some(q + more);
+                        break;
+                    }
+                    if !word {
+                        cut_dead[k] = cut;
+                    }
+                }
             }
         }
         // A JWT: three base64url parts, the first a JSON header (`eyJ`).
         if end.is_none() && b[i..].starts_with(b"eyJ") && i >= jwt_dead {
             let word = at_word();
-            let one = run(i, alnum_dash_under);
-            let two = (b.get(i + one) == Some(&b'.')).then(|| run(i + one + 1, alnum_dash_under));
-            let three = two.filter(|t| *t >= 8).and_then(|t| {
-                let at = i + one + 1 + t;
-                (b.get(at) == Some(&b'.')).then(|| (at, run(at + 1, alnum_dash_under)))
-            });
-            match three {
-                Some((at, len)) if one >= 10 && len >= 8 => {
-                    if word || at + 1 + len - (i + 3) >= GLUED_BODY {
-                        end = Some(at + 1 + len);
+            let long_enough = |e: usize| word || e - 3 >= GLUED_BODY;
+            let found = jwt_at(&b[i..]);
+            match found {
+                Ok(e) if long_enough(e) => end = Some(i + e),
+                _ => {
+                    // Cut before its shortest form, or before it is long enough: read on
+                    // across one splitter (PR #53 re-audit).
+                    // A start inside the run of JWT bytes last measured ends where it does.
+                    let cut = if i < jwt_run_end {
+                        jwt_run_end
+                    } else {
+                        i + run(i, jwt_byte)
+                    };
+                    jwt_run_end = cut;
+                    if cut != jwt_cut_dead
+                        && let Some(q) = cut_at(s, cut, cx, &mut runs)
+                    {
+                        let mut joined = b[i..cut].to_vec();
+                        joined.extend_from_slice(&b[q..q + run(q, jwt_byte)]);
+                        match jwt_at(&joined) {
+                            Ok(e) if e > cut - i && long_enough(e) => {
+                                end = Some(q + e - (cut - i));
+                            }
+                            _ => jwt_cut_dead = cut,
+                        }
+                    }
+                    // No later start inside this first part can be a JWT either.
+                    if end.is_none()
+                        && let Err(one) = found
+                    {
+                        jwt_dead = i + one;
                     }
                 }
-                // No later start inside this first part can be a JWT either.
-                _ => jwt_dead = i + one,
             }
         }
         match end {
@@ -1410,9 +1472,9 @@ pub const TAIL_CHARS: usize = 8;
 /// The end of one splitter at byte `i` of `s` (PR #53 audit): where a removed terminal control
 /// sequence stood ([`Cx::bounds`], no bytes); a control character (CR LF as one); one terminal
 /// control sequence, raw or written ([`esc_at`], [`sequence_end`], over `runs`); an invisible
-/// character ([`lil_parse::is_invisible`]); or, after any run of `\`, the written escape of a
-/// control character (`\n`, `\r`, `\r\n` at one escape level, `\t`, `\b`, `\f`, `\a`, `\v`,
-/// `\e`, `\0`, `\xXX`, `\uXXXX`, `\u{…}`) or of an invisible one.
+/// character ([`hidden_char`]); or, after any run of `\`, the written escape of a control
+/// character (`\n`, `\r`, `\r\n` at one escape level, `\t`, `\b`, `\f`, `\a`, `\v`, `\e`, `\0`,
+/// `\xXX`, `\uXXXX`, `\u{…}`) or of an invisible one.
 fn splitter_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>) -> Option<usize> {
     if cx.bound_at(i) {
         return Some(i);
@@ -1427,7 +1489,7 @@ fn splitter_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>) -> Option<u
     {
         return Some(end);
     }
-    if c.is_control() || lil_parse::is_invisible(c) {
+    if hidden_char(c) {
         return Some(i + c.len_utf8());
     }
     if c != '\\' {
@@ -1435,9 +1497,7 @@ fn splitter_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>) -> Option<u
     }
     let run = b[i..].iter().take_while(|x| **x == b'\\').count();
     let j = i + run;
-    let hidden = |code: u32| {
-        char::from_u32(code).is_some_and(|c| c.is_control() || lil_parse::is_invisible(c))
-    };
+    let hidden = |code: u32| char::from_u32(code).is_some_and(hidden_char);
     let hex = |from: usize, len: usize| {
         b.get(from..from + len)
             .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
@@ -1480,23 +1540,61 @@ fn sgr_leftover_end(b: &[u8], j: usize) -> Option<usize> {
     (b.get(j + 1 + params) == Some(&b'm')).then_some(j + 2 + params)
 }
 
-/// Where the rest of a token one splitter cut off ends, when its placeholder ends at byte `i`
-/// of `s` (PR #53 audit): across exactly one splitter ([`splitter_end`]) and any SGR leftover
-/// ([`sgr_leftover_end`]), or, with `direct`, right after it, a run of [`TAIL_CHARS`] or more
-/// of `A-Z a-z 0-9 _ -`. `None` when there is none, so a word after a space always stays.
-fn tail_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>, direct: bool) -> Option<usize> {
+/// A character that can split a key unseen: a control character, an invisible one
+/// ([`lil_parse::is_invisible`]), or U+FFFE or U+FFFF, which no text may hold (PR #53
+/// re-audit).
+fn hidden_char(c: char) -> bool {
+    c.is_control() || lil_parse::is_invisible(c) || matches!(c, '\u{fffe}' | '\u{ffff}')
+}
+
+/// The end of the cut at byte `i` of `s`: exactly one splitter ([`splitter_end`]; two in a
+/// row, written or raw, such as `\n\n`, `\u0007\u0007` or two SGRs, count as one, PR #53
+/// re-audit) and any SGR leftover ([`sgr_leftover_end`]) after it, or an SGR leftover alone;
+/// `None` when there is neither.
+fn cut_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>) -> Option<usize> {
     let b = s.as_bytes();
     let mut j = i;
     let mut crossed = false;
     if let Some(k) = splitter_end(s, j, cx, runs) {
         (j, crossed) = (k, true);
+        if k > i
+            && let Some(again) = splitter_end(s, k, cx, runs)
+        {
+            j = again;
+        }
     }
     if let Some(k) = sgr_leftover_end(b, j) {
         (j, crossed) = (k, true);
     }
-    if !crossed && !direct {
-        return None;
-    }
+    crossed.then_some(j)
+}
+
+/// [`cut_end`] at byte `p` of `s`, with the runs of `\` built (once) only when a splitter that
+/// holds an `ESC` can start there or after another splitter.
+fn cut_at<'a>(s: &'a str, p: usize, cx: &Cx, runs: &mut Option<Runs<'a>>) -> Option<usize> {
+    let esc = s
+        .as_bytes()
+        .get(p)
+        .is_some_and(|c| !c.is_ascii_graphic() || matches!(c, b'\\' | b'%' | b'&'));
+    let runs = if esc {
+        Some(&*runs.get_or_insert_with(|| Runs::new(s)))
+    } else {
+        None
+    };
+    cut_end(s, p, cx, runs)
+}
+
+/// Where the rest of a token one splitter cut off ends, when its placeholder ends at byte `i`
+/// of `s` (PR #53 audit): across the cut ([`cut_end`]), or, with `direct`, right after it, a
+/// run of [`TAIL_CHARS`] or more of `A-Z a-z 0-9 _ -`. `None` when there is none, so a word
+/// after a space always stays.
+fn tail_end(s: &str, i: usize, cx: &Cx, runs: Option<&Runs<'_>>, direct: bool) -> Option<usize> {
+    let b = s.as_bytes();
+    let j = match cut_end(s, i, cx, runs) {
+        Some(j) => j,
+        None if direct => i,
+        None => return None,
+    };
     let run = b[j.min(b.len())..]
         .iter()
         .take_while(|c| alnum_dash_under(**c))
@@ -2396,6 +2494,14 @@ mod tests {
             "xoxb-",
             "AKIAZ",
             "s",
+            // A body read on across a cut (PR #53 re-audit).
+            "eyJ.",
+            "eyJ.\n",
+            "eyJaaaaaaaaa.bbbbbbbb.c\u{7}",
+            "sk-\n",
+            "AKIA\n",
+            "xsk-a\u{7}",
+            "ghp_ab\nCDEFGHIJKLMNOPQRSTUVWXYZ",
         ] {
             let work = |n: usize| {
                 let text = format!("x{}", unit.repeat(n));
@@ -2573,6 +2679,147 @@ mod tests {
             r.text("api_key=hunter2 then_ordinary_words").0,
             "api_key=<redacted> then_ordinary_words"
         );
+    }
+
+    /// A fixed pseudo-random run of `set`'s characters (no real key).
+    fn fake_of(set: &[u8], len: usize, mut seed: u64) -> String {
+        (0..len)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                set[usize::try_from(seed >> 33).unwrap() % set.len()] as char
+            })
+            .collect()
+    }
+
+    /// The ten formats of the PR #53 re-audit, each with a fake body of its usual length:
+    /// `(name, the prefix rule 6 reads, body, the format's shortest body)`; for a JWT, where its
+    /// shortest form ends (8 characters into its third part).
+    fn cut_keys() -> Vec<(&'static str, &'static str, String, usize)> {
+        const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let fake = |len, seed| fake_of(ALNUM, len, seed);
+        let header = "hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.";
+        vec![
+            ("ghp", "ghp_", fake(36, 11), 20),
+            (
+                "github_pat",
+                "github_pat_",
+                format!("11{}_{}", fake(20, 12), fake(59, 13)),
+                20,
+            ),
+            ("hf", "hf_", fake(34, 14), 20),
+            ("sk-ant", "sk-ant-", format!("api03-{}", fake(89, 15)), 16),
+            ("sk-proj", "sk-", format!("proj-{}", fake(120, 16)), 16),
+            ("sk", "sk-", fake(48, 17), 16),
+            (
+                "xoxb",
+                "xoxb-",
+                format!("2718281828-3141592653589-{}", fake(24, 18)),
+                10,
+            ),
+            ("AKIA", "AKIA", fake_of(UPPER, 16, 19), 16),
+            ("AGE", "AGE-SECRET-KEY-1", fake_of(UPPER, 58, 20), 50),
+            (
+                "JWT",
+                "eyJ",
+                format!("{header}{}", fake(43, 21)),
+                header.len() + 8,
+            ),
+        ]
+    }
+
+    /// `raw` redacted as it came, and the message of a JSON log line holding it, redacted.
+    fn redacted_both_ways(r: &Redactor, raw: &str) -> [String; 2] {
+        let line = serde_json::json!({"level": "ERROR", "message": raw}).to_string();
+        let (out, _) = r.text(&line);
+        let message = serde_json::from_str::<serde_json::Value>(&out)
+            .map(|v| v["message"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_else(|e| format!("not JSON ({e}): {out}"));
+        [r.text(raw).0, message]
+    }
+
+    /// The PR #53 re-audit: a key one splitter cuts before its format's shortest body loses
+    /// both parts, the part after the splitter however short (all of an AKIA id's cuts), in a
+    /// log line as it came and as JSON writes it, for each of the ten formats.
+    #[test] // spec: ARCH-121
+    fn a_key_cut_before_its_shortest_body_goes_whole() {
+        let r = Redactor::default();
+        let mut leaks = Vec::new();
+        let mut cases = 0;
+        for (format, prefix, body, shortest) in cut_keys() {
+            for at in 0..shortest {
+                for (splitter, text) in [
+                    ("LF", "\n"),
+                    ("CRLF", "\r\n"),
+                    ("BEL", "\u{7}"),
+                    ("SGR", "\u{1b}[0m"),
+                ] {
+                    let raw = format!(
+                        "upload failed: {prefix}{}{text}{} end",
+                        &body[..at],
+                        &body[at..]
+                    );
+                    for (form, out) in ["raw", "json"].iter().zip(redacted_both_ways(&r, &raw)) {
+                        cases += 1;
+                        if out != "upload failed: <redacted> end" {
+                            leaks.push(format!("{format} at {at} {splitter} {form}: {out:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "{} of {cases} leak: {leaks:#?}",
+            leaks.len()
+        );
+    }
+
+    /// The PR #53 re-audit: two splitters in a row (`\n\n`, `\u0007\u0007`, written or raw) are
+    /// one splitter, and so are U+FFFE and U+FFFF, deep inside a key and before its shortest
+    /// body.
+    #[test] // spec: ARCH-121
+    fn two_splitters_in_a_row_or_a_noncharacter_are_one_splitter() {
+        let r = Redactor::default();
+        let deep = split_keys()
+            .into_iter()
+            .map(|(format, prefix, body)| (format, prefix.to_string(), body.len() / 2, body));
+        let short = cut_keys()
+            .into_iter()
+            .map(|(format, prefix, body, shortest)| {
+                (format, prefix.to_string(), shortest / 2, body)
+            });
+        let mut leaks = Vec::new();
+        for (format, prefix, at, body) in deep.chain(short) {
+            for (splitter, text) in [
+                ("written LF LF", r"\n\n"),
+                ("written CRLF CRLF", r"\r\n\r\n"),
+                ("written BEL BEL", r"\u0007\u0007"),
+                ("written ESC[0m ESC[0m", r"\u001b[0m\u001b[0m"),
+                ("LF LF", "\n\n"),
+                ("BEL BEL", "\u{7}\u{7}"),
+                ("ESC[0m ESC[32m", "\u{1b}[0m\u{1b}[32m"),
+                ("ESC[01;31m ESC[K", "\u{1b}[01;31m\u{1b}[K"),
+                ("LF ZWSP", "\n\u{200b}"),
+                ("ZWSP SHY", "\u{200b}\u{ad}"),
+                ("U+FFFE", "\u{fffe}"),
+                ("U+FFFF", "\u{ffff}"),
+            ] {
+                let raw = format!(
+                    "upload failed: {prefix}{}{text}{} end",
+                    &body[..at],
+                    &body[at..]
+                );
+                for (form, out) in ["raw", "json"].iter().zip(redacted_both_ways(&r, &raw)) {
+                    if out != "upload failed: <redacted> end" {
+                        leaks.push(format!("{format} at {at} {splitter} {form}: {out:?}"));
+                    }
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{} leaks: {leaks:#?}", leaks.len());
     }
 
     /// Checkpoint A ruling (the PR #49 carry): a `Debug` or tuple pair whose quoted first

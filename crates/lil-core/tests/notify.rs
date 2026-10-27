@@ -679,7 +679,9 @@ fn a_restart_hold_posts_one_toast() {
 /// nothing, and a hold of new jobs posts again.
 #[test] // spec: APP-146, ARCH-022, CORE-160
 fn a_restart_hold_toasts_once_per_held_batch() {
-    let logs = capture_logs();
+    let Some(logs) = capture_logs("a_restart_hold_toasts_once_per_held_batch") else {
+        return;
+    };
     let env = TestEnv::new();
     // Jobs held in a paused lane when `start` drops its core.
     let held_in = |n: u64| {
@@ -1015,6 +1017,39 @@ fn a_key_split_deep_inside_is_redacted_whole_in_its_toast() {
         notice_body(&mut p, "words"),
         "words: <redacted> then_some_ordinary_words"
     );
+}
+
+/// The PR #53 re-audit: in a toast, where written escapes stay as they came, two written
+/// escapes in a row are one splitter, and a key a written escape cuts before its format's
+/// shortest body loses both parts.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_cut_by_written_escapes_is_redacted_whole_in_its_toast() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let (_, prefix, body) = split_keys().remove(0);
+    let (head, tail) = body.split_at(body.len() / 2);
+    let akia = "AKIAQ3EXAMPLE7FAKE99";
+    let ghp = format!("ghp_{}", "A1".repeat(18));
+    let mut leaks = Vec::new();
+    for (tag, key) in [
+        ("lflf", format!(r"{prefix}{head}\n\n{tail}")),
+        ("belbel", format!(r"{prefix}{head}\u0007\u0007{tail}")),
+        ("akia", format!(r"{}\n{}", &akia[..8], &akia[8..])),
+        ("ghp", format!(r"{}\r\n{}", &ghp[..14], &ghp[14..])),
+    ] {
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({ "message": format!("{tag}: key {key} end") }),
+        );
+        let body = notice_body(&mut p, tag);
+        if body != format!("{tag}: key <redacted> end") {
+            leaks.push(body);
+        }
+    }
+    assert!(leaks.is_empty(), "{} leaks: {leaks:#?}", leaks.len());
 }
 
 /// Re-review I-A: a terminal sequence still bounds a key, and one inside a key doesn't hide
@@ -1406,7 +1441,9 @@ fn a_reposted_toast_gets_its_buttons_and_a_fresh_token_once_the_handlers_are_bac
 /// reconcile is logged once it is done, so the check waits for it, not for time.
 #[test] // spec: APP-146, APP-022, ARCH-055
 fn a_failed_repost_keeps_the_bare_toast() {
-    let logs = capture_logs();
+    let Some(logs) = capture_logs("a_failed_repost_keeps_the_bare_toast") else {
+        return;
+    };
     let reconciled = || {
         logs.text()
             .lines()
@@ -1733,23 +1770,51 @@ impl Captured {
     }
 }
 
-/// Captures every log line of this process from now on (nextest runs each test in its own
-/// process, so the test owns the global subscriber).
-fn capture_logs() -> Captured {
+/// Set, to the test's name, in the process [`capture_logs`] starts for one test.
+const OWN_PROCESS: &str = "LIL_NOTIFY_LOG_TEST";
+
+/// Every log line of this process from now on, for the test `name` (its function's name),
+/// which runs in a process of its own. The log subscriber is process-wide and goes to its
+/// first caller only, and the in-process core logs from threads of its own, so no per-test
+/// buffer could tell one test's lines from another's (PR #53 audit: under plain `cargo test`,
+/// a test that lost the race waited in vain). So this starts the test binary again for that
+/// one test, where the test owns the subscriber, and checks that it passed there: `None`
+/// here, once it has; the capture in that process.
+fn capture_logs(name: &str) -> Option<Captured> {
+    if std::env::var_os(OWN_PROCESS).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(OWN_PROCESS, name)
+            .output()
+            .expect("the test binary starts");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("test result: ok. 1 passed"),
+            "{name} in a process of its own:\n{text}"
+        );
+        return None;
+    }
     let logs = Captured::default();
-    let _ = tracing::subscriber::set_global_default(
+    tracing::subscriber::set_global_default(
         tracing_subscriber::fmt()
             .with_writer(logs.clone())
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
             .finish(),
-    );
-    logs
+    )
+    .expect("the only test of its process owns the log subscriber");
+    Some(logs)
 }
 
 #[test] // spec: APP-022, ARCH-117
 fn a_toast_token_never_reaches_a_log_line() {
-    let logs = capture_logs();
+    let Some(logs) = capture_logs("a_toast_token_never_reaches_a_log_line") else {
+        return;
+    };
     let env = TestEnv::new();
     let scheme = env.env.activation_scheme();
     let _core = core_with(&env, FakeClock::new(), None, None);
