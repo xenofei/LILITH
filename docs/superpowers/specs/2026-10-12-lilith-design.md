@@ -370,7 +370,7 @@ The `mcp` and `assistant` checks protect against accidents (a stray `lil-mcp` cl
 ### 1.9 Observability
 
 - **ARCH-117** [M1] Every process writes `tracing` JSON logs to `%LOCALAPPDATA%\LILITH\logs`, rolled, rotated and size-capped. Each process writes a file a day and keeps 14, and a day's file stops at 64 MiB with one `log_capped` line (plan 4a clarification: Appendix G).
-- **ARCH-118** [M1] (contract) A `trace_id` is carried from the app or MCP call through the core to the engine job.
+- **ARCH-118** [M1] (contract) A `trace_id` is carried from the app or MCP call through the core to the engine job. An app's tool call carries its own (`tr_<16 hex>`); an `app/*` call carries none, so the core mints its trace id and writes it to its log (plan 4a ruling, 2026-10-26).
 - **ARCH-119** [M1] Engine stdout/stderr is captured into the logs. Every process installs a panic hook.
 - **ARCH-120** [Later] Minidumps on crashes.
 - **ARCH-121** [M1] The Diagnostics panel shows component versions, engine health, VRAM, the queue, recent errors, the event log, a telemetry summary and a backup status line, with "Export diagnostics bundle". The bundle redacts secrets and Claude Code profile labels and emails. (owner decision 2026-10-22) It also replaces the user-profile folder with `%USERPROFILE%` and the computer name with `<machine>`.
