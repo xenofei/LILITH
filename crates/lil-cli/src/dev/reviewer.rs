@@ -74,7 +74,8 @@ use super::merge::{
     is_commit_sha, one_line, short,
 };
 use super::merge_flow::{
-    Facts, GUARD_CHECK, MergeFlowSteps, MergeGate, PENDING_NEWER_RUN, Wait, merge_alone, merge_flow,
+    Facts, GUARD_CHECK, MergeFlowSteps, MergeGate, PENDING_NEWER_RUN, Wait, merge_alone,
+    merge_flow, moved_while_waiting,
 };
 use super::reviewer_hello::{
     Authenticator, HelloPlatform, KeyAuthenticator, NoTerminal, PassphraseUnlocker, Unlocker,
@@ -1897,6 +1898,26 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
         });
         if before && result.is_ok() {
             (self.release_interrupts)();
+        }
+        // A push during the wait often ends it as the old head's cancelled run, or lets it run
+        // out: say the PR moved instead (review M-3).
+        if before && result.is_err() && (self.interrupts)() == 0 {
+            let now = self
+                .with_gh(|_, gh| gh.pr(self.pr))
+                .map(|info| info.head_sha);
+            if let Ok(head) = now
+                && head != facts.head
+            {
+                bail!(
+                    "{}",
+                    moved_while_waiting(
+                        self.pr,
+                        &facts.head,
+                        &head,
+                        self.via == ApprovedVia::MergeFlow
+                    )
+                );
+            }
         }
         result
     }
@@ -5247,6 +5268,77 @@ mod tests {
         assert_eq!(slices.get(), before, "the first wait looks at once");
         steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap();
         assert_eq!(slices.get(), before + slices_per_poll);
+    }
+
+    /// Review M-3: when the wait before your authentication stops on a failure or runs out, it
+    /// looks at the PR's head once more and says the PR moved if it did, not the old head's
+    /// (often cancelled) result.
+    #[test] // spec: QA-033
+    fn a_stop_of_the_wait_before_authentication_says_when_the_head_moved() {
+        let (_tmp, work, protected, _) = glue_fixture();
+        let github_for = |fake: &FakeGitHub| {
+            fake.add_pr(42, &protected, "main");
+            green(fake, &protected);
+            fake.set_check(&protected, "pr-ready", CheckState::Pending);
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let moved = format!(
+            "PR #42 moved from {} to 0000000 while waiting for CI; the summary and audit were for {}; nothing was asked, approved or merged",
+            short(&protected),
+            short(&protected)
+        );
+        for (how, cancel) in [("a cancelled run", true), ("the wait running out", false)] {
+            let fake = FakeGitHub::new();
+            github_for(&fake);
+            let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+                Ok(Box::new(FakeRef(&fake)))
+            };
+            let pause = |_: Duration| {
+                fake.set_head(42, NEW);
+                if cancel {
+                    fake.set_check(
+                        &protected,
+                        "pr-ready",
+                        CheckState::Failure("cancelled".into()),
+                    );
+                }
+            };
+            let steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+            let facts = steps.facts().unwrap();
+            let e = format!(
+                "{:#}",
+                steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap_err()
+            );
+            assert_eq!(e, moved, "{how}");
+        }
+        // `lil dev merge` on its own has no summary or audit to name, and a head that didn't
+        // move keeps the failure.
+        let fake = FakeGitHub::new();
+        github_for(&fake);
+        fake.set_check(
+            &protected,
+            "pr-ready",
+            CheckState::Failure("failure".into()),
+        );
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let mut steps = flow_steps(&work, &checked, &key, &github, &exchange, &|_| {});
+        steps.via = ApprovedVia::Merge;
+        let facts = steps.facts().unwrap();
+        fake.set_head(42, NEW);
+        let e = format!(
+            "{:#}",
+            steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap_err()
+        );
+        assert!(e.contains("while waiting for CI; nothing was asked"), "{e}");
+        assert!(!e.contains("summary"), "{e}");
+        fake.set_head(42, &protected);
+        let e = format!(
+            "{:#}",
+            steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap_err()
+        );
+        assert!(e.contains("CI check pr-ready finished as failure"), "{e}");
     }
 
     /// A key that is never asked for: the flow must stop before your authentication.
