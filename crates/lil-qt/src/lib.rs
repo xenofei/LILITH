@@ -24,6 +24,10 @@
 //! APP-027), [`topics`] (QML's counted subscriptions) and [`retry`] (the automatic retry after
 //! a confirmation, APP-029). Its list models stand on [`paging`] (pages and rows, APP-025), and
 //! its live previews on [`preview`] (a frame out of its event, APP-031, APP-037).
+//!
+//! The shell's Qt-free parts: [`layout_file`] (the layout file and the window clamp, APP-002,
+//! APP-003), [`shortcuts`] (the shortcut map, APP-011, APP-143) and [`app_state`] (the app's
+//! own state, P4a-R16). The bridge's `ShellState` object serves the first two to QML.
 
 #[cfg(feature = "qt")]
 extern crate cxx_qt_lib;
