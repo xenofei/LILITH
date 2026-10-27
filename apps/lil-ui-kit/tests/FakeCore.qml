@@ -33,7 +33,7 @@ QtObject {
     signal callFinished(string id, string resultJson)
     signal callFailed(string id, string errorJson)
     signal callPendingConfirmation(string id, string pendingJson)
-    signal event(string topic, string kind, real seq, string dataJson)
+    signal coreEvent(string topic, string kind, real seq, string dataJson)
 
     property int _next: 1
     property var _open: ({})      // id -> {kind, confirmation, retryToken}
@@ -94,7 +94,7 @@ QtObject {
     function emit(topic, kind, data) {
         const seq = (topic in _seqs ? _seqs[topic] : 0) + 1
         _seqs[topic] = seq
-        event(topic, kind, seq, JSON.stringify(data === undefined ? null : data))
+        coreEvent(topic, kind, seq, JSON.stringify(data === undefined ? null : data))
         if (topic === "confirmations" && kind === "event")
             _answered(data)
     }

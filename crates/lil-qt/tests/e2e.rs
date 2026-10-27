@@ -204,7 +204,7 @@ impl Probe {
             let t = tx.clone();
             pinned
                 .as_mut()
-                .on_event(move |_, topic, kind, seq, json| {
+                .on_core_event(move |_, topic, kind, seq, json| {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let seq = seq as u64;
                     let _ = t.send(Seen::Event {

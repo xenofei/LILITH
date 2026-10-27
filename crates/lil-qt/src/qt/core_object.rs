@@ -15,7 +15,8 @@
 //!   `runtime`). `cancel(id)` drops the request and its callback (`false` for an id that isn't
 //!   open); the core isn't told, since a call has no cancel of its own.
 //! - **Events:** `subscribe(topic)` and `unsubscribe(topic)`; each event of a followed topic
-//!   comes as `event(topic, kind, seq, dataJson)`, throttled (APP-027). `kind` is `event`,
+//!   comes as `coreEvent(topic, kind, seq, dataJson)`, throttled (APP-027); not `event`, which
+//!   would hide `QObject::event`. `kind` is `event`,
 //!   `snapshot` or `resync_required`; reload a topic's model on every `resync_required`.
 //!   `lastSeq(topic)` is the session's last seq of a topic (-1 for none).
 //! - **Others:** `retryNow()` (the Unavailable banner's "Try again"), `shownText(text,
@@ -105,7 +106,13 @@ pub mod qobject {
         fn call_pending_confirmation(self: Pin<&mut Core>, id: QString, pending_json: QString);
 
         #[qsignal]
-        fn event(self: Pin<&mut Core>, topic: QString, kind: QString, seq: f64, data_json: QString);
+        fn core_event(
+            self: Pin<&mut Core>,
+            topic: QString,
+            kind: QString,
+            seq: f64,
+            data_json: QString,
+        );
     }
 
     impl cxx_qt::Threading for Core {}
@@ -256,7 +263,7 @@ fn apply(mut core: Pin<&mut Core>, batch: Vec<Delivery>) {
                 };
                 #[allow(clippy::cast_precision_loss, reason = "seqs stay far below 2^53")]
                 let seq = ev.seq as f64;
-                core.as_mut().event(
+                core.as_mut().core_event(
                     QString::from(ev.topic.as_str()),
                     QString::from(kind),
                     seq,

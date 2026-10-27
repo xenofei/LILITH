@@ -150,6 +150,9 @@ TestCase {
         verify(!Core.cancel(other), "only once")
         verify(!Core.cancel("rq_0"), "an unknown id is false")
         compare(Core.lastSeq("confirmations"), -1)
+        // Events come as coreEvent, which leaves QObject::event alone.
+        compare(typeof Core.coreEvent, "function")
+        compare(typeof Core.coreEvent.connect, "function")
         compare(Core.shownText("a‮b", 20), "a⟨U+202E⟩b")
 
         // Arguments that aren't a JSON object fail params.invalid.
