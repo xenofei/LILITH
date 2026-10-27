@@ -237,6 +237,29 @@ fn refuse_failed(facts: &Facts) -> Result<()> {
     Ok(())
 }
 
+/// Whether every required check other than [`GUARD_CHECK`] is green: only then are you asked.
+fn others_green(facts: &Facts) -> bool {
+    facts
+        .checks
+        .iter()
+        .all(|(name, state)| name == GUARD_CHECK || state == "success")
+}
+
+/// What the flow says when the PR's head moved while it waited for CI, before you were asked.
+/// `with_summary` for `lil dev merge-flow`, whose summary and audit were for the old head.
+pub fn moved_while_waiting(pr: u64, from: &str, to: &str, with_summary: bool) -> String {
+    let read = if with_summary {
+        format!("; the summary and audit were for {}", short(from))
+    } else {
+        String::new()
+    };
+    format!(
+        "PR #{pr} moved from {} to {} while waiting for CI{read}; nothing was asked, approved or merged",
+        short(from),
+        short(to)
+    )
+}
+
 /// How many lines of the agent's summary are shown (re-review m3): a long one mustn't bury the
 /// independent audit below it.
 pub const SUMMARY_LINES: usize = 60;
@@ -312,28 +335,28 @@ fn flow(
     refuse_failed(&first)?;
     // Owner decision 2026-10-27: CI takes longer than the wait with the key unlocked should
     // last, so the flow waits for it first, with nothing unlocked and nothing asked.
-    steps.wait_for_checks(&first, Wait::BeforeAuth)?;
-    // What you are shown and authenticate is read again now, CI green.
-    let facts = steps.facts().with_context(|| {
-        format!(
-            "PR #{} was read again after the wait for CI, and nothing was asked",
-            first.pr
-        )
-    })?;
-    if facts.head != first.head {
-        let read = if summary.is_some() {
-            format!("; the summary and audit were for {}", short(&first.head))
-        } else {
-            String::new()
-        };
-        bail!(
-            "PR #{} moved from {} to {} while waiting for CI{read}; nothing was asked, approved or merged",
-            first.pr,
-            short(&first.head),
-            short(&facts.head)
-        );
-    }
-    refuse_failed(&facts)?;
+    let facts = loop {
+        steps.wait_for_checks(&first, Wait::BeforeAuth)?;
+        // What you are shown and authenticate is read again now, CI green.
+        let again = steps.facts().with_context(|| {
+            format!(
+                "PR #{} was read again after the wait for CI, and nothing was asked",
+                first.pr
+            )
+        })?;
+        if again.head != first.head {
+            bail!(
+                "{}",
+                moved_while_waiting(first.pr, &first.head, &again.head, summary.is_some())
+            );
+        }
+        refuse_failed(&again)?;
+        if others_green(&again) {
+            break again;
+        }
+        // A check went back to pending or unreported since the wait (a green run re-run, say):
+        // wait again, within what is left of the same budget (review M-5).
+    };
     let mut shown = render_facts(&facts);
     match summary {
         Some(summary) => {

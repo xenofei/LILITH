@@ -1634,6 +1634,9 @@ struct FlowSteps<'a, 'g> {
     release_interrupts: &'a dyn Fn(),
     /// How many times Ctrl+C came since then.
     interrupts: &'a dyn Fn() -> u32,
+    /// How long the wait before your authentication has waited so far, once it started: a
+    /// second round (review M-5) goes on from there, within the same [`CI_WAIT_BEFORE_AUTH`].
+    before_auth_waited: std::cell::Cell<Option<Duration>>,
 }
 
 impl FlowSteps<'_, '_> {
@@ -1833,8 +1836,19 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
             Wait::BeforeAuth => CI_WAIT_BEFORE_AUTH,
             Wait::Others | Wait::Guard { .. } => CHECKS_WAIT,
         };
+        let before = wait == Wait::BeforeAuth;
         let result = self.with_gh(|cfg, gh| {
             let mut waited = Duration::ZERO;
+            if before {
+                if let Some(spent) = self.before_auth_waited.get() {
+                    // Back after the second read showed a check that isn't green again: look
+                    // after one poll, with what is left of the same budget (review M-5).
+                    waited = spent;
+                    self.sleep_watching(CHECKS_POLL, 0);
+                    waited += CHECKS_POLL;
+                }
+                self.before_auth_waited.set(Some(waited));
+            }
             loop {
                 if (self.interrupts)() > 0 {
                     eprintln!("{stopping}");
@@ -1876,9 +1890,12 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
                 }
                 self.sleep_watching(CHECKS_POLL, 0);
                 waited += CHECKS_POLL;
+                if before {
+                    self.before_auth_waited.set(Some(waited));
+                }
             }
         });
-        if wait == Wait::BeforeAuth && result.is_ok() {
+        if before && result.is_ok() {
             (self.release_interrupts)();
         }
         result
@@ -2031,6 +2048,7 @@ fn run_flow(pr: u64, texts: Option<(String, String)>, passphrase_only: bool) -> 
                 let _ = lil_platform::interrupt::release_interrupts();
             },
             interrupts: &lil_platform::interrupt::interrupt_count,
+            before_auth_waited: std::cell::Cell::new(None),
         };
         match &texts {
             Some((summary, audit)) => merge_flow(summary, audit, &steps, auth),
@@ -4390,6 +4408,7 @@ mod tests {
             catch_interrupts: &|_| {},
             release_interrupts: &|| {},
             interrupts: &|| 0,
+            before_auth_waited: std::cell::Cell::new(None),
         }
     }
 
@@ -5182,6 +5201,52 @@ mod tests {
         );
         assert!(steps.wait_for_checks(&facts, Wait::BeforeAuth).is_err());
         assert_eq!(*log.borrow(), ["catch BeforeAuth"]);
+    }
+
+    /// Review M-5: going back into the wait before your authentication (the second read showed
+    /// a check that isn't green again) uses what is left of the same 100 minutes, not a fresh
+    /// budget, and looks only after one poll.
+    #[test] // spec: QA-033
+    fn going_back_to_the_wait_before_authentication_keeps_its_budget() {
+        let (_tmp, work, protected, _) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        fake.set_check(&protected, "pr-ready", CheckState::Pending);
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(FakeRef(&fake)))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let slices_per_poll = (CHECKS_POLL.as_millis() / SLICE.as_millis()) as usize;
+        let slices = std::cell::Cell::new(0usize);
+        // Green after 60 minutes of polls.
+        let pause = |_: Duration| {
+            slices.set(slices.get() + 1);
+            if slices.get() == 240 * slices_per_poll {
+                fake.set_check(&protected, "pr-ready", CheckState::Success);
+            }
+        };
+        let steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+        let facts = steps.facts().unwrap();
+        steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap();
+        assert_eq!(slices.get(), 240 * slices_per_poll);
+        // Pending again: the second wait ends with the first's 100 minutes.
+        fake.set_check(&protected, "pr-ready", CheckState::Pending);
+        let e = format!(
+            "{:#}",
+            steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap_err()
+        );
+        assert!(e.contains("after 100 minutes"), "{e}");
+        assert_eq!(slices.get(), 400 * slices_per_poll);
+        // Green again by the first look of a new round: still one poll first.
+        let before = slices.get();
+        let steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+        fake.set_check(&protected, "pr-ready", CheckState::Success);
+        let facts = steps.facts().unwrap();
+        steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap();
+        assert_eq!(slices.get(), before, "the first wait looks at once");
+        steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap();
+        assert_eq!(slices.get(), before + slices_per_poll);
     }
 
     /// A key that is never asked for: the flow must stop before your authentication.
