@@ -1181,12 +1181,18 @@ QML singleton Core (module Lilith.Core), APP-028:
               coreProtocol, workspace (map or null), project, channelScheme,
               startTimes ({firstFrameMs, interactiveMs} of this start, APP-136)
   invokables: call(tool, argsJson) -> requestId; appCall(method, paramsJson) -> requestId; cancel(requestId);
-              subscribe(topic); unsubscribe(topic); shownText(text, maxChars) -> string (lil_parse::shown_text)
+              subscribe(topic); unsubscribe(topic) (counted per topic); shownText(text, maxChars) -> string
+              (lil_parse::shown_text); retryNow(); lastSeq(topic) (tests and diagnostics only)
   signals:    callFinished(id, resultJson), callFailed(id, errorJson), callPendingConfirmation(id, pendingJson),
-              event(topic, kind, seq, dataJson)
+              coreEvent(topic, kind, seq, dataJson) (not `event`, which would hide QObject::event)
   workspace switching: setWorkspace(id) -> requestId (Session::set_workspace, P4a-R34)
-CoreCall.js: call(core, tool, args, {ok, error, pending, autoRetry = true}) -> {cancel()}
-FakeCore.qml: the same API, scripted by tests (respond(id, outcome), emit(topic, kind, data))
+CoreCall.js: call(core, tool, args, {owner, ok, error, pending, autoRetry = true}) -> {id, cancel()};
+             appCall(core, method, params, {owner, ok, error, pending}) -> {id, cancel()};
+             subscribe(core, topic, owner, onEvent?) -> {topic, unsubscribe()}
+             (owner, required: the QML object the call or subscription belongs to; its destruction
+             cancels the call and ends the subscription; a panel follows topics only through subscribe)
+FakeCore.qml: the same API, scripted by tests (respond(id, outcome), emit(topic, kind, data)); it counts
+             subscriptions as Core does (subscriberCount(topic))
 ```
 
 - [ ] **Step 1: Write the failing tests:**
