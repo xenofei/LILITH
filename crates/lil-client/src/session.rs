@@ -43,7 +43,13 @@
 //!   another `instance_id` than the last connection's (the core restarted), each last seq
 //!   starts again from 0 first, so the new core replays everything it still holds instead of
 //!   skipping its first events. A topic the new core hasn't published on yet then gets no
-//!   snapshot.
+//!   snapshot, until that core forgets its first per-job topic for good (its tombstone is
+//!   evicted): from then on a topic it has no entry for starts above the seqs it no longer
+//!   keeps, so a cursor of 0 is older than its history and gets a `snapshot` or
+//!   `resync_required`, never a silent gap. Within one core, a per-job topic (`job:<id>`,
+//!   `preview:<id>`) the core forgot while the session was away goes on from its tombstone, so
+//!   its cursor replays nothing missed; once the tombstone is evicted too, the cursor gets a
+//!   `snapshot` or `resync_required` in the same way.
 //! - **Reloading** (ARCH-100). When a connection's hello names another core instance or
 //!   another workspace than the last connection whose events reached [`Session::events`], the
 //!   session puts one `resync_required` with seq 0 (the session's own, no core's) for each of
@@ -58,7 +64,10 @@
 //!   converge. A backlog overflow can fold the mark into an ordinary `resync_required` (a seq
 //!   other than 0): every `resync_required` means "reload this topic", and a change of core or
 //!   workspace is also told by the hello in [`SessionState::Ready`].
-//! - **Events** reach [`Session::events`] in the core's order, across reconnects. A topic
+//! - **Events** reach [`Session::events`] in the core's order, across reconnects. While the app
+//!   doesn't take them, the session keeps up to 1,024 events and 64 MiB of them itself; past
+//!   either it drops them for one `resync_required` per topic, as the core does with a client's
+//!   queue, so what it holds never grows without limit. A topic
 //!   subscribed while there is no connection, or while one is being set up, is subscribed on
 //!   it: the task makes the connection the current one, then subscribes the topics added
 //!   meanwhile and unsubscribes the ones removed meanwhile, until the session's topics and the
@@ -126,6 +135,10 @@ const EVENTS_CAPACITY: usize = 1024;
 /// Events the session keeps itself before it drops them for one `resync_required` per topic,
 /// as the core does with a client's queue (ARCH-032).
 const BACKLOG_MAX: usize = CLIENT_QUEUE;
+/// The bytes (topic and data, as JSON) of the events the session keeps itself, past which it
+/// drops them for one `resync_required` per topic too: 1,024 preview frames of about 1.4 MB
+/// each fit the count, not this (jobs M-4 carry).
+const BACKLOG_BYTES_MAX: usize = 64 * 1024 * 1024;
 
 /// Where the session stands (APP-034, APP-036, ARCH-100).
 #[derive(Debug, Clone, PartialEq)]
@@ -247,14 +260,7 @@ impl Session {
             history: Mutex::new(History::default()),
         });
         let (commands, commands_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run(
-            shared.clone(),
-            commands_rx,
-            Outbox {
-                tx: events_tx,
-                backlog: VecDeque::new(),
-            },
-        ));
+        let task = tokio::spawn(run(shared.clone(), commands_rx, Outbox::new(events_tx)));
         Session {
             shared,
             commands,
@@ -993,23 +999,43 @@ async fn until<F: Future>(fut: F, ctl: &mut Ctl, stop_on_retry: bool) -> Step<F:
 struct Outbox {
     tx: mpsc::Sender<EventParams>,
     backlog: VecDeque<EventParams>,
+    /// The bytes of the backlog's events ([`event_bytes`]).
+    backlog_bytes: usize,
 }
 
 impl Outbox {
-    fn push(&mut self, event: EventParams) {
-        if self.backlog.len() >= BACKLOG_MAX {
-            self.overflow(event);
-            return;
+    fn new(tx: mpsc::Sender<EventParams>) -> Outbox {
+        Outbox {
+            tx,
+            backlog: VecDeque::new(),
+            backlog_bytes: 0,
         }
+    }
+
+    fn push(&mut self, event: EventParams) {
         if !self.backlog.is_empty() {
-            self.backlog.push_back(event);
+            self.keep(event);
             return;
         }
         match self.tx.try_send(event) {
             // Closed: the app dropped its receiver, so nobody wants the event.
             Ok(()) | Err(TrySendError::Closed(_)) => {}
-            Err(TrySendError::Full(event)) => self.backlog.push_back(event),
+            Err(TrySendError::Full(event)) => self.keep(event),
         }
+    }
+
+    /// Adds `event` to the backlog, or, when the backlog is full in events or in bytes, folds
+    /// both into resyncs ([`Outbox::overflow`]).
+    fn keep(&mut self, event: EventParams) {
+        let bytes = event_bytes(&event);
+        if self.backlog.len() >= BACKLOG_MAX
+            || self.backlog_bytes.saturating_add(bytes) > BACKLOG_BYTES_MAX
+        {
+            self.overflow(event);
+            return;
+        }
+        self.backlog_bytes += bytes;
+        self.backlog.push_back(event);
     }
 
     /// The backlog is full: its events and `event` give way to one `resync_required` per
@@ -1026,6 +1052,7 @@ impl Outbox {
                 kind: EventKind::ResyncRequired,
                 data: Value::Null,
             }));
+        self.backlog_bytes = self.backlog.iter().map(event_bytes).sum();
     }
 
     /// One `resync_required` with seq 0 per topic of `topics`, behind every event pushed so
@@ -1050,12 +1077,35 @@ impl Outbox {
         match self.tx.reserve().await {
             Ok(permit) => {
                 if let Some(event) = self.backlog.pop_front() {
+                    self.backlog_bytes = self.backlog_bytes.saturating_sub(event_bytes(&event));
                     permit.send(event);
                 }
             }
-            Err(_) => self.backlog.clear(),
+            Err(_) => {
+                self.backlog.clear();
+                self.backlog_bytes = 0;
+            }
         }
     }
+}
+
+/// What an event weighs in the backlog: its topic and its data as JSON.
+fn event_bytes(event: &EventParams) -> usize {
+    /// Counts what is written, keeping nothing.
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Writing a `Value` to a writer that never fails can't fail.
+    let _ = serde_json::to_writer(&mut count, &event.data);
+    event.topic.len() + count.0
 }
 
 #[cfg(test)]
@@ -1354,10 +1404,7 @@ mod tests {
     #[test] // spec: ARCH-032
     fn a_full_backlog_becomes_one_resync_per_topic() {
         let (tx, mut rx) = mpsc::channel(1);
-        let mut out = Outbox {
-            tx,
-            backlog: VecDeque::new(),
-        };
+        let mut out = Outbox::new(tx);
         out.push(event("test:a", 1));
         for n in 0..BACKLOG_MAX as u64 {
             let (topic, seq) = if n % 2 == 0 {
@@ -1391,6 +1438,55 @@ mod tests {
             1,
             "the event sent before the backlog"
         );
+    }
+
+    /// A backlog whose events pass [`BACKLOG_BYTES_MAX`] gives way as a full one does, however
+    /// few the events: one `resync_required` per topic at its newest seq (jobs M-4 carry).
+    #[test] // spec: ARCH-032
+    fn a_backlog_past_its_byte_bound_becomes_one_resync_per_topic() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut out = Outbox::new(tx);
+        out.push(event("test:a", 1));
+        let big = |topic: &str, seq: u64| EventParams {
+            topic: topic.to_string(),
+            seq,
+            kind: EventKind::Event,
+            data: json!({"frame": "p".repeat(1024 * 1024)}),
+        };
+        let fits = BACKLOG_BYTES_MAX / (1024 * 1024) - 1;
+        for n in 0..fits as u64 {
+            out.push(big(if n % 2 == 0 { "test:a" } else { "test:b" }, 2 + n));
+        }
+        assert_eq!(
+            out.backlog.len(),
+            fits,
+            "under the bound, every event is kept"
+        );
+        assert!(out.backlog.len() < BACKLOG_MAX);
+        let newest_b = out
+            .backlog
+            .iter()
+            .filter(|e| e.topic == "test:b")
+            .map(|e| e.seq)
+            .max()
+            .unwrap();
+        out.push(big("test:a", 9000));
+        out.push(big("test:b", 9001));
+        let kept: Vec<(&str, u64, EventKind)> = out
+            .backlog
+            .iter()
+            .map(|e| (e.topic.as_str(), e.seq, e.kind))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("test:a", 9000, EventKind::ResyncRequired),
+                ("test:b", newest_b, EventKind::ResyncRequired),
+                ("test:b", 9001, EventKind::Event),
+            ],
+            "past the bound the backlog is one resync per topic, and later events queue after it"
+        );
+        assert_eq!(rx.try_recv().unwrap().seq, 1);
     }
 
     /// Names that aren't topics never reach the core: left out at the start, refused by
