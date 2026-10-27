@@ -94,3 +94,21 @@ it is not allowed.
 The research notes under docs/research/ contain short, attributed quotations from
 third-party documentation and terms (for example Anthropic's Claude Code legal and
 compliance page), used for commentary. Each is linked to its source.
+
+------------------------------------------------------------------------------------
+6. Libraries the Qt build fetches
+------------------------------------------------------------------------------------
+
+The CMake build (CMakeLists.txt) downloads these at configure time, pinned by commit; none
+is included in this repository. The binaries it builds combine them with the suite's code:
+
+  KDDockWidgets v2.5.0 (https://github.com/KDAB/KDDockWidgets), docking for the apps.
+      Licence: GPL-2.0-only OR GPL-3.0-only, or a commercial licence from KDAB. LILITH takes
+      the GPL-3.0-only option, which section 13 of the GPL version 3 lets it combine with the
+      suite's AGPL-3.0-or-later code. It bundles KDBindings and nlohmann/json (MIT).
+  cxx-qt-cmake 0.10.0 (https://github.com/KDAB/cxx-qt-cmake), MIT OR Apache-2.0.
+  Corrosion v0.5.2 (https://github.com/corrosion-rs/corrosion), MIT.
+
+The deploy folder also carries the Qt 6.12.0 and Qt WebEngine 6.140.0 libraries that
+windeployqt copies (Qt's open-source licences: LGPL-3.0, GPL-2.0 or GPL-3.0 by module) and
+the Microsoft Visual C++ runtime DLLs, which Microsoft permits redistributing app-local.

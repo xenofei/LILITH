@@ -86,8 +86,10 @@ const HANDS_OFF_SCRIPT: &str = include_str!("../../../../tools/sandbox/hands-off
 /// The desktop profile's file, relative to the repository (the host run's `--config-file`).
 const NEXTEST_SANDBOX_PATH: &str = r"tools\sandbox\nextest-sandbox.toml";
 
-/// The packages whose tests make up the desktop group. `lil-qt` joins when it exists (Task 15).
-const DESKTOP_PACKAGES: [&str; 2] = ["lil-platform", "lil-qt"];
+/// The packages whose tests make up the desktop group. `lil_qt` joins when it exists (Task 15).
+/// Each lives in the folder under `crates` that is its name with `_` read as `-`: the Qt
+/// package's name has an underscore (cxx-qt 0.10.0 can't link a dashed one), its folder a dash.
+const DESKTOP_PACKAGES: [&str; 2] = ["lil-platform", "lil_qt"];
 
 /// The CTest test that runs `cargo test` and isn't a window test: never bundled.
 const CTEST_E2E: &str = "lil_qt_e2e";
@@ -576,7 +578,12 @@ pub fn run_with(
 fn desktop_packages(repo: &Path) -> Vec<&'static str> {
     DESKTOP_PACKAGES
         .into_iter()
-        .filter(|p| repo.join("crates").join(p).join("Cargo.toml").is_file())
+        .filter(|p| {
+            repo.join("crates")
+                .join(p.replace('_', "-"))
+                .join("Cargo.toml")
+                .is_file()
+        })
         .collect()
 }
 
@@ -2641,7 +2648,7 @@ mod tests {
                 file.as_str(),
             ]
         );
-        // lil-qt joins once it exists.
+        // lil_qt joins once its folder, crates\lil-qt, exists.
         let q = fx.repo.join(r"crates\lil-qt");
         std::fs::create_dir_all(&q).unwrap();
         std::fs::write(q.join("Cargo.toml"), "").unwrap();
@@ -2654,7 +2661,7 @@ mod tests {
                 "-p",
                 "lil-platform",
                 "-p",
-                "lil-qt",
+                "lil_qt",
                 "--archive-file",
                 "a.tar.zst"
             ]

@@ -1,0 +1,35 @@
+[package]
+# The package name has an underscore and the folder a dash: cxx-qt-cmake 0.10.0 fails to link a
+# dashed package name (spike 10, S0.2; Ruling Q1 revised). Every `-p`, dependency and
+# `cxx_qt_import_crate(... CRATES ...)` names `lil_qt`.
+name = "lil_qt"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The app's Rust side (P4a-R1). With default features it builds and tests without Qt; the `qt`
+# feature adds the cxx-qt bridge (the `Lilith.Core` QML module), which CMake links into
+# lil-image.exe as a static library.
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = []
+# No other feature may gate bridge code until cxx-qt PR #1496 ships: cxx-qt-build 0.10.0 reads a
+# dashed feature name differently from rustc, which breaks the Windows link.
+qt = ["dep:cxx", "dep:cxx-qt", "dep:cxx-qt-lib", "dep:cxx-qt-build"]
+
+[dependencies]
+cxx = { workspace = true, optional = true }
+cxx-qt = { workspace = true, optional = true }
+cxx-qt-lib = { workspace = true, optional = true }
+lil-platform = { path = "../lil-platform" }
+lil-protocol = { path = "../lil-protocol" }
+
+[build-dependencies]
+cxx-qt-build = { workspace = true, optional = true }
+
+[lints]
+workspace = true
