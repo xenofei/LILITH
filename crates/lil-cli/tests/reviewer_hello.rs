@@ -696,6 +696,14 @@ fn the_agents_texts_are_quoted_so_they_cannot_imitate_lils_facts() {
 struct FakeSteps {
     log: Log,
     facts: Facts,
+    /// What the reads after the first answer, in turn (the reads after the wait for CI). Once
+    /// they run out, a read answers `facts` with every check but the guard check green: CI
+    /// passed during the wait.
+    rereads: RefCell<std::collections::VecDeque<Result<Facts, &'static str>>>,
+    /// How many times the facts were read.
+    reads: std::cell::Cell<u32>,
+    /// Makes the wait for the other checks, before your authentication, fail with this.
+    before_auth_error: Option<&'static str>,
     /// The head `merge` asks the gate about.
     merge_head: Option<String>,
     /// What `post_approval` says about the guard re-run.
@@ -714,6 +722,10 @@ struct FakeSteps {
     merge_error: Option<&'static str>,
     /// Makes `withdraw_approval` fail.
     withdraw_fails: bool,
+    /// Ctrl+C comes during the second read of the facts.
+    ctrl_c_on_reread: bool,
+    /// Whether Ctrl+C came.
+    ctrl_c: std::cell::Cell<bool>,
 }
 
 impl FakeSteps {
@@ -732,6 +744,9 @@ impl FakeSteps {
                 checks: vec![("every-push".into(), "success".into())],
                 already_approved: false,
             },
+            rereads: RefCell::default(),
+            reads: std::cell::Cell::new(0),
+            before_auth_error: None,
             merge_head: None,
             rerun: true,
             approved: RefCell::default(),
@@ -741,6 +756,8 @@ impl FakeSteps {
             merge_panics: false,
             merge_error: None,
             withdraw_fails: false,
+            ctrl_c_on_reread: false,
+            ctrl_c: std::cell::Cell::new(false),
         }
     }
 }
@@ -748,7 +765,27 @@ impl FakeSteps {
 impl MergeFlowSteps for FakeSteps {
     fn facts(&self) -> anyhow::Result<Facts> {
         self.log.borrow_mut().push("steps:facts".into());
-        Ok(self.facts.clone())
+        let reads = self.reads.get();
+        self.reads.set(reads + 1);
+        if reads > 0 && self.ctrl_c_on_reread {
+            self.ctrl_c.set(true);
+        }
+        if reads == 0 {
+            return Ok(self.facts.clone());
+        }
+        match self.rereads.borrow_mut().pop_front() {
+            Some(Ok(facts)) => Ok(facts),
+            Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+            None => {
+                let mut green = self.facts.clone();
+                for (name, state) in &mut green.checks {
+                    if name != "protected-test-check" {
+                        *state = "success".into();
+                    }
+                }
+                Ok(green)
+            }
+        }
     }
     fn post_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<bool> {
         assert_eq!(pem, PEM);
@@ -763,6 +800,7 @@ impl MergeFlowSteps for FakeSteps {
     }
     fn wait_for_checks(&self, _facts: &Facts, wait: Wait) -> anyhow::Result<()> {
         let (event, error) = match wait {
+            Wait::BeforeAuth => ("steps:wait before-auth".to_string(), self.before_auth_error),
             Wait::Others => ("steps:wait others".to_string(), self.others_error),
             Wait::Guard { rerun } => (format!("steps:wait guard rerun={rerun}"), self.wait_error),
         };
@@ -782,6 +820,9 @@ impl MergeFlowSteps for FakeSteps {
         assert!(!self.merge_panics, "a bug in the merge step");
         self.log.borrow_mut().push("steps:merge".into());
         Ok("feedface".into())
+    }
+    fn interrupted(&self) -> bool {
+        self.ctrl_c.get()
     }
     fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> anyhow::Result<String> {
         assert_eq!(pem, PEM);
@@ -850,6 +891,8 @@ fn no_network_call_before_the_key_is_unlocked() {
         events(&l),
         [
             "steps:facts".to_string(),
+            "steps:wait before-auth".into(),
+            "steps:facts".into(),
             "window:Merge".into(),
             format!("hello:kek_derive {CREDENTIAL} 5a"),
             "steps:wait others".into(),
@@ -879,6 +922,8 @@ fn no_network_call_before_the_key_is_unlocked() {
         events(&l),
         [
             "steps:facts".to_string(),
+            "steps:wait before-auth".into(),
+            "steps:facts".into(),
             "window:Merge".into(),
             format!("hello:kek_derive {CREDENTIAL} 5a"),
             "passphrase:asked".into(),
@@ -1206,7 +1251,11 @@ fn merge_flow_shows_the_summary_and_the_audit_before_authenticating() {
         assert_eq!(audit, "Reviewed: looks right.");
         let e = events(&l);
         let auth_at = e.iter().position(|x| x == "auth").unwrap();
-        assert_eq!(&e[..auth_at], ["steps:facts"], "{e:?}");
+        assert_eq!(
+            &e[..auth_at],
+            ["steps:facts", "steps:wait before-auth", "steps:facts"],
+            "{e:?}"
+        );
         assert_eq!(e.last().unwrap(), "steps:merge");
         // The approval is posted on every merge, protected files or not (owner decision
         // 2026-10-26), and a failed guard check is waited on after its re-run was asked for (M8).
@@ -1260,7 +1309,16 @@ fn merge_flow_merges_nothing_without_authentication() {
                 .unwrap_err();
                 let e = format!("{e:#}");
                 assert!(e.contains("nothing was approved or merged"), "{e}");
-                assert_eq!(events(&l), ["steps:facts", "auth"], "{answer:?}");
+                assert_eq!(
+                    events(&l),
+                    [
+                        "steps:facts",
+                        "steps:wait before-auth",
+                        "steps:facts",
+                        "auth"
+                    ],
+                    "{answer:?}"
+                );
                 assert!(steps.approved.borrow().is_empty());
                 assert!(!e.contains("withdrawn"), "{e}");
             }
@@ -1279,8 +1337,9 @@ fn merge_flow_merges_nothing_without_authentication() {
 /// Owner decision 2026-10-26 (enforce on GitHub): every merge, protected files or not and
 /// whether or not the App approved the head before, posts the reviewer App's approval of exactly
 /// the head you authenticated, after your authentication and before the CI wait and the merge.
-/// The merge itself is let through only for that head.
-#[test] // spec: QA-036, QA-021
+/// The merge itself is let through only for that head. Owner decision 2026-10-27: before your
+/// authentication the flow waits for CI with nothing unlocked and reads the facts again.
+#[test] // spec: QA-036, QA-021, QA-033
 fn every_merge_posts_the_approval_of_the_head_you_authenticated() {
     const HEAD: &str = "1234567890abcdef1234567890abcdef12345678";
     for protected in [&["the protected file `x` was modified."][..], &[]] {
@@ -1299,6 +1358,8 @@ fn every_merge_posts_the_approval_of_the_head_you_authenticated() {
                 assert_eq!(
                     events(&l),
                     [
+                        "steps:facts",
+                        "steps:wait before-auth",
                         "steps:facts",
                         "auth",
                         "steps:wait others",
@@ -1397,6 +1458,8 @@ fn the_approval_is_posted_only_after_the_other_checks_are_green() {
             events(&l),
             [
                 "steps:facts",
+                "steps:wait before-auth",
+                "steps:facts",
                 "auth",
                 "steps:wait others",
                 "steps:post_approval 42",
@@ -1422,10 +1485,235 @@ fn the_approval_is_posted_only_after_the_other_checks_are_green() {
             }
             .unwrap_err();
             assert_eq!(format!("{e:#}"), error);
-            assert_eq!(events(&l), ["steps:facts", "auth", "steps:wait others"]);
+            assert_eq!(
+                events(&l),
+                [
+                    "steps:facts",
+                    "steps:wait before-auth",
+                    "steps:facts",
+                    "auth",
+                    "steps:wait others"
+                ]
+            );
             assert!(steps.approved.borrow().is_empty());
         }
     }
+}
+
+/// Owner decision 2026-10-27: a check that fails during the wait before your authentication,
+/// the wait running out and Ctrl+C during it ask nothing and post nothing.
+#[test] // spec: QA-033
+fn a_stop_during_the_wait_before_authentication_asks_nothing() {
+    for alone in [false, true] {
+        for error in [
+            "CI check pr-ready finished as failure on 1234567; nothing was asked, approved or merged",
+            "CI isn't green on 1234567 after 100 minutes (pr-ready: pending); nothing was asked, approved or merged",
+            "stopped by Ctrl+C while waiting for CI; nothing was asked, approved or merged",
+        ] {
+            let l = log();
+            let auth = FakeAuth::new(&l, Ok(()));
+            let mut steps = FakeSteps::new(&l, &[]);
+            steps.facts.checks = vec![("pr-ready".into(), "pending".into())];
+            steps.before_auth_error = Some(error);
+            let e = if alone {
+                merge_alone(&steps, &auth)
+            } else {
+                merge_flow("s", "a", &steps, &auth)
+            }
+            .unwrap_err();
+            assert_eq!(format!("{e:#}"), error);
+            assert_eq!(events(&l), ["steps:facts", "steps:wait before-auth"]);
+            assert!(auth.seen.borrow().is_empty(), "asked: {error}");
+            assert!(steps.approved.borrow().is_empty());
+        }
+    }
+}
+
+/// Review I-1: a Ctrl+C that comes during the second read, after the wait for CI, stops the flow
+/// before you are asked; the authenticator is never called.
+#[test] // spec: QA-033
+fn a_ctrl_c_during_the_second_read_never_asks() {
+    for alone in [false, true] {
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let mut steps = FakeSteps::new(&l, &[]);
+        steps.ctrl_c_on_reread = true;
+        let e = if alone {
+            merge_alone(&steps, &auth)
+        } else {
+            merge_flow("s", "a", &steps, &auth)
+        }
+        .unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "stopped by Ctrl+C before your authentication; nothing was asked, approved or merged"
+        );
+        assert!(auth.seen.borrow().is_empty(), "asked after Ctrl+C");
+        assert_eq!(
+            events(&l),
+            ["steps:facts", "steps:wait before-auth", "steps:facts"]
+        );
+        assert!(steps.approved.borrow().is_empty());
+    }
+}
+
+/// Owner decision 2026-10-27: the facts are read again after the wait for CI. A head that
+/// moved, a PR that is no longer open or a check that failed by then asks nothing.
+#[test] // spec: QA-033
+fn a_change_seen_after_the_wait_for_ci_asks_nothing() {
+    const MOVED: &str = "0000000000000000000000000000000000000abc";
+    for alone in [false, true] {
+        let run = |steps: &FakeSteps, auth: &FakeAuth| {
+            if alone {
+                merge_alone(steps, auth)
+            } else {
+                merge_flow("s", "a", steps, auth)
+            }
+        };
+
+        // The head moved.
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let steps = FakeSteps::new(&l, &[]);
+        let mut moved = steps.facts.clone();
+        moved.head = MOVED.into();
+        steps.rereads.borrow_mut().push_back(Ok(moved));
+        let e = format!("{:#}", run(&steps, &auth).unwrap_err());
+        assert!(
+            e.contains("PR #42 moved from 1234567 to 0000000 while waiting for CI"),
+            "{e}"
+        );
+        assert_eq!(
+            e.contains("the summary and audit were for 1234567"),
+            !alone,
+            "{e}"
+        );
+        assert!(e.contains("nothing was asked, approved or merged"), "{e}");
+        assert_eq!(
+            events(&l),
+            ["steps:facts", "steps:wait before-auth", "steps:facts"]
+        );
+        assert!(auth.seen.borrow().is_empty());
+
+        // The PR was closed (the read refuses it).
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let steps = FakeSteps::new(&l, &[]);
+        steps.rereads.borrow_mut().push_back(Err(
+            "PR #42 is closed, not open; nothing was approved or merged",
+        ));
+        let e = format!("{:#}", run(&steps, &auth).unwrap_err());
+        assert!(e.contains("PR #42 is closed, not open"), "{e}");
+        assert!(e.contains("nothing was asked"), "{e}");
+        assert_eq!(
+            events(&l),
+            ["steps:facts", "steps:wait before-auth", "steps:facts"]
+        );
+        assert!(auth.seen.borrow().is_empty());
+
+        // A check failed by the second read.
+        let l = log();
+        let auth = FakeAuth::new(&l, Ok(()));
+        let steps = FakeSteps::new(&l, &[]);
+        let mut failed = steps.facts.clone();
+        failed.checks = vec![("every-push".into(), "failure".into())];
+        steps.rereads.borrow_mut().push_back(Ok(failed));
+        let e = format!("{:#}", run(&steps, &auth).unwrap_err());
+        assert!(e.contains("CI check every-push finished as failure"), "{e}");
+        assert!(e.contains("nothing was asked, approved or merged"), "{e}");
+        assert!(auth.seen.borrow().is_empty());
+        assert!(steps.approved.borrow().is_empty());
+    }
+}
+
+/// Review M-5: you are asked only when the second read shows every other required check green.
+/// A check pending or unreported again sends the flow back to the wait (within what is left of
+/// its 100 minutes); a failure by then still stops it, asking nothing.
+#[test] // spec: QA-033
+fn a_check_that_is_not_green_again_sends_the_flow_back_to_the_wait() {
+    for alone in [false, true] {
+        let run = |steps: &FakeSteps, auth: &FakeAuth| {
+            if alone {
+                merge_alone(steps, auth)
+            } else {
+                merge_flow("s", "a", steps, auth)
+            }
+        };
+        for again in ["pending", "missing", "pending (a newer run is in progress)"] {
+            let l = log();
+            let auth = FakeAuth::new(&l, Ok(()));
+            let steps = FakeSteps::new(&l, &[]);
+            let mut not_green = steps.facts.clone();
+            not_green.checks = vec![
+                ("every-push".into(), "success".into()),
+                ("pr-ready".into(), again.into()),
+                ("protected-test-check".into(), "failure".into()),
+            ];
+            steps.rereads.borrow_mut().push_back(Ok(not_green.clone()));
+            run(&steps, &auth).unwrap();
+            assert_eq!(
+                events(&l),
+                [
+                    "steps:facts",
+                    "steps:wait before-auth",
+                    "steps:facts",
+                    "steps:wait before-auth",
+                    "steps:facts",
+                    "auth",
+                    "steps:wait others",
+                    "steps:post_approval 42",
+                    "steps:wait guard rerun=true",
+                    "steps:merge",
+                ],
+                "{again}"
+            );
+            let seen = auth.seen.borrow();
+            assert!(!seen[0].0.contains(again), "asked while {again}");
+
+            // Not green, then failed: nothing asked.
+            let l = log();
+            let auth = FakeAuth::new(&l, Ok(()));
+            let steps = FakeSteps::new(&l, &[]);
+            let mut failed = not_green.clone();
+            failed.checks[1].1 = "failure".into();
+            steps.rereads.borrow_mut().push_back(Ok(not_green));
+            steps.rereads.borrow_mut().push_back(Ok(failed));
+            let e = format!("{:#}", run(&steps, &auth).unwrap_err());
+            assert!(e.contains("CI check pr-ready finished as failure"), "{e}");
+            assert!(e.contains("nothing was asked, approved or merged"), "{e}");
+            assert!(auth.seen.borrow().is_empty());
+            assert!(!events(&l).contains(&"auth".to_string()));
+        }
+    }
+}
+
+/// Owner decision 2026-10-27: what you authenticate is what lil read after the wait for CI, and
+/// a failed check whose workflow runs again reads as pending, so it doesn't stop the flow.
+#[test] // spec: QA-033
+fn the_authentication_shows_the_facts_read_after_the_wait() {
+    let l = log();
+    let auth = FakeAuth::new(&l, Ok(()));
+    let mut steps = FakeSteps::new(&l, &[]);
+    steps.facts.checks = vec![
+        ("every-push".into(), "success".into()),
+        (
+            "pr-ready".into(),
+            "pending (a newer run is in progress)".into(),
+        ),
+    ];
+    let mut green = steps.facts.clone();
+    green.title = "Add the thing, read again".into();
+    green.checks = vec![
+        ("every-push".into(), "success".into()),
+        ("pr-ready".into(), "success".into()),
+    ];
+    steps.rereads.borrow_mut().push_back(Ok(green));
+    merge_flow("s", "a", &steps, &auth).unwrap();
+    let seen = auth.seen.borrow();
+    let (shown, _) = &seen[0];
+    assert!(shown.contains("Add the thing, read again"), "{shown}");
+    assert!(shown.contains("  pr-ready: success"), "{shown}");
+    assert!(!shown.contains("pending"), "{shown}");
 }
 
 /// Review round 2, M-1: a failed post (GitHub may have created the review and lost the answer)
@@ -1574,6 +1862,8 @@ fn deny_close_or_no_choice_refuses_and_never_raises_windows_hello() {
             events(&l),
             [
                 "steps:facts".to_string(),
+                "steps:wait before-auth".into(),
+                "steps:facts".into(),
                 "window:Merge".into(),
                 format!("window:refused {click:?}"),
             ],

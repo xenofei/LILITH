@@ -1,15 +1,22 @@
 //! The one-click merge flow and the merge gate (QA-036 as amended 2026-10-23 and 2026-10-26,
-//! P4a-R38; plan 4a Task 28).
+//! QA-033 as amended 2026-10-27, P4a-R38; plan 4a Task 28).
 //!
 //! **`lil dev merge-flow <PR> --summary <file> --audit <file>`.** An agent may prepare and run it
 //! for a PR you approved on its card. It reads what lil itself can check about the PR
-//! ([`Facts`]: the head commit, the files, the protected changes, CI on that exact head), shows
-//! you that with the agent's summary and the independent audit (a review written by an agent
-//! that didn't make the change), and asks for your authentication: Windows Hello first, then the
-//! passphrase ([`Authenticator`]). Only after it succeeds does it wait for every other required
-//! check on that head, then post the reviewer App's approval of that head, wait for the guard
-//! check, and merge through `lil dev merge`'s checks. Without your authentication nothing is
-//! approved or merged ([`merge_flow`]).
+//! ([`Facts`]: the head commit, the files, the protected changes, CI on that exact head). Then it
+//! waits, with nothing unlocked and nothing asked, until every other required check on that head
+//! is green ([`Wait::BeforeAuth`], owner decision 2026-10-27: CI takes longer than a wait with the
+//! key unlocked should last), and reads the PR again. A failure, a moved head, a PR that is no
+//! longer open, Ctrl+C during the wait or the wait running out asks nothing; from the end of the
+//! wait until you have authenticated, Ctrl+C ends lil at once, as it did before (review I-1).
+//! Only then does it show
+//! you what it read the second time with the agent's summary and the independent audit (a review
+//! written by an agent that didn't make the change), and ask for your authentication: Windows
+//! Hello first, then the passphrase ([`Authenticator`]). Only after it succeeds does it check
+//! again that every other required check on that head is green ([`Wait::Others`]), then post the
+//! reviewer App's approval of that head, wait for the guard check, and merge through
+//! `lil dev merge`'s checks. Without your authentication nothing is approved or merged
+//! ([`merge_flow`]).
 //!
 //! **An approval is a standing grant for its commit** (review rounds 1 and 2): while it stands,
 //! and while the guard check on that commit is green, anyone who can call GitHub's merge API can
@@ -35,7 +42,7 @@
 //! real ones are `reviewer.rs`'s), so `tests/reviewer_hello.rs` compiles it on its own.
 
 use super::reviewer_hello::{Authenticator, quoted};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use std::fmt::Write as _;
 
 /// The check the approval turns green (`ci-guard.yml`'s job name). A failure of any other
@@ -178,17 +185,29 @@ pub trait MergeFlowSteps {
     /// exactly what holds now (withdrawn and the guard check red, withdrawn but the check not
     /// red yet, or nothing to withdraw); `Err` when the approval may still stand.
     fn withdraw_approval(&self, pem: &[u8], facts: &Facts) -> Result<String>;
+    /// Whether Ctrl+C came while lil was catching it. The flow looks right before it asks for
+    /// your authentication.
+    fn interrupted(&self) -> bool;
 }
 
 /// Which checks [`MergeFlowSteps::wait_for_checks`] waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
-    /// Every required check but [`GUARD_CHECK`], before the approval is posted.
+    /// Every required check but [`GUARD_CHECK`], before you are asked for your authentication
+    /// (owner decision 2026-10-27). Nothing is unlocked or asked yet, so this wait may last
+    /// longer than the ones after it.
+    BeforeAuth,
+    /// Every required check but [`GUARD_CHECK`], after your authentication and before the
+    /// approval is posted.
     Others,
     /// [`GUARD_CHECK`] after the approval; `rerun` when its re-run was asked for, so a failed
     /// run is waited on.
     Guard { rerun: bool },
 }
+
+/// How a failed check reads while a newer run of its workflow is in progress on the same commit
+/// (ci-time review I-1): pending, never failed or passed.
+pub const PENDING_NEWER_RUN: &str = "pending (a newer run is in progress)";
 
 /// The first required check other than [`GUARD_CHECK`] that already finished as anything but
 /// success, with its state. Pending and not yet reported checks may still pass.
@@ -197,9 +216,48 @@ pub fn failed_check(facts: &Facts) -> Option<(&str, &str)> {
         .checks
         .iter()
         .find(|(name, state)| {
-            name != GUARD_CHECK && !matches!(state.as_str(), "success" | "pending" | "missing")
+            name != GUARD_CHECK
+                && !matches!(
+                    state.as_str(),
+                    "success" | "pending" | "missing" | PENDING_NEWER_RUN
+                )
         })
         .map(|(n, s)| (n.as_str(), s.as_str()))
+}
+
+/// Stops the flow, asking nothing, when another required check already failed on the head
+/// (review round 1, I-3).
+fn refuse_failed(facts: &Facts) -> Result<()> {
+    if let Some((name, state)) = failed_check(facts) {
+        bail!(
+            "CI check {name} finished as {state} on {}; nothing was asked, approved or merged. Fix it, then run the merge again",
+            short(&facts.head)
+        );
+    }
+    Ok(())
+}
+
+/// Whether every required check other than [`GUARD_CHECK`] is green: only then are you asked.
+fn others_green(facts: &Facts) -> bool {
+    facts
+        .checks
+        .iter()
+        .all(|(name, state)| name == GUARD_CHECK || state == "success")
+}
+
+/// What the flow says when the PR's head moved while it waited for CI, before you were asked.
+/// `with_summary` for `lil dev merge-flow`, whose summary and audit were for the old head.
+pub fn moved_while_waiting(pr: u64, from: &str, to: &str, with_summary: bool) -> String {
+    let read = if with_summary {
+        format!("; the summary and audit were for {}", short(from))
+    } else {
+        String::new()
+    };
+    format!(
+        "PR #{pr} moved from {} to {} while waiting for CI{read}; nothing was asked, approved or merged",
+        short(from),
+        short(to)
+    )
 }
 
 /// How many lines of the agent's summary are shown (re-review m3): a long one mustn't bury the
@@ -246,9 +304,10 @@ pub fn capped(text: &str, max_lines: usize, max_chars: usize) -> (String, Option
     (kept, Some(cut))
 }
 
-/// The flow: the facts, then your authentication with the summary and the audit shown first,
-/// then (only after it succeeded) the reviewer App's approval of the shown head, CI, and the
-/// merge of that head. Returns the merge commit.
+/// The flow: the facts, the wait for CI with nothing unlocked, the facts again, then your
+/// authentication with those facts, the summary and the audit shown first, then (only after it
+/// succeeded) the reviewer App's approval of the shown head, CI, and the merge of that head.
+/// Returns the merge commit.
 pub fn merge_flow(
     summary: &str,
     audit: &str,
@@ -270,15 +329,37 @@ fn flow(
     steps: &dyn MergeFlowSteps,
     auth: &dyn Authenticator,
 ) -> Result<String> {
-    let facts = steps.facts()?;
+    let first = steps.facts()?;
     // An approval is a standing grant for that commit (review round 1, I-3): it is posted only
     // when the merge can follow, so a failed check stops the flow before you are asked.
-    if let Some((name, state)) = failed_check(&facts) {
-        bail!(
-            "CI check {name} finished as {state} on {}; nothing was asked, approved or merged. Fix it, then run the merge again",
-            short(&facts.head)
-        );
-    }
+    refuse_failed(&first)?;
+    // Owner decision 2026-10-27: CI takes longer than the wait with the key unlocked should
+    // last, so the flow waits for it first, with nothing unlocked and nothing asked.
+    // The read the wait goes on from: its checks are the ones still not green.
+    let mut seen = first.clone();
+    let facts = loop {
+        steps.wait_for_checks(&seen, Wait::BeforeAuth)?;
+        // What you are shown and authenticate is read again now, CI green.
+        let again = steps.facts().with_context(|| {
+            format!(
+                "PR #{} was read again after the wait for CI, and nothing was asked",
+                first.pr
+            )
+        })?;
+        if again.head != first.head {
+            bail!(
+                "{}",
+                moved_while_waiting(first.pr, &first.head, &again.head, summary.is_some())
+            );
+        }
+        refuse_failed(&again)?;
+        if others_green(&again) {
+            break again;
+        }
+        // A check went back to pending or unreported since the wait (a green run re-run, say):
+        // wait again, within what is left of the same budget (review M-5).
+        seen = again;
+    };
     let mut shown = render_facts(&facts);
     match summary {
         Some(summary) => {
@@ -296,6 +377,13 @@ fn flow(
         None => shown.push_str(
             "\nSummary of the change: (none: `lil dev merge` was run on its own; `lil dev merge-flow` adds the agent's summary)\n",
         ),
+    }
+    // Review I-1: a Ctrl+C that came after the wait's last look still stops the flow before you
+    // are asked (from the end of that wait, Ctrl+C ends lil at once).
+    if steps.interrupted() {
+        bail!(
+            "stopped by Ctrl+C before your authentication; nothing was asked, approved or merged"
+        );
     }
     let pem = auth
         .authenticate(&shown, audit)

@@ -6,26 +6,48 @@
 //! tells Windows it was handled, so the process keeps running; the command polls
 //! [`interrupted`] (or [`interrupt_count`]) at its next wait and then cleans up. Children in the
 //! same console still get the event themselves (a running `cargo nextest` stops its tests).
+//! [`release_interrupts`] removes the handler again, so Ctrl+C ends the process once more (the
+//! merge flow does this while it asks for your authentication).
 //! [`say_on_repeat`] sets a line the handler itself prints on the second and every later event,
 //! so a command busy in a blocking call still answers at once. Closing the console window, a
 //! logoff and a shutdown are not caught: Windows ends the process a few seconds later anyway.
 
 use std::io::Write;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 use windows::core::BOOL;
 
 static COUNT: AtomicU32 = AtomicU32::new(0);
+/// Whether [`on_control`] is installed, so it is in Windows' list at most once.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
 static REPEAT_NOTE: OnceLock<String> = OnceLock::new();
 
 /// Records Ctrl+C and Ctrl+Break from now on, instead of ending the process. Installing it
 /// twice is harmless.
 pub fn catch_interrupts() -> std::io::Result<()> {
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
     // SAFETY: `on_control` is a plain function that stays valid for the process's life.
-    unsafe { SetConsoleCtrlHandler(Some(on_control), true) }
-        .map_err(|e| crate::process::io_error(&e))
+    unsafe { SetConsoleCtrlHandler(Some(on_control), true) }.map_err(|e| {
+        INSTALLED.store(false, Ordering::SeqCst);
+        crate::process::io_error(&e)
+    })
+}
+
+/// Undoes [`catch_interrupts`]: Ctrl+C and Ctrl+Break end the process again. The count of
+/// those already recorded stays. Releasing when nothing is installed is harmless.
+pub fn release_interrupts() -> std::io::Result<()> {
+    if !INSTALLED.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
+    // SAFETY: removes the handler `catch_interrupts` added.
+    unsafe { SetConsoleCtrlHandler(Some(on_control), false) }.map_err(|e| {
+        INSTALLED.store(true, Ordering::SeqCst);
+        crate::process::io_error(&e)
+    })
 }
 
 /// Whether Ctrl+C or Ctrl+Break came since [`catch_interrupts`].

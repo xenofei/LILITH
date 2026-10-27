@@ -298,7 +298,7 @@ pub fn merge_conditions(
     for name in &cfg.required_checks {
         let state = match gh.check(&head, name) {
             Ok(CheckState::Success) => continue,
-            Ok(CheckState::Pending) => "pending".to_string(),
+            Ok(CheckState::Pending | CheckState::Rerunning) => "pending".to_string(),
             Ok(CheckState::Missing) => "missing".to_string(),
             Ok(CheckState::Failure(conclusion)) => conclusion,
             Err(e) => {

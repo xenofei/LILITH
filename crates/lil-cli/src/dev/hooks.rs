@@ -145,7 +145,7 @@ fn range_reasons(
     }
     match gh.check(head, EVERY_PUSH) {
         Ok(CheckState::Success) => {}
-        Ok(CheckState::Pending) => reasons.push(format!(
+        Ok(CheckState::Pending | CheckState::Rerunning) => reasons.push(format!(
             "CI check {EVERY_PUSH} is still running on {}.",
             short(head)
         )),
