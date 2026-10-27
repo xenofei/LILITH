@@ -38,6 +38,83 @@ pub fn shown_text(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// `s` without the Unicode `Default_Ignorable_Code_Point` characters (Unicode 16.0.0's
+/// `DerivedCoreProperties.txt`), which a reader can't see and which can split a word (CA-walk
+/// re-review, Appendix G "Toast XML"), except those that mean something shown:
+/// - the bidirectional controls [`shown_text`] shows as markers (U+200E, U+200F,
+///   U+202A–U+202E, U+2066–U+2069);
+/// - the joiners of an emoji: a U+200D between pictographs (as [`shown_text`] keeps it), a
+///   variation selector (U+FE00–U+FE0F) right after a pictograph, and a tag character
+///   (U+E0020–U+E007F) after a pictograph or another tag character.
+pub fn without_default_ignorables(s: &str) -> String {
+    let mut before: [Option<char>; 2] = [None; 2];
+    let mut rest = s.chars().peekable();
+    let mut out = String::with_capacity(s.len());
+    let mut last_kept: Option<char> = None;
+    while let Some(c) = rest.next() {
+        let [prev, prev2] = before;
+        before = [Some(c), prev];
+        let keep = if !is_default_ignorable(c) || is_bidi_control(c) {
+            true
+        } else if c == '\u{200d}' {
+            ends_an_emoji_element(prev, prev2)
+                && rest.peek().copied().is_some_and(is_extended_pictographic)
+        } else if ('\u{fe00}'..='\u{fe0f}').contains(&c) {
+            prev.is_some_and(is_extended_pictographic)
+        } else if ('\u{e0020}'..='\u{e007f}').contains(&c) {
+            last_kept.is_some_and(|k| {
+                is_extended_pictographic(k) || ('\u{e0020}'..='\u{e007f}').contains(&k)
+            })
+        } else {
+            false
+        };
+        if keep {
+            out.push(c);
+            last_kept = Some(c);
+        }
+    }
+    out
+}
+
+/// Whether `c` is a character a reader can't see that can split a word: a
+/// `Default_Ignorable_Code_Point` other than the bidirectional controls [`shown_text`] shows
+/// as markers (PR #53 audit: the redaction's splitters).
+pub fn is_invisible(c: char) -> bool {
+    is_default_ignorable(c) && !is_bidi_control(c)
+}
+
+/// The bidirectional controls [`shown_text`] shows as markers.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// `Default_Ignorable_Code_Point` in Unicode 16.0.0's `DerivedCoreProperties.txt`.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{34f}'
+            | '\u{61c}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fff8}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
 /// One character of the output, or one marker.
 enum Piece {
     Char(char),
@@ -210,6 +287,47 @@ const EXTENDED_PICTOGRAPHIC: &[(char, char)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CA-walk re-review M-A: the invisible characters go, the shown bidi controls and the
+    /// joiners of an emoji stay.
+    #[test] // spec: APP-022, ARCH-121
+    fn default_ignorables_go_but_bidi_controls_and_emoji_joiners_stay() {
+        for c in [
+            '\u{ad}',
+            '\u{34f}',
+            '\u{61c}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{2060}',
+            '\u{2062}',
+            '\u{206a}',
+            '\u{3164}',
+            '\u{fe0f}',
+            '\u{feff}',
+            '\u{ffa0}',
+            '\u{e0001}',
+            '\u{e0041}',
+            '\u{e0100}',
+        ] {
+            assert_eq!(
+                without_default_ignorables(&format!("ab{c}12")),
+                "ab12",
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        for kept in [
+            "a\u{202e}b\u{2066}c\u{200e}d",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+            "\u{2764}\u{fe0f}",
+            "\u{1f3f4}\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}",
+            "plain text, ünïcödé",
+        ] {
+            assert_eq!(without_default_ignorables(kept), kept, "{kept:?}");
+        }
+    }
 
     #[test] // spec: APP-022
     fn the_pictograph_table_is_sorted_and_disjoint() {

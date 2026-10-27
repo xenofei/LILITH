@@ -130,6 +130,57 @@ fn call_rejects_non_object_args_with_exit_2() {
     );
 }
 
+/// Checkpoint A walkthrough (ODD-2): an `app/*` name is sent as that method, so `lil call`
+/// gets the core's `caller.not_allowed` ("… is for LILITH apps only."), never `tool.unknown`;
+/// `app/confirmations.list`, which a script may call, lists.
+#[test] // spec: ARCH-016, APP-043
+fn call_sends_an_app_name_as_that_method() {
+    let env = TestEnv::new();
+    for method in ["app/queue.pause", "app/queue.resume", "app/desktop.set"] {
+        let out = env.lil(&["call", method, "{}"]);
+        assert_eq!(out.code, 1, "{method}: {out:?}");
+        let outcome = stdout_json(&out);
+        assert_eq!(outcome["status"], "error", "{method}: {out:?}");
+        assert_eq!(
+            outcome["error"]["code"], "caller.not_allowed",
+            "{method}: {out:?}"
+        );
+        assert_eq!(
+            outcome["error"]["message"],
+            format!("{method} is for LILITH apps only."),
+            "{method}: {out:?}"
+        );
+    }
+    let listed = env.lil(&["call", "app/confirmations.list", "{\"state\":\"pending\"}"]);
+    assert_eq!(listed.code, 0, "{listed:?}");
+    assert_eq!(stdout_json(&listed)["status"], "ok", "{listed:?}");
+}
+
+/// Review M-6: an `app/*` call takes no idempotency key, so `--idempotency-key` with one is a
+/// usage error (exit 2) before any core is involved, never a key dropped silently.
+#[test] // spec: ARCH-016, APP-043
+fn call_refuses_an_idempotency_key_for_an_app_name() {
+    let env = TestEnv::new();
+    let out = env.lil(&[
+        "call",
+        "app/confirmations.list",
+        "{\"state\":\"pending\"}",
+        "--idempotency-key",
+        "ik_app",
+    ]);
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert!(
+        out.stderr
+            .contains("app/confirmations.list takes no idempotency key"),
+        "{out:?}"
+    );
+    assert!(
+        RawPipe::try_connect(&env, Duration::from_secs(1)).is_none(),
+        "a refused call started a core"
+    );
+}
+
 #[test] // spec: ARCH-016, ARCH-035
 fn call_passes_the_idempotency_key() {
     let env = TestEnv::new();

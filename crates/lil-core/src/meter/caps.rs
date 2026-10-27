@@ -52,7 +52,10 @@
 //! - **Periods** are local calendar months ([`Caps::period`], CORE-012). A reservation counts
 //!   in the month it was made: held ones of earlier months don't count against this month.
 //! - **Alerts** at 50 %, 80 % and 100 % of the settled amount, once per level, cap and month
-//!   (CORE-089), on the `caps` topic as `{kind: "alert", cap, threshold_pct, period}`; a change
+//!   (CORE-089), on the `caps` topic as `{kind: "alert", cap, threshold_pct, spent_pct, spent,
+//!   currency, period}` (`spent_pct`: the settled total as a whole percentage of the cap,
+//!   rounded down, `null` for a cap of 0; `spent`: that total in the display currency
+//!   `currency`; Checkpoint A walkthrough and its review); a change
 //!   is `{kind: "changed", caps: CapsView}` and invalid caps `{kind: "invalid", caps: [names]}`
 //!   (empty once a hand edit made them valid again; caps are read at each use).
 //! - **Who changes them** ([`Caps::set`]): only a verified `ui:*` session with `caps.v1`
@@ -471,6 +474,10 @@ impl std::fmt::Debug for Caps {
             .finish_non_exhaustive()
     }
 }
+
+/// An alert raised: its cap, its level, the spend as a whole percentage of the cap (`None` for
+/// a cap of 0) and the settled total.
+type RaisedAlert = (String, u32, Option<i128>, Money);
 
 impl Caps {
     pub fn new(
@@ -930,11 +937,12 @@ impl Caps {
             return;
         }
         let named = period.to_string();
+        let currency = s.display.to_string();
         let (period, date, now) = (period.to_string(), self.today(), self.now_ms());
         let raised = self
             .db()
             .call(move |conn| {
-                let mut run = || -> rusqlite::Result<Vec<(String, u32)>> {
+                let mut run = || -> rusqlite::Result<Vec<RaisedAlert>> {
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let mut raised = Vec::new();
                     for (cap, limit) in &caps {
@@ -945,6 +953,10 @@ impl Caps {
                         } else {
                             Money::ZERO
                         };
+                        // The spend each alert shows (owner decision 2026-10-26).
+                        let spent = (limit.micros() > 0).then(|| {
+                            i128::from(settled.micros()) * 100 / i128::from(limit.micros())
+                        });
                         for level in ALERT_LEVELS {
                             let reached = settled > Money::ZERO
                                 && i128::from(settled.micros()) * 100
@@ -957,7 +969,7 @@ impl Caps {
                                     params![period, cap, level, now],
                                 )? == 1
                             {
-                                raised.push((cap.clone(), level));
+                                raised.push((cap.clone(), level, spent, settled));
                             }
                         }
                     }
@@ -969,11 +981,14 @@ impl Caps {
             .await;
         match raised {
             Ok(raised) => {
-                for (cap, level) in raised {
-                    tracing::info!(cap = %cap, threshold_pct = level, "a cap alert");
+                for (cap, level, spent, settled) in raised {
+                    let spent = spent.map(|p| u64::try_from(p).unwrap_or(u64::MAX));
+                    tracing::info!(cap = %cap, threshold_pct = level, spent_pct = ?spent, "a cap alert");
                     self.events.publish(
                         TOPIC,
-                        json!({"kind": "alert", "cap": cap, "threshold_pct": level, "period": named}),
+                        json!({"kind": "alert", "cap": cap, "threshold_pct": level,
+                               "spent_pct": spent, "spent": settled.to_decimal_string(),
+                               "currency": currency, "period": named}),
                     );
                 }
             }

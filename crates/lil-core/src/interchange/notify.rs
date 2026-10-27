@@ -11,8 +11,15 @@
 //!     channel, so no burst of other events can drop one.
 //!   - `cap_alert` for each `caps` alert (a bus client of its own).
 //!   - `notify.claude_code` ([`Notifier::claude_code`]), an agent's `open_in` and `ui.show`
-//!     ([`Notifier::agent_opened`]) and each recovery that held jobs ([`Notifier::restart_held`]).
+//!     ([`Notifier::agent_opened`]) and each recovery that held jobs not counted in a
+//!     restart-hold toast yet ([`Notifier::restart_held`]; once per held batch, kept in the suite
+//!     `state.db`, owner decision 2026-10-26).
 //!   - No toast is ever a progress toast or updated in place (P4a-R36).
+//! - **As posted** (Checkpoint A walkthrough): every toast's title and body are redacted as a
+//!   diagnostics bundle's entries are (BUG-1), and while the handlers aren't this channel's, a
+//!   toast with a target is posted without it, its body ending [`OPEN_LILITH`] (ODD-6). A
+//!   confirmation's toast posted so holds no live token, and the next reconcile that finds the
+//!   handlers `ok` posts it again with its buttons and a fresh token.
 //! - **When.** A toast is posted only when its category is on, the channel's toasts can post
 //!   (`ready` or `not_yet_shown`) with the shortcut `ok`, and no connected `ui:*` app owns the
 //!   foreground window (P4a-R7); otherwise nothing is posted or queued. While the fullscreen
@@ -64,11 +71,12 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::toast_xml::{ToastActions, ToastText, cut_token, toast_xml};
+use super::toast_xml::{SHOWN_CHARS, ToastActions, ToastText, cut_token, shown_plain, toast_xml};
 use crate::confirm::{Confirm, ListState, NotificationPath};
 use crate::desktop::{DesktopSettingsStore, DesktopWatch, UiApps};
 use crate::events::{ClientId, EventBus};
 use crate::jobs::{BatchJob, JobId, JobStatus, Jobs, Priority, Surface};
+use crate::state::{StateDb, StateError};
 
 /// The notifier's bus client for the `jobs` topic: no connection has it.
 pub const JOBS_CLIENT: ClientId = u64::MAX;
@@ -91,6 +99,13 @@ const CORE_STOPPED: &str = "core.draining";
 const ENDED_IN_FRONT_KEPT: usize = 4096;
 /// The longest `lil:` URL argument (Appendix G "`lil:` URLs"): a longer `open` launch is left out.
 const MAX_URL_CHARS: usize = 8192;
+/// How a toast's body ends when its target was left out because the handlers aren't this
+/// channel's (Checkpoint A walkthrough, ODD-6).
+pub const OPEN_LILITH: &str = " · Open LILITH to see it";
+/// How many times a toast's text is normalised and redacted at most before it settles.
+const SETTLE_ROUNDS: usize = 4;
+/// How many job ids counted in restart-hold toasts the suite `state.db` keeps.
+const RESTART_TOASTS_KEPT: i64 = 4096;
 
 /// The categories (Appendix G).
 pub const JOB_FINISHED: &str = "job_finished";
@@ -132,6 +147,14 @@ impl NotifyOutcome {
     }
 }
 
+/// The spend a cap alert shows (the `caps` alert event's `spent_pct`, `spent` and `currency`).
+struct Spent<'a> {
+    /// `None` for a cap of 0.
+    pct: Option<u64>,
+    amount: &'a str,
+    currency: &'a str,
+}
+
 /// What the notifier needs from the core.
 pub struct NotifierParts {
     pub desktop: Arc<dyn Desktop>,
@@ -162,6 +185,9 @@ struct Memory {
     recent: VecDeque<(Duration, String)>,
     /// The confirmations whose toast this run posted.
     confirmations: HashSet<String>,
+    /// The confirmations whose toast this run posted without its target (the handlers weren't
+    /// this channel's): a reconcile posts each again once they are.
+    bare: HashSet<String>,
     /// The ended batches toasted: `(batch id, the newest attempts' ids)`, newest last.
     batches: VecDeque<(String, Vec<String>)>,
     /// The batches settled (toasted or not): `(batch id, every job id then)`, newest last. A
@@ -181,9 +207,13 @@ pub struct Notifier {
     fullscreen: watch::Receiver<bool>,
     apps: Arc<UiApps>,
     scheme: String,
+    /// The redaction's names, profile folder and computer names come from here.
+    env: Env,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdSource>,
     confirm: OnceLock<Weak<Confirm>>,
+    /// The suite `state.db`: the job ids counted in restart-hold toasts.
+    state: OnceLock<Arc<StateDb>>,
     jobs: OnceLock<Weak<Jobs>>,
     news: mpsc::UnboundedSender<ConfirmNews>,
     /// Holds the handling of `jobs` events while `true` (the overflow test's lever, on a test
@@ -244,9 +274,11 @@ impl Notifier {
             apps,
             scheme: env.activation_scheme(),
             channel: env.channel().clone(),
+            env,
             clock,
             ids,
             confirm: OnceLock::new(),
+            state: OnceLock::new(),
             jobs: OnceLock::new(),
             news,
             jobs_paused: watch::Sender::new(false),
@@ -315,7 +347,12 @@ impl Notifier {
                         .get("threshold_pct")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    me.cap_alert(text("cap"), pct, text("period")).await;
+                    let spent = Spent {
+                        pct: p.data.get("spent_pct").and_then(Value::as_u64),
+                        amount: text("spent"),
+                        currency: text("currency"),
+                    };
+                    me.cap_alert(text("cap"), pct, &spent, text("period")).await;
                 }
             }
             events.drop_client(CAPS_CLIENT);
@@ -326,6 +363,12 @@ impl Notifier {
     /// The confirmations whose toasts it posts and whose tokens it binds.
     pub fn set_confirm(&self, confirm: &Arc<Confirm>) {
         let _ = self.confirm.set(Arc::downgrade(confirm));
+    }
+
+    /// The suite `state.db`, which keeps the job ids counted in restart-hold toasts (once; set
+    /// it before any recovery).
+    pub fn set_state(&self, state: Arc<StateDb>) {
+        let _ = self.state.set(state);
     }
 
     /// The jobs whose batches it reads: subscribes its `jobs` bus client and starts handling
@@ -379,6 +422,13 @@ impl Notifier {
     #[must_use]
     pub fn pause_job_events(&self, on: bool) -> bool {
         hold_job_events(&self.channel, &self.jobs_paused, on)
+    }
+
+    fn utc_ms(&self) -> i64 {
+        self.clock
+            .utc_now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
     }
 
     fn utc_secs(&self) -> i64 {
@@ -522,16 +572,29 @@ impl Notifier {
         self.post(AGENT_ACTIVITY, &self.ids.id("n"), &text).await
     }
 
-    /// The restart hold (P4a-R41): one `job_failed` toast for a recovery that held `held` jobs,
-    /// launching the first. With `held` 0 nothing is posted (`Unavailable`).
-    pub async fn restart_held(&self, held: usize, first: &JobId) -> NotifyOutcome {
-        if held == 0 {
+    /// The restart hold (P4a-R41): one `job_failed` toast for a recovery that held `held` (in
+    /// queue order), launching the first. Once per held batch (owner decision 2026-10-26): when
+    /// every one of them was counted in a restart-hold toast already, of this run or an earlier
+    /// one, nothing is posted (`Duplicate`); a toast posted counts them all. With none held
+    /// nothing is posted (`Unavailable`). Without the suite `state.db`, or when it fails (logged),
+    /// the toast is posted.
+    pub async fn restart_held(&self, held: &[JobId]) -> NotifyOutcome {
+        let Some(first) = held.first() else {
             return NotifyOutcome::Unavailable;
+        };
+        let ids: Vec<String> = held.iter().map(ToString::to_string).collect();
+        let state = self.state.get().cloned();
+        if let Some(db) = &state {
+            match all_toasted(db, ids.clone()).await {
+                Ok(true) => return NotifyOutcome::Duplicate,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "the restart-hold toasts could not be read"),
+            }
         }
-        let body = if held == 1 {
+        let body = if held.len() == 1 {
             "1 job waits until you resume it in Jobs".to_string()
         } else {
-            format!("{held} jobs wait until you resume them in Jobs")
+            format!("{} jobs wait until you resume them in Jobs", held.len())
         };
         let text = ToastText {
             title: "Jobs held after a restart".to_string(),
@@ -539,8 +602,16 @@ impl Notifier {
             launch: Some(lil_parse::task_url(&self.scheme, first.as_str())),
             actions: ToastActions::None,
         };
-        self.post(JOB_FAILED, &format!("restart_{first}"), &text)
-            .await
+        let outcome = self
+            .post(JOB_FAILED, &format!("restart_{first}"), &text)
+            .await;
+        if outcome == NotifyOutcome::Posted
+            && let Some(db) = &state
+            && let Err(e) = count_toasted(db, ids, self.utc_ms()).await
+        {
+            tracing::warn!(error = %e, "the restart-hold toast could not be recorded");
+        }
+        outcome
     }
 
     /// The end of `batch`: its toast, once. `false` while one of its newest attempts isn't
@@ -616,7 +687,15 @@ impl Notifier {
     /// posted one already.
     /// `reconciling`: an earlier run's toast of a refused re-post is looked for and removed.
     async fn confirmation_pending(&self, view: &ConfirmationView, reconciling: bool) {
-        if lock(&self.memory).confirmations.contains(&view.id) {
+        let (posted, bare) = {
+            let memory = lock(&self.memory);
+            (
+                memory.confirmations.contains(&view.id),
+                memory.bare.contains(&view.id),
+            )
+        };
+        // Posted, or posted bare and the handlers still aren't this channel's.
+        if posted || (bare && !self.handlers_ok().await) {
             return;
         }
         let Some(confirm) = self.confirm.get().and_then(Weak::upgrade) else {
@@ -630,7 +709,12 @@ impl Notifier {
         let open_url = lil_parse::confirm_url(&self.scheme, &view.id);
         let deny_url = lil_parse::deny_url(&self.scheme, &view.id, &token);
         let body = if view.covers.contains(&Cover::Confirm) {
-            format!("{} wants to run {}", who(&view.caller_kind), view.tool)
+            let mut body = format!("{} wants to run {}", who(&view.caller_kind), view.tool);
+            // It names the cap too (Checkpoint A walkthrough, ODD-5).
+            if view.covers.contains(&Cover::Cap) {
+                body.push_str(&format!(", over your {} cap", cap_name(view.cap.as_ref())));
+            }
+            body
         } else {
             format!(
                 "A call would go over your {} cap",
@@ -646,15 +730,24 @@ impl Notifier {
                 deny_url: deny_url.clone(),
             },
         };
-        let outcome = self.post(CONFIRMATION_WAITING, &view.id, &text).await;
-        if outcome == NotifyOutcome::Posted {
-            lock(&self.memory).confirmations.insert(view.id.clone());
+        let (outcome, posted_bare) = self.post_toast(CONFIRMATION_WAITING, &view.id, &text).await;
+        if outcome == NotifyOutcome::Posted && posted_bare {
+            // No Deny shows its token: none lives.
+            confirm.forget_toast_token(&view.id, &token);
+            lock(&self.memory).bare.insert(view.id.clone());
+            tracing::info!(confirmation = %view.id, "a confirmation toast was posted without its target");
+        } else if outcome == NotifyOutcome::Posted {
+            let mut memory = lock(&self.memory);
+            memory.bare.remove(&view.id);
+            memory.confirmations.insert(view.id.clone());
+            drop(memory);
             tracing::info!(confirmation = %view.id, deny = %cut_token(&deny_url), "a confirmation toast was posted");
         } else {
             confirm.forget_toast_token(&view.id, &token);
             tracing::info!(confirmation = %view.id, outcome = ?outcome, "no confirmation toast");
-            // An earlier run's toast of it is still there with a dead Deny: it goes.
-            if !reconciling {
+            // An earlier run's toast of it is still there with a dead Deny: it goes. A bare
+            // toast of this run stays, as it was (CA-walk review M-3).
+            if !reconciling || bare {
                 return;
             }
             let desktop = self.desktop.clone();
@@ -672,7 +765,11 @@ impl Notifier {
 
     /// A confirmation answered, expired or cancelled: its toast goes, whichever run posted it.
     async fn confirmation_ended(&self, id: &str) {
-        lock(&self.memory).confirmations.remove(id);
+        {
+            let mut memory = lock(&self.memory);
+            memory.confirmations.remove(id);
+            memory.bare.remove(id);
+        }
         self.remove_toast(id).await;
     }
 
@@ -705,12 +802,16 @@ impl Notifier {
         for row in &rows {
             self.confirmation_pending(&row.view(), true).await;
         }
-        let gone: Vec<String> = lock(&self.memory)
-            .confirmations
-            .iter()
-            .filter(|id| !pending.contains(*id))
-            .cloned()
-            .collect();
+        let gone: Vec<String> = {
+            let memory = lock(&self.memory);
+            memory
+                .confirmations
+                .iter()
+                .chain(&memory.bare)
+                .filter(|id| !pending.contains(*id))
+                .cloned()
+                .collect()
+        };
         for id in gone {
             self.confirmation_ended(&id).await;
         }
@@ -724,13 +825,29 @@ impl Notifier {
                 self.remove_toast(&tag).await;
             }
         }
+        tracing::info!(
+            pending = pending.len(),
+            "the confirmation toasts were reconciled"
+        );
     }
 
-    /// A cap alert: "Spending at <pct> %" / "<cap> cap, <period>", with no launch target.
-    async fn cap_alert(&self, cap: &str, pct: u64, period: &str) {
+    /// A cap alert: "Spending at <spent> % of your <cap> cap (<period>)" / "Alert at <pct> %",
+    /// with no launch target: one per threshold crossed, each with the spend as it was
+    /// (owner decision 2026-10-26). A cap of 0 has no percentage: "Spent <amount> <currency>
+    /// against your 0 <currency> <cap> cap (<period>)" (CA-walk review M-2).
+    async fn cap_alert(&self, cap: &str, pct: u64, spent: &Spent<'_>, period: &str) {
+        let title = match spent.pct {
+            Some(p) => format!("Spending at {p} % of your {cap} cap ({period})"),
+            None if !spent.amount.is_empty() => format!(
+                "Spent {} {c} against your 0 {c} {cap} cap ({period})",
+                spent.amount,
+                c = spent.currency
+            ),
+            None => format!("Spending at {pct} % of your {cap} cap ({period})"),
+        };
         let text = ToastText {
-            title: format!("Spending at {pct} %"),
-            body: format!("{cap} cap, {period}"),
+            title,
+            body: format!("Alert at {pct} %"),
             launch: None,
             actions: ToastActions::None,
         };
@@ -741,6 +858,27 @@ impl Notifier {
 
     /// Posts `text` tagged `tag` in `category` (module docs, "When"): what became of it.
     async fn post(&self, category: &str, tag: &str, text: &ToastText) -> NotifyOutcome {
+        self.post_toast(category, tag, text).await.0
+    }
+
+    /// Whether the notification path's handlers are this channel's (the cached reading).
+    async fn handlers_ok(&self) -> bool {
+        let settings = self.settings.clone();
+        tokio::task::spawn_blocking(move || {
+            settings.notification_path(false).handlers == HandlersWire::Ok
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// [`Notifier::post`], and whether the toast went without its target (module docs, "As
+    /// posted").
+    async fn post_toast(
+        &self,
+        category: &str,
+        tag: &str,
+        text: &ToastText,
+    ) -> (NotifyOutcome, bool) {
         let (on, quiet) = {
             let s = self.current.borrow();
             (
@@ -749,43 +887,47 @@ impl Notifier {
             )
         };
         if !on {
-            return NotifyOutcome::CategoryOff;
+            return (NotifyOutcome::CategoryOff, false);
         }
         let silent = quiet && *self.fullscreen.borrow();
-        let toast = Toast {
-            tag: tag.to_string(),
-            group: category.to_string(),
-            xml: toast_xml(text),
-            silent,
-        };
-        let (settings, watch, apps, desktop) = (
+        let (settings, watch, apps, desktop, env) = (
             self.settings.clone(),
             self.watch.clone(),
             self.apps.clone(),
             self.desktop.clone(),
+            self.env.clone(),
         );
+        let (tag, group, text) = (tag.to_string(), category.to_string(), text.clone());
         let posted = tokio::task::spawn_blocking(move || {
             let path = settings.notification_path(false);
             if !can_post(&path) {
-                return NotifyOutcome::Unavailable;
+                return (NotifyOutcome::Unavailable, false);
             }
             if watch.foreground_is_one_of(&apps.pids()) {
-                return NotifyOutcome::Foreground;
+                return (NotifyOutcome::Foreground, false);
             }
+            let bare = path.handlers != HandlersWire::Ok
+                && (text.launch.is_some() || text.actions != ToastActions::None);
+            let toast = Toast {
+                tag,
+                group,
+                xml: toast_xml(&as_posted(&env, &path.handlers, text)),
+                silent,
+            };
             match desktop.post(&toast) {
-                Ok(()) => NotifyOutcome::Posted,
+                Ok(()) => (NotifyOutcome::Posted, bare),
                 Err(e) => {
                     tracing::warn!(tag = %toast.tag, group = %toast.group, error = %e, "a toast could not be posted");
                     // Reachable sees the failure at once (Appendix G "Ready").
                     settings.notification_path(true);
-                    NotifyOutcome::Unavailable
+                    (NotifyOutcome::Unavailable, false)
                 }
             }
         })
         .await;
         posted.unwrap_or_else(|e| {
             tracing::error!(error = %e, "posting a toast failed");
-            NotifyOutcome::Unavailable
+            (NotifyOutcome::Unavailable, false)
         })
     }
 }
@@ -827,6 +969,114 @@ impl NotificationPath for Notifier {
 fn can_post(path: &PathWire) -> bool {
     matches!(path.toasts, ToastsWire::Ready | ToastsWire::NotYetShown)
         && path.shortcut == ShortcutWire::Ok
+}
+
+/// `text` as it is posted (module docs, "As posted"): its title and body redacted as a
+/// diagnostics bundle's entries are, with this PC's names, as they came, as the toast shows
+/// them and once more after the cut ([`settled`]); and, while `handlers` isn't `ok`, a toast
+/// with a target without it, its body cut so that it always ends [`OPEN_LILITH`]. The title
+/// and the body are redacted apart (a key split between them is a known limit). The URLs are
+/// never redacted. It reads `suite.toml` and may ask Windows for a short name: call it off the
+/// runtime.
+fn as_posted(env: &Env, handlers: &HandlersWire, mut text: ToastText) -> ToastText {
+    let suite_toml = std::fs::read_to_string(env.suite_toml_to_read()).ok();
+    let redactor = crate::redact::redactor_for(env, suite_toml.as_deref()).compile();
+    let redact = |s: &str| redactor.text(s);
+    let targeted = text.launch.is_some() || text.actions != ToastActions::None;
+    let bare = *handlers != HandlersWire::Ok && targeted;
+    text.title = settled(&text.title, SHOWN_CHARS, &redact);
+    if bare {
+        text.launch = None;
+        text.actions = ToastActions::None;
+        let room = SHOWN_CHARS - OPEN_LILITH.chars().count();
+        text.body = format!("{}{OPEN_LILITH}", settled(&text.body, room, &redact));
+    } else {
+        text.body = settled(&text.body, SHOWN_CHARS, &redact);
+    }
+    text
+}
+
+/// `s` as a toast shows it, at most `max` `char`s, redacted in three steps (CA-walk review
+/// I-1 and re-review I-A, M-A, M-B; Appendix G "Toast XML"):
+/// 1. as it came, so a terminal sequence still bounds a key (or goes from inside one) and a
+///    key the cut would run through is redacted whole;
+/// 2. without its default-ignorable characters ([`lil_parse::without_default_ignorables`]),
+///    normalised with no cut ([`shown_plain`]: a control character inside a key goes, and the
+///    key is whole) and redacted, until both leave it as it is ([`settle`]);
+/// 3. cut to `max`, which only removes text, and settled once more.
+///
+/// A text that doesn't settle is shown as `<redacted>`.
+fn settled(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> String {
+    let (came, n) = redact(s);
+    let came = if n > 0 { came } else { s.to_string() };
+    settle(&came, usize::MAX, redact)
+        .and_then(|whole| settle(&whole, max, redact))
+        .unwrap_or_else(|| crate::redact::REDACTED.to_string())
+}
+
+/// `s` normalised to at most `max` `char`s ([`lil_parse::without_default_ignorables`], then
+/// [`shown_plain`], then a token's rest glued to its placeholder taken into it) and redacted, again until normalising and redaction both leave it as it
+/// is; `None` when it hasn't after [`SETTLE_ROUNDS`] rounds.
+fn settle(s: &str, max: usize, redact: &dyn Fn(&str) -> (String, u32)) -> Option<String> {
+    // Each normalising also takes into a `<redacted>` the rest of a token glued to it once a
+    // splitter between them is gone (PR #53 audit).
+    let norm = |t: &str| {
+        let shown = shown_plain(&lil_parse::without_default_ignorables(t), max);
+        crate::redact::glued_tails(&shown).0
+    };
+    let mut shown = norm(s);
+    for _ in 0..SETTLE_ROUNDS {
+        let (redacted, n) = redact(&shown);
+        if n == 0 {
+            return Some(shown);
+        }
+        shown = norm(&redacted);
+    }
+    None
+}
+
+/// Whether every job of `ids` was counted in a restart-hold toast already.
+async fn all_toasted(db: &StateDb, ids: Vec<String>) -> Result<bool, StateError> {
+    db.call(move |conn| {
+        let mut known = conn
+            .prepare_cached("SELECT 1 FROM restart_hold_toasts WHERE job_id = ?1")
+            .map_err(|e| StateError::Io(e.to_string()))?;
+        for id in &ids {
+            if !known
+                .exists([id])
+                .map_err(|e| StateError::Io(e.to_string()))?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .await
+}
+
+/// Counts `ids` as shown in a restart-hold toast at `at_ms`, keeping the newest
+/// [`RESTART_TOASTS_KEPT`].
+async fn count_toasted(db: &StateDb, ids: Vec<String>, at_ms: i64) -> Result<(), StateError> {
+    db.call(move |conn| {
+        let mut run = || -> rusqlite::Result<()> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for id in &ids {
+                tx.execute(
+                    "INSERT OR REPLACE INTO restart_hold_toasts (job_id, toasted_ms) VALUES (?1, ?2)",
+                    rusqlite::params![id, at_ms],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM restart_hold_toasts WHERE job_id NOT IN \
+                 (SELECT job_id FROM restart_hold_toasts \
+                  ORDER BY toasted_ms DESC, job_id DESC LIMIT ?1)",
+                [RESTART_TOASTS_KEPT],
+            )?;
+            tx.commit()
+        };
+        run().map_err(|e| StateError::Io(e.to_string()))
+    })
+    .await
 }
 
 /// A fresh 128-bit toast token, 32 lowercase hex, from `ids` (two of its 64-bit ids).

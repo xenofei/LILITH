@@ -720,6 +720,28 @@ impl Shared {
         row.summary(self.live_of(&row.job_id).as_ref())
     }
 
+    /// A job's summary as its submission returns it: one a lane's reason holds already shows
+    /// `queue_paused` with those reasons, its `status_seq` ending in that step, as its row does a
+    /// moment later, so the result never says `waiting` first (Checkpoint A walkthrough, ODD-1).
+    fn submitted_summary(&self, row: &JobRow) -> JobSummary {
+        let live = self.live_of(&row.job_id);
+        let held = live.as_ref().is_some_and(|l| !l.pause_reasons.is_empty());
+        if held && row.substatus == Some(Substatus::Waiting) {
+            let mut shown = JobRow {
+                substatus: Some(Substatus::QueuePaused),
+                ..row.clone()
+            };
+            record::push_step(
+                &mut shown.status_seq,
+                shown.status,
+                shown.substatus,
+                shown.updated_utc,
+            );
+            return shown.summary(live.as_ref());
+        }
+        row.summary(live.as_ref())
+    }
+
     /// Publishes the job's summary on `jobs` and `job:<id>` with no state change (its phase or
     /// its pause reasons changed): no jobs log line.
     async fn announce_live(&self, id: &str, scope: &Scope) {
@@ -3063,7 +3085,7 @@ impl Jobs {
         };
         let row = s.submit_new(&scope, new).await?;
         caller.submitted.set(JobId(row.job_id.clone()));
-        Ok(s.summary(&row))
+        Ok(s.submitted_summary(&row))
     }
 
     /// Submits `specs` as one batch in `caller`'s scope (P4a-R13; `test.job {batch}`): every
@@ -3123,7 +3145,7 @@ impl Jobs {
         if let Some(first) = rows.first() {
             caller.submitted.set(JobId(first.job_id.clone()));
         }
-        Ok(rows.iter().map(|r| s.summary(r)).collect())
+        Ok(rows.iter().map(|r| s.submitted_summary(r)).collect())
     }
 
     /// Job `id` of `caller`'s scope.

@@ -696,9 +696,10 @@ fn migration_10_adds_family_and_captures() {
     db.close().expect("close");
 
     let migrated = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("migrate");
-    assert_eq!(migrated.schema_version(), 10);
-    assert_eq!(known(), 10);
-    assert_eq!(lil_schema::SUITE_STATE_SCHEMA, 10);
+    // Migrated through 10 to the newest (11, the restart-hold toasts).
+    assert_eq!(migrated.schema_version(), 11);
+    assert_eq!(known(), 11);
+    assert_eq!(lil_schema::SUITE_STATE_SCHEMA, 11);
     migrated.close();
     let db = read_only(&path);
     let row: (String, Option<String>, i64) = db

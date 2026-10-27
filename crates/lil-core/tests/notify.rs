@@ -655,16 +655,15 @@ fn a_restart_hold_posts_one_toast() {
         assert_eq!(held.len(), 1, "{held:?}");
         let toast = &held[0];
         assert_eq!(toast["title"], "Jobs held after a restart", "{toast}");
+        // A test core starts with no handlers: the toast has no target and says so
+        // (Checkpoint A walkthrough, ODD-6).
         assert_eq!(
-            toast["body"], "3 jobs wait until you resume them in Jobs",
+            toast["body"], "3 jobs wait until you resume them in Jobs · Open LILITH to see it",
             "{toast}"
         );
         assert_eq!(toast["tag"], format!("restart_{}", ids[0]), "{toast}");
-        assert_eq!(
-            toast["launch"],
-            format!("{scheme}:task/{}", ids[0]),
-            "{toast}"
-        );
+        assert!(toast.get("launch").is_none(), "{toast}");
+        assert!(!toast["xml"].as_str().unwrap().contains(&scheme), "{toast}");
         write(&mut p, "job.cancel", json!({"all_mine": true}));
     }
     // A start that held none posts nothing.
@@ -673,6 +672,484 @@ fn a_restart_hold_posts_one_toast() {
     ready(&mut p);
     fence(&mut p, &env);
     assert!(posts(&mut p, "job_failed").is_empty());
+}
+
+/// Owner decision 2026-10-26 (Checkpoint A walkthrough): the restart hold's toast comes once
+/// per held batch, across restarts; a later start that holds the same jobs again posts
+/// nothing, and a hold of new jobs posts again.
+#[test] // spec: APP-146, ARCH-022, CORE-160
+fn a_restart_hold_toasts_once_per_held_batch() {
+    let logs = capture_logs();
+    let env = TestEnv::new();
+    // Jobs held in a paused lane when `start` drops its core.
+    let held_in = |n: u64| {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut a = app(&env);
+        let paused = a.call("app/queue.pause", json!({}));
+        assert_eq!(paused["result"]["status"], "ok", "{paused}");
+        let mut p = pipe(&env, json!({}));
+        job_ids(&write(
+            &mut p,
+            "test.job",
+            json!({"lane": "gpu-heavy", "batch": n}),
+        ))
+    };
+    let first = held_in(2);
+    {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({}));
+        let toast = until_posts(&mut p, "job_failed", 1).remove(0);
+        assert!(
+            toast["body"]
+                .as_str()
+                .is_some_and(|b| b.starts_with("2 jobs wait until you resume them in Jobs")),
+            "{toast}"
+        );
+    }
+    // The same two held again: no new toast.
+    {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({}));
+        let listed = p.tool_ok("jobs.list", json!({}), None);
+        let held = listed["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|j| j["pause_reasons"] == json!(["restart"]))
+            .count();
+        assert_eq!(held, 2, "held again: {listed}");
+        // The recovery's toast decision is logged once it is made (review M-5): wait for it,
+        // not for time.
+        until("the restart hold's outcome logged", || {
+            logs.text()
+                .lines()
+                .any(|l| l.contains("the restart hold's toast") && l.contains("Duplicate"))
+                .then_some(())
+        });
+        assert!(
+            posts(&mut p, "job_failed").is_empty(),
+            "{:?}",
+            posts(&mut p, "job_failed")
+        );
+    }
+    // A new job held with them: one toast for the three.
+    let more = held_in(1);
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    let toast = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert!(
+        toast["body"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("3 jobs wait until you resume them in Jobs")),
+        "{toast}"
+    );
+    assert_eq!(toast["tag"], format!("restart_{}", first[0]), "{toast}");
+    assert_ne!(first[0], more[0]);
+}
+
+/// Checkpoint A walkthrough (ODD-6): while the handlers aren't this channel's, a toast with
+/// a target is posted without it, and its text says to open LILITH, the ending always shown.
+#[test] // spec: APP-146, APP-022
+fn without_the_handlers_a_toast_has_no_target_and_says_to_open_lilith() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    desktop(&mut p, json!({"handlers": false}));
+    batch(&mut p, 1);
+    let finished = until_posts(&mut p, "job_finished", 1).remove(0);
+    assert!(finished.get("launch").is_none(), "{finished}");
+    assert_eq!(
+        finished["body"], "test.job · no project · 0 s · Open LILITH to see it",
+        "{finished}"
+    );
+    let failing = write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final", "fail_message": "x".repeat(500)}),
+    );
+    wait_done(&mut p, &job_ids(&failing)[0]);
+    let failed = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert!(failed.get("launch").is_none(), "{failed}");
+    let body = failed["body"].as_str().unwrap();
+    assert!(body.ends_with("x… · Open LILITH to see it"), "{failed}");
+    assert!(body.chars().count() <= 200, "{failed}");
+    // With the handlers back, the target is back.
+    desktop(&mut p, json!({"handlers": true, "clear": true}));
+    let id = batch(&mut p, 1).remove(0);
+    let scheme = env.env.activation_scheme();
+    let back = until_posts(&mut p, "job_finished", 1).remove(0);
+    assert_eq!(back["launch"], format!("{scheme}:task/{id}"), "{back}");
+    assert_eq!(back["body"], "test.job · no project · 0 s", "{back}");
+}
+
+/// Checkpoint A walkthrough (BUG-1): every toast's text goes through the diagnostics
+/// redaction before it is posted: a failed job's error message, an agent's notice.
+#[test] // spec: APP-146, ARCH-121
+fn every_toasts_text_is_redacted() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let key = format!("sk-ant-api03-{}", "FAKEtoastKEY".repeat(3));
+    let (secret, mail) = ("hunter2toastsecret", "toast.owner@example.com");
+    let message =
+        format!("upload failed: api_key={key} Authorization: Bearer {secret} contact {mail}");
+    let failing = write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final", "fail_message": message}),
+    );
+    wait_done(&mut p, &job_ids(&failing)[0]);
+    let failed = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert_eq!(
+        failed["body"],
+        "test.job: upload failed: api_key=<redacted> Authorization: <redacted> contact <redacted>",
+        "{failed}"
+    );
+    write(
+        &mut p,
+        "notify.claude_code",
+        json!({"message": format!("done with {key}"), "title": format!("for {mail}")}),
+    );
+    let notice = until_posts(&mut p, "agent_activity", 1).remove(0);
+    assert_eq!(notice["title"], "Claude Code: for <redacted>", "{notice}");
+    assert_eq!(notice["body"], "done with <redacted>", "{notice}");
+    for toast in [&failed, &notice] {
+        let xml = toast["xml"].as_str().unwrap();
+        for s in [key.as_str(), secret, mail] {
+            assert!(!xml.contains(s), "{s} in {xml}");
+        }
+    }
+}
+
+/// Review I-1: a key that a control character splits is redacted as the toast shows it. The
+/// text is normalised first (the control goes, joining the key) and the result redacted, so
+/// the join never puts the key back in clear: BEL, NUL, NEL and DEL.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_split_by_a_control_character_is_redacted_as_shown() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let tail = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef";
+    let cases = [
+        (format!("sk-ant-api03-ABCD\u{7}{tail}"), "BEL"),
+        (format!("sk-ant-\u{0}api03-{tail}"), "NUL"),
+        (format!("ghp_\u{85}{}", "A1".repeat(18)), "NEL"),
+        (
+            format!("hf_{}\u{7f}{}", "d4".repeat(8), "d4".repeat(9)),
+            "DEL",
+        ),
+    ];
+    for (i, (split, name)) in cases.iter().enumerate() {
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({"message": format!("{i}: upload failed: {split}")}),
+        );
+        let joined: String = split.chars().filter(|c| !c.is_control()).collect();
+        let toast = until(&format!("the {name} notice"), || {
+            posts(&mut p, "agent_activity").into_iter().find(|t| {
+                t["body"]
+                    .as_str()
+                    .is_some_and(|b| b.starts_with(&format!("{i}: ")))
+            })
+        });
+        assert_eq!(
+            toast["body"],
+            format!("{i}: upload failed: <redacted>"),
+            "{name}: {toast}"
+        );
+        assert!(
+            !toast["xml"].as_str().unwrap().contains(&joined[4..]),
+            "{name}: {toast}"
+        );
+    }
+    // A failed job's message too.
+    let failing = write(
+        &mut p,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final", "fail_message": format!("upload failed: {}", cases[0].0)}),
+    );
+    wait_done(&mut p, &job_ids(&failing)[0]);
+    let failed = until_posts(&mut p, "job_failed", 1).remove(0);
+    assert_eq!(
+        failed["body"], "test.job: upload failed: <redacted>",
+        "{failed}"
+    );
+}
+
+/// The body of the `notify.claude_code` notice whose body starts `<tag>: `, posted.
+fn notice_body(p: &mut RawPipe, tag: &str) -> String {
+    let head = format!("{tag}: ");
+    until(&format!("the {tag} notice"), || {
+        posts(p, "agent_activity").into_iter().find_map(|t| {
+            t["body"]
+                .as_str()
+                .filter(|b| b.starts_with(&head))
+                .map(str::to_string)
+        })
+    })
+}
+
+/// Re-review I-A: a key the 200-character cut runs through is redacted whole, as it came,
+/// before the cut, so no head of it is left in the toast.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_across_the_cut_is_redacted_whole() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut leaks = Vec::new();
+    for (tag, pad, key) in [
+        ("ghp", 37, format!("ghp_{}", "A1".repeat(18))),
+        ("age", 32, format!("AGE-SECRET-KEY-1{}", "G7".repeat(29))),
+        ("akia", 37, "AKIAQ3EXAMPLE7FAKE99".to_string()),
+    ] {
+        // The key starts at character 185 (160 for the age key), so the cut runs through it.
+        let message = format!("{tag}: {}{key} and more", "word ".repeat(pad - 1));
+        write(&mut p, "notify.claude_code", json!({ "message": message }));
+        let body = notice_body(&mut p, tag);
+        assert!(body.chars().count() <= 200, "{tag}: {body}");
+        if body.contains(&key[..8]) || !body.contains("<redact") {
+            leaks.push(body);
+        }
+    }
+    assert!(leaks.is_empty(), "a head of a key is left: {leaks:#?}");
+}
+
+/// The long, variable-length key formats of the PR #53 audit, with fake bodies.
+fn split_keys() -> Vec<(&'static str, String, String)> {
+    // A fixed pseudo-random run of letters and digits (no real key).
+    let fake = |len: usize, mut seed: u64| -> String {
+        const SET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        (0..len)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                SET[usize::try_from(seed >> 33).unwrap() % SET.len()] as char
+            })
+            .collect()
+    };
+    vec![
+        (
+            "sk-ant",
+            "sk-ant-".to_string(),
+            format!("api03-{}", fake(89, 1)),
+        ),
+        ("sk-proj", "sk-proj-".to_string(), fake(120, 2)),
+        ("sk", "sk-".to_string(), fake(48, 3)),
+        (
+            "github_pat",
+            "github_pat_".to_string(),
+            format!("11{}_{}", fake(22, 4), fake(59, 5)),
+        ),
+        (
+            "xoxb",
+            "xoxb-".to_string(),
+            format!("2718281828-3141592653589-{}", fake(24, 6)),
+        ),
+    ]
+}
+
+/// The splitters of the PR #53 audit: a control character, a line break, a terminal control
+/// sequence and an invisible character.
+const SPLITTERS: [(&str, &str); 7] = [
+    ("BEL", "\u{7}"),
+    ("LF", "\n"),
+    ("CRLF", "\r\n"),
+    ("SGR", "\u{1b}[0m"),
+    ("OSC8", "\u{1b}]8;;https://example.com/x\u{1b}\\"),
+    ("ZWSP", "\u{200b}"),
+    ("SHY", "\u{ad}"),
+];
+
+/// Each key split at 1/2 and 3/4 of its body by each splitter: `(name, split key)`.
+fn split_cases() -> Vec<(String, String)> {
+    let mut cases = Vec::new();
+    for (format, prefix, body) in split_keys() {
+        for (num, den) in [(1, 2), (3, 4)] {
+            let at = body.len() * num / den;
+            for (splitter, text) in SPLITTERS {
+                cases.push((
+                    format!("{format} {num}/{den} {splitter}"),
+                    format!("{prefix}{}{text}{}", &body[..at], &body[at..]),
+                ));
+            }
+        }
+    }
+    cases
+}
+
+/// The PR #53 audit: a long key split deep inside by one splitter is redacted whole in its
+/// toast, its tail with its head; ordinary words after a space stay.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_split_deep_inside_is_redacted_whole_in_its_toast() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut leaks = Vec::new();
+    for (i, (name, key)) in split_cases().into_iter().enumerate() {
+        let tag = format!("t{i}");
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({ "message": format!("{tag}: key {key} end") }),
+        );
+        let body = notice_body(&mut p, &tag);
+        if body != format!("{tag}: key <redacted> end") {
+            leaks.push(format!("{name}: {body:?}"));
+        }
+    }
+    assert!(leaks.is_empty(), "{} leaks: {leaks:#?}", leaks.len());
+    let (_, prefix, body) = split_keys().remove(0);
+    write(
+        &mut p,
+        "notify.claude_code",
+        json!({ "message": format!("words: {prefix}{body} then_some_ordinary_words") }),
+    );
+    assert_eq!(
+        notice_body(&mut p, "words"),
+        "words: <redacted> then_some_ordinary_words"
+    );
+}
+
+/// Re-review I-A: a terminal sequence still bounds a key, and one inside a key doesn't hide
+/// it: an ANSI-coloured AWS key id and Slack token, and a GitHub token a CSI splits.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_coloured_or_csi_split_key_is_redacted() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut leaks = Vec::new();
+    for (tag, text, secret) in [
+        (
+            "akia",
+            "error: \u{1b}[31mAKIAQ3EXAMPLE7FAKE99\u{1b}[0m done",
+            "Q3EXAMPLE7FAKE99",
+        ),
+        (
+            "xoxb",
+            "token \u{1b}[32mxoxb-1234567890-abcdefghijklmnop\u{1b}[0m set",
+            "abcdefghijklmnop",
+        ),
+        (
+            "csi",
+            "push ghp_Z9yX8\u{1b}[0mwV7uT6sR5qP4oN3mL2kJ1 failed",
+            "wV7uT6sR5qP4oN3mL2kJ1",
+        ),
+    ] {
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({ "message": format!("{tag}: {text}") }),
+        );
+        let body = notice_body(&mut p, tag);
+        if body.contains(secret) || !body.contains("<redacted>") {
+            leaks.push(body);
+        }
+    }
+    assert!(leaks.is_empty(), "{leaks:#?}");
+}
+
+/// Re-review M-A: a Unicode default-ignorable character inside a key (a format control, a
+/// variation selector, a filler, a tag character) is removed before the toast's text is
+/// redacted, so it can't hide the key; the bidirectional controls are still shown as markers.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn an_invisible_character_inside_a_key_is_removed_and_the_key_redacted() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let half = "A1".repeat(9);
+    let mut leaks = Vec::new();
+    for (i, c) in [
+        '\u{200b}',
+        '\u{2060}',
+        '\u{ad}',
+        '\u{34f}',
+        '\u{180e}',
+        '\u{2062}',
+        '\u{fe0f}',
+        '\u{3164}',
+        '\u{e0041}',
+        '\u{feff}',
+        '\u{200c}',
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tag = format!("i{i}");
+        let message = format!("{tag}: upload failed: ghp_{half}{c}{half}");
+        write(&mut p, "notify.claude_code", json!({ "message": message }));
+        let body = notice_body(&mut p, &tag);
+        if body != format!("{tag}: upload failed: <redacted>") {
+            leaks.push(format!("U+{:04X}: {body}", u32::from(c)));
+        }
+    }
+    assert!(leaks.is_empty(), "{leaks:#?}");
+    write(
+        &mut p,
+        "notify.claude_code",
+        json!({"message": "bidi: a\u{202e}b"}),
+    );
+    assert_eq!(
+        notice_body(&mut p, "bidi"),
+        "bidi: a\u{27e8}U+202E\u{27e9}b"
+    );
+}
+
+/// Review M-2: a zero cap's alerts show the spend itself, since no percentage of 0 exists.
+#[test] // spec: APP-146, CORE-089
+fn a_zero_caps_alerts_show_the_spend() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"0\"\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let mut a = app(&env);
+    let k = key();
+    let call = json!({"provider": "fakeprov", "amount": "2"});
+    let id = pending_id(&a.tool("test.meter_external", call.clone(), Some(&k)));
+    let r = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": id, "answer": "approve", "cap": {"action": "allow_once"}}),
+    );
+    assert_eq!(r["result"]["status"], "ok", "{r}");
+    let done = a.tool("test.meter_external", call, Some(&k));
+    assert_eq!(done["status"], "ok", "{done}");
+    let alerts = until_posts(&mut p, "cap_alert", 3);
+    for (t, pct) in alerts.iter().zip([50, 80, 100]) {
+        let title = t["title"].as_str().unwrap();
+        assert!(
+            title.starts_with("Spent 2 USD against your 0 USD monthly cap (")
+                && title.ends_with(')'),
+            "{t}"
+        );
+        assert_eq!(t["body"], format!("Alert at {pct} %"), "{t}");
+    }
+}
+
+/// Checkpoint A walkthrough (ODD-5): a call that needs a confirmation and passes a cap names
+/// the cap in its toast too.
+#[test] // spec: APP-146, APP-022, APP-054
+fn a_confirm_and_cap_toast_names_the_cap() {
+    let env = TestEnv::new();
+    env.suite_toml_set("[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n");
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let id = pending_id(&p.tool("test.destructive", json!({"cost": "2"}), Some(&key())));
+    let toast = until_posts(&mut p, "confirmation_waiting", 1).remove(0);
+    assert_eq!(toast["tag"], id.as_str(), "{toast}");
+    assert_eq!(
+        toast["body"], "A script (lil) wants to run test.destructive, over your monthly cap",
+        "{toast}"
+    );
 }
 
 #[test] // spec: APP-146
@@ -819,24 +1296,160 @@ fn a_restart_reposts_the_waiting_toasts_and_removes_them_when_answered() {
         let token = deny_token(&mut p, &scheme, &id);
         (id, token)
     };
-    // The next core posts it again, Tag and all (replacing the old toast and its dead Deny),
-    // with a fresh token.
+    // The next core posts it again, Tag and all (replacing the old toast and its dead Deny).
+    // A test core starts with no handlers, so it comes without its target and its Open and
+    // Deny, and says to open LILITH (Checkpoint A walkthrough, ODD-6).
     let _core = core_with(&env, FakeClock::new(), Some(ids), None);
     let mut p = pipe(&env, json!({}));
-    let token = deny_token(&mut p, &scheme, &id);
-    assert_ne!(token, old_token);
+    let toast = until(&format!("the toast of {id} again"), || {
+        posts(&mut p, "confirmation_waiting")
+            .into_iter()
+            .find(|t| t["tag"] == id.as_str())
+    });
+    assert!(toast.get("launch").is_none(), "{toast}");
+    assert!(
+        actions(toast["xml"].as_str().unwrap()).is_empty(),
+        "{toast}"
+    );
+    assert!(!toast["xml"].as_str().unwrap().contains(&scheme), "{toast}");
+    assert_eq!(
+        toast["body"], "A script (lil) wants to run test.destructive · Open LILITH to see it",
+        "{toast}"
+    );
     let mut a = app(&env);
+    let old = a.call(
+        "app/confirmation.answer",
+        json!({"confirmation_id": id, "answer": "deny", "toast_token": old_token}),
+    );
+    assert_eq!(error_code(&old["result"]), "confirm.unknown", "{old}");
     let r = a.call(
         "app/confirmation.answer",
-        json!({"confirmation_id": id, "answer": "deny", "toast_token": token}),
+        json!({"confirmation_id": id, "answer": "deny"}),
     );
-    assert_eq!(r["result"]["status"], "ok", "the new token denies: {r}");
+    assert_eq!(r["result"]["status"], "ok", "the app denies: {r}");
     until(&format!("the toast of {id} removed"), || {
         ops(&mut p)
             .iter()
             .any(|t| t["op"] == "remove" && t["tag"] == id.as_str())
             .then_some(())
     });
+}
+
+/// Checkpoint A walkthrough (ODD-6, review): a confirmation's toast reposted at a restart
+/// without its target (a test core starts with no handlers) is posted again by the next
+/// reconcile once the handlers are this channel's, with Open, Deny and a fresh token: the
+/// fresh token denies, and the earlier run's is dead.
+#[test] // spec: APP-146, APP-022, ARCH-055
+fn a_reposted_toast_gets_its_buttons_and_a_fresh_token_once_the_handlers_are_back() {
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let ids: Arc<dyn IdSource> = Arc::new(lil_platform::RandomIds);
+    let (id, old_token) = {
+        let _core = core_with(&env, FakeClock::new(), Some(ids.clone()), None);
+        let mut p = pipe(&env, json!({}));
+        ready(&mut p);
+        let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        let token = deny_token(&mut p, &scheme, &id);
+        (id, token)
+    };
+    let _core = core_with(&env, FakeClock::new(), Some(ids), None);
+    let mut p = pipe(&env, json!({}));
+    let of_id = |p: &mut RawPipe| -> Vec<Value> {
+        posts(p, "confirmation_waiting")
+            .into_iter()
+            .filter(|t| t["tag"] == id.as_str())
+            .collect()
+    };
+    let bare = until("the bare repost", || of_id(&mut p).into_iter().next());
+    assert!(actions(bare["xml"].as_str().unwrap()).is_empty(), "{bare}");
+    // The handlers are back; the last app closing reconciles.
+    desktop(&mut p, json!({"handlers": true}));
+    drop(app(&env));
+    let full = until("the repost with its buttons", || {
+        of_id(&mut p)
+            .into_iter()
+            .find(|t| !actions(t["xml"].as_str().unwrap()).is_empty())
+    });
+    assert_eq!(full["launch"], format!("{scheme}:confirm/{id}"), "{full}");
+    assert_eq!(
+        full["body"], "A script (lil) wants to run test.destructive",
+        "{full}"
+    );
+    let xml = full["xml"].as_str().unwrap();
+    let token = actions(xml)[1]
+        .1
+        .strip_prefix(&format!("{scheme}:deny/{id}/"))
+        .unwrap_or_else(|| panic!("not a deny URL of {id}: {xml}"))
+        .to_string();
+    assert_ne!(token, old_token);
+    let mut a = app(&env);
+    let deny = |a: &mut TestApp, token: &str| -> Value {
+        a.call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": id, "answer": "deny", "toast_token": token}),
+        )["result"]
+            .clone()
+    };
+    assert_eq!(error_code(&deny(&mut a, &old_token)), "confirm.unknown");
+    let denied = deny(&mut a, &token);
+    assert_eq!(denied["status"], "ok", "the fresh token denies: {denied}");
+    until(&format!("the toast of {id} removed"), || {
+        ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == id.as_str())
+            .then_some(())
+    });
+}
+
+/// Review M-3: a repost of a bare confirmation toast that fails (here Windows' toasts are
+/// turned off for the app as the handlers come back) leaves the bare toast where it is. Each
+/// reconcile is logged once it is done, so the check waits for it, not for time.
+#[test] // spec: APP-146, APP-022, ARCH-055
+fn a_failed_repost_keeps_the_bare_toast() {
+    let logs = capture_logs();
+    let reconciled = || {
+        logs.text()
+            .lines()
+            .filter(|l| l.contains("the confirmation toasts were reconciled"))
+            .count()
+    };
+    let env = TestEnv::new();
+    let scheme = env.env.activation_scheme();
+    let id = {
+        let _core = core_with(&env, FakeClock::new(), None, None);
+        let mut p = pipe(&env, json!({}));
+        ready(&mut p);
+        let id = pending_id(&p.tool("test.destructive", json!({}), Some(&key())));
+        deny_token(&mut p, &scheme, &id);
+        id
+    };
+    let _core = core_with(&env, FakeClock::new(), None, None);
+    let mut p = pipe(&env, json!({}));
+    let bare = until("the bare repost", || {
+        posts(&mut p, "confirmation_waiting")
+            .into_iter()
+            .find(|t| t["tag"] == id.as_str())
+    });
+    assert!(actions(bare["xml"].as_str().unwrap()).is_empty(), "{bare}");
+    // Both starts' reconciles are done.
+    until("two reconciles", || (reconciled() >= 2).then_some(()));
+    let before = reconciled();
+    let a = app(&env);
+    desktop(
+        &mut p,
+        json!({"handlers": true, "toasts": "disabled_for_app"}),
+    );
+    drop(a);
+    until("the reconcile after the app closed", || {
+        (reconciled() > before).then_some(())
+    });
+    assert!(
+        !ops(&mut p)
+            .iter()
+            .any(|t| t["op"] == "remove" && t["tag"] == id.as_str()),
+        "the bare toast stays: {:?}",
+        ops(&mut p)
+    );
 }
 
 #[test] // spec: APP-146, ARCH-055, APP-022
@@ -1194,8 +1807,8 @@ fn cap_alert_posts_once_per_threshold() {
     let _core = core(&env);
     let mut p = pipe(&env, json!({"non_interactive": true}));
     ready(&mut p);
-    // 60 %, 70 %, 85 %, 100 %.
-    for amount in ["0.6", "0.1", "0.15", "0.15"] {
+    // 30 %, then 95 % (past 50 % and 80 % at once), then 100 %.
+    for amount in ["0.3", "0.65", "0.05"] {
         write(
             &mut p,
             "test.meter_external",
@@ -1203,21 +1816,32 @@ fn cap_alert_posts_once_per_threshold() {
         );
     }
     let alerts = until_posts(&mut p, "cap_alert", 3);
-    let titles: Vec<&str> = alerts
+    // Owner decision 2026-10-26 (Checkpoint A walkthrough): one toast per threshold, each
+    // with the spend as it was then.
+    let text = |t: &Value, k: &str| t[k].as_str().unwrap().to_string();
+    let period = text(&alerts[0], "title")
+        .rsplit_once('(')
+        .and_then(|(_, p)| p.strip_suffix(')'))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("{alerts:?}"));
+    assert!(
+        period.len() == 7 && period.as_bytes()[4] == b'-',
+        "{period}"
+    );
+    let shown: Vec<(String, String)> = alerts
         .iter()
-        .map(|t| t["title"].as_str().unwrap())
+        .map(|t| (text(t, "title"), text(t, "body")))
         .collect();
+    let spending = |pct: u32| format!("Spending at {pct} % of your monthly cap ({period})");
     assert_eq!(
-        titles,
-        ["Spending at 50 %", "Spending at 80 %", "Spending at 100 %"]
+        shown,
+        [
+            (spending(95), "Alert at 50 %".to_string()),
+            (spending(95), "Alert at 80 %".to_string()),
+            (spending(100), "Alert at 100 %".to_string()),
+        ]
     );
     for t in &alerts {
-        assert!(
-            t["body"]
-                .as_str()
-                .is_some_and(|b| b.starts_with("monthly cap, ")),
-            "{t}"
-        );
         assert!(t.get("launch").is_none(), "no target: {t}");
     }
     let tags: std::collections::HashSet<&str> =
@@ -1393,7 +2017,9 @@ fn a_workspace_recovered_later_posts_its_own_restart_toast() {
     let toast = until_posts(&mut p, "job_failed", 1).remove(0);
     assert_eq!(toast["title"], "Jobs held after a restart", "{toast}");
     assert_eq!(
-        toast["body"], "2 jobs wait until you resume them in Jobs",
+        // No handlers on a test core until a test sets them (ODD-6).
+        toast["body"],
+        "2 jobs wait until you resume them in Jobs · Open LILITH to see it",
         "{toast}"
     );
     assert_eq!(toast["tag"], format!("restart_{}", ids[0]), "{toast}");

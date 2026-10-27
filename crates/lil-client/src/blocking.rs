@@ -83,6 +83,16 @@ impl BlockingClient {
         self.rt.block_on(self.client.confirmations(state))
     }
 
+    /// [`Client::app_call`].
+    pub fn app_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Outcome<serde_json::Value>, ClientError> {
+        not_on_gui_thread("blocking::BlockingClient::app_call");
+        self.rt.block_on(self.client.app_call(method, params))
+    }
+
     /// [`Client::list_tools`].
     pub fn list_tools(&self) -> Result<Vec<ToolDescriptor>, ClientError> {
         not_on_gui_thread("blocking::BlockingClient::list_tools");
