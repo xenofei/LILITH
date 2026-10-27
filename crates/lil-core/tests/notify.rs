@@ -1017,6 +1017,39 @@ fn a_key_split_deep_inside_is_redacted_whole_in_its_toast() {
     );
 }
 
+/// The PR #53 re-audit: in a toast, where written escapes stay as they came, two written
+/// escapes in a row are one splitter, and a key a written escape cuts before its format's
+/// shortest body loses both parts.
+#[test] // spec: APP-146, ARCH-121, APP-022
+fn a_key_cut_by_written_escapes_is_redacted_whole_in_its_toast() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut p = pipe(&env, json!({}));
+    ready(&mut p);
+    let (_, prefix, body) = split_keys().remove(0);
+    let (head, tail) = body.split_at(body.len() / 2);
+    let akia = "AKIAQ3EXAMPLE7FAKE99";
+    let ghp = format!("ghp_{}", "A1".repeat(18));
+    let mut leaks = Vec::new();
+    for (tag, key) in [
+        ("lflf", format!(r"{prefix}{head}\n\n{tail}")),
+        ("belbel", format!(r"{prefix}{head}\u0007\u0007{tail}")),
+        ("akia", format!(r"{}\n{}", &akia[..8], &akia[8..])),
+        ("ghp", format!(r"{}\r\n{}", &ghp[..14], &ghp[14..])),
+    ] {
+        write(
+            &mut p,
+            "notify.claude_code",
+            json!({ "message": format!("{tag}: key {key} end") }),
+        );
+        let body = notice_body(&mut p, tag);
+        if body != format!("{tag}: key <redacted> end") {
+            leaks.push(body);
+        }
+    }
+    assert!(leaks.is_empty(), "{} leaks: {leaks:#?}", leaks.len());
+}
+
 /// Re-review I-A: a terminal sequence still bounds a key, and one inside a key doesn't hide
 /// it: an ANSI-coloured AWS key id and Slack token, and a GitHub token a CSI splits.
 #[test] // spec: APP-146, ARCH-121, APP-022
