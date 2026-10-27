@@ -30,6 +30,9 @@
 // ui:image, starting a core if none runs, and the engine makes Core at once. Under --smoke-exit
 // Core is made without a session, so it starts no core: the deploy check measures the start
 // and reads the `core_object` line, which says the deployed Lilith.Core module loaded.
+// The shell (APP-001, P4a-R16): ShellWindow gets Core and the app's state folder
+// (lil_qt::app_state_dir), where it restores and saves its layout. The GUI-thread stall watchdog
+// logs stalls (lilshim/StallWatchdog.h), and the font database is filled off the GUI thread.
 //
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
@@ -41,7 +44,9 @@
 #include "lilshim/DockFactory.h"
 #include "lilshim/LogBridge.h"
 #include "lilshim/PreviewProvider.h"
+#include "lilshim/StallWatchdog.h"
 
+#include "lil_qt/src/qt/layout.cxxqt.h"
 #include "lil_qt/src/qt/mod.cxxqt.h"
 #include "lil_qt/src/qt/preview_sink.h"
 
@@ -174,6 +179,10 @@ int main(int, char **)
 
     lilshim::installLogBridge();
     lilshim::setLogSink(&toAppLog);
+    // The GUI-thread stall watchdog, and the font database filled off the GUI thread before the
+    // first show (spike 10 §8, follow-ups 3 and 4).
+    lilshim::startStallWatchdog();
+    lilshim::warmFonts();
     // env_left: what step 2 left of the cleared variables (none); the deploy check reads it,
     // with the platform, the import paths and the first frame's graphics API.
     QJsonArray envLeft;
@@ -212,8 +221,11 @@ int main(int, char **)
         if (!why.empty())
             lilshim::logEvent(QStringLiteral("error"), {{"what", "no core session"}, {"why", fromRust(why)}});
     }
-    const bool coreLoaded = engine.singletonInstance<QObject *>("Lilith.Core", "Core") != nullptr;
-    lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", coreLoaded}});
+    QObject *core = engine.singletonInstance<QObject *>("Lilith.Core", "Core");
+    lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", core != nullptr}});
+    // The shell takes the core and the app's state folder, where its layout lives (P4a-R16).
+    engine.setInitialProperties({{QStringLiteral("core"), QVariant::fromValue(core)},
+                                 {QStringLiteral("stateDir"), fromRust(lil_qt::app_state_dir())}});
     engine.loadFromModule("Lilith.UiKit", "ShellWindow");
     auto *window = engine.rootObjects().isEmpty()
                        ? nullptr

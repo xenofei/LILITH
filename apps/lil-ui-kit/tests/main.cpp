@@ -10,9 +10,12 @@
 #include <kddockwidgets/qtquick/Platform.h>
 
 #include <QCoreApplication>
+#include <QDir>
+#include <QFile>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QtQml/qqmlextensionplugin.h>
 #include <QtQuickTest>
 
@@ -40,6 +43,50 @@ public:
     }
 };
 
+// TestFiles (a context property): the file access the QML tests need, all of it under one
+// temporary folder per test process (Task 18's layout tests), and the environment.
+class TestFiles : public QObject
+{
+    Q_OBJECT
+
+public:
+    // A new, empty folder under this process's temporary folder.
+    Q_INVOKABLE QString newDir(const QString &name)
+    {
+        const QString path = m_root.filePath(QStringLiteral("%1-%2").arg(name).arg(++m_dirs));
+        QDir().mkpath(path);
+        return path;
+    }
+
+    Q_INVOKABLE bool write(const QString &path, const QString &text)
+    {
+        QFile f(path);
+        return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(text.toUtf8()) >= 0;
+    }
+
+    // The file's text, or null when there is none.
+    Q_INVOKABLE QVariant read(const QString &path) const
+    {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly))
+            return {};
+        return QString::fromUtf8(f.readAll());
+    }
+
+    Q_INVOKABLE QStringList list(const QString &dir) const
+    {
+        return QDir(dir).entryList(QDir::Files | QDir::Hidden, QDir::Name);
+    }
+
+    Q_INVOKABLE QString env(const QString &name) const { return qEnvironmentVariable(name.toUtf8().constData()); }
+
+    Q_INVOKABLE bool mkpath(const QString &path) const { return QDir().mkpath(path); }
+
+private:
+    QTemporaryDir m_root;
+    int m_dirs = 0;
+};
+
 class Setup : public QObject
 {
     Q_OBJECT
@@ -64,7 +111,11 @@ public slots:
         engine->addImportPath(QCoreApplication::applicationDirPath());
         engine->addImageProvider(QStringLiteral("lilpreview"), new lilshim::PreviewProvider);
         engine->rootContext()->setContextProperty(QStringLiteral("BridgeHook"), new BridgeHook(engine));
+        engine->rootContext()->setContextProperty(QStringLiteral("TestFiles"), &m_files);
     }
+
+private:
+    TestFiles m_files;
 };
 
 // APP-137: set before the application object, which QUICK_TEST_MAIN_WITH_SETUP creates, so

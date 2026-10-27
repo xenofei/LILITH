@@ -14,5 +14,22 @@ qt_add_qml_module(lil-ui-kit
         qml/core/OwnerWatch.qml
         qml/core/PreviewImage.qml)
 target_link_libraries(lil-ui-kit PRIVATE Qt6::Quick)
+# Task 18: the base controls (APP-156), the shell's docks and panel placeholders, and A11yWalk.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/controls/LButton.qml
+        qml/controls/LIconButton.qml
+        qml/controls/LToggle.qml
+        qml/controls/LTextField.qml
+        qml/controls/LBanner.qml
+        qml/controls/LBadge.qml
+        qml/controls/LGauge.qml
+        qml/controls/LCard.qml
+        qml/shell/DockedPanel.qml
+        qml/shell/DockTitleBar.qml
+        qml/shell/DockTabBar.qml
+        qml/shell/Panels.js
+        qml/shell/PlaceholderPanel.qml
+        qml/a11y/A11yWalk.qml)
 
 add_subdirectory(tests)

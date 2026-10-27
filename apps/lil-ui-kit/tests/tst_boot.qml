@@ -17,7 +17,7 @@ TestCase {
 
     Component {
         id: shellComponent
-        ShellWindow {}
+        ShellWindow { core: FakeCore {} }
     }
 
     Component {
@@ -29,13 +29,13 @@ TestCase {
             Rectangle {
                 id: content
                 anchors.fill: parent
-                color: Theme.panel
+                color: Theme.surface
             }
         }
     }
 
     function test_theme_loads() {
-        verify(Qt.colorEqual(Theme.window, "#1f2229"), "Theme.window")
+        verify(Qt.colorEqual(Theme.bg, "#16181d"), "Theme.bg")
         compare(typeof Theme.spacing, "number")
         verify(Theme.spacing > 0 && Theme.radius >= 0 && Theme.fontSize > 0)
     }

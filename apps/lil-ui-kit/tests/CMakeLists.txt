@@ -47,3 +47,19 @@ set_tests_properties(lil_qt_e2e PROPERTIES
     TIMEOUT 900
     ENVIRONMENT "QMAKE=$<TARGET_FILE:Qt6::qmake>"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 18: the shell's theme, controls, accessibility walk and layout.
+lil_qml_test(tst_theme tst_theme.qml)
+lil_qml_test(tst_controls tst_controls.qml)
+lil_qml_test(tst_a11y tst_a11y.qml)
+lil_qml_test(tst_layout tst_layout.qml)
+# The offscreen grabs (label grabs): build/<preset>/grabs/<panel>-<state>.png, or LIL_GRAB_DIR.
+# The offscreen platform reads fonts from QT_QPA_FONTDIR (else Qt's own lib/fonts, which Qt no
+# longer ships): Windows' fonts, so the reviewer reads the text.
+file(TO_CMAKE_PATH "$ENV{WINDIR}/Fonts" LIL_WINDOWS_FONTS)
+add_test(NAME grab_shell COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/grab_shell.qml)
+set_tests_properties(grab_shell PROPERTIES
+    LABELS grabs
+    TIMEOUT 300
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
