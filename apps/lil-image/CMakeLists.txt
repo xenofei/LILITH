@@ -19,9 +19,8 @@ add_custom_command(TARGET lil-image POST_BUILD
     VERBATIM)
 
 # The deploy folder, build/<preset>/deploy (OPS-094): our files first, then windeployqt, then the
-# VC++ runtime of the pinned 14.44 toolset that built them (cmake/deploy.cmake). Its redist is
-# found under the Visual Studio install, not through VCToolsRedistDir, which names the install's
-# default redist whatever toolset vcvars64 -vcvars_ver picked.
+# VC++ runtime: the newest redist under the Visual Studio install at 14.44 or newer, never older
+# than the 14.44 toolset that built them (cmake/deploy.cmake).
 set(LIL_DEPLOY_DIR ${CMAKE_BINARY_DIR}/deploy)
 file(TO_CMAKE_PATH "$ENV{VCINSTALLDIR}" LIL_VC_INSTALL_DIR)
 if(NOT LIL_VC_INSTALL_DIR)

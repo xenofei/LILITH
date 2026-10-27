@@ -7,24 +7,32 @@
 #      DLL (windeployqt doesn't copy it) and the dynamic Lilith.Web module as Lilith\Web\;
 #   2. windeployqt with Task 0's flags plus --no-compiler-runtime (no vc_redist.x64.exe), then
 #      qtwebengine_devtools_resources.pak removed (no DevTools in the suite);
-#   3. the whole Microsoft.VC14*.CRT folder of the pinned 14.44 toolset that built our binaries
-#      (tools/dev-shell.ps1), <VCINSTALLDIR>\Redist\MSVC\14.44.*\x64, so the runtime is the
-#      toolset's own; deps_walk checks its DLLs are 14.44.x. There is no fallback to another
-#      redist: without a 14.44 one the deploy fails.
+#   3. the whole Microsoft.VC14*.CRT folder of the newest <VCINSTALLDIR>\Redist\MSVC\14.* whose
+#      version is at least 14.44, the toolset that built our binaries (tools/dev-shell.ps1):
+#      Microsoft's rule is only that the app-local runtime is never older than that toolset (M-3
+#      ruling). deps_walk checks every runtime DLL has one version, at least 14.44. Without such a
+#      redist the deploy fails.
 foreach(var DEPLOY_DIR BIN_DIR SOURCE_DIR WINDEPLOYQT KDDW_DLL SHIM_DLL WEB_DLL KDDW_QML_DIR VC_INSTALL_DIR)
     if(NOT ${var})
         message(FATAL_ERROR "deploy.cmake: ${var} isn't set")
     endif()
 endforeach()
 file(TO_CMAKE_PATH "${VC_INSTALL_DIR}" VC_INSTALL_DIR)
-file(GLOB redist_dirs LIST_DIRECTORIES true "${VC_INSTALL_DIR}/Redist/MSVC/14.44.*")
-list(LENGTH redist_dirs redist_count)
-if(redist_count EQUAL 0)
-    message(FATAL_ERROR "deploy.cmake: no 14.44 VC++ redist under ${VC_INSTALL_DIR}/Redist/MSVC (the pinned toolset's runtime)")
+file(GLOB redist_candidates LIST_DIRECTORIES true "${VC_INSTALL_DIR}/Redist/MSVC/14.*")
+set(redist_dir "")
+set(redist_version "")
+foreach(candidate ${redist_candidates})
+    get_filename_component(version "${candidate}" NAME)
+    if(IS_DIRECTORY "${candidate}" AND version MATCHES "^14\\.[0-9]+\\.[0-9]+$"
+       AND version VERSION_GREATER_EQUAL "14.44"
+       AND (redist_version STREQUAL "" OR version VERSION_GREATER redist_version))
+        set(redist_dir "${candidate}")
+        set(redist_version "${version}")
+    endif()
+endforeach()
+if(NOT redist_dir)
+    message(FATAL_ERROR "deploy.cmake: no VC++ redist of version 14.44 or newer under ${VC_INSTALL_DIR}/Redist/MSVC")
 endif()
-# The newest 14.44 redist, if there are several.
-list(SORT redist_dirs COMPARE NATURAL ORDER DESCENDING)
-list(GET redist_dirs 0 redist_dir)
 
 file(REMOVE_RECURSE "${DEPLOY_DIR}")
 file(MAKE_DIRECTORY "${DEPLOY_DIR}/apps" "${DEPLOY_DIR}/Lilith/Web")
@@ -67,7 +75,7 @@ list(LENGTH crt_dirs crt_count)
 if(NOT crt_count EQUAL 1)
     message(FATAL_ERROR "deploy.cmake: expected one Microsoft.VC14*.CRT folder under ${redist_dir}/x64, found ${crt_count}")
 endif()
-message(STATUS "VC++ runtime from ${crt_dirs}")
+message(STATUS "VC++ runtime ${redist_version} from ${crt_dirs}")
 file(GLOB crt_dlls "${crt_dirs}/*.dll")
 file(COPY ${crt_dlls} DESTINATION "${DEPLOY_DIR}")
 
