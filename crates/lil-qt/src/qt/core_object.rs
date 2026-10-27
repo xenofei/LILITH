@@ -13,10 +13,15 @@
 //!   tool call's pending confirmation keeps the request open: once the confirmation is
 //!   answered, the call's `callFinished` or `callFailed` follows for the same id (APP-029,
 //!   `runtime`). `cancel(id)` drops the request and its callback (`false` for an id that isn't
-//!   open); the core isn't told, since a call has no cancel of its own.
+//!   open); the core isn't told, since a call has no cancel of its own. A cancelled call waiting
+//!   on its confirmation is never sent again: the confirmation stays answerable (the
+//!   Confirmations panel, a notification), and approving it runs nothing; a cancel just after
+//!   an approval can come after the resend reached the core, which then runs the call once.
+//!   QML makes calls through `CoreCall.js`, which cancels a call when its owner is destroyed.
 //! - **Events:** `subscribe(topic)` and `unsubscribe(topic)`, counted per topic: each
-//!   subscriber unsubscribes only itself, so call them in pairs (a panel in `Component.onCompleted`
-//!   and `Component.onDestruction`). Each event of a followed topic comes as
+//!   subscriber unsubscribes only itself, so they come in pairs. A panel follows a topic only
+//!   through `CoreCall.subscribe(core, topic, owner, onEvent)`, which unsubscribes once, when it
+//!   is ended or its owner is destroyed. Each event of a followed topic comes as
 //!   `coreEvent(topic, kind, seq, dataJson)`, throttled (APP-027); not `event`, which would hide
 //!   `QObject::event`. `kind` is `event`, `snapshot` or `resync_required`.
 //! - **What a model does with them** (ARCH-100, APP-033; Checkpoint A):

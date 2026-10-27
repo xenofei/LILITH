@@ -1,6 +1,7 @@
 // FakeCore: Core's API (module Lilith.Core, APP-028) for the QML tests, scripted by the test.
 //
-// A test reads what was asked (`calls`, `cancelled`, `subscribed`, `resends`) and answers:
+// A test reads what was asked (`calls`, `cancelled`, `subscribed`, `subscriberCount(topic)`,
+// `resends`) and answers:
 //   respond(id, outcome)    the wire outcome of a request: {status: "ok", ...result},
 //                           {status: "error", error} or {status: "pending_confirmation", ...}
 //   emit(topic, kind, data) an event (kind "event", "snapshot" or "resync_required"); each topic
@@ -27,7 +28,7 @@ QtObject {
     // What the code under test asked.
     property var calls: []        // {id, kind: "call" | "appCall" | "setWorkspace", name, args}
     property var cancelled: []    // request ids
-    property var subscribed: []   // topics, in order
+    property var subscribed: []   // the topics followed, in the order they were first followed
     property var resends: []      // {id, retryToken}
 
     signal callFinished(string id, string resultJson)
@@ -38,6 +39,7 @@ QtObject {
     property int _next: 1
     property var _open: ({})      // id -> {kind, confirmation, retryToken}
     property var _seqs: ({})
+    property var _counts: ({})    // topic -> subscribers, counted as Core counts them
 
     function _request(kind, name, argsJson) {
         const id = "rq_fake_" + _next++
@@ -58,8 +60,26 @@ QtObject {
         return true
     }
 
-    function subscribe(topic) { subscribed = subscribed.concat([topic]) }
-    function unsubscribe(topic) { subscribed = subscribed.filter(t => t !== topic) }
+    // Counted per topic, as Core does: the first subscriber follows it, the last one's
+    // unsubscribe ends it, and an unsubscribe of a topic not followed does nothing.
+    function subscribe(topic) {
+        const n = (_counts[topic] || 0) + 1
+        _counts[topic] = n
+        if (n === 1)
+            subscribed = subscribed.concat([topic])
+    }
+    function unsubscribe(topic) {
+        const n = _counts[topic] || 0
+        if (n === 0)
+            return
+        if (n === 1) {
+            delete _counts[topic]
+            subscribed = subscribed.filter(t => t !== topic)
+        } else {
+            _counts[topic] = n - 1
+        }
+    }
+    function subscriberCount(topic) { return _counts[topic] || 0 }
     function retryNow() {}
     function lastSeq(topic) { return topic in _seqs ? _seqs[topic] : -1 }
     function shownText(text, maxChars) {

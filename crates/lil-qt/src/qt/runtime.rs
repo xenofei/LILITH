@@ -22,9 +22,11 @@
 //!   pending call read `app/confirmations.list`, so an answer given while the app was away is
 //!   still found (Review Focus 1). That read-only list is the one `app_call` the bridge makes
 //!   again: after a failure, 1 s later at first, doubling to 30 s, until it is read.
-//! - **Events.** Each topic counts its QML subscribers ([`Runtime::subscribe`]): the session
-//!   subscribes it for the first and unsubscribes it after the last (`confirmations` never), so
-//!   a panel that stops following a topic never stops another's events. The session's
+//! - **Events.** Each topic counts its QML subscribers ([`Runtime::subscribe`], [`Topics`]): the
+//!   session subscribes it for the first and unsubscribes it after the last (`confirmations`
+//!   never), so a panel that stops following a topic never stops another's events. A subscribe
+//!   the session refused or timed out is sent again by the topic's next subscriber or on the
+//!   next connection. The session's
 //!   subscribes and unsubscribes go out one at a time, in the order QML made them, through one
 //!   task, so an unsubscribe and a subscribe of the same topic in a row end subscribed. The
 //!   followed topics' events reach QML through the throttle ([`Coalescer`], APP-027); a topic
@@ -53,6 +55,7 @@ use tokio::task::AbortHandle;
 use crate::requests::client_error;
 use crate::retry::{CONFIRMATIONS, PendingCall, PendingStep};
 use crate::throttle::Coalescer;
+use crate::topics::Topics;
 
 /// How many times an approved call is sent with its retry token before it ends
 /// `core.unreachable`: each time the connection was lost before an answer.
@@ -264,7 +267,8 @@ fn event_bytes(ev: &EventParams) -> usize {
 
 /// A change to the session's topics, in QML's order.
 enum TopicEdit {
-    Subscribe(String),
+    /// With the generation `Topics::subscribe` gave it.
+    Subscribe(String, u64),
     Unsubscribe(String),
 }
 
@@ -277,7 +281,7 @@ struct Shared {
     session: Option<Session>,
     gui: GuiOut,
     /// The topics QML follows, with how many subscribers each has.
-    qml_topics: Mutex<BTreeMap<String, usize>>,
+    qml_topics: Mutex<Topics>,
     /// The session's topic changes, to the one task that makes them in order.
     edits: mpsc::UnboundedSender<TopicEdit>,
     /// Topics no longer followed, for the pump's throttle to forget.
@@ -292,7 +296,7 @@ impl Shared {
     }
 
     fn follows(&self, topic: &str) -> bool {
-        lock(&self.qml_topics).contains_key(topic)
+        lock(&self.qml_topics).follows(topic)
     }
 }
 
@@ -329,7 +333,7 @@ impl Runtime {
                 state: Mutex::new(GuiState::default()),
                 more: Notify::new(),
             },
-            qml_topics: Mutex::new(BTreeMap::new()),
+            qml_topics: Mutex::new(Topics::new()),
             edits,
             forgotten,
             confirmations,
@@ -455,15 +459,15 @@ impl Runtime {
     /// One more QML subscriber of `topic`; the first makes the session subscribe it (live
     /// events only; module docs, "Events").
     pub fn subscribe(&self, topic: String) {
-        let first = {
-            let mut topics = lock(&self.shared().qml_topics);
-            let count = topics.entry(topic.clone()).or_insert(0);
-            *count += 1;
-            *count == 1
-        };
-        if first && topic != CONFIRMATIONS {
+        let send = lock(&self.shared().qml_topics).subscribe(&topic);
+        if let Some(generation) = send
+            && topic != CONFIRMATIONS
+        {
             // The editor task ends only with the runtime.
-            let _ = self.shared().edits.send(TopicEdit::Subscribe(topic));
+            let _ = self
+                .shared()
+                .edits
+                .send(TopicEdit::Subscribe(topic, generation));
         }
     }
 
@@ -471,20 +475,7 @@ impl Runtime {
     /// `confirmations`, which the pending calls watch. An unsubscribe of a topic QML doesn't
     /// follow does nothing.
     pub fn unsubscribe(&self, topic: String) {
-        let last = {
-            let mut topics = lock(&self.shared().qml_topics);
-            match topics.get_mut(&topic) {
-                Some(count) if *count > 1 => {
-                    *count -= 1;
-                    false
-                }
-                Some(_) => {
-                    topics.remove(&topic);
-                    true
-                }
-                None => false,
-            }
-        };
+        let last = lock(&self.shared().qml_topics).unsubscribe(&topic);
         if last {
             let _ = self.shared().forgotten.send(topic.clone());
             if topic != CONFIRMATIONS {
@@ -563,10 +554,12 @@ async fn edit_topics(shared: Arc<Shared>, mut edits: mpsc::UnboundedReceiver<Top
     };
     while let Some(edit) = edits.recv().await {
         match edit {
-            TopicEdit::Subscribe(topic) => {
+            TopicEdit::Subscribe(topic, generation) => {
                 if let Err(e) = session.subscribe(vec![topic.clone()]).await {
-                    // QML still follows it; a later first subscriber tries again.
+                    // The session dropped it; QML still follows it, so its next subscriber, or
+                    // the next connection, sends it again (re-review R-M1).
                     tracing::warn!(topic, error = %e, "the subscribe failed");
+                    lock(&shared.qml_topics).failed(&topic, generation);
                 }
             }
             TopicEdit::Unsubscribe(topic) => {
@@ -587,8 +580,20 @@ async fn flusher(shared: Arc<Shared>) {
 
 async fn watch_state(shared: Arc<Shared>, mut state: tokio::sync::watch::Receiver<SessionState>) {
     loop {
-        let view = StateView::of(&state.borrow_and_update());
+        let (view, ready) = {
+            let st = state.borrow_and_update();
+            (StateView::of(&st), matches!(*st, SessionState::Ready(_)))
+        };
         shared.gui.push(Delivery::State(view));
+        if ready {
+            // A new connection: the subscribes that failed are sent again (re-review R-M1).
+            let unheld = lock(&shared.qml_topics).unheld();
+            for (topic, generation) in unheld {
+                if topic != CONFIRMATIONS {
+                    let _ = shared.edits.send(TopicEdit::Subscribe(topic, generation));
+                }
+            }
+        }
         if state.changed().await.is_err() {
             return;
         }

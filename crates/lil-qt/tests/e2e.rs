@@ -666,6 +666,11 @@ fn set_workspace_switches_or_fails_with_the_cores_code() {
 /// Review I-1: subscriptions are counted per topic and reach the session in order. Two panels
 /// follow one topic: one leaves, the other keeps its events. An unsubscribe and a subscribe in a
 /// row (a Loader reloading its panel) end subscribed.
+///
+/// The order rests on the runtime's one editor task (`edit_topics`), which makes the session's
+/// subscribes and unsubscribes one at a time, as QML made them. The test fences on that: the
+/// answer to a subscribe of another topic made after the four edits shows that they are all
+/// done, so the event that follows shows the state they left (re-review R-M6).
 #[test] // spec: APP-028, ARCH-100
 fn topic_subscriptions_are_counted_and_kept_in_order() {
     launch("topic_subscriptions_are_counted_and_kept_in_order", || {
@@ -699,13 +704,14 @@ fn topic_subscriptions_are_counted_and_kept_in_order() {
         rig.probe.subscribe("test:shared");
         rig.probe.unsubscribe("test:shared");
         rig.probe.subscribe("test:shared");
-        // The session's last edit is a subscribe: once it is answered, the topic has a seq again.
-        poll("the re-subscription", || {
-            (rig.probe.last_seq("test:shared") >= 0.0).then_some(())
+        rig.probe.subscribe("test:fence");
+        poll("the fence's subscription", || {
+            (rig.probe.last_seq("test:fence") >= 0.0).then_some(())
         });
-        // Give any edit still on its way the time to reorder, if it could.
-        let _ = rig.probe.gather(Duration::from_millis(300));
-        assert!(rig.probe.last_seq("test:shared") >= 0.0, "still subscribed");
+        assert!(
+            rig.probe.last_seq("test:shared") >= 0.0,
+            "the last edit, a subscribe, left it subscribed"
+        );
         emit(&mut rig.probe, 2);
         event_n(&mut rig.probe, 2);
     });

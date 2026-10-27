@@ -165,14 +165,78 @@ TestCase {
 
     function test_a_call_needs_an_owner() {
         const core = fake()
+        const refused = owner => {
+            try {
+                CoreCall.call(core, "test.echo", {}, {owner: owner, ok: r => {}})
+            } catch (e) {
+                return /owner/.test(String(e))
+            }
+            return false
+        }
+        verify(refused(undefined), "a call without an owner is refused")
+        // Re-review R-M3: an owner that isn't a QML object can't hold its watch.
+        verify(refused({}), "a plain JS object is no owner")
+        compare(core.calls.length, 0, "and nothing was sent")
         let threw = false
         try {
-            CoreCall.call(core, "test.echo", {}, {ok: r => {}})
+            CoreCall.subscribe(core, "jobs", {})
         } catch (e) {
-            threw = /owner/.test(String(e))
+            threw = true
         }
-        verify(threw, "a call without an owner is refused")
-        compare(core.calls.length, 0, "and nothing was sent")
+        verify(threw && core.subscribed.length === 0, "nor a subscription's owner")
+    }
+
+    // Re-review R-M3: a call whose core object went first ends quietly.
+    function test_a_call_outlives_its_core_quietly() {
+        const core = fakeComponent.createObject(tc)
+        const owner = ownerComponent.createObject(tc)
+        const got = recorder(owner)
+        const call = CoreCall.call(core, "test.echo", {}, got.handlers)
+        core.destroy()
+        wait(0)
+        let threw = false
+        try {
+            verify(call.cancel(), "the call was still open")
+        } catch (e) {
+            threw = true
+        }
+        verify(!threw, "no TypeError from the gone core")
+        owner.destroy()
+        wait(0)
+    }
+
+    // Re-review R-M2: a subscription belongs to its owner. Two panels follow one topic; the one
+    // destroyed releases only its own subscription, and an ended one never ends another's.
+    function test_subscriptions_end_with_their_owner() {
+        const core = fake()
+        const a = ownerComponent.createObject(tc)
+        const b = ownerComponent.createObject(tc)
+        const seenA = [], seenB = []
+        CoreCall.subscribe(core, "jobs", a, (kind, seq, data) => seenA.push(data.n))
+        const subB = CoreCall.subscribe(core, "jobs", b, (kind, seq, data) => seenB.push(data.n))
+        compare(core.subscriberCount("jobs"), 2)
+        compare(core.subscribed, ["jobs"])
+        core.emit("jobs", "event", {n: 1})
+        core.emit("other", "event", {n: 99})
+        compare(seenA, [1])
+        compare(seenB, [1], "only its own topic")
+
+        a.destroy()
+        tryCompare(core, "subscribed", ["jobs"])
+        tryVerify(() => core.subscriberCount("jobs") === 1, 5000, "a's subscription is released")
+        core.emit("jobs", "event", {n: 2})
+        compare(seenA, [1], "a's handler never runs again")
+        compare(seenB, [1, 2])
+
+        verify(subB.unsubscribe())
+        verify(!subB.unsubscribe(), "once")
+        compare(core.subscriberCount("jobs"), 0)
+        compare(core.subscribed, [])
+        core.emit("jobs", "event", {n: 3})
+        compare(seenB, [1, 2])
+        b.destroy()
+        wait(0)
+        compare(core.subscriberCount("jobs"), 0, "b's destruction doesn't unsubscribe twice")
     }
 
     // Review M-1: an app call's pending confirmation ends it (Core never retries it).
