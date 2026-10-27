@@ -1361,6 +1361,7 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
     // Where each format's last glued body read on across a cut, and the JWT's, was cut.
     let mut cut_dead = [usize::MAX; TOKEN_FORMATS.len()];
     let mut jwt_cut_dead = usize::MAX;
+    let mut jwt_run_end = 0usize;
     let mut out = Out::new(s);
     let mut i = 0;
     while i < b.len() {
@@ -1422,7 +1423,13 @@ fn known_tokens(s: &str, cx: &mut Cx) -> String {
                 _ => {
                     // Cut before its shortest form, or before it is long enough: read on
                     // across one splitter (PR #53 re-audit).
-                    let cut = i + run(i, jwt_byte);
+                    // A start inside the run of JWT bytes last measured ends where it does.
+                    let cut = if i < jwt_run_end {
+                        jwt_run_end
+                    } else {
+                        i + run(i, jwt_byte)
+                    };
+                    jwt_run_end = cut;
                     if cut != jwt_cut_dead
                         && let Some(q) = cut_at(s, cut, cx, &mut runs)
                     {
@@ -2487,6 +2494,14 @@ mod tests {
             "xoxb-",
             "AKIAZ",
             "s",
+            // A body read on across a cut (PR #53 re-audit).
+            "eyJ.",
+            "eyJ.\n",
+            "eyJaaaaaaaaa.bbbbbbbb.c\u{7}",
+            "sk-\n",
+            "AKIA\n",
+            "xsk-a\u{7}",
+            "ghp_ab\nCDEFGHIJKLMNOPQRSTUVWXYZ",
         ] {
             let work = |n: usize| {
                 let text = format!("x{}", unit.repeat(n));
