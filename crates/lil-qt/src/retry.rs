@@ -39,6 +39,8 @@ pub enum PendingStep {
 pub struct PendingCall {
     confirmation_id: String,
     retry_token: String,
+    /// The call's trace id, carried by the errors it settles with (ARCH-118).
+    trace_id: Option<String>,
     done: bool,
 }
 
@@ -47,8 +49,16 @@ impl PendingCall {
         PendingCall {
             confirmation_id,
             retry_token,
+            trace_id: None,
             done: false,
         }
+    }
+
+    /// The errors this call settles with carry `trace_id`, the call's own (ARCH-118); without
+    /// it, a fresh one.
+    pub fn traced(mut self, trace_id: String) -> PendingCall {
+        self.trace_id = Some(trace_id);
+        self
     }
 
     /// The confirmation this call waits on.
@@ -103,7 +113,7 @@ impl PendingCall {
             return PendingStep::Wait;
         }
         self.done = true;
-        settle(
+        self.settle(
             &CONFIRM_EXPIRED,
             "The app closed before the confirmation was answered, so the call wasn't made.",
         )
@@ -114,12 +124,12 @@ impl PendingCall {
             "approved" => PendingStep::Resend {
                 retry_token: self.retry_token.clone(),
             },
-            "denied" => settle(&CONFIRM_DENIED, "The confirmation was denied."),
-            "expired" => settle(
+            "denied" => self.settle(&CONFIRM_DENIED, "The confirmation was denied."),
+            "expired" => self.settle(
                 &CONFIRM_EXPIRED,
                 "The confirmation expired before it was answered.",
             ),
-            "cancelled" => settle(
+            "cancelled" => self.settle(
                 &CONFIRM_EXPIRED,
                 "The confirmation was cancelled before it was answered.",
             ),
@@ -130,10 +140,16 @@ impl PendingCall {
     }
 }
 
-fn settle(code: &CodeSpec, message: &str) -> PendingStep {
-    let error = ErrorBody::new(code, message, lil_client::mint_id("t"));
-    let outcome: Outcome<Value> = Outcome::Error { error };
-    PendingStep::Settle(serde_json::to_value(outcome).expect("an outcome serialises"))
+impl PendingCall {
+    fn settle(&self, code: &CodeSpec, message: &str) -> PendingStep {
+        let trace = self
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| lil_client::mint_id("t"));
+        let error = ErrorBody::new(code, message, trace);
+        let outcome: Outcome<Value> = Outcome::Error { error };
+        PendingStep::Settle(serde_json::to_value(outcome).expect("an outcome serialises"))
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +285,21 @@ mod tests {
             PendingStep::Wait
         );
         assert_eq!(p.on_snapshot(&[], &answered), PendingStep::Wait);
+    }
+
+    /// ARCH-118: a settled call's error carries the call's own trace id.
+    #[test] // spec: APP-029, ARCH-118
+    fn a_settled_call_keeps_its_trace_id() {
+        let me = "cf_0000000000000001";
+        let mut p = call().traced("tr_00000000000000aa".into());
+        match p.on_event(&change("answered", me, "denied")) {
+            PendingStep::Settle(v) => assert_eq!(v["error"]["trace_id"], "tr_00000000000000aa"),
+            other => panic!("expected a settle, got {other:?}"),
+        }
+        match call().traced("tr_00000000000000bb".into()).on_close() {
+            PendingStep::Settle(v) => assert_eq!(v["error"]["trace_id"], "tr_00000000000000bb"),
+            other => panic!("expected a settle, got {other:?}"),
+        }
     }
 
     #[test] // spec: APP-029

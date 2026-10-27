@@ -20,9 +20,18 @@
 //! - **Confirmations.** The session is always subscribed to `confirmations`, which the pending
 //!   calls watch. A `resync_required` on it (a reconnect to another core, an overflow) makes a
 //!   pending call read `app/confirmations.list`, so an answer given while the app was away is
-//!   still found (Review Focus 1).
-//! - **Events.** QML's topics ([`Runtime::subscribe`]) reach QML through the throttle
-//!   ([`Coalescer`], APP-027); `confirmations` reaches QML only when QML subscribed to it.
+//!   still found (Review Focus 1). That read-only list is the one `app_call` the bridge makes
+//!   again: after a failure, 1 s later at first, doubling to 30 s, until it is read.
+//! - **Events.** Each topic counts its QML subscribers ([`Runtime::subscribe`]): the session
+//!   subscribes it for the first and unsubscribes it after the last (`confirmations` never), so
+//!   a panel that stops following a topic never stops another's events. The session's
+//!   subscribes and unsubscribes go out one at a time, in the order QML made them, through one
+//!   task, so an unsubscribe and a subscribe of the same topic in a row end subscribed. The
+//!   followed topics' events reach QML through the throttle ([`Coalescer`], APP-027); a topic
+//!   no longer followed loses its waiting update. `confirmations` reaches QML only when QML
+//!   subscribed to it.
+//! - **Shutdown.** Dropping the runtime gives its tasks 100 ms to end; the session is dropped
+//!   with the last of them, which closes its connection.
 
 // `ClientError::Refused` carries the core's `ErrorBody` by value, as in lil-client itself.
 #![allow(clippy::result_large_err)]
@@ -38,7 +47,7 @@ use lil_protocol::{
     CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, NO_WORKSPACE, Outcome, ToolOutput,
 };
 use serde_json::{Map, Value, json};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::AbortHandle;
 
 use crate::requests::client_error;
@@ -51,8 +60,14 @@ pub const RESEND_ATTEMPTS: u32 = 3;
 /// Events waiting for the GUI before they fold into resyncs, as the session's own backlog.
 const GUI_EVENTS_MAX: usize = CLIENT_QUEUE;
 const GUI_EVENT_BYTES_MAX: usize = 64 * 1024 * 1024;
-/// A pending call whose snapshot of the confirmations failed tries again after this.
-const SNAPSHOT_RETRY: Duration = Duration::from_secs(1);
+/// A pending call whose snapshot of the confirmations failed tries again after this, doubling
+/// up to [`SNAPSHOT_RETRY_MAX`].
+const SNAPSHOT_RETRY_FIRST: Duration = Duration::from_secs(1);
+const SNAPSHOT_RETRY_MAX: Duration = Duration::from_secs(30);
+/// How long a dropped runtime waits for its tasks.
+const SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
+/// How often the pump forgets the throttle's idle streams.
+const PRUNE_EVERY: Duration = Duration::from_secs(10);
 /// What `confirmations` events a pending call can fall behind by before it reads the list.
 const CONFIRMATIONS_BUFFER: usize = 256;
 
@@ -228,8 +243,29 @@ fn fold(st: &mut GuiState) {
     }
 }
 
+/// What an event weighs here: its topic and its data as JSON, counted without a copy.
 fn event_bytes(ev: &EventParams) -> usize {
-    ev.topic.len() + serde_json::to_vec(&ev.data).map_or(0, |v| v.len())
+    /// Counts what is written, keeping nothing.
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Writing a `Value` to a writer that never fails can't fail.
+    let _ = serde_json::to_writer(&mut count, &ev.data);
+    ev.topic.len() + count.0
+}
+
+/// A change to the session's topics, in QML's order.
+enum TopicEdit {
+    Subscribe(String),
+    Unsubscribe(String),
 }
 
 fn to_json<T: serde::Serialize>(value: &T) -> String {
@@ -240,8 +276,12 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 struct Shared {
     session: Option<Session>,
     gui: GuiOut,
-    /// The topics QML follows.
-    qml_topics: Mutex<BTreeSet<String>>,
+    /// The topics QML follows, with how many subscribers each has.
+    qml_topics: Mutex<BTreeMap<String, usize>>,
+    /// The session's topic changes, to the one task that makes them in order.
+    edits: mpsc::UnboundedSender<TopicEdit>,
+    /// Topics no longer followed, for the pump's throttle to forget.
+    forgotten: mpsc::UnboundedSender<String>,
     /// The `confirmations` events, for the pending calls.
     confirmations: broadcast::Sender<EventParams>,
 }
@@ -252,7 +292,7 @@ impl Shared {
     }
 
     fn follows(&self, topic: &str) -> bool {
-        lock(&self.qml_topics).contains(topic)
+        lock(&self.qml_topics).contains_key(topic)
     }
 }
 
@@ -280,6 +320,8 @@ impl Runtime {
             Session::start(cfg, vec![CONFIRMATIONS.to_string()])
         });
         let (confirmations, _) = broadcast::channel(CONFIRMATIONS_BUFFER);
+        let (edits, edits_rx) = mpsc::unbounded_channel();
+        let (forgotten, forgotten_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             session,
             gui: GuiOut {
@@ -287,13 +329,16 @@ impl Runtime {
                 state: Mutex::new(GuiState::default()),
                 more: Notify::new(),
             },
-            qml_topics: Mutex::new(BTreeSet::new()),
+            qml_topics: Mutex::new(BTreeMap::new()),
+            edits,
+            forgotten,
             confirmations,
         });
         match &shared.session {
             Some(session) => {
                 rt.spawn(watch_state(shared.clone(), session.state()));
-                rt.spawn(pump(shared.clone(), session.events()));
+                rt.spawn(pump(shared.clone(), session.events(), forgotten_rx));
+                rt.spawn(edit_topics(shared.clone(), edits_rx));
             }
             None => shared.gui.push(Delivery::State(StateView {
                 connection: "unavailable",
@@ -407,36 +452,45 @@ impl Runtime {
         });
     }
 
-    /// QML follows `topic` from now on; the session subscribes it (live events only).
+    /// One more QML subscriber of `topic`; the first makes the session subscribe it (live
+    /// events only; module docs, "Events").
     pub fn subscribe(&self, topic: String) {
-        lock(&self.shared().qml_topics).insert(topic.clone());
-        let shared = self.shared().clone();
-        self.rt().spawn(async move {
-            let Some(session) = shared.session.as_ref() else {
-                return;
-            };
-            if let Err(e) = session.subscribe(vec![topic.clone()]).await {
-                tracing::warn!(topic, error = %e, "the subscribe failed");
-                lock(&shared.qml_topics).remove(&topic);
-            }
-        });
+        let first = {
+            let mut topics = lock(&self.shared().qml_topics);
+            let count = topics.entry(topic.clone()).or_insert(0);
+            *count += 1;
+            *count == 1
+        };
+        if first && topic != CONFIRMATIONS {
+            // The editor task ends only with the runtime.
+            let _ = self.shared().edits.send(TopicEdit::Subscribe(topic));
+        }
     }
 
-    /// QML stops following `topic`. The session keeps `confirmations`, which the pending calls
-    /// watch.
+    /// One QML subscriber of `topic` fewer; after the last the session unsubscribes it, except
+    /// `confirmations`, which the pending calls watch. An unsubscribe of a topic QML doesn't
+    /// follow does nothing.
     pub fn unsubscribe(&self, topic: String) {
-        lock(&self.shared().qml_topics).remove(&topic);
-        if topic == CONFIRMATIONS {
-            return;
-        }
-        let shared = self.shared().clone();
-        self.rt().spawn(async move {
-            if let Some(session) = shared.session.as_ref()
-                && let Err(e) = session.unsubscribe(vec![topic.clone()]).await
-            {
-                tracing::warn!(topic, error = %e, "the unsubscribe failed");
+        let last = {
+            let mut topics = lock(&self.shared().qml_topics);
+            match topics.get_mut(&topic) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    topics.remove(&topic);
+                    true
+                }
+                None => false,
             }
-        });
+        };
+        if last {
+            let _ = self.shared().forgotten.send(topic.clone());
+            if topic != CONFIRMATIONS {
+                let _ = self.shared().edits.send(TopicEdit::Unsubscribe(topic));
+            }
+        }
     }
 
     /// `Session::retry_now` (the Unavailable banner's "Try again").
@@ -461,15 +515,16 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         let Some(rt) = self.rt.take() else { return };
         {
-            // The session and its connection are dropped inside the runtime's context.
+            // Dropped inside the runtime's context: the tasks hold the rest of `Shared`.
             let _entered = rt.enter();
             if let Some(shared) = self.shared.take() {
                 lock(&shared.gui.state).gone = true;
                 drop(shared);
             }
         }
-        // The GUI thread never waits on the core (APP-024): the tasks end in the background.
-        rt.shutdown_background();
+        // The tasks end, and the last one drops the session, closing its connection, within a
+        // short bound: the GUI thread never waits on the core itself (APP-024).
+        rt.shutdown_timeout(SHUTDOWN_WAIT);
     }
 }
 
@@ -501,6 +556,28 @@ fn ready_workspace(state: &SessionState) -> Option<String> {
     }
 }
 
+/// Makes QML's topic changes on the session, one at a time, in order (module docs, "Events").
+async fn edit_topics(shared: Arc<Shared>, mut edits: mpsc::UnboundedReceiver<TopicEdit>) {
+    let Some(session) = shared.session.as_ref() else {
+        return;
+    };
+    while let Some(edit) = edits.recv().await {
+        match edit {
+            TopicEdit::Subscribe(topic) => {
+                if let Err(e) = session.subscribe(vec![topic.clone()]).await {
+                    // QML still follows it; a later first subscriber tries again.
+                    tracing::warn!(topic, error = %e, "the subscribe failed");
+                }
+            }
+            TopicEdit::Unsubscribe(topic) => {
+                if let Err(e) = session.unsubscribe(vec![topic.clone()]).await {
+                    tracing::warn!(topic, error = %e, "the unsubscribe failed");
+                }
+            }
+        }
+    }
+}
+
 async fn flusher(shared: Arc<Shared>) {
     loop {
         shared.gui.more.notified().await;
@@ -520,9 +597,19 @@ async fn watch_state(shared: Arc<Shared>, mut state: tokio::sync::watch::Receive
 
 /// The event pump: every session event to the pending calls (`confirmations`) and, through
 /// the throttle, to QML (module docs).
-async fn pump(shared: Arc<Shared>, mut events: tokio::sync::mpsc::Receiver<EventParams>) {
+async fn pump(
+    shared: Arc<Shared>,
+    mut events: mpsc::Receiver<EventParams>,
+    mut forgotten: mpsc::UnboundedReceiver<String>,
+) {
     let mut throttle = Coalescer::new();
+    let mut next_prune = std::time::Instant::now() + PRUNE_EVERY;
     loop {
+        let now = std::time::Instant::now();
+        if now >= next_prune {
+            throttle.prune(now);
+            next_prune = now + PRUNE_EVERY;
+        }
         let due = throttle.next_due();
         let wake = async {
             match due {
@@ -551,6 +638,7 @@ async fn pump(shared: Arc<Shared>, mut events: tokio::sync::mpsc::Receiver<Event
                     }
                 }
             }
+            Some(topic) = forgotten.recv() => throttle.forget(&topic),
         }
     }
 }
@@ -607,18 +695,19 @@ async fn tool_call(shared: Arc<Shared>, id: String, tool: String, args: Map<Stri
             .clone()
             .or_else(|| ready_workspace(&session.state().borrow()))
         else {
-            shared.gui.push(settled(id, left_workspace()));
+            shared.gui.push(settled(id, left_workspace(&trace), &trace));
             return;
         };
-        let call = PendingCall::new(pending.confirmation_id.clone(), pending.retry_token);
-        match wait_for_answer(session, &mut confirmations, call, &workspace).await {
+        let call = PendingCall::new(pending.confirmation_id.clone(), pending.retry_token)
+            .traced(trace.clone());
+        match wait_for_answer(session, &mut confirmations, call, &workspace, &trace).await {
             PendingStep::Resend { retry_token } => {
                 resent.insert(pending.confirmation_id);
                 tracing::info!(request = %id, tool, trace_id = %trace, "the confirmation was approved: the call is sent again with its retry token");
                 outcome = resend(session, &tool, &args, &retry_token, &trace, &workspace).await;
             }
             step @ (PendingStep::Settle(_) | PendingStep::Wait) => {
-                shared.gui.push(settled(id, step));
+                shared.gui.push(settled(id, step, &trace));
                 return;
             }
         }
@@ -653,7 +742,7 @@ fn finished(
 }
 
 /// The delivery for a pending call that ended without a resend.
-fn settled(id: String, step: PendingStep) -> Delivery {
+fn settled(id: String, step: PendingStep, trace: &str) -> Delivery {
     let error = match step {
         PendingStep::Settle(v) => v["error"].clone(),
         // Never returned by `wait_for_answer`; ended all the same, never left open.
@@ -661,7 +750,7 @@ fn settled(id: String, step: PendingStep) -> Delivery {
             let error = ErrorBody::new(
                 &CONFIRM_EXPIRED,
                 "The call stopped waiting for its confirmation.",
-                lil_client::mint_id("t"),
+                trace,
             );
             serde_json::to_value(error).expect("an error body serialises")
         }
@@ -673,11 +762,11 @@ fn settled(id: String, step: PendingStep) -> Delivery {
 }
 
 /// The error a pending call ends with when the session left its workspace.
-fn left_workspace() -> PendingStep {
+fn left_workspace(trace: &str) -> PendingStep {
     let error = ErrorBody::new(
         &CONFIRM_EXPIRED,
         "The workspace changed while the call waited for its confirmation, so it wasn't sent again.",
-        lil_client::mint_id("t"),
+        trace,
     );
     let outcome: Outcome<Value> = Outcome::Error { error };
     PendingStep::Settle(serde_json::to_value(outcome).expect("an outcome serialises"))
@@ -689,16 +778,20 @@ async fn wait_for_answer(
     confirmations: &mut broadcast::Receiver<EventParams>,
     mut call: PendingCall,
     workspace: &str,
+    trace: &str,
 ) -> PendingStep {
     let mut state = session.state();
     let mut need_snapshot = false;
+    let mut backoff = SNAPSHOT_RETRY_FIRST;
     loop {
         let ready = ready_workspace(&state.borrow_and_update());
+        let mut failed = false;
         match ready.as_deref() {
-            Some(ws) if ws != workspace => return left_workspace(),
+            Some(ws) if ws != workspace => return left_workspace(trace),
             Some(_) if need_snapshot => match snapshot(session).await {
                 Ok((pending, answered)) => {
                     need_snapshot = false;
+                    backoff = SNAPSHOT_RETRY_FIRST;
                     let step = call.on_snapshot(&pending, &answered);
                     if step != PendingStep::Wait {
                         return step;
@@ -706,13 +799,18 @@ async fn wait_for_answer(
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, confirmation = call.confirmation_id(), "the confirmations snapshot failed; it is read again");
+                    failed = true;
                 }
             },
             _ => {}
         }
+        let wait = backoff;
+        if failed {
+            backoff = (backoff * 2).min(SNAPSHOT_RETRY_MAX);
+        }
         let retry = async {
             if need_snapshot {
-                tokio::time::sleep(SNAPSHOT_RETRY).await;
+                tokio::time::sleep(wait).await;
             } else {
                 std::future::pending::<()>().await;
             }
@@ -781,7 +879,7 @@ async fn resend(
             match ready.as_deref() {
                 Some(ws) if ws == workspace => break,
                 Some(_) => {
-                    let PendingStep::Settle(v) = left_workspace() else {
+                    let PendingStep::Settle(v) = left_workspace(trace) else {
                         unreachable!()
                     };
                     let error: ErrorBody = serde_json::from_value(v["error"].clone())
@@ -874,6 +972,43 @@ mod tests {
         assert_eq!(lock(&posted).len(), 2);
         gui.drained();
         assert!(!lock(&gui.state).in_flight, "nothing waits");
+    }
+
+    /// Few but large events (preview frames) fold at the byte bound, well before the count's.
+    #[test] // spec: APP-026
+    fn a_frozen_gui_folds_its_waiting_events_past_the_byte_bound() {
+        let gui = GuiOut {
+            post: Box::new(|_| Ok(())),
+            state: Mutex::new(GuiState::default()),
+            more: Notify::new(),
+        };
+        gui.push(event("preview:j1", 1, 10));
+        let frame = 1024 * 1024;
+        let fits = GUI_EVENT_BYTES_MAX / frame - 1;
+        for n in 0..fits as u64 {
+            gui.push(event("preview:j1", 2 + n, frame));
+        }
+        assert_eq!(
+            lock(&gui.state).waiting.len(),
+            fits,
+            "under the bound all wait"
+        );
+        gui.push(event("preview:j1", 9000, frame));
+        gui.push(event("preview:j1", 9001, frame));
+        let st = lock(&gui.state);
+        let waiting: Vec<(u64, EventKind)> = st
+            .waiting
+            .iter()
+            .map(|d| match d {
+                Delivery::Event(ev) => (ev.seq, ev.kind),
+                other => panic!("only events wait: {other:?}"),
+            })
+            .collect();
+        assert!(
+            waiting.len() <= 3 && waiting.contains(&(9000, EventKind::ResyncRequired)),
+            "folded into a resync at the newest seq: {waiting:?}"
+        );
+        assert!(st.event_bytes <= GUI_EVENT_BYTES_MAX);
     }
 
     #[test] // spec: APP-026

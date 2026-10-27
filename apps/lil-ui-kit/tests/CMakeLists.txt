@@ -33,9 +33,11 @@ lil_qml_test(tst_core_call tst_core_call.qml)
 
 # lil_qt's e2e tests (crates/lil-qt/tests/e2e.rs) against a real test-channel core. Corrosion
 # builds no test targets, so cargo builds and runs them, with QMAKE naming the Qt pair's qmake
-# for cxx-qt-build (about 4 minutes the first time). Label qml, so the qml presets run it.
+# for cxx-qt-build (about 4 minutes the first time). Label qml, so the qml presets run it. One
+# test at a time: each starts a core and a Qt event loop, and the progress test measures arrival
+# times, which parallel tests would load (review M-7).
 add_test(NAME lil_qt_e2e
-    COMMAND cargo test --locked -p lil_qt --features qt --test e2e
+    COMMAND cargo test --locked -p lil_qt --features qt --test e2e -- --test-threads=1
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(lil_qt_e2e PROPERTIES
     LABELS qml

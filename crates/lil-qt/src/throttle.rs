@@ -11,8 +11,13 @@
 //!   forward (that would break the rate). Where it carries the state the waiting update would
 //!   show, it replaces it: a `status` event on `job:<id>` carries the whole job, its progress
 //!   included, so the job's waiting progress update is dropped, and a job's last progress never
-//!   lands after its final status. A `snapshot` or `resync_required` drops the waiting update of
-//!   its topic too. Anything else (a telemetry `alert`, a job's `retrying`) leaves it waiting.
+//!   lands after its final status. A job's `retrying` starts a new attempt, so the old attempt's
+//!   waiting progress is dropped too. A `snapshot` or `resync_required` drops the waiting update
+//!   of its topic. Anything else leaves it waiting, and so overtakes it: a telemetry `alert`
+//!   (samples are whole snapshots), a job's `unresponsive` or `watchdog` flag. A model applies
+//!   each event as the state it carries, not as a step after the one before.
+//! - **Idle streams** are forgotten ([`Coalescer::prune`]), and so is a topic no longer followed
+//!   ([`Coalescer::forget`]), its waiting update with it.
 //!
 //! Qt-free: the bridge's event pump owns a [`Coalescer`] and asks it when to wake
 //! ([`Coalescer::next_due`]).
@@ -136,7 +141,10 @@ impl Coalescer {
                 // Module docs, "Order on a topic".
                 let replaces = ev.kind != EventKind::Event
                     || (ev.topic.starts_with("job:")
-                        && ev.data.get("kind").and_then(Value::as_str) == Some("status"));
+                        && matches!(
+                            ev.data.get("kind").and_then(Value::as_str),
+                            Some("status" | "retrying")
+                        ));
                 if replaces {
                     for stream in self.streams.values_mut().filter(|s| s.topic == ev.topic) {
                         stream.waiting = None;
@@ -189,6 +197,22 @@ impl Coalescer {
     /// Forgets every stream of `topic` (an unsubscribed topic): its waiting update is dropped.
     pub fn forget(&mut self, topic: &str) {
         self.streams.retain(|_, s| s.topic != topic);
+    }
+
+    /// Forgets the streams with nothing waiting whose interval has passed at `now`: their next
+    /// update applies at once either way, so only the finished jobs' streams go.
+    pub fn prune(&mut self, now: Instant) {
+        self.streams.retain(|_, s| {
+            s.waiting.is_some()
+                || s.edge
+                    .last
+                    .is_some_and(|last| now < last + s.edge.min_interval)
+        });
+    }
+
+    /// How many streams it keeps.
+    pub fn streams(&self) -> usize {
+        self.streams.len()
     }
 }
 
@@ -348,17 +372,25 @@ mod tests {
         let seqs: Vec<u64> = out.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, [11]);
         assert!(c.due(t0 + ms(300)).iter().all(|e| e.topic != "job:a"));
-        // Another kind on the job topic leaves the waiting progress as it is.
+        // A flag on the job topic leaves the waiting progress as it is.
         assert_eq!(values(&c.push(progress("a", 12, 96), t0 + ms(310))), [96]);
         assert!(c.push(progress("a", 13, 97), t0 + ms(320)).is_empty());
-        let retrying = ev(
-            "job:a",
-            14,
-            json!({"kind": "retrying", "attempt": 2, "of": 3}),
-        );
-        assert_eq!(c.push(retrying, t0 + ms(330)).len(), 1);
+        let flag = ev("job:a", 14, json!({"kind": "unresponsive", "on": false}));
+        assert_eq!(c.push(flag, t0 + ms(330)).len(), 1);
         assert!(c.due(t0 + ms(409)).is_empty(), "the rate holds");
         assert_eq!(values(&c.due(t0 + ms(410))), [97]);
+        // A new attempt drops the old attempt's waiting progress.
+        assert!(c.push(progress("a", 15, 98), t0 + ms(420)).is_empty());
+        let retrying = ev(
+            "job:a",
+            16,
+            json!({"kind": "retrying", "attempt": 2, "of": 3}),
+        );
+        assert_eq!(c.push(retrying, t0 + ms(430)).len(), 1);
+        assert!(
+            c.due(t0 + ms(600)).is_empty(),
+            "attempt 1's progress is gone"
+        );
 
         // A resync drops the waiting update: the topic is read again.
         c.push(progress("b", 10, 1000), t0 + ms(150));
@@ -372,6 +404,26 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, EventKind::ResyncRequired);
         assert_eq!(c.next_due(), None);
+    }
+
+    /// Finished jobs' streams don't pile up, and a forgotten topic's waiting update never
+    /// comes.
+    #[test] // spec: APP-027
+    fn idle_and_forgotten_streams_are_dropped() {
+        let t0 = Instant::now();
+        let mut c = Coalescer::new();
+        for job in 0..50 {
+            c.push(progress(&format!("j{job}"), 1, 1), t0);
+        }
+        c.push(progress("j0", 2, 2), t0 + ms(10));
+        assert_eq!(c.streams(), 50);
+        c.prune(t0 + ms(50));
+        assert_eq!(c.streams(), 50, "none is idle yet");
+        c.prune(t0 + ms(100));
+        assert_eq!(c.streams(), 1, "only the one with an update waiting");
+        c.forget("job:j0");
+        assert_eq!(c.streams(), 0);
+        assert!(c.due(t0 + ms(200)).is_empty(), "its waiting update is gone");
     }
 
     #[test] // spec: APP-027

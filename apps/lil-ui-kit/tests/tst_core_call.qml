@@ -1,6 +1,7 @@
 // CoreCall over Core's request signals (APP-028, APP-029): each outcome reaches its callback
 // once, a pending confirmation keeps the request open for the automatic retry, a cancel drops
-// the callback, and Core hands QML a request id (a string), never a request object.
+// the callback, a call dies with the QML object it belongs to, and Core hands QML a request id
+// (a string), never a request object.
 import QtQuick
 import QtTest
 import Lilith.Core
@@ -19,10 +20,16 @@ TestCase {
         return createTemporaryObject(fakeComponent, tc)
     }
 
-    // Records what reached which callback.
-    function recorder() {
+    Component {
+        id: ownerComponent
+        QtObject {}
+    }
+
+    // Records what reached which callback; the calls belong to `owner` (default: the test).
+    function recorder(owner) {
         const got = {ok: [], error: [], pending: []}
         got.handlers = {
+            owner: owner || tc,
             ok: r => got.ok.push(r),
             error: e => got.error.push(e),
             pending: p => got.pending.push(p)
@@ -120,6 +127,65 @@ TestCase {
         core.respond(call.id, {status: "ok", structured: {text: "late"}, artifacts: [], summary_text: ""})
         compare(got.ok.length + got.error.length + got.pending.length, 0)
         verify(!core.cancel("rq_unknown"), "an unknown id is false")
+    }
+
+    // Review I-2: a call dies with its owner. Neither a plain call nor one waiting on its
+    // confirmation runs a handler after the owner is destroyed, and both are cancelled.
+    function test_a_destroyed_owner_drops_its_calls() {
+        const core = fake()
+        const owner = ownerComponent.createObject(tc)
+        const got = recorder(owner)
+        const plain = CoreCall.call(core, "test.echo", {text: "late"}, got.handlers)
+        const waiting = CoreCall.call(core, "test.destructive", {cost: "5"}, got.handlers)
+        core.respond(waiting.id, pendingOutcome)
+        compare(got.pending.length, 1)
+
+        owner.destroy()
+        tryVerify(() => core.cancelled.length === 2, 5000, "both calls are cancelled")
+        verify(core.cancelled.indexOf(plain.id) >= 0 && core.cancelled.indexOf(waiting.id) >= 0)
+        // Whatever comes later reaches nobody, and the approval resends nothing.
+        core.respond(plain.id, {status: "ok", structured: {text: "late"}, artifacts: [], summary_text: ""})
+        core.emit("confirmations", "event",
+                  {kind: "answered", confirmation: {id: "cf_0000000000000001", state: "approved"}})
+        compare(core.resends.length, 0)
+        // Even a signal sent straight to the callbacks' ids runs none of them.
+        core.callFinished(plain.id, JSON.stringify({structured: {}}))
+        core.callFailed(waiting.id, JSON.stringify({code: "confirm.denied"}))
+        core.callPendingConfirmation(waiting.id, JSON.stringify(pendingOutcome))
+        compare(got.ok.length + got.error.length, 0)
+        compare(got.pending.length, 1)
+        verify(!plain.cancel(), "already over")
+
+        // Another owner's call goes on.
+        const other = recorder()
+        const kept = CoreCall.call(core, "test.echo", {text: "kept"}, other.handlers)
+        core.respond(kept.id, {status: "ok", structured: {text: "kept"}, artifacts: [], summary_text: ""})
+        compare(other.ok.length, 1)
+    }
+
+    function test_a_call_needs_an_owner() {
+        const core = fake()
+        let threw = false
+        try {
+            CoreCall.call(core, "test.echo", {}, {ok: r => {}})
+        } catch (e) {
+            threw = /owner/.test(String(e))
+        }
+        verify(threw, "a call without an owner is refused")
+        compare(core.calls.length, 0, "and nothing was sent")
+    }
+
+    // Review M-1: an app call's pending confirmation ends it (Core never retries it).
+    function test_an_app_call_ends_at_its_pending_confirmation() {
+        const core = fake()
+        const got = recorder()
+        const call = CoreCall.appCall(core, "app/caps.set", {}, got.handlers)
+        core.respond(call.id, pendingOutcome)
+        compare(got.pending.length, 1)
+        verify(!call.cancel(), "it has ended")
+        compare(core.cancelled.length, 0, "there was nothing left to cancel")
+        core.respond(call.id, {status: "ok"})
+        compare(got.ok.length, 0)
     }
 
     SignalSpy {

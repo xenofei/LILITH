@@ -24,8 +24,10 @@
   3. Passes when the smoke run exits 0 within -TimeoutSec; its log (JSON lines on stderr) has a
      `start` with platform `windows`, no variable left to clear and the probe DLL not found (the
      DLL search lockdown), import paths without the hostile folder, a `first_frame` whose
-     graphics API isn't OpenGL, and an `interactive` with WebEngine not loaded (APP-137); it
-     never took the foreground; and the folder is within budget.
+     graphics API isn't OpenGL, an `interactive` with WebEngine not loaded (APP-137), and a
+     `core_object` saying the deployed Lilith.Core module made its Core (with no session under
+     --smoke-exit, so no core is started); it never took the foreground; and the folder is
+     within budget.
   Off a GitHub runner both launches run inside the hands-off pop-up's window (tools/sandbox/
   hands-off.ps1: 10 s of warning, then a countdown), since a regression could open a window on
   this PC's screen; -NoHandsOff skips it.
@@ -205,6 +207,9 @@ if (-not $first) { $failures.Add('no first_frame event') }
 elseif ($first.graphics_api -eq 'opengl') { $failures.Add('the scene graph used OpenGL: QSG_RHI_BACKEND wasn''t cleared') }
 if (-not $inter) { $failures.Add('no interactive event') }
 elseif ($inter.webengine_loaded -ne $false) { $failures.Add('Qt6WebEngineCore.dll was loaded at interactive (APP-137)') }
+$coreObject = $events | Where-Object { $_.event -eq 'core_object' } | Select-Object -First 1
+if (-not $coreObject) { $failures.Add('no core_object event') }
+elseif ($coreObject.loaded -ne $true) { $failures.Add('the Lilith.Core module did not make its Core') }
 if ($foreground -gt 0) { $failures.Add("lil-image.exe took the foreground with --no-activate ($foreground samples)") }
 
 Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue

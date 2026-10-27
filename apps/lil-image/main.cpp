@@ -28,7 +28,8 @@
 // own messages among them (with their qt_category), goes there as well as to stderr.
 // The core session (APP-024): lil_qt::serve_core makes the QML singleton Core connect as
 // ui:image, starting a core if none runs, and the engine makes Core at once. Under --smoke-exit
-// neither happens: the deploy check measures the start and never starts a core.
+// Core is made without a session, so it starts no core: the deploy check measures the start
+// and reads the `core_object` line, which says the deployed Lilith.Core module loaded.
 //
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
@@ -203,9 +204,9 @@ int main(int, char **)
         const rust::String why = lil_qt::serve_core();
         if (!why.empty())
             lilshim::logEvent(QStringLiteral("error"), {{"what", "no core session"}, {"why", fromRust(why)}});
-        if (!engine.singletonInstance<QObject *>("Lilith.Core", "Core"))
-            lilshim::logEvent(QStringLiteral("error"), {{"what", "Core failed to load"}});
     }
+    const bool coreLoaded = engine.singletonInstance<QObject *>("Lilith.Core", "Core") != nullptr;
+    lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", coreLoaded}});
     engine.loadFromModule("Lilith.UiKit", "ShellWindow");
     auto *window = engine.rootObjects().isEmpty()
                        ? nullptr

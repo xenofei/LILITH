@@ -38,6 +38,9 @@ use serde_json::{Value, json};
 
 /// Set in the copy's environment: run the test's body.
 const CHILD: &str = "LIL_QT_E2E_CHILD";
+/// The file the copy writes beside itself once the body has passed: a test name that matched
+/// nothing would run no body and exit 0, so the launcher requires it (review M-13).
+const RAN: &str = "body-ran";
 /// A failure deadline for each wait, never a measurement.
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -49,6 +52,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 fn launch(test: &str, body: impl FnOnce()) {
     if std::env::var_os(CHILD).is_some() {
         body();
+        std::fs::write(own_folder().join(RAN), test).expect("write the body's marker");
         // The test passed. Its Qt event loop still runs on its own thread: ExitProcess ends
         // that thread before Qt's DLLs unload, where returning from main would run the exe's
         // static destructors under it.
@@ -91,6 +95,12 @@ fn launch(test: &str, body: impl FnOnce()) {
         "the copy running {test} ended {status:?}\n--- stdout\n{}\n--- stderr\n{}",
         read(&out),
         read(&err)
+    );
+    assert_eq!(
+        read(&folder.path().join(RAN)),
+        test,
+        "the copy ran no body for {test} (does the name match the test's?)\n--- stdout\n{}",
+        read(&out)
     );
     // The copy's core has drained by now; a scanner may still hold a copy for a moment.
     for _ in 0..50 {
@@ -271,6 +281,11 @@ impl Probe {
         self.on_gui(move |core| core.subscribe(&topic));
     }
 
+    fn unsubscribe(&self, topic: &str) {
+        let topic = QString::from(topic);
+        self.on_gui(move |core| core.unsubscribe(&topic));
+    }
+
     fn last_seq(&self, topic: &str) -> f64 {
         let topic = QString::from(topic);
         self.on_gui(move |core| core.last_seq(&topic))
@@ -379,12 +394,39 @@ fn a_cap_pending_call_retries_after_an_app_answer() {
         rig.probe.finished(&answer);
         let result = rig.probe.finished(&id);
         assert_eq!(result["structured"]["count"], 1, "it ran once: {result}");
+        // Exactly one resend (review M-6): the core logs one line per `tools/call` it took,
+        // a replay included, and both carry the call's trace id.
+        let logs = rig.env.env.logs_dir();
+        let calls = |logs: &Path| -> Vec<String> {
+            core_log_lines(logs)
+                .into_iter()
+                .filter(|l| l.contains("test.destructive") && l.contains("\"tool call "))
+                .collect()
+        };
+        let lines = poll("the core's line for the resend", || {
+            let lines = calls(&logs);
+            lines
+                .iter()
+                .any(|l| l.contains("tool call ok"))
+                .then_some(lines)
+        });
         // Nothing more for the request.
         let later = rig.probe.gather(Duration::from_millis(500));
         assert!(
             !later.iter().any(|s| matches!(s,
                 Seen::Finished(rid, _) | Seen::Failed(rid, _) | Seen::Pending(rid, _) if *rid == id)),
             "{later:#?}"
+        );
+        let lines_now = calls(&logs);
+        assert_eq!(
+            lines_now.len(),
+            2,
+            "one send and one resend: {lines_now:#?}"
+        );
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(
+            lines_now[0].contains("waits for a confirmation"),
+            "{lines_now:#?}"
         );
     });
 }
@@ -438,12 +480,21 @@ fn progress_events_arrive_at_most_10_per_second() {
             matches!(s, Seen::Event { topic: t, data, .. }
                 if *t == topic && data["kind"] == "progress")
         };
-        let at_max = |s: &Seen| {
-            matches!(s, Seen::Event { topic: t, data, .. }
-                if *t == topic && data["kind"] == "progress" && data["value"] == steps)
+        // The last step shows as its progress update, or, when the job's status came within
+        // 100 ms of it and replaced the waiting update (throttle, "Order on a topic"), in that
+        // status (review M-7).
+        let at_max = |s: &Seen| match s {
+            Seen::Event { topic: t, data, .. } if *t == topic => {
+                (data["kind"] == "progress" && data["value"] == steps)
+                    || (data["kind"] == "status" && data["job"]["progress"]["value"] == steps)
+            }
+            _ => false,
         };
-        let Seen::Event { at: last_at, .. } =
-            rig.probe.wait_for("the last step's progress", at_max)
+        let Seen::Event {
+            at: last_at,
+            data: last,
+            ..
+        } = rig.probe.wait_for("the last step", at_max)
         else {
             unreachable!()
         };
@@ -457,7 +508,9 @@ fn progress_events_arrive_at_most_10_per_second() {
             })
             .collect();
         // The last step's update, taken by the wait above.
-        arrivals.push((last_at, steps));
+        if last["kind"] == "progress" {
+            arrivals.push((last_at, steps));
+        }
         arrivals.sort_by_key(|(at, _)| *at);
         assert!(
             arrivals.len() < usize::try_from(steps).unwrap() / 10,
@@ -473,7 +526,8 @@ fn progress_events_arrive_at_most_10_per_second() {
             );
         }
         assert!(
-            arrivals.iter().filter(|(_, v)| *v == steps).count() == 1,
+            arrivals.iter().filter(|(_, v)| *v == steps).count()
+                == usize::from(last["kind"] == "progress"),
             "the newest value once: {arrivals:?}"
         );
         fake.hold_prompts(false);
@@ -607,6 +661,54 @@ fn set_workspace_switches_or_fails_with_the_cores_code() {
             );
         },
     );
+}
+
+/// Review I-1: subscriptions are counted per topic and reach the session in order. Two panels
+/// follow one topic: one leaves, the other keeps its events. An unsubscribe and a subscribe in a
+/// row (a Loader reloading its panel) end subscribed.
+#[test] // spec: APP-028, ARCH-100
+fn topic_subscriptions_are_counted_and_kept_in_order() {
+    launch("topic_subscriptions_are_counted_and_kept_in_order", || {
+        let mut rig = Rig::start(|_| {});
+        let emit = |probe: &mut Probe, n: u64| {
+            let id = probe.call("test.emit", json!({"topic": "shared", "data": {"n": n}}));
+            probe.finished(&id);
+        };
+        let event_n = |probe: &mut Probe, n: u64| {
+            probe.wait_for(&format!("event {n}"), |s| {
+                matches!(s, Seen::Event { topic, data, .. }
+                    if topic == "test:shared" && data["n"] == n)
+            });
+        };
+        // Two subscribers, then one leaves.
+        rig.probe.subscribe("test:shared");
+        rig.probe.subscribe("test:shared");
+        poll("the subscription", || {
+            (rig.probe.last_seq("test:shared") >= 0.0).then_some(())
+        });
+        rig.probe.unsubscribe("test:shared");
+        emit(&mut rig.probe, 1);
+        event_n(&mut rig.probe, 1);
+        assert!(
+            rig.probe.last_seq("test:shared") >= 1.0,
+            "the session still follows it"
+        );
+
+        // The last one leaves and comes back at once: the session ends subscribed.
+        rig.probe.unsubscribe("test:shared");
+        rig.probe.subscribe("test:shared");
+        rig.probe.unsubscribe("test:shared");
+        rig.probe.subscribe("test:shared");
+        // The session's last edit is a subscribe: once it is answered, the topic has a seq again.
+        poll("the re-subscription", || {
+            (rig.probe.last_seq("test:shared") >= 0.0).then_some(())
+        });
+        // Give any edit still on its way the time to reorder, if it could.
+        let _ = rig.probe.gather(Duration::from_millis(300));
+        assert!(rig.probe.last_seq("test:shared") >= 0.0, "still subscribed");
+        emit(&mut rig.probe, 2);
+        event_n(&mut rig.probe, 2);
+    });
 }
 
 // ---------------------------------------------------------------------------------------------

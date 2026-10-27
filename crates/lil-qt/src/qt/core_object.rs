@@ -14,11 +14,23 @@
 //!   answered, the call's `callFinished` or `callFailed` follows for the same id (APP-029,
 //!   `runtime`). `cancel(id)` drops the request and its callback (`false` for an id that isn't
 //!   open); the core isn't told, since a call has no cancel of its own.
-//! - **Events:** `subscribe(topic)` and `unsubscribe(topic)`; each event of a followed topic
-//!   comes as `coreEvent(topic, kind, seq, dataJson)`, throttled (APP-027); not `event`, which
-//!   would hide `QObject::event`. `kind` is `event`,
-//!   `snapshot` or `resync_required`; reload a topic's model on every `resync_required`.
-//!   `lastSeq(topic)` is the session's last seq of a topic (-1 for none).
+//! - **Events:** `subscribe(topic)` and `unsubscribe(topic)`, counted per topic: each
+//!   subscriber unsubscribes only itself, so call them in pairs (a panel in `Component.onCompleted`
+//!   and `Component.onDestruction`). Each event of a followed topic comes as
+//!   `coreEvent(topic, kind, seq, dataJson)`, throttled (APP-027); not `event`, which would hide
+//!   `QObject::event`. `kind` is `event`, `snapshot` or `resync_required`.
+//! - **What a model does with them** (ARCH-100, APP-033; Checkpoint A):
+//!   - it loads its state with the topic's tool, and applies every later event as the state it
+//!     carries: events can overtake one another within a topic (`throttle`), so none is a step
+//!     after the one before;
+//!   - on every `resync_required` (a seq of 0 marks a core restart or a workspace switch) it
+//!     loads again; until that load is in, it drops the topic's events and holds back its own
+//!     writes from the old state (#50 M3: calls can reach the new connection before the mark);
+//!   - after a load, it drops the events at or below the seq the load's answer stands for when
+//!     the tool says one, and else applies them all: each carries full state.
+//!   - `lastSeq(topic)` is the session's receive cursor (-1 for none), ahead of what QML has
+//!     applied (events wait in the throttle and the GUI queue): for tests and diagnostics, never
+//!     a model's loaded-at seq.
 //! - **Others:** `retryNow()` (the Unavailable banner's "Try again"), `shownText(text,
 //!   maxChars)` (`lil_parse::shown_text`, P4a-R8).
 //!
@@ -36,7 +48,7 @@ use lil_protocol::EventKind;
 use tokio::task::AbortHandle;
 
 use super::runtime::{Delivery, Runtime};
-use crate::requests::Requests;
+use crate::requests::{Requests, client_error};
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -296,36 +308,56 @@ pub(super) fn start_time_noted() {
     }
 }
 
+/// Fails request `id` with `core.unreachable` from the event loop, after the call that made it
+/// has returned: a `Core` whose runtime didn't start.
+fn unreachable_later(core: Pin<&mut Core>, id: &str) {
+    let error = client_error(
+        &lil_client::ClientError::NotConnected,
+        &lil_client::mint_id("tr"),
+    );
+    let json = serde_json::to_string(&error).expect("an error body serialises");
+    let id = id.to_string();
+    // A Core that is gone has nobody to tell.
+    let _ = core.qt_thread().queue(move |mut core| {
+        if core.as_mut().rust_mut().requests.finish(&id).is_some() {
+            core.as_mut()
+                .call_failed(QString::from(id.as_str()), QString::from(json.as_str()));
+        }
+    });
+}
+
 impl qobject::Core {
-    pub fn call(mut self: Pin<&mut Self>, tool: &QString, args_json: &QString) -> QString {
+    /// Opens a request and hands it to `start`, the runtime's call; without a runtime it fails
+    /// `core.unreachable` from the event loop.
+    fn request(
+        mut self: Pin<&mut Self>,
+        start: impl FnOnce(&Runtime, String) -> Option<AbortHandle>,
+    ) -> QString {
         let id = self.as_mut().rust_mut().requests.open(None);
-        if let Some(runtime) = self.runtime.clone()
-            && let Some(task) = runtime.call(id.clone(), tool.to_string(), &args_json.to_string())
-        {
-            self.as_mut().rust_mut().requests.set(&id, Some(task));
+        match self.runtime.clone() {
+            Some(runtime) => {
+                if let Some(task) = start(&runtime, id.clone()) {
+                    self.as_mut().rust_mut().requests.set(&id, Some(task));
+                }
+            }
+            None => unreachable_later(self.as_mut(), &id),
         }
         QString::from(id.as_str())
     }
 
-    pub fn app_call(mut self: Pin<&mut Self>, method: &QString, params_json: &QString) -> QString {
-        let id = self.as_mut().rust_mut().requests.open(None);
-        if let Some(runtime) = self.runtime.clone()
-            && let Some(task) =
-                runtime.app_call(id.clone(), method.to_string(), &params_json.to_string())
-        {
-            self.as_mut().rust_mut().requests.set(&id, Some(task));
-        }
-        QString::from(id.as_str())
+    pub fn call(self: Pin<&mut Self>, tool: &QString, args_json: &QString) -> QString {
+        let (tool, args) = (tool.to_string(), args_json.to_string());
+        self.request(move |runtime, id| runtime.call(id, tool, &args))
     }
 
-    pub fn set_workspace(mut self: Pin<&mut Self>, ws: &QString) -> QString {
-        let id = self.as_mut().rust_mut().requests.open(None);
-        if let Some(runtime) = self.runtime.clone()
-            && let Some(task) = runtime.set_workspace(id.clone(), ws.to_string())
-        {
-            self.as_mut().rust_mut().requests.set(&id, Some(task));
-        }
-        QString::from(id.as_str())
+    pub fn app_call(self: Pin<&mut Self>, method: &QString, params_json: &QString) -> QString {
+        let (method, params) = (method.to_string(), params_json.to_string());
+        self.request(move |runtime, id| runtime.app_call(id, method, &params))
+    }
+
+    pub fn set_workspace(self: Pin<&mut Self>, ws: &QString) -> QString {
+        let ws = ws.to_string();
+        self.request(move |runtime, id| runtime.set_workspace(id, ws))
     }
 
     pub fn cancel(mut self: Pin<&mut Self>, request_id: &QString) -> bool {
