@@ -22,7 +22,8 @@
 //! boot call `main.cpp` makes. The bridge's `Core` object stands on four Qt-free parts:
 //! [`requests`] (the request ids, APP-028), [`throttle`] (the leading-edge update throttle,
 //! APP-027), [`topics`] (QML's counted subscriptions) and [`retry`] (the automatic retry after
-//! a confirmation, APP-029).
+//! a confirmation, APP-029). Its list models stand on [`paging`] (pages and rows, APP-025), and
+//! its live previews on [`preview`] (a frame out of its event, APP-031, APP-037).
 
 #[cfg(feature = "qt")]
 extern crate cxx_qt_lib;
@@ -30,6 +31,8 @@ extern crate cxx_qt_lib;
 #[cfg(feature = "qt")]
 pub mod qt;
 
+pub mod paging;
+pub mod preview;
 pub mod requests;
 pub mod retry;
 pub mod throttle;
