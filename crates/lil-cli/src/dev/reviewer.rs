@@ -1843,7 +1843,23 @@ impl MergeFlowSteps for FlowSteps<'_, '_> {
             if before {
                 if let Some(spent) = self.before_auth_waited.get() {
                     // Back after the second read showed a check that isn't green again: look
-                    // after one poll, with what is left of the same budget (review M-5).
+                    // after one poll, with what is left of the same budget (review M-5). With
+                    // the budget spent it stops before looking, so a check that flaps can't
+                    // keep the flow going (re-review N-1).
+                    if spent + CHECKS_POLL > limit {
+                        let waiting: Vec<String> = facts
+                            .checks
+                            .iter()
+                            .filter(|(name, state)| name != GUARD_CHECK && state != "success")
+                            .map(|(name, state)| format!("{name}: {state}"))
+                            .collect();
+                        bail!(
+                            "CI isn't green on {} after {} minutes ({}); {nothing}. Run the merge again once it is",
+                            short(&facts.head),
+                            limit.as_secs() / 60,
+                            waiting.join(", ")
+                        );
+                    }
                     waited = spent;
                     self.sleep_watching(CHECKS_POLL, 0);
                     waited += CHECKS_POLL;
@@ -5268,6 +5284,86 @@ mod tests {
         assert_eq!(slices.get(), before, "the first wait looks at once");
         steps.wait_for_checks(&facts, Wait::BeforeAuth).unwrap();
         assert_eq!(slices.get(), before + slices_per_poll);
+    }
+
+    /// A fake GitHub whose `pr-ready` goes back to pending on every read of the PR (a check
+    /// that flaps: green whenever the wait looks, not green whenever the facts are read).
+    struct PendingOnRead<'a> {
+        fake: &'a FakeGitHub,
+        head: String,
+        reads: &'a std::cell::Cell<u32>,
+    }
+
+    impl GitHubApi for PendingOnRead<'_> {
+        fn pr(&self, n: u64) -> Result<PrInfo> {
+            self.reads.set(self.reads.get() + 1);
+            assert!(
+                self.reads.get() < 10,
+                "the loop before authentication didn't end"
+            );
+            self.fake
+                .set_check(&self.head, "pr-ready", CheckState::Pending);
+            self.fake.pr(n)
+        }
+        fn check(&self, sha: &str, name: &str) -> Result<CheckState> {
+            self.fake.check(sha, name)
+        }
+        fn reviews(&self, n: u64) -> Result<Vec<crate::dev::github::Review>> {
+            self.fake.reviews(n)
+        }
+        fn merge(&self, n: u64, sha: &str) -> Result<crate::dev::github::MergeOutcome> {
+            self.fake.merge(n, sha)
+        }
+        fn post_review_as_app(&self, n: u64, sha: &str, body: &str, token: &str) -> Result<()> {
+            self.fake.post_review_as_app(n, sha, body, token)
+        }
+        fn commit_pulls(&self, sha: &str) -> Result<Vec<crate::dev::github::CommitPull>> {
+            self.fake.commit_pulls(sha)
+        }
+    }
+
+    /// Re-review N-1: once the 100 minutes before your authentication are spent, going back
+    /// into the wait stops before it looks, so a check that flaps (green at every look of the
+    /// wait, pending at every read of the facts) can't keep the flow looping. Nothing is asked.
+    #[test] // spec: QA-033
+    fn a_flapping_check_cannot_keep_the_wait_before_authentication_going() {
+        let (_tmp, work, protected, _) = glue_fixture();
+        let fake = FakeGitHub::new();
+        fake.add_pr(42, &protected, "main");
+        green(&fake, &protected);
+        let reads = std::cell::Cell::new(0);
+        let github = |_: &MergeGuardConfig| -> Result<Box<dyn GitHubApi + '_>> {
+            Ok(Box::new(PendingOnRead {
+                fake: &fake,
+                head: protected.clone(),
+                reads: &reads,
+            }))
+        };
+        let (checked, key, exchange) = (cfg(), key_file(), Exchange::default());
+        let slices_per_poll = (CHECKS_POLL.as_millis() / SLICE.as_millis()) as usize;
+        let slices = std::cell::Cell::new(0usize);
+        // Green only once the whole budget is spent, then green at every look of the wait.
+        let pause = |_: Duration| {
+            slices.set(slices.get() + 1);
+            if slices.get() >= 400 * slices_per_poll {
+                fake.set_check(&protected, "pr-ready", CheckState::Success);
+            }
+        };
+        let steps = flow_steps(&work, &checked, &key, &github, &exchange, &pause);
+        let e = format!(
+            "{:#}",
+            merge_flow("the change", "the audit", &steps, &NeverAsked).unwrap_err()
+        );
+        assert_eq!(
+            e,
+            format!(
+                "CI isn't green on {} after 100 minutes (pr-ready: pending); nothing was asked, approved or merged. Run the merge again once it is",
+                short(&protected)
+            )
+        );
+        assert_eq!(slices.get(), 400 * slices_per_poll, "it waited on");
+        assert!(fake.posted_reviews().is_empty());
+        assert!(exchange.calls.borrow().is_empty(), "the key was used");
     }
 
     /// Review M-3: when the wait before your authentication stops on a failure or runs out, it

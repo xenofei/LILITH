@@ -335,8 +335,10 @@ fn flow(
     refuse_failed(&first)?;
     // Owner decision 2026-10-27: CI takes longer than the wait with the key unlocked should
     // last, so the flow waits for it first, with nothing unlocked and nothing asked.
+    // The read the wait goes on from: its checks are the ones still not green.
+    let mut seen = first.clone();
     let facts = loop {
-        steps.wait_for_checks(&first, Wait::BeforeAuth)?;
+        steps.wait_for_checks(&seen, Wait::BeforeAuth)?;
         // What you are shown and authenticate is read again now, CI green.
         let again = steps.facts().with_context(|| {
             format!(
@@ -356,6 +358,7 @@ fn flow(
         }
         // A check went back to pending or unreported since the wait (a green run re-run, say):
         // wait again, within what is left of the same budget (review M-5).
+        seen = again;
     };
     let mut shown = render_facts(&facts);
     match summary {
