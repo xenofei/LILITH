@@ -1,12 +1,15 @@
 # PR-ready tier (QA-071): everything the every-push tier runs, plus cargo-audit and a release
 # build, on every non-draft PR. `lil dev merge` requires the `pr-ready` check on the PR's head
-# commit (QA-033). On a draft PR, `pr-ready` fails in its first step, on purpose: GitHub counts a
-# skipped job as passing for required checks, so the job is never skipped (R38). Marking the PR
-# ready for review runs it again. `lil dev merge` refuses drafts too.
+# commit (QA-033). The work runs in two parallel jobs, pr-ready-rust (the every-push tier and
+# cargo-audit) and pr-ready-qt (the release build and the Qt build and tests); the job named
+# pr-ready passes only when both succeeded. On a draft PR, both work jobs fail in their first
+# step, on purpose, so pr-ready fails too: GitHub counts a skipped job as passing for required
+# checks, so pr-ready is never skipped (R38). Marking the PR ready for review runs it again.
+# `lil dev merge` refuses drafts too.
 #
 # The checkout is GitHub's merge of the PR into its base, so the tests run on what main would
-# become. This job runs the PR's code with a read-only token; the guard's own judgement runs from
-# main in ci-guard.yml.
+# become. The work jobs run the PR's code with a read-only token; the guard's own judgement runs
+# from main in ci-guard.yml.
 #
 # privacy-check-pr (QA-086, rulings R32-R35) runs `lil dev privacy-scan --range` (with the PR's
 # branch name as `--ref-name`) on the PR's commits (refs/remotes/origin/<base>..<head>), drafts
@@ -34,13 +37,15 @@ defaults:
     shell: bash
 
 jobs:
-  pr-ready:
-    # The check run's name. `lil dev merge` requires it by exactly this name.
-    name: pr-ready
+  # pr-ready's work runs in two jobs side by side, pr-ready-rust and pr-ready-qt; the job named
+  # pr-ready only gathers their results (below). Each work job fails on a draft in its first step
+  # (R38) and has its own concurrency group, so neither cancels the other.
+  pr-ready-rust:
+    name: pr-ready-rust
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 90
     concurrency:
-      group: pr-ready-${{ github.event.pull_request.number }}
+      group: pr-ready-rust-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     env:
       CARGO_TERM_COLOR: always
@@ -93,13 +98,47 @@ jobs:
       - name: cargo-audit
         run: cargo audit
 
-      - name: Release build
-        run: cargo build --workspace --release --locked
+      # Plans 2-6 add their Rust-only PR-ready steps here (QA-071): the real-NTFS reconciler tests.
+
+  pr-ready-qt:
+    name: pr-ready-qt
+    runs-on: windows-2025
+    timeout-minutes: 90
+    concurrency:
+      group: pr-ready-qt-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Drafts fail pr-ready
+        env:
+          DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          if [ "$DRAFT" != "false" ]; then
+            echo "::error::This PR is a draft, so pr-ready fails on purpose (a skipped check would count as passing). Mark the PR ready for review to run it."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # ---- Qt (plan 4a Task 15: ARCH-114, QA-068, QA-077, QA-078) ----
       # The Qt pair is installed by naqt every run, uncached: the repository's Actions cache is
-      # full, and the install takes about a minute (Ruling Q-C). Every CMake and CTest command
-      # runs through tools/dev-shell.ps1 (MSVC 14.44, checked; the Qt pair first on PATH).
+      # full, and the install takes about a minute (Ruling Q-C). The release build and every CMake
+      # and CTest command run through tools/dev-shell.ps1 (MSVC 14.44, checked; the Qt pair first
+      # on PATH), which needs the Qt pair installed, so the install comes first.
       - name: Install the Qt pair with naqt (Qt 6.12.0 + Qt WebEngine 6.140.0)
         shell: pwsh
         env:
@@ -125,6 +164,14 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File tools/ci/check-qt-pair.ps1
 
+      # ---- PR-ready addition: the release build ----
+      # In this job because the ci preset copies lil-core, lil and lil-mcp from target/release
+      # instead of building them again (LIL_RUST_BIN_DIR), and through dev-shell.ps1 so they are
+      # built with the same pinned 14.44 toolset as the rest of the deploy folder.
+      - name: Release build
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/dev-shell.ps1 cargo build --workspace --release --locked
+
       - name: CMake configure (ci preset)
         shell: pwsh
         run: |
@@ -148,8 +195,32 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File tools/dev-shell.ps1 ctest --preset ci-deploy
 
-      # Plans 2-6 add their PR-ready steps here (QA-071): the serialised web view / clipboard /
-      # drag / first-run group, E2E over the pipe, and the real-NTFS reconciler tests.
+      # Plans 2-6 add their Qt PR-ready steps here (QA-071): the serialised web view / clipboard /
+      # drag / first-run group and E2E over the pipe.
+
+  pr-ready:
+    # The check run's name. `lil dev merge` requires it by exactly this name. It runs no PR code:
+    # no checkout, no secrets, no token permissions. It passes only when every work job's result
+    # is exactly `success`: a failed, cancelled or skipped job fails it. `if: always()` makes it
+    # run even when a work job failed, since otherwise it would be skipped, and GitHub counts a
+    # skipped required check as passing (R38).
+    name: pr-ready
+    needs: [pr-ready-rust, pr-ready-qt]
+    if: always()
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Every pr-ready job succeeded
+        env:
+          RUST_RESULT: ${{ needs.pr-ready-rust.result }}
+          QT_RESULT: ${{ needs.pr-ready-qt.result }}
+        run: |
+          echo "pr-ready-rust: $RUST_RESULT; pr-ready-qt: $QT_RESULT"
+          if [ "$RUST_RESULT" != "success" ] || [ "$QT_RESULT" != "success" ]; then
+            echo "::error::pr-ready passes only when pr-ready-rust and pr-ready-qt both succeed."
+            exit 1
+          fi
 
   privacy-check-pr:
     name: privacy-check-pr
