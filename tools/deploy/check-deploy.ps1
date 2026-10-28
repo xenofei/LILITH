@@ -65,6 +65,11 @@ $all | Sort-Object Length -Descending | Select-Object -First 5 | ForEach-Object 
     Write-Host ("  {0} {1:N1} MiB" -f $_.FullName.Substring($Deploy.Length).TrimStart('\', '/'), ($_.Length / 1MB))
 }
 if ($mib -gt $BudgetMiB) { $failures.Add("the folder is $mib MiB, over its $BudgetMiB MiB budget") }
+# The bundled Inter faces' licence ships with them (OFL-1.1).
+$ofl = Join-Path $Deploy 'licenses\Inter-OFL.txt'
+if (-not (Test-Path -LiteralPath $ofl) -or -not (Select-String -LiteralPath $ofl -Pattern 'SIL Open Font License' -Quiet)) {
+    $failures.Add('licenses\Inter-OFL.txt, the bundled fonts'' licence, is missing')
+}
 
 # 2. The stripped environment.
 $stripRe = '\\Qt\\|Microsoft Visual Studio|Windows Kits|\\MSVC\\|\\Qt6?$'
