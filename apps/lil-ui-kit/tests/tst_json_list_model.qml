@@ -245,16 +245,46 @@ TestCase {
     }
 
     function test_resync_required_reloads() {
-        const s = reloadsOn("resync_required")
-        const core = s.core, model = s.model
-        // Past 1,024 events held during a load, they are dropped and the model loads once more.
+        reloadsOn("resync_required")
+    }
+
+    // Review N-1: past 1,024 events during a load, they are dropped, the page asked for and the
+    // backoff go on as they are, and the model loads once more when the page lands.
+    function test_an_overflow_during_a_load_keeps_the_page_and_the_backoff() {
+        const core = createTemporaryObject(fakeComponent, tc)
+        const model = createTemporaryObject(jobsComponent, tc, {core: core})
+        tryVerify(() => core.calls.length === 1)
+        const burst = n => {
+            for (let i = 0; i < n; ++i)
+                core.emit("jobs", "event", {kind: "job", job: job("x" + i, "queued")})
+        }
+        burst(2100)
+        compare(core.calls.length, 1, "no call during the burst")
+        compare(core.cancelled.length, 0, "the page asked for isn't given up")
+        core.respond(core.calls[0].id, page([job("j1", "running")]))
+        compare(core.calls.length, 2, "one load more once the page lands")
+        verify(!model.loaded)
+        compare(model.rowCount(), 1, "the page stands meanwhile; no dropped event is applied")
+        core.respond(core.calls[1].id, page([job("j1", "succeeded")]))
+        verify(model.loaded)
+        compare(model.get(0).status, "succeeded")
+        compare(core.calls.length, 2)
+
+        // A failing load waits 1 s, then 2 s; an overflow during the 2 s wait asks nothing, and
+        // the next failure still waits longer (2 s or more), not 1 s again.
         model.reload()
-        const calls = core.calls.length
-        for (let i = 0; i < 1025; ++i)
-            core.emit("jobs", "event", {kind: "job", job: job("x" + i, "queued")})
-        compare(core.calls.length, calls + 1)
-        core.respond(core.calls[calls].id, page([job("j5", "failed")]))
-        compare(model.rowCount(), 1, "the dropped events are not applied")
+        compare(core.calls.length, 3)
+        core.respond(core.calls[2].id, {status: "error", error: {code: "core.busy", message: "busy"}})
+        tryVerify(() => core.calls.length === 4, 3000)
+        core.respond(core.calls[3].id, {status: "error", error: {code: "core.busy", message: "busy"}})
+        burst(1100)
+        wait(1300)
+        compare(core.calls.length, 4, "the overflow doesn't cut the wait short")
+        tryVerify(() => core.calls.length === 5, 3000)
+        core.respond(core.calls[4].id, {status: "error", error: {code: "core.busy", message: "busy"}})
+        wait(1300)
+        compare(core.calls.length, 5, "the backoff wasn't reset")
+        compare(core.cancelled.length, 0)
     }
 
     // Review C-1: a failed page is asked again, after 1 s, then longer; a page that comes in

@@ -33,10 +33,13 @@
 //!   `snapshot` and a `resync_required` of its topic (a seq of 0: a core restart or a workspace
 //!   switch). A reload gives up the page asked for, and `loaded` is false until its first page is
 //!   in: a panel holds back its writes meanwhile (calls can reach a new connection before the app
-//!   sees the mark). The topic's events are held meanwhile, at most [`EVENT_BUFFER_MAX`] (past
-//!   that they are dropped and the model loads once more), and applied through the same `updated`
-//!   guard right after the first page replaces the rows: an event newer than the page's row wins,
-//!   an older one is dropped. The rows held stay until that page replaces them (one model reset).
+//!   sees the mark). The topic's events are held meanwhile, at most [`EVENT_BUFFER_MAX`], and
+//!   applied through the same `updated` guard right after the first page replaces the rows: an
+//!   event newer than the page's row wins, an older one is dropped. The rows held stay until that
+//!   page replaces them (one model reset). Past the bound (review N-1), the held events and the
+//!   rest of the load's are dropped, and the page asked for and any retry waiting go on as they
+//!   are: when the page lands it replaces the rows and the model loads once more, keeping the
+//!   backoff (that load failing waits as any failure does).
 //! - **Failures** (review C-1). A failed page sets `error` and is asked again after 1 s, then
 //!   2 s, doubling up to 30 s; a reload, a change that reloads, or a page that comes in starts
 //!   that over. While the current load isn't in, `core`'s `connection` becoming `ready` reloads
@@ -311,8 +314,10 @@ pub struct JsonListModelRust {
     /// The topic followed through `core`.
     followed: Option<QString>,
     reload_queued: bool,
-    /// The topic's rows held while the first page is asked for (module docs).
+    /// The topic's rows held while the first page is asked for (module docs), and whether more
+    /// came than it holds.
     held: Vec<Value>,
+    overflowed: bool,
     /// The wait before the next retry (0: none failed since the last start); the retry timer's
     /// generation (a timer of another is stale); whether the retry is of a first page.
     retry_ms: u32,
@@ -342,6 +347,7 @@ impl Default for JsonListModelRust {
             followed: None,
             reload_queued: false,
             held: Vec::new(),
+            overflowed: false,
             retry_ms: 0,
             retry_generation: 0,
             retry_first: None,
@@ -444,6 +450,7 @@ impl qobject::JsonListModel {
             }
         }
         self.as_mut().rust_mut().held.clear();
+        self.as_mut().rust_mut().overflowed = false;
         self.as_mut().rust_mut().page.reset();
         self.as_mut().set_loaded_to(false);
         self.ask(true);
@@ -542,12 +549,22 @@ impl qobject::JsonListModel {
             _ => Vec::new(),
         };
         self.as_mut().rust_mut().page.on_page(next);
-        self.as_mut().reset_backoff();
         if !self.error.is_null() {
             self.as_mut().rust_mut().error = QVariant::default();
             self.as_mut().error_changed();
         }
         let id_key = self.id_key.to_string();
+        if first && self.overflowed {
+            // More events came during the load than it holds: the page stands for now, and the
+            // model loads once more, with the backoff kept (module docs, review N-1).
+            // SAFETY: the reset is begun and ended around the change, on the GUI thread.
+            unsafe { self.as_mut().begin_reset_model() };
+            self.as_mut().rust_mut().rows.replace(page, &id_key);
+            unsafe { self.as_mut().end_reset_model() };
+            self.start_load(false);
+            return;
+        }
+        self.as_mut().reset_backoff();
         if first {
             // SAFETY: the reset is begun and ended around the change, on the GUI thread.
             unsafe { self.as_mut().begin_reset_model() };
@@ -623,11 +640,14 @@ impl qobject::JsonListModel {
                 };
                 if self.loaded {
                     self.upsert(row);
+                } else if self.overflowed {
                 } else if self.held.len() < EVENT_BUFFER_MAX {
                     self.as_mut().rust_mut().held.push(row);
                 } else {
-                    tracing::warn!(topic = %self.topic, "too many events during a load: loading again");
-                    self.reload();
+                    tracing::warn!(topic = %self.topic, "too many events during a load: it loads once more when it lands");
+                    let mut rust = self.as_mut().rust_mut();
+                    rust.held.clear();
+                    rust.overflowed = true;
                 }
             }
             _ => {}
