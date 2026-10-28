@@ -124,7 +124,10 @@ impl Rows {
             }
             None => {
                 self.rows.insert(0, row);
-                self.reindex(id_key);
+                for i in self.index.values_mut() {
+                    *i += 1;
+                }
+                self.index.insert(id, 0);
                 Some(Change::Inserted(0))
             }
         }
@@ -168,15 +171,6 @@ impl Rows {
         self.rows.clear();
         self.index.clear();
         let _ = self.append_page(page, id_key);
-    }
-
-    fn reindex(&mut self, id_key: &str) {
-        self.index = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(at, row)| Some((row_id(row, id_key)?, at)))
-            .collect();
     }
 }
 
