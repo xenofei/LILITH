@@ -24,6 +24,8 @@ TestCase {
         ShellWindow { core: fake }
     }
 
+    A11yWalk { id: walk }
+
     SignalSpy {
         id: pauseSpy
         signalName: "gpuPauseToggleRequested"
@@ -79,14 +81,27 @@ TestCase {
             verify(!shell.docks[id].content.visible, id + " is a tab behind")
         verify(origin(shell, "jobs").x > origin(shell, "home").x, "Jobs is right of Home")
         verify(origin(shell, "hardware").y > origin(shell, "home").y, "Hardware is below Home")
+        // The Default layout's proportions (ShellWindow.defaultRightShare and
+        // defaultBottomShare, 28 % each; placeholders until the owner picks them).
+        const right = shell.docks.jobs.content.width / shell.dockingArea.width
+        const bottom = shell.docks.hardware.content.height / shell.dockingArea.height
+        verify(right > 0.2 && right < 0.36, "the right column is " + Math.round(right * 100) + " % wide")
+        verify(bottom > 0.2 && bottom < 0.36, "the bottom row is " + Math.round(bottom * 100) + " % tall")
+        verify(shell.docks.hardware.content.width >= 0.95 * shell.dockingArea.width,
+               "the bottom row spans the window")
     }
 
-    // A layout saved with Confirmations in front of Jobs.
-    function savedLayout(dir) {
+    // A layout saved with Confirmations in front of Jobs, or with every panel closed.
+    function savedLayout(dir, closeAll) {
         const shell = makeShell(dir)
         showShell(shell)
         shell.docks.confirmations.setAsCurrentTab()
         tryVerify(() => shown(shell, "confirmations"))
+        if (closeAll) {
+            for (const id of defaultPanels)
+                shell.docks[id].forceClose()
+            tryVerify(() => defaultPanels.every(id => !shell.docks[id].isOpen))
+        }
         compare(shell.saveLayout(), "", "the layout is saved")
         const text = TestFiles.read(dir + "/layout.json")
         verify(text !== null && text !== undefined, "layout.json is written")
@@ -101,6 +116,7 @@ TestCase {
         showShell(shell)
         checkDefaultLayout(shell)
         verify(!shell.layoutBanner.visible, "no banner")
+        compare(shell.saveLayout(), "", "the 60 s save")
         compare(TestFiles.list(dir), [], "nothing is written until the layout changes")
     }
 
@@ -111,17 +127,49 @@ TestCase {
         const shell = makeShell(dir)
         compare(shell.layoutOpened, "restored")
         compare(DockLayout.steps(), ["windows_created", "factory_registered", "restore", "clamp"])
+        const details = DockLayout.stepDetails()
+        compare(details[0].main_windows, ["image-main"], "the main window existed")
+        compare(details[2].ok, true, "KDDockWidgets restored the blob")
+        verify(details[3].windows >= 1, "the clamp placed the main window")
         showShell(shell)
         tryVerify(() => shown(shell, "confirmations"), 5000, "the saved tab is in front")
         verify(!shell.docks.jobs.content.visible, "Jobs is behind it")
     }
 
+    function test_a_lone_backup_is_restored() { // spec: APP-002
+        // A save that stopped between the swap's two steps leaves only layout.json.bak.
+        const text = savedLayout(TestFiles.newDir("source"))
+        const dir = TestFiles.newDir("backup")
+        verify(TestFiles.write(dir + "/layout.json.bak", text))
+        const shell = makeShell(dir)
+        compare(shell.layoutOpened, "restored")
+        showShell(shell)
+        tryVerify(() => shown(shell, "confirmations"), 5000, "the backup's tab is in front")
+    }
+
+    function test_the_end_of_the_session_saves() { // spec: APP-002
+        const dir = TestFiles.newDir("session")
+        const shell = makeShell(dir)
+        showShell(shell)
+        shell.docks.usage.setAsCurrentTab()
+        wait(50)
+        DockLayout.saveRequested()   // as at a logoff, a shutdown or the application's quit
+        const saved = TestFiles.read(dir + "/layout.json")
+        verify(saved !== null && saved !== undefined, "layout.json is written")
+    }
+
     function test_bad_layout_falls_back_to_default() { // spec: APP-002, APP-004
         const good = JSON.parse(savedLayout(TestFiles.newDir("good")))
         const newer = Object.assign({}, good, {kddw: Object.assign({}, good.kddw, {serializationVersion: 999})})
+        // A blob KDDockWidgets accepts that opens no main window, or none of the panels.
+        const noWindow = Object.assign({}, good, {kddw: {serializationVersion: good.kddw.serializationVersion,
+                                                         mainWindows: []}})
+        const allClosed = savedLayout(TestFiles.newDir("closed"), true)
         for (const [what, text] of [["damaged", '{"layout": 1, "windows": [{"name": '],
                                     ["empty", ""],
-                                    ["refused", JSON.stringify(newer)]]) {
+                                    ["refused", JSON.stringify(newer)],
+                                    ["no main window", JSON.stringify(noWindow)],
+                                    ["no panel open", allClosed]]) {
             const dir = TestFiles.newDir(what)
             verify(TestFiles.write(dir + "/layout.json", text), what)
             const shell = makeShell(dir)
@@ -143,13 +191,21 @@ TestCase {
         const dir = TestFiles.newDir("maximized")
         let shell = makeShell(dir)
         showShell(shell)
+        // A normal size well inside the screen, so the maximized one differs from it.
+        shell.width = 1000
+        shell.height = 600
+        wait(100)
         shell.showMaximized()
         tryVerify(() => shell.visibility === Window.Maximized, 5000, "maximized")
+        tryVerify(() => shell.width > 1100, 5000, "the maximized window is larger: " + shell.width)
         wait(100)
         const sizes = id => ({w: shell.docks[id].content.width, h: shell.docks[id].content.height})
         const before = {home: sizes("home"), jobs: sizes("jobs"), hardware: sizes("hardware")}
         shell.close()
-        verify(TestFiles.read(dir + "/layout.json") !== null, "the layout is saved on close")
+        const saved = JSON.parse(TestFiles.read(dir + "/layout.json"))
+        compare(saved.windows[0].maximized, true, "saved maximized")
+        compare(saved.windows[0].geometry.w, 1000, "with its normal width")
+        compare(saved.windows[0].geometry.h, 600, "and its normal height")
         dropShell(shell)
         for (let round = 1; round <= 3; ++round) {
             shell = makeShell(dir)
@@ -168,6 +224,51 @@ TestCase {
             shell.close()
             dropShell(shell)
         }
+    }
+
+    // KDDockWidgets' own drag and resize areas (its separators', and the drag areas its title
+    // and tab bar bases lay under our bars) are pointer gestures for rearranging the docks;
+    // M1's keyboard routes are the dock's Float and Close buttons, its tabs and the shortcut map.
+    function kddwDragArea(item) {
+        const p = item.parent
+        return String(item).startsWith("QQuickMouseArea") && p
+               && (p.kddwSeparator !== undefined || p.titleBarCpp !== undefined || p.tabBarCpp !== undefined)
+    }
+
+    function test_the_shell_chrome_passes_the_walk() { // spec: APP-156
+        const shell = makeShell("")
+        showShell(shell)
+        checkDefaultLayout(shell)
+        verify(walk.interactiveCount(shell.contentItem, kddwDragArea) >= 12,
+               "the walk sees the title-bar buttons and the tabs: "
+               + walk.interactiveCount(shell.contentItem, kddwDragArea))
+        compare(walk.report(shell.contentItem, kddwDragArea), [])
+    }
+
+    function test_dock_buttons_work_from_the_keyboard() { // spec: APP-156
+        const shell = makeShell("")
+        showShell(shell)
+        shell.requestActivate()
+        tryVerify(() => shell.active, 5000)
+        const close = findItem(shell.contentItem, item => String(item).startsWith("LIconButton")
+                                                           && item.text === "Close Hardware")
+        verify(close, "the Close Hardware button")
+        close.forceActiveFocus(Qt.TabFocusReason)
+        tryVerify(() => close.activeFocus, 2000)
+        keyClick(Qt.Key_Space)
+        tryVerify(() => !shell.docks.hardware.isOpen, 5000, "Space closes Hardware")
+    }
+
+    // The first item under `root` for which `test` holds.
+    function findItem(root, test) {
+        if (test(root))
+            return root
+        for (let i = 0; i < root.children.length; ++i) {
+            const found = findItem(root.children[i], test)
+            if (found)
+                return found
+        }
+        return null
     }
 
     function test_float_and_redock_a_placeholder_keeps_its_state() { // spec: ARCH-116
@@ -208,6 +309,9 @@ TestCase {
         verify(shell.docks.confirmations.panelHasFocus, "and focuses it")
         keySequence("Ctrl+,")
         tryVerify(() => shown(shell, "settings"), 5000, "Ctrl+, shows Settings")
+        keySequence("Ctrl+1")
+        keyClick(Qt.Key_Comma, Qt.ControlModifier)
+        tryVerify(() => shell.docks.settings.panelHasFocus, 5000, "Ctrl and the comma key show Settings")
         keySequence("Ctrl+1")
         tryVerify(() => shell.docks.home.panelHasFocus, 5000, "Ctrl+1 focuses Home")
         keySequence("F6")

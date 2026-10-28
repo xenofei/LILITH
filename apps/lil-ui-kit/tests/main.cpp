@@ -11,6 +11,8 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QFont>
+#include <QGuiApplication>
 #include <QFile>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -112,6 +114,12 @@ public slots:
         engine->addImageProvider(QStringLiteral("lilpreview"), new lilshim::PreviewProvider);
         engine->rootContext()->setContextProperty(QStringLiteral("BridgeHook"), new BridgeHook(engine));
         engine->rootContext()->setContextProperty(QStringLiteral("TestFiles"), &m_files);
+        // The theme's face as the application font, as lil-image sets it.
+        if (QObject *theme = engine->singletonInstance<QObject *>("Lilith.UiKit", "Theme")) {
+            QFont font = QGuiApplication::font();
+            font.setFamilies({theme->property("fontFamily").toString()});
+            QGuiApplication::setFont(font);
+        }
     }
 
 private:

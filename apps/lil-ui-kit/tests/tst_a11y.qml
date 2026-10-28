@@ -61,6 +61,25 @@ TestCase {
                     height: 20
                     MouseArea { objectName: "clicky"; anchors.fill: parent }
                 }
+                // A control the keyboard can't reach.
+                LButton { objectName: "nofocus"; text: "No focus"; focusPolicy: Qt.NoFocus }
+                // A tile that takes taps through a handler, with nothing accessible.
+                Rectangle {
+                    objectName: "tile"
+                    width: 40
+                    height: 20
+                    TapHandler {}
+                }
+                // The accessible-parent pattern, done right: not reported.
+                Rectangle {
+                    objectName: "goodParent"
+                    width: 40
+                    height: 20
+                    activeFocusOnTab: true
+                    Accessible.role: Accessible.Button
+                    Accessible.name: "Open"
+                    MouseArea { objectName: "goodChild"; anchors.fill: parent }
+                }
             }
         }
     }
@@ -97,6 +116,12 @@ TestCase {
         verify(what.some(w => w.indexOf("clicky") >= 0 && w.indexOf("no accessible name") >= 0),
                JSON.stringify(what))
         verify(what.some(w => w.indexOf("clicky") >= 0 && w.indexOf("not in the tab chain") >= 0),
+               JSON.stringify(what))
+        verify(what.some(w => w.indexOf("nofocus") >= 0 && w.indexOf("lacks Qt.TabFocus") >= 0),
+               JSON.stringify(what))
+        verify(what.some(w => w.indexOf("tile") >= 0 && w.indexOf("no accessible role") >= 0),
+               JSON.stringify(what))
+        verify(!what.some(w => w.indexOf("goodParent") >= 0 || w.indexOf("goodChild") >= 0),
                JSON.stringify(what))
     }
 }

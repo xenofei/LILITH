@@ -20,6 +20,15 @@ QtObject {
     // The keyboard focus ring.
     readonly property color focus: "#7dcfff"
 
+    // Deprecated aliases of `bg` and `surface`, kept until the tasks that still use them have
+    // merged.
+    readonly property color window: bg
+    readonly property color panel: surface
+
+    // The UI face, set once as the application font (lil-image's main.cpp and the QML test
+    // runner read it from here). Segoe UI ships with Windows. A placeholder until the owner picks
+    // the face: one token, so changing it is one line.
+    readonly property string fontFamily: "Segoe UI"
     readonly property int spacing: 8
     readonly property int radius: 4
     readonly property int fontSize: 13

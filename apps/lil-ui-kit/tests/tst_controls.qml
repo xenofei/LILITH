@@ -84,6 +84,7 @@ TestCase {
         focusOn(p.banner)
         keyClick(Qt.Key_Escape)
         verify(!p.banner.visible, "Escape closes the banner")
+        tryVerify(() => p.button.activeFocus, 2000, "and the focus moves on to the next control")
         compare(p.closed, 1)
         p.banner.show()
         focusOn(p.banner)

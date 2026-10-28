@@ -32,14 +32,29 @@ Window {
     property alias layoutBanner: layoutBanner
     // Panel id -> its DockedPanel.
     readonly property var docks: ({})
-    // How the layout opened: "restored", "default", or "default_after_bad" (a file was set aside).
+    // How the layout opened: "restored", "default", "default_after_bad" (a file was set aside) or
+    // "default_unreadable" (the file couldn't be read: it is left alone and not saved over).
     property string layoutOpened
+    // The Default layout's proportions: the right column's share of the width and the bottom
+    // row's share of the height; the bottom row spans the full width. Placeholders until the
+    // owner picks the values.
+    readonly property real defaultRightShare: 0.28
+    readonly property real defaultBottomShare: 0.28
     // The plan 4a shortcut map: [{keys, action, scope}].
     readonly property var bindings: JSON.parse(ShellState.shortcuts())
     property string _lastSaved
     // True while the shell itself opens or closes docks (the restore, the Default layout, the
     // window's close), which aren't announced.
     property bool _settling: true
+    // The Default layout waits for the docking area's real size (it is 0 x 0 until the window
+    // shows), or KDDockWidgets ignores the sizes asked for.
+    property bool _defaultPending: false
+    property bool _sized: false
+    // No saves: the layout file couldn't be read, or the window is closing.
+    property bool _saveBlocked: false
+    property bool _closing: false
+    // The panels closed in this turn of the event loop, announced together.
+    property var _closedBatch: []
 
     signal gpuPauseToggleRequested()
 
@@ -62,6 +77,8 @@ Window {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         uniqueName: "image-main"
+        onWidthChanged: root.areaSized()
+        onHeightChanged: root.areaSized()
     }
 
     Component {
@@ -87,13 +104,26 @@ Window {
         onTriggered: root.saveLayout()
     }
 
-    // Saved on close before KDDockWidgets closes the docks (DockLayout's close filter).
+    // Saved on close before KDDockWidgets closes the docks (DockLayout's application filter),
+    // then no more: the docks KDDockWidgets closes next aren't the layout. A close that is
+    // vetoed leaves the window visible, and the shell goes on as before. Saved too when the
+    // session ends or the application quits.
     Connections {
         target: DockLayout
         function onMainWindowClosing(name) {
             if (name !== dockingArea.uniqueName)
                 return
             root._settling = true
+            root.saveLayout()
+            root._closing = true
+            Qt.callLater(() => {
+                if (root.visible) {
+                    root._closing = false
+                    root._settling = false
+                }
+            })
+        }
+        function onSaveRequested() {
             root.saveLayout()
         }
     }
@@ -153,24 +183,50 @@ Window {
         const saved = stateDir !== "" ? JSON.parse(ShellState.loadLayout(stateDir)) : {status: "missing"}
         let restored = false
         let setAside = saved.status === "bad" ? saved.setAside : ""
+        _saveBlocked = saved.status === "unreadable"
         if (saved.status === "ok") {
             restored = DockLayout.restore(JSON.stringify(saved.layout.kddw))
+            // A blob KDDockWidgets accepts but that opens no main window of this shell, or none
+            // of the known panels, counts as refused too.
+            if (restored) {
+                const windows = saved.layout.kddw.mainWindows || []
+                restored = windows.some(m => m.uniqueName === dockingArea.uniqueName)
+                           && Panels.all.some(p => docks[p.id] && docks[p.id].isOpen)
+            }
             if (!restored)
                 setAside = ShellState.setLayoutAside(stateDir)
         }
-        if (!restored)
-            applyDefaultLayout()
+        _defaultPending = !restored
         DockLayout.clamp(restored ? saved.layout.windows : [],
-                         (geometry, screen, screens) => JSON.parse(
-                             ShellState.clamp(JSON.stringify(geometry), screen, JSON.stringify(screens))))
-        layoutOpened = restored ? "restored" : saved.status === "missing" ? "default" : "default_after_bad"
+                         (geometry, screen, screens, margins) => JSON.parse(
+                             ShellState.clamp(JSON.stringify(geometry), screen, JSON.stringify(screens),
+                                              JSON.stringify(margins))))
+        layoutOpened = restored ? "restored"
+                     : saved.status === "missing" ? "default"
+                     : saved.status === "unreadable" ? "default_unreadable" : "default_after_bad"
         if (layoutOpened === "default_after_bad") {
             layoutBanner.text = "The saved layout couldn't be opened, so the Default layout is open."
                 + (setAside ? " The old file was kept as " + setAside + "." : "")
             if (visible)
                 layoutBanner.show()
         }
-        _lastSaved = layoutText()
+        areaSized()
+    }
+
+    // Once the docking area has its real size: the Default layout when it is waiting, and the
+    // layout as it then stands taken as the one last saved, so an unchanged layout isn't written.
+    function areaSized() {
+        if (_sized || dockingArea.width <= 0 || dockingArea.height <= 0)
+            return
+        _sized = true
+        if (_defaultPending) {
+            const settling = _settling
+            _settling = true
+            applyDefaultLayout()
+            _settling = settling
+            _defaultPending = false
+        }
+        Qt.callLater(() => { root._lastSaved = root.layoutText() })
     }
 
     // The Default layout (APP-004): Home in the centre; Jobs and Confirmations tabbed on the
@@ -191,12 +247,14 @@ Window {
                 continue
             }
             first[panel.area] = dock
+            const right = Math.round(dockingArea.width * defaultRightShare)
+            const bottom = Math.round(dockingArea.height * defaultBottomShare)
             if (panel.area === "centre")
                 dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnLeft)
             else if (panel.area === "right")
-                dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnRight, null, Qt.size(360, 0))
+                dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnRight, null, Qt.size(right, 0))
             else
-                dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnBottom, null, Qt.size(0, 240))
+                dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnBottom, null, Qt.size(0, bottom))
         }
         for (const area in first)
             first[area].setAsCurrentTab()
@@ -210,7 +268,7 @@ Window {
 
     // Writes the layout when it changed since it was read or last written. Empty, or why not.
     function saveLayout() {
-        if (stateDir === "")
+        if (stateDir === "" || _defaultPending || _saveBlocked || _closing)
             return ""
         const text = layoutText()
         if (text === _lastSaved)
@@ -222,13 +280,33 @@ Window {
     }
 
     // A panel you close says how to bring it back (APP-156): "Home closed. Ctrl+1 opens it
-    // again."
+    // again." Panels closed together (a floating window with several tabs) are one message:
+    // "Jobs and Confirmations closed. Ctrl+2 and Ctrl+3 open them again."
     function panelOpenChanged(dock) {
         if (_settling || dock.isOpen)
             return
-        const binding = bindings.find(b => b.action === dock.panel.action)
-        dockingArea.Accessible.announce(dock.panel.title + " closed."
-                                        + (binding ? " " + binding.keys + " opens it again." : ""))
+        if (_closedBatch.length === 0)
+            Qt.callLater(announceClosed)
+        _closedBatch = _closedBatch.concat([dock])
+    }
+
+    function announceClosed() {
+        const closed = _closedBatch
+        _closedBatch = []
+        if (closed.length === 0)
+            return
+        const list = a => a.length < 2 ? a.join("") : a.slice(0, -1).join(", ") + " and " + a[a.length - 1]
+        const keyOf = d => {
+            const b = bindings.find(b => b.action === d.panel.action)
+            return b ? b.keys : ""
+        }
+        let text = list(closed.map(d => d.panel.title)) + " closed."
+        if (closed.every(d => keyOf(d) !== ""))
+            text += " " + list(closed.map(keyOf)) + (closed.length === 1 ? " opens it again." : " open them again.")
+        else
+            for (const d of closed.filter(d => keyOf(d) !== ""))
+                text += " " + keyOf(d) + " opens " + d.panel.title + " again."
+        dockingArea.Accessible.announce(text)
     }
 
     function showPanel(id) {
@@ -239,6 +317,10 @@ Window {
             dock.open()
         dock.raise()
         dock.focusPanel()
+        // A panel in a floating window: that window takes the keys.
+        const win = dock.content ? dock.content.Window.window : null
+        if (win && win !== root)
+            win.requestActivate()
     }
 
     // The open panels in Panels.js order.

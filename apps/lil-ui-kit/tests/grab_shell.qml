@@ -44,6 +44,8 @@ TestCase {
         shell.visible = true
         tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000)
         wait(300)
+        compare(Qt.application.font.family, Theme.fontFamily, "the grab shows the theme's face")
+        compare(shell.width, 1280, "the shell keeps its 1280 x 800 on the 1280 x 800 screen")
         const img = grabImage(shell.contentItem)
         const dpr = shell.devicePixelRatio
         compare(img.width, Math.round(shell.width * dpr), "the grab has the window's width")

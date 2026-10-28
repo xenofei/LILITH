@@ -31,12 +31,21 @@ Item {
     function close() {
         if (!visible)
             return
+        // The keyboard focus moves on to the next item outside the banner, not to nothing.
+        if (activeFocus || closeButton.activeFocus) {
+            let next = closeButton.nextItemInFocusChain(true)
+            for (let n = 0; next && (next === root || next === closeButton) && n < 3; ++n)
+                next = next.nextItemInFocusChain(true)
+            if (next && next !== root && next !== closeButton)
+                next.forceActiveFocus(Qt.TabFocusReason)
+        }
         visible = false
         closed()
     }
 
     visible: false
-    implicitWidth: row.implicitWidth + 2 * Theme.spacing
+    // A fixed default: deriving it from the row, whose width follows the banner's, loops.
+    implicitWidth: 480
     implicitHeight: Math.max(row.implicitHeight + Theme.spacing, 36)
     activeFocusOnTab: true
 

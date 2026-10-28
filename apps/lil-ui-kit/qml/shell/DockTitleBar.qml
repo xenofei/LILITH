@@ -1,7 +1,8 @@
 // The docks' title bar, handed to KDDockWidgets by the shim's DockFactory (APP-001, APP-012).
 // It derives from KDDockWidgets' TitleBarBase, which drags the dock, and is exposed as a title
 // bar named after the dock (APP-156; spike 10 S0.7 read it this way), with named Float and Close
-// buttons that UI Automation can press.
+// buttons (LIconButton: in the tab chain, pressed with Space, Enter or Return, and by UI
+// Automation).
 import QtQuick
 import Lilith.UiKit
 import "qrc:/kddockwidgets/qtquick/views/qml/" as KDDW
@@ -43,51 +44,22 @@ KDDW.TitleBarBase {
         // Above TitleBarBase's drag area, so the buttons get their clicks.
         z: 1
 
-        TitleButton {
+        LIconButton {
             visible: root.floatButtonVisible
+            implicitWidth: 22
+            implicitHeight: 22
             glyph: "⧉"
-            name: "Float " + root.title
-            onPressed: root.floatButtonClicked()
+            text: "Float " + root.title
+            onClicked: root.floatButtonClicked()
         }
 
-        TitleButton {
+        LIconButton {
             enabled: root.closeButtonEnabled
+            implicitWidth: 22
+            implicitHeight: 22
             glyph: "×"
-            name: "Close " + root.title
-            onPressed: root.closeButtonClicked()
-        }
-    }
-
-    // A mouse-and-UI-Automation button: the dock's keyboard route is the shortcut map (F6 and
-    // the panel keys), so it isn't in the tab chain.
-    component TitleButton: Rectangle {
-        id: button
-
-        property string glyph
-        property string name
-        signal pressed()
-
-        width: 22
-        height: 22
-        radius: Theme.radius
-        color: area.containsMouse ? Theme.bg : "transparent"
-
-        Accessible.role: Accessible.Button
-        Accessible.name: name
-        Accessible.onPressAction: button.pressed()
-
-        Text {
-            anchors.centerIn: parent
-            text: button.glyph
-            color: button.enabled ? Theme.text : Theme.textMuted
-            font.pixelSize: Theme.fontSize
-        }
-
-        MouseArea {
-            id: area
-            anchors.fill: parent
-            hoverEnabled: true
-            onClicked: button.pressed()
+            text: "Close " + root.title
+            onClicked: root.closeButtonClicked()
         }
     }
 }

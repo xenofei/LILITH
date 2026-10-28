@@ -27,6 +27,13 @@ TestCase {
         verify(luminance(Theme.bg) < 0.05 && luminance(Theme.text) > 0.6, "the theme is dark")
     }
 
+    function test_the_font_is_the_themes() { // spec: APP-012
+        compare(Theme.fontFamily, "Segoe UI")
+        compare(Qt.application.font.family, Theme.fontFamily, "the application font")
+        verify(Qt.colorEqual(Theme.window, Theme.bg) && Qt.colorEqual(Theme.panel, Theme.surface),
+               "the deprecated aliases")
+    }
+
     function test_text_contrast_is_at_least_4_5_to_1() { // spec: APP-012, APP-156
         for (const back of ["bg", "surface", "surfaceRaised"]) {
             for (const fore of ["text", "textMuted"]) {

@@ -1,7 +1,8 @@
 // The docks' tab bar, handed to KDDockWidgets by the shim's DockFactory (APP-001, APP-012). It
 // derives from KDDockWidgets' TabBarBase, whose mouse area sends clicks and drags to KDDockWidgets
 // (which asks getTabIndexAtPosition), and draws its own tabs without Qt Quick Controls. Each tab
-// is exposed as a page tab named after its dock (APP-156; spike 10 S0.7 read it this way).
+// is exposed as a page tab named after its dock (APP-156; spike 10 S0.7 read it this way), is in
+// the tab chain, and Space, Enter or Return brings its panel to the front.
 import QtQuick
 import Lilith.UiKit
 import "qrc:/kddockwidgets/qtquick/views/qml/" as KDDW
@@ -50,10 +51,19 @@ KDDW.TabBarBase {
                 height: root.height
                 color: current ? Theme.surface : Theme.bg
 
+                activeFocusOnTab: true
+
                 Accessible.role: Accessible.PageTab
                 Accessible.name: title
                 Accessible.selected: current
                 Accessible.onPressAction: root.currentTabIndex = tab.index
+
+                Keys.onSpacePressed: root.currentTabIndex = tab.index
+                Keys.onReturnPressed: root.currentTabIndex = tab.index
+                Keys.onEnterPressed: root.currentTabIndex = tab.index
+
+                border.color: Theme.focus
+                border.width: activeFocus ? Theme.focusWidth : 0
 
                 Rectangle {
                     width: parent.width

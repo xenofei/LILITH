@@ -36,7 +36,7 @@
       "name": "offscreen",
       "hidden": true,
       "inherits": "base",
-      "environment": { "QT_QPA_PLATFORM": "offscreen" }
+      "environment": { "QT_QPA_PLATFORM": "offscreen", "QT_QPA_FONTDIR": "$env{WINDIR}/Fonts" }
     },
     { "name": "qml", "inherits": "offscreen", "configurePreset": "dev", "filter": { "include": { "label": "^qml$" } } },
     { "name": "grabs", "inherits": "offscreen", "configurePreset": "dev", "filter": { "include": { "label": "^grabs$" } }, "execution": { "noTestsAction": "ignore" } },
