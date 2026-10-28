@@ -48,6 +48,13 @@ TestCase {
         verify(shown.indexOf('"format":"png"') >= 0, shown)
         verify(shown.indexOf('"bytes":72') >= 0, shown)
 
+        // At any depth (review M-8).
+        core.emit("things", "event", {frames: [{format: "png", data_b64: payload}], at: {data_b64: payload}})
+        const nested = log.get(999).text
+        verify(nested.indexOf(payload) < 0, nested)
+        verify(nested.indexOf("data_b64") < 0, nested)
+        compare(nested.split('"bytes":72').length, 3, nested)
+
         // Bounded: a long event is cut.
         core.emit("things", "event", {text: "x".repeat(100000)})
         verify(log.get(999).text.length <= 2000, log.get(999).text.length)

@@ -32,10 +32,12 @@
 //!     carries: events can overtake one another within a topic (`throttle`), so none is a step
 //!     after the one before;
 //!   - on every `resync_required` (a seq of 0 marks a core restart or a workspace switch) it
-//!     loads again; until that load is in, it drops the topic's events and holds back its own
+//!     loads again; until that load is in, it holds the topic's events and holds back its own
 //!     writes from the old state (#50 M3: calls can reach the new connection before the mark);
 //!   - after a load, it drops the events at or below the seq the load's answer stands for when
-//!     the tool says one, and else applies them all: each carries full state.
+//!     the tool says one, and else applies them all, the held ones included: each carries full
+//!     state. A list tool says no seq, so `JsonListModel` applies them through its rows' guard
+//!     instead: an event older than the row held (by `updated`) is dropped (Task 17 review I-1).
 //!   - `lastSeq(topic)` is the session's receive cursor (-1 for none), ahead of what QML has
 //!     applied (events wait in the throttle and the GUI queue): for tests and diagnostics, never
 //!     a model's loaded-at seq.

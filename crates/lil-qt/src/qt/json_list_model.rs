@@ -5,25 +5,44 @@
 //!   `argsJson` (the tool's arguments, a JSON object), `listKey` (where the rows are in the
 //!   tool's `structured` output), `idKey` (each row's id), `pageSize` (default 100), `topic`,
 //!   `eventKind` and `rowKey` (below), `roleNames` (the row fields a delegate reads, as roles),
-//!   and `loaded` (read-only: the first page of the current load is in).
+//!   and, read-only, `loaded` (the first page of the current load is in) and `error` (the last
+//!   failed page's error body as a map; none, which QML reads as `undefined`, once a page
+//!   is in).
+//! - **`idKey` must be unique within the list**: two rows with one id are one row. For assets
+//!   that is `ref`, not `asset_id`, which is unique only within a project.
 //! - **Paging** ([`crate::paging::PageState`]): a load asks for the first page with `limit` set
 //!   to `pageSize`; `canFetchMore`/`fetchMore` ask for the next with the last page's
 //!   `next_cursor` as `cursor`, one at a time, until it is `null`. A row a later page holds
-//!   already (inserted live meanwhile) is updated in place, not added twice.
-//! - **Events.** The model follows `topic` through `core` (once, before its first page is asked
-//!   for, so no event is missed), and upserts each `event` of it by `idKey`
+//!   already (inserted live meanwhile) is updated in place, not added twice. `argsJson` filters
+//!   the pages only: events are upserted whatever the filter, so a filtered panel filters in QML
+//!   or reloads.
+//! - **Events.** The model asks `core` to follow `topic` once, before its first page is asked
+//!   for. The subscribe and the call still reach the core in no fixed order (Task 16's design),
+//!   so an event published just before the subscribe took effect can be missed; the next event
+//!   of that row, or a reload, puts it right. Each `event` of the topic is upserted by `idKey`
 //!   ([`crate::paging::Rows`]): a new id goes first (the lists are newest first), a known one is
-//!   updated in place (one `dataChanged`) unless the row is older than the one held. With
-//!   `eventKind` set, only events whose `kind` is that are rows, the others are skipped; with
-//!   `rowKey` set, the row is the event's value under it, else the event's data itself. (The
-//!   `jobs` topic: `eventKind: "job"`, `rowKey: "job"`; its `queue` events are skipped.)
+//!   updated in place (one `dataChanged`) unless the row is older than the one held. "Older"
+//!   compares the rows' `updated` times: no list tool says the seq its answer stands for, so this
+//!   is what "drop an event at or below the seq the model loaded at" means here (equal times
+//!   apply: each event is the full state). With `eventKind` set, only events whose `kind` is that
+//!   are rows, the others are skipped; with `rowKey` set, the row is the event's value under it,
+//!   else the event's data itself. (The `jobs` topic: `eventKind: "job"`, `rowKey: "job"`; its
+//!   `queue` events are skipped.)
 //! - **Reloads.** Changing `core`, `tool`, `argsJson`, `listKey`, `idKey` or `topic` reloads it
 //!   on the next turn of the event loop (once for several changes), and so do `reload()`, a
 //!   `snapshot` and a `resync_required` of its topic (a seq of 0: a core restart or a workspace
-//!   switch), never `Ready` (ARCH-100). A reload gives up the page asked for, and `loaded` is
-//!   false until its first page is in: the topic's events are dropped meanwhile, and a panel
-//!   holds back its writes (calls can reach a new connection before the app sees the mark). The
-//!   rows held stay until that page replaces them (one model reset).
+//!   switch). A reload gives up the page asked for, and `loaded` is false until its first page is
+//!   in: a panel holds back its writes meanwhile (calls can reach a new connection before the app
+//!   sees the mark). The topic's events are held meanwhile, at most [`EVENT_BUFFER_MAX`] (past
+//!   that they are dropped and the model loads once more), and applied through the same `updated`
+//!   guard right after the first page replaces the rows: an event newer than the page's row wins,
+//!   an older one is dropped. The rows held stay until that page replaces them (one model reset).
+//! - **Failures** (review C-1). A failed page sets `error` and is asked again after 1 s, then
+//!   2 s, doubling up to 30 s; a reload, a change that reloads, or a page that comes in starts
+//!   that over. While the current load isn't in, `core`'s `connection` becoming `ready` reloads
+//!   at once (the session fails calls at once until it is connected, and its first connection
+//!   puts no resync mark into the stream). That is not ARCH-100's forbidden reload on `Ready`:
+//!   there is no loaded state for it to replace. A loaded model never reloads on `ready`.
 //! - `get(row)`: the row as a map. When the model goes, its page asked for is cancelled and its
 //!   topic left.
 //!
@@ -52,6 +71,11 @@ pub const EVENT_LOG_ROWS: usize = 1000;
 pub const EVENT_LOG_TEXT_CHARS: usize = 2000;
 /// `pageSize`'s default.
 pub const PAGE_SIZE: i32 = 100;
+/// The topic's events a model holds while its first page is asked for.
+pub const EVENT_BUFFER_MAX: usize = 1024;
+/// The first wait before a failed page is asked again, and the longest.
+pub const RETRY_FIRST_MS: u32 = 1000;
+pub const RETRY_MAX_MS: u32 = 30_000;
 /// `Qt::UserRole`: the first role.
 const USER_ROLE: i32 = 0x0100;
 
@@ -91,6 +115,7 @@ pub mod qobject {
         #[qproperty(QString, row_key)]
         #[qproperty(QStringList, role_names)]
         #[qproperty(bool, loaded, READ, NOTIFY)]
+        #[qproperty(QVariant, error, READ, NOTIFY)]
         type JsonListModel = super::JsonListModelRust;
 
         /// Loads again from the first page (module docs).
@@ -108,6 +133,11 @@ pub mod qobject {
         fn core_call_failed(self: Pin<&mut JsonListModel>, id: &QString, error_json: &QString);
         #[qinvokable]
         fn core_call_pending(self: Pin<&mut JsonListModel>, id: &QString, pending_json: &QString);
+        #[qinvokable]
+        fn core_connection_changed(self: Pin<&mut JsonListModel>);
+        /// The retry timer (`src/qt/core_link.h`), not for QML.
+        #[qinvokable]
+        fn core_retry_due(self: Pin<&mut JsonListModel>, generation: u64);
         #[qinvokable]
         fn core_event_received(
             self: Pin<&mut JsonListModel>,
@@ -228,6 +258,12 @@ pub mod qobject {
         fn core_subscribe(link: &CoreLink, topic: &QString);
         #[cxx_name = "coreUnsubscribe"]
         fn core_unsubscribe(link: &CoreLink, topic: &QString);
+        /// `core`'s `connection` (empty without one).
+        #[cxx_name = "coreConnection"]
+        fn core_connection(link: &CoreLink) -> QString;
+        /// Calls `model.coreRetryDue(generation)` in `ms` ms, unless the model is gone by then.
+        #[cxx_name = "retryLater"]
+        fn retry_later(model: &JsonListModel, ms: u32, generation: u64);
     }
 }
 
@@ -267,6 +303,7 @@ pub struct JsonListModelRust {
     row_key: QString,
     role_names: cxx_qt_lib::QStringList,
     loaded: bool,
+    error: QVariant,
     rows: Rows,
     page: PageState,
     /// The page asked for: its request id, and whether it is a load's first.
@@ -274,6 +311,13 @@ pub struct JsonListModelRust {
     /// The topic followed through `core`.
     followed: Option<QString>,
     reload_queued: bool,
+    /// The topic's rows held while the first page is asked for (module docs).
+    held: Vec<Value>,
+    /// The wait before the next retry (0: none failed since the last start); the retry timer's
+    /// generation (a timer of another is stale); whether the retry is of a first page.
+    retry_ms: u32,
+    retry_generation: u64,
+    retry_first: Option<bool>,
     link: cxx::UniquePtr<qobject::CoreLink>,
 }
 
@@ -291,11 +335,16 @@ impl Default for JsonListModelRust {
             row_key: QString::default(),
             role_names: cxx_qt_lib::QStringList::default(),
             loaded: false,
+            error: QVariant::default(),
             rows: Rows::new(),
             page: PageState::new(),
             asked: None,
             followed: None,
             reload_queued: false,
+            held: Vec::new(),
+            retry_ms: 0,
+            retry_generation: 0,
+            retry_first: None,
             link: qobject::new_core_link(),
         }
     }
@@ -372,9 +421,17 @@ impl qobject::JsonListModel {
         }
     }
 
-    pub fn reload(mut self: Pin<&mut Self>) {
+    pub fn reload(self: Pin<&mut Self>) {
+        self.start_load(true);
+    }
+
+    /// Loads from the first page: a reload (`reset_backoff`), or a first page's retry.
+    fn start_load(mut self: Pin<&mut Self>, reset_backoff: bool) {
         if let Some((id, _)) = self.as_mut().rust_mut().asked.take() {
             qobject::core_cancel(&self.link, &id);
+        }
+        if reset_backoff {
+            self.as_mut().reset_backoff();
         }
         let topic = self.topic.clone();
         if self.followed.as_ref() != Some(&topic) {
@@ -386,9 +443,54 @@ impl qobject::JsonListModel {
                 self.as_mut().rust_mut().followed = Some(topic);
             }
         }
+        self.as_mut().rust_mut().held.clear();
         self.as_mut().rust_mut().page.reset();
         self.as_mut().set_loaded_to(false);
         self.ask(true);
+    }
+
+    /// No retry waits, and the next failure waits [`RETRY_FIRST_MS`].
+    fn reset_backoff(mut self: Pin<&mut Self>) {
+        let mut rust = self.as_mut().rust_mut();
+        rust.retry_ms = 0;
+        rust.retry_generation += 1;
+        rust.retry_first = None;
+    }
+
+    /// The page asked for failed with `error_json`: `error` is set, and it is asked again later.
+    fn page_failed(mut self: Pin<&mut Self>, first: bool, error_json: &QString) {
+        self.as_mut().rust_mut().page.on_failed();
+        self.as_mut().rust_mut().error = json_variant(&error_json.to_string());
+        self.as_mut().error_changed();
+        let ms = match self.retry_ms {
+            0 => RETRY_FIRST_MS,
+            ms => ms.saturating_mul(2).min(RETRY_MAX_MS),
+        };
+        let generation = {
+            let mut rust = self.as_mut().rust_mut();
+            rust.retry_ms = ms;
+            rust.retry_generation += 1;
+            rust.retry_first = Some(first);
+            rust.retry_generation
+        };
+        qobject::retry_later(&self, ms, generation);
+    }
+
+    pub fn core_retry_due(mut self: Pin<&mut Self>, generation: u64) {
+        if generation != self.retry_generation {
+            return;
+        }
+        match self.as_mut().rust_mut().retry_first.take() {
+            Some(true) => self.start_load(false),
+            Some(false) => self.ask(false),
+            None => {}
+        }
+    }
+
+    pub fn core_connection_changed(self: Pin<&mut Self>) {
+        if !self.loaded && qobject::core_connection(&self.link) == QString::from("ready") {
+            self.reload();
+        }
     }
 
     /// Asks for the next page (the first of a load when `first`).
@@ -440,11 +542,22 @@ impl qobject::JsonListModel {
             _ => Vec::new(),
         };
         self.as_mut().rust_mut().page.on_page(next);
+        self.as_mut().reset_backoff();
+        if !self.error.is_null() {
+            self.as_mut().rust_mut().error = QVariant::default();
+            self.as_mut().error_changed();
+        }
         let id_key = self.id_key.to_string();
         if first {
             // SAFETY: the reset is begun and ended around the change, on the GUI thread.
             unsafe { self.as_mut().begin_reset_model() };
-            self.as_mut().rust_mut().rows.replace(page, &id_key);
+            let mut rust = self.as_mut().rust_mut();
+            let held = std::mem::take(&mut rust.held);
+            rust.rows.replace(page, &id_key);
+            // The events held during the load, through the `updated` guard (module docs).
+            for row in held {
+                let _ = rust.rows.upsert(row, &id_key);
+            }
             unsafe { self.as_mut().end_reset_model() };
             self.set_loaded_to(true);
             return;
@@ -477,23 +590,23 @@ impl qobject::JsonListModel {
     }
 
     pub fn core_call_failed(mut self: Pin<&mut Self>, id: &QString, error_json: &QString) {
-        if self.as_mut().answered(id).is_some() {
-            self.as_mut().rust_mut().page.on_failed();
+        if let Some(first) = self.as_mut().answered(id) {
             tracing::warn!(tool = %self.tool, error = %error_json, "a list page failed");
+            self.page_failed(first, error_json);
         }
     }
 
     /// A list tool never waits on a confirmation: the page is given up as failed.
     pub fn core_call_pending(mut self: Pin<&mut Self>, id: &QString, pending_json: &QString) {
-        if self.as_mut().answered(id).is_some() {
+        if let Some(first) = self.as_mut().answered(id) {
             qobject::core_cancel(&self.link, id);
-            self.as_mut().rust_mut().page.on_failed();
             tracing::warn!(tool = %self.tool, pending = %pending_json, "a list page asked for a confirmation");
+            self.page_failed(first, pending_json);
         }
     }
 
     pub fn core_event_received(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         topic: &QString,
         kind: &QString,
         _seq: f64,
@@ -504,28 +617,39 @@ impl qobject::JsonListModel {
         }
         match kind.to_string().as_str() {
             "snapshot" | "resync_required" => self.reload(),
-            "event" if self.loaded => {
-                let Ok(mut data) = serde_json::from_str::<Value>(&data_json.to_string()) else {
+            "event" => {
+                let Some(row) = self.event_row(data_json) else {
                     return;
                 };
-                let event_kind = self.event_kind.to_string();
-                if !event_kind.is_empty()
-                    && data.get("kind").and_then(Value::as_str) != Some(event_kind.as_str())
-                {
-                    return;
-                }
-                let row_key = self.row_key.to_string();
-                let row = if row_key.is_empty() {
-                    data
-                } else {
-                    data[row_key.as_str()].take()
-                };
-                if row.is_object() {
+                if self.loaded {
                     self.upsert(row);
+                } else if self.held.len() < EVENT_BUFFER_MAX {
+                    self.as_mut().rust_mut().held.push(row);
+                } else {
+                    tracing::warn!(topic = %self.topic, "too many events during a load: loading again");
+                    self.reload();
                 }
             }
             _ => {}
         }
+    }
+
+    /// The row an event's data carries (module docs, "Events"), if it carries one.
+    fn event_row(&self, data_json: &QString) -> Option<Value> {
+        let mut data = serde_json::from_str::<Value>(&data_json.to_string()).ok()?;
+        let event_kind = self.event_kind.to_string();
+        if !event_kind.is_empty()
+            && data.get("kind").and_then(Value::as_str) != Some(event_kind.as_str())
+        {
+            return None;
+        }
+        let row_key = self.row_key.to_string();
+        let row = if row_key.is_empty() {
+            data
+        } else {
+            data[row_key.as_str()].take()
+        };
+        row.is_object().then_some(row)
     }
 
     /// Upserts one row with the model's signals.
@@ -630,18 +754,31 @@ const EVENT_LOG_ROLES: [&str; 5] = ["topic", "kind", "seq", "text", "receivedMs"
 fn log_text(data_json: &str) -> String {
     let mut text = data_json.to_string();
     if text.contains("\"data_b64\"")
-        && let Ok(Value::Object(mut data)) = serde_json::from_str::<Value>(&text)
-        && let Some(Value::String(b64)) = data.remove("data_b64")
+        && let Ok(mut data) = serde_json::from_str::<Value>(&text)
     {
-        let bytes = b64.trim_end_matches('=').len() * 3 / 4;
-        data.insert("bytes".to_string(), Value::from(bytes));
-        text = Value::Object(data).to_string();
+        strip_image_bytes(&mut data);
+        text = data.to_string();
     }
     if text.chars().count() > EVENT_LOG_TEXT_CHARS {
         text = text.chars().take(EVENT_LOG_TEXT_CHARS - 1).collect();
         text.push('…');
     }
     text
+}
+
+/// Replaces every `data_b64` text, at any depth, with `bytes`: its size (review M-8).
+fn strip_image_bytes(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(b64)) = map.remove("data_b64") {
+                let bytes = b64.trim_end_matches('=').len() * 3 / 4;
+                map.insert("bytes".to_string(), Value::from(bytes));
+            }
+            map.values_mut().for_each(strip_image_bytes);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_image_bytes),
+        _ => {}
+    }
 }
 
 fn now_ms() -> f64 {

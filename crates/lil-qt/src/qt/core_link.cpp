@@ -3,6 +3,7 @@
 #include "lil_qt/src/qt/json_list_model.cxxqt.h"
 
 #include <QtCore/QMetaMethod>
+#include <QtCore/QTimer>
 
 namespace lil_qt {
 
@@ -14,6 +15,7 @@ constexpr const char *kRoutes[][2] = {
     {"callFailed", "coreCallFailed(QString,QString)"},
     {"callPendingConfirmation", "coreCallPending(QString,QString)"},
     {"coreEvent", "coreEventReceived(QString,QString,double,QString)"},
+    {"connectionChanged", "coreConnectionChanged()"},
 };
 
 QMetaMethod findMethod(const QMetaObject *meta, const char *name, int parameters, QMetaMethod::MethodType type)
@@ -139,6 +141,19 @@ void coreSubscribe(const CoreLink &link, const QString &topic)
 void coreUnsubscribe(const CoreLink &link, const QString &topic)
 {
     invoke(link.core(), "unsubscribe", {topic});
+}
+
+QString coreConnection(const CoreLink &link)
+{
+    QObject *core = link.core();
+    return core ? core->property("connection").toString() : QString();
+}
+
+void retryLater(const JsonListModel &model, std::uint32_t ms, std::uint64_t generation)
+{
+    auto *target = const_cast<JsonListModel *>(&model);
+    // The model is the timer's context: once it is gone, the timer never fires.
+    QTimer::singleShot(int(ms), target, [target, generation] { target->coreRetryDue(generation); });
 }
 
 } // namespace lil_qt

@@ -2,9 +2,9 @@
 // How the list models (src/qt/json_list_model.rs) reach their `core`: any object with Core's
 // API (APP-028), the Core singleton or the QML tests' FakeCore, reached through its meta-object.
 // Its methods take QString arguments (Core) or untyped ones (a QML object's functions), and the
-// link calls them either way. Its request and event signals are connected to the model's methods
-// of the same shape: coreCallFinished, coreCallFailed, coreCallPending and coreEventReceived,
-// whichever the model has. The core is held weakly: once it is gone, every call is refused.
+// link calls them either way. Its request, event and connection signals are connected to the
+// model's methods of the same shape: coreCallFinished, coreCallFailed, coreCallPending,
+// coreEventReceived and coreConnectionChanged, whichever the model has. The core is held weakly: once it is gone, every call is refused.
 
 #include <QtCore/QList>
 #include <QtCore/QMetaObject>
@@ -13,6 +13,7 @@
 #include <QtCore/QString>
 #include <QtCore/QVariant>
 
+#include <cstdint>
 #include <memory>
 
 class JsonListModel;
@@ -53,5 +54,10 @@ QString coreCall(const CoreLink &link, const QString &tool, const QString &argsJ
 void coreCancel(const CoreLink &link, const QString &id);
 void coreSubscribe(const CoreLink &link, const QString &topic);
 void coreUnsubscribe(const CoreLink &link, const QString &topic);
+// core.connection: empty without a core.
+QString coreConnection(const CoreLink &link);
+
+// Calls model.coreRetryDue(generation) in `ms` ms on the GUI thread, unless the model is gone.
+void retryLater(const JsonListModel &model, std::uint32_t ms, std::uint64_t generation);
 
 } // namespace lil_qt
