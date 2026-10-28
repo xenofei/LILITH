@@ -46,6 +46,94 @@ TestCase {
         }
     }
 
+    // The keyboard-navigable list: the view is the one tab stop, its rows are named ListItems
+    // that take clicks (a MouseArea, a TapHandler, a press action). Nothing to report.
+    Component {
+        id: navigableList
+        Window {
+            property alias page: column
+            width: 300
+            height: 300
+            visible: true
+
+            Column {
+                id: column
+                ListView {
+                    objectName: "jobsList"
+                    width: 280
+                    height: 200
+                    activeFocusOnTab: true
+                    keyNavigationEnabled: true
+                    Accessible.role: Accessible.List
+                    Accessible.name: "Jobs"
+                    model: 4
+                    delegate: Rectangle {
+                        id: row
+                        required property int index
+                        width: 280
+                        height: 30
+                        Accessible.role: Accessible.ListItem
+                        Accessible.name: "Job " + index
+                        Accessible.onPressAction: ListView.view.currentIndex = index
+                        MouseArea { anchors.fill: parent; onClicked: row.ListView.view.currentIndex = row.index }
+                        Rectangle {
+                            width: 20
+                            height: 20
+                            TapHandler {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // A navigable list with a nameless row, and a list whose rows take clicks but which isn't a
+    // tab stop: both reported.
+    Component {
+        id: faultyLists
+        Window {
+            property alias page: column
+            width: 300
+            height: 400
+            visible: true
+
+            Column {
+                id: column
+                ListView {
+                    width: 280
+                    height: 100
+                    activeFocusOnTab: true
+                    Accessible.role: Accessible.List
+                    Accessible.name: "Backups"
+                    model: 2
+                    delegate: Rectangle {
+                        objectName: "namelessRow"
+                        width: 280
+                        height: 30
+                        Accessible.role: Accessible.ListItem
+                        MouseArea { anchors.fill: parent }
+                    }
+                }
+                ListView {
+                    width: 280
+                    height: 100
+                    Accessible.role: Accessible.List
+                    Accessible.name: "Diagnostics"
+                    model: 2
+                    delegate: Rectangle {
+                        required property int index
+                        objectName: "unreachableRow"
+                        width: 280
+                        height: 30
+                        Accessible.role: Accessible.ListItem
+                        Accessible.name: "Event " + index
+                        MouseArea { objectName: "unreachableClick"; anchors.fill: parent }
+                    }
+                }
+            }
+        }
+    }
+
     // Static controls and a named list with its scroll bar: nothing to report.
     Component {
         id: staticControls
@@ -178,6 +266,28 @@ TestCase {
         verify(!what.some(w => w.indexOf("goodParent") >= 0 || w.indexOf("goodChild") >= 0),
                JSON.stringify(what))
         verify(what.some(w => w.indexOf("paneTile") >= 0 && w.indexOf("no accessible name") >= 0),
+               JSON.stringify(what))
+    }
+
+    function test_a_navigable_list_with_named_rows_passes() { // spec: APP-156
+        const w = createTemporaryObject(navigableList, tc)
+        tryVerify(() => w.page.width > 0)
+        wait(50)
+        compare(walk.report(w.page), [])
+        verify(walk.interactiveCount(w.page) >= 5, "the list and its rows' clicks are checked")
+    }
+
+    function test_lists_with_nameless_or_unreachable_rows_are_reported() { // spec: APP-156
+        const w = createTemporaryObject(faultyLists, tc)
+        tryVerify(() => w.page.width > 0)
+        wait(50)
+        const what = walk.report(w.page)
+        verify(what.some(x => x.indexOf("namelessRow") >= 0 && x.indexOf("no accessible name") >= 0),
+               JSON.stringify(what))
+        verify(what.some(x => x.indexOf("unreachableClick") >= 0 && x.indexOf("not in the tab chain") >= 0),
+               JSON.stringify(what))
+        // R-2: a plain item is told to become focusable, not to change a focus policy.
+        verify(!what.some(x => x.indexOf("unreachableClick") >= 0 && x.indexOf("focusPolicy") >= 0),
                JSON.stringify(what))
     }
 

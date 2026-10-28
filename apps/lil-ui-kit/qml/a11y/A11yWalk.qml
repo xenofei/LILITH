@@ -18,6 +18,15 @@
 //     however it is named.
 // Not interactive: static items and controls (Label, ProgressBar, Pane, Frame, ToolSeparator,
 // ScrollView, text), and scroll bars, whose list or view the keyboard scrolls itself.
+//
+// Lists (for the Jobs, Backups and Diagnostics panels and any other list): a keyboard-navigable
+// ListView or GridView is one tab stop, and the arrow keys and Enter work inside it. Make the
+// view itself the tab stop (activeFocusOnTab, keyNavigationEnabled left on) with an
+// Accessible role (List, Table or Tree) and name. Its rows then aren't tab stops: each delegate
+// needs a row role (ListItem, Row, Cell or TreeItem) and its own name ("Job 3, running"), and
+// its pointer input (a MouseArea, a TapHandler, a press action) sits on the row or under it. A
+// row with no name, or with another role, is reported; so is a view whose rows take clicks but
+// that isn't a tab stop. Controls of their own inside a row (a button) follow the usual rule.
 // `exempt(item)`, when given, skips an item and what it holds (each caller says why). Each panel
 // task runs it over its panel:
 //     A11yWalk { id: walk }
@@ -38,20 +47,34 @@ QtObject {
                 return
             const own = LilShim.accessibleOf(item)
             const label = describe(item, own)
+            // A row of a keyboard-navigable list, or a click on or under one: judged by the row.
+            const lr = listRow(item, root, chain)
+            if (lr && (item === lr.row || kind === "pointer")) {
+                const r = LilShim.accessibleOf(lr.row)
+                const row = describe(lr.row, r)
+                if (rowRoles.indexOf(r.role) < 0)
+                    out.push({item: item, what: label + ": " + row + " of " + describe(lr.view, LilShim.accessibleOf(lr.view))
+                                                + " needs a row role (ListItem, Row, Cell or TreeItem)"})
+                if (!r.name || r.name.trim() === "")
+                    out.push({item: item, what: label + ": no accessible name on " + row})
+                return
+            }
             if (kind === "pointer") {
                 const owner = accessibleAncestor(item, root)
                 if (!owner || !takesInput(owner)) {
                     const near = owner ? " (" + describe(owner, LilShim.accessibleOf(owner)) + " is a container)" : ""
                     out.push({item: item, what: label + ": takes clicks with no accessible role on it or an interactive ancestor" + near})
                     out.push({item: item, what: label + ": no accessible name on it or an interactive ancestor" + near})
-                    out.push({item: item, what: label + ": not in the tab chain, nor an interactive ancestor" + near})
+                    out.push({item: item, what: label + ": not in the tab chain, nor an interactive ancestor" + near
+                                                + ": make it or its accessible owner focusable (activeFocusOnTab)"})
                     return
                 }
                 const a = LilShim.accessibleOf(owner)
                 if (!a.name || a.name.trim() === "")
                     out.push({item: item, what: label + ": no accessible name on " + describe(owner, a)})
                 if (chain.indexOf(owner) < 0)
-                    out.push({item: item, what: label + ": not in the tab chain, nor " + describe(owner, a)})
+                    out.push({item: item, what: label + ": not in the tab chain, nor " + describe(owner, a)
+                                                + ": make it or its accessible owner focusable (activeFocusOnTab)"})
                 return
             }
             if (own.role === Accessible.NoRole)
@@ -59,9 +82,13 @@ QtObject {
             if (!own.name || own.name.trim() === "")
                 out.push({item: item, what: label + ": no accessible name"})
             if (chain.indexOf(item) < 0) {
-                const policy = typeof item.focusPolicy === "number" && !(item.focusPolicy & Qt.TabFocus)
+                // The focus policy is the cause only for a control that takes input and isn't a
+                // tab stop by its own setting; any other item is told to become focusable.
+                const policy = typeof item.focusPolicy === "number" && !item.activeFocusOnTab
+                               && takesInput(item) && !(item.focusPolicy & Qt.TabFocus)
                 out.push({item: item, what: label + ": not in the tab chain"
-                                            + (policy ? " (its focusPolicy lacks Qt.TabFocus)" : "")})
+                                            + (policy ? " (its focusPolicy lacks Qt.TabFocus)"
+                                                      : ": make it or its accessible owner focusable (activeFocusOnTab)")})
             }
         })
         return out
@@ -80,6 +107,29 @@ QtObject {
                 ++n
         })
         return n
+    }
+
+    // The roles a list's row takes, and the roles of a list that is one tab stop.
+    readonly property var rowRoles: [Accessible.ListItem, Accessible.Row, Accessible.Cell, Accessible.TreeItem]
+    readonly property var listRoles: [Accessible.List, Accessible.Table, Accessible.Tree]
+
+    // {view, row} when `item` is, or sits under, a delegate of a keyboard-navigable ListView or
+    // GridView inside `root`: the view is a tab stop in `chain` with key navigation on and a list
+    // role and name. Else null.
+    function listRow(item, root, chain) {
+        for (let child = item, p = item.parent; p; child = p, p = p.parent) {
+            const view = p.parent
+            if (view && view.contentItem === p && view.keyNavigationEnabled !== undefined) {
+                const a = LilShim.accessibleOf(view)
+                const navigable = view.activeFocusOnTab && view.keyNavigationEnabled
+                                  && chain.indexOf(view) >= 0 && listRoles.indexOf(a.role) >= 0
+                                  && a.name && a.name.trim() !== ""
+                return navigable ? {view: view, row: child} : null
+            }
+            if (p === root)
+                break
+        }
+        return null
     }
 
     // The roles of items that take input themselves.
