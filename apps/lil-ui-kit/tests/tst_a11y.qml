@@ -66,6 +66,8 @@ TestCase {
                     keyNavigationEnabled: true
                     Accessible.role: Accessible.List
                     Accessible.name: "Jobs"
+                    // A header isn't a row: its button is checked as a button.
+                    header: LButton { objectName: "refresh"; text: "Refresh" }
                     model: 4
                     delegate: Rectangle {
                         id: row
@@ -94,7 +96,7 @@ TestCase {
         Window {
             property alias page: column
             width: 300
-            height: 400
+            height: 600
             visible: true
 
             Column {
@@ -112,6 +114,38 @@ TestCase {
                         height: 30
                         Accessible.role: Accessible.ListItem
                         MouseArea { anchors.fill: parent }
+                    }
+                }
+                ListView {
+                    width: 280
+                    height: 100
+                    activeFocusOnTab: true
+                    Accessible.role: Accessible.List
+                    Accessible.name: "Logs"
+                    header: LButton { objectName: "namelessHeader" }
+                    model: 1
+                    delegate: Rectangle {
+                        width: 280
+                        height: 30
+                        Accessible.role: Accessible.ListItem
+                        Accessible.name: "Log"
+                    }
+                }
+                ListView {
+                    width: 280
+                    height: 100
+                    activeFocusOnTab: true
+                    keyNavigationEnabled: false
+                    Accessible.role: Accessible.List
+                    Accessible.name: "Events"
+                    model: 2
+                    delegate: Rectangle {
+                        required property int index
+                        width: 280
+                        height: 30
+                        Accessible.role: Accessible.ListItem
+                        Accessible.name: "Event " + index
+                        MouseArea { objectName: "noKeysClick"; anchors.fill: parent }
                     }
                 }
                 ListView {
@@ -285,6 +319,14 @@ TestCase {
         verify(what.some(x => x.indexOf("namelessRow") >= 0 && x.indexOf("no accessible name") >= 0),
                JSON.stringify(what))
         verify(what.some(x => x.indexOf("unreachableClick") >= 0 && x.indexOf("not in the tab chain") >= 0),
+               JSON.stringify(what))
+        // S-1: a broken header button is reported as a button, not as a row.
+        verify(what.some(x => x.indexOf("namelessHeader") >= 0 && x.indexOf("no accessible name") >= 0
+                              && x.indexOf("row role") < 0), JSON.stringify(what))
+        verify(!what.some(x => x.indexOf("namelessHeader") >= 0 && x.indexOf("row role") >= 0),
+               JSON.stringify(what))
+        // S-2: rows that take clicks in a list without key navigation aren't reachable.
+        verify(what.some(x => x.indexOf("noKeysClick") >= 0 && x.indexOf("not in the tab chain") >= 0),
                JSON.stringify(what))
         // R-2: a plain item is told to become focusable, not to change a focus policy.
         verify(!what.some(x => x.indexOf("unreachableClick") >= 0 && x.indexOf("focusPolicy") >= 0),

@@ -26,7 +26,8 @@
 // needs a row role (ListItem, Row, Cell or TreeItem) and its own name ("Job 3, running"), and
 // its pointer input (a MouseArea, a TapHandler, a press action) sits on the row or under it. A
 // row with no name, or with another role, is reported; so is a view whose rows take clicks but
-// that isn't a tab stop. Controls of their own inside a row (a button) follow the usual rule.
+// that isn't a tab stop, or that has key navigation off. Controls of their own inside a row (a
+// button), and the view's header and footer, aren't rows: they follow the usual rule.
 // `exempt(item)`, when given, skips an item and what it holds (each caller says why). Each panel
 // task runs it over its panel:
 //     A11yWalk { id: walk }
@@ -115,11 +116,13 @@ QtObject {
 
     // {view, row} when `item` is, or sits under, a delegate of a keyboard-navigable ListView or
     // GridView inside `root`: the view is a tab stop in `chain` with key navigation on and a list
-    // role and name. Else null.
+    // role and name. Else null, also for the view's header and footer, which aren't rows.
     function listRow(item, root, chain) {
         for (let child = item, p = item.parent; p; child = p, p = p.parent) {
             const view = p.parent
             if (view && view.contentItem === p && view.keyNavigationEnabled !== undefined) {
+                if (child === view.headerItem || child === view.footerItem)
+                    return null
                 const a = LilShim.accessibleOf(view)
                 const navigable = view.activeFocusOnTab && view.keyNavigationEnabled
                                   && chain.indexOf(view) >= 0 && listRoles.indexOf(a.role) >= 0
