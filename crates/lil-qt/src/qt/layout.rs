@@ -3,8 +3,8 @@
 //! (`dir`): the app's state folder, which `main.cpp` hands the shell (`app_state_dir`), or a
 //! test's own temporary folder, so a QML test never touches real state.
 //!
-//! - `loadLayout(dir)`: `{"status": "ok", "layout": {...}}` (with `"fromBackup": true` when
-//!   `layout.json` is missing and its `.bak` is read instead), `{"status": "missing"}`, for a file
+//! - `loadLayout(dir)`: `{"status": "ok", "layout": {...}}`, `{"status": "missing"}` (no
+//!   `layout.json`; its `.bak` is only `replace_file`'s backup and is never read), for a file
 //!   that doesn't parse `{"status": "bad", "setAside": "<new file name>", "why"}` (the file is set
 //!   aside first), or for one that can't be read (another program holds it, say)
 //!   `{"status": "unreadable", "why"}`: the file is left alone and the shell doesn't save over it.
@@ -90,11 +90,7 @@ impl qobject::ShellState {
         match LayoutFile::load(&path) {
             Ok(layout) => qs(json!({"status": "ok", "layout": layout})),
             Err(LayoutError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                // A save that stopped between the swap's two steps leaves only the backup.
-                match LayoutFile::load(&path.with_file_name("layout.json.bak")) {
-                    Ok(layout) => qs(json!({"status": "ok", "layout": layout, "fromBackup": true})),
-                    Err(_) => qs(json!({"status": "missing"})),
-                }
+                qs(json!({"status": "missing"}))
             }
             Err(LayoutError::Io(e)) => {
                 tracing::warn!(error = %e, "the layout file can't be read: the Default layout opens, and the file is kept");
