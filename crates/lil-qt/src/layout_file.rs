@@ -15,6 +15,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use lil_platform::fs::RetryClass;
 use serde::{Deserialize, Serialize};
 
 /// The `layout` version this build reads and writes.
@@ -38,11 +39,31 @@ pub struct Screen {
     pub scale: f64,
 }
 
-/// `window`, moved and shrunk so it lies inside one screen's available area (APP-003): the screen
-/// named `saved_screen` when it is still there, else the primary, `screens[0]`. A window larger
-/// than the area shrinks to it; one that doesn't overlap the area at all (its screen was
-/// unplugged, or the screens moved) is centred in it; any other is moved just far enough to fit.
-/// With no screens, `window` is returned as it is.
+/// The smallest window (its frame) the clamp leaves, unless the screen's area is smaller: a
+/// parseable file with a size of 0 doesn't restore a 1 x 1 window.
+pub const MIN_WINDOW_W: i32 = 640;
+pub const MIN_WINDOW_H: i32 = 400;
+
+/// A window frame's margins around its client area: the title bar and the borders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Margins {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+fn to_i32(v: i64) -> i32 {
+    v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// `window` (a window's frame, title bar included), moved and shrunk so it lies inside one
+/// screen's available area (APP-003): the screen named `saved_screen` when it is still there,
+/// else the primary, `screens[0]`. A window larger than the area shrinks to it, and one smaller
+/// than [`MIN_WINDOW_W`] x [`MIN_WINDOW_H`] grows to that (within the area); one that doesn't
+/// overlap the area at all (its screen was unplugged, or the screens moved) is centred in it; any
+/// other is moved just far enough to fit. With no screens, `window` is returned as it is. The
+/// arithmetic is in i64, so no saved value overflows it.
 pub fn clamp_to_screens(window: Rect, saved_screen: &str, screens: &[Screen]) -> Rect {
     let Some(screen) = screens
         .iter()
@@ -51,22 +72,57 @@ pub fn clamp_to_screens(window: Rect, saved_screen: &str, screens: &[Screen]) ->
     else {
         return window;
     };
-    let area = screen.available;
-    let w = window.w.clamp(1, area.w.max(1));
-    let h = window.h.clamp(1, area.h.max(1));
-    let overlaps = window.x < area.x + area.w
-        && area.x < window.x + window.w
-        && window.y < area.y + area.h
-        && area.y < window.y + window.h;
+    let (ax, ay) = (i64::from(screen.available.x), i64::from(screen.available.y));
+    let aw = i64::from(screen.available.w.max(1));
+    let ah = i64::from(screen.available.h.max(1));
+    let (wx, wy) = (i64::from(window.x), i64::from(window.y));
+    let w = i64::from(window.w).max(i64::from(MIN_WINDOW_W)).min(aw);
+    let h = i64::from(window.h).max(i64::from(MIN_WINDOW_H)).min(ah);
+    let overlaps = wx < ax + aw
+        && ax < wx + i64::from(window.w)
+        && wy < ay + ah
+        && ay < wy + i64::from(window.h);
     let (x, y) = if overlaps {
-        (
-            window.x.clamp(area.x, area.x + area.w - w),
-            window.y.clamp(area.y, area.y + area.h - h),
-        )
+        (wx.clamp(ax, ax + aw - w), wy.clamp(ay, ay + ah - h))
     } else {
-        (area.x + (area.w - w) / 2, area.y + (area.h - h) / 2)
+        (ax + (aw - w) / 2, ay + (ah - h) / 2)
     };
-    Rect { x, y, w, h }
+    Rect {
+        x: to_i32(x),
+        y: to_i32(y),
+        w: to_i32(w),
+        h: to_i32(h),
+    }
+}
+
+/// [`clamp_to_screens`] for a window known by its client area: its frame (`client` grown by
+/// `margins`) is clamped, so the title bar stays on the screen, and the client area inside the
+/// clamped frame is returned.
+pub fn clamp_client(
+    client: Rect,
+    margins: Margins,
+    saved_screen: &str,
+    screens: &[Screen],
+) -> Rect {
+    let (l, t, r, b) = (
+        i64::from(margins.left),
+        i64::from(margins.top),
+        i64::from(margins.right),
+        i64::from(margins.bottom),
+    );
+    let frame = Rect {
+        x: to_i32(i64::from(client.x) - l),
+        y: to_i32(i64::from(client.y) - t),
+        w: to_i32(i64::from(client.w) + l + r),
+        h: to_i32(i64::from(client.h) + t + b),
+    };
+    let f = clamp_to_screens(frame, saved_screen, screens);
+    Rect {
+        x: to_i32(i64::from(f.x) + l),
+        y: to_i32(i64::from(f.y) + t),
+        w: to_i32(i64::from(f.w) - l - r),
+        h: to_i32(i64::from(f.h) - t - b),
+    }
 }
 
 /// The screen a window was on when the layout was saved.
@@ -120,9 +176,13 @@ impl std::error::Error for LayoutError {}
 
 impl LayoutFile {
     /// Reads `path`. `kddw` must be a JSON object; KDDockWidgets judges the rest of it at
-    /// restore.
+    /// restore. A file that isn't UTF-8 is a [`LayoutError::Parse`]; any other read error stays
+    /// [`LayoutError::Io`] (the file may be fine and only held by another program).
     pub fn load(path: &Path) -> Result<LayoutFile, LayoutError> {
-        let text = std::fs::read_to_string(path).map_err(LayoutError::Io)?;
+        let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            io::ErrorKind::InvalidData => LayoutError::Parse(e.to_string()),
+            _ => LayoutError::Io(e),
+        })?;
         LayoutFile::parse(&text)
     }
 
@@ -170,11 +230,19 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
         lil_platform::fs::flush(&file)?;
     }
     let swapped = if path.try_exists()? {
-        lil_platform::fs::replace_file(path, &temp, &backup)
+        match lil_platform::fs::replace_file(path, &temp, &backup) {
+            // Error 1177: the old file is already under the backup name and the target name is
+            // free, but the new file is still under its temp name: move it in (as lil-core's
+            // ReplacementNotMoved step does) rather than lose it.
+            Err(e) if lil_platform::fs::classify(&e) == RetryClass::ReplacementNotMoved => {
+                lil_platform::fs::move_new(&temp, path)
+            }
+            other => other,
+        }
     } else {
         lil_platform::fs::move_new(&temp, path)
     };
-    if swapped.is_err() {
+    if swapped.is_err() && temp.try_exists().unwrap_or(false) {
         let _ = std::fs::remove_file(&temp);
     }
     swapped
@@ -236,6 +304,7 @@ mod tests {
     fn layout_clamps_windows_to_the_available_area() {
         let primary = rect(0, 0, 1920, 1040);
         let right = rect(1920, 0, 2560, 1400);
+        let left = rect(-1920, 0, 1920, 1040);
         let two = [
             screen(r"\\.\DISPLAY1", primary, 1.0),
             screen(r"\\.\DISPLAY2", right, 1.5),
@@ -248,11 +317,15 @@ mod tests {
         assert!(inside(r, primary), "{r:?}");
         assert_eq!((r.w, r.h), (1280, 800), "it keeps its size");
 
-        // A layout saved at 150 % restored on a 100 % screen stays inside the area.
-        let saved_at_150 = rect(150, 90, 1800, 1100);
-        let at_100 = [screen(r"\\.\DISPLAY1", primary, 1.0)];
-        let r = clamp_to_screens(saved_at_150, r"\\.\DISPLAY1", &at_100);
-        assert!(inside(r, primary), "{r:?}");
+        // A layout saved at 100 % (a 1800 x 1000 window on a 1920 x 1040 area) restored when the
+        // screen is at 150 %, whose area is then 1280 x 693 device-independent pixels: the window
+        // shrinks into it.
+        let at_150 = [screen(r"\\.\DISPLAY1", rect(0, 0, 1280, 693), 1.5)];
+        let r = clamp_to_screens(rect(60, 20, 1800, 1000), r"\\.\DISPLAY1", &at_150);
+        assert_eq!(r, rect(0, 0, 1280, 693));
+        // And the other way: saved at 150 %, restored at 100 %, it fits and stays where it was.
+        let r = clamp_to_screens(rect(40, 30, 1200, 650), r"\\.\DISPLAY1", &one);
+        assert_eq!(r, rect(40, 30, 1200, 650));
 
         // A window larger than its area shrinks to it.
         let r = clamp_to_screens(rect(-50, -50, 4000, 3000), r"\\.\DISPLAY1", &one);
@@ -263,12 +336,58 @@ mod tests {
         let r = clamp_to_screens(rect(1800, 50, 1600, 900), r"\\.\DISPLAY2", &two);
         assert!(inside(r, right), "{r:?}");
 
+        // A screen left of the primary, at negative coordinates, keeps its window there.
+        let three = [
+            screen(r"\\.\DISPLAY1", primary, 1.0),
+            screen(r"\\.\DISPLAY3", left, 1.0),
+        ];
+        let r = clamp_to_screens(rect(-1800, 100, 1000, 700), r"\\.\DISPLAY3", &three);
+        assert_eq!(r, rect(-1800, 100, 1000, 700));
+        let r = clamp_to_screens(rect(-2500, -40, 1000, 700), r"\\.\DISPLAY3", &three);
+        assert_eq!(r, rect(-1920, 0, 1000, 700));
+
+        // One pixel of overlap counts as on the screen: it is moved in, not centred.
+        let r = clamp_to_screens(rect(1919, 100, 800, 600), r"\\.\DISPLAY1", &one);
+        assert_eq!(r, rect(1120, 100, 800, 600));
+
         // A window that fits is left where it is.
         let fits = rect(100, 100, 800, 600);
         assert_eq!(clamp_to_screens(fits, r"\\.\DISPLAY1", &two), fits);
 
+        // A size of 0 grows to the minimum; values near i32's limits don't overflow.
+        let r = clamp_to_screens(rect(10, 10, 0, 0), r"\\.\DISPLAY1", &one);
+        assert_eq!((r.w, r.h), (MIN_WINDOW_W, MIN_WINDOW_H));
+        let r = clamp_to_screens(rect(2_147_483_000, 10, 1280, 800), r"\\.\DISPLAY1", &one);
+        assert!(inside(r, primary), "{r:?}");
+
         // No screens: unchanged.
         assert_eq!(clamp_to_screens(fits, "x", &[]), fits);
+    }
+
+    #[test] // spec: APP-003
+    fn layout_clamps_the_frame_so_the_title_bar_stays_on_screen() {
+        let laptop = [screen(r"\\.\DISPLAY1", rect(0, 0, 1366, 728), 1.0)];
+        let margins = Margins {
+            left: 8,
+            top: 31,
+            right: 8,
+            bottom: 8,
+        };
+        // A 1280 x 800 client area is too tall: the frame shrinks to the area's height, and the
+        // client area sits inside it, below the title bar.
+        let client = clamp_client(rect(40, 0, 1280, 800), margins, r"\\.\DISPLAY1", &laptop);
+        assert_eq!(client, rect(40, 31, 1280, 728 - 39));
+        // A client area whose top is at the area's top moves down by the title bar.
+        let client = clamp_client(rect(100, 0, 800, 600), margins, r"\\.\DISPLAY1", &laptop);
+        assert_eq!(client, rect(100, 31, 800, 600));
+        // No margins: the client area is the frame.
+        let client = clamp_client(
+            rect(100, 0, 800, 600),
+            Margins::default(),
+            r"\\.\DISPLAY1",
+            &laptop,
+        );
+        assert_eq!(client, rect(100, 0, 800, 600));
     }
 
     fn sample() -> LayoutFile {
@@ -347,6 +466,13 @@ mod tests {
             assert!(moved.exists());
         }
         let dir = tempfile::tempdir().unwrap();
+        // Bytes that aren't UTF-8 are damage too, not a read error.
+        let path = dir.path().join("binary.json");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x7b]).unwrap();
+        assert!(matches!(
+            LayoutFile::load(&path),
+            Err(LayoutError::Parse(_))
+        ));
         assert!(matches!(
             LayoutFile::load(&dir.path().join("layout.json")),
             Err(LayoutError::Io(e)) if e.kind() == io::ErrorKind::NotFound

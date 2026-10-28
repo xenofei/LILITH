@@ -3,14 +3,17 @@
 //! (`dir`): the app's state folder, which `main.cpp` hands the shell (`app_state_dir`), or a
 //! test's own temporary folder, so a QML test never touches real state.
 //!
-//! - `loadLayout(dir)`: `{"status": "ok", "layout": {...}}`, `{"status": "missing"}`, or, for a
-//!   file that doesn't parse, `{"status": "bad", "setAside": "<new file name>", "why"}` (the file
-//!   is set aside first).
+//! - `loadLayout(dir)`: `{"status": "ok", "layout": {...}}` (with `"fromBackup": true` when
+//!   `layout.json` is missing and its `.bak` is read instead), `{"status": "missing"}`, for a file
+//!   that doesn't parse `{"status": "bad", "setAside": "<new file name>", "why"}` (the file is set
+//!   aside first), or for one that can't be read (another program holds it, say)
+//!   `{"status": "unreadable", "why"}`: the file is left alone and the shell doesn't save over it.
 //! - `setLayoutAside(dir)`: sets `layout.json` aside (KDDockWidgets refused its blob); the new
 //!   file name, or empty when it couldn't.
 //! - `saveLayout(dir, layoutJson)`: writes `layout.json` through `replace_file`; empty, or why it
 //!   couldn't.
-//! - `clamp(windowJson, savedScreen, screensJson)`: `clamp_to_screens` over JSON.
+//! - `clamp(windowJson, savedScreen, screensJson, marginsJson)`: `clamp_client` over JSON (the
+//!   window's client area and its frame margins).
 //! - `shortcuts()`: the plan 4a map as `[{"keys", "action", "scope"}]`.
 
 use core::pin::Pin;
@@ -19,7 +22,7 @@ use std::path::{Path, PathBuf};
 use cxx_qt_lib::QString;
 use serde_json::json;
 
-use crate::layout_file::{LayoutError, LayoutFile, Rect, Screen, clamp_to_screens, set_aside};
+use crate::layout_file::{LayoutError, LayoutFile, Margins, Rect, Screen, clamp_client, set_aside};
 use crate::shortcuts::ShortcutMap;
 
 #[cxx_qt::bridge]
@@ -52,6 +55,7 @@ pub mod qobject {
             window_json: &QString,
             saved_screen: &QString,
             screens_json: &QString,
+            margins_json: &QString,
         ) -> QString;
 
         #[qinvokable]
@@ -86,7 +90,15 @@ impl qobject::ShellState {
         match LayoutFile::load(&path) {
             Ok(layout) => qs(json!({"status": "ok", "layout": layout})),
             Err(LayoutError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                qs(json!({"status": "missing"}))
+                // A save that stopped between the swap's two steps leaves only the backup.
+                match LayoutFile::load(&path.with_file_name("layout.json.bak")) {
+                    Ok(layout) => qs(json!({"status": "ok", "layout": layout, "fromBackup": true})),
+                    Err(_) => qs(json!({"status": "missing"})),
+                }
+            }
+            Err(LayoutError::Io(e)) => {
+                tracing::warn!(error = %e, "the layout file can't be read: the Default layout opens, and the file is kept");
+                qs(json!({"status": "unreadable", "why": e.to_string()}))
             }
             Err(e) => {
                 let why = e.to_string();
@@ -145,12 +157,15 @@ impl qobject::ShellState {
         window_json: &QString,
         saved_screen: &QString,
         screens_json: &QString,
+        margins_json: &QString,
     ) -> QString {
         let window: Result<Rect, _> = serde_json::from_str(&window_json.to_string());
         let screens: Result<Vec<Screen>, _> = serde_json::from_str(&screens_json.to_string());
+        let margins: Margins = serde_json::from_str(&margins_json.to_string()).unwrap_or_default();
         match (window, screens) {
-            (Ok(window), Ok(screens)) => qs(json!(clamp_to_screens(
+            (Ok(window), Ok(screens)) => qs(json!(clamp_client(
                 window,
+                margins,
                 &saved_screen.to_string(),
                 &screens
             ))),
