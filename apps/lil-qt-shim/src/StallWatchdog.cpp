@@ -28,13 +28,17 @@ namespace lilshim {
 
 namespace {
 
-constexpr int kBeatMs = 10;
+// A coarse beat: a 50 ms stall doesn't need a finer one, and a precise timer under 20 ms raises
+// Windows' timer resolution for the life of the app.
+constexpr int kBeatMs = 20;
 constexpr SIZE_T kStackCopy = 32 * 1024;
 constexpr int kMaxFrames = 32;
 
 QElapsedTimer g_clock;
 std::atomic<qint64> g_lastBeatMs{0};
 std::atomic<bool> g_stop{false};
+std::atomic<int> g_stalls{0};
+std::atomic<int> g_stacks{0};
 DWORD g_guiTid = 0;
 
 struct Module
@@ -130,6 +134,7 @@ void watch()
             dumpedFor = beat;
             lastDumpMs = now;
             logEvent(QStringLiteral("gui_stall_stack"), {{"ms", double(stalled)}, {"frames", guiStack()}});
+            ++g_stacks;
         }
     }
 }
@@ -144,13 +149,15 @@ void startStallWatchdog()
     g_clock.start();
     g_lastBeatMs = g_clock.elapsed();
     auto *timer = new QTimer(QCoreApplication::instance());
-    timer->setTimerType(Qt::PreciseTimer);
+    timer->setTimerType(Qt::CoarseTimer);
     timer->setInterval(kBeatMs);
     QObject::connect(timer, &QTimer::timeout, [] {
         const qint64 now = g_clock.elapsed();
         const qint64 late = now - g_lastBeatMs.exchange(now) - kBeatMs;
-        if (late > kStallLogMs)
+        if (late > kStallLogMs) {
             logEvent(QStringLiteral("gui_stall"), {{"ms", double(late)}});
+            ++g_stalls;
+        }
     });
     timer->start();
     std::thread watcher(watch);
@@ -158,11 +165,18 @@ void startStallWatchdog()
     watcher.detach();
 }
 
+StallCounts stallCounts()
+{
+    return {g_stalls.load(), g_stacks.load()};
+}
+
 void warmFonts()
 {
     QThreadPool::globalInstance()->start([] {
+        QElapsedTimer took;
+        took.start();
         const qsizetype families = QFontDatabase::families().size();
-        logEvent(QStringLiteral("fonts_warm"), {{"families", double(families)}});
+        logEvent(QStringLiteral("fonts_warm"), {{"families", double(families)}, {"ms", double(took.elapsed())}});
     });
 }
 

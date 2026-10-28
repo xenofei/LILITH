@@ -1,6 +1,7 @@
 #include "LilShim.h"
 
 #include "lilshim/Activation.h"
+#include "lilshim/StallWatchdog.h"
 
 #include <QAccessible>
 #include <QColor>
@@ -26,10 +27,12 @@ QVariantMap LilShim::accessibleOf(QObject *item) const
 {
     QAccessibleInterface *iface = item ? QAccessible::queryAccessibleInterface(item) : nullptr;
     if (!iface)
-        return {{"role", 0}, {"name", QString()}, {"focusable", false}};
+        return {{"role", 0}, {"name", QString()}, {"focusable", false}, {"actions", QStringList()}};
+    QAccessibleActionInterface *actions = iface->actionInterface();
     return {{"role", int(iface->role())},
             {"name", iface->text(QAccessible::Name)},
-            {"focusable", bool(iface->state().focusable)}};
+            {"focusable", bool(iface->state().focusable)},
+            {"actions", actions ? actions->actionNames() : QStringList()}};
 }
 
 void LilShim::applyPalette(const QVariantMap &colors) const
@@ -50,4 +53,15 @@ void LilShim::applyPalette(const QVariantMap &colors) const
             palette.setColor(role, v.value<QColor>());
     }
     QGuiApplication::setPalette(palette);
+}
+
+void LilShim::startStallWatchdog() const
+{
+    lilshim::startStallWatchdog();
+}
+
+QVariantMap LilShim::stallCounts() const
+{
+    const lilshim::StallCounts c = lilshim::stallCounts();
+    return {{"stalls", c.stalls}, {"stacks", c.stacks}};
 }

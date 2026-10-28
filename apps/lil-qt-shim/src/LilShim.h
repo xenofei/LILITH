@@ -23,8 +23,9 @@ public:
     Q_INVOKABLE void showInExplorer(const QString &path) const;
 
     // What the accessibility layer (UI Automation's source) exposes for `item`:
-    // {role: QAccessible::Role (QML's Accessible.Role), name, focusable}; role 0 (NoRole) and an
-    // empty name when it has no accessible interface. A11yWalk reads it.
+    // {role: QAccessible::Role (QML's Accessible.Role), name, focusable, actions: [action names
+    // such as "Press" and "SetFocus"]}; role 0 (NoRole) and an empty name when it has no
+    // accessible interface. A11yWalk reads it.
     Q_INVOKABLE QVariantMap accessibleOf(QObject *item) const;
 
     // Sets the application palette from the theme (APP-012), so what Qt and KDDockWidgets
@@ -32,4 +33,8 @@ public:
     // dark too. Keys: window, windowText, base, alternateBase, text, button, buttonText, light,
     // mid, dark, highlight, highlightedText, placeholderText; colours as QML colors.
     Q_INVOKABLE void applyPalette(const QVariantMap &colors) const;
+
+    // lilshim::startStallWatchdog and what it has logged: {stalls, stacks} (the bench test).
+    Q_INVOKABLE void startStallWatchdog() const;
+    Q_INVOKABLE QVariantMap stallCounts() const;
 };

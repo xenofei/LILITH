@@ -1,7 +1,8 @@
 #pragma once
 // The GUI-thread stall watchdog (APP-135; spike 10 §8, follow-ups 3 and 4) and the font warm-up.
 //
-// startStallWatchdog() runs a heartbeat on the GUI thread and a watcher thread beside it:
+// startStallWatchdog() runs a heartbeat on the GUI thread (a coarse 20 ms timer) and a watcher
+// thread beside it:
 // - each stall of the GUI thread longer than kStallLogMs is logged once it ends, as
 //   {"event": "gui_stall", "ms"} (spike 10 saw 14 such stalls a minute under ComfyUI load, so
 //   they are expected and only logged);
@@ -21,10 +22,19 @@ constexpr int kStallLogMs = 50;
 constexpr int kStallDumpMs = 250;
 constexpr int kDumpEveryMs = 60'000;
 
-// Call once, on the GUI thread, after the application object exists.
+// Call on the GUI thread, after the application object exists; later calls do nothing.
 LILSHIM_EXPORT void startStallWatchdog();
 
 // Call once, after the application object exists and before the QML engine loads the window.
+// It logs {"event": "fonts_warm", "families", "ms"}.
 LILSHIM_EXPORT void warmFonts();
+
+// What the watchdog has logged so far (the bench test reads it).
+struct StallCounts
+{
+    int stalls;
+    int stacks;
+};
+LILSHIM_EXPORT StallCounts stallCounts();
 
 } // namespace lilshim

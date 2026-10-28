@@ -12,6 +12,7 @@
 #include <kddockwidgets/qtquick/views/View.h>
 
 #include <QGuiApplication>
+#include <QSessionManager>
 #include <QJSEngine>
 #include <QJsonArray>
 #include <QQuickItem>
@@ -57,16 +58,9 @@ QRect mapRect(const QVariantMap &m)
     return QRect(m.value("x").toInt(), m.value("y").toInt(), m.value("w").toInt(), m.value("h").toInt());
 }
 
-// The geometry the window has when it isn't maximized: the platform's normal geometry (in
-// device-independent pixels), else, for a normal window, its geometry.
-QRect normalGeometry(QWindow *w)
+QVariantMap marginsMap(const QMargins &m)
 {
-    if (const QPlatformWindow *pw = w->handle()) {
-        const QRect native = pw->normalGeometry();
-        if (native.isValid())
-            return QHighDpi::fromNativePixels(native, w);
-    }
-    return w->geometry();
+    return {{"left", m.left()}, {"top", m.top()}, {"right", m.right()}, {"bottom", m.bottom()}};
 }
 
 } // namespace
@@ -74,6 +68,12 @@ QRect normalGeometry(QWindow *w)
 LayoutBridge::LayoutBridge(QObject *parent)
     : QObject(parent)
 {
+    // An application filter runs before every object's own, KDDockWidgets' close filter among
+    // them, whatever order they were installed in.
+    qGuiApp->installEventFilter(this);
+    // A logoff or shutdown quits without a close event: the shell saves then too.
+    connect(qGuiApp, &QGuiApplication::commitDataRequest, this, [this](QSessionManager &) { emit saveRequested(); });
+    connect(qGuiApp, &QCoreApplication::aboutToQuit, this, &LayoutBridge::saveRequested);
 }
 
 LayoutBridge::~LayoutBridge()
@@ -90,17 +90,39 @@ void LayoutBridge::step(const QString &name, const QJsonObject &fields)
     m_steps << name;
     QJsonObject all = fields;
     all.insert(QStringLiteral("step"), name);
+    m_details.append(all.toVariantMap());
     lilshim::logEvent(QStringLiteral("layout_step"), all);
 }
 
 bool LayoutBridge::eventFilter(QObject *watched, QEvent *event)
 {
-    if (event->type() == QEvent::Close) {
-        const auto it = m_watched.constFind(watched);
-        if (it != m_watched.constEnd())
-            emit mainWindowClosing(it.value());
+    const QEvent::Type type = event->type();
+    if (type != QEvent::Close && type != QEvent::Move && type != QEvent::Resize)
+        return false;
+    const auto it = m_watched.constFind(watched);
+    if (it == m_watched.constEnd())
+        return false;
+    auto *w = static_cast<QWindow *>(watched);
+    if (type == QEvent::Close)
+        emit mainWindowClosing(it.value());
+    else if (w->windowStates() == Qt::WindowNoState)
+        m_normal.insert(w, w->geometry());
+    return false;
+}
+
+// The geometry the window has when it isn't maximized: the platform's normal geometry (in
+// device-independent pixels), else the last geometry seen while it was normal (the offscreen
+// platform keeps none), else its geometry.
+QRect LayoutBridge::normalGeometry(QWindow *w) const
+{
+    if (const QPlatformWindow *pw = w->handle()) {
+        const QRect native = pw->normalGeometry();
+        if (native.isValid())
+            return QHighDpi::fromNativePixels(native, w);
     }
-    return QObject::eventFilter(watched, event);
+    if (w->windowStates() != Qt::WindowNoState && m_normal.contains(w))
+        return m_normal.value(w);
+    return w->geometry();
 }
 
 QStringList LayoutBridge::steps() const
@@ -108,9 +130,15 @@ QStringList LayoutBridge::steps() const
     return m_steps;
 }
 
+QVariantList LayoutBridge::stepDetails() const
+{
+    return m_details;
+}
+
 void LayoutBridge::clearSteps()
 {
     m_steps.clear();
+    m_details.clear();
 }
 
 void LayoutBridge::windowsCreated()
@@ -118,12 +146,13 @@ void LayoutBridge::windowsCreated()
     QJsonArray names;
     for (KDDockWidgets::Core::MainWindow *mw : KDDockWidgets::DockRegistry::self()->mainwindows()) {
         names.append(mw->uniqueName());
-        // Installed after KDDockWidgets' own close filter, so it runs first.
         QWindow *w = windowOf(mw);
         if (w && !m_watched.contains(w)) {
             m_watched.insert(w, mw->uniqueName());
-            w->installEventFilter(this);
-            connect(w, &QObject::destroyed, this, [this, w] { m_watched.remove(w); });
+            connect(w, &QObject::destroyed, this, [this, w] {
+                m_watched.remove(w);
+                m_normal.remove(w);
+            });
         }
     }
     step(QStringLiteral("windows_created"), {{"main_windows", names}});
@@ -149,13 +178,19 @@ int LayoutBridge::clamp(const QVariantList &saved, const QJSValue &clampFn)
 {
     QJSEngine *engine = qjsEngine(this);
     const QJSValue screenList = engine ? engine->toScriptValue(screens()) : QJSValue();
+    // The frame is clamped, not the client area, so the title bar stays on the screen: the
+    // platform window is made first, which gives the frame's margins.
     auto place = [&](QWindow *w, QRect geometry, const QString &screen, bool maximized) {
-        const QJSValue r = clampFn.call({engine->toScriptValue(rectMap(geometry)), QJSValue(screen), screenList});
+        w->create();
+        const QJSValue r = clampFn.call({engine->toScriptValue(rectMap(geometry)), QJSValue(screen), screenList,
+                                         engine->toScriptValue(marginsMap(w->frameMargins()))});
         const QRect clamped = mapRect(r.toVariant().toMap());
         if (!clamped.isValid())
             return false;
         w->setWindowStates(Qt::WindowNoState);
         w->setGeometry(clamped);
+        if (m_watched.contains(w))
+            m_normal.insert(w, clamped);
         if (maximized)
             w->setWindowStates(Qt::WindowMaximized);
         return true;
