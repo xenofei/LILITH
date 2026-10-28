@@ -81,14 +81,20 @@ TestCase {
             verify(!shell.docks[id].content.visible, id + " is a tab behind")
         verify(origin(shell, "jobs").x > origin(shell, "home").x, "Jobs is right of Home")
         verify(origin(shell, "hardware").y > origin(shell, "home").y, "Hardware is below Home")
-        // The Default layout's proportions (ShellWindow.defaultRightShare and
-        // defaultBottomShare, 28 % each; placeholders until the owner picks them).
-        const right = shell.docks.jobs.content.width / shell.dockingArea.width
-        const bottom = shell.docks.hardware.content.height / shell.dockingArea.height
+        // The Default layout's proportions (the owner's choice: ShellWindow.defaultRightShare and
+        // defaultBottomShare, 28 % each), with the bottom row under Home only.
+        const area = shell.dockingArea
+        const right = shell.docks.jobs.content.width / area.width
+        const bottom = shell.docks.hardware.content.height / area.height
         verify(right > 0.2 && right < 0.36, "the right column is " + Math.round(right * 100) + " % wide")
         verify(bottom > 0.2 && bottom < 0.36, "the bottom row is " + Math.round(bottom * 100) + " % tall")
-        verify(shell.docks.hardware.content.width >= 0.95 * shell.dockingArea.width,
-               "the bottom row spans the window")
+        const jobsTop = shell.docks.jobs.content.mapToItem(area, 0, 0).y
+        verify(jobsTop < 0.1 * area.height && jobsTop + shell.docks.jobs.content.height > 0.98 * area.height,
+               "Jobs spans the full height: from " + jobsTop + " for " + shell.docks.jobs.content.height
+               + " of " + area.height)
+        verify(Math.abs(shell.docks.hardware.content.width - shell.docks.home.content.width) <= 2,
+               "the bottom row is as wide as Home: " + shell.docks.hardware.content.width + " against "
+               + shell.docks.home.content.width)
     }
 
     // A layout saved with Confirmations in front of Jobs, or with every panel closed.

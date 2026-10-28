@@ -35,9 +35,8 @@ Window {
     // How the layout opened: "restored", "default", "default_after_bad" (a file was set aside) or
     // "default_unreadable" (the file couldn't be read: it is left alone and not saved over).
     property string layoutOpened
-    // The Default layout's proportions: the right column's share of the width and the bottom
-    // row's share of the height; the bottom row spans the full width. Placeholders until the
-    // owner picks the values.
+    // The Default layout's proportions (the owner's choice): the right column's share of the
+    // width, at the full height, and the bottom row's share of the height, under Home only.
     readonly property real defaultRightShare: 0.28
     readonly property real defaultBottomShare: 0.28
     // The plan 4a shortcut map: [{keys, action, scope}].
@@ -230,8 +229,8 @@ Window {
     }
 
     // The Default layout (APP-004): Home in the centre; Jobs and Confirmations tabbed on the
-    // right; Hardware, Usage & spend, Diagnostics and Settings tabbed at the bottom. Panels with
-    // no area stay closed.
+    // right, at the full height; Hardware, Usage & spend, Diagnostics and Settings tabbed at the
+    // bottom, under Home. Panels with no area stay closed.
     function applyDefaultLayout() {
         for (const id in docks) {
             if (docks[id].isOpen)
@@ -254,7 +253,7 @@ Window {
             else if (panel.area === "right")
                 dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnRight, null, Qt.size(right, 0))
             else
-                dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnBottom, null, Qt.size(0, bottom))
+                dockingArea.addDockWidget(dock, KDDW.KDDockWidgets.Location_OnBottom, first.centre, Qt.size(0, bottom))
         }
         for (const area in first)
             first[area].setAsCurrentTab()
