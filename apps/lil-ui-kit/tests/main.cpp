@@ -1,6 +1,7 @@
 // The Qt Quick Test runner for apps/lil-ui-kit/tests (QA-068). CTest runs each tst_*.qml in its
 // own process (`-input <file>`), under QT_QPA_PLATFORM=offscreen (the qml and grabs presets).
 #include "lilshim/DockFactory.h"
+#include "lilshim/Fonts.h"
 #include "lilshim/PreviewProvider.h"
 
 #include "lil_qt/src/qt/preview_feed.cxxqt.h"
@@ -11,8 +12,6 @@
 
 #include <QCoreApplication>
 #include <QDir>
-#include <QFont>
-#include <QGuiApplication>
 #include <QFile>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -114,12 +113,9 @@ public slots:
         engine->addImageProvider(QStringLiteral("lilpreview"), new lilshim::PreviewProvider);
         engine->rootContext()->setContextProperty(QStringLiteral("BridgeHook"), new BridgeHook(engine));
         engine->rootContext()->setContextProperty(QStringLiteral("TestFiles"), &m_files);
-        // The theme's face as the application font, as lil-image sets it.
-        if (QObject *theme = engine->singletonInstance<QObject *>("Lilith.UiKit", "Theme")) {
-            QFont font = QGuiApplication::font();
-            font.setFamilies({theme->property("fontFamily").toString()});
-            QGuiApplication::setFont(font);
-        }
+        // The theme's bundled face as the application font, as lil-image sets it.
+        if (QObject *theme = engine->singletonInstance<QObject *>("Lilith.UiKit", "Theme"))
+            lilshim::applyThemeFont(theme->property("fontFamily").toString());
     }
 
 private:

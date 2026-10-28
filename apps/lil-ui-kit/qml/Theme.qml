@@ -25,10 +25,10 @@ QtObject {
     readonly property color window: bg
     readonly property color panel: surface
 
-    // The UI face, set once as the application font (lil-image's main.cpp and the QML test
-    // runner read it from here). Segoe UI ships with Windows. A placeholder until the owner picks
-    // the face: one token, so changing it is one line.
-    readonly property string fontFamily: "Segoe UI"
+    // The UI face (the owner's choice), bundled with the shim (Inter 4.1, OFL-1.1) and set once
+    // as the application font by lil-image's main.cpp and the QML test runner, which read it
+    // from here (lilshim::applyThemeFont).
+    readonly property string fontFamily: "Inter"
     readonly property int spacing: 8
     readonly property int radius: 4
     readonly property int fontSize: 13

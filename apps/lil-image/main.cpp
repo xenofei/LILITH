@@ -43,6 +43,7 @@
 // run), which the deploy check plants on PATH and in the current folder.
 #include "lilshim/Activation.h"
 #include "lilshim/DockFactory.h"
+#include "lilshim/Fonts.h"
 #include "lilshim/LogBridge.h"
 #include "lilshim/PreviewProvider.h"
 #include "lilshim/StallWatchdog.h"
@@ -55,7 +56,6 @@
 #include <kddockwidgets/qtquick/Platform.h>
 
 #include <QAbstractEventDispatcher>
-#include <QFont>
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -222,12 +222,10 @@ int main(int, char **)
         if (!why.empty())
             lilshim::logEvent(QStringLiteral("error"), {{"what", "no core session"}, {"why", fromRust(why)}});
     }
-    // The theme's face as the application font (APP-012), before anything is laid out.
-    if (QObject *theme = engine.singletonInstance<QObject *>("Lilith.UiKit", "Theme")) {
-        QFont font = QGuiApplication::font();
-        font.setFamilies({theme->property("fontFamily").toString()});
-        QGuiApplication::setFont(font);
-    }
+    // The theme's face, bundled, as the application font (APP-012), before anything is laid
+    // out; if it fails to load, the system UI font, and the failure is logged.
+    if (QObject *theme = engine.singletonInstance<QObject *>("Lilith.UiKit", "Theme"))
+        lilshim::applyThemeFont(theme->property("fontFamily").toString());
     QObject *core = engine.singletonInstance<QObject *>("Lilith.Core", "Core");
     lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", core != nullptr}});
     // The shell takes the core and the app's state folder, where its layout lives (P4a-R16);

@@ -2,6 +2,7 @@
 // focus ring).
 import QtQuick
 import QtTest
+import Lilith.Shim
 import Lilith.UiKit
 
 TestCase {
@@ -28,8 +29,13 @@ TestCase {
     }
 
     function test_the_font_is_the_themes() { // spec: APP-012
-        compare(Theme.fontFamily, "Segoe UI")
+        compare(Theme.fontFamily, "Inter")
         compare(Qt.application.font.family, Theme.fontFamily, "the application font")
+        // What the font database really matches, regular and bold: the bundled faces, not a
+        // fallback.
+        compare(LilShim.resolvedFont(400).family, "Inter", "regular resolves to Inter")
+        compare(LilShim.resolvedFont(700).family, "Inter", "bold resolves to Inter")
+        compare(LilShim.resolvedFont(700).weight, 700, "bold resolves to Inter Bold")
         verify(Qt.colorEqual(Theme.window, Theme.bg) && Qt.colorEqual(Theme.panel, Theme.surface),
                "the deprecated aliases")
     }

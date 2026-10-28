@@ -6,8 +6,9 @@
 .DESCRIPTION
   1. Measures the folder (every file, in MiB) against the budget: test-params.toml's
      [budgets] deploy_folder_mib once Task 29 adds it; until then an interim budget, the latest
-     legitimate measurement plus 10 % (plan 4a ruling, 2026-10-26): 397.1 MiB, Task 16's
-     361.0 MiB plus 10 % (it was 365.3, Task 0's trimmed 332.1 MiB plus 10 %, spike 10 §8.2). A
+     legitimate measurement plus 10 % (plan 4a ruling, 2026-10-26): 399.6 MiB, Task 18's
+     363.3 MiB plus 10 %, with the bundled Inter faces (it was 397.1, Task 16's 361.0 MiB plus
+     10 %, and before that 365.3, Task 0's trimmed 332.1 MiB plus 10 %, spike 10 §8.2). A
      later task that grows the deploy legitimately re-measures it, updates this value and says
      so in its PR body.
   2. Starts the deployed lil-image.exe with spike 02's stripped environment (every PATH folder of
@@ -49,8 +50,8 @@ $failures = [System.Collections.Generic.List[string]]::new()
 
 # 1. Size.
 if ($BudgetMiB -le 0) {
-    # The interim budget (see the description): Task 16's 361.0 MiB plus 10 %.
-    $BudgetMiB = 397.1
+    # The interim budget (see the description): Task 18's 363.3 MiB plus 10 %.
+    $BudgetMiB = 399.6
     $params = Join-Path $Repo 'test-params.toml'
     if (Test-Path -LiteralPath $params) {
         $line = Select-String -LiteralPath $params -Pattern '^\s*deploy_folder_mib\s*=\s*([0-9.]+)' | Select-Object -First 1
