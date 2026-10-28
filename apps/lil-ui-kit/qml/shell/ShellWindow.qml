@@ -30,6 +30,9 @@ Window {
 
     property alias dockingArea: dockingArea
     property alias layoutBanner: layoutBanner
+    property alias noPanelsHint: noPanelsHint
+    // How many of the panels are open (the hint shows at none).
+    property int openCount: 0
     // Panel id -> its DockedPanel.
     readonly property var docks: ({})
     // How the layout opened: "restored", "default", "default_after_bad" (a file was set aside) or
@@ -78,6 +81,19 @@ Window {
         uniqueName: "image-main"
         onWidthChanged: root.areaSized()
         onHeightChanged: root.areaSized()
+    }
+
+    // A layout saved with every panel closed opens that way (a valid layout): the centre says how
+    // to bring one back.
+    Text {
+        id: noPanelsHint
+        anchors.centerIn: dockingArea
+        visible: root._sized && root.openCount === 0 && !root._defaultPending
+        text: "No panels open. " + root.keysFor("panel.home") + " opens Home."
+        color: Theme.textMuted
+        font.pixelSize: Theme.fontSize + 1
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
     }
 
     Component {
@@ -185,12 +201,14 @@ Window {
         _saveBlocked = saved.status === "unreadable"
         if (saved.status === "ok") {
             restored = DockLayout.restore(JSON.stringify(saved.layout.kddw))
-            // A blob KDDockWidgets accepts but that opens no main window of this shell, or none
-            // of the known panels, counts as refused too.
+            // A blob KDDockWidgets accepts but that has no main window of this shell, or that
+            // names only panels this build doesn't know, counts as refused too. One with every
+            // panel closed is a layout like any other.
             if (restored) {
                 const windows = saved.layout.kddw.mainWindows || []
+                const blob = JSON.stringify(saved.layout.kddw)
                 restored = windows.some(m => m.uniqueName === dockingArea.uniqueName)
-                           && Panels.all.some(p => docks[p.id] && docks[p.id].isOpen)
+                           && Panels.all.some(p => blob.indexOf('"' + p.id + '"') >= 0)
             }
             if (!restored)
                 setAside = ShellState.setLayoutAside(stateDir)
@@ -282,6 +300,7 @@ Window {
     // again." Panels closed together (a floating window with several tabs) are one message:
     // "Jobs and Confirmations closed. Ctrl+2 and Ctrl+3 open them again."
     function panelOpenChanged(dock) {
+        openCount = openPanels().length
         if (_settling || dock.isOpen)
             return
         if (_closedBatch.length === 0)
@@ -306,6 +325,12 @@ Window {
             for (const d of closed.filter(d => keyOf(d) !== ""))
                 text += " " + keyOf(d) + " opens " + d.panel.title + " again."
         dockingArea.Accessible.announce(text)
+    }
+
+    // The keys of `action` in the shortcut map, or "" when it has none.
+    function keysFor(action) {
+        const b = bindings.find(b => b.action === action)
+        return b ? b.keys : ""
     }
 
     function showPanel(id) {

@@ -35,7 +35,10 @@ TestCase {
         // fallback.
         compare(LilShim.resolvedFont(400).family, "Inter", "regular resolves to Inter")
         compare(LilShim.resolvedFont(700).family, "Inter", "bold resolves to Inter")
-        compare(LilShim.resolvedFont(700).weight, 700, "bold resolves to Inter Bold")
+        // The face behind the font (QRawFont): a bold synthesised from Regular would say
+        // "Regular" here.
+        compare(LilShim.resolvedFont(400).style, "Regular", "regular is the bundled Regular face")
+        compare(LilShim.resolvedFont(700).style, "Bold", "bold is the bundled Bold face")
         verify(Qt.colorEqual(Theme.window, Theme.bg) && Qt.colorEqual(Theme.panel, Theme.surface),
                "the deprecated aliases")
     }

@@ -4,16 +4,20 @@
 //     source UI Automation reads) exposes them (LilShim.accessibleOf);
 //   - a place in the tab chain (reached by Item.nextItemInFocusChain from the root's first
 //     item).
-// Interactive means:
-//   - a control: every Qt Quick Control and template (Control, AbstractButton, TextField, ...;
-//     known by their `background`), whatever its focusPolicy (one without Qt.TabFocus is
-//     reported as out of the tab chain), anything in the tab
-//     chain by its own activeFocusOnTab, and anything with an accessible action (press, toggle,
-//     increase, ...);
+// Interactive means, judged by what an item does rather than what it is:
+//   - a control: anything in the tab chain by its own activeFocusOnTab, anything with a role
+//     that takes input (a button, check box, radio button, editable text, combo box, slider,
+//     spin box, dial, page tab, link or menu item: AbstractButton, TextInput, Slider and the
+//     like), and anything with an accessible action other than Set Focus (press, toggle,
+//     increase, ...), whatever its focusPolicy (one without Qt.TabFocus is reported as out of
+//     the tab chain);
 //   - a pointer target: a MouseArea that takes buttons, or an item holding an enabled TapHandler
-//     or DragHandler. It is judged by its nearest ancestor (up to the root) with an accessible
-//     role: that ancestor needs the name and the place in the tab chain; with no such ancestor,
-//     the pointer target itself fails all three.
+//     or DragHandler. It needs the role and name on its nearest ancestor (up to the root) with
+//     an accessible role, and that ancestor must itself be a control in the tab chain: the
+//     search stops at that ancestor, and a container (a Pane, a group) there doesn't count,
+//     however it is named.
+// Not interactive: static items and controls (Label, ProgressBar, Pane, Frame, ToolSeparator,
+// ScrollView, text), and scroll bars, whose list or view the keyboard scrolls itself.
 // `exempt(item)`, when given, skips an item and what it holds (each caller says why). Each panel
 // task runs it over its panel:
 //     A11yWalk { id: walk }
@@ -36,10 +40,11 @@ QtObject {
             const label = describe(item, own)
             if (kind === "pointer") {
                 const owner = accessibleAncestor(item, root)
-                if (!owner) {
-                    out.push({item: item, what: label + ": takes clicks with no accessible role on it or an ancestor"})
-                    out.push({item: item, what: label + ": no accessible name on it or an ancestor"})
-                    out.push({item: item, what: label + ": not in the tab chain, nor an accessible ancestor"})
+                if (!owner || !takesInput(owner)) {
+                    const near = owner ? " (" + describe(owner, LilShim.accessibleOf(owner)) + " is a container)" : ""
+                    out.push({item: item, what: label + ": takes clicks with no accessible role on it or an interactive ancestor" + near})
+                    out.push({item: item, what: label + ": no accessible name on it or an interactive ancestor" + near})
+                    out.push({item: item, what: label + ": not in the tab chain, nor an interactive ancestor" + near})
                     return
                 }
                 const a = LilShim.accessibleOf(owner)
@@ -54,7 +59,7 @@ QtObject {
             if (!own.name || own.name.trim() === "")
                 out.push({item: item, what: label + ": no accessible name"})
             if (chain.indexOf(item) < 0) {
-                const policy = isControl(item) && !(item.focusPolicy & Qt.TabFocus)
+                const policy = typeof item.focusPolicy === "number" && !(item.focusPolicy & Qt.TabFocus)
                 out.push({item: item, what: label + ": not in the tab chain"
                                             + (policy ? " (its focusPolicy lacks Qt.TabFocus)" : "")})
             }
@@ -77,23 +82,29 @@ QtObject {
         return n
     }
 
+    // The roles of items that take input themselves.
+    readonly property var inputRoles: [Accessible.Button, Accessible.CheckBox, Accessible.RadioButton,
+        Accessible.EditableText, Accessible.ComboBox, Accessible.Slider, Accessible.SpinBox,
+        Accessible.Dial, Accessible.PageTab, Accessible.Link, Accessible.MenuItem]
+
+    // Whether the item takes input by its role or its accessible actions. Setting the focus is
+    // every focusable item's action, not a sign it does anything, and a focusable container
+    // (a Pane, a group) still doesn't take input.
+    function takesInput(item) {
+        const a = LilShim.accessibleOf(item)
+        return inputRoles.indexOf(a.role) >= 0
+               || a.actions.some(name => name.replace(/\s/g, "") !== "SetFocus")
+    }
+
     // "control", "pointer" or "" (see the header).
     function interactiveKind(item) {
-        if (isControl(item) || item.activeFocusOnTab)
+        if (LilShim.accessibleOf(item).role === Accessible.ScrollBar)
+            return ""
+        if (item.activeFocusOnTab || takesInput(item))
             return "control"
         if (String(item).startsWith("QQuickMouseArea"))
             return item.acceptedButtons !== Qt.NoButton ? "pointer" : ""
-        if (hasPointerHandler(item))
-            return "pointer"
-        const a = LilShim.accessibleOf(item)
-        // Setting the focus is every focusable item's action, not a sign it does anything.
-        return a.actions.some(name => name.replace(/\s/g, "") !== "SetFocus") ? "control" : ""
-    }
-
-    // A Qt Quick Control or template: every item has a focusPolicy since Qt 6.7, but only these
-    // have a background.
-    function isControl(item) {
-        return item.background !== undefined
+        return hasPointerHandler(item) ? "pointer" : ""
     }
 
     function hasPointerHandler(item) {

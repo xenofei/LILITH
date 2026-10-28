@@ -83,11 +83,18 @@ TestCase {
         verify(origin(shell, "hardware").y > origin(shell, "home").y, "Hardware is below Home")
         // The Default layout's proportions (the owner's choice: ShellWindow.defaultRightShare and
         // defaultBottomShare, 28 % each), with the bottom row under Home only.
+        // Each share is what Home's group leaves of the docking area, the separator included:
+        // 28 % within 4 points, so a few pixels of bars don't matter and a 50/50 split fails.
         const area = shell.dockingArea
-        const right = shell.docks.jobs.content.width / area.width
-        const bottom = shell.docks.hardware.content.height / area.height
-        verify(right > 0.2 && right < 0.36, "the right column is " + Math.round(right * 100) + " % wide")
-        verify(bottom > 0.2 && bottom < 0.36, "the bottom row is " + Math.round(bottom * 100) + " % tall")
+        const home = shell.docks.home.content
+        const homeEnd = home.mapToItem(area, home.width, home.height)
+        const right = (area.width - homeEnd.x) / area.width
+        const bottom = (area.height - homeEnd.y) / area.height
+        const share = 0.28   // the owner's choice, for both
+        verify(Math.abs(right - share) <= 0.04,
+               "the right column is " + (right * 100).toFixed(1) + " % of the width")
+        verify(Math.abs(bottom - share) <= 0.04,
+               "the bottom row is " + (bottom * 100).toFixed(1) + " % of the height")
         const jobsTop = shell.docks.jobs.content.mapToItem(area, 0, 0).y
         verify(jobsTop < 0.1 * area.height && jobsTop + shell.docks.jobs.content.height > 0.98 * area.height,
                "Jobs spans the full height: from " + jobsTop + " for " + shell.docks.jobs.content.height
@@ -142,15 +149,33 @@ TestCase {
         verify(!shell.docks.jobs.content.visible, "Jobs is behind it")
     }
 
-    function test_a_lone_backup_is_restored() { // spec: APP-002
-        // A save that stopped between the swap's two steps leaves only layout.json.bak.
+    function test_a_lone_backup_is_never_read() { // spec: APP-002
+        // layout.json.bak is only ReplaceFileW's backup: with no layout.json, the Default opens.
         const text = savedLayout(TestFiles.newDir("source"))
         const dir = TestFiles.newDir("backup")
         verify(TestFiles.write(dir + "/layout.json.bak", text))
         const shell = makeShell(dir)
-        compare(shell.layoutOpened, "restored")
+        compare(shell.layoutOpened, "default")
         showShell(shell)
-        tryVerify(() => shown(shell, "confirmations"), 5000, "the backup's tab is in front")
+        checkDefaultLayout(shell)
+        verify(!shell.layoutBanner.visible, "no banner")
+    }
+
+    function test_a_layout_with_every_panel_closed_opens_as_saved() { // spec: APP-002, APP-156
+        const dir = TestFiles.newDir("closed")
+        savedLayout(dir, true)
+        const shell = makeShell(dir)
+        compare(shell.layoutOpened, "restored")
+        compare(TestFiles.list(dir).filter(f => f.startsWith("layout.json.bad-")), [], "nothing is set aside")
+        showShell(shell)
+        verify(!shell.layoutBanner.visible, "no banner")
+        verify(defaultPanels.every(id => !shell.docks[id].isOpen), "every panel stays closed")
+        tryVerify(() => shell.noPanelsHint.visible, 5000, "the hint shows")
+        compare(shell.noPanelsHint.text, "No panels open. Ctrl+1 opens Home.")
+        compare(LilShim.accessibleOf(shell.noPanelsHint).name, "No panels open. Ctrl+1 opens Home.")
+        shell.showPanel("home")
+        tryVerify(() => shown(shell, "home"), 5000, "Home opens")
+        verify(!shell.noPanelsHint.visible, "and the hint goes")
     }
 
     function test_the_end_of_the_session_saves() { // spec: APP-002
@@ -170,12 +195,16 @@ TestCase {
         // A blob KDDockWidgets accepts that opens no main window, or none of the panels.
         const noWindow = Object.assign({}, good, {kddw: {serializationVersion: good.kddw.serializationVersion,
                                                          mainWindows: []}})
-        const allClosed = savedLayout(TestFiles.newDir("closed"), true)
+        // One that names only panels this build doesn't know.
+        let unknown = JSON.stringify(good.kddw)
+        for (const id of defaultPanels.concat(["backups"]))
+            unknown = unknown.split('"' + id + '"').join('"gone-' + id + '"')
+        const unknownOnly = Object.assign({}, good, {kddw: JSON.parse(unknown)})
         for (const [what, text] of [["damaged", '{"layout": 1, "windows": [{"name": '],
                                     ["empty", ""],
                                     ["refused", JSON.stringify(newer)],
                                     ["no main window", JSON.stringify(noWindow)],
-                                    ["no panel open", allClosed]]) {
+                                    ["unknown panels only", JSON.stringify(unknownOnly)]]) {
             const dir = TestFiles.newDir(what)
             verify(TestFiles.write(dir + "/layout.json", text), what)
             const shell = makeShell(dir)

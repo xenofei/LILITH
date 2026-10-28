@@ -1,5 +1,6 @@
 // A11yWalk (APP-156) over a page of every base control, and over pages it must fault.
 import QtQuick
+import QtQuick.Controls.Basic as QQC
 import QtTest
 import Lilith.Shim
 import Lilith.UiKit
@@ -45,6 +46,44 @@ TestCase {
         }
     }
 
+    // Static controls and a named list with its scroll bar: nothing to report.
+    Component {
+        id: staticControls
+        Window {
+            property alias page: column
+            width: 480
+            height: 600
+            visible: true
+
+            Column {
+                id: column
+                spacing: 4
+                QQC.Label { objectName: "label"; text: "Hello" }
+                QQC.ProgressBar { objectName: "progress"; value: 0.4 }
+                QQC.Pane { objectName: "pane"; width: 100; height: 30 }
+                QQC.Frame { objectName: "frame"; width: 100; height: 30 }
+                QQC.ToolSeparator { objectName: "separator" }
+                QQC.ScrollView {
+                    objectName: "scrollView"
+                    width: 100
+                    height: 40
+                    Text { text: "inside" }
+                }
+                ListView {
+                    objectName: "list"
+                    width: 200
+                    height: 80
+                    activeFocusOnTab: true
+                    Accessible.name: "Recent jobs"
+                    model: 20
+                    delegate: Text { text: "Job " + index }
+                    QQC.ScrollBar.vertical: QQC.ScrollBar { objectName: "scrollBar" }
+                }
+                Text { text: "plain" }
+            }
+        }
+    }
+
     Component {
         id: faulty
         Window {
@@ -69,6 +108,21 @@ TestCase {
                     width: 40
                     height: 20
                     TapHandler {}
+                }
+                // A nameless tile under a named, focusable Pane: the Pane is a container, so the
+                // tile is reported.
+                Rectangle {
+                    width: 60
+                    height: 30
+                    activeFocusOnTab: true
+                    Accessible.role: Accessible.Pane
+                    Accessible.name: "Hardware"
+                    Rectangle {
+                        objectName: "paneTile"
+                        width: 40
+                        height: 20
+                        TapHandler {}
+                    }
                 }
                 // The accessible-parent pattern, done right: not reported.
                 Rectangle {
@@ -123,5 +177,14 @@ TestCase {
                JSON.stringify(what))
         verify(!what.some(w => w.indexOf("goodParent") >= 0 || w.indexOf("goodChild") >= 0),
                JSON.stringify(what))
+        verify(what.some(w => w.indexOf("paneTile") >= 0 && w.indexOf("no accessible name") >= 0),
+               JSON.stringify(what))
+    }
+
+    function test_static_controls_and_scroll_bars_pass() { // spec: APP-156
+        const w = createTemporaryObject(staticControls, tc)
+        tryVerify(() => w.page.width > 0)
+        compare(walk.report(w.page), [])
+        verify(walk.interactiveCount(w.page) >= 1, "the list is checked")
     }
 }
