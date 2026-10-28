@@ -1,8 +1,9 @@
 // A job's live preview (APP-031, APP-037): follows preview:<jobId> and job:<jobId> through
 // CoreCall, for as long as it exists, and shows each frame's image://lilpreview/<job_id>/<frame>
 // URL as the bridge gives it, a new one per frame, with caching off and loading off the GUI
-// thread; it keeps the frame shown while the next loads. Once the job ends it shows nothing
-// (the provider drops the frame). No image bytes reach QML: only the URL.
+// thread; it keeps the frame shown while the next loads. Once the job ends (a final status
+// event, or a snapshot of the job after a reconnect) it shows nothing (the provider drops the
+// frame). No image bytes reach QML: only the URL.
 //
 //   PreviewImage { core: Core; jobId: job.job_id }
 import QtQuick
@@ -36,7 +37,10 @@ Image {
                     root.source = data.url
             }),
             CoreCall.subscribe(core, "job:" + jobId, root, (kind, seq, data) => {
-                const status = data && data.kind === "status" && data.job ? data.job.status : ""
+                // A status event carries the job; a snapshot (after a reconnect) is the job.
+                const job = !data ? null : kind === "snapshot" ? data
+                          : kind === "event" && data.kind === "status" ? data.job : null
+                const status = job ? job.status : ""
                 if (status === "succeeded" || status === "failed" || status === "cancelled")
                     root.source = ""
             })

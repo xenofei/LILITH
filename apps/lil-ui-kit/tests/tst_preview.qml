@@ -84,7 +84,9 @@ TestCase {
         compare(old.implicitWidth, 3)
 
         // Another job's frame is its own.
-        frame(core, "j_2", twoWide)
+        const third = frame(core, "j_2", twoWide)
+        verify(third.startsWith("image://lilpreview/j_2/"), third)
+        compare(loaded(third).implicitWidth, 2)
         compare(loaded(second).implicitWidth, 3)
     }
 
@@ -108,6 +110,17 @@ TestCase {
         compare(loaded(other).status, Image.Ready)
         core.emitFromCore("jobs", "event", {kind: "job", job: {job_id: "j_4", status: "failed"}})
         compare(loaded(other).status, Image.Error)
+
+        // A job that ended while the app was away: after the reconnect, job:<id> gets a
+        // snapshot of the job itself, its final status at the top (review M-1).
+        const away = createTemporaryObject(previewComponent, tc, {core: core, jobId: "j_6"})
+        const awayUrl = frame(core, "j_6", twoWide)
+        tryCompare(away, "status", Image.Ready)
+        core.emitFromCore("job:j_6", "snapshot", {job_id: "j_6", kind: "comfyui.workflow", status: "running"})
+        compare(away.source.toString(), awayUrl, "a running job keeps its frame")
+        core.emitFromCore("job:j_6", "snapshot", {job_id: "j_6", kind: "comfyui.workflow", status: "cancelled"})
+        compare(away.source.toString(), "")
+        compare(loaded(awayUrl).status, Image.Error)
     }
 
     function test_no_image_bytes_reach_qml_properties() {

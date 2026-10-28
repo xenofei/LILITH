@@ -20,7 +20,7 @@ Q_IMPORT_QML_PLUGIN(Lilith_UiKitPlugin)
 Q_IMPORT_QML_PLUGIN(Lilith_ShimPlugin)
 
 // FakeCore.emitFromCore's way into the bridge's own event step (src/qt/preview_feed.rs), which
-// Core's events go through: `BridgeHook.event(topic, dataJson)` is the data QML then gets.
+// Core's events go through: `BridgeHook.event(topic, kind, dataJson)` is the data QML then gets.
 class BridgeHook : public QObject
 {
     Q_OBJECT
@@ -28,11 +28,13 @@ class BridgeHook : public QObject
 public:
     using QObject::QObject;
 
-    Q_INVOKABLE QString event(const QString &topic, const QString &dataJson) const
+    Q_INVOKABLE QString event(const QString &topic, const QString &kind, const QString &dataJson) const
     {
         const QByteArray t = topic.toUtf8();
+        const QByteArray k = kind.toUtf8();
         const QByteArray d = dataJson.toUtf8();
         const rust::String out = lil_qt::preview_feed_event(rust::Str(t.constData(), size_t(t.size())),
+                                                             rust::Str(k.constData(), size_t(k.size())),
                                                              rust::Str(d.constData(), size_t(d.size())));
         return QString::fromUtf8(out.data(), qsizetype(out.size()));
     }

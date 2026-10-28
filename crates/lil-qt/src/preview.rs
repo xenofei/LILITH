@@ -8,10 +8,12 @@
 //!   byte reaches QML: not in an event, a property or a model role.
 //! - `<frame>` is the bridge's own count, one up for every frame of the process, so each frame
 //!   has its own URL, a core restart included (the core's seqs start again).
-//! - [`ended_job`] names the job a `status` event on `job:<id>`, or a `job` event on `jobs`,
-//!   shows finished (`succeeded`, `failed` or `cancelled`): its frame is then dropped.
+//! - [`ended_job`] names the job a `status` event on `job:<id>`, a `job` event on `jobs`, or a
+//!   `snapshot` of `job:<id>` (the job itself, after a reconnect) shows finished (`succeeded`,
+//!   `failed` or `cancelled`): its frame is then dropped.
 
 use base64::Engine as _;
+use lil_protocol::EventKind;
 use serde_json::{Value, json};
 
 /// The image provider's scheme and host, as QML's `Image.source` names it.
@@ -53,20 +55,36 @@ pub fn take_frame(topic: &str, data: &mut Value) -> Option<Frame> {
     })
 }
 
-/// The job whose end `data` on `topic` shows (module docs).
-pub fn ended_job(topic: &str, data: &Value) -> Option<String> {
-    let kind = data.get("kind")?.as_str()?;
-    let job = data.get("job")?;
-    let id = job.get("job_id")?.as_str()?;
-    let shown = match topic.strip_prefix("job:") {
-        Some(of) => kind == "status" && of == id,
-        None => topic == "jobs" && kind == "job",
+/// The job whose end `data`, an event of `kind` on `topic`, shows (module docs).
+pub fn ended_job(topic: &str, kind: EventKind, data: &Value) -> Option<String> {
+    let finished = |job: &Value| {
+        matches!(
+            job.get("status").and_then(Value::as_str),
+            Some("succeeded" | "failed" | "cancelled")
+        )
     };
-    let ended = matches!(
-        job.get("status").and_then(Value::as_str),
-        Some("succeeded" | "failed" | "cancelled")
-    );
-    (shown && ended).then(|| id.to_string())
+    let id_of = |job: &Value| job.get("job_id")?.as_str().map(str::to_string);
+    match (topic.strip_prefix("job:"), kind) {
+        // A snapshot of job:<id> is the JobSummary itself (review M-1).
+        (Some(of), EventKind::Snapshot) => {
+            (finished(data) && id_of(data).as_deref() == Some(of)).then(|| of.to_string())
+        }
+        (Some(of), EventKind::Event) => {
+            let job = data.get("job")?;
+            let status = data.get("kind").and_then(Value::as_str) == Some("status");
+            (status && finished(job) && id_of(job).as_deref() == Some(of)).then(|| of.to_string())
+        }
+        (None, EventKind::Event) if topic == "jobs" => {
+            let job = data.get("job")?;
+            let shown = data.get("kind").and_then(Value::as_str) == Some("job");
+            if shown && finished(job) {
+                id_of(job)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -108,22 +126,65 @@ mod tests {
         let status = |s: &str| json!({"kind": "status", "job": {"job_id": "j_1", "status": s}});
         for s in ["succeeded", "failed", "cancelled"] {
             assert_eq!(
-                ended_job("job:j_1", &status(s)).as_deref(),
+                ended_job("job:j_1", EventKind::Event, &status(s)).as_deref(),
                 Some("j_1"),
                 "{s}"
             );
             let on_jobs = json!({"kind": "job", "job": {"job_id": "j_2", "status": s}});
-            assert_eq!(ended_job("jobs", &on_jobs).as_deref(), Some("j_2"), "{s}");
+            assert_eq!(
+                ended_job("jobs", EventKind::Event, &on_jobs).as_deref(),
+                Some("j_2"),
+                "{s}"
+            );
         }
         for s in ["queued", "running"] {
-            assert_eq!(ended_job("job:j_1", &status(s)), None, "{s}");
+            assert_eq!(
+                ended_job("job:j_1", EventKind::Event, &status(s)),
+                None,
+                "{s}"
+            );
         }
         let progress = json!({"kind": "progress", "progress": {"value": 1, "max": 2}});
-        assert_eq!(ended_job("job:j_1", &progress), None);
+        assert_eq!(ended_job("job:j_1", EventKind::Event, &progress), None);
         assert_eq!(
-            ended_job("jobs", &json!({"kind": "queue", "state": {}})),
+            ended_job(
+                "jobs",
+                EventKind::Event,
+                &json!({"kind": "queue", "state": {}})
+            ),
             None
         );
-        assert_eq!(ended_job("assets", &status("succeeded")), None);
+        assert_eq!(
+            ended_job("assets", EventKind::Event, &status("succeeded")),
+            None
+        );
+
+        // Review M-1: after a reconnect, a job:<id> whose history is gone gets a snapshot of
+        // the JobSummary itself, its status at the top (its `kind` is the job's kind).
+        let summary = |s: &str| json!({"job_id": "j_1", "kind": "comfyui.workflow", "status": s});
+        assert_eq!(
+            ended_job("job:j_1", EventKind::Snapshot, &summary("succeeded")).as_deref(),
+            Some("j_1")
+        );
+        assert_eq!(
+            ended_job("job:j_1", EventKind::Snapshot, &summary("running")),
+            None
+        );
+        assert_eq!(
+            ended_job("job:j_1", EventKind::Event, &summary("failed")),
+            None
+        );
+        assert_eq!(
+            ended_job("job:j_2", EventKind::Snapshot, &summary("failed")),
+            None
+        );
+        assert_eq!(
+            ended_job("jobs", EventKind::Snapshot, &summary("failed")),
+            None
+        );
+        assert_eq!(
+            ended_job("job:j_1", EventKind::ResyncRequired, &Value::Null),
+            None
+        );
     }
 }

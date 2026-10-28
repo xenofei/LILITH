@@ -8,6 +8,9 @@
 //! - A job's frame is dropped when an event QML follows shows the job finished
 //!   ([`crate::preview::ended_job`]), and when the app stops following the job's
 //!   `preview:<job_id>` ([`forgotten`]), so the provider holds frames only for jobs on show.
+//! - Both decodes run inline on the pump, so every topic's events wait behind them: ComfyUI's
+//!   previews are small (at most 1 MB, ARCH-033; TAESD frames are far smaller), so this stays
+//!   cheap. It is to be revisited if Task 23's previews show otherwise (review M-5).
 //!
 //! The sink is the shim's provider, which `main.cpp` names (`lil_qt::setPreviewSink`,
 //! `src/qt/preview_sink.h`). The QML tests' FakeCore runs the same step through
@@ -15,7 +18,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use lil_protocol::EventParams;
+use lil_protocol::{EventKind, EventParams};
 use serde_json::Value;
 
 use crate::preview::{ended_job, frame_url, take_frame};
@@ -36,9 +39,9 @@ pub mod ffi {
 
     #[namespace = "lil_qt"]
     extern "Rust" {
-        /// The feed's step for an event's data (JSON) on `topic`, as the pump runs it: the data
-        /// QML then gets, as JSON.
-        fn preview_feed_event(topic: &str, data_json: &str) -> String;
+        /// The feed's step for an event's data (JSON) of `kind` (`event`, `snapshot` or
+        /// `resync_required`) on `topic`, as the pump runs it: the data QML then gets, as JSON.
+        fn preview_feed_event(topic: &str, kind: &str, data_json: &str) -> String;
     }
 }
 
@@ -47,7 +50,7 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 /// The feed's step for one event (module docs).
 pub fn on_event(ev: &mut EventParams) {
-    apply(&ev.topic, &mut ev.data);
+    apply(&ev.topic, ev.kind, &mut ev.data);
 }
 
 /// The app no longer follows `topic`: a job's frame goes with its `preview:<job_id>`.
@@ -57,19 +60,24 @@ pub fn forgotten(topic: &str) {
     }
 }
 
-fn apply(topic: &str, data: &mut Value) {
+fn apply(topic: &str, kind: EventKind, data: &mut Value) {
     if let Some(frame) = take_frame(topic, data) {
         if ffi::preview_put(&frame.job, &frame.bytes) {
             let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
             data["url"] = Value::from(frame_url(&frame.job, n));
         }
-    } else if let Some(job) = ended_job(topic, data) {
+    } else if let Some(job) = ended_job(topic, kind, data) {
         ffi::preview_drop(&job);
     }
 }
 
-fn preview_feed_event(topic: &str, data_json: &str) -> String {
+fn preview_feed_event(topic: &str, kind: &str, data_json: &str) -> String {
+    let kind = match kind {
+        "snapshot" => EventKind::Snapshot,
+        "resync_required" => EventKind::ResyncRequired,
+        _ => EventKind::Event,
+    };
     let mut data = serde_json::from_str(data_json).unwrap_or(Value::Null);
-    apply(topic, &mut data);
+    apply(topic, kind, &mut data);
     data.to_string()
 }
