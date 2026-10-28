@@ -7,6 +7,7 @@
 #include <QColor>
 #include <QFont>
 #include <QFontInfo>
+#include <QRawFont>
 #include <QGuiApplication>
 #include <QPalette>
 
@@ -73,5 +74,8 @@ QVariantMap LilShim::resolvedFont(int weight) const
     QFont font = QGuiApplication::font();
     font.setWeight(QFont::Weight(weight));
     const QFontInfo info(font);
-    return {{"family", info.family()}, {"weight", info.weight()}};
+    // The face file the engine really uses: a weight synthesised from another face keeps that
+    // face's style name.
+    const QRawFont raw = QRawFont::fromFont(font);
+    return {{"family", info.family()}, {"weight", info.weight()}, {"style", raw.styleName()}};
 }

@@ -39,6 +39,7 @@ public:
     Q_INVOKABLE QVariantMap stallCounts() const;
 
     // What the application font resolves to at `weight` (QFont::Weight: 400 regular, 700
-    // bold), through QFontInfo: {family, weight}.
+    // bold), through QFontInfo, and the style name of the face file behind it (QRawFont):
+    // {family, weight, style}.
     Q_INVOKABLE QVariantMap resolvedFont(int weight) const;
 };
