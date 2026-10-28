@@ -112,3 +112,21 @@ is included in this repository. The binaries it builds combine them with the sui
 The deploy folder also carries the Qt 6.12.0 and Qt WebEngine 6.140.0 libraries that
 windeployqt copies (Qt's open-source licences: LGPL-3.0, GPL-2.0 or GPL-3.0 by module) and
 the Microsoft Visual C++ runtime DLLs, which Microsoft permits redistributing app-local.
+
+------------------------------------------------------------------------------------
+7. The Inter typeface (rsms/inter)
+------------------------------------------------------------------------------------
+
+Source:   https://github.com/rsms/inter, release v4.1 (2024-11-16), asset Inter-4.1.zip
+          (SHA-256 9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e)
+Licence:  SIL Open Font License, Version 1.1 (apps/lil-qt-shim/fonts/inter/OFL.txt)
+Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)
+
+The shell's UI face (Theme.fontFamily). Two static fonts of the release, unchanged, are
+compiled into the shim DLL as a Qt resource:
+
+  apps/lil-qt-shim/fonts/inter/Inter-Regular.ttf   (the zip's extras/ttf/Inter-Regular.ttf)
+  apps/lil-qt-shim/fonts/inter/Inter-Bold.ttf      (the zip's extras/ttf/Inter-Bold.ttf)
+
+Their SHA-256 sums are in apps/lil-qt-shim/fonts/inter/SHA256SUMS
+(`sha256sum -c SHA256SUMS` in that folder).

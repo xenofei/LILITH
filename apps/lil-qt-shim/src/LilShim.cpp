@@ -5,6 +5,8 @@
 
 #include <QAccessible>
 #include <QColor>
+#include <QFont>
+#include <QFontInfo>
 #include <QGuiApplication>
 #include <QPalette>
 
@@ -64,4 +66,12 @@ QVariantMap LilShim::stallCounts() const
 {
     const lilshim::StallCounts c = lilshim::stallCounts();
     return {{"stalls", c.stalls}, {"stacks", c.stacks}};
+}
+
+QVariantMap LilShim::resolvedFont(int weight) const
+{
+    QFont font = QGuiApplication::font();
+    font.setWeight(QFont::Weight(weight));
+    const QFontInfo info(font);
+    return {{"family", info.family()}, {"weight", info.weight()}};
 }

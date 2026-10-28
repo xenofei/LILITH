@@ -37,4 +37,8 @@ public:
     // lilshim::startStallWatchdog and what it has logged: {stalls, stacks} (the bench test).
     Q_INVOKABLE void startStallWatchdog() const;
     Q_INVOKABLE QVariantMap stallCounts() const;
+
+    // What the application font resolves to at `weight` (QFont::Weight: 400 regular, 700
+    // bold), through QFontInfo: {family, weight}.
+    Q_INVOKABLE QVariantMap resolvedFont(int weight) const;
 };

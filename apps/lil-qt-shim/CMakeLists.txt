@@ -31,3 +31,10 @@ target_include_directories(lil-qt-shim-qml PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_sources(lil-qt-shim PRIVATE include/lilshim/StallWatchdog.h src/StallWatchdog.cpp)
 target_sources(lil-qt-shim-qml PRIVATE src/LayoutBridge.h src/LayoutBridge.cpp)
 target_link_libraries(lil-qt-shim-qml PRIVATE Qt6::GuiPrivate KDAB::kddockwidgets)
+# Task 18, fix round 2: the bundled UI face (Inter 4.1, OFL-1.1; NOTICE section 7), as a Qt
+# resource of the DLL, and the call that loads it (lilshim::applyThemeFont).
+target_sources(lil-qt-shim PRIVATE include/lilshim/Fonts.h src/Fonts.cpp)
+qt_add_resources(lil-qt-shim lil-fonts
+    PREFIX /lilith/fonts
+    BASE fonts
+    FILES fonts/inter/Inter-Regular.ttf fonts/inter/Inter-Bold.ttf)
