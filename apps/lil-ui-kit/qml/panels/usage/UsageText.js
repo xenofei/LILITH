@@ -1,6 +1,8 @@
 // The Usage & spend panel's words and rows (APP-116 to APP-124): what a `usage.summary` row or a
 // cap reads as, and the rows the panel shows and exports. Money is never computed here: every
-// amount is the core's decimal string, shown with its currency code as it comes (CORE-013).
+// amount is the core's decimal string (CORE-013). On screen it is formatted by the `money`
+// function the caller passes (MoneyText.text, Lilith.Core: "1,234.57 USD"); the CSV keeps the
+// exact decimals.
 .pragma library
 
 // The dimension picker, in its order: the `group_by` field and its button's text.
@@ -56,12 +58,18 @@ function label(dimension, value) {
     return String(value)
 }
 
-// "3 EUR · 1.5 USD" for {EUR: "3", USD: "1.5"}; "" for none.
-function amounts(byCurrency) {
-    return Object.keys(byCurrency || {}).sort().map(c => byCurrency[c] + " " + c).join(" · ")
+// `amount` in `currency` through `money(amount, currency)`, or as it came without one.
+function moneyOf(amount, currency, money) {
+    return money ? money(String(amount), String(currency)) : amount + " " + currency
+}
+
+// "3.00 EUR · 1.50 USD" for {EUR: "3", USD: "1.5"} (through `money`); "" for none.
+function amounts(byCurrency, money) {
+    return Object.keys(byCurrency || {}).sort().map(c => moneyOf(byCurrency[c], c, money)).join(" · ")
 }
 
 // "1200 input tokens · 4 images" for a row's units, in Appendix F's order, then any other.
+// `cache_ttl` is a duration the core never adds up; shown as it comes if a row carries one.
 function unitText(values) {
     const v = values || {}
     const known = units.filter(([k]) => v[k] !== undefined && v[k] !== null).map(([k, word]) => v[k] + " " + word)
@@ -123,11 +131,19 @@ function shownRows(summary, basis, dimension) {
     })
 }
 
+// "YYYY-MM" of today, on this PC's calendar, as the core's months are (CORE-012).
+function localMonth() {
+    const d = new Date()
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0")
+}
+
 // The CSV of the rows shown (APP-117): its columns and one object per line. `amount` is money
 // spend only (money and unattributed rows, told apart by `basis`), one line per currency; local
-// work's energy cost has its own `energy_currency` and `energy_cost` columns; a month's fixed
-// costs follow as `basis: "fixed_cost"` lines with their `display_amount`. The unit columns are
-// the ones the rows carry, in Appendix F's order. Values are raw: the CSV guards them.
+// work's energy cost has its own `energy_currency` and `energy_cost` columns. A row in several
+// currencies has its counts and units on its first line only, so a spreadsheet's sums count
+// them once. A month's fixed costs follow as `basis: "fixed_cost"` lines with the month's
+// period and their `display_amount`. The unit columns are the ones the rows carry, in
+// Appendix F's order. Values are raw (exact decimals): the CSV guards them.
 function exportTable(summary, dimension) {
     const rows = []
     for (const basis of bases)
@@ -141,11 +157,11 @@ function exportTable(summary, dimension) {
                      .concat(fixed.length > 0 ? ["display_amount"] : [])
     const lines = []
     for (const r of rows) {
-        const base = {period: r.period, basis: r.basis, label: r.label, records: r.records,
-                      estimated: r.estimated, reconciled: r.reconciled}
+        const base = {period: r.period, basis: r.basis, label: r.label}
         base[dimension] = r.value
+        const counts = {records: r.records, estimated: r.estimated, reconciled: r.reconciled}
         for (const k of seen)
-            base[k] = r.units[k] === undefined ? null : r.units[k]
+            counts[k] = r.units[k] === undefined ? null : r.units[k]
         const parts = []
         for (const c of Object.keys(r.byCurrency).sort())
             parts.push({currency: c, amount: r.byCurrency[c]})
@@ -153,11 +169,11 @@ function exportTable(summary, dimension) {
             parts.push({energy_currency: c, energy_cost: r.energyCost[c]})
         if (parts.length === 0)
             parts.push({})
-        for (const p of parts)
-            lines.push(Object.assign({}, base, p))
+        parts.forEach((p, i) => lines.push(Object.assign({}, base, i === 0 ? counts : {}, p)))
     }
+    const month = summary && summary.rows && summary.rows.length > 0 ? summary.rows[0].period : localMonth()
     for (const f of fixed)
-        lines.push({basis: "fixed_cost", label: f.name, currency: f.currency, amount: f.amount,
+        lines.push({period: month, basis: "fixed_cost", label: f.name, currency: f.currency, amount: f.amount,
                     display_amount: f.display_amount})
     return {columns: columns, rows: lines}
 }
@@ -179,11 +195,11 @@ function capName(cap) {
     return String(cap)
 }
 
-// An `alert` event of the `caps` topic as one line (CORE-089).
-function alertText(a) {
+// An `alert` event of the `caps` topic as one line (CORE-089), its amount through `money`.
+function alertText(a, money) {
     let text = capName(a.cap) + " passed " + a.threshold_pct + " %"
     if (a.spent !== undefined && a.spent !== null)
-        text += ": " + a.spent + " " + (a.currency || "") + " settled"
+        text += ": " + moneyOf(a.spent, a.currency || "", money) + " settled"
                 + (a.spent_pct !== undefined && a.spent_pct !== null ? " (" + a.spent_pct + " %)" : "")
     if (a.period)
         text += ", " + a.period

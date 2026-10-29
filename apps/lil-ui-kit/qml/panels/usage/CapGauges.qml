@@ -3,13 +3,14 @@
 // in suite.toml doesn't read, or an amount under it has no dated rate) shows as such, never as a
 // ratio (it counts as exceeded). The 50, 80 and 100 % alerts of the `caps` topic (CORE-089) are
 // one line each, newest first, never stacked; a repeat of the same cap, level and month adds
-// none, and a read of a new month drops the old month's. The panel decides when to read() again:
+// none, and a read of a new month drops older months'. The panel decides when to read() again:
 // a read while one is out waits for it, then reads once more.
 //
 // Every Text of its own is plain text, and the cap names, currencies, alert and error text go
-// through `core.shownText` (P4a-R8).
+// through `core.shownText` (P4a-R8). Amounts show through MoneyText (owner decision 2026-10-29).
 pragma ComponentBehavior: Bound
 import QtQuick
+import Lilith.Core
 import Lilith.UiKit
 import "UsageText.js" as UsageText
 
@@ -28,6 +29,10 @@ LCard {
 
     title: "Spending caps" + (view ? " · " + safe(view.period, 16) : "")
 
+    function money(amount, currency) {
+        return MoneyText.text(String(amount), String(currency))
+    }
+
     function safe(s, n) {
         return UsageText.shown(core, s, n)
     }
@@ -45,8 +50,10 @@ LCard {
                 root.view = r.structured
                 root.error = null
                 const period = root.view ? root.view.period : ""
-                if (root.alerts.some(a => a.period !== period))
-                    root.alerts = root.alerts.filter(a => a.period === period)
+                // Only older months' alerts go ("YYYY-MM" compares in order): a late read of
+                // last month never drops this month's alert, which the core sends once.
+                if (period !== "" && root.alerts.some(a => a.period < period))
+                    root.alerts = root.alerts.filter(a => a.period >= period)
                 root.again()
             },
             error: e => {
@@ -69,7 +76,7 @@ LCard {
         const key = [a.cap, a.threshold_pct, a.period].join("|")
         if (alerts.some(x => x.key === key))
             return
-        const text = safe(UsageText.alertText(a), 300)
+        const text = safe(UsageText.alertText(a, money), 300)
         alerts = [{key: key, period: a.period, text: text}].concat(alerts)
         Accessible.announce(text)
     }
@@ -122,9 +129,10 @@ LCard {
                     LGauge {
                         objectName: "cap_" + capLoader.modelData.cap
                         width: capLoader.width
-                        label: root.safe(capLoader.name + ": " + capLoader.modelData.settled + " settled + "
-                                         + capLoader.modelData.held + " held of " + capLoader.modelData.limit
-                                         + " " + root.currency, 200)
+                        label: root.safe(capLoader.name + ": "
+                                         + root.money(capLoader.modelData.settled, root.currency) + " settled + "
+                                         + root.money(capLoader.modelData.held, root.currency) + " held of "
+                                         + root.money(capLoader.modelData.limit, root.currency), 200)
                         // Floored to the whole percent, as the alerts are.
                         value: Math.floor(capLoader.modelData.ratio_permille / 10) / 100
                     }

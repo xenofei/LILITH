@@ -199,10 +199,10 @@ TestCase {
         // The month tab and the day tab.
         compare(panel.tab, "month")
         verify(panel.month.visible && !panel.day.visible)
-        verify(shows(panel.month, "5 USD"), "the month's total")
+        verify(shows(panel.month, "5.00 USD"), "the month's total")
         panel.setTab("day")
         verify(panel.day.visible && !panel.month.visible)
-        verify(shows(panel.day, "1 USD"), "the day's total")
+        verify(shows(panel.day, "1.00 USD"), "the day's total")
     }
 
     function test_tokens_images_and_seconds_by_model() { // spec: APP-117
@@ -213,6 +213,8 @@ TestCase {
         answer(core, isSummary("month", ["model"]), ok(summary([
             row(monthKey, "money", {model: "gpt-4o"},
                 {records: 6, by_currency: {USD: "0.5"}, units: {input_tokens: 5000, output_tokens: 700, images: 2}}),
+            row(monthKey, "money", {model: "mixed"},
+                {records: 4, by_currency: {EUR: "1", USD: "2"}, units: {input_tokens: 100}}),
             row(monthKey, "subscription_quota", {model: "claude-sonnet"},
                 {records: 3, units: {input_tokens: 1200, output_tokens: 300, requests: 3}}),
             row(monthKey, "subscription_quota", {model: "gpt-image-1"},
@@ -227,11 +229,11 @@ TestCase {
                          "gpt-image-1", "4 images", "12.5 s"])
             verify(shows(quota, s), s)
         const local = section(panel, "month", "local")
-        for (const s of ["flux-dev", "81.5 GPU-seconds", "9.25 Wh", "0.002 USD"])
+        for (const s of ["flux-dev", "81.5 GPU-seconds", "9.25 Wh", "< 0.01 USD"])
             verify(shows(local, s), s)
         // A pay-as-you-go model's tokens and images, beside its money.
         const money = section(panel, "month", "money")
-        for (const s of ["gpt-4o", "0.5 USD", "5000 input tokens", "700 output tokens", "2 images"])
+        for (const s of ["gpt-4o", "0.50 USD", "5000 input tokens", "700 output tokens", "2 images"])
             verify(shows(money, s), s)
         // And in the CSV, each unit in its own column.
         const dir = TestFiles.newDir("usage-units")
@@ -242,8 +244,17 @@ TestCase {
                 + "input_tokens,output_tokens,images,seconds,requests,gpu_seconds,energy_wh_gross,"
                 + "energy_currency,energy_cost")
         compare(lines[1], "2026-10,money,gpt-4o,gpt-4o,6,0,0,USD,0.5,5000,700,2,,,,,,")
-        compare(lines[4], "2026-10,local,flux-dev,flux-dev,5,,,,,,,,,,81.5,9.25,USD,0.002",
+        compare(lines[2], "2026-10,money,mixed,mixed,4,0,0,EUR,1,100,,,,,,,,")
+        compare(lines[3], "2026-10,money,mixed,mixed,,,,USD,2,,,,,,,,,", "counts and units on the first line only")
+        compare(lines.find(l => l.indexOf(",local,") >= 0),
+                "2026-10,local,flux-dev,flux-dev,5,,,,,,,,,,81.5,9.25,USD,0.002",
                 "local work's energy cost in its own columns, not in amount")
+        // A spreadsheet's sums over the money lines count each row once.
+        const columns = lines[0].split(",")
+        const moneyLines = lines.filter(l => l.indexOf(",money,") >= 0).map(l => l.split(","))
+        const sum = name => moneyLines.reduce((n, l) => n + Number(l[columns.indexOf(name)] || 0), 0)
+        compare(sum("records"), 10, "6 + 4 records")
+        compare(sum("input_tokens"), 5100, "5000 + 100 input tokens")
     }
 
     function test_estimated_and_reconciled_are_marked() { // spec: APP-117
@@ -279,10 +290,10 @@ TestCase {
         compare(panel.month.shown("unattributed").map(r => r.label), ["comfy-org"])
         const outside = section(panel, "month", "unattributed")
         verify(shows(outside, "comfy-org"))
-        verify(shows(outside, "3 USD"))
+        verify(shows(outside, "3.00 USD"))
         verify(!shows(section(panel, "month", "money"), "comfy-org"), "not in the money section")
-        verify(shows(section(panel, "month", "totals"), "2 USD"), "the total is the core's, without it")
-        verify(!shows(section(panel, "month", "totals"), "5 USD"))
+        verify(shows(section(panel, "month", "totals"), "2.00 USD"), "the total is the core's, without it")
+        verify(!shows(section(panel, "month", "totals"), "5.00 USD"))
     }
 
     function test_billing_bases_are_never_added_together() { // spec: APP-118, CORE-081
@@ -306,7 +317,7 @@ TestCase {
         verify(!shows(quota, "USD"), "subscription quota is in its own units, never money")
         verify(shows(quota, "not money, and not in the spend total"))
         verify(shows(local, "30 GPU-seconds") && !shows(local, "openrouter"))
-        verify(texts(section(panel, "month", "totals")).indexOf("Spend this month: 4 USD") >= 0,
+        verify(texts(section(panel, "month", "totals")).indexOf("Spend this month: 4.00 USD") >= 0,
                "the whole totals line: " + texts(section(panel, "month", "totals")))
     }
 
@@ -321,11 +332,11 @@ TestCase {
         tryVerify(() => panel.month.loaded && panel.day.loaded, 5000)
         const fixed = section(panel, "month", "fixed_costs")
         verify(fixed.visible)
-        verify(shows(fixed, "storage") && shows(fixed, "5 USD"))
-        verify(shows(fixed, "plan") && shows(fixed, "18 GBP"))
+        verify(shows(fixed, "storage") && shows(fixed, "5.00 USD"))
+        verify(shows(fixed, "plan") && shows(fixed, "18.00 GBP"))
         verify(shows(fixed, "no rate"), "a cost that couldn't be converted says so")
         verify(shows(fixed, "Caps don't apply"))
-        verify(shows(section(panel, "month", "totals"), "6 USD"))
+        verify(shows(section(panel, "month", "totals"), "6.00 USD"))
         verify(shows(section(panel, "month", "totals"), "fixed costs included"))
         panel.setTab("day")
         verify(!section(panel, "day", "fixed_costs").visible, "a day has no fixed costs")
@@ -336,14 +347,18 @@ TestCase {
         const core = makeCore()
         const panel = makePanel(core)
         load(core, "provider",
-             summary([row(monthKey, "money", {provider: "p-eur"}, {records: 2, by_currency: {EUR: "3"}})],
+             summary([row(monthKey, "money", {provider: "p-eur"}, {records: 2, by_currency: {EUR: "3"}}),
+                      row(monthKey, "money", {provider: "p-big"}, {records: 9, by_currency: {JPY: "1234567.5", USD: "1234.565"}})],
                      {by_currency: {EUR: "3", USD: "1"}, display_total: "9.4", unconverted: ["GBP"]}))
         tryVerify(() => panel.month.loaded, 5000)
         const totals = section(panel, "month", "totals")
-        verify(shows(totals, "9.4 USD"), "the converted total, as the core gives it")
-        verify(shows(totals, "3 EUR") && shows(totals, "1 USD"), "each currency's own total")
+        verify(shows(totals, "9.40 USD"), "the core's total, shown to the cent")
+        verify(shows(totals, "3.00 EUR") && shows(totals, "1.00 USD"), "each currency's own total")
         verify(shows(totals, "GBP"), "a currency with no rate is named")
-        verify(shows(section(panel, "month", "money"), "3 EUR"))
+        const money = section(panel, "month", "money")
+        verify(shows(money, "3.00 EUR"))
+        verify(shows(money, "1,234.57 USD"), "rounded half up, with separators")
+        verify(shows(money, "1,234,568 JPY"), "JPY has no minor unit")
         // The display currency is the caps' own, as caps.get gives it.
         compare(panel.gauges.currency, "USD")
     }
@@ -361,7 +376,7 @@ TestCase {
         const gauge = findChild(panel.gauges, "cap_monthly")
         verify(gauge, "the monthly gauge")
         compare(gauge.value, 0.5)
-        verify(gauge.label.indexOf("4") >= 0 && gauge.label.indexOf("10 USD") >= 0, gauge.label)
+        verify(gauge.label.indexOf("4.00 USD settled + 1.00 USD held of 10.00 USD") >= 0, gauge.label)
         verify(!findChild(panel.gauges, "cap_provider:openrouter"), "an invalid cap has no gauge")
         const invalid = findChild(panel.gauges, "cap_provider:openrouter_invalid")
         verify(invalid && invalid.visible)
@@ -385,11 +400,21 @@ TestCase {
                   2000, "one per line")
         verify(shown[0].text.indexOf("100 %") >= 0, "the newest first: " + shown[0].text)
         verify(shown[2].text.indexOf("50 %") >= 0, shown[2].text)
-        verify(shown[1].text.indexOf("Monthly") >= 0, shown[1].text)
+        verify(shown[1].text.indexOf("Monthly") >= 0 && shown[1].text.indexOf("8.00 USD settled") >= 0, shown[1].text)
 
-        // A read of the next month drops this month's alerts.
+        // At the month's turn: the next month's alert, then a late read of this month. The new
+        // alert stays (the core sends it once).
+        core.emit("caps", "event", {kind: "alert", cap: "monthly", threshold_pct: 50, spent_pct: 50,
+                                    spent: "5", currency: "USD", period: "2026-11"})
+        tryVerify(() => panel.gauges.alerts.length === 4, 5000)
+        answer(core, isCaps, ok(capsView()))
+        wait(50)
+        compare(panel.gauges.alerts.length, 4, "a late read of the old month drops nothing")
+        // A read of the new month drops the older months' alerts only.
+        core.emit("caps", "event", {kind: "changed", caps: capsView()})
         answer(core, isCaps, ok({display_currency: "USD", period: "2026-11", caps: []}))
-        tryVerify(() => panel.gauges.alerts.length === 0, 5000, "the old month's alerts go")
+        tryVerify(() => panel.gauges.alerts.length === 1, 5000, "the old month's alerts go")
+        compare(panel.gauges.alerts[0].period, "2026-11")
     }
 
     function test_caps_are_read_again_at_most_once_a_second() { // spec: APP-121
@@ -502,7 +527,7 @@ TestCase {
             row(monthKey, "money", {provider: "openrouter"}, {records: 3, estimated: 2, by_currency: {EUR: "3", USD: "1.5"}}),
             row(monthKey, "money", {provider: "=cmd"}, {records: 1}),
             row(monthKey, "subscription_quota", {provider: "anthropic"}, {records: 2, units: {input_tokens: 900}}),
-        ]))
+        ], {fixed_costs: [{name: "storage", amount: "5", currency: "USD", display_amount: "5"}]}))
         tryVerify(() => panel.month.loaded && panel.exportButton.enabled, 5000)
         const dir = TestFiles.newDir("usage-csv")
         const file = "file:///" + dir + "/usage.csv"
@@ -513,13 +538,15 @@ TestCase {
         verify(text !== null, "the file is written")
         // TestFiles.read (QString::fromUtf8) drops the BOM; lil_qt's csv_ tests check its bytes.
         const lines = text.split("\r\n")
-        compare(lines[0], "period,basis,provider,label,records,estimated,reconciled,currency,amount,input_tokens")
-        compare(lines[1], "2026-10,money,openrouter,openrouter,3,2,0,EUR,3,")
-        compare(lines[2], "2026-10,money,openrouter,openrouter,3,2,0,USD,1.5,")
-        compare(lines[3], "2026-10,money,'=cmd,'=cmd,1,0,0,USD,1,", "a formula stays text")
-        compare(lines[4], "2026-10,subscription_quota,anthropic,anthropic,2,,,,,900")
-        compare(lines[5], "")
-        compare(lines.length, 6)
+        compare(lines[0], "period,basis,provider,label,records,estimated,reconciled,currency,amount,input_tokens,"
+                + "display_amount")
+        compare(lines[1], "2026-10,money,openrouter,openrouter,3,2,0,EUR,3,,", "exact decimals, not as shown")
+        compare(lines[2], "2026-10,money,openrouter,openrouter,,,,USD,1.5,,", "counts once per row")
+        compare(lines[3], "2026-10,money,'=cmd,'=cmd,1,0,0,USD,1,,", "a formula stays text")
+        compare(lines[4], "2026-10,subscription_quota,anthropic,anthropic,2,,,,,900,")
+        compare(lines[5], "2026-10,fixed_cost,,storage,,,,USD,5,,5", "a fixed cost, with its month")
+        compare(lines[6], "")
+        compare(lines.length, 7)
         compare(TestFiles.list(dir), ["usage.csv"], "nothing beside it")
 
         // The same file again, after the figures moved: it is replaced, and no backup stays.

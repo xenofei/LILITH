@@ -3,13 +3,15 @@
 // billing bases apart (APP-118): the totals, money, subscription quota (its own units), local
 // work, spend outside LILITH (unattributed, APP-116) and, for a month, the fixed costs (APP-119).
 // Every figure is the core's own (decimal strings with their currency codes); nothing is added
-// up here. Each row shows the record units it carries (tokens, images, seconds: APP-117).
+// up here. Each row shows the record units it carries (tokens, images, seconds: APP-117). Amounts
+// show through MoneyText ("1,234.57 USD", owner decision 2026-10-29).
 //
 // Every Text is plain text, and every string from the usage logs or suite.toml (names,
 // currencies, error text) is shown through `core.shownText` (P4a-R8): markup shows as written
 // and loads nothing.
 pragma ComponentBehavior: Bound
 import QtQuick
+import Lilith.Core
 import Lilith.UiKit
 import "UsageText.js" as UsageText
 
@@ -43,6 +45,11 @@ Column {
     // The rows of `basis` as shown (UsageText.shownRows).
     function shown(basis) {
         return UsageText.shownRows(summary, basis, shownDimension)
+    }
+
+    // `amount` in `currency`, as the apps show money (MoneyText, owner decision 2026-10-29).
+    function money(amount, currency) {
+        return MoneyText.text(String(amount), String(currency))
     }
 
     // `s` as shown (core.shownText): at most `n` characters, 80 by default.
@@ -199,8 +206,7 @@ Column {
         spacing: 2
 
         Line {
-            text: "Spend " + root.periodWord + ": " + (root.summary ? root.summary.display_total + " "
-                  + root.safe(root.summary.display_currency, 16) : "")
+            text: "Spend " + root.periodWord + ": " + (root.summary ? root.safe(root.money(root.summary.display_total, root.summary.display_currency), 60) : "")
             font.pixelSize: Theme.fontSize + 4
             font.bold: true
         }
@@ -210,8 +216,8 @@ Column {
         }
         Line {
             visible: text !== ""
-            text: root.summary && UsageText.amounts(root.summary.by_currency) !== ""
-                  ? "By currency: " + root.safe(UsageText.amounts(root.summary.by_currency), 300) : ""
+            text: root.summary && UsageText.amounts(root.summary.by_currency, root.money) !== ""
+                  ? "By currency: " + root.safe(UsageText.amounts(root.summary.by_currency, root.money), 300) : ""
         }
         Line {
             visible: !!(root.summary && root.summary.unconverted && root.summary.unconverted.length)
@@ -242,7 +248,7 @@ Column {
             id: moneyRows
             model: UsageText.shownRows(root.summary, "money", root.shownDimension)
             delegate: UsageRow {
-                figures: [UsageText.amounts(modelData.byCurrency), UsageText.unitText(modelData.units),
+                figures: [UsageText.amounts(modelData.byCurrency, root.money), UsageText.unitText(modelData.units),
                           UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
             }
         }
@@ -291,8 +297,8 @@ Column {
             model: UsageText.shownRows(root.summary, "local", root.shownDimension)
             delegate: UsageRow {
                 figures: [UsageText.unitText(modelData.units),
-                          UsageText.amounts(modelData.energyCost) !== ""
-                          ? "energy " + UsageText.amounts(modelData.energyCost) : "",
+                          UsageText.amounts(modelData.energyCost, root.money) !== ""
+                          ? "energy " + UsageText.amounts(modelData.energyCost, root.money) : "",
                           UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
             }
         }
@@ -313,13 +319,13 @@ Column {
             readonly property var u: root.summary && root.summary.unattributed ? root.summary.unattributed : ({})
             text: "Paid ComfyUI work submitted outside the suite (unattributed), never in the totals above"
                   + (u.records ? ": " + UsageText.records(u.records)
-                     + (UsageText.amounts(u.by_currency) !== ""
-                        ? ", " + root.safe(UsageText.amounts(u.by_currency), 300) : "") : ".")
+                     + (UsageText.amounts(u.by_currency, root.money) !== ""
+                        ? ", " + root.safe(UsageText.amounts(u.by_currency, root.money), 300) : "") : ".")
         }
         Repeater {
             model: UsageText.shownRows(root.summary, "unattributed", root.shownDimension)
             delegate: UsageRow {
-                figures: [UsageText.amounts(modelData.byCurrency), UsageText.unitText(modelData.units),
+                figures: [UsageText.amounts(modelData.byCurrency, root.money), UsageText.unitText(modelData.units),
                           UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
             }
         }
@@ -338,11 +344,11 @@ Column {
             model: root.summary && root.summary.fixed_costs ? root.summary.fixed_costs : []
             delegate: Line {
                 required property var modelData
-                readonly property string own: modelData.amount + " " + root.safe(modelData.currency, 16)
+                readonly property string own: root.safe(root.money(modelData.amount, modelData.currency), 60)
                 readonly property string shownAs: modelData.display_amount === null
                     ? "no rate: not in the total"
                     : modelData.currency === root.summary.display_currency
-                      ? "" : modelData.display_amount + " " + root.safe(root.summary.display_currency, 16)
+                      ? "" : root.safe(root.money(modelData.display_amount, root.summary.display_currency), 60)
                 text: root.safe(modelData.name) + ": " + own + (shownAs !== "" ? " (" + shownAs + ")" : "")
                 color: modelData.display_amount === null ? Theme.warning : Theme.text
             }
