@@ -250,8 +250,14 @@ function Save-UiaTree([string]$path) {
         if ($lines.Count -ge 4000) { return }
         try {
             $c = $e.Current
-            $name = if ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            # Names only for the app's own Qt elements (their ids start "QGuiApplication"):
+            # nothing of the system dialogs, whose lists show the PC's own folders and files.
+            $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
+            $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
+            # The save dialog's file list, navigation pane and address bar or breadcrumb: the
+            # node alone, nothing under it.
+            if ($c.AutomationId -in 'listview', 'ProperTreeHost', '40965', '41477' -or $c.ClassName -in 'Breadcrumb Parent', 'Address Band Root') { return }
         } catch { $lines.Add(('{0}(gone)' -f ('  ' * $depth))); return }
         $child = $walker.GetFirstChild($e)
         while ($child) { & $walk $child ($depth + 1); $child = $walker.GetNextSibling($child) }
@@ -259,12 +265,12 @@ function Save-UiaTree([string]$path) {
     foreach ($w in App-Windows) { & $walk $w 0 }
     Set-Content -LiteralPath $path -Value $lines -Encoding utf8
 }
-# The replace prompt's Yes: under the save dialog, else in a window of the app's own.
+# The replace prompt's Yes, any control type: under the save dialog, else in a window of the
+# app's own.
 function Find-Yes($dlg) {
-    $yes = And (Prop $AE::NameProperty 'Yes') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Button))
+    $yes = Prop $AE::NameProperty 'Yes'
     try { $e = $dlg.FindFirst($TS::Descendants, $yes); if ($e) { return $e } } catch { }
-    $wins = $AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id))
-    foreach ($w in $wins) { $e = $w.FindFirst($TS::Descendants, $yes); if ($e) { return $e } }
+    foreach ($w in App-Windows) { $e = $w.FindFirst($TS::Descendants, $yes); if ($e) { return $e } }
     return $null
 }
 $dialogTitle = 'Export the usage as CSV'
@@ -273,12 +279,60 @@ function Open-SaveDialog {
     Invoke-Element $btn
     return Wait-For { Find-Window $script:app.Id $dialogTitle } 20 'the save dialog'
 }
+# `e`'s window in front (Win32).
+function Show-Element($e) {
+    try { [void][LilUsageCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
+    Start-Sleep -Milliseconds 300
+}
+# SendKeys' own characters, escaped.
+function Escape-Keys([string]$s) { [regex]::Replace($s, '[+^%~(){}\[\]]', '{$0}') }
+# A child of the dialog with automation id `id`, any control type, invoked; false when it has
+# no Invoke pattern.
+function Invoke-DialogId($dlg, [string]$id) {
+    $e = $dlg.FindFirst($TS::Children, (Prop $AE::AutomationIdProperty $id))
+    if (-not $e) { $e = $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $id)) }
+    $p = $null
+    if ($e -and $e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return $true }
+    return $false
+}
+# The full path into the file name box (id 1001 under FileNameControlHost, any control type;
+# the dialog goes to its folder), then Save (id 1, else Enter).
 function Save-As($dlg, [string]$path) {
-    $edit = Wait-For { $dlg.FindFirst($TS::Descendants, (And (Prop $AE::AutomationIdProperty '1001') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Edit)))) } 10 'the file name box'
-    $vp = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-    $vp.SetValue($path)
-    $save = $dlg.FindFirst($TS::Descendants, (And (Prop $AE::AutomationIdProperty '1') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Button))))
-    Invoke-Element $save
+    $hostPane = Wait-For { $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty 'FileNameControlHost')) } 10 'the file name box''s host'
+    $box = $hostPane.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty '1001'))
+    if (-not $box) { $box = $hostPane }
+    $vp = $null
+    $typed = $false
+    if ($box.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+        try { $vp.SetValue($path); $typed = $true; Write-Host 'file name: set through its value pattern' } catch { }
+    }
+    if (-not $typed) {
+        # The file name box has the keyboard focus when the dialog opens.
+        Show-Element $dlg
+        try { $box.SetFocus() } catch { }
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        [System.Windows.Forms.SendKeys]::SendWait((Escape-Keys $path))
+        Write-Host 'file name: typed'
+        Start-Sleep -Milliseconds 300
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        return
+    }
+    if (-not (Invoke-DialogId $dlg '1')) {
+        Show-Element $dlg; try { $box.SetFocus() } catch { }
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    }
+}
+# Cancel: id 2, else Escape.
+function Cancel-Dialog($dlg) {
+    if (-not (Invoke-DialogId $dlg '2')) { Show-Element $dlg; [System.Windows.Forms.SendKeys]::SendWait('{ESC}') }
+}
+# The replace prompt: its Yes, any control type, else Alt+Y.
+function Confirm-Replace($dlg) {
+    $yes = $null
+    try { $yes = Wait-For { Find-Yes $dlg } 5 'the replace prompt''s Yes' } catch { }
+    if ($yes) { Invoke-Element $yes; Write-Host 'replace prompt: Yes'; return }
+    [System.Windows.Forms.SendKeys]::SendWait('%y')
+    Write-Host 'replace prompt: Alt+Y'
 }
 
 $outDir = $null
@@ -315,8 +369,7 @@ try {
     # (b) Cancel.
     $before = @{ hash = (Get-FileHash -LiteralPath $file).Hash; time = (Get-Item -LiteralPath $file).LastWriteTimeUtc; names = (Get-Listing $outDir) -join '|' }
     $dlg = Open-SaveDialog
-    $cancel = $dlg.FindFirst($TS::Descendants, (And (Prop $AE::AutomationIdProperty '2') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Button))))
-    Invoke-Element $cancel
+    Cancel-Dialog $dlg
     [void](Wait-For { if (-not (Find-Window $script:app.Id $dialogTitle)) { $true } } 10 'the dialog to close')
     Start-Sleep -Seconds 1
     $after = @{ hash = (Get-FileHash -LiteralPath $file).Hash; time = (Get-Item -LiteralPath $file).LastWriteTimeUtc; names = (Get-Listing $outDir) -join '|' }
@@ -327,8 +380,8 @@ try {
     [void](Wait-For { Find-NameStarting $script:main 'Spend this month: 1.75 USD' } 15 'the panel to read the second record')
     $dlg = Open-SaveDialog
     Save-As $dlg $file
-    $yes = Wait-For { Find-Yes $dlg } 10 'the replace prompt''s Yes'
-    Invoke-Element $yes
+    Start-Sleep -Milliseconds 500
+    Confirm-Replace $dlg
     [void](Wait-For { if ((Get-FileHash -LiteralPath $file).Hash -ne $before.hash) { $true } } 20 'usage.csv to change')
     Start-Sleep -Milliseconds 500
     $r = @(Test-Export $outDir @('openrouter', 'fal'))
