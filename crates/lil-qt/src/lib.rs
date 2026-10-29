@@ -38,6 +38,7 @@ pub mod qt;
 pub mod app_state;
 pub mod csv;
 pub mod layout_file;
+pub mod money;
 pub mod paging;
 pub mod preview;
 pub mod requests;
