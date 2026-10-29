@@ -2,7 +2,8 @@
 //! background [`runtime`], with the list models of [`json_list_model`], the live-preview feed
 //! of [`preview_feed`], and [`layout`], the shell's layout file and shortcut map), and the calls
 //! `apps/lil-image/main.cpp` makes: the boot plan before Qt starts, the app's log (ARCH-117,
-//! ARCH-119), the Qt log lines, the start times and the core session.
+//! ARCH-119), the Qt log lines, the start times and the core session. [`csv_export`] is the
+//! Usage & spend panel's save-file bridge.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -10,6 +11,7 @@ use lil_client::ClientConfig;
 use lil_protocol::CallerKind;
 
 pub mod core_object;
+pub mod csv_export;
 pub mod json_list_model;
 pub mod layout;
 pub mod preview_feed;
