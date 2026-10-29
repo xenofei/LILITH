@@ -2,7 +2,7 @@
 //! bridge (APP-117). `save(file, rowsJson, columnsJson)` writes the rows the panel shows to the
 //! file you picked ([`crate::csv::export`], through `replace_file`) on a thread of its own, never
 //! the GUI thread (QA-026), and then emits `saved(path)` or `failed(path, why)` on the GUI
-//! thread; a failed write leaves the file that was there as it was.
+//! thread. `why` says why the write failed and what became of the file that was there.
 //!
 //! - `file` is a `file:` URL (the file dialog's); `path` in the signals is its local path.
 //! - `busy` is true from a `save` until its signal. A `save` while busy, or one whose arguments
