@@ -6,7 +6,7 @@
 //!   themselves, away from zero for a negative amount. No binary float is ever involved.
 //! - **Separators.** A comma between each group of three integer digits, a point before the
 //!   decimals.
-//! - **Small amounts.** A non-zero amount that rounds to zero reads "< 0.01 USD" ("< 1 JPY"),
+//! - **Small amounts.** A non-zero amount below one minor unit reads "< 0.01 USD" ("< 1 JPY"),
 //!   or "> -0.01 USD" when negative. Zero reads "0.00 USD".
 //! - **Malformed input** (not `-?digits[.digits]`) is shown as it came, cut to
 //!   [`MALFORMED_MAX`] characters (never the code or the mark), marked "(unreadable)", and never
@@ -54,9 +54,6 @@ pub fn money_text(amount: &str, currency: &str) -> String {
     let mut kept: Vec<u8> = whole.bytes().map(|b| b - b'0').collect();
     let decimals: Vec<u8> = part.bytes().map(|b| b - b'0').collect();
     kept.extend((0..scale).map(|i| decimals.get(i).copied().unwrap_or(0)));
-    if decimals.get(scale).copied().unwrap_or(0) >= 5 {
-        carry(&mut kept);
-    }
     let nonzero = whole.bytes().chain(part.bytes()).any(|b| b != b'0');
     if kept.iter().all(|d| *d == 0) {
         if !nonzero {
@@ -70,6 +67,11 @@ pub fn money_text(amount: &str, currency: &str) -> String {
         } else {
             format!("< {one}")
         });
+    }
+    // Rounded only once the amount is known to be at least one minor unit, so half a cent
+    // still reads "< 0.01".
+    if decimals.get(scale).copied().unwrap_or(0) >= 5 {
+        carry(&mut kept);
     }
     let sign = if negative { "-" } else { "" };
     with_code(format!("{sign}{}", grouped(&kept, scale)))
@@ -177,9 +179,17 @@ mod tests {
         assert_eq!(money_text("0.0049", "USD"), "< 0.01 USD");
         assert_eq!(
             money_text("0.005", "USD"),
-            "0.01 USD",
-            "half a cent rounds up"
+            "< 0.01 USD",
+            "half a cent is still below one"
         );
+        assert_eq!(money_text("0.0099", "USD"), "< 0.01 USD");
+        assert_eq!(money_text("0.01", "USD"), "0.01 USD");
+        assert_eq!(
+            money_text("0.015", "USD"),
+            "0.02 USD",
+            "rounded once at least a cent"
+        );
+        assert_eq!(money_text("0.5", "JPY"), "< 1 JPY");
         assert_eq!(money_text("0.4", "JPY"), "< 1 JPY");
         assert_eq!(money_text("0.0004", "KWD"), "< 0.001 KWD");
         assert_eq!(money_text("-0.004", "USD"), "> -0.01 USD");
@@ -196,7 +206,8 @@ mod tests {
             "-1,234.57 EUR",
             "half away from zero"
         );
-        assert_eq!(money_text("-0.005", "USD"), "-0.01 USD");
+        assert_eq!(money_text("-0.005", "USD"), "> -0.01 USD");
+        assert_eq!(money_text("-0.015", "USD"), "-0.02 USD");
     }
 
     #[test] // spec: APP-120
