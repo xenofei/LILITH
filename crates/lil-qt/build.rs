@@ -12,5 +12,6 @@ fn main() {
         .cpp_file("src/qt/core_link.cpp")
         .cpp_file("src/qt/preview_sink.cpp")
         .file("src/qt/csv_export.rs")
+        .file("src/qt/money_text.rs")
         .build();
 }

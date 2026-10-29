@@ -13,6 +13,7 @@ pub mod core_object;
 pub mod csv_export;
 pub mod json_list_model;
 pub mod layout;
+pub mod money_text;
 pub mod preview_feed;
 pub mod runtime;
 
