@@ -3,7 +3,8 @@
 //!
 //! - **Bases.** `money` (`payg`, `prepaid_credits`, `byok`, `free_tier`), `subscription_quota`
 //!   (its own units, CORE-070) and `local` (GPU-seconds and energy) are kept apart; each has at
-//!   least `records`. Unattributed records (paid ComfyUI work submitted outside the suite) are
+//!   least `records`; money, subscription quota and unattributed spend, and their rows, carry
+//!   `units`, the record units they add up (APP-117). Unattributed records (paid ComfyUI work submitted outside the suite) are
 //!   in `unattributed` alone, never in a basis or a total (CORE-082).
 //! - **Money.** A record's amount is its `cost`, else its `est_cost` (counted as `estimated`;
 //!   a `reconciled` cost is counted as such). `by_currency` sums the money basis per native
@@ -349,6 +350,7 @@ impl Tally {
                 v.insert("estimated".into(), json!(self.estimated));
                 v.insert("reconciled".into(), json!(self.reconciled));
                 v.insert("by_currency".into(), self.money.value());
+                v.insert("units".into(), self.units_value());
             }
             "local" => {
                 for (k, s) in &self.units {
@@ -357,15 +359,20 @@ impl Tally {
                 v.insert("energy_cost".into(), self.energy_cost.value());
             }
             _ => {
-                let units: Map<String, Value> = self
-                    .units
-                    .iter()
-                    .map(|(k, s)| (k.clone(), s.value()))
-                    .collect();
-                v.insert("units".into(), Value::Object(units));
+                v.insert("units".into(), self.units_value());
             }
         }
         Value::Object(v)
+    }
+
+    /// `{"<unit>": sum}` of the record units added up.
+    fn units_value(&self) -> Value {
+        Value::Object(
+            self.units
+                .iter()
+                .map(|(k, s)| (k.clone(), s.value()))
+                .collect(),
+        )
     }
 }
 
@@ -451,6 +458,11 @@ pub fn summarize(
                     }
                     if line.get("cost_source").and_then(Value::as_str) == Some("reconciled") {
                         t.reconciled += 1;
+                    }
+                    for unit in super::record::UNITS {
+                        if let Some(v) = line.get(*unit) {
+                            t.units.entry((*unit).to_string()).or_default().add(v);
+                        }
                     }
                 }
                 "local" => {
@@ -588,5 +600,69 @@ mod tests {
         assert_eq!(months_between("2026-10", "2026-10"), 1);
         assert_eq!(months_between("2026-11", "2027-01"), 3);
         assert_eq!(months_between("2026-11", "2026-10"), 1);
+    }
+
+    #[test] // spec: CORE-082
+    fn summary_money_and_unattributed_carry_their_units() {
+        let line = |provider: &str, model: &str, attribution: &str, units: Value| {
+            let mut l = json!({
+                "ts": "2027-01-15T12:00:00.000Z", "provider": provider, "model": model,
+                "billing_basis": "payg", "attribution": attribution, "currency": "USD", "cost": "1",
+            });
+            l.as_object_mut()
+                .unwrap()
+                .extend(units.as_object().unwrap().clone());
+            l.as_object().unwrap().clone()
+        };
+        let lines = [
+            line(
+                "p",
+                "m1",
+                "suite",
+                json!({"input_tokens": 1200, "output_tokens": 300}),
+            ),
+            line(
+                "p",
+                "m1",
+                "suite",
+                json!({"input_tokens": 800, "images": 2}),
+            ),
+            line("p", "m2", "suite", json!({"seconds": "1.5"})),
+            line("comfy", "m3", "unattributed", json!({"images": 4})),
+        ];
+        let utc = |_: i64| 0;
+        let range = Range {
+            from_ms: 0,
+            to_ms: i64::MAX,
+            period: Period::Month,
+            offset_secs: &utc,
+        };
+        let s = summarize(&lines, &range, &MoneySettings::default(), &[GroupBy::Model]);
+        assert_eq!(
+            s["bases"]["money"]["units"],
+            json!({"input_tokens": 2000, "output_tokens": 300, "images": 2, "seconds": "1.5"}),
+            "{s}"
+        );
+        assert_eq!(s["unattributed"]["units"], json!({"images": 4}), "{s}");
+        let row = |model: &str| {
+            s["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["model"] == model)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            row("m1")["units"],
+            json!({"input_tokens": 2000, "output_tokens": 300, "images": 2})
+        );
+        assert_eq!(
+            row("m1")["by_currency"],
+            json!({"USD": "2"}),
+            "money stays as it was"
+        );
+        assert_eq!(row("m3")["basis"], "unattributed");
+        assert_eq!(row("m3")["units"], json!({"images": 4}));
     }
 }
