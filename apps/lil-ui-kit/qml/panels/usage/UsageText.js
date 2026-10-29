@@ -70,10 +70,12 @@ function amounts(byCurrency, money) {
 
 // "1200 input tokens · 4 images" for a row's units, in Appendix F's order, then any other.
 // `cache_ttl` is a duration the core never adds up; shown as it comes if a row carries one.
-function unitText(values) {
+// Each value through `count` (MoneyText.count: "412,000"), when given.
+function unitText(values, count) {
     const v = values || {}
-    const known = units.filter(([k]) => v[k] !== undefined && v[k] !== null).map(([k, word]) => v[k] + " " + word)
-    const rest = Object.keys(v).filter(k => !units.some(([u]) => u === k)).map(k => v[k] + " " + k)
+    const n = x => count ? count(String(x)) : String(x)
+    const known = units.filter(([k]) => v[k] !== undefined && v[k] !== null).map(([k, word]) => n(v[k]) + " " + word)
+    const rest = Object.keys(v).filter(k => !units.some(([u]) => u === k)).map(k => n(v[k]) + " " + k)
     return known.concat(rest).join(" · ")
 }
 
@@ -92,22 +94,24 @@ function unitsOf(basis, row) {
 }
 
 // "2 of 3 estimated", "1 reconciled": a money row's marks (APP-117).
-function marks(row) {
+function marks(row, count) {
+    const n = x => count ? count(String(x)) : String(x)
     const out = []
     if (row.estimated > 0)
-        out.push(row.estimated === row.records ? "estimated" : row.estimated + " of " + row.records + " estimated")
+        out.push(row.estimated === row.records ? "estimated" : n(row.estimated) + " of " + n(row.records) + " estimated")
     if (row.reconciled > 0)
-        out.push(row.reconciled + " reconciled")
+        out.push(n(row.reconciled) + " reconciled")
     return out
 }
 
-function records(n) {
-    return n + (n === 1 ? " record" : " records")
+// "1 record", "12,345 records" (through `count`, when given).
+function records(n, count) {
+    return (count ? count(String(n)) : n) + (n === 1 ? " record" : " records")
 }
 
 // The rows of `summary` of `basis` as the panel shows them, grouped by `dimension`. Labels are
-// raw here: the panel shows them through `shown`.
-function shownRows(summary, basis, dimension) {
+// raw here: the panel shows them through `shown`; counts in the marks go through `count`.
+function shownRows(summary, basis, dimension, count) {
     if (!summary || !summary.rows)
         return []
     return summary.rows.filter(r => r.basis === basis).map(r => {
@@ -126,7 +130,7 @@ function shownRows(summary, basis, dimension) {
             byCurrency: money ? (r.by_currency || {}) : {},
             energyCost: basis === "local" ? (r.energy_cost || {}) : {},
             units: unitsOf(basis, r),
-            marks: money ? marks(r) : [],
+            marks: money ? marks(r, count) : [],
         }
     })
 }

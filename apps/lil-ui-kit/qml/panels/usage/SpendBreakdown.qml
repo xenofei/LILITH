@@ -44,12 +44,17 @@ Column {
 
     // The rows of `basis` as shown (UsageText.shownRows).
     function shown(basis) {
-        return UsageText.shownRows(summary, basis, shownDimension)
+        return UsageText.shownRows(summary, basis, shownDimension, count)
     }
 
     // `amount` in `currency`, as the apps show money (MoneyText, owner decision 2026-10-29).
     function money(amount, currency) {
         return MoneyText.text(String(amount), String(currency))
+    }
+
+    // A count with thousands separators ("412,000").
+    function count(value) {
+        return MoneyText.count(String(value))
     }
 
     // `s` as shown (core.shownText): at most `n` characters, 80 by default.
@@ -241,15 +246,15 @@ Column {
         Heading { text: "Money" }
         Note {
             readonly property var m: root.bases.money || ({})
-            text: UsageText.records(m.records || 0) + ": " + (m.estimated || 0) + " estimated, "
-                  + (m.reconciled || 0) + " reconciled"
+            text: UsageText.records(m.records || 0, root.count) + ": " + root.count(m.estimated || 0)
+                  + " estimated, " + root.count(m.reconciled || 0) + " reconciled"
         }
         Repeater {
             id: moneyRows
-            model: UsageText.shownRows(root.summary, "money", root.shownDimension)
+            model: UsageText.shownRows(root.summary, "money", root.shownDimension, root.count)
             delegate: UsageRow {
-                figures: [UsageText.amounts(modelData.byCurrency, root.money), UsageText.unitText(modelData.units),
-                          UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
+                figures: [UsageText.amounts(modelData.byCurrency, root.money), UsageText.unitText(modelData.units, root.count),
+                          UsageText.records(modelData.records, root.count)].filter(s => s !== "").join("  ·  ")
             }
         }
         Note {
@@ -268,9 +273,9 @@ Column {
         Note { text: "In each plan's own units: not money, and not in the spend total." }
         Repeater {
             id: quotaRows
-            model: UsageText.shownRows(root.summary, "subscription_quota", root.shownDimension)
+            model: UsageText.shownRows(root.summary, "subscription_quota", root.shownDimension, root.count)
             delegate: UsageRow {
-                figures: [UsageText.unitText(modelData.units), UsageText.records(modelData.records)]
+                figures: [UsageText.unitText(modelData.units, root.count), UsageText.records(modelData.records, root.count)]
                          .filter(s => s !== "").join("  ·  ")
             }
         }
@@ -289,17 +294,17 @@ Column {
         Heading { text: "Local work" }
         Note {
             readonly property var l: root.bases.local || ({})
-            text: "GPU time and energy on this PC" + (UsageText.unitText(UsageText.unitsOf("local", l)) !== ""
-                  ? ": " + UsageText.unitText(UsageText.unitsOf("local", l)) : ".")
+            text: "GPU time and energy on this PC" + (UsageText.unitText(UsageText.unitsOf("local", l), root.count) !== ""
+                  ? ": " + UsageText.unitText(UsageText.unitsOf("local", l), root.count) : ".")
         }
         Repeater {
             id: localRows
-            model: UsageText.shownRows(root.summary, "local", root.shownDimension)
+            model: UsageText.shownRows(root.summary, "local", root.shownDimension, root.count)
             delegate: UsageRow {
-                figures: [UsageText.unitText(modelData.units),
+                figures: [UsageText.unitText(modelData.units, root.count),
                           UsageText.amounts(modelData.energyCost, root.money) !== ""
                           ? "energy " + UsageText.amounts(modelData.energyCost, root.money) : "",
-                          UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
+                          UsageText.records(modelData.records, root.count)].filter(s => s !== "").join("  ·  ")
             }
         }
         Note {
@@ -318,15 +323,15 @@ Column {
         Note {
             readonly property var u: root.summary && root.summary.unattributed ? root.summary.unattributed : ({})
             text: "Paid ComfyUI work submitted outside the suite (unattributed), never in the totals above"
-                  + (u.records ? ": " + UsageText.records(u.records)
+                  + (u.records ? ": " + UsageText.records(u.records, root.count)
                      + (UsageText.amounts(u.by_currency, root.money) !== ""
                         ? ", " + root.safe(UsageText.amounts(u.by_currency, root.money), 300) : "") : ".")
         }
         Repeater {
-            model: UsageText.shownRows(root.summary, "unattributed", root.shownDimension)
+            model: UsageText.shownRows(root.summary, "unattributed", root.shownDimension, root.count)
             delegate: UsageRow {
-                figures: [UsageText.amounts(modelData.byCurrency, root.money), UsageText.unitText(modelData.units),
-                          UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
+                figures: [UsageText.amounts(modelData.byCurrency, root.money), UsageText.unitText(modelData.units, root.count),
+                          UsageText.records(modelData.records, root.count)].filter(s => s !== "").join("  ·  ")
             }
         }
     }

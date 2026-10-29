@@ -225,7 +225,7 @@ TestCase {
         answer(core, isSummary("day", ["model"]), ok(summary()))
         tryVerify(() => panel.month.shown("subscription_quota").length === 2, 5000)
         const quota = section(panel, "month", "subscription_quota")
-        for (const s of ["claude-sonnet", "1200 input tokens", "300 output tokens", "3 requests",
+        for (const s of ["claude-sonnet", "1,200 input tokens", "300 output tokens", "3 requests",
                          "gpt-image-1", "4 images", "12.5 s"])
             verify(shows(quota, s), s)
         const local = section(panel, "month", "local")
@@ -233,7 +233,7 @@ TestCase {
             verify(shows(local, s), s)
         // A pay-as-you-go model's tokens and images, beside its money.
         const money = section(panel, "month", "money")
-        for (const s of ["gpt-4o", "0.50 USD", "5000 input tokens", "700 output tokens", "2 images"])
+        for (const s of ["gpt-4o", "0.50 USD", "5,000 input tokens", "700 output tokens", "2 images"])
             verify(shows(money, s), s)
         // And in the CSV, each unit in its own column.
         const dir = TestFiles.newDir("usage-units")

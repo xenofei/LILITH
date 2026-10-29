@@ -1,7 +1,8 @@
 //! `MoneyText`, a QML singleton of module `Lilith.Core`: [`crate::money::money_text`] for QML.
 //! `MoneyText.text(amount, currency)` takes the core's decimal string and its currency code and
-//! gives "1,234.57 USD" (owner decision 2026-10-29). The panels show every amount through it;
-//! exports keep the exact decimals.
+//! gives "1,234.57 USD" (owner decision 2026-10-29); `MoneyText.count(value)` gives a count
+//! with thousands separators, "412,000" ([`crate::counts::count_text`]). The panels show every
+//! amount and count through it; exports keep the exact values.
 
 use cxx_qt_lib::QString;
 
@@ -22,6 +23,10 @@ pub mod qobject {
         /// `amount` in `currency`, as the apps show it.
         #[qinvokable]
         fn text(self: &MoneyText, amount: &QString, currency: &QString) -> QString;
+
+        /// `value`, a count, with thousands separators.
+        #[qinvokable]
+        fn count(self: &MoneyText, value: &QString) -> QString;
     }
 }
 
@@ -34,5 +39,9 @@ impl qobject::MoneyText {
             &amount.to_string(),
             &currency.to_string(),
         ))
+    }
+
+    fn count(&self, value: &QString) -> QString {
+        QString::from(&crate::counts::count_text(&value.to_string()))
     }
 }

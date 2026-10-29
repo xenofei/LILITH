@@ -36,6 +36,7 @@ extern crate cxx_qt_lib;
 pub mod qt;
 
 pub mod app_state;
+pub mod counts;
 pub mod csv;
 pub mod layout_file;
 pub mod money;
