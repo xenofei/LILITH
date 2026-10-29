@@ -22,6 +22,8 @@ default = []
 qt = ["dep:cxx", "dep:cxx-qt", "dep:cxx-qt-lib", "dep:cxx-qt-build"]
 
 [dependencies]
+# Live previews arrive as base64 on `preview:<job_id>` (APP-031).
+base64.workspace = true
 cxx = { workspace = true, optional = true }
 cxx-qt = { workspace = true, optional = true }
 cxx-qt-lib = { workspace = true, optional = true }

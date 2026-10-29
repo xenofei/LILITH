@@ -15,7 +15,9 @@
     off-PATH run can't see a missing one), vcruntime140.dll, vcruntime140_1.dll and
     msvcp140.dll among them, and every VC++ runtime DLL in it has one and the same version, at
     least 14.44, the toolset that built the binaries (one redist folder, cmake/deploy.cmake);
-  - the dynamic Lilith.Web module is deployed as Lilith\Web\ (its qmldir and plugin DLL).
+  - the dynamic Lilith.Web module is deployed as Lilith\Web\ (its qmldir and plugin DLL);
+  - APP-031: Qt's JPEG image-format plugin is deployed (imageformats\qjpeg.dll), which the
+    live-preview provider needs for ComfyUI's JPEG frames.
 #>
 param(
     [Parameter(Mandatory)] [string]$Deploy,
@@ -88,6 +90,9 @@ Write-Host ("VC++ runtime versions: {0}" -f (($runtime | ForEach-Object { "$($_.
 $web = Join-Path $Deploy 'Lilith\Web'
 if (-not (Test-Path -LiteralPath (Join-Path $web 'qmldir') -PathType Leaf)) { $failures.Add('Lilith\Web\qmldir is not deployed') }
 if (@(Get-ChildItem -LiteralPath $web -Filter '*.dll' -ErrorAction SilentlyContinue).Count -eq 0) { $failures.Add('Lilith\Web\ has no plugin DLL') }
+
+# APP-031: the live previews' JPEG frames.
+if (-not (Test-Path -LiteralPath (Join-Path $Deploy 'imageformats\qjpeg.dll') -PathType Leaf)) { $failures.Add('imageformats\qjpeg.dll is not deployed (JPEG live previews, APP-031)') }
 
 if ($failures.Count) {
     Write-Host 'deps_walk: FAIL'

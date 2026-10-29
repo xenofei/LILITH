@@ -6,6 +6,8 @@
 //                           {status: "error", error} or {status: "pending_confirmation", ...}
 //   emit(topic, kind, data) an event (kind "event", "snapshot" or "resync_required"); each topic
 //                           counts its own seq
+//   emitFromCore(topic, kind, data)
+//                           the same, through the bridge's event step (previews), as Core's are
 // As Core does, a tool call's pending confirmation keeps the request open (unless the caller
 // cancels it), and an answer to it on the `confirmations` topic resends the call once with its
 // retry token (recorded in `resends`, answered again with respond(id, ...)) or settles it with
@@ -117,6 +119,16 @@ QtObject {
         coreEvent(topic, kind, seq, JSON.stringify(data === undefined ? null : data))
         if (topic === "confirmations" && kind === "event")
             _answered(data)
+    }
+
+    // emitFromCore(topic, kind, data): as emit, but the data first goes through the bridge's own
+    // event step (crates/lil-qt/src/qt/preview_feed.rs), as Core's events do: a preview frame
+    // reaches the image provider and the event carries {format, bytes, url}, and a finished
+    // job's frame is dropped. The test runner provides BridgeHook (main.cpp).
+    function emitFromCore(topic, kind, data) {
+        const seq = (topic in _seqs ? _seqs[topic] : 0) + 1
+        _seqs[topic] = seq
+        coreEvent(topic, kind, seq, BridgeHook.event(topic, kind, JSON.stringify(data === undefined ? null : data)))
     }
 
     function _answered(data) {

@@ -1980,6 +1980,7 @@ dependencies = [
 name = "lil_qt"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "cxx",
  "cxx-qt",
  "cxx-qt-build",
