@@ -8,14 +8,19 @@
 //!   decimals.
 //! - **Small amounts.** A non-zero amount that rounds to zero reads "< 0.01 USD" ("< 1 JPY"),
 //!   or "> -0.01 USD" when negative. Zero reads "0.00 USD".
-//! - **Malformed input** (not `-?digits[.digits]`) is shown as it came, marked "(unreadable)",
-//!   and never panics.
+//! - **Malformed input** (not `-?digits[.digits]`) is shown as it came, cut to
+//!   [`MALFORMED_MAX`] characters (never the code or the mark), marked "(unreadable)", and never
+//!   panics.
+//! - **The code** is read in any case and shown in upper case ("jpy" is JPY, 0 decimals).
 //!
 //! The CSV export keeps the exact decimals; this is for the screen only.
 
+/// The most characters of a malformed amount shown, its "…" included.
+pub const MALFORMED_MAX: usize = 24;
+
 /// The ISO 4217 minor unit of `currency`: the number of decimals it is shown with.
 pub fn minor_unit(currency: &str) -> usize {
-    match currency {
+    match currency.to_ascii_uppercase().as_str() {
         "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF" | "UGX"
         | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => 0,
         "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => 3,
@@ -26,6 +31,8 @@ pub fn minor_unit(currency: &str) -> usize {
 
 /// `amount` (the core's decimal string) in `currency`, as the apps show it (module docs).
 pub fn money_text(amount: &str, currency: &str) -> String {
+    let currency = currency.to_ascii_uppercase();
+    let currency = currency.as_str();
     let with_code = |text: String| {
         if currency.is_empty() {
             text
@@ -34,7 +41,13 @@ pub fn money_text(amount: &str, currency: &str) -> String {
         }
     };
     let Some((negative, whole, part)) = parse(amount) else {
-        return format!("{} (unreadable)", with_code(amount.to_string()));
+        let shown = if amount.chars().count() > MALFORMED_MAX {
+            let cut: String = amount.chars().take(MALFORMED_MAX - 1).collect();
+            format!("{cut}…")
+        } else {
+            amount.to_string()
+        };
+        return format!("{} (unreadable)", with_code(shown));
     };
     let scale = minor_unit(currency);
     // The digits kept (whole and `scale` decimals), and the first one dropped.
@@ -201,6 +214,34 @@ mod tests {
             money_text("1.2", ""),
             "1.20",
             "no currency, no trailing space"
+        );
+    }
+
+    #[test] // spec: APP-120
+    fn money_text_reads_the_code_in_any_case_and_shows_it_upper() {
+        assert_eq!(money_text("1234.5", "jpy"), "1,235 JPY");
+        assert_eq!(money_text("1.2345", "Kwd"), "1.235 KWD");
+        assert_eq!(money_text("1.2", "usd"), "1.20 USD");
+        assert_eq!(minor_unit("jpy"), 0);
+    }
+
+    #[test] // spec: APP-120
+    fn money_text_cuts_a_long_malformed_amount_never_the_code_or_the_mark() {
+        let raw = "x".repeat(100);
+        let shown = money_text(&raw, "USD");
+        assert!(shown.ends_with(" USD (unreadable)"), "{shown}");
+        let amount = shown.strip_suffix(" USD (unreadable)").unwrap();
+        assert_eq!(amount.chars().count(), MALFORMED_MAX, "{shown}");
+        assert!(amount.ends_with('…'), "{shown}");
+        let wide = "é".repeat(40);
+        assert!(
+            money_text(&wide, "EUR").ends_with(" EUR (unreadable)"),
+            "cut on characters, not bytes"
+        );
+        assert_eq!(
+            money_text("1.2.3", "USD"),
+            "1.2.3 USD (unreadable)",
+            "short: whole"
         );
     }
 
