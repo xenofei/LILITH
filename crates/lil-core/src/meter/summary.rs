@@ -4,8 +4,9 @@
 //! - **Bases.** `money` (`payg`, `prepaid_credits`, `byok`, `free_tier`), `subscription_quota`
 //!   (its own units, CORE-070) and `local` (GPU-seconds and energy) are kept apart; each has at
 //!   least `records`; money, subscription quota and unattributed spend, and their rows, carry
-//!   `units`, the record units they add up (APP-117). Unattributed records (paid ComfyUI work submitted outside the suite) are
-//!   in `unattributed` alone, never in a basis or a total (CORE-082).
+//!   `units`, the record units they add up (APP-117; `cache_ttl` is a duration, not a count,
+//!   so it is never added up). Unattributed records (paid ComfyUI work submitted outside the
+//!   suite) are in `unattributed` alone, never in a basis or a total (CORE-082).
 //! - **Money.** A record's amount is its `cost`, else its `est_cost` (counted as `estimated`;
 //!   a `reconciled` cost is counted as such). `by_currency` sums the money basis per native
 //!   currency (CORE-081). `display_total` converts each record at the newest
@@ -376,6 +377,11 @@ impl Tally {
     }
 }
 
+/// The record units a tally adds up: every unit but `cache_ttl`, a duration.
+fn counted_units() -> impl Iterator<Item = &'static &'static str> {
+    super::record::UNITS.iter().filter(|u| **u != "cache_ttl")
+}
+
 /// The basis a record counts under.
 fn basis_of(line: &Map<String, Value>) -> &'static str {
     if line.get("attribution").and_then(Value::as_str) == Some("unattributed") {
@@ -459,7 +465,7 @@ pub fn summarize(
                     if line.get("cost_source").and_then(Value::as_str) == Some("reconciled") {
                         t.reconciled += 1;
                     }
-                    for unit in super::record::UNITS {
+                    for unit in counted_units() {
                         if let Some(v) = line.get(*unit) {
                             t.units.entry((*unit).to_string()).or_default().add(v);
                         }
@@ -481,7 +487,7 @@ pub fn summarize(
                     }
                 }
                 _ => {
-                    for unit in super::record::UNITS {
+                    for unit in counted_units() {
                         if let Some(v) = line.get(*unit) {
                             t.units.entry((*unit).to_string()).or_default().add(v);
                         }
@@ -619,7 +625,7 @@ mod tests {
                 "p",
                 "m1",
                 "suite",
-                json!({"input_tokens": 1200, "output_tokens": 300}),
+                json!({"input_tokens": 1200, "output_tokens": 300, "cache_ttl": "5m"}),
             ),
             line(
                 "p",
@@ -644,6 +650,10 @@ mod tests {
             "{s}"
         );
         assert_eq!(s["unattributed"]["units"], json!({"images": 4}), "{s}");
+        assert!(
+            s["bases"]["money"]["units"].get("cache_ttl").is_none(),
+            "a TTL is never added up"
+        );
         let row = |model: &str| {
             s["rows"]
                 .as_array()
