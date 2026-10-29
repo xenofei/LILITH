@@ -18,7 +18,7 @@ const all = [
      action: "panel.confirmations"},
     {id: "hardware", title: "Hardware", source: "PlaceholderPanel.qml", area: "bottom",
      action: "panel.hardware"},
-    {id: "usage", title: "Usage & spend", source: "PlaceholderPanel.qml", area: "bottom",
+    {id: "usage", title: "Usage & spend", source: "../panels/usage/UsagePanel.qml", area: "bottom",
      action: "panel.usage"},
     {id: "diagnostics", title: "Diagnostics", source: "PlaceholderPanel.qml", area: "bottom",
      action: "panel.diagnostics"},

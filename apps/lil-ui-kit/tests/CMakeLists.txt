@@ -91,3 +91,9 @@ set_tests_properties(onscreen_layout PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 24: the Usage & spend panel; its float test makes a shell, so it runs on the 1280 x 800
+# offscreen screen.
+lil_qml_test(tst_usage tst_usage.qml)
+set_property(TEST tst_usage APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
