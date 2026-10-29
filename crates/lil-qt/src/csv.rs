@@ -6,15 +6,24 @@
 //!   value under that column: a string as it is, a number or `true`/`false` as JSON writes it, a
 //!   missing value or `null` empty, and an array or object as compact JSON. Every line ends with
 //!   CRLF. A cell holding a comma, a double quote, CR or LF is quoted, its quotes doubled.
-//! - **Formulas.** A cell starting with `=`, `+`, `-` or `@` is prefixed with `'`, so a
+//! - **Formulas** (OWASP's CSV-injection list). A cell starting with TAB or CR, or whose first
+//!   character other than ASCII whitespace is `=`, `+`, `-` or `@`, is prefixed with `'`, so a
 //!   spreadsheet shows it as text and never runs it (a provider or model name is text the suite
-//!   doesn't choose).
-//! - **The file.** Written whole or not at all: a failed write leaves the file that was there as
-//!   it was.
+//!   doesn't choose). A plain decimal number (`-1.5`, `-3`) stays a number.
+//! - **The file.** [`export`] writes a UTF-8 BOM first, so Excel reads non-ASCII names right.
+//!   It is written whole or not at all: the old file is swapped out under the LILITH-owned
+//!   hidden name `.<name>.lil-bak` beside it (never a name of yours such as `<name>.bak`), which
+//!   is deleted once the new file is in. A failed write leaves the file that was there as it was,
+//!   and its error says so; in the rare case the old file is left only under its backup name,
+//!   the error names it.
 
+use std::io;
 use std::path::Path;
 
 use serde_json::Value;
+
+/// What [`export`] writes before the text.
+const BOM: &str = "\u{FEFF}";
 
 /// The CSV text of `rows` under `columns` (module docs).
 pub fn csv(rows: &[Value], columns: &[&str]) -> String {
@@ -34,9 +43,58 @@ pub fn csv(rows: &[Value], columns: &[&str]) -> String {
 /// Writes [`csv`] of `rows` to `path` through `replace_file` (module docs).
 ///
 /// # Errors
-/// When the file can't be written; the file at `path`, if any, is then unchanged.
-pub fn export(path: &Path, rows: &[Value], columns: &[&str]) -> std::io::Result<()> {
-    crate::layout_file::write_replacing(path, csv(rows, columns).as_bytes())
+/// When the file can't be written; the error says what became of the file at `path`.
+pub fn export(path: &Path, rows: &[Value], columns: &[&str]) -> io::Result<()> {
+    let backup_name = |name: &str| format!(".{name}.lil-bak");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let backup = path.with_file_name(backup_name(&name));
+    let existed = path.try_exists().unwrap_or(false);
+    let text = format!("{BOM}{}", csv(rows, columns));
+    match crate::layout_file::write_replacing_with(path, text.as_bytes(), backup_name) {
+        Ok(()) => {
+            if existed && let Err(e) = std::fs::remove_file(&backup) {
+                tracing::warn!(error = %e, "the old CSV's backup wasn't deleted");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let left = if !existed {
+                format!("Nothing was written to {name}.")
+            } else if !path.try_exists().unwrap_or(true) && backup.try_exists().unwrap_or(false) {
+                format!(
+                    "The old {name} is kept as {} beside it.",
+                    backup_name(&name)
+                )
+            } else {
+                format!("{name} is as it was.")
+            };
+            Err(io::Error::new(e.kind(), format!("{e}. {left}")))
+        }
+    }
+}
+
+/// Whether a spreadsheet could take `cell` as a formula (module docs).
+fn needs_guard(cell: &str) -> bool {
+    if is_decimal(cell) {
+        return false;
+    }
+    cell.starts_with(['\t', '\r'])
+        || cell
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .starts_with(['=', '+', '-', '@'])
+}
+
+/// `-?[0-9]+(\.[0-9]+)?`.
+fn is_decimal(cell: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let unsigned = cell.strip_prefix('-').unwrap_or(cell);
+    match unsigned.split_once('.') {
+        Some((whole, part)) => digits(whole) && digits(part),
+        None => digits(unsigned),
+    }
 }
 
 /// Appends one line of `cells`, each guarded and quoted, ending with CRLF.
@@ -45,7 +103,7 @@ fn line(out: &mut String, cells: impl Iterator<Item = String>) {
         if i > 0 {
             out.push(',');
         }
-        let guarded = if cell.starts_with(['=', '+', '-', '@']) {
+        let guarded = if needs_guard(&cell) {
             format!("'{cell}")
         } else {
             cell
@@ -80,7 +138,7 @@ mod tests {
         let rows = [
             json!({"provider": "openrouter", "records": 3, "amount": "1.25", "estimated": true}),
             json!({"provider": "a, \"b\"", "records": 1, "amount": null}),
-            json!({"provider": "=HYPERLINK(\"x\")", "records": 2, "amount": "+1", "note": "-2"}),
+            json!({"provider": "=HYPERLINK(\"x\")", "records": 2, "amount": "+1", "note": "-x"}),
             json!({"provider": "@SUM(A1)", "model": "line\nbreak", "note": "cr\rhere"}),
             json!({"provider": "list", "note": ["a", 1], "amount": {"USD": "1"}}),
         ];
@@ -96,7 +154,7 @@ mod tests {
             "a comma and quotes are quoted"
         );
         assert_eq!(
-            lines[3], "\"'=HYPERLINK(\"\"x\"\")\",,2,'+1,'-2\r\n",
+            lines[3], "\"'=HYPERLINK(\"\"x\"\")\",,2,'+1,'-x\r\n",
             "a formula is text, then quoted"
         );
         assert_eq!(
@@ -111,42 +169,129 @@ mod tests {
         assert_eq!(csv(&[], &["a", "b"]), "a,b\r\n", "the header alone");
     }
 
+    /// OWASP's CSV-injection list: a leading TAB or CR, and `= + - @` after leading whitespace.
+    #[test] // spec: APP-117
+    fn csv_guards_a_leading_tab_cr_or_whitespace_before_a_formula() {
+        let cell = |v: Value| {
+            let text = csv(&[json!({ "c": v })], &["c"]);
+            text.strip_prefix("c\r\n")
+                .unwrap()
+                .strip_suffix("\r\n")
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(cell(json!("\t=1+1")), "'\t=1+1", "a leading TAB");
+        assert_eq!(
+            cell(json!("\tplain")),
+            "'\tplain",
+            "a leading TAB, whatever follows"
+        );
+        assert_eq!(
+            cell(json!("\r=cmd|x")),
+            "\"'\r=cmd|x\"",
+            "a leading CR, then quoted"
+        );
+        assert_eq!(cell(json!(" =1+1")), "' =1+1", "a space before =");
+        assert_eq!(cell(json!("  +1")), "'  +1", "spaces before +");
+        assert_eq!(cell(json!(" -x")), "' -x", "a space before -");
+        assert_eq!(
+            cell(json!("\n@x")),
+            "\"'\n@x\"",
+            "a line feed before @, then quoted"
+        );
+        assert_eq!(cell(json!("a=b")), "a=b", "= inside text is fine");
+        assert_eq!(
+            cell(json!(" plain")),
+            " plain",
+            "leading spaces before text are fine"
+        );
+    }
+
+    #[test] // spec: APP-117
+    fn csv_keeps_negative_numbers_as_numbers() {
+        let cell = |v: Value| {
+            let text = csv(&[json!({ "c": v })], &["c"]);
+            text.strip_prefix("c\r\n")
+                .unwrap()
+                .strip_suffix("\r\n")
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(cell(json!("-1.5")), "-1.5", "a negative decimal string");
+        assert_eq!(cell(json!("-3")), "-3");
+        assert_eq!(cell(json!(-3)), "-3", "a negative JSON number");
+        assert_eq!(cell(json!(-0.25)), "-0.25");
+        assert_eq!(
+            cell(json!("-1.5e3")),
+            "'-1.5e3",
+            "not a plain decimal: guarded"
+        );
+        assert_eq!(cell(json!("-1.")), "'-1.", "not a plain decimal: guarded");
+        assert_eq!(cell(json!("--1")), "'--1");
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test] // spec: APP-117
     fn csv_export_replaces_the_file_and_a_failed_write_keeps_the_old_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.csv");
+        // A file of the user's own that a backup must never take.
+        let theirs = dir.path().join("usage.csv.bak");
+        std::fs::write(&theirs, "mine").unwrap();
         let rows = [json!({"provider": "p", "records": 1})];
         export(&path, &rows, &["provider", "records"]).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "provider,records\r\np,1\r\n",
-            "a new file"
-        );
-        let rows = [json!({"provider": "q", "records": 2})];
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], b"\xEF\xBB\xBF", "a UTF-8 BOM, for Excel");
+        assert_eq!(&bytes[3..], b"provider,records\r\np,1\r\n", "a new file");
+        let rows = [json!({"provider": "café", "records": 2})];
         export(&path, &rows, &["provider", "records"]).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "provider,records\r\nq,2\r\n",
+            "\u{FEFF}provider,records\r\ncafé,2\r\n",
             "an existing file is replaced"
         );
-        // Another program holds the file open without sharing: the write fails and the file
-        // keeps what it had.
+        assert_eq!(
+            names(dir.path()),
+            ["usage.csv", "usage.csv.bak"],
+            "no backup or temp file is left beside it"
+        );
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "mine");
+        // Another program holds the file open without sharing: the write fails, the file keeps
+        // what it had, and the error says so.
         let held = lil_platform::fs::open_exclusive(&path).unwrap();
         let rows = [json!({"provider": "r", "records": 3})];
-        assert!(export(&path, &rows, &["provider", "records"]).is_err());
+        let why = export(&path, &rows, &["provider", "records"])
+            .unwrap_err()
+            .to_string();
         drop(held);
+        assert!(why.contains("usage.csv is as it was"), "{why}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "provider,records\r\nq,2\r\n",
+            "\u{FEFF}provider,records\r\ncafé,2\r\n",
             "a failed write leaves the file untouched"
         );
-        let names: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
         assert!(
-            !names.iter().any(|n| n.ends_with(".lil-tmp")),
-            "no temp file is left: {names:?}"
+            !names(dir.path()).iter().any(|n| n.ends_with(".lil-tmp")),
+            "no temp file is left: {:?}",
+            names(dir.path())
         );
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "mine");
+    }
+
+    #[test] // spec: APP-117
+    fn csv_export_says_nothing_was_written_when_there_was_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blocker"), "a file").unwrap();
+        let path = dir.path().join("blocker").join("usage.csv");
+        let why = export(&path, &[], &["a"]).unwrap_err().to_string();
+        assert!(why.contains("Nothing was written to usage.csv"), "{why}");
     }
 }

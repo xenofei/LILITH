@@ -214,6 +214,15 @@ impl LayoutFile {
 /// it, flushed, then swapped in with `replace_file` (the old file kept as `<name>.bak`), or
 /// moved into place when there is no file yet.
 pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_replacing_with(path, bytes, |name| format!("{name}.bak"))
+}
+
+/// [`write_replacing`], keeping the old file under `backup(<name>)` beside it.
+pub(crate) fn write_replacing_with(
+    path: &Path,
+    bytes: &[u8],
+    backup: impl Fn(&str) -> String,
+) -> io::Result<()> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -223,7 +232,7 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let name = name.to_string_lossy();
     let temp = dir.join(format!(".{name}.lil-tmp"));
-    let backup = dir.join(format!("{name}.bak"));
+    let backup = dir.join(backup(&name));
     {
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(bytes)?;
