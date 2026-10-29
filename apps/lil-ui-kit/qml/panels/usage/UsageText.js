@@ -146,9 +146,10 @@ function localMonth() {
 // work's energy cost has its own `energy_currency` and `energy_cost` columns. A row in several
 // currencies has its counts and units on its first line only, so a spreadsheet's sums count
 // them once. A month's fixed costs follow as `basis: "fixed_cost"` lines with the month's
-// period and their `display_amount`. The unit columns are the ones the rows carry, in
+// period (the rows', else `month`, the month the summary was read for) and their
+// `display_amount`. The unit columns are the ones the rows carry, in
 // Appendix F's order. Values are raw (exact decimals): the CSV guards them.
-function exportTable(summary, dimension) {
+function exportTable(summary, dimension, month) {
     const rows = []
     for (const basis of bases)
         rows.push(...shownRows(summary, basis, dimension))
@@ -175,9 +176,9 @@ function exportTable(summary, dimension) {
             parts.push({})
         parts.forEach((p, i) => lines.push(Object.assign({}, base, i === 0 ? counts : {}, p)))
     }
-    const month = summary && summary.rows && summary.rows.length > 0 ? summary.rows[0].period : localMonth()
+    const period = summary && summary.rows && summary.rows.length > 0 ? summary.rows[0].period : (month || localMonth())
     for (const f of fixed)
-        lines.push({period: month, basis: "fixed_cost", label: f.name, currency: f.currency, amount: f.amount,
+        lines.push({period: period, basis: "fixed_cost", label: f.name, currency: f.currency, amount: f.amount,
                     display_amount: f.display_amount})
     return {columns: columns, rows: lines}
 }

@@ -62,7 +62,7 @@ Rectangle {
 
     // The CSV of the tab shown, written to `file` (a file: URL); false when it can't start.
     function exportTo(file) {
-        const table = UsageText.exportTable(current.summary, current.shownDimension)
+        const table = UsageText.exportTable(current.summary, current.shownDimension, current.readMonth)
         if (csvExport.save(file, JSON.stringify(table.rows), JSON.stringify(table.columns)))
             return true
         panelBanner.kind = "danger"

@@ -27,6 +27,9 @@ Column {
     // The last summary read, null until the first.
     property var summary: null
     property bool loaded: false
+    // The local month ("YYYY-MM", CORE-012) the summary in hand was read in: its fixed costs'
+    // month in an export when it has no rows.
+    property string readMonth
     // The last read's error body, null after a read that worked.
     property var error: null
     property var _call: null
@@ -73,12 +76,14 @@ Column {
             _call.cancel()
         _due = false
         const asked = dimension
+        const month = UsageText.localMonth()
         _asked = asked
         _call = CoreCall.call(core, "usage.summary", {period: period, group_by: [asked]}, {
             owner: root,
             ok: r => {
                 root._call = null
                 root.shownDimension = asked
+                root.readMonth = month
                 root.summary = r.structured
                 root.error = null
                 root.loaded = true

@@ -338,6 +338,16 @@ TestCase {
         verify(shows(fixed, "Caps don't apply"))
         verify(shows(section(panel, "month", "totals"), "6.00 USD"))
         verify(shows(section(panel, "month", "totals"), "fixed costs included"))
+        // A month with no usage rows: its fixed costs carry the month the summary was read for,
+        // not the export's. The read records its month (here as if made in September).
+        verify(/^\d{4}-\d{2}$/.test(panel.month.readMonth), "the read's month: " + panel.month.readMonth)
+        panel.month.readMonth = "2026-09"
+        const dir = TestFiles.newDir("usage-fixed")
+        verify(panel.exportTo("file:///" + dir + "/fixed.csv"))
+        tryVerify(() => !panel.exporter.busy && panel.banner.visible, 5000)
+        const lines = TestFiles.read(dir + "/fixed.csv").split("\r\n")
+        compare(lines[1], "2026-09,fixed_cost,,storage,,,,USD,5,5")
+        compare(lines[2], "2026-09,fixed_cost,,plan,,,,GBP,18,")
         panel.setTab("day")
         verify(!section(panel, "day", "fixed_costs").visible, "a day has no fixed costs")
         verify(!shows(section(panel, "day", "totals"), "fixed costs included"))
@@ -618,7 +628,8 @@ TestCase {
             for (const t of items)
                 compare(t.textFormat, Text.PlainText, marker + " in " + String(t))
         }
-        for (const marker of ["<i>prov</i>", "<u>EUR</u>", "<s>GBP</s>", "<u>cost</u>", "<s>XTS</s>",
+        // Currency codes show in upper case (MoneyText), their markup as written all the same.
+        for (const marker of ["<i>prov</i>", "<U>EUR</U>", "<s>GBP</s>", "<u>cost</u>", "<S>XTS</S>",
                               "<b>acc</b>", "<i>k_1</i>", "<b>bad</b>", "<b>alert</b>", "<img src="])
             check(panel, marker)
         // Through shownText: the long name is cut.
