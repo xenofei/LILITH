@@ -1,0 +1,16 @@
+{
+    "synchronousWindowSystemEvents": false,
+    "windowFrameMargins": false,
+    "screens": [
+        {
+            "name": "Offscreen 1280x800",
+            "x": 0,
+            "y": 0,
+            "width": 1280,
+            "height": 800,
+            "logicalDpi": 96,
+            "logicalBaseDpi": 96,
+            "dpr": 1
+        }
+    ]
+}

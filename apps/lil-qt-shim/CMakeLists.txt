@@ -25,3 +25,16 @@ qt_add_qml_module(lil-qt-shim-qml
     SOURCES src/LilShim.h src/LilShim.cpp)
 target_link_libraries(lil-qt-shim-qml PRIVATE lil-qt-shim Qt6::Qml)
 target_include_directories(lil-qt-shim-qml PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Task 18: the GUI-thread stall watchdog and the font warm-up (in the DLL), and DockLayout,
+# KDDockWidgets' LayoutSaver for QML (APP-003), in Lilith.Shim; it reads the platform's normal
+# window geometry (GuiPrivate).
+target_sources(lil-qt-shim PRIVATE include/lilshim/StallWatchdog.h src/StallWatchdog.cpp)
+target_sources(lil-qt-shim-qml PRIVATE src/LayoutBridge.h src/LayoutBridge.cpp)
+target_link_libraries(lil-qt-shim-qml PRIVATE Qt6::GuiPrivate KDAB::kddockwidgets)
+# Task 18, fix round 2: the bundled UI face (Inter 4.1, OFL-1.1; NOTICE section 7), as a Qt
+# resource of the DLL, and the call that loads it (lilshim::applyThemeFont).
+target_sources(lil-qt-shim PRIVATE include/lilshim/Fonts.h src/Fonts.cpp)
+qt_add_resources(lil-qt-shim lil-fonts
+    PREFIX /lilith/fonts
+    BASE fonts
+    FILES fonts/inter/Inter-Regular.ttf fonts/inter/Inter-Bold.ttf)

@@ -4,7 +4,8 @@
 #
 # The order is spike 10's (§7; Ruling Q8):
 #   1. our files: the four programs, apps\image.toml, qt.conf, the shim DLL, the KDDockWidgets
-#      DLL (windeployqt doesn't copy it) and the dynamic Lilith.Web module as Lilith\Web\;
+#      DLL (windeployqt doesn't copy it), the dynamic Lilith.Web module as Lilith\Web\, and
+#      licenses\Inter-OFL.txt, the licence of the fonts the shim DLL carries;
 #   2. windeployqt with Task 0's flags plus --no-compiler-runtime (no vc_redist.x64.exe), then
 #      qtwebengine_devtools_resources.pak removed (no DevTools in the suite);
 #   3. the whole Microsoft.VC14*.CRT folder of the newest <VCINSTALLDIR>\Redist\MSVC\14.* whose
@@ -44,6 +45,8 @@ endforeach()
 file(COPY "${SOURCE_DIR}/apps/lil-image/image.toml" DESTINATION "${DEPLOY_DIR}/apps")
 file(COPY "${SOURCE_DIR}/apps/lil-image/qt.conf" DESTINATION "${DEPLOY_DIR}")
 file(COPY "${SHIM_DLL}" "${KDDW_DLL}" DESTINATION "${DEPLOY_DIR}")
+# The bundled Inter faces' licence (OFL-1.1 asks every copy of the fonts to carry it).
+configure_file("${SOURCE_DIR}/apps/lil-qt-shim/fonts/inter/OFL.txt" "${DEPLOY_DIR}/licenses/Inter-OFL.txt" COPYONLY)
 get_filename_component(web_dir "${WEB_DLL}" DIRECTORY)
 file(GLOB web_files "${web_dir}/qmldir" "${web_dir}/*.qmltypes" "${web_dir}/*.dll")
 file(COPY ${web_files} DESTINATION "${DEPLOY_DIR}/Lilith/Web")

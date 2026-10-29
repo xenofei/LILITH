@@ -1,6 +1,8 @@
 #pragma once
-// The dock factory: KDDockWidgets' Qt Quick ViewFactory, which Task 18 themes through the suite's
-// own QML (title bars, tabs). Until then it is KDDockWidgets' own look.
+// The dock factory: KDDockWidgets' Qt Quick ViewFactory, themed through the suite's own QML
+// (APP-001, APP-012): the title bars and the tab bars are Lilith.UiKit's DockTitleBar.qml and
+// DockTabBar.qml, which carry the accessible roles and names (APP-156). The rest of
+// KDDockWidgets' look follows the application palette the shell sets from its theme.
 
 #include "lilshim/shim_global.h"
 
@@ -21,6 +23,9 @@ public:
 
     DockFactory();
     ~DockFactory() override;
+
+    QUrl titleBarFilename() const override;
+    QUrl tabbarFilename() const override;
 
     // Makes a new factory KDDockWidgets' own. Call it after
     // KDDockWidgets::initFrontend(FrontendType::QtQuick) and before any dock exists.

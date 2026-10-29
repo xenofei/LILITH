@@ -30,6 +30,10 @@
 // ui:image, starting a core if none runs, and the engine makes Core at once. Under --smoke-exit
 // Core is made without a session, so it starts no core: the deploy check measures the start
 // and reads the `core_object` line, which says the deployed Lilith.Core module loaded.
+// The shell (APP-001, P4a-R16): ShellWindow gets Core and the app's state folder
+// (lil_qt::app_state_dir), where it restores and saves its layout. The GUI-thread stall watchdog
+// logs stalls once the window is interactive (lilshim/StallWatchdog.h), and the font database is
+// filled off the GUI thread.
 //
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
@@ -39,9 +43,12 @@
 // run), which the deploy check plants on PATH and in the current folder.
 #include "lilshim/Activation.h"
 #include "lilshim/DockFactory.h"
+#include "lilshim/Fonts.h"
 #include "lilshim/LogBridge.h"
 #include "lilshim/PreviewProvider.h"
+#include "lilshim/StallWatchdog.h"
 
+#include "lil_qt/src/qt/layout.cxxqt.h"
 #include "lil_qt/src/qt/mod.cxxqt.h"
 #include "lil_qt/src/qt/preview_sink.h"
 
@@ -174,6 +181,9 @@ int main(int, char **)
 
     lilshim::installLogBridge();
     lilshim::setLogSink(&toAppLog);
+    // The font database, filled off the GUI thread before the first show (spike 10 §8,
+    // follow-up 4).
+    lilshim::warmFonts();
     // env_left: what step 2 left of the cleared variables (none); the deploy check reads it,
     // with the platform, the import paths and the first frame's graphics API.
     QJsonArray envLeft;
@@ -212,8 +222,17 @@ int main(int, char **)
         if (!why.empty())
             lilshim::logEvent(QStringLiteral("error"), {{"what", "no core session"}, {"why", fromRust(why)}});
     }
-    const bool coreLoaded = engine.singletonInstance<QObject *>("Lilith.Core", "Core") != nullptr;
-    lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", coreLoaded}});
+    // The theme's face, bundled, as the application font (APP-012), before anything is laid
+    // out; if it fails to load, the system UI font, and the failure is logged.
+    if (QObject *theme = engine.singletonInstance<QObject *>("Lilith.UiKit", "Theme"))
+        lilshim::applyThemeFont(theme->property("fontFamily").toString());
+    QObject *core = engine.singletonInstance<QObject *>("Lilith.Core", "Core");
+    lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", core != nullptr}});
+    // The shell takes the core and the app's state folder, where its layout lives (P4a-R16);
+    // under --smoke-exit none, so the deploy check neither reads nor writes the app's state.
+    const QString stateDir = plan.smoke_exit ? QString() : fromRust(lil_qt::app_state_dir());
+    engine.setInitialProperties({{QStringLiteral("core"), QVariant::fromValue(core)},
+                                 {QStringLiteral("stateDir"), stateDir}});
     engine.loadFromModule("Lilith.UiKit", "ShellWindow");
     auto *window = engine.rootObjects().isEmpty()
                        ? nullptr
@@ -257,6 +276,9 @@ int main(int, char **)
                           {{"ms", ms},
                            {"webengine_loaded", lilshim::isModuleLoaded(QStringLiteral("Qt6WebEngineCore.dll"))}});
         lil_qt::note_start_time("interactive", ms);
+        // The GUI-thread stall watchdog (spike 10 §8, follow-up 3), from here on: the start's own
+        // loading isn't a stall.
+        lilshim::startStallWatchdog();
         reached();
     });
 
