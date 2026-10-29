@@ -7,9 +7,10 @@
 //!   missing value or `null` empty, and an array or object as compact JSON. Every line ends with
 //!   CRLF. A cell holding a comma, a double quote, CR or LF is quoted, its quotes doubled.
 //! - **Formulas** (OWASP's CSV-injection list). A cell starting with TAB or CR, or whose first
-//!   character other than ASCII whitespace is `=`, `+`, `-` or `@`, is prefixed with `'`, so a
-//!   spreadsheet shows it as text and never runs it (a provider or model name is text the suite
-//!   doesn't choose). A plain decimal number (`-1.5`, `-3`) stays a number.
+//!   character other than whitespace (VT, no-break and ideographic spaces included) is `=`, `+`,
+//!   `-` or `@`, is prefixed with `'`, so a spreadsheet shows it as text and never runs it (a
+//!   provider or model name is text the suite doesn't choose). A plain decimal number (`-1.5`,
+//!   `-3`) stays a number.
 //! - **The file.** [`export`] writes a UTF-8 BOM first, so Excel reads non-ASCII names right.
 //!   It is written whole or not at all: the old file is swapped out under the LILITH-owned
 //!   hidden name `.<name>.lil-bak` beside it (never a name of yours such as `<name>.bak`), which
@@ -83,7 +84,7 @@ fn needs_guard(cell: &str) -> bool {
     }
     cell.starts_with(['\t', '\r'])
         || cell
-            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .trim_start_matches(char::is_whitespace)
             .starts_with(['=', '+', '-', '@'])
 }
 
@@ -204,6 +205,13 @@ mod tests {
             cell(json!(" plain")),
             " plain",
             "leading spaces before text are fine"
+        );
+        assert_eq!(cell(json!("\u{b}=1")), "'\u{b}=1", "a VT before =");
+        assert_eq!(cell(json!("\u{a0}=1+1")), "'\u{a0}=1+1", "a no-break space");
+        assert_eq!(
+            cell(json!("\u{3000}=1+1")),
+            "'\u{3000}=1+1",
+            "an ideographic space"
         );
     }
 
