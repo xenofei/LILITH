@@ -17,6 +17,7 @@
      After each step the disk is checked: the file, its UTF-8 BOM and header, the record's
      provider, no .lil-tmp or .lil-bak beside it, a pre-placed usage.csv.bak of "yours" left as
      it was; after the cancel the file and the folder are unchanged.
+  On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first.
   4. lil-image is closed, the test core stopped, the temporary root removed, and the pop-up told
      it is done. Exit 0 only when every check passed.
   -DryRun does step 3's seeding and the disk checks' self-test only: no pop-up, no window.
@@ -26,10 +27,13 @@ param(
     [string]$Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
     [string]$Deploy = '',
     [switch]$SkipDeployTests,
+    # Where a failed run leaves the app's UIA tree and the logs: by default build\dev\usage-export-check.
+    [string]$DiagDir = '',
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
 if (-not $Deploy) { $Deploy = Join-Path $Repo 'build\dev\deploy' }
+if (-not $DiagDir) { $DiagDir = Join-Path $Repo 'build\dev\usage-export-check' }
 $lil = Join-Path $Deploy 'lil.exe'
 $image = Join-Path $Deploy 'lil-image.exe'
 $results = [System.Collections.Generic.List[string]]::new()
@@ -202,6 +206,7 @@ function Open-UsagePanel {
         if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); $how = 'its dock tab (select)' }
         elseif ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); $how = 'its dock tab (invoke)' }
     }
+    Write-Host ("the Usage & spend tab: {0}" -f $(if ($tab) { "found ($how)" } else { 'not found' }))
     if (-not $how) { Show-App; [System.Windows.Forms.SendKeys]::SendWait('^5'); $how = 'Ctrl+5' }
     try {
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
@@ -211,13 +216,48 @@ function Open-UsagePanel {
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
     }
     Pass "$how opened Usage & spend with the month total"
-}function Find-Named($in, [string]$name) {
-    $in.FindFirst($TS::Descendants, (Prop $AE::NameProperty $name))
 }
-function Find-NameStarting($in, [string]$prefix) {
-    $all = $in.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-    foreach ($e in $all) { try { if ($e.Current.Name.StartsWith($prefix)) { return $e } } catch { } }
+
+# The app's top-level windows (the main window, a floating dock, a dialog).
+function App-Windows {
+    @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
+}
+# The first element named `name`, under `in` or else under any window of the app.
+function Find-Named($in, [string]$name) {
+    $c = Prop $AE::NameProperty $name
+    $e = $in.FindFirst($TS::Descendants, $c)
+    if ($e) { return $e }
+    foreach ($w in App-Windows) { $e = $w.FindFirst($TS::Descendants, $c); if ($e) { return $e } }
     return $null
+}
+# The first element whose name starts with `prefix`, under `in` or else under any window of
+# the app.
+function Find-NameStarting($in, [string]$prefix) {
+    foreach ($root in @($in) + (App-Windows)) {
+        $all = $root.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($e in $all) { try { if ($e.Current.Name.StartsWith($prefix)) { return $e } } catch { } }
+    }
+    return $null
+}
+
+# On a failure: every window of the app as UIA shows it (depth, control type, name, automation
+# id, offscreen, enabled), into <DiagDir>\uia-tree.txt, at most 4000 elements.
+function Save-UiaTree([string]$path) {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $walk = {
+        param($e, [int]$depth)
+        if ($lines.Count -ge 4000) { return }
+        try {
+            $c = $e.Current
+            $name = if ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
+        } catch { $lines.Add(('{0}(gone)' -f ('  ' * $depth))); return }
+        $child = $walker.GetFirstChild($e)
+        while ($child) { & $walk $child ($depth + 1); $child = $walker.GetNextSibling($child) }
+    }
+    foreach ($w in App-Windows) { & $walk $w 0 }
+    Set-Content -LiteralPath $path -Value $lines -Encoding utf8
 }
 # The replace prompt's Yes: under the save dialog, else in a window of the app's own.
 function Find-Yes($dlg) {
@@ -250,8 +290,14 @@ try {
     Set-Content -LiteralPath (Join-Path $outDir 'usage.csv.bak') -Value 'mine' -NoNewline
     Seed 'openrouter' '1.25'
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
-    $script:main = Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window'
-    Pass 'lil-image is up on the test channel'
+    [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
+    # The shell's window is titled "LILITH" (or "LILITH — <project>"); else the first one.
+    Start-Sleep -Seconds 1
+    $wins = App-Windows
+    $script:main = ($wins | Where-Object { $_.Current.Name -like 'LILITH*' } | Select-Object -First 1)
+    if (-not $script:main) { $script:main = $wins[0] }
+    $note = ($wins | ForEach-Object { '"' + $_.Current.Name + '"' }) -join ', '
+    Pass "lil-image is up on the test channel (its windows: $note)"
     Open-UsagePanel
     $file = Join-Path $outDir 'usage.csv'
 
@@ -289,6 +335,17 @@ try {
     Check ($r.Count -eq 0) "(c) overwritten: both records, BOM, no .lil-bak or .lil-tmp left, yours untouched ($($r -join '; '))"
 } catch {
     Fail "the export check stopped: $_"
+    foreach ($p in 'Reading the usage', "Couldn't read the usage", 'Spend this month') {
+        try { $e = Find-NameStarting $script:main $p; if ($e) { Write-Host "the app shows: $($e.Current.Name)" } } catch { }
+    }
+    # What the app showed, and its and the core's logs, for the fix (the test root goes below).
+    try {
+        New-Item -ItemType Directory -Force $DiagDir | Out-Null
+        if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
+        $logs = Join-Path $root "local\LILITH-$channel\logs"
+        if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir 'logs') -Recurse -Force }
+        Write-Host "diagnostics in $DiagDir"
+    } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
     if ($script:app -and -not $script:app.HasExited) {
         try {
