@@ -69,35 +69,36 @@ TestCase {
 
     function money(period, fields, records, byCurrency, over) {
         return Object.assign({period: period, basis: "money", records: records, estimated: 0, reconciled: 0,
-                              by_currency: byCurrency}, fields, over || {})
+                              by_currency: byCurrency, units: {}}, fields, over || {})
     }
 
     function month(dim) {
         const p = "2026-10"
         const rows = dim === "caller_kind" ? [
             money(p, {caller_kind: "ui:image"}, 14, {USD: "3.42"}),
-            money(p, {caller_kind: "assistant"}, 6, {USD: "1.10"}, {estimated: 2}),
-            money(p, {caller_kind: "mcp"}, 9, {USD: "0.86", EUR: "1.20"}),
+            money(p, {caller_kind: "assistant"}, 6, {USD: "1.1"}, {estimated: 2}),
+            money(p, {caller_kind: "mcp"}, 9, {USD: "0.86", EUR: "1.2"}),
             money(p, {caller_kind: "cli"}, 2, {USD: "0.04"}),
         ] : [
-            money(p, {provider: "openrouter"}, 18, {USD: "2.96"}, {estimated: 3}),
-            money(p, {provider: "fal"}, 11, {USD: "2.46", EUR: "1.20"}, {reconciled: 4}),
+            money(p, {provider: "openrouter"}, 18, {USD: "2.96"}, {estimated: 3, units: {input_tokens: 412000, output_tokens: 38200}}),
+            money(p, {provider: "fal"}, 11, {USD: "2.46", EUR: "1.2"}, {reconciled: 4, units: {images: 11}}),
             {period: p, basis: "subscription_quota", provider: "nanogpt", records: 40,
              units: {input_tokens: 182000, output_tokens: 31500, requests: 40}},
             {period: p, basis: "local", provider: "local", records: 23, gpu_seconds: "1840.5",
              energy_wh_gross: "212.4", energy_cost: {USD: "0.06"}},
             {period: p, basis: "unattributed", provider: "comfy-org", records: 2, estimated: 0, reconciled: 0,
-             by_currency: {USD: "0.80"}},
+             by_currency: {USD: "0.8"}, units: {images: 2}},
         ]
         return {
-            bases: {money: {records: 29, estimated: 3, reconciled: 4, by_currency: {EUR: "1.20", USD: "5.42"}},
+            bases: {money: {records: 29, estimated: 3, reconciled: 4, by_currency: {EUR: "1.2", USD: "5.42"},
+                           units: {input_tokens: 412000, output_tokens: 38200, images: 11}},
                     subscription_quota: {records: 40, units: {input_tokens: 182000, output_tokens: 31500, requests: 40}},
                     local: {records: 23, gpu_seconds: "1840.5", energy_wh_gross: "212.4", energy_cost: {USD: "0.06"}}},
-            by_currency: {EUR: "1.20", USD: "5.42"}, display_currency: "USD", display_total: "16.71",
+            by_currency: {EUR: "1.2", USD: "5.42"}, display_currency: "USD", display_total: "10.74",
             fixed_costs: [{name: "Backup storage", amount: "4", currency: "USD", display_amount: "4"},
                           {name: "Claude plan", amount: "18", currency: "GBP", display_amount: null}],
             unconverted: ["GBP"],
-            unattributed: {records: 2, estimated: 0, reconciled: 0, by_currency: {USD: "0.80"}},
+            unattributed: {records: 2, estimated: 0, reconciled: 0, by_currency: {USD: "0.8"}, units: {images: 2}},
             rows: rows
         }
     }
@@ -106,12 +107,12 @@ TestCase {
         const p = "2026-10-28"
         const rows = dim === "caller_kind"
             ? [money(p, {caller_kind: "ui:image"}, 3, {USD: "0.62"}), money(p, {caller_kind: "mcp"}, 1, {USD: "0.08"})]
-            : [money(p, {provider: "openrouter"}, 4, {USD: "0.70"})]
+            : [money(p, {provider: "openrouter"}, 4, {USD: "0.7"})]
         return {
-            bases: {money: {records: 4, estimated: 0, reconciled: 0, by_currency: {USD: "0.70"}},
+            bases: {money: {records: 4, estimated: 0, reconciled: 0, by_currency: {USD: "0.7"}, units: {}},
                     subscription_quota: {records: 0, units: {}}, local: {records: 0, energy_cost: {}}},
-            by_currency: {USD: "0.70"}, display_currency: "USD", display_total: "0.70", fixed_costs: [],
-            unattributed: {records: 0, estimated: 0, reconciled: 0, by_currency: {}}, rows: rows
+            by_currency: {USD: "0.7"}, display_currency: "USD", display_total: "0.7", fixed_costs: [],
+            unattributed: {records: 0, estimated: 0, reconciled: 0, by_currency: {}, units: {}}, rows: rows
         }
     }
 
@@ -124,7 +125,7 @@ TestCase {
 
     function caps() {
         return {display_currency: "USD", period: "2026-10", caps: [
-            {cap: "monthly", limit: "20", settled: "16.71", held: "0.40", ratio_permille: 855},
+            {cap: "monthly", limit: "10", settled: "6.34", held: "0.4", ratio_permille: 674},
             {cap: "provider:openrouter", limit: "5", settled: "2.96", held: "0", ratio_permille: 592},
             {cap: "per_call_max", limit: "x", settled: "0", held: "0", ratio_permille: 0, invalid: true}]}
     }
@@ -134,9 +135,8 @@ TestCase {
         answer(core, isSummary("day", [dim]), ok(day(dim)))
         answer(core, isSummary("month", ["provider", "account"]), ok(accounts()))
         answer(core, c => c.name === "caps.get", ok(caps()))
-        for (const pct of [50, 80])
-            core.emit("caps", "event", {kind: "alert", cap: "monthly", threshold_pct: pct, spent_pct: pct + 3,
-                                        spent: String((pct + 3) / 5), currency: "USD", period: "2026-10"})
+        core.emit("caps", "event", {kind: "alert", cap: "monthly", threshold_pct: 50, spent_pct: 50,
+                                    spent: "5.02", currency: "USD", period: "2026-10"})
     }
 
     function distinctColours(img) {
@@ -174,7 +174,7 @@ TestCase {
         const core = fakeComponent.createObject(tc)
         const host = createTemporaryObject(panelComponent, tc, {core: core})
         load(core, "provider")
-        tryVerify(() => host.panel.month.loaded && host.panel.gauges.alerts.length === 2, 5000)
+        tryVerify(() => host.panel.month.loaded && host.panel.gauges.alerts.length === 1, 5000)
         save(host, host.contentItem, "month")
     }
 
