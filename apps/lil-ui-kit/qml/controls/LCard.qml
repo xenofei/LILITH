@@ -25,6 +25,7 @@ Rectangle {
         y: Theme.spacing
         width: parent.width - 2 * Theme.spacing
         text: root.title
+        textFormat: Text.PlainText
         color: Theme.text
         font.pixelSize: Theme.fontSize + 1
         font.bold: true

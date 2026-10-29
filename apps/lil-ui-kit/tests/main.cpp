@@ -10,7 +10,12 @@
 #include <kddockwidgets/Config.h>
 #include <kddockwidgets/qtquick/Platform.h>
 
+#include <atomic>
+
 #include <QCoreApplication>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QQmlNetworkAccessManagerFactory>
 #include <QDir>
 #include <QFile>
 #include <QQmlContext>
@@ -42,6 +47,29 @@ public:
                                                              rust::Str(d.constData(), size_t(d.size())));
         return QString::fromUtf8(out.data(), qsizetype(out.size()));
     }
+};
+
+// Every network request the QML engine makes (an <img> in rich text among them), counted: a
+// test of the controls checks that markup in their text loads nothing.
+static std::atomic<int> s_networkRequests{0};
+
+class CountingNam : public QNetworkAccessManager
+{
+public:
+    using QNetworkAccessManager::QNetworkAccessManager;
+
+protected:
+    QNetworkReply *createRequest(Operation op, const QNetworkRequest &request, QIODevice *data) override
+    {
+        ++s_networkRequests;
+        return QNetworkAccessManager::createRequest(op, request, data);
+    }
+};
+
+class CountingNamFactory : public QQmlNetworkAccessManagerFactory
+{
+public:
+    QNetworkAccessManager *create(QObject *parent) override { return new CountingNam(parent); }
 };
 
 // TestFiles (a context property): the file access the QML tests need, all of it under one
@@ -83,6 +111,9 @@ public:
 
     Q_INVOKABLE bool mkpath(const QString &path) const { return QDir().mkpath(path); }
 
+    // How many network requests the QML engine has made so far.
+    Q_INVOKABLE int networkRequests() const { return s_networkRequests; }
+
 private:
     QTemporaryDir m_root;
     int m_dirs = 0;
@@ -108,6 +139,7 @@ public slots:
     void qmlEngineAvailable(QQmlEngine *engine)
     {
         KDDockWidgets::QtQuick::Platform::instance()->setQmlEngine(engine);
+        engine->setNetworkAccessManagerFactory(&m_nam);
         // Lilith.Web is a dynamic module in <bin>/Lilith/Web, beside this executable.
         engine->addImportPath(QCoreApplication::applicationDirPath());
         engine->addImageProvider(QStringLiteral("lilpreview"), new lilshim::PreviewProvider);
@@ -120,6 +152,7 @@ public slots:
 
 private:
     TestFiles m_files;
+    CountingNamFactory m_nam;
 };
 
 // APP-137: set before the application object, which QUICK_TEST_MAIN_WITH_SETUP creates, so

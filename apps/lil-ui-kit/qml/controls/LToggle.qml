@@ -45,6 +45,7 @@ T.Switch {
     contentItem: Text {
         leftPadding: control.indicator.width + control.spacing
         text: control.text
+        textFormat: Text.PlainText
         font: control.font
         color: control.enabled ? Theme.text : Theme.textMuted
         verticalAlignment: Text.AlignVCenter
