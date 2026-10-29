@@ -3,7 +3,11 @@
 // billing bases apart (APP-118): the totals, money, subscription quota (its own units), local
 // work, spend outside LILITH (unattributed, APP-116) and, for a month, the fixed costs (APP-119).
 // Every figure is the core's own (decimal strings with their currency codes); nothing is added
-// up here.
+// up here. Each row shows the record units it carries (tokens, images, seconds: APP-117).
+//
+// Every Text is plain text, and every string from the usage logs or suite.toml (names,
+// currencies, error text) is shown through `core.shownText` (P4a-R8): markup shows as written
+// and loads nothing.
 pragma ComponentBehavior: Bound
 import QtQuick
 import Lilith.UiKit
@@ -24,6 +28,9 @@ Column {
     // The last read's error body, null after a read that worked.
     property var error: null
     property var _call: null
+    // The dimension the open read asked for, and whether another read waits for it.
+    property string _asked
+    property bool _due: false
 
     readonly property string periodWord: period === "month" ? "this month" : "today"
     readonly property var bases: summary && summary.bases ? summary.bases : ({})
@@ -38,11 +45,23 @@ Column {
         return UsageText.shownRows(summary, basis, shownDimension)
     }
 
-    // Reads the summary again; a read still open is dropped.
+    // `s` as shown (core.shownText): at most `n` characters, 80 by default.
+    function safe(s, n) {
+        return UsageText.shown(core, s, n)
+    }
+
+    // Reads the summary again. A read still open for the same dimension isn't dropped: one more
+    // read follows it once it settles. One for another dimension is dropped.
     function reload() {
+        if (_call && _asked === dimension) {
+            _due = true
+            return
+        }
         if (_call)
             _call.cancel()
+        _due = false
         const asked = dimension
+        _asked = asked
         _call = CoreCall.call(core, "usage.summary", {period: period, group_by: [asked]}, {
             owner: root,
             ok: r => {
@@ -51,18 +70,28 @@ Column {
                 root.summary = r.structured
                 root.error = null
                 root.loaded = true
+                root.again()
             },
             error: e => {
                 root._call = null
                 root.error = e
+                root.again()
             }
         })
+    }
+
+    function again() {
+        if (_due) {
+            _due = false
+            reload()
+        }
     }
 
     component Line: Text {
         width: parent ? parent.width : 0
         color: Theme.text
         font.pixelSize: Theme.fontSize
+        textFormat: Text.PlainText
         wrapMode: Text.Wrap
         Accessible.role: Accessible.StaticText
         Accessible.name: text
@@ -78,37 +107,51 @@ Column {
         font.bold: true
     }
 
-    // One row of a section: its label (and the raw value when it reads differently), what it
-    // counts, and its marks.
+    // One row of a section: its label, the raw value beside it when it reads differently (muted),
+    // what it counts, and its marks.
     component UsageRow: Item {
         id: line
 
         required property var modelData
         property string figures
+        readonly property string label: root.safe(modelData.label)
+        readonly property string detail: modelData.detail !== "" ? root.safe(modelData.detail) : ""
+        readonly property string shownFigures: root.safe(figures, 300)
 
         width: parent ? parent.width : 0
         height: Math.max(labelText.implicitHeight, figuresText.implicitHeight) + 4
 
         Accessible.role: Accessible.StaticText
-        Accessible.name: [modelData.label, modelData.detail, figures].concat(modelData.marks)
-                         .filter(s => s !== "").join(", ")
+        Accessible.name: [label, detail, shownFigures].concat(modelData.marks).filter(s => s !== "").join(", ")
 
         Text {
             id: labelText
-            width: line.width * 0.34
-            text: line.modelData.label + (line.modelData.detail !== ""
-                  ? "  <font color=\"" + Theme.textMuted + "\">" + line.modelData.detail + "</font>" : "")
-            textFormat: line.modelData.detail !== "" ? Text.StyledText : Text.PlainText
+            width: Math.min(implicitWidth, line.width * 0.34 - (detailText.visible ? detailText.width + 4 : 0))
+            text: line.label
+            textFormat: Text.PlainText
             color: Theme.text
             font.pixelSize: Theme.fontSize
             elide: Text.ElideRight
         }
 
         Text {
+            id: detailText
+            visible: line.detail !== ""
+            x: labelText.width + 4
+            width: Math.min(implicitWidth, line.width * 0.17)
+            text: line.detail
+            textFormat: Text.PlainText
+            color: Theme.textMuted
+            font.pixelSize: Theme.fontSize
+            elide: Text.ElideRight
+        }
+
+        Text {
             id: figuresText
-            x: labelText.width + Theme.spacing
+            x: line.width * 0.34 + Theme.spacing
             width: line.width - x - marksRow.width - Theme.spacing
-            text: line.figures
+            text: line.shownFigures
+            textFormat: Text.PlainText
             color: Theme.text
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap
@@ -138,7 +181,8 @@ Column {
 
     Line {
         visible: !!root.error
-        text: "Couldn't read the usage" + (root.error && root.error.message ? ": " + root.error.message : ".")
+        text: "Couldn't read the usage" + (root.error && root.error.message
+              ? ": " + root.safe(root.error.message, 300) : ".")
         color: Theme.danger
     }
 
@@ -156,7 +200,7 @@ Column {
 
         Line {
             text: "Spend " + root.periodWord + ": " + (root.summary ? root.summary.display_total + " "
-                  + root.summary.display_currency : "")
+                  + root.safe(root.summary.display_currency, 16) : "")
             font.pixelSize: Theme.fontSize + 4
             font.bold: true
         }
@@ -167,11 +211,11 @@ Column {
         Line {
             visible: text !== ""
             text: root.summary && UsageText.amounts(root.summary.by_currency) !== ""
-                  ? "By currency: " + UsageText.amounts(root.summary.by_currency) : ""
+                  ? "By currency: " + root.safe(UsageText.amounts(root.summary.by_currency), 300) : ""
         }
         Line {
             visible: !!(root.summary && root.summary.unconverted && root.summary.unconverted.length)
-            text: visible ? "No rate for " + root.summary.unconverted.join(", ")
+            text: visible ? "No rate for " + root.safe(root.summary.unconverted.join(", "), 200)
                             + ": left out of the converted total. Add a dated rate for it in suite.toml." : ""
             color: Theme.warning
         }
@@ -198,7 +242,8 @@ Column {
             id: moneyRows
             model: UsageText.shownRows(root.summary, "money", root.shownDimension)
             delegate: UsageRow {
-                figures: UsageText.amounts(modelData.byCurrency) + "  ·  " + UsageText.records(modelData.records)
+                figures: [UsageText.amounts(modelData.byCurrency), UsageText.unitText(modelData.units),
+                          UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
             }
         }
         Note {
@@ -246,8 +291,8 @@ Column {
             model: UsageText.shownRows(root.summary, "local", root.shownDimension)
             delegate: UsageRow {
                 figures: [UsageText.unitText(modelData.units),
-                          UsageText.amounts(modelData.byCurrency) !== ""
-                          ? "energy " + UsageText.amounts(modelData.byCurrency) : "",
+                          UsageText.amounts(modelData.energyCost) !== ""
+                          ? "energy " + UsageText.amounts(modelData.energyCost) : "",
                           UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
             }
         }
@@ -268,12 +313,14 @@ Column {
             readonly property var u: root.summary && root.summary.unattributed ? root.summary.unattributed : ({})
             text: "Paid ComfyUI work submitted outside the suite (unattributed), never in the totals above"
                   + (u.records ? ": " + UsageText.records(u.records)
-                     + (UsageText.amounts(u.by_currency) !== "" ? ", " + UsageText.amounts(u.by_currency) : "") : ".")
+                     + (UsageText.amounts(u.by_currency) !== ""
+                        ? ", " + root.safe(UsageText.amounts(u.by_currency), 300) : "") : ".")
         }
         Repeater {
             model: UsageText.shownRows(root.summary, "unattributed", root.shownDimension)
             delegate: UsageRow {
-                figures: UsageText.amounts(modelData.byCurrency) + "  ·  " + UsageText.records(modelData.records)
+                figures: [UsageText.amounts(modelData.byCurrency), UsageText.unitText(modelData.units),
+                          UsageText.records(modelData.records)].filter(s => s !== "").join("  ·  ")
             }
         }
     }
@@ -291,12 +338,12 @@ Column {
             model: root.summary && root.summary.fixed_costs ? root.summary.fixed_costs : []
             delegate: Line {
                 required property var modelData
-                readonly property string own: modelData.amount + " " + modelData.currency
+                readonly property string own: modelData.amount + " " + root.safe(modelData.currency, 16)
                 readonly property string shownAs: modelData.display_amount === null
                     ? "no rate: not in the total"
                     : modelData.currency === root.summary.display_currency
-                      ? "" : modelData.display_amount + " " + root.summary.display_currency
-                text: modelData.name + ": " + own + (shownAs !== "" ? " (" + shownAs + ")" : "")
+                      ? "" : modelData.display_amount + " " + root.safe(root.summary.display_currency, 16)
+                text: root.safe(modelData.name) + ": " + own + (shownAs !== "" ? " (" + shownAs + ")" : "")
                 color: modelData.display_amount === null ? Theme.warning : Theme.text
             }
         }

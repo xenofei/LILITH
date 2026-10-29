@@ -98,19 +98,19 @@ TestCase {
     function summary(rows, over) {
         return Object.assign({
             bases: {
-                money: {records: 0, estimated: 0, reconciled: 0, by_currency: {}},
+                money: {records: 0, estimated: 0, reconciled: 0, by_currency: {}, units: {}},
                 subscription_quota: {records: 0, units: {}},
                 local: {records: 0, energy_cost: {}}
             },
             by_currency: {}, display_currency: "USD", display_total: "0", fixed_costs: [],
-            unattributed: {records: 0, estimated: 0, reconciled: 0, by_currency: {}},
+            unattributed: {records: 0, estimated: 0, reconciled: 0, by_currency: {}, units: {}},
             rows: rows || []
         }, over || {})
     }
 
     function row(period, basis, fields, over) {
         const base = basis === "money" || basis === "unattributed"
-                   ? {records: 1, estimated: 0, reconciled: 0, by_currency: {USD: "1"}}
+                   ? {records: 1, estimated: 0, reconciled: 0, by_currency: {USD: "1"}, units: {}}
                    : basis === "local" ? {records: 1, energy_cost: {}} : {records: 1, units: {}}
         return Object.assign({period: period, basis: basis}, base, fields, over || {})
     }
@@ -211,6 +211,8 @@ TestCase {
         load(core, "provider")
         panel.setDimension("model")
         answer(core, isSummary("month", ["model"]), ok(summary([
+            row(monthKey, "money", {model: "gpt-4o"},
+                {records: 6, by_currency: {USD: "0.5"}, units: {input_tokens: 5000, output_tokens: 700, images: 2}}),
             row(monthKey, "subscription_quota", {model: "claude-sonnet"},
                 {records: 3, units: {input_tokens: 1200, output_tokens: 300, requests: 3}}),
             row(monthKey, "subscription_quota", {model: "gpt-image-1"},
@@ -227,6 +229,21 @@ TestCase {
         const local = section(panel, "month", "local")
         for (const s of ["flux-dev", "81.5 GPU-seconds", "9.25 Wh", "0.002 USD"])
             verify(shows(local, s), s)
+        // A pay-as-you-go model's tokens and images, beside its money.
+        const money = section(panel, "month", "money")
+        for (const s of ["gpt-4o", "0.5 USD", "5000 input tokens", "700 output tokens", "2 images"])
+            verify(shows(money, s), s)
+        // And in the CSV, each unit in its own column.
+        const dir = TestFiles.newDir("usage-units")
+        verify(panel.exportTo("file:///" + dir + "/units.csv"))
+        tryVerify(() => !panel.exporter.busy && panel.banner.visible, 5000)
+        const lines = TestFiles.read(dir + "/units.csv").split("\r\n")
+        compare(lines[0], "period,basis,model,label,records,estimated,reconciled,currency,amount,"
+                + "input_tokens,output_tokens,images,seconds,requests,gpu_seconds,energy_wh_gross,"
+                + "energy_currency,energy_cost")
+        compare(lines[1], "2026-10,money,gpt-4o,gpt-4o,6,0,0,USD,0.5,5000,700,2,,,,,,")
+        compare(lines[4], "2026-10,local,flux-dev,flux-dev,5,,,,,,,,,,81.5,9.25,USD,0.002",
+                "local work's energy cost in its own columns, not in amount")
     }
 
     function test_estimated_and_reconciled_are_marked() { // spec: APP-117
@@ -289,7 +306,8 @@ TestCase {
         verify(!shows(quota, "USD"), "subscription quota is in its own units, never money")
         verify(shows(quota, "not money, and not in the spend total"))
         verify(shows(local, "30 GPU-seconds") && !shows(local, "openrouter"))
-        verify(shows(section(panel, "month", "totals"), "4 USD"))
+        verify(texts(section(panel, "month", "totals")).indexOf("Spend this month: 4 USD") >= 0,
+               "the whole totals line: " + texts(section(panel, "month", "totals")))
     }
 
     function test_fixed_costs_are_in_the_month_total() { // spec: APP-119, CORE-083
@@ -335,9 +353,11 @@ TestCase {
         const panel = makePanel(core)
         load(core, "provider", null, null, null, capsView([
             {cap: "monthly", limit: "10", settled: "4", held: "1", ratio_permille: 500},
-            {cap: "provider:openrouter", limit: "5", settled: "0", held: "0", ratio_permille: 0, invalid: true},
+            {cap: "provider:openrouter", limit: "5", settled: "0", held: "0", ratio_permille: 1000, invalid: true},
+            {cap: "provider:fal", limit: "2", settled: "1.99", held: "0", ratio_permille: 995},
         ]))
-        tryVerify(() => panel.gauges.view && panel.gauges.view.caps.length === 2, 5000)
+        tryVerify(() => panel.gauges.view && panel.gauges.view.caps.length === 3, 5000)
+        compare(findChild(panel.gauges, "cap_provider:fal").value, 0.99, "floored, as the alerts are: not 100 %")
         const gauge = findChild(panel.gauges, "cap_monthly")
         verify(gauge, "the monthly gauge")
         compare(gauge.value, 0.5)
@@ -345,7 +365,7 @@ TestCase {
         verify(!findChild(panel.gauges, "cap_provider:openrouter"), "an invalid cap has no gauge")
         const invalid = findChild(panel.gauges, "cap_provider:openrouter_invalid")
         verify(invalid && invalid.visible)
-        verify(invalid.text.indexOf("invalid") >= 0, invalid.text)
+        verify(invalid.text.indexOf("can't be measured") >= 0 && invalid.text.indexOf("no dated rate") >= 0, invalid.text)
 
         // The alerts: one line each, never stacked; a repeat adds none.
         for (const pct of [50, 80, 100])
@@ -366,6 +386,10 @@ TestCase {
         verify(shown[0].text.indexOf("100 %") >= 0, "the newest first: " + shown[0].text)
         verify(shown[2].text.indexOf("50 %") >= 0, shown[2].text)
         verify(shown[1].text.indexOf("Monthly") >= 0, shown[1].text)
+
+        // A read of the next month drops this month's alerts.
+        answer(core, isCaps, ok({display_currency: "USD", period: "2026-11", caps: []}))
+        tryVerify(() => panel.gauges.alerts.length === 0, 5000, "the old month's alerts go")
     }
 
     function test_caps_are_read_again_at_most_once_a_second() { // spec: APP-121
@@ -393,9 +417,25 @@ TestCase {
         wait(100)
         compare(capsReads(), 3)
         // A usage record reads the breakdowns again too, throttled the same way.
+        const open = () => core.calls.filter(c => c.name === "usage.summary" && !answered[c.id])
+        // Answer what is out, and the reads that waited for it, until none is out.
+        for (let n = 0; n < 5 && open().length > 0; ++n) {
+            for (const c of open())
+                answer(core, x => x.id === c.id, ok(summary()))
+        }
+        compare(open().length, 0)
+        wait(1100)
         const before = summaryCalls(core)
         core.emit("usage", "event", {kind: "record", record: {provider: "p"}})
-        tryVerify(() => summaryCalls(core) === before + 3, 2000, "month, day and accounts")
+        compare(summaryCalls(core), before + 3, "month, day and accounts")
+        // A re-read while those are out doesn't drop them: one more read follows each.
+        wait(1100)
+        core.emit("usage", "event", {kind: "record", record: {provider: "p"}})
+        compare(summaryCalls(core), before + 3, "the reads out are kept")
+        compare(core.cancelled.length, 0, "nothing is cancelled")
+        for (const c of open())
+            answer(core, x => x.id === c.id, ok(summary()))
+        compare(summaryCalls(core), before + 6, "then one more each")
     }
 
     function test_resyncs_reload_and_ready_does_not() { // spec: APP-028
@@ -436,9 +476,10 @@ TestCase {
     function test_claude_code_section_is_empty_until_engine_a() { // spec: APP-123
         const core = makeCore()
         const panel = makePanel(core)
-        load(core, "provider")
-        compare(panel.claudeCode.rowCount, 0)
+        load(core, "provider", summary([row(monthKey, "money", {caller_kind: "mcp"})]))
         verify(panel.claudeCode.visible)
+        // Its only lines: the title and the line saying it fills in with Engine A.
+        compare(texts(panel.claudeCode).length, 2, texts(panel.claudeCode).join(" | "))
         verify(shows(panel.claudeCode, "Engine A"), texts(panel.claudeCode).join(" | "))
     }
 
@@ -470,6 +511,7 @@ TestCase {
         compare(panel.banner.kind, "ok")
         const text = TestFiles.read(dir + "/usage.csv")
         verify(text !== null, "the file is written")
+        // TestFiles.read (QString::fromUtf8) drops the BOM; lil_qt's csv_ tests check its bytes.
         const lines = text.split("\r\n")
         compare(lines[0], "period,basis,provider,label,records,estimated,reconciled,currency,amount,input_tokens")
         compare(lines[1], "2026-10,money,openrouter,openrouter,3,2,0,EUR,3,")
@@ -478,13 +520,96 @@ TestCase {
         compare(lines[4], "2026-10,subscription_quota,anthropic,anthropic,2,,,,,900")
         compare(lines[5], "")
         compare(lines.length, 6)
+        compare(TestFiles.list(dir), ["usage.csv"], "nothing beside it")
 
-        // A file that can't be written: the panel says so.
+        // The same file again, after the figures moved: it is replaced, and no backup stays.
+        core.emit("usage", "resync_required", null)
+        answer(core, isSummary("month", ["provider"]), ok(summary([row(monthKey, "money", {provider: "fal"})])))
+        tryVerify(() => panel.month.shown("money").length === 1, 5000)
+        panel.banner.close()
+        verify(panel.exportTo(file))
+        tryVerify(() => !panel.exporter.busy && panel.banner.visible, 5000)
+        compare(TestFiles.read(dir + "/usage.csv").split("\r\n")[1], "2026-10,money,fal,fal,1,0,0,USD,1")
+        compare(TestFiles.list(dir), ["usage.csv"], "the backup is deleted after the swap")
+
+        // A file that can't be written: the panel says so, and what became of it.
         TestFiles.write(dir + "/blocker", "a file, not a folder")
         verify(panel.exportTo("file:///" + dir + "/blocker/usage.csv"))
         tryVerify(() => !panel.exporter.busy && panel.banner.kind === "danger", 5000)
         verify(panel.banner.visible)
         verify(panel.banner.text.indexOf("wasn't saved") >= 0, panel.banner.text)
+        verify(panel.banner.text.indexOf("Nothing was written to usage.csv") >= 0, panel.banner.text)
+    }
+
+    // Texts of the panel's own (not the base controls', whose formats Task 19 sets): visible ones
+    // under `item`.
+    function ownTexts(item) {
+        const base = ["LButton", "LIconButton", "LBadge", "LBanner", "LGauge"]
+        const cards = ["LCard", "CapGauges", "AccountsList", "ClaudeCodeSection"]
+        const typeOf = i => String(i).replace(/[_(].*$/, "")
+        const out = []
+        const walkItem = i => {
+            if (!i.visible || base.indexOf(typeOf(i)) >= 0)
+                return
+            const cardHeading = i.parent && cards.indexOf(typeOf(i.parent)) >= 0
+            if (typeof i.text === "string" && typeof i.lineCount === "number" && !cardHeading)
+                out.push(i)
+            for (let n = 0; n < i.children.length; ++n)
+                walkItem(i.children[n])
+        }
+        walkItem(item)
+        return out
+    }
+
+    // Markup in a name from the usage logs or suite.toml shows as written: every Text is plain,
+    // so no <img> is ever fetched (the reviewer's probe saw one fetched through StyledText and
+    // AutoText), and each string goes through core.shownText (P4a-R8), which FakeCore cuts to
+    // its length.
+    function test_untrusted_text_shows_literally_and_loads_nothing() { // spec: APP-116, APP-122
+        const core = makeCore()
+        const panel = makePanel(core)
+        const img = "<img src=\"http://127.0.0.1:9/probe.png\">"
+        const long = "<b>long</b>" + "x".repeat(200)
+        answer(core, isSummary("month", ["provider"]), ok(summary([
+            row(monthKey, "money", {provider: "<i>prov</i>" + img}, {by_currency: {"<u>EUR</u>": "1"}}),
+            row(monthKey, "money", {provider: long}),
+        ], {by_currency: {"<u>EUR</u>": "1"}, unconverted: ["<s>GBP</s>"],
+            fixed_costs: [{name: "<u>cost</u>" + img, amount: "5", currency: "<s>XTS</s>", display_amount: null}]})))
+        answer(core, isSummary("day", ["provider"]),
+               {status: "error", error: {code: "test.boom", category: "internal", message: "<b>boom</b>" + img,
+                                         trace_id: "t", retry: "never"}})
+        answer(core, isSummary("month", ["provider", "account"]), ok(summary([
+            row(monthKey, "money", {provider: "<b>acc</b>", account: "<i>k_1</i>" + img})])))
+        answer(core, isCaps, ok(capsView([{cap: "provider:<b>bad</b>", limit: "1", settled: "0", held: "0",
+                                           ratio_permille: 1000, invalid: true}])))
+        core.emit("caps", "event", {kind: "alert", cap: "provider:<b>alert</b>", threshold_pct: 50, spent_pct: 50,
+                                    spent: "0.5", currency: "USD", period: monthKey})
+        tryVerify(() => panel.month.loaded && panel.accounts.entries.length === 1 && panel.gauges.alerts.length === 1, 5000)
+        const check = (root, marker) => {
+            const items = ownTexts(root).filter(t => t.text.indexOf(marker) >= 0)
+            verify(items.length > 0, marker + " is shown as written: " + texts(root).join(" | "))
+            for (const t of items)
+                compare(t.textFormat, Text.PlainText, marker + " in " + String(t))
+        }
+        for (const marker of ["<i>prov</i>", "<u>EUR</u>", "<s>GBP</s>", "<u>cost</u>", "<s>XTS</s>",
+                              "<b>acc</b>", "<i>k_1</i>", "<b>bad</b>", "<b>alert</b>", "<img src="])
+            check(panel, marker)
+        // Through shownText: the long name is cut.
+        const cut = ownTexts(section(panel, "month", "money")).find(t => t.text.indexOf("<b>long</b>") === 0)
+        verify(cut, "the long name")
+        verify(cut.text.length <= 80 && cut.text.endsWith("…"), cut.text)
+        // The caller kind's raw value beside "You", and an error's text.
+        panel.setDimension("caller_kind")
+        answer(core, isSummary("month", ["caller_kind"]), ok(summary([
+            row(monthKey, "money", {caller_kind: "ui:x" + img + "<b>me</b>"})])))
+        tryVerify(() => panel.month.shown("money").length === 1, 5000)
+        check(section(panel, "month", "money"), "<b>me</b>")
+        panel.setTab("day")
+        check(panel.day, "<b>boom</b>")
+        // Every Text of the panel's own is plain.
+        panel.setTab("month")
+        for (const t of ownTexts(panel))
+            compare(t.textFormat, Text.PlainText, String(t) + ": " + t.text)
     }
 
     function test_float_and_redock_keeps_usage_state() { // spec: ARCH-116

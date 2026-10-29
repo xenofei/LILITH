@@ -8,9 +8,6 @@ import Lilith.UiKit
 LCard {
     id: root
 
-    // The profiles shown: none until Engine A.
-    readonly property int rowCount: 0
-
     title: "Claude Code"
 
     Text {
@@ -18,6 +15,7 @@ LCard {
         text: "Nothing to show yet. Each profile's 5-hour and weekly usage and its reset times show "
               + "here once LILITH runs Claude Code itself (Engine A). Claude Code's calls to LILITH's "
               + "tools are in the breakdown, under the caller Claude Code."
+        textFormat: Text.PlainText
         color: Theme.textMuted
         font.pixelSize: Theme.fontSize
         wrapMode: Text.Wrap

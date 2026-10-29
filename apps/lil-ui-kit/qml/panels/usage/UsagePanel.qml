@@ -11,8 +11,9 @@
 // are the core's.
 //
 // The export writes the rows of the tab shown (UsageText.exportTable) to the file you pick,
-// through the CsvExport bridge, off the GUI thread; a failed write says why in the banner and
-// leaves the file as it was.
+// through the CsvExport bridge, off the GUI thread; a failed write says why in the banner, and
+// what became of the file that was there. Every Text of the panel's own is plain text, and every
+// string from the usage logs or suite.toml goes through `core.shownText` (P4a-R8).
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Dialogs
@@ -140,11 +141,11 @@ Rectangle {
         id: csvExport
         onSaved: path => {
             panelBanner.kind = "ok"
-            panelBanner.show("Saved the CSV as " + path + ".")
+            panelBanner.show("Saved the CSV as " + UsageText.shown(root.core, path, 260) + ".")
         }
         onFailed: (path, why) => {
             panelBanner.kind = "danger"
-            panelBanner.show("The CSV wasn't saved (" + why + "), so " + path + " is as it was.")
+            panelBanner.show("The CSV wasn't saved: " + UsageText.shown(root.core, why, 400))
         }
     }
 
@@ -192,6 +193,7 @@ Rectangle {
             leftPadding: Theme.spacing
             verticalAlignment: Text.AlignVCenter
             text: "By"
+            textFormat: Text.PlainText
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
         }

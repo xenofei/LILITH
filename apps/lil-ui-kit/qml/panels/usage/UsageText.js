@@ -69,10 +69,9 @@ function unitText(values) {
     return known.concat(rest).join(" · ")
 }
 
-// The units of a row of `basis`: a quota row's `units`, a local row's own fields.
+// The units of a row of `basis`: a money, quota or unattributed row's `units`, a local row's
+// own fields.
 function unitsOf(basis, row) {
-    if (basis === "subscription_quota")
-        return row.units || {}
     if (basis === "local") {
         const out = {}
         for (const [k] of units) {
@@ -81,7 +80,7 @@ function unitsOf(basis, row) {
         }
         return out
     }
-    return {}
+    return row.units || {}
 }
 
 // "2 of 3 estimated", "1 reconciled": a money row's marks (APP-117).
@@ -98,7 +97,8 @@ function records(n) {
     return n + (n === 1 ? " record" : " records")
 }
 
-// The rows of `summary` of `basis` as the panel shows them, grouped by `dimension`.
+// The rows of `summary` of `basis` as the panel shows them, grouped by `dimension`. Labels are
+// raw here: the panel shows them through `shown`.
 function shownRows(summary, basis, dimension) {
     if (!summary || !summary.rows)
         return []
@@ -115,23 +115,30 @@ function shownRows(summary, basis, dimension) {
             records: r.records,
             estimated: money ? (r.estimated || 0) : null,
             reconciled: money ? (r.reconciled || 0) : null,
-            byCurrency: money ? (r.by_currency || {}) : (basis === "local" ? (r.energy_cost || {}) : {}),
+            byCurrency: money ? (r.by_currency || {}) : {},
+            energyCost: basis === "local" ? (r.energy_cost || {}) : {},
             units: unitsOf(basis, r),
             marks: money ? marks(r) : [],
         }
     })
 }
 
-// The CSV of the rows shown (APP-117): its columns and one object per line. A row with amounts
-// in several currencies is one line per currency; for local work the amount is its energy cost.
-// The unit columns are the ones the rows carry, in Appendix F's order.
+// The CSV of the rows shown (APP-117): its columns and one object per line. `amount` is money
+// spend only (money and unattributed rows, told apart by `basis`), one line per currency; local
+// work's energy cost has its own `energy_currency` and `energy_cost` columns; a month's fixed
+// costs follow as `basis: "fixed_cost"` lines with their `display_amount`. The unit columns are
+// the ones the rows carry, in Appendix F's order. Values are raw: the CSV guards them.
 function exportTable(summary, dimension) {
     const rows = []
     for (const basis of bases)
         rows.push(...shownRows(summary, basis, dimension))
     const seen = units.map(([k]) => k).filter(k => rows.some(r => r.units[k] !== undefined))
+    const energy = rows.some(r => Object.keys(r.energyCost).length > 0)
+    const fixed = (summary && summary.fixed_costs) || []
     const columns = ["period", "basis", dimension, "label", "records", "estimated", "reconciled",
                      "currency", "amount"].concat(seen)
+                     .concat(energy ? ["energy_currency", "energy_cost"] : [])
+                     .concat(fixed.length > 0 ? ["display_amount"] : [])
     const lines = []
     for (const r of rows) {
         const base = {period: r.period, basis: r.basis, label: r.label, records: r.records,
@@ -139,15 +146,28 @@ function exportTable(summary, dimension) {
         base[dimension] = r.value
         for (const k of seen)
             base[k] = r.units[k] === undefined ? null : r.units[k]
-        const currencies = Object.keys(r.byCurrency).sort()
-        if (currencies.length === 0)
-            lines.push(Object.assign({currency: null, amount: null}, base))
-        for (const c of currencies)
-            lines.push(Object.assign({currency: c, amount: r.byCurrency[c]}, base))
+        const parts = []
+        for (const c of Object.keys(r.byCurrency).sort())
+            parts.push({currency: c, amount: r.byCurrency[c]})
+        for (const c of Object.keys(r.energyCost).sort())
+            parts.push({energy_currency: c, energy_cost: r.energyCost[c]})
+        if (parts.length === 0)
+            parts.push({})
+        for (const p of parts)
+            lines.push(Object.assign({}, base, p))
     }
+    for (const f of fixed)
+        lines.push({basis: "fixed_cost", label: f.name, currency: f.currency, amount: f.amount,
+                    display_amount: f.display_amount})
     return {columns: columns, rows: lines}
 }
 
+// `s` as shown on screen: `core.shownText` (controls removed, bidi and zero-width marks made
+// visible, at most `n` characters, 80 by default; P4a-R8).
+function shown(core, s, n) {
+    const text = s === null || s === undefined ? "" : String(s)
+    return core ? core.shownText(text, n || 80) : text
+}
 // A cap's name: "Monthly cap", "Per-call maximum", "openrouter cap".
 function capName(cap) {
     if (cap === "monthly")

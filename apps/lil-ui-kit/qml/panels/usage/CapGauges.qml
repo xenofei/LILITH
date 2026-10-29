@@ -1,8 +1,13 @@
 // The cap gauges (APP-121): `caps.get` as one gauge per cap, settled plus held money against its
-// limit in the display currency, as caps.get gives it. A cap whose value in suite.toml doesn't
-// parse shows as invalid, never as a ratio (it counts as exceeded). The 50, 80 and 100 % alerts
-// of the `caps` topic (CORE-089) are one line each, newest first, never stacked; a repeat of
-// the same cap, level and month adds none. The panel decides when to read() again.
+// limit in the display currency, as caps.get gives it. A cap the core can't measure (its value
+// in suite.toml doesn't read, or an amount under it has no dated rate) shows as such, never as a
+// ratio (it counts as exceeded). The 50, 80 and 100 % alerts of the `caps` topic (CORE-089) are
+// one line each, newest first, never stacked; a repeat of the same cap, level and month adds
+// none, and a read of a new month drops the old month's. The panel decides when to read() again:
+// a read while one is out waits for it, then reads once more.
+//
+// Every Text of its own is plain text, and the cap names, currencies, alert and error text go
+// through `core.shownText` (P4a-R8).
 pragma ComponentBehavior: Bound
 import QtQuick
 import Lilith.UiKit
@@ -15,29 +20,48 @@ LCard {
     // The last CapsView read, null until the first.
     property var view: null
     property var error: null
-    // [{key, text}], newest first.
+    // [{key, period, text}], newest first.
     property var alerts: []
     readonly property string currency: view ? view.display_currency : ""
     property var _call: null
+    property bool _due: false
 
-    title: "Spending caps" + (view ? " · " + view.period : "")
+    title: "Spending caps" + (view ? " · " + safe(view.period, 16) : "")
 
-    // Reads caps.get again; a read still open is dropped.
+    function safe(s, n) {
+        return UsageText.shown(core, s, n)
+    }
+
+    // Reads caps.get again (see the header for a read still out).
     function read() {
-        if (_call)
-            _call.cancel()
+        if (_call) {
+            _due = true
+            return
+        }
         _call = CoreCall.call(core, "caps.get", {}, {
             owner: root,
             ok: r => {
                 root._call = null
                 root.view = r.structured
                 root.error = null
+                const period = root.view ? root.view.period : ""
+                if (root.alerts.some(a => a.period !== period))
+                    root.alerts = root.alerts.filter(a => a.period === period)
+                root.again()
             },
             error: e => {
                 root._call = null
                 root.error = e
+                root.again()
             }
         })
+    }
+
+    function again() {
+        if (_due) {
+            _due = false
+            read()
+        }
     }
 
     // An `alert` event's data.
@@ -45,8 +69,8 @@ LCard {
         const key = [a.cap, a.threshold_pct, a.period].join("|")
         if (alerts.some(x => x.key === key))
             return
-        const text = UsageText.alertText(a)
-        alerts = [{key: key, text: text}].concat(alerts)
+        const text = safe(UsageText.alertText(a), 300)
+        alerts = [{key: key, period: a.period, text: text}].concat(alerts)
         Accessible.announce(text)
     }
 
@@ -59,6 +83,7 @@ LCard {
             width: parent.width
             visible: root.view !== null && root.view.caps.length === 0
             text: "No spending caps are set. Caps are optional, and only you set them."
+            textFormat: Text.PlainText
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap
@@ -69,8 +94,10 @@ LCard {
         Text {
             width: parent.width
             visible: root.view === null
-            text: root.error ? "Couldn't read the caps" + (root.error.message ? ": " + root.error.message : ".")
+            text: root.error ? "Couldn't read the caps" + (root.error.message
+                               ? ": " + root.safe(root.error.message, 300) : ".")
                              : "Reading the caps…"
+            textFormat: Text.PlainText
             color: root.error ? Theme.danger : Theme.textMuted
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap
@@ -80,11 +107,12 @@ LCard {
 
         Repeater {
             model: root.view ? root.view.caps : []
-            // A gauge, or for an invalid cap a line saying so (never a gauge).
+            // A gauge, or for a cap that can't be measured a line saying so (never a gauge).
             delegate: Loader {
                 id: capLoader
 
                 required property var modelData
+                readonly property string name: root.safe(UsageText.capName(modelData.cap))
 
                 width: body.width
                 sourceComponent: modelData.invalid ? invalidCap : gaugeCap
@@ -94,10 +122,11 @@ LCard {
                     LGauge {
                         objectName: "cap_" + capLoader.modelData.cap
                         width: capLoader.width
-                        label: UsageText.capName(capLoader.modelData.cap) + ": " + capLoader.modelData.settled
-                               + " settled + " + capLoader.modelData.held + " held of " + capLoader.modelData.limit
-                               + " " + root.currency
-                        value: capLoader.modelData.ratio_permille / 1000
+                        label: root.safe(capLoader.name + ": " + capLoader.modelData.settled + " settled + "
+                                         + capLoader.modelData.held + " held of " + capLoader.modelData.limit
+                                         + " " + root.currency, 200)
+                        // Floored to the whole percent, as the alerts are.
+                        value: Math.floor(capLoader.modelData.ratio_permille / 10) / 100
                     }
                 }
 
@@ -106,7 +135,9 @@ LCard {
                     Text {
                         objectName: "cap_" + capLoader.modelData.cap + "_invalid"
                         width: capLoader.width
-                        text: UsageText.capName(capLoader.modelData.cap) + ": invalid in suite.toml, so it counts as exceeded"
+                        text: capLoader.name + ": can't be measured, so it counts as exceeded. Its value in "
+                              + "suite.toml doesn't read, or an amount under it is in a currency with no dated rate."
+                        textFormat: Text.PlainText
                         color: Theme.danger
                         font.pixelSize: Theme.fontSize
                         wrapMode: Text.Wrap
@@ -129,6 +160,7 @@ LCard {
                     objectName: "alert"
                     width: parent.width
                     text: modelData.text
+                    textFormat: Text.PlainText
                     color: Theme.warning
                     font.pixelSize: Theme.fontSize
                     elide: Text.ElideRight
