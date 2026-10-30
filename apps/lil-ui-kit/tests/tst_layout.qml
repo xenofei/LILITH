@@ -35,9 +35,30 @@ TestCase {
                                           "diagnostics", "settings"]
 
     // The shell of the test before deletes its docks later (KDDockWidgets' names are
-    // process-wide): let that run first.
+    // process-wide): wait until they are gone.
     function init() {
-        wait(100)
+        waitDocksGone()
+    }
+
+    // No main window and no dock of an earlier shell is left in KDDockWidgets.
+    function waitDocksGone() {
+        tryVerify(() => {
+            const kddw = JSON.parse(DockLayout.serialize())
+            return DockLayout.mainWindows().length === 0
+                   && !(Array.isArray(kddw.allDockWidgets) && kddw.allDockWidgets.length > 0)
+        }, 5000, "the earlier shell's docks are gone")
+    }
+
+    // The shell's layout is built and laid out: every shown dock has its size, and the layout
+    // text is the same at two checks in a row.
+    function waitLaidOut(shell) {
+        let last = ""
+        tryVerify(() => {
+            const text = shell.layoutText()
+            const same = text === last
+            last = text
+            return same && shell.docksSized()
+        }, 5000, "the layout settles")
     }
 
     function makeShell(dir) {
@@ -48,15 +69,13 @@ TestCase {
 
     function showShell(shell) {
         shell.visible = true
-        tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000,
-                  "the docks are laid out")
-        wait(50)
+        tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
     }
 
     // A shell is destroyed before the next one is made: KDDockWidgets' names are process-wide.
     function dropShell(shell) {
         shell.destroy()
-        wait(100)
+        waitDocksGone()
     }
 
     function shown(shell, id) {
@@ -183,7 +202,7 @@ TestCase {
         const shell = makeShell(dir)
         showShell(shell)
         shell.docks.usage.setAsCurrentTab()
-        wait(50)
+        tryVerify(() => shown(shell, "usage"), 5000, "Usage is the tab in front")
         DockLayout.saveRequested()   // as at a logoff, a shutdown or the application's quit
         const saved = TestFiles.read(dir + "/layout.json")
         verify(saved !== null && saved !== undefined, "layout.json is written")
@@ -229,11 +248,12 @@ TestCase {
         // A normal size well inside the screen, so the maximized one differs from it.
         shell.width = 1000
         shell.height = 600
-        wait(100)
+        tryVerify(() => shell.width === 1000 && shell.height === 600, 5000, "the normal size")
+        waitLaidOut(shell)
         shell.showMaximized()
         tryVerify(() => shell.visibility === Window.Maximized, 5000, "maximized")
         tryVerify(() => shell.width > 1100, 5000, "the maximized window is larger: " + shell.width)
-        wait(100)
+        waitLaidOut(shell)
         const sizes = id => ({w: shell.docks[id].content.width, h: shell.docks[id].content.height})
         const before = {home: sizes("home"), jobs: sizes("jobs"), hardware: sizes("hardware")}
         shell.close()
@@ -247,8 +267,8 @@ TestCase {
             compare(shell.layoutOpened, "restored")
             shell.visible = true
             tryVerify(() => shell.visibility === Window.Maximized, 5000, "restored maximized")
-            tryVerify(() => shell.docks.home.content.width > 0, 5000)
-            wait(100)
+            tryVerify(() => shell.layoutSettled, 5000, "the restored layout is laid out")
+            waitLaidOut(shell)
             for (const id in before) {
                 const now = sizes(id)
                 verify(Math.abs(now.w - before[id].w) <= 4 && Math.abs(now.h - before[id].h) <= 4,

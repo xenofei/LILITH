@@ -45,6 +45,10 @@ Window {
     // The plan 4a shortcut map: [{keys, action, scope}].
     readonly property var bindings: JSON.parse(ShellState.shortcuts())
     property string _lastSaved
+    // The layout as built and laid out: set once every shown dock has its size and the layout's
+    // text has stopped changing, which is when `_lastSaved` is taken. No save before then.
+    property bool layoutSettled: false
+    property string _settleCandidate
     // True while the shell itself opens or closes docks (the restore, the Default layout, the
     // window's close), which aren't announced.
     property bool _settling: true
@@ -244,7 +248,7 @@ Window {
             _settling = settling
             _defaultPending = false
         }
-        Qt.callLater(() => { root._lastSaved = root.layoutText() })
+        settleCheck.start()
     }
 
     // The Default layout (APP-004): Home in the centre; Jobs and Confirmations tabbed on the
@@ -284,9 +288,40 @@ Window {
                                kddw: JSON.parse(DockLayout.serialize())})
     }
 
+    // Every open dock that shows has its size.
+    function docksSized() {
+        for (const id in docks) {
+            const content = docks[id] ? docks[id].content : null
+            if (docks[id] && docks[id].isOpen && content && content.visible
+                    && (content.width <= 0 || content.height <= 0))
+                return false
+        }
+        return true
+    }
+
+    // Takes the layout last saved once it has settled: two checks in a row that find the docks
+    // sized and the same layout text.
+    Timer {
+        id: settleCheck
+        interval: 50
+        repeat: true
+        onTriggered: {
+            if (!root.docksSized())
+                return
+            const text = root.layoutText()
+            if (text !== root._settleCandidate) {
+                root._settleCandidate = text
+                return
+            }
+            root._lastSaved = text
+            root.layoutSettled = true
+            stop()
+        }
+    }
+
     // Writes the layout when it changed since it was read or last written. Empty, or why not.
     function saveLayout() {
-        if (stateDir === "" || _defaultPending || _saveBlocked || _closing)
+        if (stateDir === "" || _defaultPending || _saveBlocked || _closing || !layoutSettled)
             return ""
         const text = layoutText()
         if (text === _lastSaved)
