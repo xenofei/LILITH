@@ -128,7 +128,6 @@ Window {
     // --- Open requests (Task 19): the Opened card, until Task 26 moves it into Home ---
     OpenedCard {
         id: openedCard
-        core: root.core
         anchors.right: dockingArea.right
         anchors.bottom: dockingArea.bottom
         anchors.margins: 2 * Theme.spacing

@@ -88,6 +88,23 @@ TestCase {
         verify(!card.visible, "Dismiss hides the card")
     }
 
+    function test_untrusted_text_is_plain_and_marked() { // spec: AI-222, P4a-R8
+        const shell = makeShell()
+        const card = shell.openedCard
+        const title = '<b>x</b>​<img src="http://127.0.0.1:9/probe.png">'
+        const before = TestFiles.networkRequests()
+        launch(shell, {kind: "lilref", target: sealed + "‮", title: title})
+        compare(card.heading, '<b>x</b>⟨U+200B⟩<img src="http://127.0.0.1:9/probe.png">',
+                "the title is shown as written, its zero-width space marked")
+        compare(card.targetText, sealed + "‮", "the target is kept as received")
+        verify(card.shownTarget.endsWith("⟨U+202E⟩"), "and shown with its bidi mark marked: "
+               + card.shownTarget)
+        launch(shell, {kind: "refused", message: "This link isn't one LILITH opens: a⁦b"})
+        compare(card.message, "This link isn't one LILITH opens: a⟨U+2066⟩b")
+        wait(300)
+        compare(TestFiles.networkRequests(), before, "nothing was loaded")
+    }
+
     function test_refused_link_shows_message() {
         const shell = makeShell()
         const card = shell.openedCard
@@ -99,7 +116,9 @@ TestCase {
         verify(!card.copyButton.visible, "nothing to copy")
         verify(card.dismissButton.visible)
         compare(fake.calls, [], "a refused link asks the core nothing")
-        verify(!shell.docks.jobs.content.visible || shell.shownJob === "", "and opens no panel")
+        compare(shell.shownJob, "", "and opens no job")
+        compare(shell.shownConfirmation, "", "nor a confirmation")
+        compare(fakeShim.activations.length, 1, "only the window comes forward")
         compare(walk.problems(card), [])
     }
 

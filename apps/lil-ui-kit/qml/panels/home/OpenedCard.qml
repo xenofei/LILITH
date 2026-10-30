@@ -3,20 +3,23 @@
 // or why a link was refused ("This link isn't one LILITH opens: …", APP-020). Plan 4b routes the
 // target to the Inspector instead; until Task 26 builds Home, the shell holds the card.
 //
-// It shows a target as text only: nothing is fetched, loaded or run from it (AI-222). Its
-// actions are Copy (the target's text to the clipboard) and Dismiss.
+// It shows a target as text only: nothing is fetched, loaded or run from it (AI-222). Every
+// string from outside (the target, a `.lilref` title, a refusal) goes through the core's
+// shownText (P4a-R8), so control, bidi and zero-width characters are removed or marked, and is
+// shown as plain text. Its actions are Copy (the target's text to the clipboard) and Dismiss.
 import QtQuick
+import Lilith.Core
 import Lilith.UiKit
 
 LCard {
     id: root
 
-    // The core (Core or FakeCore), for shownText.
-    property var core
     // The card's title: the `.lilref` file's title, else "Opened"; "Link refused" for a refusal.
     property string heading: "Opened"
     // The target as received (empty for a refusal), and how it is shown.
     property string targetText
+    // The target as shown (shownText, at most 300 characters).
+    readonly property string shownTarget: shown(targetText, 300)
     // "Open", "Edit" or "Use as input".
     property string intentText
     // Why a link was refused; empty otherwise.
@@ -28,7 +31,7 @@ LCard {
     function show(launch) {
         message = ""
         targetText = launch.target || ""
-        heading = launch.title ? launch.title : "Opened"
+        heading = launch.title ? shown(launch.title, 200) : "Opened"
         intentText = launch.intent === "edit" ? "Edit"
                    : launch.intent === "use_as_input" ? "Use as input" : "Open"
         visible = true
@@ -38,12 +41,13 @@ LCard {
         targetText = ""
         intentText = ""
         heading = "Link refused"
-        message = text
+        message = shown(text, 300)
         visible = true
     }
 
+    // lil_parse::shown_text, from the bridge itself (whatever core the shell was given).
     function shown(text, max) {
-        return core && core.shownText ? core.shownText(text, max) : text
+        return Core.shownText(String(text), max)
     }
 
     visible: false
@@ -58,7 +62,7 @@ LCard {
         Text {
             width: parent.width
             visible: root.message === ""
-            text: root.shown(root.targetText, 300)
+            text: root.shownTarget
             color: Theme.text
             font.pixelSize: Theme.fontSize
             wrapMode: Text.WrapAnywhere
