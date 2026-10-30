@@ -295,6 +295,7 @@ async fn serve(
     stop: Arc<Notify>,
 ) {
     let mut server = first;
+    let mut refusals = RefusalLog::default();
     loop {
         let connected = tokio::select! {
             connected = server.connect() => connected,
@@ -315,7 +316,7 @@ async fn serve(
         };
         let client = std::mem::replace(&mut server, next);
         if let Err(e) = connected {
-            tracing::warn!(error = %e, "a launch's connection to the app's pipe failed");
+            refusals.refused(&format!("its connection failed: {e}"));
             continue;
         }
         let exchanged = exchange(client, &app, me.as_ref(), &closing);
@@ -326,8 +327,71 @@ async fn serve(
                 }
             }
             Ok(Ok(None)) => tracing::info!("a launch came while the app closes: told it so"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "a launch's arguments were refused"),
-            Err(_) => tracing::warn!("a launch didn't hand its arguments over within 2 s"),
+            Ok(Err(e)) => refusals.refused(&e.to_string()),
+            Err(_) => refusals.refused("it didn't hand its arguments over within 2 s"),
+        }
+    }
+}
+
+/// How many refused launches get a line of their own before the log only counts them.
+const REFUSALS_LOGGED: u32 = 5;
+/// How often the count is written.
+const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+
+/// What the log gets of the launches the running instance refuses, so a client that opens the
+/// pipe again and again can't fill the app's daily log: the first few, then a count once a
+/// minute, until a whole minute has passed without a refusal.
+#[derive(Debug, Default)]
+struct RefusalLog {
+    window_from: Option<Instant>,
+    last: Option<Instant>,
+    logged: u32,
+    counted: u64,
+}
+
+impl RefusalLog {
+    /// One more refusal, at `now`: whether it gets a line of its own, and how many to report as
+    /// counted in the minute that has just ended.
+    fn note(&mut self, now: Instant) -> (bool, u64) {
+        let over = |since: Option<Instant>| {
+            since.is_none_or(|from| now.duration_since(from) >= REFUSAL_WINDOW)
+        };
+        let mut report = 0;
+        if over(self.window_from) {
+            self.window_from = Some(now);
+            report = std::mem::take(&mut self.counted);
+        }
+        if over(self.last) {
+            self.logged = 0;
+        }
+        self.last = Some(now);
+        if self.logged < REFUSALS_LOGGED {
+            self.logged += 1;
+            (true, report)
+        } else {
+            self.counted += 1;
+            (false, report)
+        }
+    }
+
+    fn refused(&mut self, why: &str) {
+        let (line, report) = self.note(Instant::now());
+        if report > 0 {
+            tracing::warn!(count = report, "more launches were counted out of the log");
+        }
+        if line {
+            tracing::warn!(why, "a launch's arguments were refused");
+        }
+    }
+}
+
+impl Drop for RefusalLog {
+    fn drop(&mut self) {
+        if self.counted > 0 {
+            tracing::warn!(
+                count = self.counted,
+                "more launches were counted out of the log"
+            );
         }
     }
 }
@@ -1020,6 +1084,26 @@ mod tests {
 
     fn this_identity() -> Identity {
         Identity::of_this_process().unwrap()
+    }
+
+    #[test] // spec: APP-013
+    fn refused_launches_get_a_few_lines_then_a_count_once_a_minute() {
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut log = RefusalLog::default();
+        for n in 0..u64::from(REFUSALS_LOGGED) {
+            assert_eq!(log.note(at(n)), (true, 0), "{n}");
+        }
+        for _ in 0..1000 {
+            assert_eq!(log.note(at(10)), (false, 0));
+        }
+        // A minute on, the count and no more lines: the flood goes on.
+        assert_eq!(log.note(at(60)), (false, 1000));
+        assert_eq!(log.note(at(61)), (false, 0));
+        assert_eq!(log.note(at(120)), (false, 2));
+        // After a quiet minute, what was left is reported and a refusal has a line again.
+        assert_eq!(log.note(at(300)), (true, 1));
+        assert_eq!(log.note(at(301)), (true, 0));
     }
 
     #[test] // spec: ARCH-027

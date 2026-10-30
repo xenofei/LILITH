@@ -1065,6 +1065,55 @@ fn a_pipe_held_by_another_program_starts_its_own_instance() {
     }
 }
 
+#[test] // spec: APP-013
+fn a_flood_of_refused_clients_writes_a_few_log_lines_and_a_count() {
+    // This test process isn't the app's exe, so the running instance refuses each of them.
+    const CLIENTS: u64 = 40;
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    let first = running(&folder, &env, "", "shell");
+    let name = env.env.app_pipe_name(APP, false);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        for _ in 0..CLIENTS {
+            loop {
+                match lil_platform::pipe::open_client(&name) {
+                    Ok(client) => {
+                        drop(client);
+                        break;
+                    }
+                    Err(lil_platform::pipe::ConnectError::Busy) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+    });
+    folder.stop();
+    first.wait_line("stopped");
+    let lines = log_lines(&env);
+    let refused: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("were refused"))
+        .collect();
+    assert!(refused.len() <= 5, "{} lines: {refused:?}", refused.len());
+    let counted: Vec<Value> = lines
+        .iter()
+        .filter(|l| l.contains("more launches"))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(counted.len(), 1, "{lines:?}");
+    let count = counted[0]["count"]
+        .as_u64()
+        .or_else(|| counted[0]["fields"]["count"].as_u64())
+        .unwrap_or_else(|| panic!("{}", counted[0]));
+    assert_eq!(u64::try_from(refused.len()).unwrap() + count, CLIENTS);
+}
+
 #[test] // spec: P4a-R9
 fn a_deny_that_fails_exits_non_zero() {
     let rt = tokio::runtime::Builder::new_multi_thread()
