@@ -25,9 +25,10 @@
 //! [`start`] is what a start does before Qt: which pipe a plan goes to, and the deny of a toast
 //! (P4a-R9), which never shows a window: it goes to the running app, else to a running confirm
 //! window, else this process sends it itself with [`send_deny`] (`StartPolicy::NoStart`, so a
-//! stale toast's Deny starts no core, and at most 10 s in all). When another program holds the
-//! pipe (it can't be opened, or its server isn't this exe as this user), the start goes on as an
-//! instance of its own, without the pipe, and says so ([`BootPlan::pipe_notice`]).
+//! stale toast's Deny starts no core, and at most 10 s in all). When the hand-over fails, however
+//! it fails (another program holds the pipe, the instance doesn't answer or answers oddly, the
+//! pipe breaks), the start goes on as an instance of its own, without the pipe, and says why
+//! ([`BootPlan::pipe_notice`]); it never ends silently.
 //!
 //! **Threads.** [`forward`] and [`send_deny`] each run on a current-thread tokio runtime of their
 //! own, made and shut down within the call, so nothing of theirs is left when they return. A
@@ -85,6 +86,15 @@ pub const NOTICE_SELF_UNKNOWN: &str = "LILITH couldn't check which program it is
 /// What it says when LILITH's own instance was still closing after [`CLOSING_WAIT`] (M-13).
 pub const NOTICE_CLOSING: &str =
     "The running LILITH was still closing, so this launch opened a window of its own.";
+/// What it says when whatever holds the pipe started the exchange and never finished it.
+pub const NOTICE_TIMEOUT: &str = "LILITH's launch channel didn't finish answering in time, so \
+                                  this launch opened a window of its own.";
+/// What it says when whatever holds the pipe answered something else than the exchange.
+pub const NOTICE_REFUSED: &str = "LILITH's launch channel gave an answer LILITH doesn't \
+                                  recognise, so this launch opened a window of its own.";
+/// What it says when the pipe failed during the exchange.
+pub const NOTICE_PIPE_FAILED: &str = "LILITH's launch channel failed during the hand-over, so \
+                                      this launch opened a window of its own.";
 /// The wait between tries while every instance of the pipe is busy.
 const BUSY_RETRY: Duration = Duration::from_millis(10);
 /// The wait between tries while the running instance closes.
@@ -799,10 +809,10 @@ pub fn send_deny(cfg: &ClientConfig, id: &str, token: &str) -> DenyOutcome {
 #[derive(Debug)]
 pub enum Start {
     /// Exit with this code before Qt starts: 0 once the arguments reached the running instance
-    /// or the deny was sent, 1 when it failed (logged).
+    /// or the deny was sent, 1 when a deny failed (logged).
     Exit(i32),
-    /// Start Qt, serving this instance's pipe (none under `--smoke-exit`, or when another
-    /// program holds the pipe: then [`BootPlan::pipe_notice`] says why).
+    /// Start Qt, serving this instance's pipe (none under `--smoke-exit`, or when the exchange
+    /// with whatever holds the pipe failed: then [`BootPlan::pipe_notice`] says why).
     Run(Option<InstanceServer>),
 }
 
@@ -924,12 +934,30 @@ fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start
                 plan.pipe_notice = Some(NOTICE_BUSY);
                 return Start::Run(None);
             }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "the running LILITH didn't take this launch, so it ends here"
+            Err(ForwardError::Timeout) => {
+                tracing::warn!(
+                    "the app's pipe didn't finish the exchange in 2 s: starting as an instance \
+                     of its own, without the pipe"
                 );
-                return Start::Exit(1);
+                plan.pipe_notice = Some(NOTICE_TIMEOUT);
+                return Start::Run(None);
+            }
+            Err(ForwardError::Refused) => {
+                tracing::warn!(
+                    "the app's pipe answered something else than the exchange: starting as an \
+                     instance of its own, without the pipe"
+                );
+                plan.pipe_notice = Some(NOTICE_REFUSED);
+                return Start::Run(None);
+            }
+            Err(ForwardError::Io(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "the app's pipe failed during the exchange: starting as an instance of its \
+                     own, without the pipe"
+                );
+                plan.pipe_notice = Some(NOTICE_PIPE_FAILED);
+                return Start::Run(None);
             }
         }
     }

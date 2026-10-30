@@ -1065,6 +1065,58 @@ fn a_pipe_held_by_another_program_starts_its_own_instance() {
     }
 }
 
+#[test] // spec: APP-014
+fn an_exchange_that_fails_opens_a_window_that_says_why() {
+    use lil_qt::single_instance::{NOTICE_PIPE_FAILED, NOTICE_REFUSED, NOTICE_TIMEOUT};
+    // A copy of the app's exe that passes every check and then says nothing, says the wrong
+    // thing, or says what isn't JSON. No launch ends silently.
+    for (says, notice) in [
+        (None, NOTICE_TIMEOUT),
+        (Some(r#"{"app":"other","pid":1}"#), NOTICE_REFUSED),
+        (Some("not json"), NOTICE_PIPE_FAILED),
+    ] {
+        let env = TestEnv::new();
+        let folder = Folder::new();
+        let mut extra = vec![(PROBE_ROLE, "says".into())];
+        if let Some(says) = says {
+            extra.push((PROBE_SAYS, says.into()));
+        }
+        let server = Launch::start_with(&folder, &env, "", &extra);
+        server.wait_line("ready");
+        let mut launch = Launch::start(&folder, &env, &task_url(&env, 8));
+        let (code, took) = launch.wait_exit();
+        assert_eq!(code, 0, "{says:?}: {:?}", launch.lines());
+        let run: Value = serde_json::from_str(&launch.wait_line("run ")).unwrap();
+        assert_eq!(run["pipe_notice"], notice, "{says:?}: {run}");
+        assert_eq!(run["job"], "j_0000000000000008", "its own launch: {run}");
+        if says.is_none() {
+            assert!(took >= Duration::from_millis(1900), "{took:?}");
+        }
+    }
+}
+
+#[test] // spec: APP-014, APP-020
+fn a_refused_link_too_long_for_the_message_reaches_the_window_cut() {
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    let first = running(&folder, &env, "", "shell");
+    // 25,000 characters of 3 bytes each: longer than a message may be.
+    let link = format!("{}:{}", scheme(&env), "€".repeat(25_000));
+    let mut launch = Launch::start(&folder, &env, &link);
+    assert_eq!(launch.wait_exit().0, 0, "{:?}", launch.lines());
+    assert_eq!(launch.lines(), ["exit 0 forwarded=true"]);
+    let got: Value = serde_json::from_str(&first.wait_line("deliver ")).unwrap();
+    assert_eq!(got["kind"], "refused", "{got}");
+    assert!(
+        got["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("This link isn't one LILITH opens: "),
+        "{got}"
+    );
+    folder.stop();
+}
+
 #[test] // spec: APP-013
 fn a_flood_of_refused_clients_writes_a_few_log_lines_and_a_count() {
     // This test process isn't the app's exe, so the running instance refuses each of them.

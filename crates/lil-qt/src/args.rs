@@ -305,7 +305,30 @@ fn read(args: &[String], env: &Env) -> Result<BootPlan, &'static str> {
         }
     }
     plan.args = args.to_vec();
+    if plan.link_refused.is_some()
+        && let Some(link) = plan.args.last_mut()
+    {
+        cut_for_the_wire(link);
+    }
     Ok(plan)
+}
+
+/// The most of a refused link a second launch forwards, in UTF-8 bytes: a message may be 64 KiB
+/// (`single_instance::MESSAGE_MAX`), and JSON may write a character in 6 bytes.
+const FORWARDED_LINK_BYTES: usize = 8192;
+
+/// A refused link as a second launch forwards it, so it reaches the Opened card, cut, however
+/// long it is. It stays refused when the running instance reads it again: its `…` fits no
+/// verb, ref or `.lilref`, and what's left of a path is still longer than a target may be.
+fn cut_for_the_wire(link: &mut String) {
+    if link.len() > FORWARDED_LINK_BYTES {
+        let mut at = FORWARDED_LINK_BYTES;
+        while !link.is_char_boundary(at) {
+            at -= 1;
+        }
+        link.truncate(at);
+        link.push('…');
+    }
 }
 
 /// `^cf_[0-9a-f]{16}$`.
@@ -502,6 +525,7 @@ fn lilref(arg: &str) -> Result<Opened, String> {
     if !is_drive_absolute(arg) {
         return Err("LILITH opens a .lilref file by its full path.".to_string());
     }
+    check_target(arg)?;
     let path = Path::new(arg);
     let unreadable = || "LILITH couldn't read this .lilref file.".to_string();
     // A mapped network drive is a network share too, and a volume that can't be told is taken
@@ -1028,6 +1052,49 @@ mod tests {
         }
         assert_eq!(cut_secrets("lil-dev:open/@@@"), "lil-dev:open/@@@");
         assert_eq!(cut_secrets("deny/"), "deny/");
+    }
+
+    #[test] // spec: APP-014, APP-020
+    fn a_refused_link_is_cut_before_it_goes_on_the_wire_and_stays_refused() {
+        let scheme = "lil-dev";
+        let task = "task/j_0123456789abcdef";
+        for link in [
+            // Each its worst case: 3-byte characters, and characters JSON writes in 6 bytes.
+            format!("{scheme}:{}", "€".repeat(25_000)),
+            format!("{scheme}:{}", "\u{1}".repeat(25_000)),
+            // Keeping only its start must not make a link of it, or a target it would open.
+            format!("{scheme}:{task}/{}", "x".repeat(25_000)),
+            format!("C:\\{}", "x".repeat(25_000)),
+            format!("C:\\{}.lilref", "x".repeat(25_000)),
+            b64(&"x".repeat(25_000)),
+        ] {
+            let p = plan_args(std::slice::from_ref(&link), &env(Channel::Dev));
+            let message = p
+                .link_refused
+                .as_deref()
+                .unwrap_or_else(|| panic!("{link:.30}"));
+            assert_eq!(p.opened, None, "{link:.30}");
+            let wire = json!({"args": p.args}).to_string();
+            assert!(
+                wire.len() < crate::single_instance::MESSAGE_MAX,
+                "{link:.30}"
+            );
+            let again = plan_args(&p.args, &env(Channel::Dev));
+            assert_eq!(again.opened, None, "{link:.30}");
+            // It says the same, but for what the cut itself took off a link it can't show.
+            let start = |text: &str| text.chars().take(40).collect::<String>();
+            assert_eq!(
+                start(again.link_refused.as_deref().unwrap_or_default()),
+                start(message),
+                "{link:.30}"
+            );
+        }
+        // One that fits goes as it came.
+        let short = format!("{scheme}:{}", "x".repeat(100));
+        assert_eq!(
+            plan_args(std::slice::from_ref(&short), &env(Channel::Dev)).args,
+            [short]
+        );
     }
 
     #[test] // spec: APP-020, QA-050
