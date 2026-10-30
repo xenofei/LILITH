@@ -35,8 +35,8 @@ lil-schema = { path = "../lil-schema" }
 serde.workspace = true
 serde_json.workspace = true
 # rt-multi-thread: the background runtime that owns the session (APP-024); macros: `select!`
-# in its event pump.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# in its event pump; net and io-util: the app's single-instance pipe (APP-013).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 tracing.workspace = true
 
 [build-dependencies]
