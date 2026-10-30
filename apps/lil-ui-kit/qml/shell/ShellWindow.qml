@@ -529,8 +529,8 @@ Window {
                       focus: data.focus === true, activate: true})
     }
 
-    // Opens panel `id`, and calls its `method(arg)` when the panel has one; the keyboard focus
-    // moves into it only with `focus`.
+    // Opens panel `id`, and calls its `method(arg, focus)` when the panel has one; the keyboard
+    // focus moves into it only with `focus`.
     function openPanelOn(id, method, arg, focus) {
         const dock = docks[id]
         if (!dock)
@@ -544,7 +544,7 @@ Window {
         }
         const content = dock.content
         if (method && content && typeof content[method] === "function")
-            content[method](arg)
+            content[method](arg, focus)
     }
     // --- end of open requests ---
 }

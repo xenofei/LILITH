@@ -62,6 +62,51 @@ TestCase {
                                                             fields)))
     }
 
+    function job(id, over) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z")
+        return Object.assign({job_id: id, kind: "comfy.prompt", lane: "gpu-heavy", priority: "user",
+                              status: "running", substatus: "executing", created: at, updated: at,
+                              started: at, attempt: 1, trace_id: "t_" + id, batch_id: "b_" + id, index: 0,
+                              origin: {surface: "panel", id: "image"},
+                              status_seq: [{status: "running", substatus: "executing", at: at}]}, over || {})
+    }
+
+    function finished(id, created) {
+        return job(id, {status: "succeeded", substatus: null, created: created, finished: created})
+    }
+
+    // The jobs.list calls not answered yet, as the real core answers them over `jobs`.
+    property var answered: ({})
+    function answerJobs(jobs) {
+        for (const c of fake.calls) {
+            if (c.name === "jobs.list" && !answered[c.id]) {
+                answered[c.id] = true
+                fake.respond(c.id, fake.jobsListAnswer(c.args, jobs, []))
+            }
+        }
+    }
+
+    // Answers until `done()`, each read leading to the next, and fails with `what` if it never is.
+    function answerUntil(jobs, done, what) {
+        tryVerify(() => {
+            answerJobs(jobs)
+            return done()
+        }, 5000, what)
+    }
+
+    // Puts the keyboard focus somewhere other than Jobs: the item that holds it.
+    function focusHome(shell) {
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000, "the window is active")
+        shell.docks.home.focusPanel()
+        tryVerify(() => shell.activeFocusItem !== null, 2000, "Home has the focus")
+        return shell.activeFocusItem
+    }
+
+    function selected(view) {
+        return view.currentItem ? view.currentItem.jobId : ""
+    }
+
     function test_shows_the_target_and_its_actions() {
         const shell = makeShell()
         const card = shell.openedCard
@@ -173,17 +218,111 @@ TestCase {
         compare(shell.openedCard.targetText, "C:\\b.png")
     }
 
-    function test_task_url_opens_jobs_on_that_job() {
+    function test_task_url_opens_jobs_on_that_job() { // spec: P4a-R21
         const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        answerUntil([job("j_00000000000000aa"), job(id)], () => panel.live.loaded && panel.live.count === 2,
+                    "the panel has its rows")
         shell.docks.jobs.forceClose()
         tryVerify(() => !shell.docks.jobs.isOpen, 2000)
-        launch(shell, {kind: "task", job: "j_0123456789abcdef"})
-        compare(shell.shownJob, "j_0123456789abcdef")
+        launch(shell, {kind: "task", job: id})
+        compare(shell.shownJob, id)
         tryVerify(() => shell.docks.jobs.isOpen && shell.docks.jobs.content.visible, 2000,
                   "Jobs opens")
+        tryVerify(() => selected(panel.liveView) === id, 2000, "on that job")
+        verify(panel.rowFor(id).ListView.isCurrentItem, "its row is the selected one")
         verify(!shell.openedCard.visible, "a task isn't an Opened target")
         compare(fakeShim.activations.length, 1)
         verify(fakeShim.activations[0].takeFocus)
+    }
+
+    function test_task_link_lands_on_a_running_job_after_a_cold_start() { // spec: P4a-R21
+        const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        // The launch comes before the panel's first read has returned.
+        verify(!panel.model.loaded && !panel.live.loaded, "no read has returned")
+        launch(shell, {kind: "task", job: id})
+        compare(panel.liveView.currentIndex, -1)
+        answerUntil([job("j_00000000000000aa"), job(id)], () => selected(panel.liveView) === id,
+                    "the row is selected once it is there")
+        verify(panel.rowFor(id).ListView.isCurrentItem)
+        tryVerify(() => panel.liveView.activeFocus, 2000, "and has the keyboard focus, as the link asked")
+        compare(panel.banner.visible, false)
+    }
+
+    function test_task_link_lands_on_a_finished_job_pages_back() { // spec: P4a-R21
+        const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: id})
+        // 250 newer jobs before it: more than a screenful and two pages.
+        const jobs = []
+        for (let i = 0; i < 250; ++i)
+            jobs.push(finished("j_" + String(i).padStart(16, "1"), "2026-10-30T12:00:00Z"))
+        jobs.push(finished(id, "2026-10-01T12:00:00Z"))
+        answerUntil(jobs, () => selected(panel.historyView) === id, "it pages back to the job")
+        compare(panel.liveView.currentIndex, -1)
+        compare(panel.banner.visible, false)
+    }
+
+    function test_task_link_to_a_job_not_in_the_list_says_so() { // spec: P4a-R21
+        const shell = makeShell()
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: "j_00000000000000ff"})
+        answerUntil([job("j_00000000000000aa")], () => panel.banner.visible, "the read ends without the row")
+        verify(panel.banner.text.indexOf("j_00000000000000ff") >= 0
+               && panel.banner.text.indexOf("isn't in the list") >= 0, panel.banner.text)
+        compare(panel.liveView.currentIndex, -1)
+        compare(panel.wantedJob, "", "it has stopped looking")
+        // Once loaded, the same at once; and a request for a job that's there replaces it.
+        launch(shell, {kind: "task", job: "j_00000000000000ee"})
+        verify(panel.banner.text.indexOf("j_00000000000000ee") >= 0, panel.banner.text)
+        launch(shell, {kind: "task", job: "j_00000000000000aa"})
+        verify(!panel.banner.visible, "the words go with the request")
+        compare(selected(panel.liveView), "j_00000000000000aa")
+    }
+
+    function test_a_new_task_link_replaces_the_one_waiting() { // spec: P4a-R21
+        const shell = makeShell()
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: "j_00000000000000aa"})
+        launch(shell, {kind: "task", job: "j_00000000000000bb"})
+        answerUntil([job("j_00000000000000aa"), job("j_00000000000000bb")],
+                    () => selected(panel.liveView) === "j_00000000000000bb", "the last request lands")
+        wait(50)
+        compare(selected(panel.liveView), "j_00000000000000bb", "and the first never does")
+        compare(panel.banner.visible, false)
+    }
+
+    function test_task_link_with_no_focus_leaves_the_keyboard_focus_where_it_is() { // spec: APP-065
+        for (const cold of [true, false]) {
+            wait(100)
+            const shell = makeShell()
+            const id = "j_0123456789abcdef"
+            const panel = shell.docks.jobs.content
+            const jobs = [job(id)]
+            if (!cold)
+                answerUntil(jobs, () => panel.live.loaded, "the panel has its rows")
+            const holder = focusHome(shell)
+            launch(shell, {kind: "task", job: id, focus: false})
+            answerUntil(jobs, () => selected(panel.liveView) === id, "the row is selected, cold: " + cold)
+            verify(!panel.liveView.activeFocus, "the list didn't take the focus, cold: " + cold)
+            verify(shell.activeFocusItem === holder, "it stayed where it was, cold: " + cold)
+            shell.destroy()
+        }
+    }
+
+    function test_a_late_landing_leaves_a_focus_that_has_moved_on() { // spec: P4a-R21
+        const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: id})
+        // The person goes on while the first read is out.
+        const holder = focusHome(shell)
+        answerUntil([job(id)], () => selected(panel.liveView) === id, "the row is selected")
+        verify(shell.activeFocusItem === holder, "the focus stayed where the person put it")
     }
 
     function test_agent_open_request_never_takes_focus() {
