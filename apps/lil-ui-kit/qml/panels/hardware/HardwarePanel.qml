@@ -170,14 +170,15 @@ Rectangle {
         })
     }
 
-    // A snapshot: the state shown, unless it is older than the one shown.
-    function apply(s, append) {
+    // A snapshot: the state shown, unless it is older than the one shown. `seq` is the topic's
+    // for an event, none for a loaded snapshot.
+    function apply(s, append, seq) {
         if (!s || !s.cpu)
             return
         if (snapshot && s.ts < snapshot.ts)
             return
         snapshot = s
-        alerts.setAll(s.alerts || [], s.ts)
+        alerts.setAll(s.alerts || [], s.ts, seq)
         if (append) {
             const ts = Date.parse(s.ts)
             for (let i = 0; i < chartSpecs.length; ++i) {
@@ -190,17 +191,18 @@ Rectangle {
 
     function onTelemetry(kind, seq, data) {
         if (kind === "resync_required") {
+            alerts.resetSeqs()
             reload()
         } else if (kind === "snapshot") {
-            apply(data, false)
+            apply(data, false, seq)
             loadSeries()
             energy.reload()
         } else if (data && data.kind === "sample") {
-            apply(data.snapshot, true)
+            apply(data.snapshot, true, seq)
         } else if (data && data.kind === "alert" && data.alert) {
             alerts.upsert(data.alert)
         } else if (data && data.kind === "alert_cleared") {
-            alerts.clear(data.id)
+            alerts.clear(data.id, seq)
         }
     }
 
@@ -612,6 +614,7 @@ Rectangle {
                 objectName: "energyTable"
                 width: Math.min(parent.width, 720)
                 core: root.core
+                parts: root.snapshot ? root.snapshot.system_parts || [] : []
             }
         }
     }

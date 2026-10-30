@@ -25,6 +25,14 @@ Column {
 
     // Unix ms each kind was last announced at.
     property var _announced: ({})
+    // The topic seq of each kind's last `alert_cleared`: a sample of a lower seq (an older one
+    // the clear overtook in the throttle) doesn't raise the kind again. Forgotten on a resync,
+    // when the seqs start again.
+    property var _clearedSeq: ({})
+
+    function resetSeqs() {
+        _clearedSeq = {}
+    }
 
     // The kinds raised now.
     function activeKinds() {
@@ -36,9 +44,11 @@ Column {
         return out
     }
 
-    // A sample's `alerts` (the state at `sampleTs`, an RFC 3339 time): the kinds not in it are
-    // cleared, unless raised after the sample (an alert event can overtake an older sample).
-    function setAll(alerts, sampleTs) {
+    // A sample's `alerts` (the state at `sampleTs`, an RFC 3339 time, and the topic's `seq`, none
+    // for a loaded snapshot): the kinds not in it are cleared, unless raised after the sample (an
+    // alert event can overtake an older sample); a kind in it is raised, unless it was cleared
+    // after the sample (a clear can overtake one too).
+    function setAll(alerts, sampleTs, seq) {
         const kinds = alerts.map(a => String(a.kind))
         const at = Date.parse(sampleTs || "")
         for (let i = 0; i < alertModel.count; ++i) {
@@ -49,8 +59,12 @@ Column {
                 continue
             clearAt(i)
         }
-        for (const a of alerts)
+        for (const a of alerts) {
+            const cleared = _clearedSeq[String(a.kind)]
+            if (seq !== undefined && cleared !== undefined && seq < cleared)
+                continue
             upsert(a)
+        }
     }
 
     // A raised alert (the topic's `alert` event, or one in a sample).
@@ -71,10 +85,14 @@ Column {
         announce(alertModel.count - 1)
     }
 
-    // A cleared alert (`alert_cleared`, by id).
-    function clear(id) {
+    // A cleared alert (`alert_cleared`, by id, at the topic's `seq`).
+    function clear(id, seq) {
         for (let i = 0; i < alertModel.count; ++i) {
-            if (alertModel.get(i).alertId === id && alertModel.get(i).active)
+            if (alertModel.get(i).alertId !== id)
+                continue
+            if (seq !== undefined)
+                _clearedSeq[alertModel.get(i).alertKind] = seq
+            if (alertModel.get(i).active)
                 clearAt(i)
         }
     }

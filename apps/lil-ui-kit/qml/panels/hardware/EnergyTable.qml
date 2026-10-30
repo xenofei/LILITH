@@ -5,8 +5,10 @@
 // The whole system is always an estimate ((GPU + CPU + the rest-of-system baseline) / PSU
 // efficiency), and says so. A part that wasn't measured throughout is labelled "estimated", and
 // one with no energy at all and nothing measured (no GPU, a CPU with no meter and no TDP, a
-// period with no samples yet) is "—", "not measured", never 0 Wh. It reads again every minute
-// while it shows, and on reload().
+// period with no samples yet) is "—", "not measured", never 0 Wh; "not measured on this PC" when
+// the snapshot says no source here can measure it (`parts`: its `system_parts`), and a row of
+// nothing on a PC that can measure nothing says that instead of "no data yet". It reads again
+// every minute while it shows, and on reload().
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
@@ -16,6 +18,8 @@ LCard {
     id: root
 
     required property var core
+    // The snapshot's `system_parts`: [{part, mw, measured}], measured being the basis.
+    property var parts: []
 
     // The recent jobs listed.
     readonly property int jobCount: 5
@@ -90,8 +94,18 @@ LCard {
         return system(e) === "" && part(e.gpu_mj, e.measured.gpu) === "" && part(e.cpu_mj, e.measured.cpu) === ""
     }
 
-    function partName(name, text) {
-        return name + (text ? " " + text : " not measured")
+    // No source on this PC can measure `key` ("gpu", "cpu", "rest"): its basis is unknown.
+    function unmeasurable(key) {
+        const p = parts.find(x => x.part === key)
+        return !!p && p.measured === "unknown"
+    }
+
+    function nothingMeasurable() {
+        return parts.length > 0 && ["gpu", "cpu", "rest"].every(unmeasurable)
+    }
+
+    function partName(name, text, key) {
+        return name + (text ? " " + text : unmeasurable(key) ? " not measured on this PC" : " not measured")
     }
 
     function rowName(r) {
@@ -99,11 +113,11 @@ LCard {
         if (!e)
             return r.label + ": not read yet"
         if (noData(e))
-            return r.label + ": no data yet"
+            return r.label + (nothingMeasurable() ? ": not measured on this PC" : ": no data yet")
         const whole = system(e)
         return r.label + ": " + (whole ? "whole system " + whole + " (estimated)" : "whole system not measured")
-               + ", " + partName("GPU", part(e.gpu_mj, e.measured.gpu))
-               + ", " + partName("CPU", part(e.cpu_mj, e.measured.cpu))
+               + ", " + partName("GPU", part(e.gpu_mj, e.measured.gpu), "gpu")
+               + ", " + partName("CPU", part(e.cpu_mj, e.measured.cpu), "cpu")
                + (e.energy_cost ? ", cost " + Format.cost(e.energy_cost) : "")
     }
 
@@ -229,7 +243,7 @@ LCard {
                     id: jobText
                     width: table.width - table.labelWidth
                     text: Format.energy(modelData.system_mj) + " (estimated)"
-                          + "  ·  " + root.partName("GPU", root.part(modelData.gpu_mj_above_idle, modelData.measured.gpu))
+                          + "  ·  " + root.partName("GPU", root.part(modelData.gpu_mj_above_idle, modelData.measured.gpu), "gpu")
                           + " above idle" + (modelData.idle_unknown ? " (no idle baseline)" : "")
                     color: Theme.textMuted
                     font.pixelSize: Theme.fontSize

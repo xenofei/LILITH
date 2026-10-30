@@ -545,6 +545,60 @@ TestCase {
         compare([cell("year", "energyGpu"), cell("year", "energyCpu")], ["—", "—"])
     }
 
+    function test_a_cleared_alert_isnt_raised_again_by_an_older_sample() { // spec: APP-132
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        const strip = named(t.panel, "alertsStrip")
+        const alert = {id: "gpu_temperature", kind: "temperature", value: 88, since: "2026-10-28T12:00:05.000Z"}
+        // Each event with its own seq, as Core delivers them after the throttle.
+        const send = (seq, data) => t.fake.coreEvent("telemetry", "event", seq, JSON.stringify(data))
+        send(10, {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:05.000Z", alerts: [alert]})})
+        compare(strip.activeKinds(), ["temperature"])
+        // The clear (seq 12) overtakes an older sample the throttle held (seq 11), which still
+        // carries the alert.
+        send(12, {kind: "alert_cleared", id: "gpu_temperature"})
+        send(11, {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:06.000Z", alerts: [alert]})})
+        compare(strip.activeKinds(), [], "the older sample doesn't raise it again")
+        verifyShows(strip, "Cleared at", "the banner stays cleared")
+        // A sample after the clear that has it raises it again.
+        send(13, {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:07.000Z", alerts: [alert]})})
+        compare(strip.activeKinds(), ["temperature"])
+        // After a resync the seqs start again: a sample with a low seq is current again.
+        send(14, {kind: "alert_cleared", id: "gpu_temperature"})
+        t.fake.coreEvent("telemetry", "resync_required", 0, "null")
+        send(1, {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:09.000Z", alerts: [alert]})})
+        compare(strip.activeKinds(), ["temperature"], "the old seqs don't hold after a resync")
+    }
+
+    function test_parts_no_source_can_measure_say_so() { // spec: APP-131
+        // No NVIDIA GPU, no Energy Meter and no TDP, no rest of system set: nothing on this PC
+        // can be measured, however many samples there are.
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot({gpu: undefined, system_power_mw: 0,
+            system_parts: [{part: "gpu", mw: 0, measured: "unknown"}, {part: "cpu", mw: 0, measured: "unknown"},
+                           {part: "rest", mw: 0, measured: "unknown"}]}))
+        for (const c of callsTo(t.fake, "telemetry.energy"))
+            t.fake.respond(c.id, {status: "ok", structured: {from: c.args.from, to: c.args.to,
+                gpu_mj: 0, cpu_mj: 0, system_mj: 0, measured: {gpu: false, cpu: false}}})
+        const table = named(t.panel, "energyTable")
+        for (const p of ["session", "day", "month", "year"]) {
+            const name = LilShim.accessibleOf(named(table, "energyRow:" + p)).name
+            verify(/not measured on this PC/.test(name), p + ": " + name)
+            verify(!/no data yet/.test(name), p + ": " + name)
+        }
+        // Only the GPU can't be measured here: the CPU is, and today's row says which.
+        const u = makePanel()
+        answer(u.fake, "telemetry.snapshot", snapshot({gpu: undefined,
+            system_parts: [{part: "gpu", mw: 0, measured: "unknown"}, {part: "cpu", mw: 64000, measured: "measured"},
+                           {part: "rest", mw: 63000, measured: "estimated"}]}))
+        const calls = callsTo(u.fake, "telemetry.energy")
+        u.fake.respond(calls[1].id, {status: "ok", structured: {from: calls[1].args.from, to: calls[1].args.to,
+            gpu_mj: 0, cpu_mj: 36000000, system_mj: 72000000, measured: {gpu: false, cpu: true}}})
+        const day = LilShim.accessibleOf(named(named(u.panel, "energyTable"), "energyRow:day")).name
+        verify(/GPU not measured on this PC/.test(day), day)
+        verify(/CPU 10 Wh/.test(day), day)
+    }
+
     function test_a_hole_breaks_the_line_and_a_stopped_series_says_so() { // spec: APP-129
         const t = makePanel()
         answer(t.fake, "telemetry.snapshot", snapshot())
