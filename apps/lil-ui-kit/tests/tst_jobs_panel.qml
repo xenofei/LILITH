@@ -302,12 +302,13 @@ TestCase {
                                queued("j4", 1)],
                         queue: [queued("j2", 0, Object.assign({index: 1}, batch)), queued("j4", 1)]})
         verify(!button(row(t.panel, "j4"), "Cancel batch"), "a batch of one has no batch cancel")
-        button(row(t.panel, "j2"), "Cancel batch").click()
+        button(row(t.panel, "j2"), "Cancel batch (2)").click()
         compare(answer(t.core, c => c.name === "job.cancel", ok({jobs: []})).args, {batch_id: "b_9"})
         button(row(t.panel, "j4"), "Cancel").click()
         compare(answer(t.core, c => c.name === "job.cancel", ok({job: queued("j4", 1)})).args, {job_id: "j4"})
         button(t.panel, "Cancel all from this app").click()
-        compare(answer(t.core, c => c.name === "job.cancel", ok({jobs: [queued("j2", 0), queued("j4", 1)]})).args,
+        compare(answer(t.core, c => c.name === "job.cancel",
+                       ok({jobs: [queued("j2", 0, {status: "cancelled"}), queued("j4", 1, {status: "cancelled"})]})).args,
                 {all_mine: true})
         tryVerify(() => t.panel.banner.visible && t.panel.banner.text === "Cancelled 2 jobs.", 2000,
                   t.panel.banner.text)
@@ -656,6 +657,18 @@ TestCase {
         tryVerify(() => header.text.indexOf("Paused while fullscreen") >= 0, 2000, header.text)
     }
 
+    function test_a_pause_answered_during_a_read_stands() { // spec: APP-114, CORE-160
+        const t = load({queue: [queued("j2", 0)]})
+        const header = t.panel.laneHeader("gpu-heavy")
+        t.core.emit("jobs", "event", {kind: "job", job: queued("j2", 0, {updated: iso()})})
+        tryVerify(() => openCalls(t.core, isQueueRead).length > 0, 2000, "the read")
+        button(header, "Pause").click()
+        answer(t.core, c => c.name === "app/queue.pause", okState(lane({paused: true, reasons: ["manual"]})), "pause")
+        answerLive(t.core, [], [queued("j2", 0)], [lane()])
+        wait(100)
+        verify(header.text.indexOf("Paused by you") >= 0, header.text)
+    }
+
     // --- Words that must be true (audit finding 7e). ---
 
     function test_no_finished_jobs_isnt_said_while_loading() { // spec: APP-114
@@ -698,6 +711,71 @@ TestCase {
         const text = row(t.panel, "j1").statusText
         verify(text.indexOf("taking longer than estimated") >= 0, text)
         verify(text.indexOf("under 1 s") < 0, text)
+    }
+
+    // --- Writes (audit finding 8). ---
+
+    function test_a_double_click_of_pause_is_one_call() { // spec: APP-114, CORE-160
+        const t = load({jobs: [job("j1")]})
+        const header = t.panel.laneHeader("gpu-heavy")
+        const control = button(header, "Pause")
+        const isQueueCall = c => c.kind === "appCall"
+        control.click()
+        verify(!control.enabled, "busy while its call is out")
+        compare(callsOf(t.core, isQueueCall).length, 1)
+        // The answer comes before the second click of a double-click.
+        answer(t.core, isQueueCall, okState(lane({paused: true, reasons: ["manual"]})), "pause")
+        tryVerify(() => header.text.indexOf("Paused by you") >= 0, 2000, header.text)
+        verify(control.enabled, "free again once answered")
+        control.click()
+        verify(!control.enabled, "and busy for the resume")
+        compare(callsOf(t.core, isQueueCall).length, 2)
+        answer(t.core, isQueueCall, {status: "error", error: {code: "x.y", category: "internal", message: "No.",
+                                                              trace_id: "t", retry: "never"}}, "resume")
+        tryVerify(() => control.enabled, 2000, "free again after a refusal")
+        verify(t.panel.banner.visible, "the refusal shows")
+    }
+
+    function test_the_held_resume_waits_for_its_lanes_call_too() { // spec: APP-114, CORE-160
+        const t = load({lanes: [lane({held: 2, restart_held: 2})]})
+        const header = t.panel.laneHeader("gpu-heavy")
+        const held = button(header, "Resume held jobs (2)")
+        held.click()
+        verify(!held.enabled && !button(header, "Pause").enabled, "the lane's controls wait")
+        answer(t.core, c => c.name === "app/queue.resume", okState(lane()), "resume held")
+        tryVerify(() => button(header, "Pause").enabled, 2000)
+    }
+
+    function test_retry_is_busy_while_its_call_is_out() { // spec: APP-114
+        const failed = job("j6", {status: "failed", substatus: null, finished: iso(1000),
+                                  error: {code: "x", category: "internal", message: "Broke.", trace_id: "t",
+                                          retry: "after_resolve"}})
+        const t = load({jobs: [failed]})
+        const control = button(row(t.panel, "j6"), "Retry")
+        control.click()
+        verify(!control.enabled, "busy while its call is out")
+        compare(callsOf(t.core, c => c.name === "job.retry").length, 1)
+        answer(t.core, c => c.name === "job.retry", ok({job: job("j9")}))
+        tryVerify(() => control.enabled, 2000, "free again")
+    }
+
+    function test_cancel_batch_says_its_count_and_cancel_all_what_happened() { // spec: APP-114, CORE-160
+        const batch = {batch_id: "b_9"}
+        const members = []
+        for (let i = 0; i < 12; ++i)
+            members.push(queued("m" + (100 + i), i, Object.assign({index: i}, batch)))
+        const t = load({queue: members})
+        verify(button(row(t.panel, "m100"), "Cancel batch (12)"), "the count it knows")
+        const cancelAll = button(t.panel, "Cancel all from this app")
+        cancelAll.click()
+        answer(t.core, c => c.name === "job.cancel",
+               ok({jobs: [job("a", {status: "cancelled"}), job("b", {status: "cancelled"})]}))
+        tryVerify(() => t.panel.banner.text === "Cancelled 2 jobs.", 2000, t.panel.banner.text)
+        // A running job only begins to cancel.
+        cancelAll.click()
+        answer(t.core, c => c.name === "job.cancel",
+               ok({jobs: [job("a", {status: "cancelled"}), job("b", {substatus: "cancelling"})]}))
+        tryVerify(() => t.panel.banner.text === "Cancelling or cancelled 2 jobs.", 2000, t.panel.banner.text)
     }
 
     // A list emptied under a row still being made off the frame's path: the view cancels that row

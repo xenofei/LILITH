@@ -99,6 +99,9 @@ Rectangle {
             return "No finished job in the newest " + grouped(_historyCutAt) + " jobs."
         return "No finished jobs yet."
     }
+    // The lanes (lane -> true) with a call of theirs out, and the jobs with a retry out.
+    property var busyLanes: ({})
+    property var busyRetries: ({})
 
     readonly property bool writable: jobsModel.loaded && live.loaded
     readonly property var knownLanes: ["gpu-heavy", "cpu"]
@@ -294,22 +297,56 @@ Rectangle {
 
     function cancelAllMine() {
         callTool("job.cancel", {all_mine: true}, "Couldn't cancel this app's jobs", r => {
-            const n = ((r.structured || {}).jobs || []).length
+            const jobs = (r.structured || {}).jobs || []
+            const jobsWord = jobs.length === 1 ? "1 job." : jobs.length + " jobs."
             banner.kind = "ok"
-            banner.show(n === 1 ? "Cancelled 1 job." : "Cancelled " + n + " jobs.")
+            // A running job only begins to cancel: its row says "Cancelling" until it stops.
+            banner.show((jobs.every(j => j.status === "cancelled") ? "Cancelled " : "Cancelling or cancelled ")
+                        + jobsWord)
         })
     }
 
     function retryJob(jobId) {
-        callTool("job.retry", {job_id: jobId}, "Couldn't retry the job")
+        if (!writable || busyRetries[jobId])
+            return
+        const done = () => {
+            const busy = Object.assign({}, root.busyRetries)
+            delete busy[jobId]
+            root.busyRetries = busy
+        }
+        const busy = Object.assign({}, busyRetries)
+        busy[jobId] = true
+        busyRetries = busy
+        CoreCall.call(core, "job.retry", {job_id: jobId}, {owner: root, ok: done,
+                                                           error: e => {
+                                                               done()
+                                                               root.failed("Couldn't retry the job", e)
+                                                           }})
     }
 
+    // One call at a time for a lane: a double-click of Pause can't pause and then resume.
     function queueCall(method, params, what) {
-        if (!writable)
+        if (!writable || busyLanes[params.lane])
             return
+        const done = () => {
+            const busy = Object.assign({}, root.busyLanes)
+            delete busy[params.lane]
+            root.busyLanes = busy
+        }
+        const busy = Object.assign({}, busyLanes)
+        busy[params.lane] = true
+        busyLanes = busy
         CoreCall.appCall(core, method, params, {owner: root,
-                                                ok: state => root.applyLanes([state]),
-                                                error: e => root.failed(what, e)})
+                                                ok: state => {
+                                                    done()
+                                                    root.laneStateCame(state)
+                                                    root.applyLanes([state])
+                                                },
+                                                pending: done,
+                                                error: e => {
+                                                    done()
+                                                    root.failed(what, e)
+                                                }})
     }
 
     function pause(lane) {
@@ -406,23 +443,23 @@ Rectangle {
             root._liveReading = false
             retryLive.start()
         }
-        rawCall("jobs.list", {status: "running", limit: 100}, json => {
-            if (!gone) {
-                live.setRunning(json)
-                done()
-            }
-        }, fail)
-        const page = cursor => rawCall("jobs.list", cursor ? {order: "queue", limit: 100, cursor: cursor}
-                                                           : {order: "queue", limit: 100}, json => {
-            if (gone)
-                return
-            const next = live.addQueuePage(json)
-            if (next !== "")
-                page(next)
-            else
-                done()
-        }, fail)
-        page("")
+        // A listing, each page after the page before.
+        const list = (args, add) => {
+            const page = cursor => rawCall("jobs.list", Object.assign({limit: 100}, args, cursor ? {cursor: cursor} : {}),
+                                           json => {
+                if (gone)
+                    return
+                const next = add(json)
+                if (next !== "")
+                    page(next)
+                else
+                    done()
+            }, fail)
+            page("")
+        }
+        list({status: "running"}, json => live.addRunningPage(json))
+        list({order: "queue"}, json => live.addQueuePage(json))
+        list({status: "queued"}, json => live.addQueuedPage(json))
     }
 
     function overviewChanged() {

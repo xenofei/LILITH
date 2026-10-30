@@ -341,7 +341,7 @@ Rectangle {
                 }
                 LButton {
                     visible: root.active && (root.model.batch_size || 0) >= 2
-                    text: "Cancel batch"
+                    text: "Cancel batch (" + root.model.batch_size + ")"
                     enabled: root.panel.writable
                     onClicked: root.panel.cancelBatch(root.model.batch_id)
                 }
@@ -349,7 +349,7 @@ Rectangle {
                     visible: root.retryable
                     text: root.fixAction && root.fixAction.id === "retry_job" ? root.panel.shown(root.fixAction.label)
                                                                               : "Retry"
-                    enabled: root.panel.writable
+                    enabled: root.panel.writable && !root.panel.busyRetries[root.jobId]
                     onClicked: root.panel.retryJob(root.jobId)
                 }
                 CostChip {
