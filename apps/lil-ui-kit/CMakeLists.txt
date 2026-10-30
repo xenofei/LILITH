@@ -52,4 +52,13 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/hardware/AlertsStrip.qml
         qml/panels/hardware/HardwareFormat.js)
 
+# Task 22: the Jobs panel and the cost and time chip.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/controls/CostChip.qml
+        qml/panels/jobs/JobsPanel.qml
+        qml/panels/jobs/JobRow.qml
+        qml/panels/jobs/LaneHeader.qml
+        qml/panels/jobs/QueueControls.qml)
+
 add_subdirectory(tests)

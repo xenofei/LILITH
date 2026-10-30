@@ -124,3 +124,10 @@ set_tests_properties(bench_hardware PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 22: the Jobs panel and the cost and time chip; the panel tests make shells too, so they
+# run on the 1280 x 800 offscreen screen.
+lil_qml_test(tst_jobs_panel tst_jobs_panel.qml)
+lil_qml_test(tst_cost_chip tst_cost_chip.qml)
+set_property(TEST tst_jobs_panel APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
