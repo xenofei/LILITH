@@ -294,7 +294,9 @@ fn launches_ready() {
 }
 
 fn launch_handled(seq: u64) {
-    lock(&LAUNCHES).open.remove(&seq);
+    if lock(&LAUNCHES).open.remove(&seq).is_some() {
+        tracing::info!(seq, "the window took a forwarded launch");
+    }
 }
 
 fn release_instance() {

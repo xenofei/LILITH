@@ -35,8 +35,17 @@ void activate(QWindow *w, bool takeFocus)
         w->raise();
         if (IsIconic(hwnd))
             ShowWindow(hwnd, SW_RESTORE);
-        if (!SetForegroundWindow(hwnd))
-            qCInfo(lcActivation) << "SetForegroundWindow was refused: the taskbar button flashes";
+        // One line either way, so a launch that didn't come forward says why in the app's log:
+        // refused (the launch that asked had no foreground right to give), or taken and then
+        // lost to another process.
+        if (!SetForegroundWindow(hwnd)) {
+            DWORD frontPid = 0;
+            GetWindowThreadProcessId(GetForegroundWindow(), &frontPid);
+            qCWarning(lcActivation) << "SetForegroundWindow was refused: the taskbar button flashes;"
+                                    << "the front is held by process" << frontPid;
+        } else {
+            qCInfo(lcActivation) << "the window took the front";
+        }
         w->requestActivate();
         return;
     }

@@ -195,6 +195,62 @@ fn click(hwnd: isize) {
     raise(HWND_NOTOPMOST);
 }
 
+/// What a failed foreground check saw, with no file name in it: who holds the front (the app,
+/// this test's blocker or another process, and its window class), and the app's own log lines
+/// about the launch and its activation (their messages only).
+fn front_report(env: &TestEnv, app: u32) -> String {
+    let front = foreground_pid();
+    // SAFETY: a plain query.
+    let hwnd = unsafe { GetForegroundWindow() };
+    let mut class = [0u16; 256];
+    // SAFETY: a plain query into a local buffer.
+    let n = unsafe { GetClassNameW(hwnd, &mut class) };
+    let class = String::from_utf16_lossy(&class[..usize::try_from(n).unwrap_or(0)]);
+    let holder = if front == app {
+        "the app".to_string()
+    } else if front == std::process::id() {
+        "this test's blocker".to_string()
+    } else {
+        format!("process {front}")
+    };
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(env.env.logs_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lil-image.")
+        {
+            continue;
+        }
+        for line in std::fs::read_to_string(entry.path())
+            .unwrap_or_default()
+            .lines()
+        {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let message = v["fields"]["message"].as_str().unwrap_or_default();
+            let category = v["fields"]["qt_category"].as_str().unwrap_or_default();
+            if category == "lil.shim.activation"
+                || message.contains("launch")
+                || message.contains("pipe")
+            {
+                lines.push(format!(
+                    "{} {message}",
+                    v["timestamp"].as_str().unwrap_or("")
+                ));
+            }
+        }
+    }
+    format!(
+        "the front is held by {holder} (window class {class}); the app's launch lines: {lines:#?}"
+    )
+}
+
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     let until = Instant::now() + DEADLINE;
     while !ready() {
@@ -264,7 +320,16 @@ fn desktop_second_launch_comes_to_front() {
     let took = started.elapsed();
     assert_eq!(code, Some(0), "the second launch exits 0");
     // GetForegroundWindow is the first instance's window.
-    wait_until("the first instance in front", || foreground_pid() == a);
+    let until = Instant::now() + DEADLINE;
+    while foreground_pid() != a {
+        if Instant::now() >= until {
+            panic!(
+                "the first instance in front within {DEADLINE:?}: {}",
+                front_report(&env, a)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // SAFETY: a plain query.
     let front = unsafe { GetForegroundWindow() };
     assert_eq!(app_window(a), Some(front), "its own window is in front");
