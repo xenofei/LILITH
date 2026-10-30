@@ -42,7 +42,9 @@ Rectangle {
     // A job a restart holds has no place in the queue.
     readonly property bool restartHeld: queued && (model.queue_position === undefined || model.queue_position === null)
                                         && (model.pause_reasons || []).indexOf("restart") >= 0
-    readonly property bool movable: queued && ["waiting", "waiting_for_vram", "queue_paused"].indexOf(substatus) >= 0
+    // A restart-held job doesn't move until it is released (job.move leaves it held).
+    readonly property bool movable: queued && !restartHeld
+                                    && ["waiting", "waiting_for_vram", "queue_paused"].indexOf(substatus) >= 0
     readonly property bool retryable: (status === "failed" || status === "cancelled")
                                       && !(fixAction && fixAction.id === "show_job")
                                       && !(error && error.retry === "never")

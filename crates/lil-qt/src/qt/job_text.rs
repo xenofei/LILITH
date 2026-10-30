@@ -93,7 +93,12 @@ impl qobject::JobText {
         format::running_left(&estimate(estimate_json), elapsed_s).unwrap_or(-1.0)
     }
 
-    fn queued_eta_text(&self, running_left: f64, ahead_json: &QString, own_json: &QString) -> QString {
+    fn queued_eta_text(
+        &self,
+        running_left: f64,
+        ahead_json: &QString,
+        own_json: &QString,
+    ) -> QString {
         let ahead: Vec<Option<Estimate>> =
             serde_json::from_str(&ahead_json.to_string()).unwrap_or_default();
         let ahead: Vec<Option<Spread>> = ahead.iter().map(|e| e.as_ref().and_then(wall)).collect();

@@ -320,6 +320,10 @@ TestCase {
         verify(b.indexOf("Held after a restart") >= 0, b)
         verify(b.indexOf("held") >= 0, b)
         verify(b.indexOf("#") < 0 && b.indexOf(" 0") < 0, "a restart-held job has no place: " + b)
+        // job.move leaves a restart-held job held: it offers Cancel, not a move.
+        verify(!button(row(t.panel, "j3"), "Run next") && !button(row(t.panel, "j3"), "Run last"))
+        verify(button(row(t.panel, "j3"), "Cancel"))
+        verify(button(row(t.panel, "j2"), "Run next"), "a job your pause holds still moves")
     }
 
     function test_restart_held_jobs_show_a_resume_control_when_not_paused() { // spec: APP-114, CORE-160

@@ -44,8 +44,10 @@ Rectangle {
     readonly property string text: [panel.laneLabel(lane)].concat(lines).join("\n")
 
     implicitHeight: column.implicitHeight + 2 * Theme.spacing
-    color: Theme.surfaceRaised
+    color: Theme.bg
     radius: Theme.radius
+    border.color: Theme.surfaceRaised
+    border.width: 1
 
     Accessible.role: Accessible.Grouping
     Accessible.name: panel.laneLabel(lane) + (lines.length ? ": " + lines.join(". ") : "")

@@ -13,7 +13,7 @@
 // - **Lanes** come from that read and from the `{kind: "queue", state}` events on `jobs`, applied
 //   as full states, a burst coalesced into one header update per frame.
 // - **Outside jobs** come from `engines.status` and the `engines` topic (ComfyUI's entry).
-// - **Caps** (ruling Q-D): `caps.get` is read at load and again, throttled to once a second, on
+// - **Caps:** `caps.get` is read at load and again, throttled to once a second, on
 //   `caps` and `usage` events and when a job reaches a final status; the retry's cost chip shows
 //   the share of the monthly cap from it.
 // - **Writes** (run next or last, the cancels, retry, pause and resume) wait until the model has
@@ -533,19 +533,14 @@ Rectangle {
             spacing: Theme.spacing
             bottomPadding: Theme.spacing
 
+            // The dock's title bar names the panel; this row holds the panel-wide control.
             Item {
                 width: parent.width
-                height: cancelAll.implicitHeight
-                Text {
-                    anchors { left: parent.left; leftMargin: Theme.spacing; verticalCenter: parent.verticalCenter }
-                    text: root.title
-                    color: Theme.text
-                    font.pixelSize: Theme.fontSize + 2
-                    font.bold: true
-                }
+                height: cancelAll.visible ? cancelAll.implicitHeight : 0
                 LButton {
                     id: cancelAll
                     anchors { right: parent.right; rightMargin: Theme.spacing }
+                    visible: list.count > 0
                     text: "Cancel all mine"
                     enabled: root.writable
                     onClicked: root.cancelAllMine()
