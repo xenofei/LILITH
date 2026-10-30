@@ -1295,9 +1295,16 @@ mod tests {
             eprintln!("this PC's own share can't be reached here: case skipped");
             return;
         }
+        // Refused either way: the volume check may fail on such a path before the file is opened,
+        // or the final path says where it really is. It depends on the PC.
         let p = plan(&format!("\"{}\"", through.display()));
         assert_eq!(p.opened, None);
-        assert_eq!(p.link_refused.as_deref(), Some(LILREF_NOT_LOCAL));
+        let refused = p.link_refused.as_deref();
+        assert!(
+            refused == Some(LILREF_NOT_LOCAL)
+                || refused == Some("LILITH couldn't read this .lilref file."),
+            "{refused:?}"
+        );
     }
 
     #[test] // spec: APP-021
