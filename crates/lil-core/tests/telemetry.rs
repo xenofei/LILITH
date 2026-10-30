@@ -2334,6 +2334,36 @@ async fn energy_picks_the_finest_table_that_holds_the_range() {
     assert_eq!(hours.gpu_mj, 400_000, "from h1");
 }
 
+/// An estimate stays an estimate when its samples are gone: without the Energy Meter the CPU's
+/// energy comes from `cpu_tdp_w`, and the minute and the hourly rows say so as the samples did,
+/// while the GPU's counter stays measured (APP-131).
+#[tokio::test] // spec: APP-131, CORE-062
+async fn energy_keeps_an_estimate_marked_in_the_minute_and_hourly_rows() {
+    let hw = script(vec![gpu(100_000, 1000)], vec![sys(500)]);
+    let tdp = PowerSettings {
+        cpu_tdp_mw: Some(65_000),
+        ..PowerSettings::default()
+    };
+    let rig = Rig::with(&hw, tdp);
+    rig.run(3).await;
+    let range = (T0_MS, T0_MS + 2000);
+    let fresh = rig.telemetry.energy(range.0, range.1).await.unwrap();
+    assert!(fresh.cpu_mj > 0);
+    assert!(fresh.measured.gpu && !fresh.measured.cpu, "from s1");
+
+    rig.clock.advance(Duration::from_secs(2 * 86_400));
+    rig.run(1).await;
+    let minutes = rig.telemetry.energy(range.0, range.1).await.unwrap();
+    assert_eq!(minutes.cpu_mj, fresh.cpu_mj);
+    assert!(minutes.measured.gpu && !minutes.measured.cpu, "from m1");
+
+    rig.clock.advance(Duration::from_secs(31 * 86_400));
+    rig.run(1).await;
+    let hours = rig.telemetry.energy(range.0, range.1).await.unwrap();
+    assert_eq!(hours.cpu_mj, fresh.cpu_mj);
+    assert!(hours.measured.gpu && !hours.measured.cpu, "from h1");
+}
+
 /// An app's close untracks its pid only while the pid is still tracked as the app: an engine
 /// process that took the pid over stays tracked (M6).
 #[tokio::test] // spec: APP-127
