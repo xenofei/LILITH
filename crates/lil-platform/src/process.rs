@@ -184,6 +184,26 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     Ok(None)
 }
 
+/// The mandatory integrity level of process `pid`'s token (`0x1000` Low, `0x2000` Medium,
+/// `0x3000` High, `0x4000` System): ARCH-027's "a peer I can trust" also means one at no lower
+/// level than this process ([`own_integrity_rid`]).
+///
+/// # Errors
+/// When the process can't be opened or its token read.
+pub fn integrity_rid(pid: u32) -> io::Result<u32> {
+    let process = open_raw(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    sid::token_integrity_rid(HANDLE(process.as_raw_handle())).map_err(|(_, e)| io_error(&e))
+}
+
+/// This process's own integrity level ([`integrity_rid`]).
+///
+/// # Errors
+/// When its token can't be read.
+pub fn own_integrity_rid() -> io::Result<u32> {
+    // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid and needs no closing.
+    sid::token_integrity_rid(unsafe { GetCurrentProcess() }).map_err(|(_, e)| io_error(&e))
+}
+
 /// The SID string of the user running this process.
 pub fn current_user_sid() -> io::Result<String> {
     // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid and needs no closing.
@@ -410,14 +430,68 @@ pub fn spawn_no_activate(exe: &Path, args: &[String]) -> io::Result<u32> {
         extra_env: Vec::new(),
         remove_env: Vec::new(),
     };
+    let line = command_line(req.exe.as_os_str(), &req.args)?;
+    spawn_no_activate_line(&req, &line)
+}
+
+/// [`spawn_no_activate`] with the command line `"<exe>" <arg> …` of
+/// [`verbatim_command_line`], for a program that reads its raw command line by a grammar of its
+/// own, as the apps do (P4a-R3): the Windows quoting rules would double a quoted argument's
+/// trailing backslash, which such a program keeps.
+///
+/// # Errors
+/// As [`spawn_no_activate`], and when an argument holds a `"` or a NUL.
+pub fn spawn_no_activate_verbatim(exe: &Path, args: &[String]) -> io::Result<u32> {
+    let req = SpawnRequest {
+        exe: exe.to_path_buf(),
+        args: Vec::new(),
+        extra_env: Vec::new(),
+        remove_env: Vec::new(),
+    };
+    let mut line: Vec<u16> = verbatim_command_line(exe, args)?.encode_utf16().collect();
+    line.push(0);
+    spawn_no_activate_line(&req, &line)
+}
+
+fn spawn_no_activate_line(req: &SpawnRequest, line: &[u16]) -> io::Result<u32> {
     let show = NO_ACTIVATE_SHOW;
-    let handle = match create_process(&req, DETACHED_FLAGS | BREAKAWAY, show) {
+    let handle = match create_process_line(req, line.to_vec(), DETACHED_FLAGS | BREAKAWAY, show) {
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => {
-            create_process(&req, DETACHED_FLAGS, show)
+            create_process_line(req, line.to_vec(), DETACHED_FLAGS, show)
         }
         other => other,
     }?;
     Ok(handle.pid())
+}
+
+/// `"<exe>" <arg> …`: the exe quoted, and each argument as it is, quoted only when it is empty
+/// or holds a space or a tab, nothing escaped. This is the apps' own grammar (P4a-R3), where a
+/// switch is never quoted and the one link or file may be.
+///
+/// # Errors
+/// When the exe or an argument holds a `"` or a NUL, which this form can't carry.
+pub fn verbatim_command_line(exe: &Path, args: &[String]) -> io::Result<String> {
+    let exe = exe.to_string_lossy();
+    let mut line = String::new();
+    for (i, part) in std::iter::once(exe.as_ref())
+        .chain(args.iter().map(String::as_str))
+        .enumerate()
+    {
+        if part.contains(['"', '\0']) {
+            return Err(invalid_input("a verbatim argument holds a quote or a NUL"));
+        }
+        if i > 0 {
+            line.push(' ');
+        }
+        if i == 0 || part.is_empty() || part.contains([' ', '\t']) {
+            line.push('"');
+            line.push_str(part);
+            line.push('"');
+        } else {
+            line.push_str(part);
+        }
+    }
+    Ok(line)
 }
 
 /// The show command [`spawn_no_activate`] starts a program with.
@@ -441,8 +515,18 @@ fn startup_info(show: Option<u16>) -> STARTUPINFOW {
 /// `CreateProcessW` as [`SystemSpawner`] documents it; with `show`, the child's first
 /// `ShowWindow` uses that command (`STARTF_USESHOWWINDOW`).
 fn create_process(req: &SpawnRequest, flags: u32, show: Option<u16>) -> io::Result<ProcessHandle> {
+    let line = command_line(req.exe.as_os_str(), &req.args)?;
+    create_process_line(req, line, flags, show)
+}
+
+/// [`create_process`] with a NUL-terminated command line of the caller's.
+fn create_process_line(
+    req: &SpawnRequest,
+    mut command_line: Vec<u16>,
+    flags: u32,
+    show: Option<u16>,
+) -> io::Result<ProcessHandle> {
     let application = wide_nul(req.exe.as_os_str(), "the exe path")?;
-    let mut command_line = command_line(req.exe.as_os_str(), &req.args)?;
     let environment = environment_block(current_environment()?, &req.extra_env, &req.remove_env)?;
     let directory = match req.exe.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => {
@@ -970,6 +1054,30 @@ mod tests {
         let mut wide = command_line(OsStr::new(exe), &args).unwrap();
         assert_eq!(wide.pop(), Some(0));
         String::from_utf16(&wide).unwrap()
+    }
+
+    /// Read-only: queries this process's token.
+    #[test] // spec: ARCH-027
+    fn this_process_reads_its_own_integrity_level() {
+        let own = own_integrity_rid().unwrap();
+        // Medium (0x2000) to System (0x4000): a test runs at Medium or above.
+        assert!((0x2000..=0x4000).contains(&own), "{own:#x}");
+        assert_eq!(integrity_rid(std::process::id()).unwrap(), own);
+        assert!(integrity_rid(u32::MAX - 3).is_err());
+    }
+
+    #[test] // spec: ARCH-019
+    fn a_verbatim_command_line_keeps_each_argument_as_it_is() {
+        assert_eq!(
+            verbatim_command_line(
+                Path::new(r"C:\a b\lil-image.exe"),
+                &["--no-activate".into(), r"C:\My Art\".into()]
+            )
+            .unwrap(),
+            r#""C:\a b\lil-image.exe" --no-activate "C:\My Art\""#
+        );
+        assert!(verbatim_command_line(Path::new(r"C:\a.exe"), &[r#"a"b"#.into()]).is_err());
+        assert!(verbatim_command_line(Path::new(r"C:\a.exe"), &["a\0b".into()]).is_err());
     }
 
     #[test] // spec: ARCH-019

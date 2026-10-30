@@ -2,7 +2,10 @@
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_DATA, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+use windows::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use windows::core::PWSTR;
@@ -79,6 +82,51 @@ pub(crate) fn token_user_sid(
         });
         let _ = LocalFree(Some(HLOCAL(pwstr.as_ptr().cast())));
         sid
+    }
+}
+
+/// The mandatory integrity level of the token of `process` (open with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`): the last sub-authority of its label SID, such as
+/// `0x1000` (Low), `0x2000` (Medium) or `0x3000` (High). On failure, the name of the call that
+/// failed.
+pub(crate) fn token_integrity_rid(
+    process: HANDLE,
+) -> Result<u32, (&'static str, windows::core::Error)> {
+    // SAFETY: as `token_user_sid`: every pointer is valid for its call, `buf` is 8-byte
+    // aligned and sized by the first call, and the label SID lives in `buf` while it is read.
+    unsafe {
+        let mut handle = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut handle).map_err(|e| ("OpenProcessToken", e))?;
+        let token = Token(handle);
+        let mut needed = 0u32;
+        let first = GetTokenInformation(token.0, TokenIntegrityLevel, None, 0, &mut needed);
+        if needed == 0 {
+            return Err((
+                "GetTokenInformation",
+                first
+                    .err()
+                    .unwrap_or_else(windows::core::Error::from_thread),
+            ));
+        }
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        GetTokenInformation(
+            token.0,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .map_err(|e| ("GetTokenInformation", e))?;
+        let label = &*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
+        let sid = label.Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return Err((
+                "GetSidSubAuthorityCount",
+                windows::core::Error::new(ERROR_INVALID_DATA.to_hresult(), "no sub-authority"),
+            ));
+        }
+        Ok(*GetSidSubAuthority(sid, u32::from(count) - 1))
     }
 }
 
