@@ -19,9 +19,10 @@
 //!   the cap is in the estimate's currency.
 //! - [`parse_utc_ms`]: the core's RFC 3339 times as Unix milliseconds.
 //!
-//! Money shows as the panels show it (owner decision): to the cent, thousands separated, with
-//! its currency code ("1,234.57 USD"); a non-zero amount under one cent reads "< 0.01 USD". The
-//! cap share reads only the `monthly` cap: plan 6b, which brings prices, adds the others.
+//! Money shows as every panel shows it, through [`crate::money::money_text`] (APP-120): to its
+//! currency's minor unit, thousands separated, with its code ("1,234.57 USD", "120 JPY"); a
+//! non-zero amount below one minor unit reads "< 0.01 USD". The cap share reads only the
+//! `monthly` cap: plan 6b, which brings prices, adds the others.
 
 use lil_protocol::app::CapsView;
 use lil_protocol::estimate::{Estimate, MoneyPart, Spread, sum_part};
@@ -285,34 +286,16 @@ fn share_text(permille: u32) -> String {
     }
 }
 
-/// "≈ 0.04 USD", "≈ 1,234.57 EUR"; a non-zero amount under one cent, "< 0.01 USD".
+/// "≈ 0.04 USD", "≈ 1,234.57 EUR", "≈ 120 JPY": the p50 through the shared
+/// [`crate::money::money_text`]; an amount below one minor unit is "< 0.01 USD", without "≈".
 fn money_text(m: &MoneyPart) -> Option<String> {
-    let amount = m.spread()?.p50();
-    if amount > 0.0 && amount < 0.01 {
-        return Some(format!("< 0.01 {}", m.currency));
-    }
-    Some(format!("≈ {}", money_amount(amount, &m.currency)))
-}
-
-// TODO(controller): switch to the shared money_text when Task 24 merges.
-/// An amount as the panels show money (owner decision): to the cent, the whole part in groups
-/// of three separated by commas, then the currency code: "1,234.57 USD".
-fn money_amount(amount: f64, currency: &str) -> String {
-    let fixed = format!("{:.2}", amount.abs());
-    let (whole, cents) = fixed.split_once('.').unwrap_or((&fixed, "00"));
-    let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
-    for (i, digit) in whole.chars().enumerate() {
-        if i > 0 && (whole.len() - i) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    let sign = if amount < 0.0 && fixed != "0.00" {
-        "-"
+    m.spread()?;
+    let text = crate::money::money_text(&m.p50, &m.currency);
+    if text.starts_with('<') || text.starts_with('>') {
+        Some(text)
     } else {
-        ""
-    };
-    format!("{sign}{grouped}.{cents} {currency}")
+        Some(format!("≈ {text}"))
+    }
 }
 
 #[cfg(test)]
@@ -433,7 +416,21 @@ mod tests {
             money: Some(money("120", "JPY")),
             ..Estimate::default()
         };
-        assert_eq!(chip_text(&yen, None), "≈ 120.00 JPY");
+        assert_eq!(chip_text(&yen, None), "≈ 120 JPY", "yen has no minor unit");
+        let half = Estimate {
+            money: Some(money("0.125", "USD")),
+            ..Estimate::default()
+        };
+        assert_eq!(
+            chip_text(&half, None),
+            "≈ 0.13 USD",
+            "half up on the decimal"
+        );
+        let half_cent = Estimate {
+            money: Some(money("0.005", "USD")),
+            ..Estimate::default()
+        };
+        assert_eq!(chip_text(&half_cent, None), "< 0.01 USD");
         // Both parts, local first.
         let both = Estimate {
             local: Some(local(("8.0", "9.0"), ("2.000", "2.500"))),
