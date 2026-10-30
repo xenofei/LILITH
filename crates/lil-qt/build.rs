@@ -15,5 +15,6 @@ fn main() {
         .file("src/qt/money_text.rs")
         .file("src/qt/hardware.rs")
         .file("src/qt/job_text.rs")
+        .file("src/qt/live_jobs_model.rs")
         .build();
 }

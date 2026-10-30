@@ -11,11 +11,16 @@
 //!   below 0 ("about 12 s left", "under 1 s left"), or "—" with no `wall_s`.
 //! - [`queued_eta_text`]: a queued job's finish (Appendix G "Adding estimates"): the running
 //!   job's time left, plus the `wall_s` of each job ahead in lane order, plus its own, summed by
-//!   [`sum_part`]; jobs among them with no `wall_s` are counted and named ("about 3 min, after 2
-//!   jobs with no estimate"), never taken as 0, and nothing estimated reads as not estimated.
+//!   [`sum_part`]; jobs ahead with no `wall_s` are counted and named ("about 3 min, after 2
+//!   jobs with no estimate"), a job's own missing one is said as such ("plus its own time (no
+//!   estimate)"), never taken as 0, and nothing estimated reads as not estimated.
 //! - [`elapsed_text`]: how long a job has run ("12 s", "3 min 4 s", "1 h 2 min").
 //! - [`cap_share_permille`]: the share of the `monthly` cap an estimate's `money` p50 is, when
 //!   the cap is in the estimate's currency.
+//! - [`parse_utc_ms`]: the core's RFC 3339 times as Unix milliseconds.
+//!
+//! Money shows two decimals, none for a currency without minor units (JPY and the like). The
+//! cap share reads only the `monthly` cap: plan 6b, which brings prices, adds the others.
 
 use lil_protocol::app::CapsView;
 use lil_protocol::estimate::{Estimate, MoneyPart, Spread, sum_part};
@@ -82,28 +87,45 @@ pub fn queued_eta_text(
     ahead: &[Option<&Spread>],
     own: Option<&Spread>,
 ) -> String {
-    if ahead.is_empty() && running_left.is_none() && own.is_none() {
+    let running = running_left.filter(|s| s.is_finite()).map(|s| s.max(0.0));
+    if ahead.is_empty() && running.is_none() && own.is_none() {
         return NO_ESTIMATE.to_string();
     }
-    let mut jobs: Vec<Option<&Spread>> = ahead.to_vec();
-    jobs.push(own);
-    let sum = sum_part(&jobs);
-    let running = running_left.filter(|s| s.is_finite()).map(|s| s.max(0.0));
-    let unestimated = match sum.not_estimated {
+    let sum = sum_part(ahead);
+    let known = running.is_some() || sum.total.is_some() || own.is_some();
+    let total =
+        running.unwrap_or(0.0) + sum.total.map_or(0.0, |t| t.p50()) + own.map_or(0.0, Spread::p50);
+    let mut text = String::new();
+    if known {
+        text = if total < 0.5 {
+            "under 1 s".to_string()
+        } else {
+            format!("about {}", duration(total))
+        };
+    }
+    let ahead_missing = match sum.not_estimated {
         0 => None,
         1 => Some("after 1 job with no estimate".to_string()),
         n => Some(format!("after {n} jobs with no estimate")),
     };
-    let known = match (sum.total, running) {
-        (None, None) => None,
-        (total, running) => Some(total.map_or(0.0, |t| t.p50()) + running.unwrap_or(0.0)),
-    };
-    match (known, unestimated) {
-        (Some(t), None) => format!("about {}", duration(t)),
-        (Some(t), Some(rest)) => format!("about {}, {rest}", duration(t)),
-        (None, Some(rest)) => rest,
-        (None, None) => NO_ESTIMATE.to_string(),
+    if let Some(missing) = ahead_missing {
+        if !text.is_empty() {
+            text.push_str(", ");
+        }
+        text.push_str(&missing);
     }
+    if own.is_none() {
+        // Its own time, not a job ahead: said as such.
+        text.push_str(if sum.not_estimated > 0 {
+            ", plus"
+        } else if text.is_empty() {
+            "plus"
+        } else {
+            " plus"
+        });
+        text.push_str(" its own time (no estimate)");
+    }
+    text
 }
 
 /// How long a job has run (module docs); a negative or non-finite time reads "0 s".
@@ -139,6 +161,70 @@ pub fn cap_share_permille(e: &Estimate, caps: &CapsView) -> Option<u32> {
     }
     let permille = (p50 / limit * 1000.0).round();
     (permille.is_finite() && permille >= 0.0).then(|| permille.min(f64::from(u32::MAX)) as u32)
+}
+
+/// An RFC 3339 time (`YYYY-MM-DDTHH:MM:SS`, an optional fraction, then `Z` or `±HH:MM`) as
+/// Unix milliseconds; `None` when it doesn't read.
+pub fn parse_utc_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't') {
+        return None;
+    }
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let part = s.get(from..to)?;
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut rest = &s[19..];
+    let mut ms = 0_i64;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let shown: String = frac[..digits]
+            .chars()
+            .chain("000".chars())
+            .take(3)
+            .collect();
+        ms = shown.parse().ok()?;
+        rest = &frac[digits..];
+    }
+    let offset_min = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let o = rest.get(1..)?;
+            if o.len() != 5 || o.as_bytes()[2] != b':' {
+                return None;
+            }
+            let (oh, om): (i64, i64) = (o[..2].parse().ok()?, o[3..].parse().ok()?);
+            sign * (oh * 60 + om)
+        }
+    };
+    // Days since 1970-01-01 (Hinnant's days_from_civil).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset_min * 60;
+    Some(secs * 1000 + ms)
 }
 
 /// Whole seconds, minutes, or hours and minutes.
@@ -190,16 +276,23 @@ fn money_text(m: &MoneyPart) -> Option<String> {
         "USD" => Some("$"),
         "EUR" => Some("€"),
         "GBP" => Some("£"),
+        "JPY" => Some("¥"),
         _ => None,
     };
-    let (shown, prefix) = if amount > 0.0 && amount < 0.005 {
-        (0.01, "< ")
+    // Currencies without minor units (ISO 4217 exponent 0) show whole amounts.
+    let decimals = match m.currency.as_str() {
+        "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "UGX" | "PYG" => 0,
+        _ => 2,
+    };
+    let least = if decimals == 0 { 1.0 } else { 0.01 };
+    let (shown, prefix) = if amount > 0.0 && amount < least / 2.0 {
+        (least, "< ")
     } else {
         (amount, "≈ ")
     };
     Some(match symbol {
-        Some(sym) => format!("{prefix}{sym}{shown:.2}"),
-        None => format!("{prefix}{shown:.2} {}", m.currency),
+        Some(sym) => format!("{prefix}{sym}{shown:.decimals$}"),
+        None => format!("{prefix}{shown:.decimals$} {}", m.currency),
     })
 }
 
@@ -302,6 +395,12 @@ mod tests {
             ..Estimate::default()
         };
         assert_eq!(chip_text(&chf, None), "< 0.01 CHF");
+        // A currency without minor units shows none.
+        let yen = Estimate {
+            money: Some(money("120", "JPY")),
+            ..Estimate::default()
+        };
+        assert_eq!(chip_text(&yen, None), "≈ ¥120");
         // Both parts, local first.
         let both = Estimate {
             local: Some(local(("8.0", "9.0"), ("2.000", "2.500"))),
@@ -416,16 +515,59 @@ mod tests {
             queued_eta_text(None, &[None, Some(&a)], Some(&own)),
             "about 1 min, after 1 job with no estimate"
         );
+        // Its own time not estimated: said as its own, not as a job ahead.
+        assert_eq!(
+            queued_eta_text(Some(10.0), &[Some(&a)], None),
+            "about 1 min plus its own time (no estimate)"
+        );
+        assert_eq!(
+            queued_eta_text(Some(10.0), &[Some(&a), None], None),
+            "about 1 min, after 1 job with no estimate, plus its own time (no estimate)"
+        );
         // Nothing estimated: not estimated, never 0.
         assert_eq!(
             queued_eta_text(None, &[None, None], None),
-            "after 3 jobs with no estimate"
+            "after 2 jobs with no estimate, plus its own time (no estimate)"
         );
         assert_eq!(queued_eta_text(None, &[], None), NO_ESTIMATE);
         // First in line, nothing running.
         assert_eq!(queued_eta_text(None, &[], Some(&own)), "about 20 s");
-        // A running job past its estimate adds 0, never less.
+        // A running job past its estimate adds 0, never less, and a sum of 0 is "under 1 s".
         assert_eq!(queued_eta_text(Some(0.0), &[], Some(&own)), "about 20 s");
+        assert_eq!(
+            queued_eta_text(Some(0.0), &[], None),
+            "under 1 s plus its own time (no estimate)"
+        );
+    }
+
+    #[test] // spec: APP-114
+    fn eta_reads_the_core_s_times() {
+        assert_eq!(parse_utc_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_utc_ms("2026-10-29T02:00:05Z"),
+            Some(1_793_239_205_000)
+        );
+        assert_eq!(
+            parse_utc_ms("2026-10-29T02:00:05.250Z"),
+            Some(1_793_239_205_250)
+        );
+        assert_eq!(
+            parse_utc_ms("2026-10-29T04:00:05+02:00"),
+            Some(1_793_239_205_000)
+        );
+        assert_eq!(
+            parse_utc_ms("2028-02-29T00:00:00Z"),
+            Some(1_835_395_200_000)
+        );
+        for bad in [
+            "",
+            "2026-10-29",
+            "2026-13-01T00:00:00Z",
+            "2026-10-29T02:00:05",
+            "x",
+        ] {
+            assert_eq!(parse_utc_ms(bad), None, "{bad}");
+        }
     }
 
     #[test] // spec: APP-114

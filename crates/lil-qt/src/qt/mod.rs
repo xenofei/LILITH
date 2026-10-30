@@ -15,6 +15,7 @@ pub mod hardware;
 pub mod job_text;
 pub mod json_list_model;
 pub mod layout;
+pub mod live_jobs_model;
 pub mod money_text;
 pub mod preview_feed;
 pub mod runtime;
