@@ -2376,7 +2376,8 @@ impl Shared {
 
     /// `JobCtx::settle_withdrawn`: the prompt a pause withdrew is known gone (`follow` is
     /// `None`) or is still the job's (`follow` names it, and it becomes the engine id again);
-    /// either way `withdrawn_id` is cleared (CORE-160, CORE-120).
+    /// either way `withdrawn_id` is cleared (CORE-160, CORE-120). A retry's summary is
+    /// published then, since its `waiting_for_earlier_prompt` has changed.
     pub(crate) async fn handler_settle_withdrawn(
         &self,
         id: &JobId,
@@ -2388,7 +2389,13 @@ impl Shared {
             withdrawn_id: Some(None),
             ..Change::default()
         };
-        self.handler_row(id, c, trace_id).await
+        let (scope, row) = self.handler_row_of(id, c, trace_id).await?;
+        // A retry no longer waits for the prompt it inherited: its summary says so at once
+        // (`waiting_for_earlier_prompt`, Appendix G "Withdrawal"), not at its next state change.
+        if row.retry_of.is_some() {
+            self.announce_live(id.as_str(), &scope).await;
+        }
+        Ok(())
     }
 
     /// `JobCtx::set_external_id`: a guarded update of the running job's row (never a final
@@ -2409,6 +2416,16 @@ impl Shared {
     /// A guarded update of the running job's row (never a final one) by its handler, without
     /// an announcement.
     async fn handler_row(&self, id: &JobId, c: Change, trace_id: &str) -> Result<(), ErrorBody> {
+        self.handler_row_of(id, c, trace_id).await.map(|_| ())
+    }
+
+    /// [`Shared::handler_row`], giving back the job's scope and its row after the change.
+    async fn handler_row_of(
+        &self,
+        id: &JobId,
+        c: Change,
+        trace_id: &str,
+    ) -> Result<(Scope, JobRow), ErrorBody> {
         let scope = {
             let q = self.queue();
             match q.jobs.get(id.as_str()) {
@@ -2419,7 +2436,7 @@ impl Shared {
         let lock = self.job_lock(id.as_str());
         let _serial = lock.lock().await;
         match record::update(scope.db(), id.as_str(), c, self.now()).await {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some((_, row))) => Ok((scope, row)),
             Ok(None) => Err(job_unknown(id.as_str(), trace_id)),
             Err(e) => Err(state_unavailable(&e, trace_id)),
         }

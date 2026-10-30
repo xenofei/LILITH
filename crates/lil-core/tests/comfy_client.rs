@@ -2912,9 +2912,31 @@ async fn a_retry_waits_for_the_withdrawn_prompt_of_the_job_it_retries() {
         "its summary says what it waits for"
     );
     assert_eq!(posted(&fake).len(), 1, "only the old prompt");
+    let (tx, mut rx) = mpsc::channel(256);
+    rig.events.attach(7, tx);
+    rig.events
+        .subscribe(7, &[format!("job:{retry}")], &BTreeMap::new())
+        .await;
     fake.hold_prompts(false);
     fake.release(&old);
     let done = rig.done(&retry).await;
+    // The flag cleared when the old prompt went, while the retry was still submitting: its
+    // summary was published then, not first at its next state change.
+    let mut cleared_while_submitting = false;
+    while let Ok(line) = rx.try_recv() {
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let job = &v["params"]["data"]["job"];
+        if v["params"]["data"]["kind"] == "status"
+            && job["substatus"] == "submitting"
+            && job.get("waiting_for_earlier_prompt").is_none()
+        {
+            cleared_while_submitting = true;
+        }
+    }
+    assert!(
+        cleared_while_submitting,
+        "a submitting summary without the flag was published"
+    );
     assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
     assert_eq!(done.attempt, 1, "the wait used no retry");
     assert!(!done.waiting_for_earlier_prompt);
