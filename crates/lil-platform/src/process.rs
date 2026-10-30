@@ -109,25 +109,22 @@ impl ProcessInspector for SystemInspector {
 
     fn started(&self, pid: u32) -> io::Result<u64> {
         let process = open_raw(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
-        let (mut created, mut exited, mut kernel, mut user) = (
-            FILETIME::default(),
-            FILETIME::default(),
-            FILETIME::default(),
-            FILETIME::default(),
-        );
-        // SAFETY: the handle is open for the call, and the four out-pointers are valid locals.
-        unsafe {
-            GetProcessTimes(
-                HANDLE(process.as_raw_handle()),
-                &mut created,
-                &mut exited,
-                &mut kernel,
-                &mut user,
-            )
-        }
-        .map_err(|e| io_error(&e))?;
-        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+        creation_time(HANDLE(process.as_raw_handle()))
     }
+}
+
+/// When `process` was created, in 100 ns ticks since 1601 (a `FILETIME`).
+fn creation_time(process: HANDLE) -> io::Result<u64> {
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    // SAFETY: the handle is open for the call, and the four out-pointers are valid locals.
+    unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
+        .map_err(|e| io_error(&e))?;
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 /// `OpenProcess`, with a vanished process (`ERROR_INVALID_PARAMETER`) as `NotFound`.
@@ -192,10 +189,12 @@ pub use crate::sid::TokenTrust;
 pub struct PeerInfo {
     pub process: ProcessInfo,
     pub token: TokenTrust,
+    /// When it was created, in 100 ns ticks since 1601 (a `FILETIME`).
+    pub started: u64,
 }
 
-/// [`PeerInfo`] of process `pid`: its image path, token user, integrity level and restriction,
-/// through one `OpenProcess`.
+/// [`PeerInfo`] of process `pid`: its image path, token user, integrity level, restriction and
+/// creation time, through one `OpenProcess`.
 ///
 /// # Errors
 /// When the process can't be opened or its image or token read.
@@ -205,6 +204,7 @@ pub fn inspect_peer(pid: u32) -> io::Result<PeerInfo> {
     let image = image_path(raw)?;
     let user_sid = sid::token_user_sid(raw).map_err(|(_, e)| io_error(&e))?;
     let token = sid::token_trust(raw).map_err(|(_, e)| io_error(&e))?;
+    let started = creation_time(raw)?;
     let parent_pid = parent_pid(pid)?;
     Ok(PeerInfo {
         process: ProcessInfo {
@@ -214,6 +214,7 @@ pub fn inspect_peer(pid: u32) -> io::Result<PeerInfo> {
             parent_pid,
         },
         token,
+        started,
     })
 }
 
@@ -244,6 +245,15 @@ pub fn own_token_trust() -> io::Result<TokenTrust> {
 /// When its token can't be read.
 pub fn own_integrity_rid() -> io::Result<u32> {
     own_token_trust().map(|t| t.integrity)
+}
+
+/// When this process was created, in 100 ns ticks since 1601 (a `FILETIME`).
+///
+/// # Errors
+/// When its times can't be read.
+pub fn own_start_time() -> io::Result<u64> {
+    // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid and needs no closing.
+    creation_time(unsafe { GetCurrentProcess() })
 }
 
 /// The SID string of the user running this process.
@@ -1110,6 +1120,7 @@ mod tests {
         assert_eq!(me.token.integrity, own);
         assert!(!me.token.restricted && !me.token.app_container);
         assert_eq!(me.process.image, std::env::current_exe().unwrap());
+        assert_eq!(me.started, own_start_time().unwrap(), "through its handle");
         assert!(inspect_peer(u32::MAX - 3).is_err());
     }
 

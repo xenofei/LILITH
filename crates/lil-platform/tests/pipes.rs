@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use lil_platform::pipe::{
-    ConnectError, CreateError, client_pid, create_instance, instance_dacl, instance_dacl_sids,
-    open_client, pipe_sddl, server_pid,
+    ConnectError, CreateError, ProofEvent, client_pid, create_instance, instance_dacl,
+    instance_dacl_sids, open_client, pipe_sddl, server_pid, set_proof_event,
 };
 use lil_platform::process::{ProcessInspector, SystemInspector, current_user_sid};
 use lil_platform::sockets::{SocketKind, sockets_of};
@@ -133,4 +133,28 @@ fn sockets_of_reports_a_loopback_listener() {
     let theirs = sockets_of(child.id()).unwrap();
     child.wait().unwrap();
     assert!(theirs.is_empty(), "{theirs:?}");
+}
+
+#[test] // spec: ARCH-027, APP-013
+fn a_proof_event_is_set_only_through_its_own_name() {
+    let proof = ProofEvent::new().unwrap();
+    assert!(!proof.is_set(), "a fresh event isn't set");
+    assert_ne!(proof.name(), ProofEvent::new().unwrap().name());
+    assert!(proof.name().starts_with(r"Local\"), "{}", proof.name());
+    // Only a name of the proof's own shape is opened, so a client can't have another event set.
+    let hex = proof.name().rsplit('-').next().unwrap().to_string();
+    for other in [
+        String::new(),
+        r"Local\other".to_string(),
+        format!(r"Global\lil-launch-proof-{hex}"),
+        proof.name().to_uppercase(),
+        format!("{}0", proof.name()),
+    ] {
+        assert!(set_proof_event(&other).is_err(), "{other}");
+    }
+    assert!(!proof.is_set());
+    // A proof's shape that names no event.
+    assert!(set_proof_event(&format!(r"Local\lil-launch-proof-{}", "0".repeat(32))).is_err());
+    set_proof_event(proof.name()).unwrap();
+    assert!(proof.is_set());
 }
