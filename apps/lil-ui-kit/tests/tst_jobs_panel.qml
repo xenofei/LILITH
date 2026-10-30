@@ -629,6 +629,33 @@ TestCase {
         compare(callsOf(t.core, c => c.name === "job.move").length, 0)
     }
 
+    // --- A read and a newer queue event (audit finding 7c). ---
+
+    function test_a_read_never_undoes_a_newer_queue_event() { // spec: APP-114, CORE-160
+        const q = []
+        for (let i = 0; i < 150; ++i)
+            q.push(queued("q" + (1000 + i), i))
+        const t = load({queue: q})
+        const header = t.panel.laneHeader("gpu-heavy")
+        t.core.emit("jobs", "event", {kind: "job", job: queued("q1000", 0, {updated: iso()})})
+        // A read begins; its first page has the lane as it was...
+        tryVerify(() => openCalls(t.core, isQueueRead).length > 0, 2000, "the read")
+        answer(t.core, isQueueRead, t.core.jobsListAnswer({order: "queue", limit: 100}, q, [lane()]), "page 1")
+        // ...the lane is paused before the read ends...
+        t.core.emit("jobs", "event", {kind: "queue", state: lane({paused: true, reasons: ["manual"]})})
+        tryVerify(() => header.text.indexOf("Paused by you") >= 0, 2000, header.text)
+        answer(t.core, isQueueRead, t.core.jobsListAnswer({order: "queue", limit: 100, cursor: "c100"}, q, [lane()]), "page 2")
+        answerListing(t.core, isRunningRead, [], [lane()], "running")
+        answerListing(t.core, isQueuedRead, q, [lane()], "queued")
+        wait(100)
+        // ...and stays paused.
+        verify(header.text.indexOf("Paused by you") >= 0, "the read's older lane didn't undo it: " + header.text)
+        // The next read began after that event: its lanes count.
+        t.core.emit("jobs", "event", {kind: "job", job: queued("q1000", 0, {updated: iso()})})
+        answerLive(t.core, [], q, [lane({paused: true, reasons: ["fullscreen"]})])
+        tryVerify(() => header.text.indexOf("Paused while fullscreen") >= 0, 2000, header.text)
+    }
+
     // A list emptied under a row still being made off the frame's path: the view cancels that row
     // by an index past the list's end, and Qt warns.
     function test_a_list_emptied_under_a_row_being_made_warns_nothing() { // spec: APP-114, APP-139

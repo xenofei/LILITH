@@ -23,11 +23,17 @@
 //   cap says how many queued jobs it shows.
 //
 // Each row is a JobRow. The lanes come from the read and from the `{kind: "queue", state}` events
-// on `jobs`, applied as full states, at most one header update per frame. Outside jobs come from
-// `engines.status` and the `engines` topic. `caps.get` is read at load and again, at most once a
-// second, on `caps` and `usage` events and when a job ends, for the retry's cost chip. Writes
-// wait until both lists have loaded, and refusals show in the banner. A snapshot or a
-// `resync_required` of `jobs` reads everything again; `ready` never does.
+// on `jobs`, applied as full states, at most one header update per frame; a read's lanes don't undo
+// a state of that lane that came after the read began. Outside jobs come from `engines.status` and
+// the `engines` topic. `caps.get` is read at load and again, at most once a second, on `caps` and
+// `usage` events and when a job ends, for the retry's cost chip. Writes wait until both lists have
+// loaded, and refusals show in the banner; Pause, Resume and Retry also wait for their own call,
+// so a double-click can't undo itself. A snapshot or a `resync_required` of `jobs` reads everything
+// again; `ready` never does.
+//
+// Everything from outside (messages, hints, fix labels, kinds, origins, classes, lanes, statuses,
+// substatuses, phases, reasons) is shown through Core.shownText (P4a-R8), and every Text is plain,
+// so markup shows as written and an <img> in it loads nothing (AI-222).
 //
 // Ctrl+Shift+P is the top bar's (Task 20): the panel's Pause calls the same `app/queue.*`.
 //
@@ -96,6 +102,8 @@ Rectangle {
     property var _pendingLanes: ({})
     // The `jobs` events' jobs waiting for this frame's pass.
     property var _pendingJobs: []
+    // The lanes with a state newer than the read that is out.
+    property var _newerLanes: ({})
     property bool _liveReading: false
     property bool _liveAgain: false
     // The read asked for again must carry nothing over (a snapshot or a resync came).
@@ -311,10 +319,17 @@ Rectangle {
         laneUpdates++
     }
 
+    // A state of a lane that the read now out may be older than.
+    function laneStateCame(state) {
+        if (_liveReading && state && state.lane)
+            _newerLanes[state.lane] = true
+    }
+
     // A `{kind: "queue", state}` event: at most one header update per frame.
     function queueEvent(state) {
         if (!state || !state.lane)
             return
+        laneStateCame(state)
         const pending = Object.assign({}, _pendingLanes)
         pending[state.lane] = state
         _pendingLanes = pending
@@ -346,6 +361,7 @@ Rectangle {
         }
         applyPendingJobs()
         _liveReading = true
+        _newerLanes = {}
         live.beginRead(!!fresh)
         let open = 3
         let gone = false
@@ -355,7 +371,8 @@ Rectangle {
             live.commit(Date.now())
             root._liveReading = false
             root.overviewChanged()
-            root.applyLanes(JSON.parse(live.lanesJson()))
+            const newer = root._newerLanes
+            root.applyLanes(JSON.parse(live.lanesJson()).filter(s => !newer[s.lane]))
             if (root._liveAgain) {
                 const again = root._liveFreshAgain
                 root._liveAgain = false
