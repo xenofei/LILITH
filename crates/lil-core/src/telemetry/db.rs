@@ -4,7 +4,9 @@
 //! - **Tables.** `s1` is one row per sample (1 s apart; 24 h kept), `m1` and `h1` are the
 //!   1-minute rows (30 days) and the hourly rows (forever): per metric the count, minimum,
 //!   maximum and sum of the samples in the bucket, upserted as each sample is written, so the
-//!   rolled-up rows are always current and the energy sums stay exact. `proc_s1` holds the
+//!   rolled-up rows are always current and the energy sums stay exact. Two more rows per bucket,
+//!   [`GPU_ENERGY_ESTIMATED`] and [`CPU_ENERGY_ESTIMATED`], count the samples whose energy figure
+//!   was estimated, so a rolled-up range still knows it isn't measured. `proc_s1` holds the
 //!   per-process figures of the processes that matter (tracked ones and any using the GPU),
 //!   24 h. `job_energy` holds the per-job rows `meter` writes when a job completes, and
 //!   `job_stats` (version 2) the history of each succeeded job with an estimate key, which the
@@ -86,6 +88,12 @@ pub(crate) const EST_GPU_POWER: i64 = 1;
 pub(crate) const EST_GPU_ENERGY: i64 = 2;
 pub(crate) const EST_CPU_POWER: i64 = 4;
 pub(crate) const EST_CPU_ENERGY: i64 = 8;
+
+/// The rolled-up marks: rows of `m1` and `h1`, beside the metrics', whose `n` counts the samples
+/// of the bucket with that energy figure estimated. No row means none was. They are not series
+/// metrics, so `telemetry.series` never shows them.
+const GPU_ENERGY_ESTIMATED: &str = "gpu.energy.estimated";
+const CPU_ENERGY_ESTIMATED: &str = "cpu.energy.estimated";
 
 /// The series metrics (Appendix F).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,6 +521,14 @@ impl Db {
                         upsert.execute(params![bucket, m.name(), v])?;
                     }
                 }
+                for (bit, mark) in [
+                    (EST_GPU_ENERGY, GPU_ENERGY_ESTIMATED),
+                    (EST_CPU_ENERGY, CPU_ENERGY_ESTIMATED),
+                ] {
+                    if row.est & bit != 0 {
+                        upsert.execute(params![bucket, mark, 1])?;
+                    }
+                }
             }
             let mut proc = tx.prepare_cached(
                 "INSERT INTO proc_s1 (ts, pid, sm, cpu_ms, ram_mib, vram_local, vram_committed) \
@@ -888,43 +904,47 @@ impl Db {
                 };
                 let mut stmt = conn.prepare_cached(&format!(
                     "SELECT metric, SUM(n), SUM(sum) FROM {table} \
-                     WHERE metric IN (?1, ?2, ?3) AND ts > ?5 - ?4 AND ts <= ?6 GROUP BY metric"
+                     WHERE metric IN (?1, ?2, ?3, ?4, ?5) AND ts > ?7 - ?6 AND ts <= ?8 GROUP BY metric"
                 ))?;
                 let mut found = stmt.query(params![
                     Metric::GpuEnergy.name(),
                     Metric::CpuEnergy.name(),
                     Metric::CpuUtil.name(),
+                    GPU_ENERGY_ESTIMATED,
+                    CPU_ENERGY_ESTIMATED,
                     len,
                     from_ms,
                     to_ms
                 ])?;
-                let (mut gpu_n, mut cpu_n) = (0, 0);
+                let (mut gpu_n, mut cpu_n, mut gpu_est, mut cpu_est) = (0, 0, 0, 0);
                 while let Some(r) = found.next()? {
                     let metric: String = r.get(0)?;
                     let (n, sum) = (
                         u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
                         u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
                     );
-                    match Metric::parse(&metric) {
-                        Some(Metric::GpuEnergy) => (out.gpu_mj, gpu_n) = (sum, n),
-                        Some(Metric::CpuEnergy) => (out.cpu_mj, cpu_n) = (sum, n),
+                    match (metric.as_str(), Metric::parse(&metric)) {
+                        (GPU_ENERGY_ESTIMATED, _) => gpu_est = n,
+                        (CPU_ENERGY_ESTIMATED, _) => cpu_est = n,
+                        (_, Some(Metric::GpuEnergy)) => (out.gpu_mj, gpu_n) = (sum, n),
+                        (_, Some(Metric::CpuEnergy)) => (out.cpu_mj, cpu_n) = (sum, n),
                         // Every sample has the CPU's utilisation: it counts the samples.
                         _ => out.samples = n,
                     }
                 }
                 // A nominal second a sample (CORE-061): the rolled-up rows keep no `dt`.
                 out.covered_ms = out.samples * 1000;
-                out.gpu_measured = out.samples > 0 && gpu_n == out.samples;
-                out.cpu_measured = out.samples > 0 && cpu_n == out.samples;
+                out.gpu_measured = out.samples > 0 && gpu_n == out.samples && gpu_est == 0;
+                out.cpu_measured = out.samples > 0 && cpu_n == out.samples && cpu_est == 0;
             }
         }
         Ok(out)
     }
 }
 
-/// What [`Db::energy`] found: the summed energy, whether every sample had each figure from a
-/// counter (from `m1` and `h1`: had it at all, since they keep no estimated mark), how many
-/// samples, and the time they stand for.
+/// What [`Db::energy`] found: the summed energy, whether every sample had each figure and none
+/// was estimated (rows from before the rolled-up marks count as not estimated), how many samples,
+/// and the time they stand for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RangeEnergy {
     pub gpu_mj: u64,
@@ -1097,6 +1117,50 @@ mod tests {
         assert_eq!(count("s1"), 1, "samples past 24 h");
         assert_eq!(count("m1"), 2, "minute rows past 30 days");
         assert_eq!(count("h1"), 3, "hourly rows are forever");
+    }
+
+    /// From `m1` and `h1`, a figure is measured when every sample had it and none was estimated
+    /// (APP-131): the rolled-up rows keep the mark, and it is no series.
+    #[test] // spec: APP-131, CORE-062
+    fn rolled_up_energy_is_measured_only_when_no_sample_was_estimated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("telemetry.db"), 1_800_000_000);
+        let hour = 1_800_000_000_000 - 1_800_000_000_000 % HOUR_MS;
+        let sample = |minute: i64, i: i64, est: i64, gpu: Option<i64>| {
+            let mut r = row(
+                hour + minute * MINUTE_MS + i * 1000,
+                &[(Metric::CpuUtil, 100), (Metric::CpuEnergy, 10)],
+            );
+            r.set(Metric::GpuEnergy, gpu);
+            r.est = est;
+            db.write(&r).unwrap();
+        };
+        for i in 0..3 {
+            // Minute 0, all measured; minute 1, one CPU figure estimated; minute 2, every GPU
+            // figure estimated; minute 3, one sample without the GPU's figure.
+            sample(0, i, 0, Some(10));
+            sample(1, i, if i == 1 { EST_CPU_ENERGY } else { 0 }, Some(10));
+            sample(2, i, EST_GPU_ENERGY, Some(10));
+            sample(3, i, 0, (i != 2).then_some(10));
+        }
+        let minute = |m: i64| {
+            let from = hour + m * MINUTE_MS;
+            let e = db
+                .energy(from, from + MINUTE_MS - 1, Resolution::Minute)
+                .unwrap();
+            (e.gpu_measured, e.cpu_measured, e.samples)
+        };
+        assert_eq!(minute(0), (true, true, 3), "nothing estimated");
+        assert_eq!(minute(1), (true, false, 3), "one estimated CPU figure");
+        assert_eq!(minute(2), (false, true, 3), "estimated GPU figures");
+        assert_eq!(minute(3), (false, true, 3), "a sample without the figure");
+        // The hour holds all four minutes, and the sums are untouched by the marks.
+        let whole = db.energy(hour, hour, Resolution::Hour).unwrap();
+        assert_eq!((whole.gpu_measured, whole.cpu_measured), (false, false));
+        assert_eq!((whole.gpu_mj, whole.cpu_mj, whole.samples), (110, 120, 12));
+        // The mark isn't a series.
+        assert_eq!(Metric::parse(GPU_ENERGY_ESTIMATED), None);
+        assert_eq!(Metric::parse(CPU_ENERGY_ESTIMATED), None);
     }
 
     /// An older file is migrated forward in place and keeps its history; only a newer version,

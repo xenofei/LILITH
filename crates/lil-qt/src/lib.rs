@@ -28,6 +28,10 @@
 //! The shell's Qt-free parts: [`layout_file`] (the layout file and the window clamp, APP-002,
 //! APP-003), [`shortcuts`] (the shortcut map, APP-011, APP-143) and [`app_state`] (the app's
 //! own state, P4a-R16). The bridge's `ShellState` object serves the first two to QML.
+//!
+//! The Hardware panel's Qt-free part: [`series`] (chart resolutions, per-pixel downsampling, the
+//! chart buffer and the energy table's periods, APP-129, APP-131), served to QML by the
+//! bridge's `Hardware` singleton and `ChartSeries` objects.
 
 #[cfg(feature = "qt")]
 extern crate cxx_qt_lib;
@@ -44,6 +48,7 @@ pub mod paging;
 pub mod preview;
 pub mod requests;
 pub mod retry;
+pub mod series;
 pub mod shortcuts;
 pub mod throttle;
 pub mod topics;

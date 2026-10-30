@@ -42,4 +42,14 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/usage/ClaudeCodeSection.qml
         qml/panels/usage/UsageText.js)
 
+# Task 23: the Hardware panel.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/panels/hardware/HardwarePanel.qml
+        qml/panels/hardware/ChartTile.qml
+        qml/panels/hardware/GpuUsers.qml
+        qml/panels/hardware/EnergyTable.qml
+        qml/panels/hardware/AlertsStrip.qml
+        qml/panels/hardware/HardwareFormat.js)
+
 add_subdirectory(tests)
