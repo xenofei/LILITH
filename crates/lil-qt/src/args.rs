@@ -19,7 +19,11 @@
 //!   `deny/` link never answers anything.
 //!
 //! A `.lilref` argument (its path ends `.lilref`, any case) is read here, at most 4 KiB, and only
-//! from this PC: a UNC path or a network drive is refused unread.
+//! from this PC: a UNC path or a network drive is refused unread, and so is a file whose final
+//! path, once opened, isn't on a local drive.
+//!
+//! Text from a link, a `.lilref`, a target or a title reaches a card only through
+//! [`shown_outside`], which cuts what may be a deny token however it is spelled.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -132,8 +136,7 @@ pub struct BootPlan {
     /// Set by `single_instance::start` once the arguments reached the running instance.
     pub forwarded: bool,
     /// Set by `single_instance::start` when this start runs as an instance of its own without
-    /// the app's pipe (another program holds it, or LILITH's own instance never answered): what
-    /// the shell's banner says.
+    /// the app's pipe, because the hand-over failed: what the shell's banner says of why.
     pub pipe_notice: Option<&'static str>,
     /// Qt's `organizationName`: the channel's data-folder name (`LILITH`, `LILITH-dev`).
     pub org: String,
