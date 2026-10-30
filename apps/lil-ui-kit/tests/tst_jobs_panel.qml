@@ -324,6 +324,7 @@ TestCase {
                          okState(lane({paused: true, reasons: ["manual"]})), "pause")
         compare(p.args, {lane: "gpu-heavy"})
         tryVerify(() => header.text.indexOf("Paused by you") >= 0, 2000, header.text)
+        wait(Qt.styleHints.mouseDoubleClickInterval + 50)
         button(header, "Resume").click()
         const r = answer(t.core, c => c.kind === "appCall" && c.name === "app/queue.resume", okState(lane()), "resume")
         compare(r.args, {lane: "gpu-heavy"})
@@ -421,6 +422,7 @@ TestCase {
         verify(sent.every(c => c.args.held_only === true), "no resume of your pause")
         verify(!t.core.calls.some(c => c.name === "job.move" || c.name === "job.retry"), "no job is started")
         verify(row(t.panel, "j3").statusText.indexOf("Paused by you") >= 0)
+        wait(Qt.styleHints.mouseDoubleClickInterval + 50)
         button(header, "Resume").click()
         compare(answer(t.core, c => c.name === "app/queue.resume", okState(lane())).args, {lane: "gpu-heavy"})
     }
@@ -723,10 +725,14 @@ TestCase {
         control.click()
         verify(!control.enabled, "busy while its call is out")
         compare(callsOf(t.core, isQueueCall).length, 1)
-        // The answer comes before the second click of a double-click.
+        // The answer comes before the second click of a double-click: that click does nothing.
         answer(t.core, isQueueCall, okState(lane({paused: true, reasons: ["manual"]})), "pause")
         tryVerify(() => header.text.indexOf("Paused by you") >= 0, 2000, header.text)
-        verify(control.enabled, "free again once answered")
+        verify(control.enabled, "it keeps the focus")
+        control.click()
+        compare(callsOf(t.core, isQueueCall).length, 1, "the second click of a double-click")
+        // A deliberate click after that goes through.
+        wait(Qt.styleHints.mouseDoubleClickInterval + 50)
         control.click()
         verify(!control.enabled, "and busy for the resume")
         compare(callsOf(t.core, isQueueCall).length, 2)
@@ -734,6 +740,17 @@ TestCase {
                                                               trace_id: "t", retry: "never"}}, "resume")
         tryVerify(() => control.enabled, 2000, "free again after a refusal")
         verify(t.panel.banner.visible, "the refusal shows")
+    }
+
+    function test_an_event_waiting_for_its_frame_outlives_a_read_that_missed_it() { // spec: APP-114
+        const t = load({jobs: [job("j1")]})
+        const reads = callsOf(t.core, isRunningRead).length
+        t.core.emit("jobs", "event", {kind: "job", job: queued("j2", 0, {updated: iso()})})
+        tryVerify(() => callsOf(t.core, isRunningRead).length > reads, 2000, "a read is out")
+        // The read lists nothing; this job's event came during it and waits for its frame.
+        t.core.emit("jobs", "event", {kind: "job", job: dispatched("j9", "submitting", {updated: iso()})})
+        answerLive(t.core, [], [])
+        compare(liveOrder(t.panel), ["j9"], "the same turn: the commit took the waiting event first")
     }
 
     function test_the_held_resume_waits_for_its_lanes_call_too() { // spec: APP-114, CORE-160

@@ -103,6 +103,7 @@ Rectangle {
     }
     // The lanes (lane -> true) with a call of theirs out, and the jobs with a retry out.
     property var busyLanes: ({})
+    property var _laneAnswered: ({})
     property var busyRetries: ({})
 
     readonly property bool writable: jobsModel.loaded && live.loaded
@@ -328,14 +329,20 @@ Rectangle {
                                                            }})
     }
 
-    // One call at a time for a lane: a double-click of Pause can't pause and then resume.
+    // One call at a time for a lane, and none for a double-click's length after an answer: the
+    // core answers at once, so without that a double-click of Pause pauses and then resumes,
+    // withdrawing the prompts on the way. The control stays enabled, so it keeps the focus.
     function queueCall(method, params, what) {
         if (!writable || busyLanes[params.lane])
+            return
+        const answered = _laneAnswered[params.lane]
+        if (answered !== undefined && Date.now() - answered < Qt.styleHints.mouseDoubleClickInterval)
             return
         const done = () => {
             const busy = Object.assign({}, root.busyLanes)
             delete busy[params.lane]
             root.busyLanes = busy
+            root._laneAnswered[params.lane] = Date.now()
         }
         const busy = Object.assign({}, busyLanes)
         busy[params.lane] = true
@@ -349,6 +356,7 @@ Rectangle {
                                                 pending: done,
                                                 error: e => {
                                                     done()
+                                                    delete root._laneAnswered[params.lane]
                                                     root.failed(what, e)
                                                 }})
     }
@@ -425,6 +433,9 @@ Rectangle {
         const done = () => {
             if (gone || --open > 0)
                 return
+            // A job dispatched between the listings has its event waiting for its frame: without
+            // it, the commit would drop the row and the next frame would make a new one.
+            root.applyPendingJobs()
             live.commit(Date.now())
             root._liveReading = false
             root._liveReadFailed = false
