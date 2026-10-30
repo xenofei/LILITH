@@ -18,8 +18,9 @@
 // - **Finished** (`historyView`): the jobs that ended, newest first, from one JsonListModel over
 //   `jobs.list` with the `jobs` topic. Its pages hold every status (`jobs.list` filters on one
 //   status only), so while the list is shorter than a screenful the panel asks for more pages, at
-//   most 20 per load. A job of a status this build doesn't know is shown with the live ones, by
-//   its name, and stays there until an event ends it (P4a-R40). A live read stopped at its page
+//   most 20 per load, and its header says what it knows: looking, none yet, or none in the newest
+//   jobs it looked through. A job of a status this build doesn't know is shown with the live ones,
+//   by its name, and stays there until an event ends it (P4a-R40). A live read stopped at its page
 //   cap says how many queued jobs it shows.
 //
 // Each row is a JobRow. The lanes come from the read and from the `{kind: "queue", state}` events
@@ -83,6 +84,21 @@ Rectangle {
     property int laneUpdates: 0
     // The passes of `jobs` events applied to the live rows (at most one per frame).
     property int jobPasses: 0
+    // The Finished list's header while it has no row: still looking, or the jobs it looked through
+    // when the page limit stopped it (-1: it saw them all).
+    property bool _historySearching: true
+    property int _historyCutAt: -1
+    // A page asked for to fill the Finished list is out.
+    property bool _historyAsked: false
+    readonly property string historyHeader: {
+        if (historyList.count > 0)
+            return "Finished"
+        if (_historySearching)
+            return "Looking for finished jobs…"
+        if (_historyCutAt >= 0)
+            return "No finished job in the newest " + grouped(_historyCutAt) + " jobs."
+        return "No finished jobs yet."
+    }
 
     readonly property bool writable: jobsModel.loaded && live.loaded
     readonly property var knownLanes: ["gpu-heavy", "cpu"]
@@ -556,14 +572,21 @@ Rectangle {
                     "pause_reasons", "estimate", "queue_position", "watchdog", "all_cached"]
 
         onLoadedChanged: {
+            root._historyPages = 0
+            root._historyAsked = false
+            root._historySearching = true
+            root._historyCutAt = -1
             if (!loaded)
                 return
-            root._historyPages = 0
             root.seedUnknown(0, rowCount() - 1)
             Qt.callLater(root.fillHistory)
         }
         onRowsInserted: (parent, first, last) => {
             root.seedUnknown(first, last)
+            Qt.callLater(root.fillHistory)
+        }
+        onPageLoaded: {
+            root._historyAsked = false
             Qt.callLater(root.fillHistory)
         }
     }
@@ -581,16 +604,25 @@ Rectangle {
 
     // The history is newest first and holds every status, so its first pages can hold no
     // finished job (a batch queued after them): ask for more while the Finished list is shorter
-    // than a screenful, at most `historyFillPages` pages per load.
+    // than a screenful, at most `historyFillPages` pages per load, and say what came of it.
     function fillHistory() {
-        if (!jobsModel.loaded || _historyPages >= historyFillPages)
-            return
-        if (historyList.count >= Math.max(20, Math.ceil(historyList.height / 40)))
+        if (!jobsModel.loaded || _historyAsked)
             return
         const top = jobsModel.index(-1, 0)
-        if (!jobsModel.canFetchMore(top))
+        if (historyList.count >= Math.max(20, Math.ceil(historyList.height / 40))
+                || !jobsModel.canFetchMore(top)) {
+            _historySearching = false
+            _historyCutAt = -1
             return
+        }
+        if (_historyPages >= historyFillPages) {
+            _historySearching = false
+            _historyCutAt = jobsModel.rowCount()
+            return
+        }
         _historyPages++
+        _historyAsked = true
+        _historySearching = true
         jobsModel.fetchMore(top)
     }
 
@@ -781,7 +813,7 @@ Rectangle {
                 leftPadding: Theme.spacing
                 bottomPadding: 4
                 textFormat: Text.PlainText
-                text: historyList.count > 0 ? "Finished" : "No finished jobs yet."
+                text: root.historyHeader
                 color: Theme.textMuted
                 font.pixelSize: Theme.fontSize
                 font.bold: historyList.count > 0

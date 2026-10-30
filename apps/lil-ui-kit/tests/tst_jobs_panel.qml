@@ -656,6 +656,50 @@ TestCase {
         tryVerify(() => header.text.indexOf("Paused while fullscreen") >= 0, 2000, header.text)
     }
 
+    // --- Words that must be true (audit finding 7e). ---
+
+    function test_no_finished_jobs_isnt_said_while_loading() { // spec: APP-114
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        tryVerify(() => w.panel.historyView.headerItem !== null, 2000)
+        wait(50)
+        const said = () => w.panel.historyView.headerItem.text
+        verify(said() !== "No finished jobs yet.", "before the first page: " + said())
+        // A first page with no finished job, and more to come: still looking.
+        answer(core, isPage, ok({jobs: [queued("j1", 0)], next_cursor: "h1", lanes: [lane()]}), "first page")
+        wait(50)
+        verify(said() !== "No finished jobs yet.", "before the next page: " + said())
+        answer(core, c => isPage(c) && c.args.cursor === "h1", ok({jobs: [], next_cursor: null, lanes: [lane()]}), "the last")
+        tryVerify(() => said() === "No finished jobs yet.", 2000, said())
+    }
+
+    function test_the_page_limit_says_what_it_looked_through() { // spec: APP-114
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        const said = () => w.panel.historyView.headerItem.text
+        const page = n => {
+            const jobs = []
+            for (let i = 0; i < 100; ++i)
+                jobs.push(queued("p" + n + "_" + i, undefined))
+            return ok({jobs: jobs, next_cursor: "h" + (n + 1), lanes: [lane()]})
+        }
+        answer(core, isPage, page(0), "the first page")
+        for (let n = 1; n <= 20; ++n)
+            answer(core, c => isPage(c) && c.args.cursor === "h" + n, page(n), "page " + n)
+        tryVerify(() => said() === "No finished job in the newest 2,100 jobs.", 3000, said())
+    }
+
+    function test_a_job_past_its_estimate_says_so() { // spec: APP-114, APP-139
+        const late = job("j1", {estimate: wallEstimate(2), started: iso(30000),
+                                status_seq: [{status: "running", substatus: "executing", at: iso(30000)}]})
+        const t = load({jobs: [late]})
+        const text = row(t.panel, "j1").statusText
+        verify(text.indexOf("taking longer than estimated") >= 0, text)
+        verify(text.indexOf("under 1 s") < 0, text)
+    }
+
     // A list emptied under a row still being made off the frame's path: the view cancels that row
     // by an index past the list's end, and Qt warns.
     function test_a_list_emptied_under_a_row_being_made_warns_nothing() { // spec: APP-114, APP-139

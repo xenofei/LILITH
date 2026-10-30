@@ -8,7 +8,8 @@
 //!   but a `wall_s` part, "~8 s"; with no part at all, "no estimate yet". `unknown` entries add
 //!   nothing.
 //! - [`eta_text`]: a running job's time left, its `wall_s` p50 less the time it has run, never
-//!   below 0 ("about 12 s left", "under 1 s left"), or "—" with no `wall_s`.
+//!   below 0 ("about 12 s left", "under 1 s left", "taking longer than estimated" once past its
+//!   estimate), or "—" with no `wall_s`.
 //! - [`queued_eta_text`]: a queued job's finish (Appendix G "Adding estimates"): the running
 //!   job's time left, plus the `wall_s` of each job ahead in lane order, plus its own, summed by
 //!   [`sum_part`]; jobs ahead with no `wall_s` are counted and named ("about 3 min, after 2
@@ -69,6 +70,8 @@ pub fn eta_text(e: &Estimate, elapsed_s: f64) -> String {
 pub fn left_text(left: Option<f64>) -> String {
     match left {
         None => NO_TIME.to_string(),
+        // Times left stop at 0: past its estimate, it has no time left to tell.
+        Some(left) if left <= 0.0 => "taking longer than estimated".to_string(),
         Some(left) if left < 0.5 => "under 1 s left".to_string(),
         Some(left) => format!("about {} left", duration(left)),
     }
@@ -509,7 +512,9 @@ mod tests {
         };
         assert_eq!(eta_text(&e, 8.0), "about 12 s left");
         assert_eq!(eta_text(&e, 19.6), "under 1 s left");
-        assert_eq!(eta_text(&e, 45.0), "under 1 s left");
+        // Past its estimate: not a time left at all.
+        assert_eq!(eta_text(&e, 45.0), "taking longer than estimated");
+        assert_eq!(eta_text(&e, 20.0), "taking longer than estimated");
         assert_eq!(running_left(&e, 45.0), Some(0.0));
         assert_eq!(running_left(&e, 5.0), Some(15.0));
         let long = Estimate {
