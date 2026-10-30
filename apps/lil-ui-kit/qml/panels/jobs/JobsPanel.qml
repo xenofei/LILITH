@@ -86,6 +86,8 @@ Rectangle {
     property var _pendingLanes: ({})
     property bool _liveReading: false
     property bool _liveAgain: false
+    // The read asked for again must carry nothing over (a snapshot or a resync came).
+    property bool _liveFreshAgain: false
     property bool _capsReading: false
     // Request id -> {ok, fail}: the calls whose answer goes to Rust as it came.
     property var _raw: ({})
@@ -303,16 +305,18 @@ Rectangle {
             liveCoalesce.start()
     }
 
-    // One read of the live rows: the running jobs and every queue page, then one commit.
-    function readLive() {
+    // One read of the live rows: the running jobs and every queue page, then one commit. A
+    // `fresh` read (after a snapshot or a resync) carries nothing over.
+    function readLive(fresh) {
         if (!core)
             return
         if (_liveReading) {
             _liveAgain = true
+            _liveFreshAgain = _liveFreshAgain || !!fresh
             return
         }
         _liveReading = true
-        live.beginRead()
+        live.beginRead(!!fresh)
         let open = 2
         let gone = false
         const done = () => {
@@ -323,8 +327,13 @@ Rectangle {
             root.overviewChanged()
             root.applyLanes(JSON.parse(live.lanesJson()))
             if (root._liveAgain) {
+                const again = root._liveFreshAgain
                 root._liveAgain = false
-                root.requestLiveRead()
+                root._liveFreshAgain = false
+                if (again)
+                    root.readLive(true)
+                else
+                    root.requestLiveRead()
             }
         }
         const fail = () => {
@@ -394,8 +403,9 @@ Rectangle {
 
     function onJobsEvent(kind, data) {
         if (kind !== "event") {
-            // A snapshot or a resync: the history reloads itself; the panel reads its own state.
-            readLive()
+            // A snapshot or a resync: the history reloads itself; the panel reads its own state
+            // afresh, and the reload hands back the unknown-status jobs the core still lists.
+            readLive(true)
             readEngines()
             readCaps()
             return

@@ -709,6 +709,23 @@ TestCase {
         tryCompare(t.panel.historyView, "count", 1)
     }
 
+    function test_a_resync_drops_an_unknown_status_the_core_no_longer_lists() { // spec: APP-114
+        const odd = job("odd", {status: "paused_by_director", substatus: "waiting_quota", created: iso(1000)})
+        const t = load({jobs: [odd], queue: [queued("q0", 0)]})
+        tryVerify(() => liveOrder(t.panel).indexOf("odd") >= 0, 2000, JSON.stringify(liveOrder(t.panel)))
+        // A core restart or a workspace switch: the reload no longer lists the job.
+        t.core.emit("jobs", "resync_required", null)
+        answer(t.core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}), "the reload")
+        answerLive(t.core, [], [queued("q0", 0)])
+        tryVerify(() => liveOrder(t.panel).indexOf("odd") < 0, 2000, "gone: " + JSON.stringify(liveOrder(t.panel)))
+        compare(liveOrder(t.panel), ["q0"])
+        // One the reload still lists comes back.
+        t.core.emit("jobs", "resync_required", null)
+        answer(t.core, isPage, ok({jobs: [odd], next_cursor: null, lanes: [lane()]}), "the second reload")
+        answerLive(t.core, [], [queued("q0", 0)])
+        tryVerify(() => liveOrder(t.panel).indexOf("odd") >= 0, 2000, "back: " + JSON.stringify(liveOrder(t.panel)))
+    }
+
     function test_a_read_cut_at_its_page_cap_says_so() { // spec: APP-114
         const core = createTemporaryObject(fakeComponent, tc)
         const w = createTemporaryObject(panelWindow, tc, {core: core})

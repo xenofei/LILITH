@@ -3,7 +3,8 @@
 //! ETA and elapsed time, so the GUI thread only applies the changes (APP-114, APP-139).
 //!
 //! The panel makes the calls and hands over the raw result JSON, never parsed in QML:
-//! - `beginRead()`, then `setRunning(resultJson)` for `jobs.list {status: "running"}` and
+//! - `beginRead(fresh)` (`fresh` after a snapshot or a `resync_required`: nothing is carried
+//!   over), then `setRunning(resultJson)` for `jobs.list {status: "running"}` and
 //!   `addQueuePage(resultJson)` for each `jobs.list {order: "queue"}` page (it returns the next
 //!   page's cursor, empty when the read has them all), then `commit(nowMs)`;
 //! - `applyJob(jobJson, nowMs)` for each `jobs` event's job: 0 when it is no live row, 1 when it
@@ -94,7 +95,7 @@ pub mod qobject {
         type LiveJobsModel = super::LiveJobsModelRust;
 
         #[qinvokable]
-        fn begin_read(self: Pin<&mut LiveJobsModel>);
+        fn begin_read(self: Pin<&mut LiveJobsModel>, fresh: bool);
         #[qinvokable]
         fn add_queue_page(self: Pin<&mut LiveJobsModel>, result_json: &QString) -> QString;
         #[qinvokable]
@@ -213,8 +214,13 @@ fn field(row: &LiveRow, name: &str) -> QVariant {
 }
 
 impl qobject::LiveJobsModel {
-    fn begin_read(mut self: Pin<&mut Self>) {
-        self.as_mut().rust_mut().live.begin_read();
+    fn begin_read(mut self: Pin<&mut Self>, fresh: bool) {
+        let live = &mut self.as_mut().rust_mut().live;
+        if fresh {
+            live.begin_fresh_read();
+        } else {
+            live.begin_read();
+        }
     }
 
     fn add_queue_page(mut self: Pin<&mut Self>, result_json: &QString) -> QString {

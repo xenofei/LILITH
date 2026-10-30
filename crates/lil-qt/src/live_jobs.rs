@@ -10,7 +10,9 @@
 //!   is ([`LiveJobs::apply_job`]): a job that ended leaves, a running or queued job (or one of a
 //!   status this build doesn't know, P4a-R40) is added or updated; an event that comes while a
 //!   read is out wins over that read when it is as new. A job of a status this build doesn't
-//!   know is in neither listing, so a read keeps it until an event ends it.
+//!   know is in neither listing, so a read keeps it until an event ends it; a read after a
+//!   snapshot or a `resync_required` ([`LiveJobs::begin_fresh_read`]) keeps only the jobs the
+//!   core still lists, the reloaded history handing those back.
 //! - **Places** come only from the last queue read's entries, never from a job's own
 //!   `queue_position`, which is the place when its summary was made: a job the read lists without
 //!   one is held by a restart; one it doesn't list has no place yet.
@@ -96,6 +98,8 @@ struct Read {
     events: HashMap<String, Value>,
     lanes: Option<Value>,
     pages: u32,
+    /// A read after a resync: nothing carries over ([`LiveJobs::begin_fresh_read`]).
+    fresh: bool,
     /// It stopped at [`MAX_PAGES`] with a cursor still to follow.
     capped: bool,
 }
@@ -233,6 +237,16 @@ impl LiveJobs {
         self.read = Some(Read::default());
     }
 
+    /// A read after a snapshot or a `resync_required` (a core restart, a workspace switch): it
+    /// carries nothing over, so a job the core no longer lists leaves; the reloaded history
+    /// hands back, as events, the jobs of a status this build doesn't know that it still lists.
+    pub fn begin_fresh_read(&mut self) {
+        self.read = Some(Read {
+            fresh: true,
+            ..Read::default()
+        });
+    }
+
     /// One page of `jobs.list {order: "queue"}` (the call's result): the cursor of the next page
     /// to ask for, or `None` once the read has them all (or [`MAX_PAGES`] of them).
     pub fn add_queue_page(&mut self, result: &Value) -> Option<String> {
@@ -296,8 +310,8 @@ impl LiveJobs {
             }
         }
         // A job of a status this build doesn't know is in neither listing: it stays until an
-        // event ends it (P4a-R40), never dropped by a read.
-        for (id, job) in &self.jobs {
+        // event ends it (P4a-R40), never dropped by a read, except a fresh one.
+        for (id, job) in self.jobs.iter().filter(|_| !read.fresh) {
             let status = text(job, "status");
             if status != "queued" && status != "running" && !jobs.contains_key(id) {
                 jobs.insert(id.clone(), job.clone());
@@ -954,6 +968,29 @@ mod tests {
         read(&mut live, &[], &[vec![queued("a", Some(0), None)]]);
         assert_eq!(live.capped(), None);
         assert_eq!(live.overview("image")["capped"], Value::Null);
+    }
+
+    #[test] // spec: APP-114
+    fn a_fresh_read_keeps_only_what_the_core_still_lists() {
+        let mut live = LiveJobs::new();
+        read(&mut live, &[], &[vec![queued("q", Some(0), None)]]);
+        live.apply_job(job("gone", "paused_by_director", "x", "gpu-heavy"), NOW);
+        live.apply_job(job("kept", "paused_by_director", "x", "gpu-heavy"), NOW);
+        assert_eq!(ids(&live), ["q", "gone", "kept"]);
+        // A resync: the reloaded history lists only `kept`, handed over during the read.
+        live.begin_fresh_read();
+        live.apply_job(job("kept", "paused_by_director", "x", "gpu-heavy"), NOW);
+        live.set_running(&page(&[], None));
+        assert_eq!(
+            live.add_queue_page(&page(&[queued("q", Some(0), None)], None)),
+            None
+        );
+        live.commit(NOW);
+        assert_eq!(
+            ids(&live),
+            ["q", "kept"],
+            "the job the core no longer lists is gone"
+        );
     }
 
     #[test] // spec: APP-114
