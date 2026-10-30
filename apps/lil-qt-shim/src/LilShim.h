@@ -16,6 +16,10 @@ class LilShim : public QObject
 public:
     explicit LilShim(QObject *parent = nullptr);
 
+    // lilshim::activate on `window` (a QWindow, such as the shell's Window): brought to the front
+    // with the focus, or shown with its taskbar button flashing (APP-014, APP-065).
+    Q_INVOKABLE void activate(QObject *window, bool takeFocus) const;
+
     // lilshim::isModuleLoaded: whether `dll` is loaded in this process.
     Q_INVOKABLE bool isModuleLoaded(const QString &dll) const;
 

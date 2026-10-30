@@ -1,6 +1,6 @@
 #pragma once
-// Window activation and the shell glue the QML side can't reach (APP-030). Task 19 adds the
-// foreground hand-off of a forwarded launch.
+// Window activation and the shell glue the QML side can't reach (APP-030), and the foreground
+// hand-off of a forwarded launch (APP-014).
 
 #include "lilshim/shim_global.h"
 
@@ -10,8 +10,11 @@ class QWindow;
 
 namespace lilshim {
 
-// Shows `w`. With takeFocus, it is shown, raised and activated. Without, it is shown without
-// being activated (no focus taken) and its taskbar button flashes until it comes to the front.
+// Shows `w`. With takeFocus, it is restored if minimized, shown, raised and brought to the front
+// with SetForegroundWindow, which works when this process may take the foreground (a second
+// launch's AllowSetForegroundWindow gives it that right, APP-014). Without, it is shown without
+// being activated (no focus taken) and its taskbar button flashes until it comes to the front
+// (APP-065).
 LILSHIM_EXPORT void activate(QWindow *w, bool takeFocus);
 
 // Whether `dll` (a file name such as "Qt6WebEngineCore.dll") is loaded in this process

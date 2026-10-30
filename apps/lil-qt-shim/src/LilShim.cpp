@@ -10,10 +10,16 @@
 #include <QRawFont>
 #include <QGuiApplication>
 #include <QPalette>
+#include <QWindow>
 
 LilShim::LilShim(QObject *parent)
     : QObject(parent)
 {
+}
+
+void LilShim::activate(QObject *window, bool takeFocus) const
+{
+    lilshim::activate(qobject_cast<QWindow *>(window), takeFocus);
 }
 
 bool LilShim::isModuleLoaded(const QString &dll) const
