@@ -12,15 +12,20 @@ use std::time::{Duration, Instant};
 use lil_platform::guard::require_desktop_group;
 use lil_platform::hello::{OwnerWindow, Raise};
 use lil_testkit::{CoreFixture, TestEnv};
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow, GetSystemMetrics,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST,
+    IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+    SwitchToThisWindow, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -94,24 +99,77 @@ fn app_window(pid: u32) -> Option<HWND> {
     find.found
 }
 
-/// One synthesized click at the centre of `hwnd` (Task 1's S1.4 blocker recipe), which gives its
-/// process the foreground.
+/// The window class of `hwnd`.
+fn class_of(hwnd: HWND) -> String {
+    let mut name = [0u16; 256];
+    // SAFETY: a plain query into a local buffer.
+    let n = unsafe { GetClassNameW(hwnd, &mut name) };
+    String::from_utf16_lossy(&name[..usize::try_from(n).unwrap_or(0)])
+}
+
+/// One synthesized click on a visible point of `hwnd`, never its title bar (Task 1's S1.4
+/// blocker recipe), which gives its process the foreground. The window is made topmost for the
+/// click, so nothing covers it, and is normal again after. Coordinates are physical: the test
+/// is per-monitor DPI aware.
 fn click(hwnd: isize) {
+    let h = HWND(hwnd as *mut c_void);
+    let raise = |after: HWND| {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+        // SAFETY: a plain call on a live window of this process.
+        unsafe { SetWindowPos(h, Some(after), 0, 0, 0, 0, flags) }.expect("SetWindowPos");
+    };
+    raise(HWND_TOPMOST);
+    std::thread::sleep(Duration::from_millis(200));
     let mut rect = RECT::default();
     // SAFETY: plain queries; `rect` is a valid out-pointer.
+    unsafe { GetWindowRect(h, &mut rect) }.expect("the blocker's rectangle");
+    let root_at = |p: POINT| {
+        // SAFETY: plain queries.
+        unsafe { GetAncestor(WindowFromPoint(p), GA_ROOT) }
+    };
+    let top = rect.top + 48;
+    let point = (1..=5)
+        .flat_map(|j| (1..=5).map(move |i| (i, j)))
+        .map(|(i, j)| POINT {
+            x: rect.left + (rect.right - rect.left) * i / 6,
+            y: top + (rect.bottom - top) * j / 6,
+        })
+        .find(|&p| root_at(p) == h)
+        .unwrap_or_else(|| {
+            let centre = POINT {
+                x: (rect.left + rect.right) / 2,
+                y: (rect.top + rect.bottom) / 2,
+            };
+            let there = root_at(centre);
+            let mut pid = 0u32;
+            // SAFETY: plain queries.
+            let (visible, iconic) = unsafe {
+                GetWindowThreadProcessId(there, Some(&mut pid));
+                (IsWindowVisible(h).as_bool(), IsIconic(h).as_bool())
+            };
+            let class = class_of(there);
+            // The lock screen's frame covers every window while the PC is locked.
+            let locked = if class == "LockScreenBackstopFrame" {
+                " The PC is locked: run the host set while it is unlocked."
+            } else {
+                ""
+            };
+            panic!(
+                "no point of the blocker {rect:?} is visible (visible {visible}, minimized                  {iconic}); pid {pid}'s window of class {class} covers its centre.{locked}"
+            )
+        });
+    // SAFETY: plain queries and one SendInput of two mouse inputs.
     unsafe {
-        GetWindowRect(HWND(hwnd as *mut c_void), &mut rect).expect("the blocker's rectangle");
         let (vx, vy) = (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
             GetSystemMetrics(SM_YVIRTUALSCREEN),
         );
         let (vw, vh) = (
-            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
         );
-        let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-        let dx = (x - vx) * 65535 / vw;
-        let dy = (y - vy) * 65535 / vh;
+        let dx = (point.x - vx) * 65535 / (vw - 1);
+        let dy = (point.y - vy) * 65535 / (vh - 1);
         let at = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         let input = |flags| INPUT {
             r#type: INPUT_MOUSE,
@@ -133,6 +191,8 @@ fn click(hwnd: isize) {
             "SendInput"
         );
     }
+    std::thread::sleep(Duration::from_millis(200));
+    raise(HWND_NOTOPMOST);
 }
 
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -147,29 +207,46 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
 #[ignore = "desktop"]
 fn desktop_second_launch_comes_to_front() {
     require_desktop_group(true);
+    // Physical coordinates for the blocker's click (WindowFromPoint and SendInput agree).
+    // SAFETY: a plain call, before this process makes any window.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let env = TestEnv::new();
     let deploy = deployed_app().parent().unwrap().to_path_buf();
     let _core = CoreFixture::start_exe(&env, &deploy.join("lil-core.exe"));
 
-    // A, the first instance, with its window up.
-    let first = Running(start_app(&env, &[]));
-    let a = first.0.id();
-    wait_until("the first instance's window", || app_window(a).is_some());
-
-    // Another window takes the front: the blocker, raised, else clicked.
+    // Another window takes the front first: the blocker, raised, else clicked.
     let blocker = OwnerWindow::open(
         "LILITH desktop test",
         "A second launch of LILITH must bring its first window in front of this one.",
     )
     .expect("the blocker window");
-    if blocker.bring_to_front() == Raise::NotInFront {
-        click(blocker.hwnd());
+    // Task 1's recipes in turn: SetForegroundWindow (with the input attached), then the
+    // fallback recipe's SwitchToThisWindow, then a synthesized click on the blocker.
+    let raised = blocker.bring_to_front();
+    if raised == Raise::NotInFront && !blocker.wait_front(Duration::from_millis(500)) {
+        // SAFETY: a plain call on a live window of this process.
+        unsafe { SwitchToThisWindow(HWND(blocker.hwnd() as *mut c_void), true) };
+        if !blocker.wait_front(Duration::from_millis(500)) {
+            click(blocker.hwnd());
+        }
     }
     assert!(
         blocker.wait_front(Duration::from_secs(5)),
-        "the blocker holds the front before the second launch"
+        "the blocker holds the front before the app starts ({}; the front is pid {})",
+        raised.name(),
+        foreground_pid()
     );
-    assert_ne!(foreground_pid(), a);
+
+    // A, the first instance, shown behind it without the focus.
+    let first = Running(start_app(&env, &["--no-activate"]));
+    let a = first.0.id();
+    wait_until("the first instance's window", || app_window(a).is_some());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        blocker.wait_front(Duration::from_secs(2)),
+        "the blocker still holds the front (the front is pid {}, the app {a})",
+        foreground_pid()
+    );
 
     // B, started by the process in front, as a toast click starts it: it hands over and exits.
     let started = Instant::now();
