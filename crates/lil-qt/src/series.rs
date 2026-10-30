@@ -5,7 +5,9 @@
 //! - [`downsample`]: a series cut to at most one point per pixel, each keeping its pixel's least
 //!   min and greatest max, so a one-second spike survives a 24-hour window.
 //! - [`SeriesBuffer`]: one chart's points: a `telemetry.series` answer, then the live samples of
-//!   the `telemetry` topic, merged into the window's resolution step and cut to the window.
+//!   the `telemetry` topic, merged into the window's resolution step and cut to the window. The
+//!   window ends at the newest sample of any chart (`set_end`), so a series that stopped leaves
+//!   the right of its chart empty and says it is stale; a hole in a series breaks its line.
 //! - [`energy_periods`]: the energy table's session, day, month and year, by the local calendar.
 
 /// One point of a `telemetry.series` answer: `(Unix ms, min, average, max)`.
@@ -68,11 +70,12 @@ pub fn downsample(points: &[SeriesPoint], width_px: usize) -> Vec<(i64, f64, f64
 }
 
 /// One chart's points, oldest first, for a window of `window_s` seconds that ends at the newest
-/// point.
+/// point or at the end set, whichever is later.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeriesBuffer {
     window_s: u64,
     points: Vec<SeriesPoint>,
+    end_ms: Option<i64>,
 }
 
 impl SeriesBuffer {
@@ -80,6 +83,7 @@ impl SeriesBuffer {
         SeriesBuffer {
             window_s: window_s.clamp(1, LONGEST_WINDOW_S),
             points: Vec::new(),
+            end_ms: None,
         }
     }
 
@@ -132,11 +136,38 @@ impl SeriesBuffer {
         }
     }
 
+    /// The window's end: the time of the newest sample the panel has (of any metric). A later
+    /// point of this series moves it on by itself; an earlier end changes nothing.
+    pub fn set_end(&mut self, end_ms: i64) {
+        self.end_ms = Some(self.end_ms.map_or(end_ms, |e| e.max(end_ms)));
+        self.trim();
+    }
+
+    /// The newest point's time.
+    pub fn newest_ms(&self) -> Option<i64> {
+        self.points.last().map(|p| p.0)
+    }
+
+    fn end(&self) -> Option<i64> {
+        match (self.newest_ms(), self.end_ms) {
+            (Some(n), Some(e)) => Some(n.max(e)),
+            (n, e) => n.or(e),
+        }
+    }
+
+    /// The series has stopped: its newest point is more than two steps before the window's end.
+    pub fn is_stale(&self) -> bool {
+        match (self.newest_ms(), self.end()) {
+            (Some(newest), Some(end)) => end - newest > 2 * step_ms(self.window_s),
+            _ => false,
+        }
+    }
+
     fn trim(&mut self) {
-        let Some(&(newest, ..)) = self.points.last() else {
+        let Some(end) = self.end() else {
             return;
         };
-        let start = newest - self.window_ms();
+        let start = end - self.window_ms();
         let keep_from = self.points.partition_point(|p| p.0 < start);
         self.points.drain(..keep_from);
     }
@@ -156,17 +187,32 @@ impl SeriesBuffer {
     }
 
     /// What a plot `width_px` pixels wide draws: at most `width_px` points `(x in pixels from
-    /// the window's start, min, max)`, the newest at `width_px`.
-    pub fn view(&self, width_px: usize) -> Vec<(f64, f64, f64)> {
-        let Some(&(newest, ..)) = self.points.last() else {
+    /// the window's start, min, max)` in all, the window's end at `width_px`, as lines broken
+    /// wherever two neighbours are further apart than two steps and two pixels (no data was
+    /// stored between them: the core was stopped, the PC slept, a source failed).
+    pub fn view(&self, width_px: usize) -> Vec<Vec<(f64, f64, f64)>> {
+        let Some(end) = self.end() else {
             return Vec::new();
         };
-        let window = self.window_ms() as f64;
-        let start = newest - self.window_ms();
-        downsample(&self.points, width_px)
-            .into_iter()
-            .map(|(ts, min, max)| ((ts - start) as f64 * width_px as f64 / window, min, max))
-            .collect()
+        if width_px == 0 {
+            return Vec::new();
+        }
+        let window_ms = self.window_ms();
+        let window = window_ms as f64;
+        let start = end - window_ms;
+        let pixel_ms = window_ms / width_px as i64;
+        let gap = (2 * step_ms(self.window_s)).max(2 * pixel_ms);
+        let mut lines: Vec<Vec<(f64, f64, f64)>> = Vec::new();
+        let mut before: Option<i64> = None;
+        for (ts, min, max) in downsample(&self.points, width_px) {
+            let point = ((ts - start) as f64 * width_px as f64 / window, min, max);
+            match (before, lines.last_mut()) {
+                (Some(b), Some(line)) if ts - b <= gap => line.push(point),
+                _ => lines.push(vec![point]),
+            }
+            before = Some(ts);
+        }
+        lines
     }
 }
 
@@ -369,12 +415,15 @@ mod tests {
         assert_eq!(b.points()[0].0, t + 1000, "older than the window goes");
 
         // The view: at most a point per pixel, the newest pixel at the right edge.
-        let v = b.view(300);
+        let v = b.view(300).concat();
         assert!(v.len() <= 300);
         let right = v.last().unwrap().0;
         assert!(right > 299.0 && right <= 300.0, "{right}");
         assert!(v[0].0 >= 0.0);
-        assert_eq!(b.view(300).iter().map(|p| p.2).fold(0.0, f64::max), 7.0);
+        assert_eq!(
+            b.view(300).concat().iter().map(|p| p.2).fold(0.0, f64::max),
+            7.0
+        );
 
         // 24 hours at 1 m: live seconds merge into their minute.
         b.set_window(LONGEST_WINDOW_S);
@@ -406,6 +455,49 @@ mod tests {
             3,
             "a value that isn't a number is skipped"
         );
+    }
+
+    #[test] // spec: APP-129
+    fn a_gap_breaks_the_line_and_a_stopped_series_shows_it() {
+        let t = utc(2026, 10, 28, 12, 0);
+        let p = |ts: i64, v: f64| (ts, v, v, v);
+        // 3 minutes, a 10-minute hole (the core was stopped), then 2 minutes.
+        let mut b = SeriesBuffer::new(LIVE_WINDOW_S);
+        let mut points: Vec<SeriesPoint> = (0..180).map(|i| p(t + i * 1000, 1.0)).collect();
+        points.extend((780..900).map(|i| p(t + i * 1000, 2.0)));
+        b.load(points);
+        let segments = b.view(300);
+        assert_eq!(segments.len(), 2, "the hole breaks the line");
+        assert!(segments[0].last().unwrap().0 < segments[1][0].0);
+        assert!(segments.iter().map(Vec::len).sum::<usize>() <= 300);
+        assert!(!b.is_stale());
+
+        // A sample every second is one line; so is 24 hours of minutes, a pixel being 6 minutes.
+        let mut c = SeriesBuffer::new(LIVE_WINDOW_S);
+        c.load((0..900).map(|i| p(t + i * 1000, 1.0)).collect());
+        assert_eq!(c.view(300).len(), 1);
+        let mut d = SeriesBuffer::new(LONGEST_WINDOW_S);
+        d.load((0..1440).map(|i| p(t + i * 60_000, 1.0)).collect());
+        assert_eq!(d.view(224).len(), 1);
+
+        // A series that stopped while the others went on: the end moves with them, so its right
+        // edge is empty and it says it is stale.
+        let last = t + 899_000;
+        b.set_end(last + 60_000);
+        assert!(b.is_stale());
+        assert_eq!(b.newest_ms(), Some(last));
+        let right = b.view(300).last().unwrap().last().unwrap().0;
+        assert!(right < 300.0 - 15.0, "a minute of 15 is 20 px: {right}");
+        // The window follows the end: 13 minutes on, the first stretch has gone.
+        b.set_end(last + 13 * 60_000);
+        assert_eq!(b.view(300).len(), 1);
+        // Data again at the end: current.
+        b.push(last + 13 * 60_000, 3.0);
+        assert!(!b.is_stale());
+        assert_eq!(b.view(300).len(), 2, "the stop is a hole now");
+        // An end before the newest point changes nothing.
+        b.set_end(t);
+        assert!(!b.is_stale());
     }
 
     #[test] // spec: APP-129
