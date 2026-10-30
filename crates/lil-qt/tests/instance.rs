@@ -928,12 +928,25 @@ struct LowLaunch {
 
 impl LowLaunch {
     fn start(folder: &Folder, out_dir: &std::path::Path, env: &TestEnv, rest: &str) -> LowLaunch {
+        Self::start_as(false, folder, out_dir, env, rest)
+    }
+
+    /// With `restricted`, a write-restricted Medium token instead (restricting SIDs: this user
+    /// and Everyone), as some sandboxes run a helper (review M-20).
+    fn start_as(
+        restricted: bool,
+        folder: &Folder,
+        out_dir: &std::path::Path,
+        env: &TestEnv,
+        rest: &str,
+    ) -> LowLaunch {
         use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
         use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
         use windows::Win32::Security::{
-            DuplicateTokenEx, PSID, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
-            TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
-            TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
+            CreateRestrictedToken, DuplicateTokenEx, PSID, SID_AND_ATTRIBUTES,
+            SecurityImpersonation, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
+            TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
+            WRITE_RESTRICTED,
         };
         use windows::Win32::System::Threading::{
             CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
@@ -995,20 +1008,85 @@ impl LowLaunch {
             .expect("a copy of the token");
             let mut sid = PSID::default();
             ConvertStringSidToSidW(&HSTRING::from("S-1-16-4096"), &mut sid).expect("the Low SID");
-            let label = TOKEN_MANDATORY_LABEL {
-                Label: SID_AND_ATTRIBUTES {
-                    Sid: sid,
-                    // SE_GROUP_INTEGRITY.
-                    Attributes: 0x20,
-                },
-            };
-            SetTokenInformation(
-                low,
-                TokenIntegrityLevel,
-                (&raw const label).cast(),
-                u32::try_from(size_of::<TOKEN_MANDATORY_LABEL>()).unwrap() + 12,
-            )
-            .expect("the Low label");
+            if restricted {
+                let user = lil_platform::process::current_user_sid().expect("this user's SID");
+                let mut sids = Vec::new();
+                for text in [user.as_str(), "S-1-1-0"] {
+                    let mut one = PSID::default();
+                    ConvertStringSidToSidW(&HSTRING::from(text), &mut one).expect("a SID");
+                    sids.push(SID_AND_ATTRIBUTES {
+                        Sid: one,
+                        Attributes: 0,
+                    });
+                }
+                // The logon SID, without which the restricted process can't open its window
+                // station or desktop (STATUS_DLL_INIT_FAILED).
+                let mut needed = 0u32;
+                let _ = windows::Win32::Security::GetTokenInformation(
+                    token,
+                    windows::Win32::Security::TokenGroups,
+                    None,
+                    0,
+                    &mut needed,
+                );
+                let mut groups_buf = vec![0u64; (needed as usize).div_ceil(8)];
+                windows::Win32::Security::GetTokenInformation(
+                    token,
+                    windows::Win32::Security::TokenGroups,
+                    Some(groups_buf.as_mut_ptr().cast()),
+                    needed,
+                    &mut needed,
+                )
+                .expect("the token's groups");
+                let groups = &*groups_buf
+                    .as_ptr()
+                    .cast::<windows::Win32::Security::TOKEN_GROUPS>();
+                let all = std::slice::from_raw_parts(
+                    groups.Groups.as_ptr(),
+                    usize::try_from(groups.GroupCount).unwrap(),
+                );
+                let mut extra: Vec<SID_AND_ATTRIBUTES> = all
+                    .iter()
+                    // SE_GROUP_LOGON_ID.
+                    .filter(|g| g.Attributes & 0xC000_0000 == 0xC000_0000)
+                    .map(|g| SID_AND_ATTRIBUTES {
+                        Sid: g.Sid,
+                        Attributes: 0,
+                    })
+                    .collect();
+                let owned = sids.len();
+                sids.append(&mut extra);
+                let mut write_restricted = HANDLE::default();
+                CreateRestrictedToken(
+                    token,
+                    WRITE_RESTRICTED,
+                    None,
+                    None,
+                    Some(&sids),
+                    &mut write_restricted,
+                )
+                .expect("a write-restricted token");
+                let _ = CloseHandle(low);
+                low = write_restricted;
+                for one in sids.into_iter().take(owned) {
+                    let _ = LocalFree(Some(HLOCAL(one.Sid.0)));
+                }
+            } else {
+                let label = TOKEN_MANDATORY_LABEL {
+                    Label: SID_AND_ATTRIBUTES {
+                        Sid: sid,
+                        // SE_GROUP_INTEGRITY.
+                        Attributes: 0x20,
+                    },
+                };
+                SetTokenInformation(
+                    low,
+                    TokenIntegrityLevel,
+                    (&raw const label).cast(),
+                    u32::try_from(size_of::<TOKEN_MANDATORY_LABEL>()).unwrap() + 12,
+                )
+                .expect("the Low label");
+            }
             let startup = STARTUPINFOW {
                 cb: u32::try_from(size_of::<STARTUPINFOW>()).unwrap(),
                 ..Default::default()
@@ -1135,6 +1213,47 @@ fn a_lower_integrity_launch_hands_the_instance_nothing() {
     // nothing.
     let run: Value = serde_json::from_str(&low.wait_line("run ")).unwrap();
     assert!(run["pipe_notice"].is_string(), "{run}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.delivered(), Vec::<Value>::new());
+    folder.stop();
+}
+
+#[test] // spec: ARCH-027
+fn a_restricted_token_copy_is_never_trusted() {
+    // A write-restricted Medium copy of the app's exe holds the pipe: a launch hands it
+    // nothing (review M-20).
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    let out_dir = tempfile::tempdir().unwrap();
+    let held = LowLaunch::start_as(true, &folder, out_dir.path(), &env, "");
+    assert_eq!(held.wait_line("claimed "), "shell", "{:?}", held.lines());
+    let mut launch = Launch::start(&folder, &env, &task_url(&env, 3));
+    assert_eq!(launch.wait_exit().0, 0, "{:?}", launch.lines());
+    let run: Value = serde_json::from_str(&launch.wait_line("run ")).unwrap();
+    assert_eq!(
+        run["pipe_notice"],
+        lil_qt::single_instance::NOTICE_HELD,
+        "{run}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        held.lines().iter().all(|l| !l.starts_with("deliver")),
+        "{:?}",
+        held.lines()
+    );
+    drop(held);
+
+    // And a restricted launch hands a normal instance nothing: LILITH's own instance doesn't
+    // accept it, and it says so.
+    let app = running(&folder, &env, "", "shell");
+    let out_dir2 = tempfile::tempdir().unwrap();
+    let restricted = LowLaunch::start_as(true, &folder, out_dir2.path(), &env, &task_url(&env, 4));
+    let run: Value = serde_json::from_str(&restricted.wait_line("run ")).unwrap();
+    assert_eq!(
+        run["pipe_notice"],
+        lil_qt::single_instance::NOTICE_NOT_ACCEPTED,
+        "{run}"
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(app.delivered(), Vec::<Value>::new());
     folder.stop();

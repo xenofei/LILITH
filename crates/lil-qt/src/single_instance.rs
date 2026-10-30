@@ -43,10 +43,7 @@ use lil_platform::Env;
 use lil_platform::pipe::{
     ConnectError, CreateError, client_pid, create_instance, open_client, server_pid,
 };
-use lil_platform::process::{
-    ProcessInfo, ProcessInspector, SystemInspector, current_user_sid, integrity_rid,
-    own_integrity_rid,
-};
+use lil_platform::process::{PeerInfo, current_user_sid, inspect_peer, own_integrity_rid};
 use lil_protocol::Outcome;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -71,6 +68,12 @@ pub const NOTICE_HELD: &str = "Another program is holding LILITH's launch channe
 /// What it says when LILITH's own instance never answered (review M-14).
 pub const NOTICE_BUSY: &str =
     "The running LILITH didn't answer in time, so this launch opened a window of its own.";
+/// What it says when LILITH's own instance refused this launch (review M-21).
+pub const NOTICE_NOT_ACCEPTED: &str =
+    "The running LILITH didn't accept this launch, so it opened a window of its own.";
+/// What it says when this start can't tell who it is, so trusts no instance (review M-21).
+pub const NOTICE_SELF_UNKNOWN: &str = "LILITH couldn't check which program it is, so this \
+                                       launch opened a window of its own.";
 /// What it says when LILITH's own instance was still closing after [`CLOSING_WAIT`] (M-13).
 pub const NOTICE_CLOSING: &str =
     "The running LILITH was still closing, so this launch opened a window of its own.";
@@ -97,6 +100,11 @@ pub enum ForwardError {
     Untrusted,
     /// Every instance of the pipe stayed busy for the whole budget: nothing served it.
     Busy,
+    /// LILITH's own instance (this exe, this user, checked) didn't accept this launch: it can't
+    /// tell who it is, or it runs at a higher integrity level (review M-21).
+    NotAccepted,
+    /// This process can't tell who it is, so it trusts no peer (review M-21).
+    SelfUnknown,
     /// The running instance is closing: it took nothing.
     Closing,
     /// No exchange within [`BUDGET`].
@@ -118,6 +126,10 @@ impl std::fmt::Display for ForwardError {
                 write!(f, "every instance of the pipe stayed busy for {BUDGET:?}")
             }
             ForwardError::Closing => f.write_str("the running instance is closing"),
+            ForwardError::NotAccepted => {
+                f.write_str("the running instance didn't accept this launch")
+            }
+            ForwardError::SelfUnknown => f.write_str("this process can't tell who it is"),
             ForwardError::Timeout => {
                 write!(f, "the running instance didn't answer within {BUDGET:?}")
             }
@@ -428,28 +440,32 @@ impl Identity {
 }
 
 /// ARCH-027 for the app's pipe, either way: the peer is this exe, run as this user, at an
-/// integrity level no lower than this process's (review I-1, I-6). A lower-integrity copy of
-/// the same exe (a sandboxed helper's child, say) is no peer to hand a launch or a deny token
-/// to, nor to take one from.
-pub fn peer_is_trusted(info: &ProcessInfo, peer_integrity: u32, me: &Identity) -> bool {
-    peer_integrity >= me.integrity
-        && info.user_sid.eq_ignore_ascii_case(&me.sid)
-        && same_file(&info.image, &me.exe)
+/// integrity level no lower than this process's, with a token that is neither restricted nor
+/// an AppContainer's (review I-1, I-6, M-20). A lower-integrity or restricted copy of the same
+/// exe (a sandboxed helper's child, say) is no peer to hand a launch or a deny token to, nor to
+/// take one from.
+pub fn peer_is_trusted(peer: &PeerInfo, me: &Identity) -> bool {
+    peer.token.integrity >= me.integrity
+        && !peer.token.restricted
+        && !peer.token.app_container
+        && peer.process.user_sid.eq_ignore_ascii_case(&me.sid)
+        && same_file(&peer.process.image, &me.exe)
 }
 
-/// [`peer_is_trusted`] of process `pid`, inspected now: false (logged) when it can't be.
+/// [`peer_is_trusted`] of process `pid`, inspected now through one handle (review M-19): false
+/// (logged) when it can't be.
 fn peer_checks_out(pid: u32, me: &Identity) -> bool {
-    let inspected = SystemInspector
-        .inspect(pid)
-        .and_then(|info| integrity_rid(pid).map(|il| (info, il)));
-    match inspected {
-        Ok((info, il)) => {
-            let trusted = peer_is_trusted(&info, il, me);
+    match inspect_peer(pid) {
+        Ok(peer) => {
+            let trusted = peer_is_trusted(&peer, me);
             if !trusted {
                 tracing::warn!(
                     pid,
-                    integrity = format!("{il:#x}"),
-                    "a pipe peer isn't this exe run as this user at this integrity level or above"
+                    integrity = format!("{:#x}", peer.token.integrity),
+                    restricted = peer.token.restricted,
+                    app_container = peer.token.app_container,
+                    "a pipe peer isn't this exe run as this user, unrestricted, at this \
+                     integrity level or above"
                 );
             }
             trusted
@@ -479,7 +495,10 @@ fn forward_granting(
     args: &[String],
     grant_foreground: bool,
 ) -> Result<u32, ForwardError> {
-    let me = Identity::of_this_process().map_err(ForwardError::Io)?;
+    let me = Identity::of_this_process().map_err(|e| {
+        tracing::warn!(error = %e, "this process can't tell who it is, so it trusts no pipe peer");
+        ForwardError::SelfUnknown
+    })?;
     forward_as(env, app, confirm, args, &me, grant_foreground)
 }
 
@@ -539,8 +558,9 @@ fn forward_as(
             let mut reader = BufReader::new(reader);
             let hello = read_line(&mut reader).await.map_err(after_trust)?;
             if hello["untrusted"] == true {
-                tracing::warn!(pid, "the running instance doesn't trust this launch");
-                return Err(ForwardError::Untrusted);
+                // LILITH's own instance, checked above, refused this launch (review M-21).
+                tracing::warn!(pid, "the running LILITH didn't accept this launch");
+                return Err(ForwardError::NotAccepted);
             }
             if hello["app"] != app || hello["pid"].as_u64() != Some(u64::from(pid)) {
                 return Err(ForwardError::Refused);
@@ -764,6 +784,14 @@ fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start
                 plan.pipe_notice = Some(NOTICE_HELD);
                 return Start::Run(None);
             }
+            Err(ForwardError::NotAccepted) => {
+                plan.pipe_notice = Some(NOTICE_NOT_ACCEPTED);
+                return Start::Run(None);
+            }
+            Err(ForwardError::SelfUnknown) => {
+                plan.pipe_notice = Some(NOTICE_SELF_UNKNOWN);
+                return Start::Run(None);
+            }
             Err(ForwardError::Busy) => {
                 tracing::warn!(
                     "the running LILITH didn't answer in time: starting as an instance of its \
@@ -856,6 +884,7 @@ pub fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lil_platform::process::{ProcessInfo, TokenTrust};
     use std::path::PathBuf;
 
     fn info(image: PathBuf, sid: &str) -> ProcessInfo {
@@ -868,7 +897,7 @@ mod tests {
     }
 
     #[test] // spec: ARCH-027
-    fn a_peer_must_be_this_exe_run_as_this_user_at_no_lower_integrity() {
+    fn a_peer_must_be_this_exe_run_as_this_user_unrestricted_at_no_lower_integrity() {
         const LOW: u32 = 0x1000;
         const MEDIUM: u32 = 0x2000;
         const HIGH: u32 = 0x3000;
@@ -879,33 +908,51 @@ mod tests {
             sid: sid.to_string(),
             integrity: MEDIUM,
         };
-        assert!(peer_is_trusted(&info(own.clone(), sid), MEDIUM, &me));
+        let peer = |image: PathBuf, sid: &str, integrity: u32| PeerInfo {
+            process: info(image, sid),
+            token: TokenTrust {
+                integrity,
+                restricted: false,
+                app_container: false,
+            },
+        };
+        assert!(peer_is_trusted(&peer(own.clone(), sid, MEDIUM), &me));
         assert!(peer_is_trusted(
-            &info(own.clone(), &sid.to_lowercase()),
-            MEDIUM,
+            &peer(own.clone(), &sid.to_lowercase(), MEDIUM),
             &me
         ));
         // A peer above this process (elevated) is no risk to it; one below is (review I-6).
-        assert!(peer_is_trusted(&info(own.clone(), sid), HIGH, &me));
-        assert!(!peer_is_trusted(&info(own.clone(), sid), LOW, &me));
-        assert!(!peer_is_trusted(&info(own.clone(), sid), 0, &me));
+        assert!(peer_is_trusted(&peer(own.clone(), sid, HIGH), &me));
+        assert!(!peer_is_trusted(&peer(own.clone(), sid, LOW), &me));
+        assert!(!peer_is_trusted(&peer(own.clone(), sid, 0), &me));
+        // A restricted or AppContainer token, at Medium all the same (review M-20).
+        let mut restricted = peer(own.clone(), sid, MEDIUM);
+        restricted.token.restricted = true;
+        assert!(!peer_is_trusted(&restricted, &me));
+        let mut contained = peer(own.clone(), sid, MEDIUM);
+        contained.token.app_container = true;
+        assert!(!peer_is_trusted(&contained, &me));
         // An elevated instance takes nothing from a Medium launch (review M-16).
         let elevated = Identity {
             integrity: HIGH,
             ..me.clone()
         };
-        assert!(!peer_is_trusted(&info(own.clone(), sid), MEDIUM, &elevated));
+        assert!(!peer_is_trusted(&peer(own.clone(), sid, MEDIUM), &elevated));
         // Another user running the same exe.
         for other_sid in ["S-1-5-21-1-2-3-1002", "S-1-5-18"] {
-            assert!(!peer_is_trusted(&info(own.clone(), other_sid), MEDIUM, &me));
+            assert!(!peer_is_trusted(&peer(own.clone(), other_sid, MEDIUM), &me));
         }
         // This user running another exe, or one that doesn't exist.
         let other = own.with_file_name("not-this-exe.exe");
-        assert!(!peer_is_trusted(&info(other, sid), MEDIUM, &me));
+        assert!(!peer_is_trusted(&peer(other, sid, MEDIUM), &me));
         let dir = tempfile::tempdir().unwrap();
         let copy = dir.path().join("copy.exe");
         std::fs::copy(&own, &copy).unwrap();
-        assert!(!peer_is_trusted(&info(copy, sid), MEDIUM, &me));
+        assert!(!peer_is_trusted(&peer(copy, sid, MEDIUM), &me));
+        // This test process itself, read through one handle.
+        let this = inspect_peer(std::process::id()).unwrap();
+        let me_now = Identity::of_this_process().unwrap();
+        assert!(peer_is_trusted(&this, &me_now));
     }
 
     #[test] // spec: APP-014
