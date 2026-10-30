@@ -2400,6 +2400,87 @@ async fn queue_position_and_queue_order_follow_a_move() {
     fx.shutdown().await;
 }
 
+/// What the Jobs panel relies on: a job the core has dispatched (`submitting`, `queued_in_engine`)
+/// keeps status `queued`, has no `queue_position`, is left out of the queue order, and `{status:
+/// "queued"}` finds it among the others, whose places don't count it.
+#[tokio::test(start_paused = true)] // spec: CORE-160, APP-114
+async fn a_dispatched_job_is_in_the_status_read_and_not_the_queue_order() {
+    let fx = Fx::suite().await;
+    let mut in_engine = spec(
+        Lane::GpuHeavy,
+        Priority::User,
+        json!({"gate": "engine", "in_engine": true}),
+    );
+    in_engine.engine = Some(EngineKind::ComfyUi);
+    let in_engine = fx.submit(in_engine).await;
+    until_substatus(&fx, &in_engine.job_id, "queued_in_engine").await;
+    let mut submitting = gated(Lane::Cpu, Priority::User, "submit");
+    submitting.engine = Some(EngineKind::ComfyUi);
+    let submitting = fx.submit(submitting).await;
+    until_substatus(&fx, &submitting.job_id, "submitting").await;
+    let first = fx
+        .submit(spec(Lane::GpuHeavy, Priority::User, json!({})))
+        .await;
+    let second = fx
+        .submit(spec(Lane::GpuHeavy, Priority::User, json!({})))
+        .await;
+
+    let f = JobFilter {
+        order: Some(ListOrder::Queue),
+        ..JobFilter::default()
+    };
+    let places: Vec<(String, Option<u32>)> = fx
+        .jobs
+        .list(&fx.ctx(), f)
+        .await
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|j| (j.job_id, j.queue_position))
+        .collect();
+    assert_eq!(
+        places,
+        [
+            (first.job_id.clone(), Some(0)),
+            (second.job_id.clone(), Some(1))
+        ],
+        "the dispatched jobs aren't listed, and no place counts them"
+    );
+
+    let f = JobFilter {
+        status: Some(JobStatus::Queued),
+        ..JobFilter::default()
+    };
+    let (listed, next) = fx.jobs.list(&fx.ctx(), f).await.unwrap();
+    assert_eq!(next, None);
+    let listed: Vec<(String, Option<u32>, JobStatus)> = listed
+        .into_iter()
+        .map(|j| (j.job_id, j.queue_position, j.status))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (second.job_id.clone(), Some(1), JobStatus::Queued),
+            (first.job_id.clone(), Some(0), JobStatus::Queued),
+            (submitting.job_id.clone(), None, JobStatus::Queued),
+            (in_engine.job_id.clone(), None, JobStatus::Queued),
+        ],
+        "newest first, the same places, the dispatched jobs with none"
+    );
+
+    fx.handler.open("engine");
+    fx.handler.open("submit");
+    for id in [
+        &in_engine.job_id,
+        &submitting.job_id,
+        &first.job_id,
+        &second.job_id,
+    ] {
+        fx.finished(id).await;
+    }
+    fx.shutdown().await;
+}
+
 /// Review I-1: a job a restart holds is never picked until it is released, so it has no
 /// `queue_position`, isn't counted ahead of a job submitted after it, and the queue order lists
 /// it after the runnable jobs of its lane.

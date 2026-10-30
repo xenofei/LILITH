@@ -124,3 +124,25 @@ set_tests_properties(bench_hardware PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 22: the Jobs panel and the cost and time chip; the panel tests make shells too, so they
+# run on the 1280 x 800 offscreen screen.
+lil_qml_test(tst_jobs_panel tst_jobs_panel.qml)
+lil_qml_test(tst_cost_chip tst_cost_chip.qml)
+set_property(TEST tst_jobs_panel APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+add_test(NAME grab_jobs COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/grab_jobs.qml)
+set_tests_properties(grab_jobs PROPERTIES
+    LABELS grabs
+    TIMEOUT 300
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+set_property(TEST grab_jobs APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+# The Jobs panel's GUI-thread cost (label bench): offscreen on the 1280 x 800 screen.
+add_test(NAME bench_jobs_panel COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/bench_jobs_panel.qml)
+set_tests_properties(bench_jobs_panel PROPERTIES
+    LABELS bench
+    TIMEOUT 120
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")

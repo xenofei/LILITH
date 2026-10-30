@@ -549,6 +549,10 @@ pub struct JobSummary {
     /// lane's queued jobs of every scope (Appendix G "Queue position").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<u32>,
+    /// Present (and `true`) while a retry waits in `submitting` for the earlier ComfyUI prompt
+    /// it inherited (its row's `withdrawn_id`) to leave (Appendix G "Withdrawal").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_earlier_prompt: bool,
 }
 
 /// The summary text of a job whose every node the engine served from its cache (CORE-117).

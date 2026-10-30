@@ -162,4 +162,15 @@ TestCase {
         wait(500)
         compare(TestFiles.networkRequests(), before, "no control loaded the <img>")
     }
+
+    // A Templates control takes its font from the platform theme, not the application font
+    // (QQuickTheme), so each base control names the theme's face itself.
+    function test_every_base_control_takes_the_theme_face() { // spec: APP-012
+        const p = createTemporaryObject(page, tc)
+        compare(Qt.application.font.family, Theme.fontFamily, "the application font")
+        for (const [name, control] of [["LButton", p.button], ["LIconButton", p.iconButton],
+                                       ["LToggle", p.toggle], ["LTextField", p.field],
+                                       ["LBanner's Dismiss button", p.banner.closeButton]])
+            compare(control.font.family, Theme.fontFamily, name)
+    }
 }

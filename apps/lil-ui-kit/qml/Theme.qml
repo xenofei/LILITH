@@ -27,7 +27,9 @@ QtObject {
 
     // The UI face (the owner's choice), bundled with the shim (Inter 4.1, OFL-1.1) and set once
     // as the application font by lil-image's main.cpp and the QML test runner, which read it
-    // from here (lilshim::applyThemeFont).
+    // from here (lilshim::applyThemeFont). Text items follow the application font; a Templates
+    // control takes its font from the platform theme instead, so each base control sets
+    // `font.family` to this itself.
     readonly property string fontFamily: "Inter"
     readonly property int spacing: 8
     readonly property int radius: 4

@@ -12,7 +12,8 @@
 //!   that is `ref`, not `asset_id`, which is unique only within a project.
 //! - **Paging** ([`crate::paging::PageState`]): a load asks for the first page with `limit` set
 //!   to `pageSize`; `canFetchMore`/`fetchMore` ask for the next with the last page's
-//!   `next_cursor` as `cursor`, one at a time, until it is `null`. A row a later page holds
+//!   `next_cursor` as `cursor`, one at a time, until it is `null`; `pageLoaded` says each of those
+//!   pages is in, whether or not it added a row. A row a later page holds
 //!   already (inserted live meanwhile) is updated in place, not added twice. `argsJson` filters
 //!   the pages only: events are upserted whatever the filter, so a filtered panel filters in QML
 //!   or reloads.
@@ -161,6 +162,10 @@ pub mod qobject {
         fn can_fetch_more(self: &JsonListModel, parent: &QModelIndex) -> bool;
         #[cxx_override]
         fn fetch_more(self: Pin<&mut JsonListModel>, parent: &QModelIndex);
+
+        /// A page after the first is in, its rows applied, whether or not it added any.
+        #[qsignal]
+        fn page_loaded(self: Pin<&mut JsonListModel>);
 
         #[inherit]
         unsafe fn begin_reset_model(self: Pin<&mut JsonListModel>);
@@ -604,6 +609,7 @@ impl qobject::JsonListModel {
             self.as_mut().rust_mut().rows.append_page(fresh, &id_key);
             unsafe { self.as_mut().end_insert_rows() };
         }
+        self.page_loaded();
     }
 
     pub fn core_call_failed(mut self: Pin<&mut Self>, id: &QString, error_json: &QString) {

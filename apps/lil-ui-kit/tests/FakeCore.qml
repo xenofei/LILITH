@@ -8,6 +8,8 @@
 //                           counts its own seq
 //   emitFromCore(topic, kind, data)
 //                           the same, through the bridge's event step (previews), as Core's are
+//   jobsListAnswer(args, jobs, lanes)
+//                           `jobs.list`'s answer, as the real core gives it, over the live `jobs`
 // As Core does, a tool call's pending confirmation keeps the request open (unless the caller
 // cancels it), and an answer to it on the `confirmations` topic resends the call once with its
 // retry token (recorded in `resends`, answered again with respond(id, ...)) or settles it with
@@ -89,6 +91,36 @@ QtObject {
     }
 
     // The test's side.
+
+    // `jobs.list`'s wire outcome for `args` over the live `jobs`, as the real core answers it
+    // (`Jobs::list`, `Active::queued`, Appendix G "Queue position"): `{order: "queue"}` lists the
+    // jobs the core holds queued, by lane, then by `queue_position`, those a restart holds after
+    // the others; a job it has dispatched (`submitting`, `queued_in_engine`) keeps status `queued`
+    // but isn't among them and has no `queue_position`. `{status}` lists that status, newest
+    // first, the dispatched jobs with the others. Pages of `args.limit`, with a cursor of its own.
+    function jobsListAnswer(args, jobs, lanes) {
+        const dispatched = j => j.status === "queued"
+                                && (j.substatus === "submitting" || j.substatus === "queued_in_engine")
+        const placeless = j => j.queue_position === undefined || j.queue_position === null
+        const laneRank = j => j.lane === "gpu-heavy" ? 0 : j.lane === "cpu" ? 1 : 2
+        const sorted = jobs.map(j => dispatched(j) ? Object.assign({}, j, {queue_position: undefined}) : j)
+        let listed
+        if (args.order === "queue") {
+            listed = sorted.filter(j => j.status === "queued" && !dispatched(j)).sort((a, b) =>
+                laneRank(a) - laneRank(b) || Number(placeless(a)) - Number(placeless(b))
+                || (a.queue_position || 0) - (b.queue_position || 0))
+        } else {
+            listed = sorted.filter(j => !args.status || j.status === args.status)
+                           .sort((a, b) => String(b.created).localeCompare(String(a.created)))
+        }
+        const at = args.cursor ? Number(args.cursor.slice(1)) : 0
+        const size = args.limit || 100
+        const more = at + size < listed.length
+        return {status: "ok", artifacts: [], summary_text: "",
+                structured: {jobs: listed.slice(at, at + size), next_cursor: more ? "c" + (at + size) : null,
+                             lanes: lanes || []}}
+    }
+
     function respond(id, outcome) {
         if (!(id in _open))
             return false
