@@ -14,7 +14,7 @@ use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP_STATE_LISTEN, MIB_TCP6ROW_OWNER_PID,
     MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID,
     MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
-    UDP_TABLE_OWNER_PID,
+    TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
@@ -201,31 +201,29 @@ fn row_port(raw: u32) -> u16 {
     u16::from_be(raw as u16)
 }
 
-/// An IPv4 row's local address and owner, when the row is a listening socket.
-fn listener_v4(r: &MIB_TCPROW_OWNER_PID) -> Option<(SocketAddr, u32)> {
-    (r.dwState == MIB_TCP_STATE_LISTEN.0 as u32).then(|| {
-        // The address is in network byte order: its bytes in memory are the octets.
-        let ip = Ipv4Addr::from(r.dwLocalAddr.to_ne_bytes());
-        let addr = SocketAddr::V4(SocketAddrV4::new(ip, row_port(r.dwLocalPort)));
-        (addr, r.dwOwningPid)
-    })
+/// An IPv4 listener row's local address and owner.
+fn listener_v4(r: &MIB_TCPROW_OWNER_PID) -> (SocketAddr, u32) {
+    // The address is in network byte order: its bytes in memory are the octets.
+    let ip = Ipv4Addr::from(r.dwLocalAddr.to_ne_bytes());
+    let addr = SocketAddr::V4(SocketAddrV4::new(ip, row_port(r.dwLocalPort)));
+    (addr, r.dwOwningPid)
 }
 
-/// An IPv6 row's local address and owner, when the row is a listening socket.
-fn listener_v6(r: &MIB_TCP6ROW_OWNER_PID) -> Option<(SocketAddr, u32)> {
-    (r.dwState == MIB_TCP_STATE_LISTEN.0 as u32).then(|| {
-        let ip = Ipv6Addr::from(r.ucLocalAddr);
-        let addr = SocketAddr::V6(SocketAddrV6::new(
-            ip,
-            row_port(r.dwLocalPort),
-            0,
-            r.dwLocalScopeId,
-        ));
-        (addr, r.dwOwningPid)
-    })
+/// An IPv6 listener row's local address and owner.
+fn listener_v6(r: &MIB_TCP6ROW_OWNER_PID) -> (SocketAddr, u32) {
+    let ip = Ipv6Addr::from(r.ucLocalAddr);
+    let addr = SocketAddr::V6(SocketAddrV6::new(
+        ip,
+        row_port(r.dwLocalPort),
+        0,
+        r.dwLocalScopeId,
+    ));
+    (addr, r.dwOwningPid)
 }
 
-/// Every listening TCP socket: its local address and its owner's pid.
+/// Every listening TCP socket: its local address and its owner's pid. The OS picks the rows (the
+/// `_LISTENER` table class): a row's `dwState` can't be trusted, since some Windows builds report
+/// a listener as state 0 and an outgoing connection as LISTEN in the `_ALL` table.
 fn tcp_listeners() -> io::Result<Vec<(SocketAddr, u32)>> {
     let mut found = Vec::new();
 
@@ -237,7 +235,7 @@ fn tcp_listeners() -> io::Result<Vec<(SocketAddr, u32)>> {
                 size,
                 false,
                 u32::from(AF_INET.0),
-                TCP_TABLE_OWNER_PID_ALL,
+                TCP_TABLE_OWNER_PID_LISTENER,
                 0,
             )
         }
@@ -246,7 +244,7 @@ fn tcp_listeners() -> io::Result<Vec<(SocketAddr, u32)>> {
     let rows = unsafe {
         table_rows::<MIB_TCPROW_OWNER_PID>(&tcp4, offset_of!(MIB_TCPTABLE_OWNER_PID, table))
     }?;
-    found.extend(rows.iter().filter_map(listener_v4));
+    found.extend(rows.iter().map(listener_v4));
 
     let tcp6 = fetch(|buf, size| {
         // SAFETY: as above.
@@ -256,7 +254,7 @@ fn tcp_listeners() -> io::Result<Vec<(SocketAddr, u32)>> {
                 size,
                 false,
                 u32::from(AF_INET6.0),
-                TCP_TABLE_OWNER_PID_ALL,
+                TCP_TABLE_OWNER_PID_LISTENER,
                 0,
             )
         }
@@ -265,7 +263,7 @@ fn tcp_listeners() -> io::Result<Vec<(SocketAddr, u32)>> {
     let rows = unsafe {
         table_rows::<MIB_TCP6ROW_OWNER_PID>(&tcp6, offset_of!(MIB_TCP6TABLE_OWNER_PID, table))
     }?;
-    found.extend(rows.iter().filter_map(listener_v6));
+    found.extend(rows.iter().map(listener_v6));
 
     Ok(found)
 }
@@ -313,7 +311,6 @@ unsafe fn table_rows<T: Copy>(buf: &[u64], offset: usize) -> io::Result<&[T]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_ESTAB;
 
     /// A port as the tables hold it: network byte order in the low 16 bits.
     fn raw_port(port: u16) -> u32 {
@@ -344,34 +341,30 @@ mod tests {
         }
     }
 
-    /// Table rows become the addresses the loopback check reads: wildcard listeners as
-    /// `0.0.0.0` and `[::]`, loopback ones as `127.0.0.1` and `[::1]`, and a connected socket not
-    /// at all. Synthetic rows, so no test binds a wildcard socket (P3-R11).
+    /// Listener rows become the addresses the loopback check reads: wildcard listeners as
+    /// `0.0.0.0` and `[::]`, loopback ones as `127.0.0.1` and `[::1]`, whatever state the row
+    /// reports. Synthetic rows, so no test binds a wildcard socket (P3-R11).
     #[test] // spec: ARCH-068
     fn table_rows_convert_to_listening_addresses() {
         let listen = MIB_TCP_STATE_LISTEN.0 as u32;
-        let established = MIB_TCP_STATE_ESTAB.0 as u32;
         let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
         assert_eq!(
             listener_v4(&v4([0, 0, 0, 0], 8188, listen, 7)),
-            Some((addr("0.0.0.0:8188"), 7))
+            (addr("0.0.0.0:8188"), 7)
         );
         assert_eq!(
-            listener_v4(&v4([127, 0, 0, 1], 50_001, listen, 8)),
-            Some((addr("127.0.0.1:50001"), 8))
+            listener_v4(&v4([127, 0, 0, 1], 50_001, 0, 8)),
+            (addr("127.0.0.1:50001"), 8),
+            "a listener some Windows builds report as state 0"
         );
-        assert_eq!(listener_v4(&v4([127, 0, 0, 1], 1, established, 8)), None);
         assert_eq!(
             listener_v6(&v6(Ipv6Addr::UNSPECIFIED, 8188, listen, 7)),
-            Some((addr("[::]:8188"), 7))
+            (addr("[::]:8188"), 7)
         );
         assert_eq!(
-            listener_v6(&v6(Ipv6Addr::LOCALHOST, 443, listen, 9)),
-            Some((addr("[::1]:443"), 9))
-        );
-        assert_eq!(
-            listener_v6(&v6(Ipv6Addr::LOCALHOST, 1, established, 9)),
-            None
+            listener_v6(&v6(Ipv6Addr::LOCALHOST, 443, 0, 9)),
+            (addr("[::1]:443"), 9),
+            "the same for IPv6"
         );
     }
 }
