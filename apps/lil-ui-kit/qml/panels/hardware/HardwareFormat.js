@@ -8,10 +8,18 @@ function group(n) {
     return (n < 0 ? "-" : "") + s.replace(/\B(?=(\d{3})+(?!\d))/g, ",")
 }
 
-// One decimal, dropped when it is 0: 9.5, 16.
+// `x` with `digits` decimals and its whole part grouped: 2974.66 is "2,974.66".
+function fixed(x, digits) {
+    const text = Math.abs(x).toFixed(digits)
+    const dot = text.indexOf(".")
+    const whole = dot < 0 ? text : text.slice(0, dot)
+    return (x < 0 && Number(text) !== 0 ? "-" : "") + group(Number(whole)) + (dot < 0 ? "" : text.slice(dot))
+}
+
+// One decimal, dropped when it is 0: 9.5, 16, 1,234.5.
 function oneDecimal(x) {
     const r = Math.round(x * 10) / 10
-    return Number.isInteger(r) ? group(r) : r.toFixed(1)
+    return Number.isInteger(r) ? group(r) : fixed(r, 1)
 }
 
 function percent(p) {
@@ -40,23 +48,25 @@ function mhz(n) {
     return group(n) + " MHz"
 }
 
-// Bytes per second, decimal units: "1.2 MB/s", "40 kB/s".
+// Bytes per second, decimal units, the unit chosen after rounding: "1.2 MB/s", "40 kB/s", and
+// 999,960 B/s is "1 MB/s", not "1,000 kB/s".
 function rate(bps) {
-    if (bps >= 1e9)
-        return oneDecimal(bps / 1e9) + " GB/s"
-    if (bps >= 1e6)
-        return oneDecimal(bps / 1e6) + " MB/s"
-    if (bps >= 1e3)
-        return oneDecimal(bps / 1e3) + " kB/s"
+    const units = [[1e9, " GB/s"], [1e6, " MB/s"], [1e3, " kB/s"]]
+    for (const [size, unit] of units) {
+        const shown = Math.round(bps / size * 10) / 10
+        if (shown >= 1)
+            return oneDecimal(shown) + unit
+    }
     return group(bps) + " B/s"
 }
 
-// mJ as energy: "2.0 Wh", "500 Wh", "15.00 kWh".
+// mJ as energy, the unit chosen after rounding: "2.0 Wh", "500 Wh", "15.00 kWh", "2,974.72 kWh";
+// 999.96 Wh is "1.00 kWh".
 function energy(mj) {
     const wh = mj / 3.6e6
-    if (wh >= 1000)
-        return (wh / 1000).toFixed(2) + " kWh"
-    if (wh >= 10)
+    if (Math.round(wh) >= 1000)
+        return fixed(wh / 1000, 2) + " kWh"
+    if (Math.round(wh * 10) / 10 >= 10)
         return group(wh) + " Wh"
     return wh.toFixed(1) + " Wh"
 }

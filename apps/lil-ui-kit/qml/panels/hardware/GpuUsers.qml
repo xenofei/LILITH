@@ -1,8 +1,10 @@
 // "Who's using the GPU" (APP-127): the snapshot's `gpu_users`, the most dedicated GPU memory
-// first, each with its MiB and, when the GPU reports it, its share of the GPU. The app's own
-// process (role `app`) is "LILITH (this app)" and ComfyUI's (role `comfyui`) "ComfyUI"; any other
-// name comes from the system and is untrusted, so it is shown through Core.shownText (P4a-R8).
+// first, each with its MiB and, when the GPU reports it, its share of the GPU. This app's own
+// process (role `app`, this process's pid) is "LILITH (this app)", another LILITH app's (role
+// `app`) "LILITH app", and ComfyUI's (role `comfyui`) "ComfyUI"; any other name comes from the
+// system and is untrusted, so it is shown through Core.shownText (P4a-R8).
 import QtQuick
+import Lilith.Core
 import Lilith.UiKit
 import "HardwareFormat.js" as Format
 
@@ -19,7 +21,7 @@ LCard {
 
     function nameOf(user) {
         if (user.role === "app")
-            return "LILITH (this app)"
+            return user.pid === Hardware.pid ? "LILITH (this app)" : "LILITH app"
         if (user.role === "comfyui")
             return "ComfyUI"
         return root.core ? root.core.shownText(String(user.name || ("pid " + user.pid)), root.nameChars) : ""
@@ -36,13 +38,15 @@ LCard {
             font.pixelSize: Theme.fontSize
         }
 
+        // By count, so a sample (a new array every second) updates the rows in place.
         Repeater {
-            model: root.users
+            model: root.users.length
 
             delegate: Item {
                 id: row
                 objectName: "gpuUser"
-                required property var modelData
+                required property int index
+                readonly property var modelData: root.users[index] || ({})
                 readonly property string name: root.nameOf(modelData)
                 readonly property string share: modelData.sm_permille !== undefined
                                                 ? Format.percent(modelData.sm_permille / 10) : ""

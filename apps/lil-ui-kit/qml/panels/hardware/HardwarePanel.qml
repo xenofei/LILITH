@@ -7,15 +7,21 @@
 //   (events can overtake one another); `alert` and `alert_cleared` change the alerts at once, and
 //   the next sample's `alerts` are the state again. A `snapshot` of the topic is the state too,
 //   and like `resync_required` it loads everything again. It never reloads on `ready`, but for a
-//   first load that failed (the session wasn't connected yet).
+//   first load that failed (the session wasn't connected yet). The cards' rows are fixed items
+//   bound to the snapshot, updated in place every second, never rebuilt.
 // - **Charts.** One `telemetry.series` call loads every chart for the window, at
 //   Hardware.resolutionFor(window) (1 s up to an hour, else 1 min), from `to` minus the window
-//   plus one step, so a range never holds more than the tool's 3,600 points. Each sample appends
-//   its values; the samples come at 1 Hz through Core's throttle (APP-027). Each chart keeps at
-//   most a point per pixel (ChartSeries, in Rust).
+//   plus two steps, so a range stays under the tool's 3,600 points even with a clock running a
+//   little fast. Each sample is appended to every chart, with NaN where it has no value, and
+//   ends every chart's window: a chart that stopped shows it. The samples come at 1 Hz through
+//   Core's throttle (APP-027). Each chart keeps at most a point per pixel (ChartSeries, in
+//   Rust).
 // - **No CPU temperature** (APP-128): Windows doesn't give it without a driver.
-// - A figure that isn't measured says so: "estimated", "unknown", "not reported", or "last
-//   reading" for a GPU that was lost.
+// - A figure that isn't measured says so: "estimated" (the whole system always, and a part
+//   whose basis in `system_parts` is estimated), "unknown", "not reported", "not measured",
+//   "rest of system not set", or "last reading" for a GPU that was lost.
+// - Text from outside the panel (the GPU's and the disks' and adapters' names, the core's error
+//   messages, an unknown alert kind) is shown through Core.shownText (P4a-R8) and as plain text.
 import QtQuick
 import QtQuick.Controls.Basic as QQC
 import Lilith.Core
@@ -51,29 +57,28 @@ Rectangle {
     // The charts, in order, as they are made.
     property var chartTiles: []
 
-    // The charts: metric, label, value as text, the top of the scale (0: the window's peak) and
-    // the live value in a snapshot (NaN for none).
+    // The charts: metric, label, value as text and the live value in a snapshot (NaN for none).
+    // Constant: what depends on the snapshot (the scale, the estimate note) is bound per tile.
     readonly property var chartSpecs: [
-        {metric: "gpu.util", label: "GPU load", format: v => Format.percent(v), max: 100,
+        {metric: "gpu.util", label: "GPU load", format: v => Format.percent(v),
          live: s => s.gpu && s.gpu.measured ? s.gpu.util_pct : NaN},
         {metric: "gpu.vram_used", label: "GPU memory", format: v => Format.gib(v),
-         max: gpu ? gpu.vram_total_mib : 0,
          live: s => s.gpu && s.gpu.measured ? s.gpu.vram_used_mib : NaN},
-        {metric: "gpu.temp", label: "GPU temperature", format: v => Math.round(v) + " °C", max: 100,
+        {metric: "gpu.temp", label: "GPU temperature", format: v => Math.round(v) + " °C",
          live: s => s.gpu && s.gpu.measured ? s.gpu.temp_c : NaN},
-        {metric: "gpu.power", label: "GPU power", format: v => Format.watts(v), max: 0,
+        {metric: "gpu.power", label: "GPU power", format: v => Format.watts(v),
          live: s => s.gpu && s.gpu.power_mw > 0 ? s.gpu.power_mw : NaN},
-        {metric: "cpu.util", label: "CPU load", format: v => Format.percent(v / 10), max: 1000,
+        {metric: "cpu.util", label: "CPU load", format: v => Format.percent(v / 10),
          live: s => s.cpu.util_permille},
-        {metric: "cpu.power", label: "CPU power", format: v => Format.watts(v), max: 0,
+        {metric: "cpu.power", label: "CPU power", format: v => Format.watts(v),
          live: s => s.cpu.package_power_mw > 0 ? s.cpu.package_power_mw : NaN},
-        {metric: "ram.used", label: "RAM", format: v => Format.gib(v), max: snapshot ? snapshot.ram.total_mib : 0,
+        {metric: "ram.used", label: "RAM", format: v => Format.gib(v),
          live: s => s.ram.used_mib},
-        {metric: "system.power", label: "Whole-system power", format: v => Format.watts(v), max: 0,
+        {metric: "system.power", label: "System power", format: v => Format.watts(v),
          live: s => s.system_power_mw > 0 ? s.system_power_mw : NaN},
-        {metric: "net.rx", label: "Network in", format: v => Format.rate(v), max: 0,
+        {metric: "net.rx", label: "Network in", format: v => Format.rate(v),
          live: s => s.net.reduce((n, a) => n + a.rx_bps, 0)},
-        {metric: "net.tx", label: "Network out", format: v => Format.rate(v), max: 0,
+        {metric: "net.tx", label: "Network out", format: v => Format.rate(v),
          live: s => s.net.reduce((n, a) => n + a.tx_bps, 0)}
     ]
 
@@ -118,6 +123,11 @@ Rectangle {
         energy.reload()
     }
 
+    // A failure's message as shown (it is the core's text).
+    function failure(what, e) {
+        return what + shown(String(e.message || e.code || ""), 200)
+    }
+
     function loadSnapshot() {
         if (_snapshotCall)
             _snapshotCall.cancel()
@@ -128,7 +138,7 @@ Rectangle {
                 root.problem = ""
                 root.apply(out.structured)
             },
-            error: e => { root.problem = "The hardware can't be read now: " + (e.message || e.code) }
+            error: e => { root.problem = root.failure("The hardware can't be read now: ", e) }
         })
     }
 
@@ -141,7 +151,7 @@ Rectangle {
         const window = windowS
         _seriesCall = CoreCall.call(core, "telemetry.series", {
             metrics: chartSpecs.map(c => c.metric),
-            from: new Date(to - windowS * 1000 + step).toISOString(),
+            from: new Date(to - windowS * 1000 + 2 * step).toISOString(),
             to: new Date(to).toISOString(),
             resolution: resolution
         }, {
@@ -156,7 +166,7 @@ Rectangle {
                         tile.series.load(JSON.stringify(s.points))
                 }
             },
-            error: e => { root.problem = "The hardware history can't be read now: " + (e.message || e.code) }
+            error: e => { root.problem = root.failure("The hardware history can't be read now: ", e) }
         })
     }
 
@@ -167,7 +177,7 @@ Rectangle {
         if (snapshot && s.ts < snapshot.ts)
             return
         snapshot = s
-        alerts.setAll(s.alerts || [])
+        alerts.setAll(s.alerts || [], s.ts)
         if (append) {
             const ts = Date.parse(s.ts)
             for (let i = 0; i < chartSpecs.length; ++i) {
@@ -199,17 +209,58 @@ Rectangle {
         return core ? core.shownText(text, maxChars) : ""
     }
 
+    // A part's basis in the snapshot's whole-system figure: "measured", "estimated", "unknown".
+    function basis(part) {
+        const p = snapshot ? (snapshot.system_parts || []).find(x => x.part === part) : null
+        return p ? p.measured : "unknown"
+    }
+
     function partsText(parts) {
         const names = {gpu: "GPU", cpu: "CPU", rest: "rest"}
-        return parts.map(p => (names[p.part] || p.part) + (p.measured === "unknown" ? " unknown"
-                                                           : " " + Format.watts(p.mw) + " " + p.measured))
+        return parts.map(p => p.measured === "unknown"
+                              ? (p.part === "rest" ? "rest of system not set" : (names[p.part] || p.part) + " unknown")
+                              : (names[p.part] || p.part) + " " + Format.watts(p.mw) + " " + p.measured)
                     .join("  ·  ")
+    }
+
+    function gpuPowerText(g) {
+        if (g.power_mw <= 0 || basis("gpu") === "unknown")
+            return "unknown"
+        return Format.watts(g.power_mw) + (basis("gpu") === "estimated" ? " (estimated)" : "")
     }
 
     function cpuPowerText(c) {
         if (c.package_power_mw <= 0 && !c.measured)
             return "unknown"
         return Format.watts(c.package_power_mw) + (c.measured ? "" : " (estimated)")
+    }
+
+    // A chart's estimate note.
+    function noteFor(metric) {
+        if (metric === "system.power")
+            return " (estimated)"
+        if (metric === "gpu.power")
+            return basis("gpu") === "estimated" ? " (estimated)" : ""
+        if (metric === "cpu.power")
+            return cpu && !cpu.measured ? " (estimated)" : ""
+        return ""
+    }
+
+    // A chart's scale top; 0 for its window's peak.
+    function scaleFor(metric) {
+        switch (metric) {
+        case "gpu.util":
+        case "gpu.temp":
+            return 100
+        case "cpu.util":
+            return 1000
+        case "gpu.vram_used":
+            return gpu ? gpu.vram_total_mib : 0
+        case "ram.used":
+            return snapshot ? snapshot.ram.total_mib : 0
+        default:
+            return 0
+        }
     }
 
     // Keeps the item with the keyboard focus in view.
@@ -261,9 +312,10 @@ Rectangle {
                 id: alerts
                 objectName: "alertsStrip"
                 width: parent.width
+                core: root.core
             }
 
-            // The whole system.
+            // The whole system: always an estimate.
             Row {
                 spacing: Theme.spacing
                 width: parent.width
@@ -276,7 +328,8 @@ Rectangle {
                 }
                 Text {
                     id: systemPower
-                    text: root.snapshot ? Format.watts(root.snapshot.system_power_mw) : "…"
+                    objectName: "systemPower"
+                    text: root.snapshot ? Format.watts(root.snapshot.system_power_mw) + " (estimated)" : "…"
                     color: Theme.text
                     font.pixelSize: Theme.fontSize + 4
                     font.bold: true
@@ -323,18 +376,46 @@ Rectangle {
                             color: Theme.warning
                             font.pixelSize: Theme.fontSize
                         }
-                        Repeater {
-                            model: root.gpu ? [
-                                ["Load", Format.percent(root.gpu.util_pct)],
-                                ["Memory", Format.gibOf(root.gpu.vram_used_mib, root.gpu.vram_total_mib)],
-                                ["Temperature", root.gpu.temp_c + " °C"],
-                                ["Power", root.gpu.power_mw > 0 ? Format.watts(root.gpu.power_mw) : "unknown"],
-                                ["Core clock", Format.mhz(root.gpu.sm_clock_mhz)],
-                                ["Memory clock", Format.mhz(root.gpu.mem_clock_mhz)],
-                                ["Fan", root.gpu.fan_pct !== undefined ? Format.percent(root.gpu.fan_pct) : "not reported"],
-                                ["Throttling", Format.throttle(root.gpu.throttle)]
-                            ] : []
-                            delegate: ValueRow {}
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Load"
+                            value: root.gpu ? Format.percent(root.gpu.util_pct) : ""
+                        }
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Memory"
+                            value: root.gpu ? Format.gibOf(root.gpu.vram_used_mib, root.gpu.vram_total_mib) : ""
+                        }
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Temperature"
+                            value: root.gpu ? root.gpu.temp_c + " °C" : ""
+                        }
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Power"
+                            value: root.gpu ? root.gpuPowerText(root.gpu) : ""
+                        }
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Core clock"
+                            value: root.gpu ? Format.mhz(root.gpu.sm_clock_mhz) : ""
+                        }
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Memory clock"
+                            value: root.gpu ? Format.mhz(root.gpu.mem_clock_mhz) : ""
+                        }
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Fan"
+                            value: !root.gpu ? "" : root.gpu.fan_pct !== undefined ? Format.percent(root.gpu.fan_pct)
+                                                                                   : "not reported"
+                        }
+                        ValueRow {
+                            visible: !!root.gpu
+                            label: "Throttling"
+                            value: root.gpu ? Format.throttle(root.gpu.throttle) : ""
                         }
                     }
                 }
@@ -355,12 +436,15 @@ Rectangle {
                         width: parent.width
                         spacing: 2
 
-                        Repeater {
-                            model: root.cpu ? [
-                                ["Load", Format.percent(root.cpu.util_permille / 10)],
-                                ["Package power", root.cpuPowerText(root.cpu)]
-                            ] : []
-                            delegate: ValueRow {}
+                        ValueRow {
+                            visible: !!root.cpu
+                            label: "Load"
+                            value: root.cpu ? Format.percent(root.cpu.util_permille / 10) : ""
+                        }
+                        ValueRow {
+                            visible: !!root.cpu
+                            label: "Package power"
+                            value: root.cpu ? root.cpuPowerText(root.cpu) : ""
                         }
 
                         // The per-core load strip.
@@ -402,9 +486,10 @@ Rectangle {
 
                     Column {
                         width: parent.width
-                        Repeater {
-                            model: root.snapshot ? [["In use", Format.gibOf(root.snapshot.ram.used_mib, root.snapshot.ram.total_mib)]] : []
-                            delegate: ValueRow {}
+                        ValueRow {
+                            visible: !!root.snapshot
+                            label: "In use"
+                            value: root.snapshot ? Format.gibOf(root.snapshot.ram.used_mib, root.snapshot.ram.total_mib) : ""
                         }
                     }
                 }
@@ -417,13 +502,27 @@ Rectangle {
                     Column {
                         width: parent.width
                         spacing: 2
+                        // By count, so a sample updates the rows in place.
                         Repeater {
-                            model: root.snapshot ? root.snapshot.disks.map(d => [root.shown(String(d.volume), 24), Format.gib(d.free_mib) + " free"])
-                                                   .concat([
-                                                       ["Workspace", root.snapshot.sizes.workspace_mib !== undefined ? Format.gib(root.snapshot.sizes.workspace_mib) : "not measured"],
-                                                       ["Models", root.snapshot.sizes.models_mib !== undefined ? Format.gib(root.snapshot.sizes.models_mib) : "not measured"]
-                                                   ]) : []
-                            delegate: ValueRow {}
+                            model: root.snapshot ? root.snapshot.disks.length : 0
+                            delegate: ValueRow {
+                                required property int index
+                                readonly property var disk: root.snapshot ? root.snapshot.disks[index] || null : null
+                                label: disk ? root.shown(String(disk.volume), 24) : ""
+                                value: disk ? Format.gib(disk.free_mib) + " free" : ""
+                            }
+                        }
+                        ValueRow {
+                            visible: !!root.snapshot
+                            label: "Workspace"
+                            value: root.snapshot && root.snapshot.sizes.workspace_mib !== undefined
+                                   ? Format.gib(root.snapshot.sizes.workspace_mib) : "not measured"
+                        }
+                        ValueRow {
+                            visible: !!root.snapshot
+                            label: "Models"
+                            value: root.snapshot && root.snapshot.sizes.models_mib !== undefined
+                                   ? Format.gib(root.snapshot.sizes.models_mib) : "not measured"
                         }
                     }
                 }
@@ -443,9 +542,13 @@ Rectangle {
                             font.pixelSize: Theme.fontSize
                         }
                         Repeater {
-                            model: root.snapshot ? root.snapshot.net.map(n => [root.shown(String(n.adapter), 32),
-                                                                              Format.rate(n.rx_bps) + " in · " + Format.rate(n.tx_bps) + " out"]) : []
-                            delegate: ValueRow {}
+                            model: root.snapshot ? root.snapshot.net.length : 0
+                            delegate: ValueRow {
+                                required property int index
+                                readonly property var adapter: root.snapshot ? root.snapshot.net[index] || null : null
+                                label: adapter ? root.shown(String(adapter.adapter), 32) : ""
+                                value: adapter ? Format.rate(adapter.rx_bps) + " in · " + Format.rate(adapter.tx_bps) + " out" : ""
+                            }
                         }
                     }
                 }
@@ -495,8 +598,9 @@ Rectangle {
                         width: 240
                         metric: spec.metric
                         label: spec.label
+                        note: root.noteFor(spec.metric)
                         format: spec.format
-                        scaleMax: spec.max
+                        scaleMax: root.scaleFor(spec.metric)
                         windowS: root.windowS
                         windowText: root.windowWords
                     }
@@ -514,13 +618,14 @@ Rectangle {
 
     // A label and its value in a card.
     component ValueRow: Item {
-        required property var modelData
+        property string label
+        property string value
         width: parent ? parent.width : 0
         height: valueText.implicitHeight
 
         Text {
             width: parent.width - valueText.implicitWidth - Theme.spacing
-            text: parent.modelData[0]
+            text: parent.label
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
             elide: Text.ElideRight
@@ -529,7 +634,7 @@ Rectangle {
         Text {
             id: valueText
             anchors.right: parent.right
-            text: parent.modelData[1]
+            text: parent.value
             color: Theme.text
             font.pixelSize: Theme.fontSize
             font.bold: true

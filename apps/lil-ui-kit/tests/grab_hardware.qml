@@ -5,6 +5,7 @@
 // be one flat colour. The data is a fixture; the core is FakeCore.
 import QtQuick
 import QtTest
+import Lilith.Core
 import Lilith.UiKit
 
 TestCase {
@@ -60,7 +61,7 @@ TestCase {
                       since: new Date(ts - 90000).toISOString()}],
             gpu_users: [{pid: 4100, name: "comfyui", vram_local_mib: 6144, sm_permille: 900, role: "comfyui"},
                         {pid: 3300, name: "NightRacer.exe", vram_local_mib: 2048, sm_permille: 60},
-                        {pid: 1200, name: "app", vram_local_mib: 512, role: "app"}]
+                        {pid: Hardware.pid, name: "app", vram_local_mib: 512, role: "app"}]
         }
     }
 
