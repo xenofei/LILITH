@@ -1,14 +1,16 @@
 //! The cxx-qt bridge (feature `qt`): the `Lilith.Core` QML module ([`core_object`], on the
 //! background [`runtime`], with the list models of [`json_list_model`], the live-preview feed
 //! of [`preview_feed`], and [`layout`], the shell's layout file and shortcut map), and the calls
-//! `apps/lil-image/main.cpp` makes: the boot plan before Qt starts, the app's log (ARCH-117,
-//! ARCH-119), the Qt log lines, the start times and the core session.
+//! `apps/lil-image/main.cpp` makes: the boot plan and the single instance before Qt starts
+//! ([`boot`]), the app's log (ARCH-117, ARCH-119), the Qt log lines, the start times and the
+//! core session.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use lil_client::ClientConfig;
 use lil_protocol::CallerKind;
 
+pub mod boot;
 pub mod core_object;
 pub mod csv_export;
 pub mod hardware;
@@ -22,28 +24,8 @@ pub mod runtime;
 
 #[cxx_qt::bridge]
 pub mod ffi {
-    /// [`crate::BootPlan`] as `main.cpp` reads it, with what the plan needs from the process.
-    #[namespace = "lil_qt"]
-    struct QtBoot {
-        /// Empty to start; else why the start is refused (exit 2, Qt never starts).
-        refused: String,
-        no_activate: bool,
-        smoke_exit: bool,
-        org: String,
-        app: String,
-        /// The `argv` Qt is built from: the program name alone.
-        qt_args: Vec<String>,
-        /// The exe's folder: Qt's only library path.
-        app_dir: String,
-        /// The environment variables to remove before any Qt call.
-        clear_env: Vec<String>,
-    }
-
     #[namespace = "lil_qt"]
     extern "Rust" {
-        /// Plans this start from the raw command line and the process environment.
-        fn boot() -> QtBoot;
-
         /// The process environment's names that `qt_env_to_clear` would still clear: empty once
         /// `main.cpp` has cleared them (logged at start, checked by the deploy check).
         fn env_left() -> Vec<String>;
@@ -180,58 +162,4 @@ fn env_left() -> Vec<String> {
         .map(|(name, _)| name.to_string_lossy().into_owned())
         .collect();
     crate::qt_env_to_clear(names.iter().map(String::as_str))
-}
-
-fn boot() -> ffi::QtBoot {
-    let (names, odd): (Vec<_>, Vec<_>) = std::env::vars_os()
-        .map(|(name, _)| name.into_string())
-        .partition(Result::is_ok);
-    let names: Vec<String> = names.into_iter().filter_map(Result::ok).collect();
-    let clear_env = crate::qt_env_to_clear(names.iter().map(String::as_str));
-    // A name that isn't UTF-8 can't be handed to main.cpp to clear: one that would be cleared
-    // refuses the start instead.
-    let odd: Vec<String> = odd
-        .into_iter()
-        .filter_map(Result::err)
-        .map(|n| n.to_string_lossy().into_owned())
-        .collect();
-    let unclearable = !crate::qt_env_to_clear(odd.iter().map(String::as_str)).is_empty();
-    let app_dir = crate::app_dir(std::env::current_exe().ok().as_deref());
-    let env = match (lil_platform::Env::from_process(), &app_dir) {
-        (Err(e), _) => Err(format!("LILITH didn't start: {e}")),
-        (Ok(_), _) if unclearable => Err(
-            "LILITH didn't start: an environment variable Qt reads couldn't be cleared."
-                .to_string(),
-        ),
-        (Ok(_), None) => {
-            Err("LILITH didn't start: it couldn't tell which folder it runs from.".to_string())
-        }
-        (Ok(env), Some(_)) => Ok(env),
-    };
-    let app_dir = app_dir.unwrap_or_default();
-    let plan = match env {
-        Ok(env) => crate::plan_boot(&lil_platform::desktop::raw_command_line(), &env),
-        Err(refused) => {
-            return ffi::QtBoot {
-                refused,
-                no_activate: false,
-                smoke_exit: false,
-                org: String::new(),
-                app: crate::APP.to_string(),
-                qt_args: vec![crate::QT_ARGV0.to_string()],
-                app_dir,
-                clear_env,
-            };
-        }
-    };
-    ffi::QtBoot {
-        refused: plan.refused.unwrap_or_default(),
-        no_activate: plan.no_activate,
-        smoke_exit: plan.smoke_exit,
-        org: plan.org,
-        app: plan.app,
-        qt_args: plan.qt_args,
-        app_dir,
-        clear_env,
-    }
 }
