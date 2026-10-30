@@ -210,7 +210,7 @@ fn boot() -> ffi::QtBoot {
     };
     let app_dir = app_dir.unwrap_or_default();
     let plan = match env {
-        Ok(env) => crate::boot(&lil_platform::desktop::raw_command_line(), &env),
+        Ok(env) => crate::plan_boot(&lil_platform::desktop::raw_command_line(), &env),
         Err(refused) => {
             return ffi::QtBoot {
                 refused,
