@@ -110,3 +110,10 @@ set_property(TEST grab_usage APPEND PROPERTY
 lil_qml_test(tst_hardware tst_hardware.qml)
 set_property(TEST tst_hardware APPEND PROPERTY
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+# The Hardware panel's grabs (label grabs), as grab_shell's.
+add_test(NAME grab_hardware COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/grab_hardware.qml)
+set_tests_properties(grab_hardware PROPERTIES
+    LABELS grabs
+    TIMEOUT 300
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
