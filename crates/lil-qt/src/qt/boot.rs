@@ -17,9 +17,10 @@
 //!    `src/qt/launch_sink.h`) and called `launches_ready()`; from then on each goes to the
 //!    window as it comes, and the window says when it has taken one (`launch_handled`).
 //! 4. `release_instance()`, once the event loop has ended and before the window goes: the pipe
-//!    answers "closing" from then on, so a new launch waits and becomes the instance itself; a
-//!    forwarded launch the window never took is started again as a launch of its own; a deny in
-//!    flight is joined; then the pipe and its threads end (review I-3).
+//!    answers "closing" from then on; the router ends; the pipe ends and its thread is joined,
+//!    so a new launch becomes the instance itself; what the pipe took is routed; a forwarded
+//!    launch the window never took is started again as a launch of its own; a deny in flight
+//!    is joined (review I-3, M-12).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +32,9 @@ use lil_client::ClientConfig;
 use lil_platform::Env;
 
 use crate::args::{BootPlan, Mode, launch_json};
-use crate::single_instance::{Forwarded, InstanceServer, Routed, Start, route, start};
+use crate::single_instance::{
+    Forwarded, InstanceServer, Routed, Start, restart_untaken, route, start,
+};
 
 #[cxx_qt::bridge]
 pub mod ffi {
@@ -305,25 +308,26 @@ fn release_instance() {
     if let Some(router) = lock(&ROUTER).take() {
         let _ = router.join();
     }
-    // Launches taken before the close and not yet routed.
+    // The pipe ends and its thread is joined first, so every launch it took is in hand before
+    // the last ones are routed (review M-12). A launch waiting on the pipe now becomes the
+    // instance itself.
+    server.shutdown();
     if let Ok(env) = Env::from_process() {
         while let Some(forwarded) = server.next() {
             take(&forwarded, &env);
         }
     }
-    // Forwarded launches the window never took start again, as launches of their own: they
-    // wait for this process's pipe to go, then become the instance.
+    // Forwarded launches the window never took start again, as launches of their own, in the
+    // app's own grammar (review M-15).
     let open = std::mem::take(&mut lock(&LAUNCHES).open);
     if !open.is_empty() {
         match std::env::current_exe() {
             Ok(exe) => {
-                for args in open.into_values() {
-                    if let Err(e) = lil_platform::process::spawn_no_activate(&exe, &args) {
-                        tracing::error!(error = %e, "a launch the window never took was lost");
-                    } else {
-                        tracing::info!("a launch the window never took starts again on its own");
-                    }
-                }
+                restart_untaken(
+                    &exe,
+                    open.into_values(),
+                    lil_platform::process::spawn_no_activate_verbatim,
+                );
             }
             Err(e) => tracing::error!(error = %e, "launches the window never took were lost"),
         }
@@ -331,9 +335,5 @@ fn release_instance() {
     for deny in std::mem::take(&mut *lock(&DENIES)) {
         let _ = deny.join();
     }
-    // The pipe ends, and its thread is joined (the router's reference is gone with it).
-    match Arc::try_unwrap(server) {
-        Ok(server) => drop(server),
-        Err(_) => tracing::error!("the app's pipe is still referenced at its end"),
-    }
+    drop(server);
 }

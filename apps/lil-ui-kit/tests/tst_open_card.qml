@@ -172,7 +172,11 @@ TestCase {
         verify(!shell.instanceBanner.visible)
         launch(shell, {kind: "activate", activate: false})
         verify(!shell.instanceBanner.visible, "no banner while the pipe is the app's own")
-        launch(shell, {kind: "activate", activate: false, pipe_held: true})
+        launch(shell, {kind: "activate", activate: false, pipe_notice: null})
+        verify(!shell.instanceBanner.visible)
+        launch(shell, {kind: "activate", activate: false,
+                       pipe_notice: "Another program is holding LILITH's launch channel, so a "
+                                    + "second launch may open a second window."})
         verify(shell.instanceBanner.visible)
         compare(shell.instanceBanner.text, "Another program is holding LILITH's launch channel, so a "
                 + "second launch may open a second window.")

@@ -22,7 +22,7 @@
 //! window, else this process sends it itself with [`send_deny`] (`StartPolicy::NoStart`, so a
 //! stale toast's Deny starts no core, and at most 10 s in all). When another program holds the
 //! pipe (it can't be opened, or its server isn't this exe as this user), the start goes on as an
-//! instance of its own, without the pipe, and says so ([`BootPlan::pipe_held`]).
+//! instance of its own, without the pipe, and says so ([`BootPlan::pipe_notice`]).
 //!
 //! **Threads.** [`forward`] and [`send_deny`] each run on a current-thread tokio runtime of their
 //! own, made and shut down within the call, so nothing of theirs is left when they return. A
@@ -31,7 +31,7 @@
 //! caller's thread. Dropping the server stops and joins the thread.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,8 +40,13 @@ use std::time::{Duration, Instant};
 
 use lil_client::{Client, ClientConfig, ClientError, StartPolicy};
 use lil_platform::Env;
-use lil_platform::pipe::{ConnectError, CreateError, create_instance, open_client, server_pid};
-use lil_platform::process::{ProcessInfo, ProcessInspector, SystemInspector, current_user_sid};
+use lil_platform::pipe::{
+    ConnectError, CreateError, client_pid, create_instance, open_client, server_pid,
+};
+use lil_platform::process::{
+    ProcessInfo, ProcessInspector, SystemInspector, current_user_sid, integrity_rid,
+    own_integrity_rid,
+};
 use lil_protocol::Outcome;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -54,10 +59,21 @@ use crate::args::{BootPlan, Mode, Opened};
 pub const MESSAGE_MAX: usize = 64 * 1024;
 /// How long a second launch tries, and how long the server gives one client.
 pub const BUDGET: Duration = Duration::from_secs(2);
-/// How long a launch waits for a closing instance to go before it starts without the pipe.
-pub const CLOSING_WAIT: Duration = Duration::from_secs(10);
 /// The longest a toast's deny may take, connection included.
 pub const DENY_BOUND: Duration = Duration::from_secs(10);
+/// How long a launch waits for a closing instance to go before it starts without the pipe:
+/// longer than the instance's end may take (its denies in flight, then its last exchange), so
+/// a launch never gives up just before the pipe goes (review M-13).
+pub const CLOSING_WAIT: Duration = Duration::from_secs(15);
+/// What the shell's banner says when another program holds the pipe (review I-2, M-10).
+pub const NOTICE_HELD: &str = "Another program is holding LILITH's launch channel, so a second \
+                               launch may open a second window.";
+/// What it says when LILITH's own instance never answered (review M-14).
+pub const NOTICE_BUSY: &str =
+    "The running LILITH didn't answer in time, so this launch opened a window of its own.";
+/// What it says when LILITH's own instance was still closing after [`CLOSING_WAIT`] (M-13).
+pub const NOTICE_CLOSING: &str =
+    "The running LILITH was still closing, so this launch opened a window of its own.";
 /// The wait between tries while every instance of the pipe is busy.
 const BUSY_RETRY: Duration = Duration::from_millis(10);
 /// The wait between tries while the running instance closes.
@@ -75,9 +91,12 @@ pub enum ForwardError {
     /// No instance owns the pipe.
     NotRunning,
     /// The pipe is held by something this launch doesn't trust: it can't be opened (a DACL that
-    /// leaves this user out, or every instance stays busy for the whole budget), or its server
-    /// isn't this executable run as this user, or can't be inspected. Nothing was written.
+    /// leaves this user out), or its server isn't this executable run as this user at this
+    /// process's integrity level or above, or can't be inspected, or the server didn't trust
+    /// this launch. Nothing was written.
     Untrusted,
+    /// Every instance of the pipe stayed busy for the whole budget: nothing served it.
+    Busy,
     /// The running instance is closing: it took nothing.
     Closing,
     /// No exchange within [`BUDGET`].
@@ -93,8 +112,11 @@ impl std::fmt::Display for ForwardError {
             ForwardError::NotRunning => f.write_str("no instance is running"),
             ForwardError::Untrusted => f.write_str(
                 "the pipe is held by another program (it can't be opened, or its server isn't \
-                 this exe run as this user)",
+                 this exe run as this user at this integrity level or above)",
             ),
+            ForwardError::Busy => {
+                write!(f, "every instance of the pipe stayed busy for {BUDGET:?}")
+            }
             ForwardError::Closing => f.write_str("the running instance is closing"),
             ForwardError::Timeout => {
                 write!(f, "the running instance didn't answer within {BUDGET:?}")
@@ -118,7 +140,7 @@ pub struct InstanceServer {
     rx: Mutex<mpsc::Receiver<Forwarded>>,
     closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for InstanceServer {
@@ -160,7 +182,13 @@ impl InstanceServer {
                     match first {
                         Ok(first) => {
                             let _ = claimed_tx.send(Ok(true));
-                            rt.block_on(serve(first, name, app, tx, closing, stop));
+                            // Who a client must be (ARCH-027): unknown, and none is taken.
+                            let me = Identity::of_this_process()
+                                .inspect_err(|e| {
+                                    tracing::error!(error = %e, "this process can't tell who it is: no launch is taken");
+                                })
+                                .ok();
+                            rt.block_on(serve(first, name, app, me, tx, closing, stop));
                         }
                         Err(CreateError::AlreadyOwned) => {
                             let _ = claimed_tx.send(Ok(false));
@@ -180,7 +208,7 @@ impl InstanceServer {
                 rx: Mutex::new(rx),
                 closing,
                 stop,
-                thread: Some(thread),
+                thread: Mutex::new(Some(thread)),
             })),
             other => {
                 let _ = thread.join();
@@ -214,15 +242,26 @@ impl InstanceServer {
     pub fn close(&self) {
         self.closing.store(true, Ordering::SeqCst);
     }
+
+    /// Closes the pipe and joins its thread, keeping what was taken: once this returns, nothing
+    /// more is taken, and [`InstanceServer::next`] has every launch that was (review M-12).
+    pub fn shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.stop.notify_one();
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Drop for InstanceServer {
     fn drop(&mut self) {
-        self.closing.store(true, Ordering::SeqCst);
-        self.stop.notify_one();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -230,6 +269,7 @@ async fn serve(
     first: NamedPipeServer,
     name: String,
     app: String,
+    me: Option<Identity>,
     tx: mpsc::Sender<Forwarded>,
     closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
@@ -258,7 +298,8 @@ async fn serve(
             tracing::warn!(error = %e, "a launch's connection to the app's pipe failed");
             continue;
         }
-        match tokio::time::timeout(BUDGET, exchange(client, &app, &closing)).await {
+        let exchanged = exchange(client, &app, me.as_ref(), &closing);
+        match tokio::time::timeout(BUDGET, exchanged).await {
             Ok(Ok(Some(args))) => {
                 if tx.send(Forwarded { args }).is_err() {
                     return;
@@ -272,12 +313,26 @@ async fn serve(
 }
 
 /// The server's side of one exchange: the arguments, once answered `{"ok": true}`, or `None`
-/// once answered "closing".
+/// once answered "closing". A client that isn't this exe, run as this user at this process's
+/// integrity level or above, is answered `{"untrusted": true}` and nothing more (review M-16,
+/// I-6): a second launch always is.
 async fn exchange(
     mut client: NamedPipeServer,
     app: &str,
+    me: Option<&Identity>,
     closing: &AtomicBool,
 ) -> io::Result<Option<Vec<String>>> {
+    let trusted = match (me, client_pid(&client)) {
+        (Some(me), Ok(pid)) => peer_checks_out(pid, me),
+        _ => false,
+    };
+    if !trusted {
+        write_line(&mut client, &json!({"untrusted": true})).await?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the launch isn't this exe run as this user at this integrity level or above",
+        ));
+    }
     let hello = json!({"app": app, "pid": std::process::id()});
     write_line(&mut client, &hello).await?;
     let (reader, mut writer) = tokio::io::split(client);
@@ -349,18 +404,61 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((canon(a), canon(b)), (Ok(a), Ok(b)) if a == b)
 }
 
-/// ARCH-027 for the app's pipe: its server is `own_exe`, run as `own_sid`.
-pub fn server_is_trusted(info: &ProcessInfo, own_exe: &Path, own_sid: &str) -> bool {
-    info.user_sid.eq_ignore_ascii_case(own_sid) && same_file(&info.image, own_exe)
+/// Who this process is, as ARCH-027 compares a pipe peer with it: its exe, its token user and
+/// its token's integrity level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub exe: PathBuf,
+    pub sid: String,
+    pub integrity: u32,
 }
 
-/// What a client of the pipe is: its exe and user, how it inspects the server, and whether the
-/// server may take the foreground.
-struct Forwarder<'a> {
-    own_exe: &'a Path,
-    own_sid: &'a str,
-    inspector: &'a dyn ProcessInspector,
-    grant_foreground: bool,
+impl Identity {
+    /// This process's.
+    ///
+    /// # Errors
+    /// When its exe or token can't be read.
+    pub fn of_this_process() -> io::Result<Identity> {
+        Ok(Identity {
+            exe: std::env::current_exe()?,
+            sid: current_user_sid()?,
+            integrity: own_integrity_rid()?,
+        })
+    }
+}
+
+/// ARCH-027 for the app's pipe, either way: the peer is this exe, run as this user, at an
+/// integrity level no lower than this process's (review I-1, I-6). A lower-integrity copy of
+/// the same exe (a sandboxed helper's child, say) is no peer to hand a launch or a deny token
+/// to, nor to take one from.
+pub fn peer_is_trusted(info: &ProcessInfo, peer_integrity: u32, me: &Identity) -> bool {
+    peer_integrity >= me.integrity
+        && info.user_sid.eq_ignore_ascii_case(&me.sid)
+        && same_file(&info.image, &me.exe)
+}
+
+/// [`peer_is_trusted`] of process `pid`, inspected now: false (logged) when it can't be.
+fn peer_checks_out(pid: u32, me: &Identity) -> bool {
+    let inspected = SystemInspector
+        .inspect(pid)
+        .and_then(|info| integrity_rid(pid).map(|il| (info, il)));
+    match inspected {
+        Ok((info, il)) => {
+            let trusted = peer_is_trusted(&info, il, me);
+            if !trusted {
+                tracing::warn!(
+                    pid,
+                    integrity = format!("{il:#x}"),
+                    "a pipe peer isn't this exe run as this user at this integrity level or above"
+                );
+            }
+            trusted
+        }
+        Err(e) => {
+            tracing::warn!(pid, error = %e, "a pipe peer can't be inspected");
+            false
+        }
+    }
 }
 
 /// Hands `args` to the running instance of `app` (its confirm window with `confirm`), which may
@@ -381,15 +479,8 @@ fn forward_granting(
     args: &[String],
     grant_foreground: bool,
 ) -> Result<u32, ForwardError> {
-    let own_exe = std::env::current_exe().map_err(ForwardError::Io)?;
-    let own_sid = current_user_sid().map_err(ForwardError::Io)?;
-    let client = Forwarder {
-        own_exe: &own_exe,
-        own_sid: &own_sid,
-        inspector: &SystemInspector,
-        grant_foreground,
-    };
-    forward_as(env, app, confirm, args, &client)
+    let me = Identity::of_this_process().map_err(ForwardError::Io)?;
+    forward_as(env, app, confirm, args, &me, grant_foreground)
 }
 
 /// `true` for an error that means the server went away mid-exchange (it was closing).
@@ -405,7 +496,8 @@ fn forward_as(
     app: &str,
     confirm: bool,
     args: &[String],
-    me: &Forwarder<'_>,
+    me: &Identity,
+    grant_foreground: bool,
 ) -> Result<u32, ForwardError> {
     let name = env.app_pipe_name(app, confirm);
     let deadline = Instant::now() + BUDGET;
@@ -423,14 +515,15 @@ fn forward_as(
                 match open_client(&name) {
                     Ok(client) => break client,
                     Err(ConnectError::NotFound) => return Err(ForwardError::NotRunning),
-                    // Every instance busy for the whole budget: nothing serves the pipe (a
-                    // squatter that never answers, or a hung instance), so it counts as held.
+                    // Every instance busy for the whole budget: nothing serves the pipe (a hung
+                    // instance, or a squatter that never answers).
                     Err(ConnectError::Busy) if Instant::now() + BUSY_RETRY >= deadline => {
                         tracing::warn!("every instance of the app's pipe stayed busy for 2 s");
-                        return Err(ForwardError::Untrusted);
+                        return Err(ForwardError::Busy);
                     }
                     Err(ConnectError::Busy) => tokio::time::sleep(BUSY_RETRY).await,
-                    // Held by a pipe whose DACL leaves this user out (review I-2).
+                    // Held by a pipe whose DACL, or whose integrity label, leaves this launch
+                    // out (review I-2).
                     Err(ConnectError::Io(e)) => {
                         tracing::warn!(error = %e, "the app's pipe can't be opened");
                         return Err(ForwardError::Untrusted);
@@ -438,20 +531,21 @@ fn forward_as(
                 }
             };
             let pid = server_pid(&client).map_err(|_| ForwardError::Untrusted)?;
-            let info = me.inspector.inspect(pid).map_err(|e| {
-                tracing::warn!(pid, error = %e, "the app's pipe server can't be inspected");
-                ForwardError::Untrusted
-            })?;
-            if !server_is_trusted(&info, me.own_exe, me.own_sid) {
+            // Before a byte is written (I-1, I-6).
+            if !peer_checks_out(pid, me) {
                 return Err(ForwardError::Untrusted);
             }
             let (reader, mut writer) = tokio::io::split(client);
             let mut reader = BufReader::new(reader);
             let hello = read_line(&mut reader).await.map_err(after_trust)?;
+            if hello["untrusted"] == true {
+                tracing::warn!(pid, "the running instance doesn't trust this launch");
+                return Err(ForwardError::Untrusted);
+            }
             if hello["app"] != app || hello["pid"].as_u64() != Some(u64::from(pid)) {
                 return Err(ForwardError::Refused);
             }
-            if me.grant_foreground && !lil_platform::desktop::allow_set_foreground(pid) {
+            if grant_foreground && !lil_platform::desktop::allow_set_foreground(pid) {
                 tracing::info!(
                     pid,
                     "AllowSetForegroundWindow was refused: the window may only flash"
@@ -564,7 +658,7 @@ pub enum Start {
     /// or the deny was sent, 1 when it failed (logged).
     Exit(i32),
     /// Start Qt, serving this instance's pipe (none under `--smoke-exit`, or when another
-    /// program holds the pipe: then [`BootPlan::pipe_held`] is set).
+    /// program holds the pipe: then [`BootPlan::pipe_notice`] says why).
     Run(Option<InstanceServer>),
 }
 
@@ -642,7 +736,7 @@ fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start
                     error = %e,
                     "the app's pipe couldn't be created: starting as an instance of its own"
                 );
-                plan.pipe_held = true;
+                plan.pipe_notice = Some(NOTICE_HELD);
                 return Start::Run(None);
             }
         }
@@ -656,9 +750,10 @@ fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start
             }
             Err(ForwardError::NotRunning | ForwardError::Closing) => {
                 tracing::warn!(
-                    "the running instance was still closing after 10 s: starting as an \
+                    "the running instance was still closing after 15 s: starting as an \
                      instance of its own, without the pipe"
                 );
+                plan.pipe_notice = Some(NOTICE_CLOSING);
                 return Start::Run(None);
             }
             Err(ForwardError::Untrusted) => {
@@ -666,7 +761,15 @@ fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start
                     "another program holds the app's pipe: starting as an instance of its own, \
                      without single-instance protection"
                 );
-                plan.pipe_held = true;
+                plan.pipe_notice = Some(NOTICE_HELD);
+                return Start::Run(None);
+            }
+            Err(ForwardError::Busy) => {
+                tracing::warn!(
+                    "the running LILITH didn't answer in time: starting as an instance of its \
+                     own, without the pipe"
+                );
+                plan.pipe_notice = Some(NOTICE_BUSY);
                 return Start::Run(None);
             }
             Err(e) => {
@@ -678,6 +781,29 @@ fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start
             }
         }
     }
+}
+
+/// Starts again, each as a launch of its own, the forwarded launches `open` the window never
+/// took before the instance's end (review I-3, M-15): `spawn(exe, args)` is
+/// `lil_platform::process::spawn_no_activate_verbatim` in the app, whose command line
+/// (`"<exe>" <arg> …`, nothing escaped) reads back through `plan_boot` to the same arguments.
+/// How many started.
+pub fn restart_untaken(
+    exe: &Path,
+    open: impl IntoIterator<Item = Vec<String>>,
+    spawn: impl Fn(&Path, &[String]) -> io::Result<u32>,
+) -> usize {
+    let mut started = 0;
+    for args in open {
+        match spawn(exe, &args) {
+            Ok(_) => {
+                started += 1;
+                tracing::info!("a launch the window never took starts again on its own");
+            }
+            Err(e) => tracing::error!(error = %e, "a launch the window never took was lost"),
+        }
+    }
+    started
 }
 
 /// What the running instance does with one forwarded launch ([`route`]).
@@ -742,33 +868,96 @@ mod tests {
     }
 
     #[test] // spec: ARCH-027
-    fn the_server_must_be_this_exe_run_as_this_user() {
+    fn a_peer_must_be_this_exe_run_as_this_user_at_no_lower_integrity() {
+        const LOW: u32 = 0x1000;
+        const MEDIUM: u32 = 0x2000;
+        const HIGH: u32 = 0x3000;
         let own = std::env::current_exe().unwrap();
         let sid = "S-1-5-21-1-2-3-1001";
-        assert!(server_is_trusted(&info(own.clone(), sid), &own, sid));
-        assert!(server_is_trusted(
+        let me = Identity {
+            exe: own.clone(),
+            sid: sid.to_string(),
+            integrity: MEDIUM,
+        };
+        assert!(peer_is_trusted(&info(own.clone(), sid), MEDIUM, &me));
+        assert!(peer_is_trusted(
             &info(own.clone(), &sid.to_lowercase()),
-            &own,
-            sid
+            MEDIUM,
+            &me
         ));
+        // A peer above this process (elevated) is no risk to it; one below is (review I-6).
+        assert!(peer_is_trusted(&info(own.clone(), sid), HIGH, &me));
+        assert!(!peer_is_trusted(&info(own.clone(), sid), LOW, &me));
+        assert!(!peer_is_trusted(&info(own.clone(), sid), 0, &me));
+        // An elevated instance takes nothing from a Medium launch (review M-16).
+        let elevated = Identity {
+            integrity: HIGH,
+            ..me.clone()
+        };
+        assert!(!peer_is_trusted(&info(own.clone(), sid), MEDIUM, &elevated));
         // Another user running the same exe.
-        assert!(!server_is_trusted(
-            &info(own.clone(), "S-1-5-21-1-2-3-1002"),
-            &own,
-            sid
-        ));
-        assert!(!server_is_trusted(
-            &info(own.clone(), "S-1-5-18"),
-            &own,
-            sid
-        ));
+        for other_sid in ["S-1-5-21-1-2-3-1002", "S-1-5-18"] {
+            assert!(!peer_is_trusted(&info(own.clone(), other_sid), MEDIUM, &me));
+        }
         // This user running another exe, or one that doesn't exist.
         let other = own.with_file_name("not-this-exe.exe");
-        assert!(!server_is_trusted(&info(other, sid), &own, sid));
+        assert!(!peer_is_trusted(&info(other, sid), MEDIUM, &me));
         let dir = tempfile::tempdir().unwrap();
         let copy = dir.path().join("copy.exe");
         std::fs::copy(&own, &copy).unwrap();
-        assert!(!server_is_trusted(&info(copy, sid), &own, sid));
+        assert!(!peer_is_trusted(&info(copy, sid), MEDIUM, &me));
+    }
+
+    #[test] // spec: APP-014
+    fn an_untaken_launch_starts_again_with_its_own_arguments() {
+        let exe = Path::new(r"C:\Program Files\LILITH\lil-image.exe");
+        let open = vec![
+            vec![
+                "--intent".to_string(),
+                "edit".to_string(),
+                r"C:\My Art\".to_string(),
+            ],
+            vec![
+                "--no-activate".to_string(),
+                "lil-dev:task/j_0123456789abcdef".to_string(),
+            ],
+            vec![],
+        ];
+        let lines = Mutex::new(Vec::new());
+        let started = restart_untaken(exe, open.clone(), |exe, args| {
+            lines
+                .lock()
+                .unwrap()
+                .push(lil_platform::process::verbatim_command_line(exe, args)?);
+            Ok(1)
+        });
+        assert_eq!(started, 3);
+        let env = lil_platform::Env::with_roots(
+            lil_platform::Channel::Dev,
+            lil_platform::Roots {
+                roaming: PathBuf::from(r"C:\R"),
+                local: PathBuf::from(r"C:\L"),
+                user_profile: PathBuf::from(r"C:\P"),
+            },
+            "S-1-5-21-1-2-3-1001".to_string(),
+        );
+        // Each restart's command line reads back to the same arguments: the trailing backslash
+        // of a quoted folder stays one (review M-15).
+        let lines = lines.into_inner().unwrap();
+        for (line, args) in lines.iter().zip(&open) {
+            let plan = crate::args::plan_boot(line, &env);
+            assert_eq!(plan.refused, None, "{line}");
+            assert_eq!(&plan.args, args, "{line}");
+        }
+        assert_eq!(
+            crate::args::plan_boot(&lines[0], &env).opened,
+            Some(crate::args::Opened::Target(r"C:\My Art\".into()))
+        );
+        // A spawn that fails starts nothing and is counted out.
+        assert_eq!(
+            restart_untaken(exe, open, |_, _| Err(io::Error::other("no"))),
+            0
+        );
     }
 
     #[test] // spec: P4a-R9

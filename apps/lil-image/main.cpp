@@ -258,6 +258,8 @@ int main(int, char **)
                        : qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
     if (!window) {
         lilshim::logEvent(QStringLiteral("error"), {{"what", "ShellWindow failed to load"}});
+        // The instance ends as it would after the event loop: what it took starts again.
+        lil_qt::release_instance();
         return 1;
     }
 

@@ -131,9 +131,10 @@ pub struct BootPlan {
     pub refused: Option<String>,
     /// Set by `single_instance::start` once the arguments reached the running instance.
     pub forwarded: bool,
-    /// Set by `single_instance::start` when another program holds the app's pipe: this start
-    /// runs as an instance of its own, and the shell says so.
-    pub pipe_held: bool,
+    /// Set by `single_instance::start` when this start runs as an instance of its own without
+    /// the app's pipe (another program holds it, or LILITH's own instance never answered): what
+    /// the shell's banner says.
+    pub pipe_notice: Option<&'static str>,
     /// Qt's `organizationName`: the channel's data-folder name (`LILITH`, `LILITH-dev`).
     pub org: String,
     /// Qt's `applicationName` ([`APP`]).
@@ -177,7 +178,7 @@ fn base_plan(env: &Env) -> BootPlan {
         link_refused: None,
         refused: None,
         forwarded: false,
-        pipe_held: false,
+        pipe_notice: None,
         org,
         app: APP.to_string(),
         qt_args: vec![QT_ARGV0.to_string()],
@@ -336,46 +337,103 @@ fn has_scheme(s: &str) -> bool {
     })
 }
 
-/// The end of a separator at `at` in `text`: `/`, or `%2F` in any case.
-fn separator_end(text: &str, at: usize) -> Option<usize> {
-    let rest = &text[at..];
-    if rest.starts_with('/') {
-        Some(at + 1)
-    } else if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("%2f") {
-        Some(at + 3)
-    } else {
-        None
+/// `text` with each `%HH` escape decoded, up to three times over (a link may be encoded more than
+/// once), as bytes read back as UTF-8 (lossily): the form a refused link is shown in, so no
+/// spelling of a secret hides it from [`cut_secrets`] (review M-11).
+fn decoded(text: &str) -> String {
+    let once = |s: &str| -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if b[i] == b'%'
+                && i + 2 < b.len()
+                && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+            {
+                out.push(u8::try_from(h * 16 + l).unwrap_or(b'?'));
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let mut s = text.to_string();
+    for _ in 0..3 {
+        let next = once(&s);
+        if next == s {
+            break;
+        }
+        s = next;
     }
+    s
 }
 
-/// `text` with what follows a `deny<sep><id><sep>` cut to `…`, `deny` in any case and each
-/// separator `/` or `%2F`: a deny token is never shown or logged, however a refused link spells
-/// it (P4a-R9; review M-1).
-fn cut_token(text: &str) -> String {
-    let lower = text.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(found) = lower[from..].find("deny") {
-        let at = from + found;
-        from = at + "deny".len();
-        let Some(id_start) = separator_end(text, from) else {
-            continue;
-        };
-        let cut = (id_start..text.len())
-            .filter(|&i| text.is_char_boundary(i))
-            .find_map(|i| separator_end(text, i));
-        if let Some(cut) = cut
-            && cut < text.len()
-        {
-            return format!("{}…", &text[..cut]);
+/// The shortest run of hex digits taken for a secret: a deny token is 32 (P4a-R9).
+const SECRET_HEX: usize = 32;
+
+/// `text` with what may be a deny token cut to `…`, however a refused link spells it (P4a-R9;
+/// review M-1, M-11): every run of 32 or more hex digits, whatever surrounds it, and whatever
+/// follows `deny` and one more separator (`/` or `\`, the id's) after the id.
+fn cut_secrets(text: &str) -> String {
+    // Runs of hex digits.
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= SECRET_HEX {
+            out.push('…');
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_hexdigit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
         }
     }
-    text.to_string()
+    flush(&mut run, &mut out);
+    // What follows `deny<sep><id><sep>`, or `deny<sep>` and no id.
+    let lower = out.to_ascii_lowercase();
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("deny") {
+        let at = from + found + "deny".len();
+        from = at;
+        let rest = &out[at..];
+        let Some(first) = rest.chars().next().filter(|&c| is_sep(c)) else {
+            continue;
+        };
+        let after_sep = at + first.len_utf8();
+        let id_ok = |s: &str| {
+            s.strip_prefix("cf_")
+                .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+        };
+        let tail = &out[after_sep..];
+        let cut = match tail.find(is_sep) {
+            // `deny/<id>/<tail>`: the id stays.
+            Some(end) if id_ok(&tail[..end]) => after_sep + end + 1,
+            // `deny/<tail>` with no id.
+            _ => after_sep,
+        };
+        if cut < out.len() {
+            return format!("{}…", &out[..cut]);
+        }
+    }
+    out
 }
 
+/// What the Opened card says of a refused link: its decoded form, secrets cut, at most 80
+/// characters as shown text.
 fn not_a_link(arg: &str) -> String {
     format!(
         "This link isn't one LILITH opens: {}",
-        cut_token(&lil_parse::shown_text(arg, SHOWN_CHARS))
+        lil_parse::shown_text(&cut_secrets(&decoded(arg)), SHOWN_CHARS)
     )
 }
 
@@ -412,10 +470,7 @@ fn classify(arg: &str, env: &Env) -> Result<Opened, String> {
             Ok(LilUrl::Task(job)) => Ok(Opened::Task(job)),
             Ok(LilUrl::Open(target)) => check_target(&target).map(|()| Opened::Target(target)),
             Ok(LilUrl::Ref(r)) => Ok(Opened::Ref(r)),
-            Err(refusal) => Err(format!(
-                "This link isn't one LILITH opens: {}",
-                cut_token(&refusal.shown)
-            )),
+            Err(_) => Err(not_a_link(arg)),
         };
     }
     if is_drive_absolute(arg) {
@@ -494,14 +549,14 @@ fn lilref(arg: &str) -> Result<Opened, String> {
 /// `{kind, intent, focus, activate, …}`, `kind` being `refused` (`message`), `target`, `ref` or
 /// `lilref` (`target`, and `title` for a `.lilref`), `task` (`job`), `confirm` (`id`),
 /// `confirm_list` or `activate` (nothing to show). `focus` is false under `--no-activate`;
-/// `activate` false when the window was shown by the start itself; `pipe_held` true when
-/// another program holds the app's pipe. A deny is never shown, so it has none: `None`.
+/// `activate` false when the window was shown by the start itself; `pipe_notice` the banner's
+/// text when this start runs without the app's pipe, else null. A deny is never shown, so it has none: `None`.
 pub fn launch_json(plan: &BootPlan, activate: bool) -> Option<String> {
     let mut v = json!({
         "intent": plan.intent.as_str(),
         "focus": !plan.no_activate,
         "activate": activate,
-        "pipe_held": plan.pipe_held,
+        "pipe_notice": plan.pipe_notice,
     });
     let set = |v: &mut Value, fields: Value| {
         if let (Some(into), Value::Object(from)) = (v.as_object_mut(), fields) {
@@ -573,7 +628,7 @@ mod tests {
                 link_refused: None,
                 refused: None,
                 forwarded: false,
-                pipe_held: false,
+                pipe_notice: None,
                 org: "LILITH-dev".to_string(),
                 app: "image".to_string(),
                 qt_args: vec!["lil-image".to_string()],
@@ -919,16 +974,34 @@ mod tests {
             format!("lil:deny/{CF}/{TOKEN}"),
             format!("other:x/deny/{CF}/{TOKEN}"),
             format!("deny/{CF}/{TOKEN}"),
+            // Review M-11's spellings.
+            format!("lil-dev:deny\\{CF}\\{TOKEN}"),
+            format!("lil-dev:deny%5C{CF}%5c{TOKEN}"),
+            format!("lil-dev:deny%252F{CF}%252F{TOKEN}"),
+            format!("lil-dev:de%6Ey/{CF}/{TOKEN}"),
+            format!("lil-dev:%64%65%6e%79/{CF}/{TOKEN}"),
+            format!("lil-dev:deny/{TOKEN}"),
+            format!("lil-dev:x?t={}", TOKEN.to_uppercase()),
+            format!("lil-dev:deny/{CF}/%30%30{}", &TOKEN[2..]),
         ] {
             let p = plan(&format!("\"{rest}\""));
             let message = p
                 .link_refused
                 .unwrap_or_else(|| panic!("{rest}: not refused"));
-            assert!(!message.contains(TOKEN), "{rest}: {message}");
-            assert!(message.contains(CF), "{rest}: the id stays: {message}");
+            let lower = message.to_ascii_lowercase();
+            // Not the token, nor any 20 of its characters in a row.
+            for start in 0..=12 {
+                assert!(
+                    !lower.contains(&TOKEN[start..start + 20]),
+                    "{rest}: {message}"
+                );
+            }
+            if rest.contains(CF) {
+                assert!(message.contains(CF), "{rest}: the id stays: {message}");
+            }
         }
-        assert_eq!(cut_token("lil-dev:open/@@@"), "lil-dev:open/@@@");
-        assert_eq!(cut_token("deny/"), "deny/");
+        assert_eq!(cut_secrets("lil-dev:open/@@@"), "lil-dev:open/@@@");
+        assert_eq!(cut_secrets("deny/"), "deny/");
     }
 
     #[test] // spec: APP-020, QA-050

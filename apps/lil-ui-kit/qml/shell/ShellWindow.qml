@@ -501,9 +501,9 @@ Window {
     // A launch: {kind, intent, focus, activate, ...} (lil_qt::args::launch_json).
     function handleLaunch(launch) {
         const focus = launch.focus !== false
-        if (launch.pipe_held === true)
-            instanceBanner.show("Another program is holding LILITH's launch channel, so a second "
-                                + "launch may open a second window.")
+        // This start runs without the app's pipe: the bridge's words for why.
+        if (typeof launch.pipe_notice === "string" && launch.pipe_notice !== "")
+            instanceBanner.show(launch.pipe_notice)
         if (launch.activate !== false)
             shim.activate(root, focus)
         if (launch.kind === "target" || launch.kind === "ref" || launch.kind === "lilref") {

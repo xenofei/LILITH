@@ -839,7 +839,24 @@ fn a_pipe_held_by_another_program_starts_its_own_instance() {
             let (code, _) = launch.wait_exit();
             assert_eq!(code, 0, "{what} {rest}: {:?}", launch.lines());
             let run: Value = serde_json::from_str(&launch.wait_line("run ")).unwrap();
-            assert_eq!(run["pipe_held"], true, "{what} {rest}: {run}");
+            // The first launch finds the pipe held; this squatter serves no one, so a later
+            // one finds every instance busy, which can't be told from a hung LILITH (M-14).
+            let notice = run["pipe_notice"].as_str().unwrap_or_default();
+            assert!(
+                [
+                    lil_qt::single_instance::NOTICE_HELD,
+                    lil_qt::single_instance::NOTICE_BUSY
+                ]
+                .contains(&notice),
+                "{what} {rest}: {run}"
+            );
+            if rest.is_empty() {
+                assert_eq!(
+                    notice,
+                    lil_qt::single_instance::NOTICE_HELD,
+                    "{what}: {run}"
+                );
+            }
             assert!(
                 launch.lines().iter().all(|l| !l.starts_with("claimed")),
                 "{what}: {:?}",
@@ -881,4 +898,244 @@ fn a_deny_that_fails_exits_non_zero() {
     let lines = deny_lines(&env, CF);
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("\"failed\""), "{}", lines[0]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Integrity levels (review I-6, M-16).
+// ---------------------------------------------------------------------------------------------
+
+/// Labels `dir` and what it holds Low-integrity writable (`icacls /setintegritylevel`), as a
+/// sandboxed helper's folder is: a Low process can then write its out file there. Never the
+/// folder of an exe the test starts at Medium: Windows starts an exe labelled Low at Low.
+fn label_low(dir: &std::path::Path) {
+    let done = Command::new("icacls")
+        .arg(dir)
+        .args(["/setintegritylevel", "(OI)(CI)low"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("icacls");
+    assert!(done.success(), "icacls {}", dir.display());
+}
+
+/// A probe launch started at Low integrity, as a sandboxed helper of this user could start the
+/// app: this process's token, duplicated with the Low label (S-1-16-4096), through
+/// `CreateProcessAsUserW` (review I-6's recipe).
+struct LowLaunch {
+    process: windows::Win32::Foundation::HANDLE,
+    out: PathBuf,
+}
+
+impl LowLaunch {
+    fn start(folder: &Folder, out_dir: &std::path::Path, env: &TestEnv, rest: &str) -> LowLaunch {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows::Win32::Security::{
+            DuplicateTokenEx, PSID, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
+            TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
+            TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
+        };
+        use windows::Win32::System::Threading::{
+            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
+            OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+        use windows::core::{HSTRING, PWSTR};
+
+        let out = out_dir.join("low.txt");
+        let exe = folder.exe();
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        let mut set = |k: &str, v: std::ffi::OsString| {
+            vars.retain(|(name, _)| !name.eq_ignore_ascii_case(k));
+            vars.push((k.into(), v));
+        };
+        for (k, v) in env.child_env() {
+            set(&k.to_string_lossy(), v);
+        }
+        set(PROBE, "1".into());
+        set(
+            PROBE_CMDLINE,
+            format!("\"{}\" {rest}", exe.display()).into(),
+        );
+        set(PROBE_OUT, out.clone().into_os_string());
+        let mut block: Vec<u16> = Vec::new();
+        for (k, v) in &vars {
+            use std::os::windows::ffi::OsStrExt as _;
+            block.extend(k.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(v.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        let mut command: Vec<u16> = format!(
+            "\"{}\" probe --exact --ignored --nocapture --test-threads=1",
+            exe.display()
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+        // SAFETY: every handle is this process's own and closed once; every buffer outlives
+        // the call that reads it; the SID from ConvertStringSidToSidW is freed once.
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+                &mut token,
+            )
+            .expect("this process's token");
+            let mut low = HANDLE::default();
+            DuplicateTokenEx(
+                token,
+                windows::Win32::Security::TOKEN_ACCESS_MASK(0x0200_0000),
+                None,
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut low,
+            )
+            .expect("a copy of the token");
+            let mut sid = PSID::default();
+            ConvertStringSidToSidW(&HSTRING::from("S-1-16-4096"), &mut sid).expect("the Low SID");
+            let label = TOKEN_MANDATORY_LABEL {
+                Label: SID_AND_ATTRIBUTES {
+                    Sid: sid,
+                    // SE_GROUP_INTEGRITY.
+                    Attributes: 0x20,
+                },
+            };
+            SetTokenInformation(
+                low,
+                TokenIntegrityLevel,
+                (&raw const label).cast(),
+                u32::try_from(size_of::<TOKEN_MANDATORY_LABEL>()).unwrap() + 12,
+            )
+            .expect("the Low label");
+            let startup = STARTUPINFOW {
+                cb: u32::try_from(size_of::<STARTUPINFOW>()).unwrap(),
+                ..Default::default()
+            };
+            let mut info = PROCESS_INFORMATION::default();
+            CreateProcessAsUserW(
+                Some(low),
+                &HSTRING::from(exe.as_os_str()),
+                Some(PWSTR(command.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                Some(block.as_ptr().cast()),
+                None,
+                &startup,
+                &mut info,
+            )
+            .expect("the Low process");
+            let _ = CloseHandle(info.hThread);
+            let _ = CloseHandle(low);
+            let _ = CloseHandle(token);
+            let _ = LocalFree(Some(HLOCAL(sid.0)));
+            LowLaunch {
+                process: info.hProcess,
+                out,
+            }
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.out)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn wait_line(&self, prefix: &str) -> String {
+        let until = Instant::now() + DEADLINE;
+        loop {
+            if let Some(line) = self.lines().iter().find(|l| l.starts_with(prefix)) {
+                return line[prefix.len()..].trim().to_string();
+            }
+            assert!(
+                Instant::now() < until,
+                "no `{prefix}` line from the Low probe; it wrote {:?}",
+                self.lines()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for LowLaunch {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        // SAFETY: the process handle is this struct's own, closed once.
+        unsafe {
+            let _ = TerminateProcess(self.process, 1);
+            let _ = WaitForSingleObject(self.process, 5000);
+            let _ = CloseHandle(self.process);
+        }
+    }
+}
+
+#[test] // spec: ARCH-027, APP-013
+fn a_lower_integrity_instance_is_never_trusted() {
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    let low_dir = tempfile::tempdir().unwrap();
+    label_low(low_dir.path());
+    label_low(env.root());
+    // A Low copy of the app's exe claims the pipe first.
+    let low = LowLaunch::start(&folder, low_dir.path(), &env, "");
+    assert_eq!(low.wait_line("claimed "), "shell", "{:?}", low.lines());
+    // A normal launch hands it nothing, not even a deny, and runs as an instance of its own.
+    for rest in [
+        task_url(&env, 5),
+        format!(
+            "\"{}:deny/{CF}/00112233445566778899aabbccddeeff\"",
+            scheme(&env)
+        ),
+    ] {
+        let mut launch = Launch::start(&folder, &env, &rest);
+        let (code, _) = launch.wait_exit();
+        assert_eq!(code, 0, "{rest}: {:?}", launch.lines());
+        assert!(
+            !launch.lines().iter().any(|l| l.contains("forwarded=true")),
+            "{rest}: {:?}",
+            launch.lines()
+        );
+        if rest.contains("task/") {
+            let run: Value = serde_json::from_str(&launch.wait_line("run ")).unwrap();
+            assert_eq!(
+                run["pipe_notice"],
+                lil_qt::single_instance::NOTICE_HELD,
+                "{run}"
+            );
+            assert_eq!(run["job"], "j_0000000000000005", "its own launch: {run}");
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        low.lines()
+            .iter()
+            .all(|l| !l.starts_with("deliver") && !l.starts_with("handled")),
+        "the Low instance got nothing: {:?}",
+        low.lines()
+    );
+}
+
+#[test] // spec: ARCH-027
+fn a_lower_integrity_launch_hands_the_instance_nothing() {
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    let low_dir = tempfile::tempdir().unwrap();
+    label_low(low_dir.path());
+    label_low(env.root());
+    let app = running(&folder, &env, "", "shell");
+    let low = LowLaunch::start(&folder, low_dir.path(), &env, &task_url(&env, 6));
+    // It can't hand its launch over: it runs as an instance of its own, and the app gets
+    // nothing.
+    let run: Value = serde_json::from_str(&low.wait_line("run ")).unwrap();
+    assert!(run["pipe_notice"].is_string(), "{run}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.delivered(), Vec::<Value>::new());
+    folder.stop();
 }

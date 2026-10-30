@@ -51,12 +51,14 @@ lil-testkit = { path = "../lil-testkit" }
 tempfile.workspace = true
 # desktop_app.rs (the desktop group): the foreground window, the windows of a process and the
 # blocker's synthesized click in physical coordinates (Task 1's S1.4 recipe); instance.rs: a
-# squatter's pipe with a security descriptor of its own, and this process's threads.
+# squatter's pipe with a security descriptor of its own, this process's threads, and a
+# Low-integrity launch (CreateProcessAsUserW).
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
