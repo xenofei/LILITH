@@ -36,14 +36,15 @@ use windows::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
     FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx, FileIdInfo,
-    FileStandardInfo, FlushFileBuffers, GetDriveTypeW, GetFileAttributesW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLongPathNameW, GetShortPathNameW,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
+    FileDispositionInfoEx, FileIdInfo, FileStandardInfo, FlushFileBuffers,
+    GETFINALPATHNAMEBYHANDLE_FLAGS, GetDriveTypeW, GetFileAttributesW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetLongPathNameW, GetShortPathNameW,
     GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK,
     LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS,
     REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
-    SetFileAttributesW, SetFileInformationByHandle, UnlockFileEx,
+    SetFileAttributesW, SetFileInformationByHandle, UnlockFileEx, VOLUME_NAME_DOS,
 };
 use windows::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 use windows::core::PCWSTR;
@@ -477,6 +478,28 @@ pub fn identity(path: &Path) -> io::Result<FileIdentity> {
         change_time: (basic.ChangeTime != 0).then_some(basic.ChangeTime),
         attributes: basic.FileAttributes,
     })
+}
+
+/// Where an open file really is, once every link on the way has been followed
+/// (`GetFinalPathNameByHandleW`): `\\?\C:\…`, or `\\?\UNC\server\share\…` on a share.
+///
+/// # Errors
+/// When Windows can't say, a volume without a drive letter among the cases.
+pub fn final_path(file: &File) -> io::Result<PathBuf> {
+    let mut buf = vec![0u16; 32_768];
+    // SAFETY: the handle is open while `file` is borrowed; `buf` is a writable slice.
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            handle(file),
+            &mut buf,
+            GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0),
+        )
+    } as usize;
+    if len == 0 || len >= buf.len() {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(len);
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
 }
 
 /// The facts of a volume that decide whether file ids can be trusted (CORE-041, ARCH-089).

@@ -532,6 +532,12 @@ fn classify(arg: &str, env: &Env) -> Result<Opened, String> {
     Err(not_a_link(arg))
 }
 
+/// An open file's final path (`lil_platform::fs::final_path`) names a drive of this PC: `\\?\C:\…`,
+/// never `\\?\UNC\…` (a share, a mapped drive) or anything else.
+fn final_path_is_local(path: &str) -> bool {
+    path.strip_prefix(r"\\?\").is_some_and(is_drive_absolute)
+}
+
 /// Reads a `.lilref` file: local only, a regular file of at most 4 KiB, UTF-8, and one
 /// `lil_schema::parse_lilref` accepts.
 fn lilref(arg: &str) -> Result<Opened, String> {
@@ -566,6 +572,17 @@ fn lilref(arg: &str) -> Result<Opened, String> {
         )
     };
     let file = std::fs::File::open(path).map_err(|_| unreadable())?;
+    // A parent folder may be a link to a share, which the checks above can't see: where the
+    // opened file really is decides, before a byte of it is read.
+    let really = lil_platform::fs::final_path(&file).map_err(|_| unreadable())?;
+    if !final_path_is_local(&really.to_string_lossy()) {
+        return Err(LILREF_NOT_LOCAL.to_string());
+    }
+    match lil_platform::fs::volume_info(&really) {
+        Ok(v) if !v.remote => {}
+        Ok(_) => return Err(LILREF_NOT_LOCAL.to_string()),
+        Err(_) => return Err(unreadable()),
+    }
     let meta = file.metadata().map_err(|_| unreadable())?;
     if !meta.is_file() {
         return Err(unreadable());
@@ -1207,6 +1224,77 @@ mod tests {
             plan(r#""C:\a.png""#).opened,
             Some(Opened::Target(r"C:\a.png".into()))
         );
+    }
+
+    #[test] // spec: APP-021
+    fn a_lilref_is_on_this_pc_only_when_its_final_path_says_so() {
+        for local in [r"\\?\C:\a\x.lilref", r"\\?\d:/x.lilref"] {
+            assert!(final_path_is_local(local), "{local}");
+        }
+        for not in [
+            r"\\?\UNC\host\share\x.lilref",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\x.lilref",
+            r"\\host\share\x.lilref",
+            r"\\.\C:\x.lilref",
+            r"C:\x.lilref",
+            r"\\?\",
+            "",
+        ] {
+            assert!(!final_path_is_local(not), "{not}");
+        }
+    }
+
+    #[test] // spec: APP-021
+    fn a_lilref_behind_a_local_folder_link_is_read_from_where_it_really_is() {
+        // A junction needs no privilege. It can only lead to this PC, so this shows the check on
+        // a real handle, and that it lets such a file through.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(
+            real.join("x.lilref"),
+            format!(r#"{{"lilref": 1, "ref": "{}"}}"#, sealed()),
+        )
+        .unwrap();
+        let link = dir.path().join("link");
+        lil_platform::fs::create_junction(&link, &real).unwrap();
+        let through = link.join("x.lilref");
+        let file = std::fs::File::open(&through).unwrap();
+        let really = lil_platform::fs::final_path(&file).unwrap();
+        let really = really.to_string_lossy();
+        assert!(final_path_is_local(&really), "{really}");
+        assert!(really.ends_with(r"\real\x.lilref"), "{really}");
+        assert!(plan(&format!("\"{}\"", through.display())).opened.is_some());
+    }
+
+    #[test] // spec: APP-021
+    fn a_lilref_behind_a_folder_link_to_a_share_is_refused() {
+        // A folder symbolic link needs Developer Mode or the privilege, and a share of this PC
+        // an account allowed to reach it: without them the case is skipped, and
+        // `a_lilref_is_on_this_pc_only_when_its_final_path_says_so` is the decision's test.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("x.lilref"),
+            format!(r#"{{"lilref": 1, "ref": "{}"}}"#, sealed()),
+        )
+        .unwrap();
+        let full = std::fs::canonicalize(dir.path()).unwrap();
+        let full = full.to_string_lossy();
+        let local = full.strip_prefix(r"\\?\").unwrap();
+        let share = format!(r"\\localhost\{}$\{}", &local[..1], &local[3..]);
+        let link = dir.path().join("link");
+        if std::os::windows::fs::symlink_dir(&share, &link).is_err() {
+            eprintln!("no folder symbolic link could be made here: case skipped");
+            return;
+        }
+        let through = link.join("x.lilref");
+        if std::fs::read(&through).is_err() {
+            eprintln!("this PC's own share can't be reached here: case skipped");
+            return;
+        }
+        let p = plan(&format!("\"{}\"", through.display()));
+        assert_eq!(p.opened, None);
+        assert_eq!(p.link_refused.as_deref(), Some(LILREF_NOT_LOCAL));
     }
 
     #[test] // spec: APP-021
