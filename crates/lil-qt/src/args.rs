@@ -131,6 +131,9 @@ pub struct BootPlan {
     pub refused: Option<String>,
     /// Set by `single_instance::start` once the arguments reached the running instance.
     pub forwarded: bool,
+    /// Set by `single_instance::start` when another program holds the app's pipe: this start
+    /// runs as an instance of its own, and the shell says so.
+    pub pipe_held: bool,
     /// Qt's `organizationName`: the channel's data-folder name (`LILITH`, `LILITH-dev`).
     pub org: String,
     /// Qt's `applicationName` ([`APP`]).
@@ -174,6 +177,7 @@ fn base_plan(env: &Env) -> BootPlan {
         link_refused: None,
         refused: None,
         forwarded: false,
+        pipe_held: false,
         org,
         app: APP.to_string(),
         qt_args: vec![QT_ARGV0.to_string()],
@@ -276,6 +280,10 @@ fn read(args: &[String], env: &Env) -> Result<BootPlan, &'static str> {
             return Err(REPEATED);
         }
     }
+    // `--smoke-exit` is the deploy check's: alone, or with `--no-activate` (review M-4).
+    if plan.smoke_exit && (positional.is_some() || confirm.is_some() || intent_seen) {
+        return Err(NOT_AN_ARGUMENT);
+    }
     if let Some(id) = confirm {
         if positional.is_some() {
             return Err(TWO_ARGUMENTS);
@@ -328,26 +336,67 @@ fn has_scheme(s: &str) -> bool {
     })
 }
 
-/// `text` with what follows a `deny/<id>/` cut to `…`: a deny token is never shown or logged,
-/// another channel's included (P4a-R9).
-fn cut_token(text: &str) -> String {
-    let Some(at) = text.find("deny/") else {
-        return text.to_string();
-    };
-    let after = at + "deny/".len();
-    match text[after..].find('/') {
-        Some(slash) if after + slash + 1 < text.len() => {
-            format!("{}…", &text[..after + slash + 1])
-        }
-        _ => text.to_string(),
+/// The end of a separator at `at` in `text`: `/`, or `%2F` in any case.
+fn separator_end(text: &str, at: usize) -> Option<usize> {
+    let rest = &text[at..];
+    if rest.starts_with('/') {
+        Some(at + 1)
+    } else if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("%2f") {
+        Some(at + 3)
+    } else {
+        None
     }
+}
+
+/// `text` with what follows a `deny<sep><id><sep>` cut to `…`, `deny` in any case and each
+/// separator `/` or `%2F`: a deny token is never shown or logged, however a refused link spells
+/// it (P4a-R9; review M-1).
+fn cut_token(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("deny") {
+        let at = from + found;
+        from = at + "deny".len();
+        let Some(id_start) = separator_end(text, from) else {
+            continue;
+        };
+        let cut = (id_start..text.len())
+            .filter(|&i| text.is_char_boundary(i))
+            .find_map(|i| separator_end(text, i));
+        if let Some(cut) = cut
+            && cut < text.len()
+        {
+            return format!("{}…", &text[..cut]);
+        }
+    }
+    text.to_string()
 }
 
 fn not_a_link(arg: &str) -> String {
     format!(
         "This link isn't one LILITH opens: {}",
-        lil_parse::shown_text(arg, SHOWN_CHARS)
+        cut_token(&lil_parse::shown_text(arg, SHOWN_CHARS))
     )
+}
+
+/// The longest target, in UTF-8 bytes, as an `open/` link carries (Appendix G).
+const MAX_TARGET_BYTES: usize = 4096;
+
+/// A target the card shows and plan 4b's Inspector opens, held to the `open/` rules whichever
+/// way it came (review M-2): 1 to 4,096 bytes, no control character, and on this PC.
+fn check_target(target: &str) -> Result<(), String> {
+    if target.is_empty() || target.len() > MAX_TARGET_BYTES {
+        return Err(format!(
+            "This file or link is longer than {MAX_TARGET_BYTES} bytes, so LILITH doesn't open it."
+        ));
+    }
+    if target.chars().any(char::is_control) {
+        return Err(not_a_link(target));
+    }
+    if is_unc_like(target) {
+        return Err("LILITH opens files from this PC only.".to_string());
+    }
+    Ok(())
 }
 
 /// What the one positional argument opens, or what the Opened card says instead.
@@ -361,7 +410,7 @@ fn classify(arg: &str, env: &Env) -> Result<Opened, String> {
             Ok(LilUrl::Confirm(id)) => Ok(Opened::Confirm(id)),
             Ok(LilUrl::Deny { id, token }) => Ok(Opened::Deny { id, token }),
             Ok(LilUrl::Task(job)) => Ok(Opened::Task(job)),
-            Ok(LilUrl::Open(target)) => Ok(Opened::Target(target)),
+            Ok(LilUrl::Open(target)) => check_target(&target).map(|()| Opened::Target(target)),
             Ok(LilUrl::Ref(r)) => Ok(Opened::Ref(r)),
             Err(refusal) => Err(format!(
                 "This link isn't one LILITH opens: {}",
@@ -370,7 +419,7 @@ fn classify(arg: &str, env: &Env) -> Result<Opened, String> {
         };
     }
     if is_drive_absolute(arg) {
-        return Ok(Opened::Target(arg.to_string()));
+        return check_target(arg).map(|()| Opened::Target(arg.to_string()));
     }
     if is_unc_like(arg) {
         return Err("LILITH opens files from this PC only.".to_string());
@@ -388,11 +437,23 @@ fn lilref(arg: &str) -> Result<Opened, String> {
         return Err("LILITH opens a .lilref file by its full path.".to_string());
     }
     let path = Path::new(arg);
-    // A mapped network drive is a network share too: refused before the file is opened.
-    if lil_platform::fs::volume_info(path).is_ok_and(|v| v.remote) {
-        return Err(LILREF_NOT_LOCAL.to_string());
-    }
     let unreadable = || "LILITH couldn't read this .lilref file.".to_string();
+    // A mapped network drive is a network share too, and a volume that can't be told is taken
+    // for one: refused before the file is opened (review M-7).
+    match lil_platform::fs::volume_info(path) {
+        Ok(v) if !v.remote => {}
+        Ok(_) => return Err(LILREF_NOT_LOCAL.to_string()),
+        Err(_) => return Err(unreadable()),
+    }
+    // A link (symbolic, a junction, any reparse point) could lead off this PC: never followed.
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let meta = std::fs::symlink_metadata(path).map_err(|_| unreadable())?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(LILREF_NOT_LOCAL.to_string());
+        }
+    }
     let too_large = || {
         format!(
             "This .lilref file is larger than {LILREF_MAX_BYTES} bytes, so it isn't one LILITH opens."
@@ -433,13 +494,14 @@ fn lilref(arg: &str) -> Result<Opened, String> {
 /// `{kind, intent, focus, activate, …}`, `kind` being `refused` (`message`), `target`, `ref` or
 /// `lilref` (`target`, and `title` for a `.lilref`), `task` (`job`), `confirm` (`id`),
 /// `confirm_list` or `activate` (nothing to show). `focus` is false under `--no-activate`;
-/// `activate` false when the window was shown by the start itself. A deny is never shown, so
-/// it has none: `None`.
+/// `activate` false when the window was shown by the start itself; `pipe_held` true when
+/// another program holds the app's pipe. A deny is never shown, so it has none: `None`.
 pub fn launch_json(plan: &BootPlan, activate: bool) -> Option<String> {
     let mut v = json!({
         "intent": plan.intent.as_str(),
         "focus": !plan.no_activate,
         "activate": activate,
+        "pipe_held": plan.pipe_held,
     });
     let set = |v: &mut Value, fields: Value| {
         if let (Some(into), Value::Object(from)) = (v.as_object_mut(), fields) {
@@ -511,6 +573,7 @@ mod tests {
                 link_refused: None,
                 refused: None,
                 forwarded: false,
+                pipe_held: false,
                 org: "LILITH-dev".to_string(),
                 app: "image".to_string(),
                 qt_args: vec!["lil-image".to_string()],
@@ -827,5 +890,84 @@ mod tests {
         );
         let first: Value = serde_json::from_str(&launch_json(&plan(""), false).unwrap()).unwrap();
         assert_eq!(first["activate"], false);
+    }
+
+    #[test] // spec: APP-020
+    fn smoke_exit_takes_no_link_and_no_confirm() {
+        for rest in [
+            "--smoke-exit lil-dev:task/j_0123456789abcdef".to_string(),
+            format!("--smoke-exit \"lil-dev:deny/{CF}/{TOKEN}\""),
+            "--smoke-exit --confirm".to_string(),
+            format!("--confirm {CF} --smoke-exit"),
+            "--smoke-exit --intent edit".to_string(),
+            r#"--smoke-exit "C:\a.png""#.to_string(),
+        ] {
+            let p = plan(&rest);
+            assert!(p.refused.is_some(), "{rest}");
+            assert_eq!(p.opened, None, "{rest}");
+        }
+        let p = plan("--smoke-exit --no-activate");
+        assert!(p.smoke_exit && p.no_activate && p.refused.is_none());
+    }
+
+    #[test] // spec: APP-020, P4a-R9
+    fn a_refused_link_never_shows_a_token_however_it_is_spelled() {
+        for rest in [
+            format!("lil-dev:DENY/{CF}/{TOKEN}"),
+            format!("lil-dev:Deny%2F{CF}%2f{TOKEN}"),
+            format!("lil-dev:deny%2f{CF}/{TOKEN}"),
+            format!("lil:deny/{CF}/{TOKEN}"),
+            format!("other:x/deny/{CF}/{TOKEN}"),
+            format!("deny/{CF}/{TOKEN}"),
+        ] {
+            let p = plan(&format!("\"{rest}\""));
+            let message = p
+                .link_refused
+                .unwrap_or_else(|| panic!("{rest}: not refused"));
+            assert!(!message.contains(TOKEN), "{rest}: {message}");
+            assert!(message.contains(CF), "{rest}: the id stays: {message}");
+        }
+        assert_eq!(cut_token("lil-dev:open/@@@"), "lil-dev:open/@@@");
+        assert_eq!(cut_token("deny/"), "deny/");
+    }
+
+    #[test] // spec: APP-020, QA-050
+    fn a_target_is_held_to_the_open_rules_whichever_way_it_comes() {
+        // A path with a control character, or longer than an open/ target may be.
+        for target in [
+            "C:\\a\u{7}b.png".to_string(),
+            format!("C:\\{}.png", "x".repeat(4100)),
+        ] {
+            let p = plan_args(std::slice::from_ref(&target), &env(Channel::Dev));
+            assert_eq!(p.opened, None, "{target:.20}");
+            assert!(p.link_refused.is_some(), "{target:.20}");
+        }
+        // An open/ target naming a share is refused as a share path is.
+        let p = plan(&b64(r"\\host\share\x.png"));
+        assert_eq!(
+            p.link_refused.as_deref(),
+            Some("LILITH opens files from this PC only.")
+        );
+        assert_eq!(
+            plan(r#""C:\a.png""#).opened,
+            Some(Opened::Target(r"C:\a.png".into()))
+        );
+    }
+
+    #[test] // spec: APP-021
+    fn a_lilref_link_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.lilref");
+        std::fs::write(&real, format!(r#"{{"lilref": 1, "ref": "{}"}}"#, sealed())).unwrap();
+        assert!(plan(&format!("\"{}\"", real.display())).opened.is_some());
+        let link = dir.path().join("link.lilref");
+        // A symbolic link needs Developer Mode or the privilege: without it the case is skipped.
+        if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+            eprintln!("no symbolic link could be made here: case skipped");
+            return;
+        }
+        let p = plan(&format!("\"{}\"", link.display()));
+        assert_eq!(p.opened, None);
+        assert_eq!(p.link_refused.as_deref(), Some(LILREF_NOT_LOCAL));
     }
 }
