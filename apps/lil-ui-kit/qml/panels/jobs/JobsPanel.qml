@@ -62,6 +62,8 @@ Rectangle {
     property Item emptyText: null
     // The live list's "Showing the first N queued jobs" line (made in its header).
     property Item cappedNote: null
+    // The live list's line while its last read failed (made in its header).
+    property Item staleNote: null
 
     // lane -> QueueState.
     property var lanes: ({})
@@ -124,6 +126,8 @@ Rectangle {
     // The lanes with a state newer than the read that is out.
     property var _newerLanes: ({})
     property bool _liveReading: false
+    // The last read failed: the rows may be old, and it is asked again.
+    property bool _liveReadFailed: false
     property bool _liveAgain: false
     // The read asked for again must carry nothing over (a snapshot or a resync came).
     property bool _liveFreshAgain: false
@@ -423,6 +427,7 @@ Rectangle {
                 return
             live.commit(Date.now())
             root._liveReading = false
+            root._liveReadFailed = false
             root.overviewChanged()
             const newer = root._newerLanes
             root.applyLanes(JSON.parse(live.lanesJson()).filter(s => !newer[s.lane]))
@@ -441,6 +446,7 @@ Rectangle {
                 return
             gone = true
             root._liveReading = false
+            root._liveReadFailed = true
             retryLive.start()
         }
         // A listing, each page after the page before.
@@ -807,6 +813,20 @@ Rectangle {
                     color: Theme.warning
                     font.pixelSize: Theme.fontSize
                     Component.onCompleted: root.cappedNote = cappedText
+                }
+
+                // A failed read says so: the rows above may be old until the retry works.
+                Text {
+                    id: staleText
+                    visible: root._liveReadFailed
+                    width: parent.width
+                    leftPadding: Theme.spacing
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    text: "Couldn't read the queue. Trying again…"
+                    color: Theme.warning
+                    font.pixelSize: Theme.fontSize
+                    Component.onCompleted: root.staleNote = staleText
                 }
 
                 Text {

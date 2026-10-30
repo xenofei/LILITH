@@ -778,6 +778,24 @@ TestCase {
         tryVerify(() => t.panel.banner.text === "Cancelling or cancelled 2 jobs.", 2000, t.panel.banner.text)
     }
 
+    // A failed read says so, and the next good one takes it back.
+    function test_a_failed_live_read_says_so_until_a_read_works() { // spec: APP-114
+        const t = load({queue: [queued("j2", 0)]})
+        verify(!t.panel.staleNote.visible, "nothing to say yet")
+        t.core.emit("jobs", "event", {kind: "job", job: queued("j2", 0, {updated: iso()})})
+        answer(t.core, isRunningRead, {status: "error", error: {code: "state.unavailable", category: "transient",
+                                                                message: "No.", trace_id: "t", retry: "after_backoff"}})
+        tryVerify(() => t.panel.staleNote.visible, 2000, "the note")
+        compare(t.panel.staleNote.text, "Couldn't read the queue. Trying again…")
+        verify(row(t.panel, "j2"), "the rows stay")
+        // The other listings of that read count for nothing; the retry comes 2 s later.
+        for (const c of openCalls(t.core, c => isQueueRead(c) || isQueuedRead(c)))
+            answered[c.id] = true
+        tryVerify(() => openCalls(t.core, isRunningRead).length === 1, 4000, "the retry")
+        answerLive(t.core, [], [queued("j2", 0)])
+        tryVerify(() => !t.panel.staleNote.visible, 2000, "gone")
+    }
+
     // A list emptied under a row still being made off the frame's path: the view cancels that row
     // by an index past the list's end, and Qt warns.
     function test_a_list_emptied_under_a_row_being_made_warns_nothing() { // spec: APP-114, APP-139
