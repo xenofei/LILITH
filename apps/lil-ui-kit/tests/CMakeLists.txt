@@ -117,3 +117,10 @@ set_tests_properties(grab_hardware PROPERTIES
     TIMEOUT 300
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+# The Hardware panel's per-sample cost (label bench): offscreen, on the 1280 x 800 screen.
+add_test(NAME bench_hardware COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/bench_hardware.qml)
+set_tests_properties(bench_hardware PROPERTIES
+    LABELS bench
+    TIMEOUT 120
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
