@@ -109,13 +109,18 @@ TestCase {
         const shell = makeShell()
         const card = shell.openedCard
         const message = "This link isn't one LILITH opens: lil-dev:open/@@@"
+        // The docked panels ask the core for their own data; the launch must add nothing.
+        const before = fake.calls.length
+        const panelCalls = new Set(fake.calls.map(c => c.name))
         launch(shell, {kind: "refused", message: message})
+        compare(fake.calls.slice(before), [], "a refused link asks the core nothing")
         tryVerify(() => card.visible, 2000, "the card shows")
         compare(card.message, message)
         compare(card.targetText, "")
         verify(!card.copyButton.visible, "nothing to copy")
         verify(card.dismissButton.visible)
-        compare(fake.calls, [], "a refused link asks the core nothing")
+        compare(fake.calls.slice(before).filter(c => !panelCalls.has(c.name)), [],
+                "nor later, beyond the panels' own re-reads")
         compare(shell.shownJob, "", "and opens no job")
         compare(shell.shownConfirmation, "", "nor a confirmation")
         compare(fakeShim.activations.length, 1, "only the window comes forward")
