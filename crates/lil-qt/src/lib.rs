@@ -44,6 +44,7 @@ pub mod paging;
 pub mod preview;
 pub mod requests;
 pub mod retry;
+pub mod series;
 pub mod shortcuts;
 pub mod throttle;
 pub mod topics;
