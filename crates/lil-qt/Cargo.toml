@@ -49,3 +49,10 @@ workspace = true
 # The e2e tests (feature `qt`): a real test-channel core.
 lil-testkit = { path = "../lil-testkit" }
 tempfile.workspace = true
+# desktop_app.rs (the desktop group): the foreground window, the windows of a process and the
+# blocker's synthesized click (Task 1's S1.4 recipe).
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
