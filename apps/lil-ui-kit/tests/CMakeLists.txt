@@ -75,6 +75,17 @@ configure_file(offscreen-screen.json ${CMAKE_CURRENT_BINARY_DIR}/offscreen-scree
 set_property(TEST tst_boot tst_theme tst_controls tst_a11y tst_layout grab_shell APPEND PROPERTY
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
 
+# Task 19: the shell's open requests and the Opened card, on the same offscreen screen.
+lil_qml_test(tst_open_card tst_open_card.qml)
+add_test(NAME grab_open_card COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/grab_open_card.qml)
+set_tests_properties(grab_open_card PROPERTIES
+    LABELS grabs
+    TIMEOUT 300
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+set_property(TEST tst_open_card grab_open_card APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+
 # The stall watchdog's bench check (label bench): offscreen whatever the preset.
 add_test(NAME bench_stall_watchdog COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/bench_stall_watchdog.qml)
 set_tests_properties(bench_stall_watchdog PROPERTIES

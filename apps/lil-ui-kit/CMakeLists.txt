@@ -31,6 +31,10 @@ qt_target_qml_sources(lil-ui-kit
         qml/shell/Panels.js
         qml/shell/PlaceholderPanel.qml
         qml/a11y/A11yWalk.qml)
+# Task 19: the Opened card (P4a-R21), held by the shell until Task 26 moves it into Home.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/panels/home/OpenedCard.qml)
 
 # Task 24: the Usage & spend panel.
 qt_target_qml_sources(lil-ui-kit
