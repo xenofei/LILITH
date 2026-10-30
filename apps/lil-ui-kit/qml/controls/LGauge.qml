@@ -24,6 +24,7 @@ Item {
         id: caption
         width: parent.width
         text: root.label
+        textFormat: Text.PlainText
         color: Theme.textMuted
         font.pixelSize: Theme.fontSize - 1
         elide: Text.ElideRight
@@ -31,6 +32,7 @@ Item {
         Text {
             anchors.right: parent.right
             text: root.percent + " %"
+            textFormat: Text.PlainText
             color: Theme.text
             font: caption.font
         }

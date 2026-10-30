@@ -32,6 +32,7 @@ T.TextField {
         width: control.width - control.leftPadding - control.rightPadding
         height: control.height - control.topPadding - control.bottomPadding
         text: control.placeholderText
+        textFormat: Text.PlainText
         font: control.font
         color: control.placeholderTextColor
         verticalAlignment: control.verticalAlignment

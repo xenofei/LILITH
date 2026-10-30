@@ -24,6 +24,7 @@ Rectangle {
         Text {
             width: parent.width
             text: root.title
+            textFormat: Text.PlainText
             color: Theme.text
             font.pixelSize: Theme.fontSize + 4
             font.bold: true
@@ -34,6 +35,7 @@ Rectangle {
         Text {
             width: parent.width
             text: "This panel isn't built yet."
+            textFormat: Text.PlainText
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
             horizontalAlignment: Text.AlignHCenter

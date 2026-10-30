@@ -85,6 +85,7 @@ Item {
             width: row.width - (closeButton.visible ? closeButton.width + row.spacing : 0)
             anchors.verticalCenter: parent.verticalCenter
             text: root.text
+            textFormat: Text.PlainText
             color: Theme.text
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap

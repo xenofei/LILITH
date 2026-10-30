@@ -25,6 +25,7 @@ Rectangle {
         id: label
         anchors.centerIn: parent
         text: root.text
+        textFormat: Text.PlainText
         color: Theme.bg
         font.pixelSize: Theme.fontSize - 1
         font.bold: true

@@ -75,6 +75,7 @@ KDDW.TabBarBase {
                     id: label
                     anchors.centerIn: parent
                     text: tab.title
+                    textFormat: Text.PlainText
                     color: tab.current ? Theme.text : Theme.textMuted
                     font.pixelSize: Theme.fontSize
                 }

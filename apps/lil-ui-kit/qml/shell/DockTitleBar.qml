@@ -29,6 +29,7 @@ KDDW.TitleBarBase {
         anchors.right: buttons.left
         anchors.verticalCenter: parent.verticalCenter
         text: root.title
+        textFormat: Text.PlainText
         color: Theme.text
         font.pixelSize: Theme.fontSize
         font.bold: root.isFocused

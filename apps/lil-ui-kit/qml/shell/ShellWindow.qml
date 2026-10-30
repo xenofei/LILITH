@@ -90,6 +90,7 @@ Window {
         anchors.centerIn: dockingArea
         visible: root._sized && root.openCount === 0 && !root._defaultPending
         text: "No panels open. " + root.keysFor("panel.home") + " opens Home."
+        textFormat: Text.PlainText
         color: Theme.textMuted
         font.pixelSize: Theme.fontSize + 1
         Accessible.role: Accessible.StaticText

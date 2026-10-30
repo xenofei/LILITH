@@ -22,6 +22,7 @@ T.Button {
 
     contentItem: Text {
         text: control.glyph
+        textFormat: Text.PlainText
         font: control.font
         color: control.enabled ? Theme.text : Theme.textMuted
         horizontalAlignment: Text.AlignHCenter

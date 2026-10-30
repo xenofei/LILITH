@@ -26,6 +26,7 @@ T.Button {
 
     contentItem: Text {
         text: control.text
+        textFormat: Text.PlainText
         font: control.font
         color: !control.enabled ? Theme.textMuted : control.primary ? Theme.bg : Theme.text
         horizontalAlignment: Text.AlignHCenter

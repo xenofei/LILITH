@@ -32,4 +32,14 @@ qt_target_qml_sources(lil-ui-kit
         qml/shell/PlaceholderPanel.qml
         qml/a11y/A11yWalk.qml)
 
+# Task 24: the Usage & spend panel.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/panels/usage/UsagePanel.qml
+        qml/panels/usage/SpendBreakdown.qml
+        qml/panels/usage/CapGauges.qml
+        qml/panels/usage/AccountsList.qml
+        qml/panels/usage/ClaudeCodeSection.qml
+        qml/panels/usage/UsageText.js)
+
 add_subdirectory(tests)
