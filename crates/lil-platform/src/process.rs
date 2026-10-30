@@ -184,15 +184,58 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     Ok(None)
 }
 
+pub use crate::sid::TokenTrust;
+
+/// A pipe peer as ARCH-027 judges it, every part read through the one handle opened first, so
+/// a pid reused between two reads can't mix two processes (Task 19 review M-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub process: ProcessInfo,
+    pub token: TokenTrust,
+}
+
+/// [`PeerInfo`] of process `pid`: its image path, token user, integrity level and restriction,
+/// through one `OpenProcess`.
+///
+/// # Errors
+/// When the process can't be opened or its image or token read.
+pub fn inspect_peer(pid: u32) -> io::Result<PeerInfo> {
+    let process = open_raw(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let raw = HANDLE(process.as_raw_handle());
+    let image = image_path(raw)?;
+    let user_sid = sid::token_user_sid(raw).map_err(|(_, e)| io_error(&e))?;
+    let token = sid::token_trust(raw).map_err(|(_, e)| io_error(&e))?;
+    let parent_pid = parent_pid(pid)?;
+    Ok(PeerInfo {
+        process: ProcessInfo {
+            pid,
+            image,
+            user_sid,
+            parent_pid,
+        },
+        token,
+    })
+}
+
 /// The mandatory integrity level of process `pid`'s token (`0x1000` Low, `0x2000` Medium,
-/// `0x3000` High, `0x4000` System): ARCH-027's "a peer I can trust" also means one at no lower
-/// level than this process ([`own_integrity_rid`]).
+/// `0x3000` High, `0x4000` System).
 ///
 /// # Errors
 /// When the process can't be opened or its token read.
 pub fn integrity_rid(pid: u32) -> io::Result<u32> {
     let process = open_raw(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
-    sid::token_integrity_rid(HANDLE(process.as_raw_handle())).map_err(|(_, e)| io_error(&e))
+    sid::token_trust(HANDLE(process.as_raw_handle()))
+        .map(|t| t.integrity)
+        .map_err(|(_, e)| io_error(&e))
+}
+
+/// This process's own [`TokenTrust`].
+///
+/// # Errors
+/// When its token can't be read.
+pub fn own_token_trust() -> io::Result<TokenTrust> {
+    // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid and needs no closing.
+    sid::token_trust(unsafe { GetCurrentProcess() }).map_err(|(_, e)| io_error(&e))
 }
 
 /// This process's own integrity level ([`integrity_rid`]).
@@ -200,8 +243,7 @@ pub fn integrity_rid(pid: u32) -> io::Result<u32> {
 /// # Errors
 /// When its token can't be read.
 pub fn own_integrity_rid() -> io::Result<u32> {
-    // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid and needs no closing.
-    sid::token_integrity_rid(unsafe { GetCurrentProcess() }).map_err(|(_, e)| io_error(&e))
+    own_token_trust().map(|t| t.integrity)
 }
 
 /// The SID string of the user running this process.
@@ -1064,6 +1106,11 @@ mod tests {
         assert!((0x2000..=0x4000).contains(&own), "{own:#x}");
         assert_eq!(integrity_rid(std::process::id()).unwrap(), own);
         assert!(integrity_rid(u32::MAX - 3).is_err());
+        let me = inspect_peer(std::process::id()).unwrap();
+        assert_eq!(me.token.integrity, own);
+        assert!(!me.token.restricted && !me.token.app_container);
+        assert_eq!(me.process.image, std::env::current_exe().unwrap());
+        assert!(inspect_peer(u32::MAX - 3).is_err());
     }
 
     #[test] // spec: ARCH-019

@@ -3,8 +3,9 @@
 use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_DATA, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsTokenRestricted,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenIsAppContainer,
+    TokenUser,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -85,13 +86,22 @@ pub(crate) fn token_user_sid(
     }
 }
 
-/// The mandatory integrity level of the token of `process` (open with at least
-/// `PROCESS_QUERY_LIMITED_INFORMATION`): the last sub-authority of its label SID, such as
-/// `0x1000` (Low), `0x2000` (Medium) or `0x3000` (High). On failure, the name of the call that
-/// failed.
-pub(crate) fn token_integrity_rid(
+/// What a pipe peer's token says of its trust (ARCH-027), read from one token handle: its
+/// mandatory integrity level (the last sub-authority of its label SID: `0x1000` Low, `0x2000`
+/// Medium, `0x3000` High), whether it is restricted (`IsTokenRestricted`: restricting SIDs, a
+/// write-restricted token among them) and whether it is an AppContainer token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenTrust {
+    pub integrity: u32,
+    pub restricted: bool,
+    pub app_container: bool,
+}
+
+/// [`TokenTrust`] of the token of `process` (open with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`). On failure, the name of the call that failed.
+pub(crate) fn token_trust(
     process: HANDLE,
-) -> Result<u32, (&'static str, windows::core::Error)> {
+) -> Result<TokenTrust, (&'static str, windows::core::Error)> {
     // SAFETY: as `token_user_sid`: every pointer is valid for its call, `buf` is 8-byte
     // aligned and sized by the first call, and the label SID lives in `buf` while it is read.
     unsafe {
@@ -126,7 +136,28 @@ pub(crate) fn token_integrity_rid(
                 windows::core::Error::new(ERROR_INVALID_DATA.to_hresult(), "no sub-authority"),
             ));
         }
-        Ok(*GetSidSubAuthority(sid, u32::from(count) - 1))
+        let integrity = *GetSidSubAuthority(sid, u32::from(count) - 1);
+        // FALSE with no error is "not restricted"; FALSE with an error is a failure.
+        let restricted = match IsTokenRestricted(token.0) {
+            Ok(()) => true,
+            Err(e) if e.code().is_ok() => false,
+            Err(e) => return Err(("IsTokenRestricted", e)),
+        };
+        let mut app_container = 0u32;
+        let mut len = 0u32;
+        GetTokenInformation(
+            token.0,
+            TokenIsAppContainer,
+            Some((&raw mut app_container).cast()),
+            u32::try_from(size_of::<u32>()).unwrap_or(4),
+            &mut len,
+        )
+        .map_err(|e| ("GetTokenInformation", e))?;
+        Ok(TokenTrust {
+            integrity,
+            restricted,
+            app_container: app_container != 0,
+        })
     }
 }
 
