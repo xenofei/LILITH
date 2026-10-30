@@ -11,6 +11,7 @@ use lil_protocol::CallerKind;
 
 pub mod core_object;
 pub mod csv_export;
+pub mod hardware;
 pub mod json_list_model;
 pub mod layout;
 pub mod money_text;
