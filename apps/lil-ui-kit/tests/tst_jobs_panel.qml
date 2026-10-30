@@ -758,6 +758,9 @@ TestCase {
         tryVerify(() => panel.model.loaded && panel.liveView.count === 2)
         panel.liveView.currentIndex = 1
         const pages = core.calls.length
+        // The model's and the panel's, plus any other docked panel's (Usage & spend follows jobs).
+        const subscribers = core.subscriberCount("jobs")
+        verify(subscribers >= 2, "the model and the panel follow jobs: " + subscribers)
         const dock = shell.docks.jobs
         dock.isFloating = true
         tryVerify(() => dock.isFloating && panel.Window.window && panel.Window.window !== shell, 5000,
@@ -772,6 +775,6 @@ TestCase {
         compare(panel.liveView.count, 2)
         compare(panel.liveView.currentIndex, 1)
         compare(core.calls.length, pages, "nothing was loaded again")
-        compare(core.subscriberCount("jobs"), 2, "the model's and the panel's subscriptions stay")
+        compare(core.subscriberCount("jobs"), subscribers, "the model's and the panel's subscriptions stay")
     }
 }
