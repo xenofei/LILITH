@@ -105,6 +105,39 @@ TestCase {
         compare(TestFiles.networkRequests(), before, "nothing was loaded")
     }
 
+    function test_no_token_reaches_the_card_however_it_is_spelled() { // spec: P4a-R9
+        const shell = makeShell()
+        const card = shell.openedCard
+        const id = "cf_0123456789abcdef"
+        const token = "00112233445566778899aabbccddeeff"
+        const clean = text => {
+            const lower = String(text).toLowerCase()
+            return lower.indexOf(token.slice(0, 16)) < 0 && lower.indexOf(token.slice(16)) < 0
+        }
+        for (const spelled of ["lil-dev:deny/" + id + "/" + token,
+                               "lil-dev:DENY/" + id + "/" + token.toUpperCase(),
+                               "C:\\art\\deny\\" + id + "\\" + token + ".png",
+                               "C:\\art\\" + token + ".png",
+                               "x?t=" + token.slice(0, 16) + "%E2%80%8B" + token.slice(16),
+                               "x?t=" + token.slice(0, 16) + "\u00ad" + token.slice(16),
+                               "lil-dev:deny%252F" + id + "%252F" + token]) {
+            // A .lilref's title and a target, a target by a launch, an agent's and a refusal.
+            launch(shell, {kind: "lilref", target: spelled, title: "Crane " + spelled})
+            verify(clean(card.heading), card.heading)
+            verify(clean(card.shownTarget), card.shownTarget)
+            compare(card.targetText, spelled, "Copy keeps the target as it came")
+            launch(shell, {kind: "target", target: spelled})
+            verify(clean(card.shownTarget), card.shownTarget)
+            fake.emit("open_requests:image", "event", {target: spelled, intent: "open", focus: false})
+            verify(clean(card.shownTarget), card.shownTarget)
+            launch(shell, {kind: "refused", message: "This link isn't one LILITH opens: " + spelled})
+            verify(clean(card.message), card.message)
+        }
+        // What holds no token reads as it came.
+        launch(shell, {kind: "target", target: "C:\\art\\100%25 crane.png"})
+        compare(card.shownTarget, "C:\\art\\100%25 crane.png")
+    }
+
     function test_refused_link_shows_message() {
         const shell = makeShell()
         const card = shell.openedCard
