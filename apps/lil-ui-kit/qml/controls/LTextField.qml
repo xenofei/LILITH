@@ -18,6 +18,7 @@ T.TextField {
     rightPadding: 8
     focusPolicy: Qt.StrongFocus
     font.pixelSize: Theme.fontSize
+    font.family: Theme.fontFamily
     color: Theme.text
     selectionColor: Theme.accent
     selectedTextColor: Theme.bg

@@ -16,6 +16,7 @@ T.Switch {
     spacing: Theme.spacing
     focusPolicy: Qt.StrongFocus
     font.pixelSize: Theme.fontSize
+    font.family: Theme.fontFamily
 
     Accessible.name: text
 

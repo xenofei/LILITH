@@ -18,6 +18,7 @@ T.Button {
     horizontalPadding: 12
     focusPolicy: Qt.StrongFocus
     font.pixelSize: Theme.fontSize
+    font.family: Theme.fontFamily
 
     Accessible.name: text
 
