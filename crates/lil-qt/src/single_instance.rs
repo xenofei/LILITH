@@ -6,8 +6,9 @@
 //! 1. the running instance ([`InstanceServer`]) writes `{"app": "<app>", "pid": <pid>}` when a
 //!    client connects;
 //! 2. the second launch ([`forward`]) checks the pipe's reported server as ARCH-027 says, this
-//!    exe as this user, and that it isn't this process and didn't start after it (else
-//!    [`ForwardError::Untrusted`], and nothing is written), then has it prove it holds the pipe:
+//!    exe as this user, and that it isn't this process and didn't start after this launch opened
+//!    the pipe (else [`ForwardError::Untrusted`], and nothing is written), then has it prove it
+//!    holds the pipe:
 //!    it writes `{"prove": "<name>"}`, the name of a fresh event ([`ProofEvent`]); the instance
 //!    sets that event and answers `{"proved": true}`, and without the event set nothing more is
 //!    written (`GetNamedPipeServerProcessId` names the pipe's creator, even after it has died
@@ -51,7 +52,7 @@ use lil_platform::pipe::{
     set_proof_event,
 };
 use lil_platform::process::{
-    PeerInfo, current_user_sid, inspect_peer, own_integrity_rid, own_start_time,
+    PeerInfo, current_user_sid, filetime_now, inspect_peer, own_integrity_rid,
 };
 use lil_protocol::Outcome;
 use serde_json::{Value, json};
@@ -113,8 +114,9 @@ pub enum ForwardError {
     NotRunning,
     /// The pipe is held by something this launch doesn't trust: it can't be opened (a DACL that
     /// leaves this user out), or its server isn't this executable run as this user at this
-    /// process's integrity level or above, is this very process, started after it, or can't be
-    /// inspected, or its holder didn't prove it is that server. No argument was written.
+    /// process's integrity level or above, is this very process, started after this launch opened
+    /// the pipe, or can't be inspected, or its holder didn't prove it is that server. No argument
+    /// was written.
     Untrusted,
     /// Every instance of the pipe stayed busy for the whole budget: nothing served it.
     Busy,
@@ -511,15 +513,13 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Who this process is, as ARCH-027 compares a pipe peer with it: its exe, its token user and
-/// its token's integrity level; and its pid and creation time (a `FILETIME`), which a server it
-/// connects to can't share or come after.
+/// its token's integrity level; and its pid, which a server it connects to can't share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub exe: PathBuf,
     pub sid: String,
     pub integrity: u32,
     pub pid: u32,
-    pub started: u64,
 }
 
 impl Identity {
@@ -533,7 +533,6 @@ impl Identity {
             sid: current_user_sid()?,
             integrity: own_integrity_rid()?,
             pid: std::process::id(),
-            started: own_start_time()?,
         })
     }
 }
@@ -564,16 +563,19 @@ fn identity_refusal(peer: &PeerInfo, me: &Identity) -> Option<String> {
 }
 
 /// Why a launch won't take `peer`, which the pipe reports as its server: it must pass
-/// [`peer_is_trusted`], and could have made the pipe this launch found. A process that is this
-/// launch itself, or started after it, didn't: the pipe's creator has died and its pid has been
-/// reused. An older process on that pid is what the proof is for.
-fn server_refusal(peer: &PeerInfo, me: &Identity) -> Option<String> {
+/// [`peer_is_trusted`], and could have made the pipe this launch opened at `opened_at`. A process
+/// that is this launch itself, or started after that moment, didn't: the pipe's creator has died
+/// and its pid has been reused. It may well have started after this launch did: in a burst of
+/// launches the one that claims the pipe needn't be the oldest. An older process on that pid is
+/// what the proof is for.
+fn server_refusal(peer: &PeerInfo, me: &Identity, opened_at: u64) -> Option<String> {
     if peer.process.pid == me.pid {
         return Some("the pipe reports this very process as its server".to_string());
     }
-    if peer.started > me.started {
+    if peer.started > opened_at {
         return Some(format!(
-            "process {}, which the pipe reports as its server, started after this launch",
+            "process {}, which the pipe reports as its server, started after this launch opened \
+             the pipe",
             peer.process.pid
         ));
     }
@@ -615,7 +617,7 @@ fn forward_granting(
         tracing::warn!(error = %e, "this process can't tell who it is, so it trusts no pipe peer");
         ForwardError::SelfUnknown
     })?;
-    forward_as(env, app, confirm, args, &me, grant_foreground)
+    forward_as(env, app, confirm, args, &me, grant_foreground, filetime_now)
 }
 
 /// `true` for an error that means the server went away mid-exchange (it was closing).
@@ -633,6 +635,7 @@ fn forward_as(
     args: &[String],
     me: &Identity,
     grant_foreground: bool,
+    now: fn() -> u64,
 ) -> Result<u32, ForwardError> {
     let name = env.app_pipe_name(app, confirm);
     let deadline = Instant::now() + BUDGET;
@@ -665,9 +668,10 @@ fn forward_as(
                     }
                 }
             };
+            let opened_at = now();
             let pid = server_pid(&client).map_err(|_| ForwardError::Untrusted)?;
             // Before a byte is written (I-1, I-6).
-            if let Some(why) = judged(pid, me, server_refusal) {
+            if let Some(why) = judged(pid, me, |peer, me| server_refusal(peer, me, opened_at)) {
                 tracing::warn!(
                     pid,
                     why,
@@ -1060,7 +1064,6 @@ mod tests {
             sid: sid.to_string(),
             integrity: MEDIUM,
             pid: 2,
-            started: 100,
         };
         let peer = |image: PathBuf, sid: &str, integrity: u32| PeerInfo {
             process: info(image, sid),
@@ -1153,45 +1156,54 @@ mod tests {
     }
 
     #[test] // spec: ARCH-027
-    fn a_launch_takes_no_server_that_is_itself_or_started_after_it() {
+    fn a_launch_takes_no_server_that_is_itself_or_newer_than_the_pipe_it_opened() {
         let me = this_identity();
+        let opened_at = 1000;
         let peer = |pid: u32, started: u64| {
             let mut peer = inspect_peer(std::process::id()).unwrap();
             peer.process.pid = pid;
             peer.started = started;
             peer
         };
-        assert_eq!(server_refusal(&peer(me.pid + 4, me.started - 1), &me), None);
+        assert_eq!(server_refusal(&peer(me.pid + 4, 999), &me, opened_at), None);
         assert_eq!(
-            server_refusal(&peer(me.pid + 4, me.started), &me),
+            server_refusal(&peer(me.pid + 4, opened_at), &me, opened_at),
             None,
             "the same tick isn't after"
         );
-        let refused = |peer: &PeerInfo| server_refusal(peer, &me).unwrap();
-        assert!(refused(&peer(me.pid, me.started)).contains("this very process"));
-        assert!(refused(&peer(me.pid + 4, me.started + 1)).contains("started after"));
+        let refused = |peer: &PeerInfo| server_refusal(peer, &me, opened_at).unwrap();
+        assert!(refused(&peer(me.pid, 999)).contains("this very process"));
+        assert!(refused(&peer(me.pid + 4, opened_at + 1)).contains("started after"));
     }
 
     #[test] // spec: ARCH-027, APP-013
-    fn a_launch_hands_over_only_after_the_proof_and_only_to_an_older_server() {
+    fn a_launch_hands_over_only_after_the_proof_and_only_to_a_server_older_than_its_open() {
         // A real exchange in this one process, as if this launch were another process: its pid
-        // told apart, and its start time before or after the server's.
+        // told apart, and the pipe opened before or after the server started.
         let env = lil_testkit::TestEnv::new();
         let server = InstanceServer::claim(&env.env, "image", false)
             .unwrap()
             .expect("the pipe is free");
         let args = vec!["--no-activate".to_string()];
-        let launch = |started: u64| Identity {
+        let launch = Identity {
             pid: std::process::id() + 4,
-            started,
             ..this_identity()
         };
         assert!(matches!(
-            forward_as(&env.env, "image", false, &args, &launch(0), false),
+            forward_as(&env.env, "image", false, &args, &launch, false, || 0),
             Err(ForwardError::Untrusted)
         ));
         assert_eq!(server.next(), None, "nothing was handed over");
-        let pid = forward_as(&env.env, "image", false, &args, &launch(u64::MAX), false).unwrap();
+        let pid = forward_as(
+            &env.env,
+            "image",
+            false,
+            &args,
+            &launch,
+            false,
+            filetime_now,
+        )
+        .unwrap();
         assert_eq!(pid, std::process::id());
         assert_eq!(
             server.next_within(Duration::from_secs(5)),
@@ -1220,11 +1232,10 @@ mod tests {
         });
         let launch = Identity {
             pid: std::process::id() + 4,
-            started: u64::MAX,
             ..this_identity()
         };
         let started = Instant::now();
-        let result = forward_as(&env.env, "image", false, &[], &launch, false);
+        let result = forward_as(&env.env, "image", false, &[], &launch, false, filetime_now);
         let took = started.elapsed();
         assert!(matches!(result, Err(ForwardError::Timeout)), "{result:?}");
         assert!(

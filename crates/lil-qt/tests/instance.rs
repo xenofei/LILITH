@@ -38,6 +38,8 @@ const PROBE_SAYS: &str = "LIL_QT_PROBE_SAYS";
 const PROBE_HOLDER: &str = "LIL_QT_PROBE_HOLDER";
 const PROBE_HANDED: &str = "LIL_QT_PROBE_HANDED";
 const PROBE_KEEP: &str = "LIL_QT_PROBE_KEEP";
+/// A launch waits before it does anything for this file to appear.
+const PROBE_GO: &str = "LIL_QT_PROBE_GO";
 /// A failure deadline for each wait, never a measurement.
 const DEADLINE: Duration = Duration::from_secs(30);
 const CF: &str = "cf_0123456789abcdef";
@@ -77,6 +79,13 @@ fn probe() {
             hold_pipe(pipe, std::env::var(PROBE_SAYS).ok());
         }
         _ => {}
+    }
+    if let Some(go) = std::env::var_os(PROBE_GO) {
+        write_out("waiting");
+        let until = Instant::now() + DEADLINE;
+        while !std::path::Path::new(&go).exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     let _log = lil_platform::logs::init(&env, lil_qt::QT_ARGV0);
     let cmdline = std::env::var(PROBE_CMDLINE).expect("LIL_QT_PROBE_CMDLINE");
@@ -509,6 +518,33 @@ fn a_second_launch_forwards_and_exits() {
     assert_eq!(got["job"], "j_0000000000000001", "{got}");
     assert_eq!(got["focus"], false, "--no-activate came along: {got}");
     assert_eq!(got["activate"], true, "{got}");
+    folder.stop();
+}
+
+#[test] // spec: APP-014, ARCH-027
+fn a_launch_that_started_first_forwards_to_the_one_that_claimed_first() {
+    // A burst, as a multi-select Open in Explorer starts one: launch A's process is the older,
+    // but launch B reaches the pipe first. A must hand over to B, and no window may say another
+    // program holds the channel.
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    let go = folder.dir.path().join("go");
+    let mut a = Launch::start_with(
+        &folder,
+        &env,
+        &task_url(&env, 1),
+        &[(PROBE_GO, go.as_os_str().to_owned())],
+    );
+    a.wait_line("waiting");
+    let b = running(&folder, &env, &task_url(&env, 2), "shell");
+    let run: Value = serde_json::from_str(&b.wait_line("run ")).unwrap();
+    assert_eq!(run["job"], "j_0000000000000002", "{run}");
+    assert_eq!(run["pipe_notice"], Value::Null, "{run}");
+    std::fs::write(&go, "").unwrap();
+    assert_eq!(a.wait_exit().0, 0, "{:?}", a.lines());
+    assert_eq!(a.lines(), ["waiting", "exit 0 forwarded=true"]);
+    let got: Value = serde_json::from_str(&b.wait_line("deliver ")).unwrap();
+    assert_eq!(got["job"], "j_0000000000000001", "{got}");
     folder.stop();
 }
 
@@ -1130,11 +1166,16 @@ fn a_flood_of_refused_clients_writes_a_few_log_lines_and_a_count() {
         .build()
         .unwrap();
     rt.block_on(async {
+        use tokio::io::AsyncReadExt as _;
         for _ in 0..CLIENTS {
             loop {
                 match lil_platform::pipe::open_client(&name) {
-                    Ok(client) => {
-                        drop(client);
+                    // Refused, and told so: the instance has dealt with this one when it answers,
+                    // so the stop below can't overtake a client it hasn't read yet.
+                    Ok(mut client) => {
+                        let mut answer = [0u8; 64];
+                        let read = client.read(&mut answer).await.unwrap();
+                        assert!(answer[..read].starts_with(b"{\"untrusted\""));
                         break;
                     }
                     Err(lil_platform::pipe::ConnectError::Busy) => {

@@ -247,13 +247,14 @@ pub fn own_integrity_rid() -> io::Result<u32> {
     own_token_trust().map(|t| t.integrity)
 }
 
-/// When this process was created, in 100 ns ticks since 1601 (a `FILETIME`).
-///
-/// # Errors
-/// When its times can't be read.
-pub fn own_start_time() -> io::Result<u64> {
-    // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid and needs no closing.
-    creation_time(unsafe { GetCurrentProcess() })
+/// The time now, as [`PeerInfo::started`] counts it: 100 ns ticks since 1601 (a `FILETIME`).
+pub fn filetime_now() -> u64 {
+    /// 1601 to 1970, in those ticks.
+    const TICKS_TO_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    TICKS_TO_UNIX_EPOCH + u64::try_from(since_epoch.as_nanos() / 100).unwrap_or(u64::MAX / 2)
 }
 
 /// The SID string of the user running this process.
@@ -1120,7 +1121,14 @@ mod tests {
         assert_eq!(me.token.integrity, own);
         assert!(!me.token.restricted && !me.token.app_container);
         assert_eq!(me.process.image, std::env::current_exe().unwrap());
-        assert_eq!(me.started, own_start_time().unwrap(), "through its handle");
+        let started = SystemInspector.started(std::process::id()).unwrap();
+        assert_eq!(me.started, started, "through its handle");
+        // In the same ticks as the time now: after it, by less than a day.
+        let now = filetime_now();
+        assert!(
+            me.started <= now && now - me.started < 864_000_000_000,
+            "{now}"
+        );
         assert!(inspect_peer(u32::MAX - 3).is_err());
     }
 
