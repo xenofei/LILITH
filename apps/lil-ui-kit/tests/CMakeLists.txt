@@ -105,3 +105,8 @@ set_tests_properties(grab_usage PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
 set_property(TEST grab_usage APPEND PROPERTY
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+
+# Task 23: the Hardware panel, on the shell's 1280 x 800 offscreen screen (it floats the panel).
+lil_qml_test(tst_hardware tst_hardware.qml)
+set_property(TEST tst_hardware APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
