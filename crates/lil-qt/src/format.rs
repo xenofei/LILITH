@@ -3,9 +3,9 @@
 //! parses JSON and calls these.
 //!
 //! - [`chip_text`]: the chip, from the estimate's parts: `local` reads "local · ~8 s · ~2 Wh"
-//!   (GPU-seconds and watt-hours, their p50s), `money` "≈ $0.04 · 3 % of cap" (its p50, and the
-//!   share of the monthly cap when there is one), both joined by " · "; with neither but a
-//!   `wall_s` part, "~8 s"; with no part at all, "no estimate yet". `unknown` entries add
+//!   (GPU-seconds and watt-hours, their p50s), `money` "≈ 0.04 USD · 3 % of cap" (its p50,
+//!   and the share of the monthly cap when there is one), both joined by " · "; with neither
+//!   but a `wall_s` part, "~8 s"; with no part at all, "no estimate yet". `unknown` entries add
 //!   nothing.
 //! - [`eta_text`]: a running job's time left, its `wall_s` p50 less the time it has run, never
 //!   below 0 ("about 12 s left", "under 1 s left"), or "—" with no `wall_s`.
@@ -19,7 +19,8 @@
 //!   the cap is in the estimate's currency.
 //! - [`parse_utc_ms`]: the core's RFC 3339 times as Unix milliseconds.
 //!
-//! Money shows two decimals, none for a currency without minor units (JPY and the like). The
+//! Money shows as the panels show it (owner decision): to the cent, thousands separated, with
+//! its currency code ("1,234.57 USD"); a non-zero amount under one cent reads "< 0.01 USD". The
 //! cap share reads only the `monthly` cap: plan 6b, which brings prices, adds the others.
 
 use lil_protocol::app::CapsView;
@@ -284,31 +285,34 @@ fn share_text(permille: u32) -> String {
     }
 }
 
-/// "≈ $0.04", "≈ €1.50", "≈ 2.00 CHF"; under a cent, "< $0.01".
+/// "≈ 0.04 USD", "≈ 1,234.57 EUR"; a non-zero amount under one cent, "< 0.01 USD".
 fn money_text(m: &MoneyPart) -> Option<String> {
     let amount = m.spread()?.p50();
-    let symbol = match m.currency.as_str() {
-        "USD" => Some("$"),
-        "EUR" => Some("€"),
-        "GBP" => Some("£"),
-        "JPY" => Some("¥"),
-        _ => None,
-    };
-    // Currencies without minor units (ISO 4217 exponent 0) show whole amounts.
-    let decimals = match m.currency.as_str() {
-        "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "UGX" | "PYG" => 0,
-        _ => 2,
-    };
-    let least = if decimals == 0 { 1.0 } else { 0.01 };
-    let (shown, prefix) = if amount > 0.0 && amount < least / 2.0 {
-        (least, "< ")
+    if amount > 0.0 && amount < 0.01 {
+        return Some(format!("< 0.01 {}", m.currency));
+    }
+    Some(format!("≈ {}", money_amount(amount, &m.currency)))
+}
+
+// TODO(controller): switch to the shared money_text when Task 24 merges.
+/// An amount as the panels show money (owner decision): to the cent, the whole part in groups
+/// of three separated by commas, then the currency code: "1,234.57 USD".
+fn money_amount(amount: f64, currency: &str) -> String {
+    let fixed = format!("{:.2}", amount.abs());
+    let (whole, cents) = fixed.split_once('.').unwrap_or((&fixed, "00"));
+    let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
+    for (i, digit) in whole.chars().enumerate() {
+        if i > 0 && (whole.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    let sign = if amount < 0.0 && fixed != "0.00" {
+        "-"
     } else {
-        (amount, "≈ ")
+        ""
     };
-    Some(match symbol {
-        Some(sym) => format!("{prefix}{sym}{shown:.decimals$}"),
-        None => format!("{prefix}{shown:.decimals$} {}", m.currency),
-    })
+    format!("{sign}{grouped}.{cents} {currency}")
 }
 
 #[cfg(test)]
@@ -397,25 +401,39 @@ mod tests {
             money: Some(money("0.04", "USD")),
             ..Estimate::default()
         };
-        assert_eq!(chip_text(&e, Some(30)), "≈ $0.04 · 3 % of cap");
-        assert_eq!(chip_text(&e, None), "≈ $0.04");
-        assert_eq!(chip_text(&e, Some(4)), "≈ $0.04 · <1 % of cap");
+        // To the cent, with its currency code (the owner's rule for money in the panels).
+        assert_eq!(chip_text(&e, Some(30)), "≈ 0.04 USD · 3 % of cap");
+        assert_eq!(chip_text(&e, None), "≈ 0.04 USD");
+        assert_eq!(chip_text(&e, Some(4)), "≈ 0.04 USD · <1 % of cap");
         let eur = Estimate {
             money: Some(money("1.5", "EUR")),
             ..Estimate::default()
         };
-        assert_eq!(chip_text(&eur, None), "≈ €1.50");
+        assert_eq!(chip_text(&eur, None), "≈ 1.50 EUR");
         let chf = Estimate {
             money: Some(money("0.001", "CHF")),
             ..Estimate::default()
         };
         assert_eq!(chip_text(&chf, None), "< 0.01 CHF");
-        // A currency without minor units shows none.
+        // Under a cent but not zero; zero itself; thousands separated.
+        for (amount, text) in [
+            ("0.009", "< 0.01 USD"),
+            ("0", "≈ 0.00 USD"),
+            ("1234.567", "≈ 1,234.57 USD"),
+            ("1234567", "≈ 1,234,567.00 USD"),
+            ("999.999", "≈ 1,000.00 USD"),
+        ] {
+            let e = Estimate {
+                money: Some(money(amount, "USD")),
+                ..Estimate::default()
+            };
+            assert_eq!(chip_text(&e, None), text, "{amount}");
+        }
         let yen = Estimate {
             money: Some(money("120", "JPY")),
             ..Estimate::default()
         };
-        assert_eq!(chip_text(&yen, None), "≈ ¥120");
+        assert_eq!(chip_text(&yen, None), "≈ 120.00 JPY");
         // Both parts, local first.
         let both = Estimate {
             local: Some(local(("8.0", "9.0"), ("2.000", "2.500"))),
@@ -424,7 +442,7 @@ mod tests {
         };
         assert_eq!(
             chip_text(&both, Some(30)),
-            "local · ~8 s · ~2 Wh · ≈ $0.04 · 3 % of cap"
+            "local · ~8 s · ~2 Wh · ≈ 0.04 USD · 3 % of cap"
         );
 
         // The share is of the monthly cap, in its currency only.
