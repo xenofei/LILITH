@@ -208,6 +208,37 @@ TestCase {
         verify(saved !== null && saved !== undefined, "layout.json is written")
     }
 
+    function test_a_layout_that_never_settles_is_saved_after_the_fallback() { // spec: APP-002
+        const dir = TestFiles.newDir("unsettled")
+        const shell = makeShell(dir)
+        // Home's content keeps a 0 width, as a panel that never laid out would.
+        const content = shell.docks.home.content
+        const pin = () => { if (content.width !== 0) content.width = 0 }
+        content.widthChanged.connect(pin)
+        pin()
+        ignoreWarning(/layout_settle_timeout: .*these docks have no size: home/)
+        shell.visible = true
+        tryVerify(() => shell._sized, 5000, "the window shows")
+        verify(!shell.layoutSettled, "not settled while Home has no size")
+        tryVerify(() => shell.layoutSettled, shell.settleTimeoutMs + 3000, "settled by the fallback")
+        content.widthChanged.disconnect(pin)
+        shell.docks.usage.setAsCurrentTab()
+        tryVerify(() => shown(shell, "usage"), 5000, "Usage is the tab in front")
+        compare(shell.saveLayout(), "", "the save")
+        const saved = TestFiles.read(dir + "/layout.json")
+        verify(saved !== null && saved !== undefined, "layout.json is written after the fallback")
+        dropShell(shell)
+    }
+
+    function test_a_layout_never_shown_is_not_saved_and_the_log_says_so() { // spec: APP-002
+        const dir = TestFiles.newDir("unshown")
+        const shell = makeShell(dir)
+        ignoreWarning(/layout_save_skipped/)
+        DockLayout.saveRequested()   // a logoff before the window ever showed
+        compare(TestFiles.list(dir), [], "nothing is written")
+        dropShell(shell)
+    }
+
     function test_bad_layout_falls_back_to_default() { // spec: APP-002, APP-004
         const good = JSON.parse(savedLayout(TestFiles.newDir("good")))
         const newer = Object.assign({}, good, {kddw: Object.assign({}, good.kddw, {serializationVersion: 999})})

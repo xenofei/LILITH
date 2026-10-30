@@ -46,9 +46,13 @@ Window {
     readonly property var bindings: JSON.parse(ShellState.shortcuts())
     property string _lastSaved
     // The layout as built and laid out: set once every shown dock has its size and the layout's
-    // text has stopped changing, which is when `_lastSaved` is taken. No save before then.
+    // text has stopped changing, which is when `_lastSaved` is taken. No save before then. If
+    // that hasn't happened `settleTimeoutMs` after the window showed (or the layout was
+    // restored), it is set anyway, with a warning in the log naming the check that never passed.
     property bool layoutSettled: false
+    readonly property int settleTimeoutMs: 3000
     property string _settleCandidate
+    property real _settleStartMs: 0
     // True while the shell itself opens or closes docks (the restore, the Default layout, the
     // window's close), which aren't announced.
     property bool _settling: true
@@ -248,6 +252,7 @@ Window {
             _settling = settling
             _defaultPending = false
         }
+        _settleStartMs = Date.now()
         settleCheck.start()
     }
 
@@ -288,41 +293,61 @@ Window {
                                kddw: JSON.parse(DockLayout.serialize())})
     }
 
-    // Every open dock that shows has its size.
-    function docksSized() {
+    // The open docks that show but have no size yet.
+    function unsizedDocks() {
+        const out = []
         for (const id in docks) {
             const content = docks[id] ? docks[id].content : null
             if (docks[id] && docks[id].isOpen && content && content.visible
                     && (content.width <= 0 || content.height <= 0))
-                return false
+                out.push(id)
         }
-        return true
+        return out
+    }
+
+    // Every open dock that shows has its size.
+    function docksSized() {
+        return unsizedDocks().length === 0
     }
 
     // Takes the layout last saved once it has settled: two checks in a row that find the docks
-    // sized and the same layout text.
+    // sized and the same layout text; or, past `settleTimeoutMs`, as it then stands, with a
+    // warning naming what never passed.
     Timer {
         id: settleCheck
         interval: 50
         repeat: true
         onTriggered: {
-            if (!root.docksSized())
-                return
-            const text = root.layoutText()
-            if (text !== root._settleCandidate) {
-                root._settleCandidate = text
+            const unsized = root.unsizedDocks()
+            const text = unsized.length === 0 ? root.layoutText() : ""
+            if (unsized.length === 0 && text === root._settleCandidate) {
+                root._lastSaved = text
+                root.layoutSettled = true
+                stop()
                 return
             }
-            root._lastSaved = text
+            root._settleCandidate = text
+            if (Date.now() - root._settleStartMs < root.settleTimeoutMs)
+                return
+            console.warn("layout_settle_timeout: the layout didn't settle in " + root.settleTimeoutMs
+                         + " ms (" + (unsized.length > 0 ? "these docks have no size: " + unsized.join(", ")
+                                                         : "its text kept changing")
+                         + "); it is taken as it stands, and saving resumes")
+            root._lastSaved = root.layoutText()
             root.layoutSettled = true
             stop()
         }
     }
 
     // Writes the layout when it changed since it was read or last written. Empty, or why not.
+    // A layout that was never shown and laid out isn't saved, and the log says so.
     function saveLayout() {
-        if (stateDir === "" || _defaultPending || _saveBlocked || _closing || !layoutSettled)
+        if (stateDir === "" || _saveBlocked || _closing)
             return ""
+        if (_defaultPending || !layoutSettled) {
+            console.warn("layout_save_skipped: the layout hasn't been shown and laid out yet, so it isn't saved")
+            return ""
+        }
         const text = layoutText()
         if (text === _lastSaved)
             return ""
