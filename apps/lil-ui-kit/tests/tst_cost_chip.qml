@@ -69,10 +69,10 @@ TestCase {
         const money = {money: {source: "prices_yaml", p50: "0.04", p90: "0.05", upper_bound: "0.06",
                                currency: "USD"}, unknown: []}
         const chip = createTemporaryObject(chipComponent, tc, {core: core, estimate: money})
-        compare(chip.text, "≈ $0.04")
+        compare(chip.text, "≈ 0.04 USD")
         chip.caps = {display_currency: "USD", period: "2026-10",
                      caps: [{cap: "monthly", limit: "1.33", settled: "0", held: "0", ratio_permille: 0}]}
-        compare(chip.text, "≈ $0.04 · 3 % of cap", "the share of the monthly cap")
+        compare(chip.text, "≈ 0.04 USD · 3 % of cap", "the share of the monthly cap")
         chip.estimate = null
         compare(chip.text, "no estimate yet")
         wait(400)

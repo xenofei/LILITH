@@ -1,5 +1,5 @@
 // The cost and time chip (APP-140, CORE-161): what an action that spends GPU time or money is
-// estimated to cost, before you click: "local · ~8 s · ~2 Wh", "≈ $0.04 · 3 % of cap" or
+// estimated to cost, before you click: "local · ~8 s · ~2 Wh", "≈ 0.04 USD · 3 % of cap" or
 // "no estimate yet" (JobText.chipText). It informs only; caps and confirmations gate as before.
 //
 //   CostChip { core: Core; tool: "comfy.prompt"; args: {...} }   // asks job.estimate

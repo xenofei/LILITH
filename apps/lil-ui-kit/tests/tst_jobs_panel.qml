@@ -658,6 +658,76 @@ TestCase {
         tryVerify(() => button(t.panel, "Cancel all from this app"), 2000, "this app's queued job")
     }
 
+    function test_finished_jobs_past_a_first_page_of_queued_ones() { // spec: APP-114
+        // A batch of 100 queued jobs is newer than every finished job: the first history page
+        // holds none of them, and the panel asks for the next.
+        const batch = []
+        for (let i = 0; i < 100; ++i)
+            batch.push(queued("b" + (100 + i), i, {batch_id: "b_big", index: i, created: iso(1000 + i)}))
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        answer(core, isPage, ok({jobs: batch, next_cursor: "h1", lanes: [lane()]}), "the first page")
+        answerLive(core, [], batch)
+        answer(core, c => c.name === "engines.status", ok({engines: [comfy(0, 0)]}))
+        answer(core, c => c.name === "caps.get", ok({display_currency: "USD", period: "2026-10", caps: []}))
+        const failed = job("f1", {status: "failed", substatus: null, created: iso(500000), finished: iso(400000),
+                                  estimate: localEstimate,
+                                  error: {code: "x", category: "internal", message: "Broke.", trace_id: "t",
+                                          retry: "after_resolve"}})
+        const next = answer(core, c => isPage(c) && c.args.cursor === "h1",
+                            ok({jobs: [failed, job("d1", {status: "succeeded", substatus: null,
+                                                          finished: iso(450000)})],
+                                next_cursor: null, lanes: [lane()]}), "the next page")
+        compare(next.args, {limit: 100, cursor: "h1"})
+        tryCompare(w.panel.historyView, "count", 2)
+        verify(button(row(w.panel, "f1"), "Retry"), "the failed job's Retry is reachable")
+        wait(300)
+        verify(!core.calls.some(c => isPage(c) && c.args.cursor !== undefined && c.args.cursor !== "h1"),
+               "no page past the last")
+    }
+
+    function test_an_unknown_status_stays_live_through_reads() { // spec: APP-114
+        const odd = job("odd", {status: "paused_by_director", substatus: "waiting_quota", created: iso(1000)})
+        const t = load({jobs: [odd], queue: [queued("q0", 0)]})
+        tryVerify(() => liveOrder(t.panel).indexOf("odd") >= 0, 2000, JSON.stringify(liveOrder(t.panel)))
+        // Three reads, each from a new job's event: the job no read can list stays.
+        for (let i = 1; i <= 3; ++i) {
+            t.core.emit("jobs", "event", {kind: "job", job: queued("q" + i, i, {updated: iso()})})
+            const qs = []
+            for (let k = 0; k <= i; ++k)
+                qs.push(queued("q" + k, k))
+            answerLive(t.core, [], qs)
+            tryVerify(() => liveOrder(t.panel).length === i + 2, 2000, JSON.stringify(liveOrder(t.panel)))
+            verify(liveOrder(t.panel).indexOf("odd") >= 0, "read " + i + ": " + JSON.stringify(liveOrder(t.panel)))
+        }
+        compare(t.panel.historyView.count, 0, "and it isn't history")
+        // An event that ends it does.
+        t.core.emit("jobs", "event", {kind: "job", job: job("odd", {status: "cancelled", substatus: null,
+                                                                    finished: iso(), updated: iso()})})
+        tryVerify(() => liveOrder(t.panel).indexOf("odd") < 0, 2000)
+        tryCompare(t.panel.historyView, "count", 1)
+    }
+
+    function test_a_read_cut_at_its_page_cap_says_so() { // spec: APP-114
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        answer(core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}))
+        answer(core, isRunningRead, ok({jobs: [], next_cursor: null, lanes: [lane()]}))
+        // A cursor that never ends: one job a page, always more.
+        for (let i = 0; i < 100; ++i)
+            answer(core, isQueueRead, ok({jobs: [queued("q" + (1000 + i), i)], next_cursor: "c" + (i + 1),
+                                          lanes: [lane()]}), "page " + i)
+        answer(core, c => c.name === "engines.status", ok({engines: [comfy(0, 0)]}))
+        answer(core, c => c.name === "caps.get", ok({display_currency: "USD", period: "2026-10", caps: []}))
+        tryCompare(w.panel.live, "count", 100)
+        wait(200)
+        compare(openCalls(core, isQueueRead).length, 0, "it stops at the cap")
+        verify(w.panel.cappedNote.visible, "and says so")
+        compare(w.panel.cappedNote.text, "Showing the first 100 queued jobs")
+    }
+
     function test_float_and_redock_keeps_jobs_state() { // spec: ARCH-116
         const core = createTemporaryObject(fakeComponent, tc)
         const shell = createTemporaryObject(shellComponent, tc, {core: core})

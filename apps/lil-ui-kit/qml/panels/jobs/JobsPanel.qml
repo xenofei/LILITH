@@ -12,8 +12,11 @@
 //   (LaneHeader: the pause and its reasons, the held jobs, waiting for GPU memory, ComfyUI's
 //   outside jobs, and QueueControls) and "Cancel all from this app".
 // - **Finished** (`historyView`): the jobs that ended, newest first, from one JsonListModel over
-//   `jobs.list` with the `jobs` topic. A job of a status this build doesn't know is shown with the
-//   live ones, by its name (P4a-R40).
+//   `jobs.list` with the `jobs` topic. Its pages hold every status (`jobs.list` filters on one
+//   status only), so while the list is shorter than a screenful the panel asks for more pages, at
+//   most 20 per load. A job of a status this build doesn't know is shown with the live ones, by
+//   its name, and stays there until an event ends it (P4a-R40). A live read stopped at its page
+//   cap says how many queued jobs it shows.
 //
 // Each row is a JobRow. The lanes come from the read and from the `{kind: "queue", state}` events
 // on `jobs`, applied as full states, at most one header update per frame. Outside jobs come from
@@ -46,6 +49,8 @@ Rectangle {
     property alias banner: banner
     // The live list's "Nothing is running or queued." line (made in its header).
     property Item emptyText: null
+    // The live list's "Showing the first N queued jobs" line (made in its header).
+    property Item cappedNote: null
 
     // lane -> QueueState.
     property var lanes: ({})
@@ -58,6 +63,12 @@ Rectangle {
     property var rowLanes: []
     property var vramLanes: []
     property int mine: 0
+    // How many queued jobs the last read listed when it stopped at its page cap, else -1.
+    property int capped: -1
+    // The history pages asked for to fill the Finished list since its load (at most
+    // `historyFillPages`): a first page can hold no finished job at all (a batch).
+    property int _historyPages: 0
+    readonly property int historyFillPages: 20
     // The lane header updates applied (at most one per frame).
     property int laneUpdates: 0
 
@@ -349,6 +360,7 @@ Rectangle {
         if (JSON.stringify(o.waiting_for_vram) !== JSON.stringify(vramLanes))
             vramLanes = o.waiting_for_vram
         mine = o.mine
+        capped = o.capped === null || o.capped === undefined ? -1 : o.capped
     }
 
     function readEngines() {
@@ -473,18 +485,43 @@ Rectangle {
                     "status_seq", "origin", "phase", "subtasks", "indeterminate", "unresponsive",
                     "pause_reasons", "estimate", "queue_position", "watchdog", "all_cached"]
 
-        // A job of a status this build doesn't know shows with the live ones.
         onLoadedChanged: {
             if (!loaded)
                 return
-            const role = 0x0100 + roleNames.indexOf("status")
-            const known = ["queued", "running", "succeeded", "failed", "cancelled"]
-            for (let i = 0; i < rowCount(); ++i) {
-                if (known.indexOf(data(index(i, 0), role)) < 0
-                        && live.applyJob(JSON.stringify(get(i)), Date.now()) > 0)
-                    root.overviewChanged()
-            }
+            root._historyPages = 0
+            root.seedUnknown(0, rowCount() - 1)
+            Qt.callLater(root.fillHistory)
         }
+        onRowsInserted: (parent, first, last) => {
+            root.seedUnknown(first, last)
+            Qt.callLater(root.fillHistory)
+        }
+    }
+
+    // A job of a status this build doesn't know shows with the live ones (P4a-R40).
+    function seedUnknown(first, last) {
+        const role = 0x0100 + jobsModel.roleNames.indexOf("status")
+        const known = ["queued", "running", "succeeded", "failed", "cancelled"]
+        for (let i = first; i <= last; ++i) {
+            if (known.indexOf(jobsModel.data(jobsModel.index(i, 0), role)) < 0
+                    && live.applyJob(JSON.stringify(jobsModel.get(i)), Date.now()) > 0)
+                overviewChanged()
+        }
+    }
+
+    // The history is newest first and holds every status, so its first pages can hold no
+    // finished job (a batch queued after them): ask for more while the Finished list is shorter
+    // than a screenful, at most `historyFillPages` pages per load.
+    function fillHistory() {
+        if (!jobsModel.loaded || _historyPages >= historyFillPages)
+            return
+        if (historyList.count >= Math.max(20, Math.ceil(historyList.height / 40)))
+            return
+        const top = jobsModel.index(-1, 0)
+        if (!jobsModel.canFetchMore(top))
+            return
+        _historyPages++
+        jobsModel.fetchMore(top)
     }
 
     // The jobs that ended, newest first as the list gives them.
@@ -607,6 +644,20 @@ Rectangle {
                         visible: modelData === "gpu-heavy" || root.rowLanes.indexOf(modelData) >= 0
                                  || (queueState && (queueState.paused || queueState.held > 0))
                     }
+                }
+
+                // A read cut at its page cap says so, rather than dropping the rest unseen.
+                Text {
+                    id: cappedText
+                    visible: root.capped >= 0
+                    width: parent.width
+                    leftPadding: Theme.spacing
+                    wrapMode: Text.Wrap
+                    text: "Showing the first " + String(root.capped).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+                          + " queued jobs"
+                    color: Theme.warning
+                    font.pixelSize: Theme.fontSize
+                    Component.onCompleted: root.cappedNote = cappedText
                 }
 
                 Text {
