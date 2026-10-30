@@ -167,6 +167,19 @@ TestCase {
         compare(fakeShim.activations.length, 2)
     }
 
+    function test_a_held_pipe_shows_a_banner() { // spec: APP-013
+        const shell = makeShell()
+        verify(!shell.instanceBanner.visible)
+        launch(shell, {kind: "activate", activate: false})
+        verify(!shell.instanceBanner.visible, "no banner while the pipe is the app's own")
+        launch(shell, {kind: "activate", activate: false, pipe_held: true})
+        verify(shell.instanceBanner.visible)
+        compare(shell.instanceBanner.text, "Another program is holding LILITH's launch channel, so a "
+                + "second launch may open a second window.")
+        tryVerify(() => shell.dockingArea.y >= shell.instanceBanner.height, 2000,
+                  "the docks sit below it")
+    }
+
     function test_confirm_link_opens_confirmations() {
         const shell = makeShell()
         shell.docks.confirmations.forceClose()

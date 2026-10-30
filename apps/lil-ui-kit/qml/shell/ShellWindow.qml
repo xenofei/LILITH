@@ -81,6 +81,7 @@ Window {
     // The shim the window is activated through: LilShim, or a test's fake.
     property var shim: LilShim
     property alias openedCard: openedCard
+    property alias instanceBanner: instanceBanner
     // The job a `task` link last opened Jobs on, and the confirmation a `confirm` link last
     // opened Confirmations on.
     property string shownJob
@@ -100,9 +101,19 @@ Window {
         kind: "warning"
     }
 
+    // --- Open requests (Task 19): while another program holds the launch channel ---
+    LBanner {
+        id: instanceBanner
+        anchors.top: layoutBanner.visible ? layoutBanner.bottom : parent.top
+        width: parent.width
+        kind: "warning"
+    }
+    // --- end of open requests ---
+
     KDDW.DockingArea {
         id: dockingArea
-        anchors.top: layoutBanner.visible ? layoutBanner.bottom : parent.top
+        anchors.top: instanceBanner.visible ? instanceBanner.bottom
+                   : layoutBanner.visible ? layoutBanner.bottom : parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -490,6 +501,9 @@ Window {
     // A launch: {kind, intent, focus, activate, ...} (lil_qt::args::launch_json).
     function handleLaunch(launch) {
         const focus = launch.focus !== false
+        if (launch.pipe_held === true)
+            instanceBanner.show("Another program is holding LILITH's launch channel, so a second "
+                                + "launch may open a second window.")
         if (launch.activate !== false)
             shim.activate(root, focus)
         if (launch.kind === "target" || launch.kind === "ref" || launch.kind === "lilref") {

@@ -8,7 +8,8 @@
 //! for the window instead: it writes `run <launch JSON>` and, when it claimed a pipe, `claimed
 //! <shell | confirm>`, then serves it, writing `deliver <launch JSON>` for each forwarded launch
 //! the window would get and `handled` for one it handled without the window (a deny), until a
-//! `stop` file appears beside it. A probe that exits writes `exit <code> forwarded=<bool>`.
+//! `stop` file appears beside it (a `closing` file first closes it, as the app's teardown does,
+//! and it writes `closing`). A probe that exits writes `exit <code> forwarded=<bool>`.
 //! Each line goes to its own `LIL_QT_PROBE_OUT` file.
 //!
 //! **The deny's identity (ruling Q4).** A deny needs a verified `ui:*` caller: the copies are
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use lil_client::ClientConfig;
 use lil_platform::Env;
-use lil_qt::single_instance::{ForwardError, Start, forward, route, start};
+use lil_qt::single_instance::{ForwardError, InstanceServer, Routed, Start, forward, route, start};
 use lil_qt::{APP, plan_boot};
 use lil_testkit::{CoreFixture, RawPipe, TestEnv, ensure_built};
 use serde_json::{Value, json};
@@ -85,23 +86,38 @@ fn probe() {
     };
     write_out(&format!("claimed {mode}"));
     let stop = own_folder().join("stop");
+    let closing = own_folder().join("closing");
+    let mut closed = false;
+    let mut denies = Vec::new();
     let until = Instant::now() + Duration::from_secs(120);
     while !stop.exists() && Instant::now() < until {
+        if !closed && closing.exists() {
+            // As the app does when it starts to close: no launch is taken from now on.
+            server.close();
+            closed = true;
+            write_out("closing");
+        }
         while let Some(forwarded) = server.next() {
             let env2 = env.clone();
             match route(&forwarded, &env, move || deny_cfg(&env2)) {
-                Some(p) => write_out(&format!(
+                Routed::Show(p) => write_out(&format!(
                     "deliver {}",
                     lil_qt::args::launch_json(&p, true).unwrap_or_default()
                 )),
-                None => write_out("handled"),
+                Routed::Deny(handle) => {
+                    denies.push(handle);
+                    write_out("handled");
+                }
+                Routed::Nothing => write_out("nothing"),
             }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     drop(server);
-    // Give a deny's own thread time to end; its outcome is in the log.
-    std::thread::sleep(Duration::from_millis(500));
+    // A deny in flight is joined before the process ends (its outcome is in the log).
+    for deny in denies {
+        let _ = deny.join();
+    }
     write_out("stopped");
     std::process::exit(0);
 }
@@ -308,11 +324,15 @@ fn two_quick_second_launches_reach_one_window() {
         assert!(Instant::now() < until, "{:?}", first.lines());
         std::thread::sleep(Duration::from_millis(10));
     }
-    let jobs: Vec<Value> = first.delivered().iter().map(|d| d["job"].clone()).collect();
-    assert_eq!(
-        jobs,
-        [json!("j_0000000000000001"), json!("j_0000000000000002")]
-    );
+    // Which of the two connects first is up to the scheduler; the order of connections is
+    // `the_instance_keeps_the_order_of_its_launches`'s.
+    let mut jobs: Vec<String> = first
+        .delivered()
+        .iter()
+        .map(|d| d["job"].as_str().unwrap_or_default().to_string())
+        .collect();
+    jobs.sort();
+    assert_eq!(jobs, ["j_0000000000000001", "j_0000000000000002"]);
     folder.stop();
 }
 
@@ -645,4 +665,220 @@ fn deny_url_opens_no_window_and_answers_once() {
             "{line}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Order, teardown, threads and a held pipe (review M-5, I-3, I-2).
+// ---------------------------------------------------------------------------------------------
+
+#[test] // spec: APP-014
+fn the_instance_keeps_the_order_of_its_launches() {
+    // In one process: the server is this exe as this user, so the forwards are trusted, and
+    // each connects only after the one before was answered.
+    let env = TestEnv::new();
+    let server = InstanceServer::claim(&env.env, APP, false)
+        .unwrap()
+        .expect("the pipe is free");
+    for n in 1..=3 {
+        let args = vec![format!("lil-test:task/j_00000000000000{n:02x}")];
+        forward(&env.env, APP, false, &args).expect("handed over");
+    }
+    let got: Vec<String> = std::iter::from_fn(|| server.next_within(Duration::from_secs(5)))
+        .take(3)
+        .map(|f| f.args[0].clone())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "lil-test:task/j_0000000000000001",
+            "lil-test:task/j_0000000000000002",
+            "lil-test:task/j_0000000000000003"
+        ]
+    );
+}
+
+#[test] // spec: APP-013, APP-014
+fn a_launch_while_the_app_closes_becomes_its_own_instance() {
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    let first = running(&folder, &env, "", "shell");
+    std::fs::write(folder.dir.path().join("closing"), "").unwrap();
+    first.wait_line("closing");
+    // The launch is told "closing" and waits for the first instance to go.
+    let mut second = Launch::start(&folder, &env, &task_url(&env, 7));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        second.child.try_wait().unwrap().is_none(),
+        "{:?}",
+        second.lines()
+    );
+    assert!(second.lines().is_empty(), "{:?}", second.lines());
+    folder.stop();
+    first.wait_line("stopped");
+    // Then it is the instance, with its own launch: nothing was swallowed.
+    assert_eq!(second.wait_line("claimed "), "shell");
+    let run: Value = serde_json::from_str(&second.wait_line("run ")).unwrap();
+    assert_eq!(run["job"], "j_0000000000000007", "{run}");
+    assert_eq!(first.delivered(), Vec::<Value>::new());
+    assert_eq!(second.wait_exit().0, 0);
+}
+
+/// This process's threads.
+fn thread_count() -> usize {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    let pid = std::process::id();
+    // SAFETY: a snapshot walked with a correctly sized entry, then closed.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).expect("a thread snapshot");
+        let mut entry = THREADENTRY32 {
+            dwSize: u32::try_from(size_of::<THREADENTRY32>()).unwrap(),
+            ..Default::default()
+        };
+        let mut n = 0;
+        let mut more = Thread32First(snap, &mut entry).is_ok();
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                n += 1;
+            }
+            more = Thread32Next(snap, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        n
+    }
+}
+
+#[test] // spec: APP-013
+fn no_thread_outlives_the_instance_or_a_forward() {
+    let env = TestEnv::new();
+    let before = thread_count();
+    let server = InstanceServer::claim(&env.env, APP, false)
+        .unwrap()
+        .expect("the pipe is free");
+    assert_eq!(
+        thread_count(),
+        before + 1,
+        "the instance serves on one thread"
+    );
+    forward(&env.env, APP, false, &["--no-activate".to_string()]).expect("handed over");
+    assert_eq!(thread_count(), before + 1, "a forward leaves no thread");
+    // A claim that finds the pipe owned leaves none either.
+    assert!(
+        InstanceServer::claim(&env.env, APP, false)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(thread_count(), before + 1);
+    drop(server);
+    assert_eq!(
+        thread_count(),
+        before,
+        "dropping the instance joins its thread"
+    );
+    assert!(matches!(
+        forward(&env.env, APP, false, &[]),
+        Err(ForwardError::NotRunning)
+    ));
+}
+
+/// A pipe of `name` made first by this process with the security descriptor `sddl`, listening.
+fn squat(
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    sddl: &str,
+) -> tokio::net::windows::named_pipe::NamedPipeServer {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::core::HSTRING;
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a NUL-terminated SDDL and a valid out-pointer; the descriptor is left to the
+    // process's end (a test).
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &HSTRING::from(sddl),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .expect("the squatter's descriptor");
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    let _in = rt.enter();
+    // SAFETY: `attributes` and its descriptor outlive the call.
+    unsafe {
+        tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create_with_security_attributes_raw(name, (&raw mut attributes).cast())
+    }
+    .expect("the squatter's pipe")
+}
+
+#[test] // spec: APP-013, ARCH-026, ARCH-027
+fn a_pipe_held_by_another_program_starts_its_own_instance() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    // A DACL that leaves this user out (SYSTEM only), and one that lets everyone in but whose
+    // server isn't the app's exe.
+    for (what, sddl) in [("deny-all", "D:P(A;;GA;;;SY)"), ("open", "D:P(A;;GA;;;WD)")] {
+        let env = TestEnv::new();
+        let folder = Folder::new();
+        let _squatter = squat(&rt, &env.env.app_pipe_name(APP, false), sddl);
+        for rest in [String::new(), task_url(&env, 9)] {
+            let mut launch = Launch::start(&folder, &env, &rest);
+            let (code, _) = launch.wait_exit();
+            assert_eq!(code, 0, "{what} {rest}: {:?}", launch.lines());
+            let run: Value = serde_json::from_str(&launch.wait_line("run ")).unwrap();
+            assert_eq!(run["pipe_held"], true, "{what} {rest}: {run}");
+            assert!(
+                launch.lines().iter().all(|l| !l.starts_with("claimed")),
+                "{what}: {:?}",
+                launch.lines()
+            );
+            if !rest.is_empty() {
+                assert_eq!(run["job"], "j_0000000000000009", "its own launch: {run}");
+            }
+        }
+        assert!(
+            log_lines(&env)
+                .iter()
+                .any(|l| l.contains("another program holds the app's pipe")),
+            "{what}: a warning is logged"
+        );
+    }
+}
+
+#[test] // spec: P4a-R9
+fn a_deny_that_fails_exits_non_zero() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let env = TestEnv::new();
+    let folder = Folder::new();
+    // The core's pipe is held by this process, which isn't a core the client trusts.
+    let _squatter = squat(&rt, &env.env.pipe_name(), "D:P(A;;GA;;;WD)");
+    let deny = format!(
+        "\"{}:deny/{CF}/0123456789abcdef0123456789abcdef\"",
+        scheme(&env)
+    );
+    let mut launch = Launch::start(&folder, &env, &deny);
+    let (code, took) = launch.wait_exit();
+    assert_eq!(code, 1, "{:?}", launch.lines());
+    assert!(took < Duration::from_secs(15), "bounded: {took:?}");
+    assert_eq!(launch.lines(), ["exit 1 forwarded=false"]);
+    let lines = deny_lines(&env, CF);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("\"failed\""), "{}", lines[0]);
 }

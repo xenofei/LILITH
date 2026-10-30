@@ -5,28 +5,34 @@
 //! user-only security descriptor. The exchange, each message one JSON line of at most 64 KiB:
 //! 1. the running instance ([`InstanceServer`]) writes `{"app": "<app>", "pid": <pid>}` when a
 //!    client connects;
-//! 2. the second launch ([`forward`]) checks that the server's image path is its own executable
-//!    (else [`ForwardError::Untrusted`], and nothing is written), calls
-//!    `AllowSetForegroundWindow(pid)` and writes `{"args": [<argument>, …]}`;
+//! 2. the second launch ([`forward`]) checks the server as ARCH-027 says, its image path is its
+//!    own executable and its token user is the current user (else [`ForwardError::Untrusted`],
+//!    and nothing is written), calls `AllowSetForegroundWindow(pid)` unless the launch never
+//!    comes forward (a deny, `--no-activate`), and writes `{"args": [<argument>, …]}`;
 //! 3. the running instance reads it, answers `{"ok": true}` and queues the arguments
-//!    ([`InstanceServer::next`]); the second launch then exits 0.
+//!    ([`InstanceServer::next`]); the second launch then exits 0. An instance that is closing
+//!    ([`InstanceServer::close`]) answers `{"ok": false, "closing": true}` instead, and queues
+//!    nothing: the second launch waits for it to go and becomes the instance itself.
 //!
 //! The second launch gives up 2 s after it started ([`ForwardError::Timeout`]). The server takes
-//! one client at a time, in the order they connect, each within 2 s, so two quick launches are
-//! both read, in turn, by the one running instance.
+//! one client at a time, in the order they connect, each within 2 s.
 //!
 //! [`start`] is what a start does before Qt: which pipe a plan goes to, and the deny of a toast
 //! (P4a-R9), which never shows a window: it goes to the running app, else to a running confirm
 //! window, else this process sends it itself with [`send_deny`] (`StartPolicy::NoStart`, so a
-//! stale toast's Deny starts no core) and exits 0.
+//! stale toast's Deny starts no core, and at most 10 s in all). When another program holds the
+//! pipe (it can't be opened, or its server isn't this exe as this user), the start goes on as an
+//! instance of its own, without the pipe, and says so ([`BootPlan::pipe_held`]).
 //!
 //! **Threads.** [`forward`] and [`send_deny`] each run on a current-thread tokio runtime of their
-//! own, made and shut down within the call, so nothing is left running when they return. A
-//! claimed [`InstanceServer`] serves on one thread of its own (`lil-instance`) with its own
-//! current-thread runtime, for as long as it lives; dropping it stops and joins that thread.
+//! own, made and shut down within the call, so nothing of theirs is left when they return. A
+//! claimed [`InstanceServer`] makes its pipe and serves it on one thread of its own
+//! (`lil-instance`), with that thread's own current-thread runtime: nothing tokio runs on the
+//! caller's thread. Dropping the server stops and joins the thread.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -35,7 +41,7 @@ use std::time::{Duration, Instant};
 use lil_client::{Client, ClientConfig, ClientError, StartPolicy};
 use lil_platform::Env;
 use lil_platform::pipe::{ConnectError, CreateError, create_instance, open_client, server_pid};
-use lil_platform::process::{ProcessInspector, SystemInspector};
+use lil_platform::process::{ProcessInfo, ProcessInspector, SystemInspector, current_user_sid};
 use lil_protocol::Outcome;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -48,8 +54,14 @@ use crate::args::{BootPlan, Mode, Opened};
 pub const MESSAGE_MAX: usize = 64 * 1024;
 /// How long a second launch tries, and how long the server gives one client.
 pub const BUDGET: Duration = Duration::from_secs(2);
+/// How long a launch waits for a closing instance to go before it starts without the pipe.
+pub const CLOSING_WAIT: Duration = Duration::from_secs(10);
+/// The longest a toast's deny may take, connection included.
+pub const DENY_BOUND: Duration = Duration::from_secs(10);
 /// The wait between tries while every instance of the pipe is busy.
 const BUSY_RETRY: Duration = Duration::from_millis(10);
+/// The wait between tries while the running instance closes.
+const CLOSING_RETRY: Duration = Duration::from_millis(50);
 
 /// The arguments a second launch handed over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +74,12 @@ pub struct Forwarded {
 pub enum ForwardError {
     /// No instance owns the pipe.
     NotRunning,
-    /// The pipe's server isn't this executable: nothing was written.
+    /// The pipe is held by something this launch doesn't trust: it can't be opened (a DACL that
+    /// leaves this user out, or every instance stays busy for the whole budget), or its server
+    /// isn't this executable run as this user, or can't be inspected. Nothing was written.
     Untrusted,
+    /// The running instance is closing: it took nothing.
+    Closing,
     /// No exchange within [`BUDGET`].
     Timeout,
     /// The server answered something else than the exchange.
@@ -75,9 +91,11 @@ impl std::fmt::Display for ForwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ForwardError::NotRunning => f.write_str("no instance is running"),
-            ForwardError::Untrusted => {
-                f.write_str("the pipe's server is another program than this one")
-            }
+            ForwardError::Untrusted => f.write_str(
+                "the pipe is held by another program (it can't be opened, or its server isn't \
+                 this exe run as this user)",
+            ),
+            ForwardError::Closing => f.write_str("the running instance is closing"),
             ForwardError::Timeout => {
                 write!(f, "the running instance didn't answer within {BUDGET:?}")
             }
@@ -95,15 +113,10 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-/// What the server thread hands to [`InstanceServer`].
-struct Shared {
-    hook: Mutex<Option<Box<dyn Fn() + Send>>>,
-}
-
 /// The running instance's side of the pipe.
 pub struct InstanceServer {
     rx: Mutex<mpsc::Receiver<Forwarded>>,
-    shared: Arc<Shared>,
+    closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
     thread: Option<JoinHandle<()>>,
 }
@@ -116,42 +129,64 @@ impl std::fmt::Debug for InstanceServer {
 
 impl InstanceServer {
     /// Creates `app`'s pipe (its confirm window's with `confirm`) as its first instance and
-    /// serves it: `None` when another process owns it.
+    /// serves it: `None` when another process owns it. The pipe is made on the server's own
+    /// thread, which ends at once when the pipe isn't claimed.
     ///
     /// # Errors
     /// When the pipe can't be created for another reason, or the thread can't start.
     pub fn claim(env: &Env, app: &str, confirm: bool) -> io::Result<Option<InstanceServer>> {
         let name = env.app_pipe_name(app, confirm);
-        let rt = runtime()?;
-        let first = {
-            let _in = rt.enter();
-            match create_instance(&name, true) {
-                Ok(server) => server,
-                Err(CreateError::AlreadyOwned) => return Ok(None),
-                Err(CreateError::Io(e)) => return Err(e),
-            }
-        };
         let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Shared {
-            hook: Mutex::new(None),
-        });
+        let (claimed_tx, claimed_rx) = mpsc::channel::<io::Result<bool>>();
+        let closing = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(Notify::new());
         let app = app.to_string();
         let thread = {
-            let (shared, stop) = (shared.clone(), stop.clone());
+            let (closing, stop) = (closing.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("lil-instance".into())
                 .spawn(move || {
-                    rt.block_on(serve(first, name, app, tx, shared, stop));
+                    let rt = match runtime() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            let _ = claimed_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let first = {
+                        let _in = rt.enter();
+                        create_instance(&name, true)
+                    };
+                    match first {
+                        Ok(first) => {
+                            let _ = claimed_tx.send(Ok(true));
+                            rt.block_on(serve(first, name, app, tx, closing, stop));
+                        }
+                        Err(CreateError::AlreadyOwned) => {
+                            let _ = claimed_tx.send(Ok(false));
+                        }
+                        Err(CreateError::Io(e)) => {
+                            let _ = claimed_tx.send(Err(e));
+                        }
+                    }
                     // The runtime is dropped here, on its own thread.
                 })?
         };
-        Ok(Some(InstanceServer {
-            rx: Mutex::new(rx),
-            shared,
-            stop,
-            thread: Some(thread),
-        }))
+        let claimed = claimed_rx
+            .recv()
+            .unwrap_or_else(|_| Err(io::Error::other("the instance thread ended early")));
+        match claimed {
+            Ok(true) => Ok(Some(InstanceServer {
+                rx: Mutex::new(rx),
+                closing,
+                stop,
+                thread: Some(thread),
+            })),
+            other => {
+                let _ = thread.join();
+                other.map(|_| None)
+            }
+        }
     }
 
     /// The next arguments a second launch handed over, in the order they came; `None` when
@@ -164,19 +199,26 @@ impl InstanceServer {
             .ok()
     }
 
-    /// Calls `hook` (from the server's thread) each time arguments arrive, after they are
-    /// queued for [`InstanceServer::next`].
-    pub fn on_arrival(&self, hook: impl Fn() + Send + 'static) {
-        *self
-            .shared
-            .hook
+    /// [`InstanceServer::next`], waiting at most `within` for one.
+    pub fn next_within(&self, within: Duration) -> Option<Forwarded> {
+        self.rx
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+            .unwrap_or_else(PoisonError::into_inner)
+            .recv_timeout(within)
+            .ok()
+    }
+
+    /// From now on every launch is answered "closing" and taken by none: it waits for this
+    /// instance to go and becomes the instance itself. What was taken before is still
+    /// [`InstanceServer::next`]'s.
+    pub fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
     }
 }
 
 impl Drop for InstanceServer {
     fn drop(&mut self) {
+        self.closing.store(true, Ordering::SeqCst);
         self.stop.notify_one();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -189,19 +231,15 @@ async fn serve(
     name: String,
     app: String,
     tx: mpsc::Sender<Forwarded>,
-    shared: Arc<Shared>,
+    closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
 ) {
     let mut server = first;
     loop {
-        tokio::select! {
-            connected = server.connect() => {
-                if let Err(e) = connected {
-                    tracing::warn!(error = %e, "a launch's connection to the app's pipe failed");
-                }
-            }
+        let connected = tokio::select! {
+            connected = server.connect() => connected,
             () = stop.notified() => return,
-        }
+        };
         // The next instance exists before this client is read, so the next launch can connect.
         let next = loop {
             match create_instance(&name, false) {
@@ -216,28 +254,30 @@ async fn serve(
             }
         };
         let client = std::mem::replace(&mut server, next);
-        match tokio::time::timeout(BUDGET, exchange(client, &app)).await {
-            Ok(Ok(args)) => {
+        if let Err(e) = connected {
+            tracing::warn!(error = %e, "a launch's connection to the app's pipe failed");
+            continue;
+        }
+        match tokio::time::timeout(BUDGET, exchange(client, &app, &closing)).await {
+            Ok(Ok(Some(args))) => {
                 if tx.send(Forwarded { args }).is_err() {
                     return;
                 }
-                if let Some(hook) = shared
-                    .hook
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-                {
-                    hook();
-                }
             }
+            Ok(Ok(None)) => tracing::info!("a launch came while the app closes: told it so"),
             Ok(Err(e)) => tracing::warn!(error = %e, "a launch's arguments were refused"),
             Err(_) => tracing::warn!("a launch didn't hand its arguments over within 2 s"),
         }
     }
 }
 
-/// The server's side of one exchange: the arguments, once answered `{"ok": true}`.
-async fn exchange(mut client: NamedPipeServer, app: &str) -> io::Result<Vec<String>> {
+/// The server's side of one exchange: the arguments, once answered `{"ok": true}`, or `None`
+/// once answered "closing".
+async fn exchange(
+    mut client: NamedPipeServer,
+    app: &str,
+    closing: &AtomicBool,
+) -> io::Result<Option<Vec<String>>> {
     let hello = json!({"app": app, "pid": std::process::id()});
     write_line(&mut client, &hello).await?;
     let (reader, mut writer) = tokio::io::split(client);
@@ -252,8 +292,12 @@ async fn exchange(mut client: NamedPipeServer, app: &str) -> io::Result<Vec<Stri
                 .collect::<Option<Vec<_>>>()
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not {\"args\": [string]}"))?;
+    if closing.load(Ordering::SeqCst) {
+        write_line(&mut writer, &json!({"ok": false, "closing": true})).await?;
+        return Ok(None);
+    }
     write_line(&mut writer, &json!({"ok": true})).await?;
-    Ok(args)
+    Ok(Some(args))
 }
 
 async fn write_line(w: &mut (impl AsyncWrite + Unpin), v: &Value) -> io::Result<()> {
@@ -305,53 +349,109 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((canon(a), canon(b)), (Ok(a), Ok(b)) if a == b)
 }
 
-/// Hands `args` to the running instance of `app` (its confirm window with `confirm`): the
-/// instance's pid.
-///
-/// # Errors
-/// [`ForwardError`]: no instance, a server that isn't this executable, no exchange within
-/// [`BUDGET`], or a broken pipe.
-pub fn forward(env: &Env, app: &str, confirm: bool, args: &[String]) -> Result<u32, ForwardError> {
-    let own = std::env::current_exe().map_err(ForwardError::Io)?;
-    forward_as(env, app, confirm, args, &own)
+/// ARCH-027 for the app's pipe: its server is `own_exe`, run as `own_sid`.
+pub fn server_is_trusted(info: &ProcessInfo, own_exe: &Path, own_sid: &str) -> bool {
+    info.user_sid.eq_ignore_ascii_case(own_sid) && same_file(&info.image, own_exe)
 }
 
-/// [`forward`], with `own` as this executable.
+/// What a client of the pipe is: its exe and user, how it inspects the server, and whether the
+/// server may take the foreground.
+struct Forwarder<'a> {
+    own_exe: &'a Path,
+    own_sid: &'a str,
+    inspector: &'a dyn ProcessInspector,
+    grant_foreground: bool,
+}
+
+/// Hands `args` to the running instance of `app` (its confirm window with `confirm`), which may
+/// then take the foreground: the instance's pid.
+///
+/// # Errors
+/// [`ForwardError`]: no instance, a pipe held by another program, a closing instance, no
+/// exchange within [`BUDGET`], or a broken pipe.
+pub fn forward(env: &Env, app: &str, confirm: bool, args: &[String]) -> Result<u32, ForwardError> {
+    forward_granting(env, app, confirm, args, true)
+}
+
+/// [`forward`], allowing the instance the foreground only with `grant_foreground` (review M-3).
+fn forward_granting(
+    env: &Env,
+    app: &str,
+    confirm: bool,
+    args: &[String],
+    grant_foreground: bool,
+) -> Result<u32, ForwardError> {
+    let own_exe = std::env::current_exe().map_err(ForwardError::Io)?;
+    let own_sid = current_user_sid().map_err(ForwardError::Io)?;
+    let client = Forwarder {
+        own_exe: &own_exe,
+        own_sid: &own_sid,
+        inspector: &SystemInspector,
+        grant_foreground,
+    };
+    forward_as(env, app, confirm, args, &client)
+}
+
+/// `true` for an error that means the server went away mid-exchange (it was closing).
+fn gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    )
+}
+
 fn forward_as(
     env: &Env,
     app: &str,
     confirm: bool,
     args: &[String],
-    own: &Path,
+    me: &Forwarder<'_>,
 ) -> Result<u32, ForwardError> {
     let name = env.app_pipe_name(app, confirm);
     let deadline = Instant::now() + BUDGET;
     let rt = runtime().map_err(ForwardError::Io)?;
+    let after_trust = |e: io::Error| {
+        if gone(&e) {
+            ForwardError::Closing
+        } else {
+            ForwardError::Io(e)
+        }
+    };
     let result = rt.block_on(async {
         let exchange = async {
             let client = loop {
                 match open_client(&name) {
                     Ok(client) => break client,
                     Err(ConnectError::NotFound) => return Err(ForwardError::NotRunning),
+                    // Every instance busy for the whole budget: nothing serves the pipe (a
+                    // squatter that never answers, or a hung instance), so it counts as held.
+                    Err(ConnectError::Busy) if Instant::now() + BUSY_RETRY >= deadline => {
+                        tracing::warn!("every instance of the app's pipe stayed busy for 2 s");
+                        return Err(ForwardError::Untrusted);
+                    }
                     Err(ConnectError::Busy) => tokio::time::sleep(BUSY_RETRY).await,
-                    Err(ConnectError::Io(e)) => return Err(ForwardError::Io(e)),
+                    // Held by a pipe whose DACL leaves this user out (review I-2).
+                    Err(ConnectError::Io(e)) => {
+                        tracing::warn!(error = %e, "the app's pipe can't be opened");
+                        return Err(ForwardError::Untrusted);
+                    }
                 }
             };
-            let pid = server_pid(&client).map_err(ForwardError::Io)?;
-            let image: PathBuf = SystemInspector
-                .inspect(pid)
-                .map_err(ForwardError::Io)?
-                .image;
-            if !same_file(&image, own) {
+            let pid = server_pid(&client).map_err(|_| ForwardError::Untrusted)?;
+            let info = me.inspector.inspect(pid).map_err(|e| {
+                tracing::warn!(pid, error = %e, "the app's pipe server can't be inspected");
+                ForwardError::Untrusted
+            })?;
+            if !server_is_trusted(&info, me.own_exe, me.own_sid) {
                 return Err(ForwardError::Untrusted);
             }
             let (reader, mut writer) = tokio::io::split(client);
             let mut reader = BufReader::new(reader);
-            let hello = read_line(&mut reader).await.map_err(ForwardError::Io)?;
+            let hello = read_line(&mut reader).await.map_err(after_trust)?;
             if hello["app"] != app || hello["pid"].as_u64() != Some(u64::from(pid)) {
                 return Err(ForwardError::Refused);
             }
-            if !lil_platform::desktop::allow_set_foreground(pid) {
+            if me.grant_foreground && !lil_platform::desktop::allow_set_foreground(pid) {
                 tracing::info!(
                     pid,
                     "AllowSetForegroundWindow was refused: the window may only flash"
@@ -359,12 +459,15 @@ fn forward_as(
             }
             write_line(&mut writer, &json!({ "args": args }))
                 .await
-                .map_err(ForwardError::Io)?;
-            let ok = read_line(&mut reader).await.map_err(ForwardError::Io)?;
-            if ok != json!({"ok": true}) {
-                return Err(ForwardError::Refused);
+                .map_err(after_trust)?;
+            let answer = read_line(&mut reader).await.map_err(after_trust)?;
+            if answer == json!({"ok": true}) {
+                Ok(pid)
+            } else if answer["closing"] == true {
+                Err(ForwardError::Closing)
+            } else {
+                Err(ForwardError::Refused)
             }
-            Ok(pid)
         };
         match tokio::time::timeout_at(deadline.into(), exchange).await {
             Ok(result) => result,
@@ -389,38 +492,58 @@ pub enum DenyOutcome {
     Refused(String),
     /// No core runs: nothing is started, and the token died with the core that made it.
     NoCore,
-    /// The core couldn't be reached or answered oddly.
+    /// The core couldn't be reached, answered oddly, or not within [`DENY_BOUND`].
     Failed(String),
+}
+
+impl DenyOutcome {
+    /// The exit code of a process that only sent this deny: 0 unless it failed.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            DenyOutcome::Failed(_) => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// `work`, or [`DenyOutcome::Failed`] with `timeout` once `bound` has passed.
+fn bounded(bound: Duration, work: impl std::future::Future<Output = DenyOutcome>) -> DenyOutcome {
+    match runtime() {
+        Err(e) => DenyOutcome::Failed(e.to_string()),
+        Ok(rt) => rt.block_on(async {
+            tokio::time::timeout(bound, work)
+                .await
+                .unwrap_or_else(|_| DenyOutcome::Failed(format!("no answer within {bound:?}")))
+        }),
+    }
 }
 
 /// Sends a toast's deny (P4a-R9): `app/confirmation.answer {confirmation_id, answer: "deny",
 /// toast_token}` over a new connection made with `cfg` (a verified `ui:*` caller), never
-/// starting a core. Shows nothing; writes one log line, with the token cut.
+/// starting a core, in at most [`DENY_BOUND`]. Shows nothing; writes one log line, with the
+/// token cut.
 pub fn send_deny(cfg: &ClientConfig, id: &str, token: &str) -> DenyOutcome {
     let mut cfg = cfg.clone();
     cfg.start = StartPolicy::NoStart;
-    let outcome = match runtime() {
-        Err(e) => DenyOutcome::Failed(e.to_string()),
-        Ok(rt) => rt.block_on(async {
-            let client = match Client::connect(&cfg).await {
-                Ok(client) => client,
-                Err(ClientError::NotRunning) => return DenyOutcome::NoCore,
-                Err(e) => return DenyOutcome::Failed(e.to_string()),
-            };
-            let params = json!({"confirmation_id": id, "answer": "deny", "toast_token": token});
-            match client.app_call("app/confirmation.answer", params).await {
-                Ok(Outcome::Ok(_)) => DenyOutcome::Denied,
-                Ok(Outcome::Error { error }) => DenyOutcome::Refused(error.code),
-                Ok(_) => DenyOutcome::Failed("an unexpected outcome".into()),
-                Err(e) => DenyOutcome::Failed(e.to_string()),
-            }
-        }),
-    };
+    let outcome = bounded(DENY_BOUND, async {
+        let client = match Client::connect(&cfg).await {
+            Ok(client) => client,
+            Err(ClientError::NotRunning) => return DenyOutcome::NoCore,
+            Err(e) => return DenyOutcome::Failed(e.to_string()),
+        };
+        let params = json!({"confirmation_id": id, "answer": "deny", "toast_token": token});
+        match client.app_call("app/confirmation.answer", params).await {
+            Ok(Outcome::Ok(_)) => DenyOutcome::Denied,
+            Ok(Outcome::Error { error }) => DenyOutcome::Refused(error.code),
+            Ok(_) => DenyOutcome::Failed("an unexpected outcome".into()),
+            Err(e) => DenyOutcome::Failed(e.to_string()),
+        }
+    });
     let link = cut_deny(id);
     match &outcome {
         DenyOutcome::Denied => tracing::info!(link, outcome = "denied", "a notification's deny"),
         DenyOutcome::Refused(code) => {
-            tracing::info!(link, outcome = "refused", code, "a notification's deny")
+            tracing::info!(link, outcome = "refused", code, "a notification's deny");
         }
         DenyOutcome::NoCore => tracing::info!(
             link,
@@ -428,7 +551,7 @@ pub fn send_deny(cfg: &ClientConfig, id: &str, token: &str) -> DenyOutcome {
             "a notification's deny: no core runs, so its confirmation is gone"
         ),
         DenyOutcome::Failed(why) => {
-            tracing::warn!(link, outcome = "failed", why, "a notification's deny")
+            tracing::warn!(link, outcome = "failed", why, "a notification's deny");
         }
     }
     outcome
@@ -438,21 +561,27 @@ pub fn send_deny(cfg: &ClientConfig, id: &str, token: &str) -> DenyOutcome {
 #[derive(Debug)]
 pub enum Start {
     /// Exit with this code before Qt starts: 0 once the arguments reached the running instance
-    /// or the deny was sent.
+    /// or the deny was sent, 1 when it failed (logged).
     Exit(i32),
     /// Start Qt, serving this instance's pipe (none under `--smoke-exit`, or when another
-    /// program squats the pipe).
+    /// program holds the pipe: then [`BootPlan::pipe_held`] is set).
     Run(Option<InstanceServer>),
 }
 
 /// The first instance among `pipes` (`confirm` flags, in order) that takes `args`.
-fn forward_first(env: &Env, app: &str, pipes: &[bool], args: &[String]) -> Option<u32> {
+fn forward_first(
+    env: &Env,
+    app: &str,
+    pipes: &[bool],
+    args: &[String],
+    grant_foreground: bool,
+) -> Option<u32> {
     for &confirm in pipes {
-        match forward(env, app, confirm, args) {
+        match forward_granting(env, app, confirm, args, grant_foreground) {
             Ok(pid) => return Some(pid),
             Err(ForwardError::NotRunning) => {}
             Err(e) => {
-                tracing::warn!(confirm, error = %e, "a running instance didn't take the launch")
+                tracing::warn!(confirm, error = %e, "a running instance didn't take the launch");
             }
         }
     }
@@ -475,74 +604,110 @@ pub fn start(
     let app = plan.app.clone();
     if let Some(Opened::Deny { id, token }) = &plan.opened {
         // A deny never shows a window (P4a-R9, P4a-R11): the running app, else a confirm window,
-        // else this process.
-        if forward_first(env, &app, &[false, true], &plan.args).is_some() {
+        // else this process. None of them is allowed the foreground.
+        if forward_first(env, &app, &[false, true], &plan.args, false).is_some() {
             plan.forwarded = true;
             return Start::Exit(0);
         }
-        match deny_cfg() {
-            Some(cfg) => {
-                send_deny(&cfg, id, token);
-            }
-            None => tracing::warn!(
+        let Some(cfg) = deny_cfg() else {
+            tracing::warn!(
                 link = cut_deny(id),
                 "a notification's deny had no connection to go on"
-            ),
-        }
-        return Start::Exit(0);
+            );
+            return Start::Exit(1);
+        };
+        return Start::Exit(send_deny(&cfg, id, token).exit_code());
     }
+    let grant = !plan.no_activate;
     let confirm = matches!(plan.mode, Mode::Confirm { .. });
-    if confirm && forward_first(env, &app, &[false], &plan.args).is_some() {
+    if confirm && forward_first(env, &app, &[false], &plan.args, grant).is_some() {
         // While the full app runs, confirm links go to it first (P4a-R11).
         plan.forwarded = true;
         return Start::Exit(0);
     }
-    // Claim this mode's pipe, or hand the launch to its owner; once more if the owner went away
-    // between the two.
-    for _ in 0..2 {
+    instance(plan, env, confirm, grant)
+}
+
+/// Claims this mode's pipe, or hands the launch to its owner: retried while the owner closes or
+/// goes away between the two, for at most [`CLOSING_WAIT`].
+fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start {
+    let app = plan.app.clone();
+    let until = Instant::now() + CLOSING_WAIT;
+    loop {
         match InstanceServer::claim(env, &app, confirm) {
             Ok(Some(server)) => return Start::Run(Some(server)),
             Ok(None) => {}
             Err(e) => {
-                tracing::error!(error = %e, "the app's pipe couldn't be created");
-                return Start::Exit(1);
+                tracing::warn!(
+                    error = %e,
+                    "the app's pipe couldn't be created: starting as an instance of its own"
+                );
+                plan.pipe_held = true;
+                return Start::Run(None);
             }
         }
-        match forward(env, &app, confirm, &plan.args) {
+        match forward_granting(env, &app, confirm, &plan.args, grant) {
             Ok(_) => {
                 plan.forwarded = true;
                 return Start::Exit(0);
             }
-            Err(ForwardError::NotRunning) => continue,
+            Err(ForwardError::NotRunning | ForwardError::Closing) if Instant::now() < until => {
+                std::thread::sleep(CLOSING_RETRY);
+            }
+            Err(ForwardError::NotRunning | ForwardError::Closing) => {
+                tracing::warn!(
+                    "the running instance was still closing after 10 s: starting as an \
+                     instance of its own, without the pipe"
+                );
+                return Start::Run(None);
+            }
             Err(ForwardError::Untrusted) => {
-                // Another program holds the pipe: this start goes on without one.
-                tracing::warn!("another program holds the app's pipe: starting without it");
+                tracing::warn!(
+                    "another program holds the app's pipe: starting as an instance of its own, \
+                     without single-instance protection"
+                );
+                plan.pipe_held = true;
                 return Start::Run(None);
             }
             Err(e) => {
-                tracing::warn!(error = %e, "the running instance didn't take the launch");
+                tracing::error!(
+                    error = %e,
+                    "the running LILITH didn't take this launch, so it ends here"
+                );
                 return Start::Exit(1);
             }
         }
     }
-    Start::Exit(1)
 }
 
-/// What the running instance does with a forwarded launch: the plan for its window, or `None`
-/// when there is nothing to show (a deny, sent on a thread of its own with `deny_cfg`'s
-/// connection, without the window knowing).
+/// What the running instance does with one forwarded launch ([`route`]).
+#[derive(Debug)]
+pub enum Routed {
+    /// The window shows it.
+    Show(Box<BootPlan>),
+    /// A deny, being sent on this thread without the window knowing; join it before exiting.
+    Deny(JoinHandle<()>),
+    /// Nothing: the arguments were refused (logged).
+    Nothing,
+}
+
+/// What the running instance does with a forwarded launch: the plan for its window, or a
+/// deny sent on a thread of its own with `deny_cfg`'s connection.
 pub fn route(
     forwarded: &Forwarded,
     env: &Env,
     deny_cfg: impl FnOnce() -> Option<ClientConfig> + Send + 'static,
-) -> Option<BootPlan> {
+) -> Routed {
     let plan = crate::args::plan_args(&forwarded.args, env);
     if plan.refused.is_some() {
         tracing::warn!("a launch's command line was refused by the running instance");
-        return None;
+        return Routed::Nothing;
     }
-    if let Some(Opened::Deny { id, token }) = plan.opened.clone() {
-        let spawned = std::thread::Builder::new()
+    let Some(Opened::Deny { id, token }) = plan.opened.clone() else {
+        return Routed::Show(Box::new(plan));
+    };
+    let spawned =
+        std::thread::Builder::new()
             .name("lil-deny".into())
             .spawn(move || match deny_cfg() {
                 Some(cfg) => {
@@ -553,10 +718,75 @@ pub fn route(
                     "a notification's deny had no connection to go on"
                 ),
             });
-        if let Err(e) = spawned {
+    match spawned {
+        Ok(handle) => Routed::Deny(handle),
+        Err(e) => {
             tracing::error!(error = %e, "a notification's deny couldn't start");
+            Routed::Nothing
         }
-        return None;
     }
-    Some(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn info(image: PathBuf, sid: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: 1,
+            image,
+            user_sid: sid.to_string(),
+            parent_pid: None,
+        }
+    }
+
+    #[test] // spec: ARCH-027
+    fn the_server_must_be_this_exe_run_as_this_user() {
+        let own = std::env::current_exe().unwrap();
+        let sid = "S-1-5-21-1-2-3-1001";
+        assert!(server_is_trusted(&info(own.clone(), sid), &own, sid));
+        assert!(server_is_trusted(
+            &info(own.clone(), &sid.to_lowercase()),
+            &own,
+            sid
+        ));
+        // Another user running the same exe.
+        assert!(!server_is_trusted(
+            &info(own.clone(), "S-1-5-21-1-2-3-1002"),
+            &own,
+            sid
+        ));
+        assert!(!server_is_trusted(
+            &info(own.clone(), "S-1-5-18"),
+            &own,
+            sid
+        ));
+        // This user running another exe, or one that doesn't exist.
+        let other = own.with_file_name("not-this-exe.exe");
+        assert!(!server_is_trusted(&info(other, sid), &own, sid));
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("copy.exe");
+        std::fs::copy(&own, &copy).unwrap();
+        assert!(!server_is_trusted(&info(copy, sid), &own, sid));
+    }
+
+    #[test] // spec: P4a-R9
+    fn a_deny_that_never_answers_fails_within_its_bound() {
+        let started = Instant::now();
+        let outcome = bounded(
+            Duration::from_millis(200),
+            std::future::pending::<DenyOutcome>(),
+        );
+        assert!(matches!(outcome, DenyOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(outcome.exit_code(), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        for ok in [
+            DenyOutcome::Denied,
+            DenyOutcome::NoCore,
+            DenyOutcome::Refused("confirm.unknown".into()),
+        ] {
+            assert_eq!(ok.exit_code(), 0);
+        }
+    }
 }

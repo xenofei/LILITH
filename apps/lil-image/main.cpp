@@ -40,7 +40,9 @@
 // filled off the GUI thread.
 //
 // Launches (P4a-R21): this start's own and each forwarded one reach ShellWindow.handleLaunchJson
-// through lil_qt::setLaunchSink once the window is loaded. Until Task 21's confirm window, a
+// through lil_qt::deliverLaunchesTo once the window is loaded. Once the event loop has ended,
+// lil_qt::release_instance stops taking launches (a new one becomes the instance itself) before
+// the window goes, and starts again any the window never took. Until Task 21's confirm window, a
 // confirm-window start (--confirm, a confirm/ link with no app running) opens the shell without
 // the app's state folder, on its Confirmations panel.
 //
@@ -70,7 +72,6 @@
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonObject>
-#include <QPointer>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -134,19 +135,6 @@ QString fromRust(const rust::String &s)
 void toAppLog(const char *line, qsizetype size)
 {
     lil_qt::log_line(rust::Str(line, size_t(size)));
-}
-
-// The window launches go to (lil_qt::setLaunchSink), set once it is loaded.
-QPointer<QQuickWindow> s_window;
-
-// A launch's JSON, from the instance's pipe thread: queued to the GUI thread, where the shell
-// takes it.
-void toWindow(const QString &json)
-{
-    QMetaObject::invokeMethod(qApp, [json] {
-        if (s_window)
-            QMetaObject::invokeMethod(s_window.data(), "handleLaunchJson", Q_ARG(QVariant, QVariant(json)));
-    }, Qt::QueuedConnection);
 }
 
 QString graphicsApiName(QQuickWindow *window)
@@ -296,8 +284,7 @@ int main(int, char **)
     lilshim::activate(window, !plan.no_activate);
 
     // Launches: this start's own, then each a second launch hands over (P4a-R21).
-    s_window = window;
-    lil_qt::setLaunchSink(&toWindow);
+    lil_qt::deliverLaunchesTo(window);
     lil_qt::launches_ready();
 
     // interactive: the first time the event loop goes idle after the window was shown.
@@ -319,6 +306,9 @@ int main(int, char **)
     });
 
     const int rc = app.exec();
+    // No launch is taken from here on, before the window and the engine go.
+    lil_qt::deliverLaunchesTo(nullptr);
+    lil_qt::release_instance();
     lilshim::logEvent(QStringLiteral("exit"), {{"code", rc}});
     return rc;
 }
