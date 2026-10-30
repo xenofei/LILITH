@@ -2907,12 +2907,17 @@ async fn a_retry_waits_for_the_withdrawn_prompt_of_the_job_it_retries() {
         (JobStatus::Queued, Some("submitting"), 1),
         "{waiting:?}"
     );
+    assert!(
+        waiting.waiting_for_earlier_prompt,
+        "its summary says what it waits for"
+    );
     assert_eq!(posted(&fake).len(), 1, "only the old prompt");
     fake.hold_prompts(false);
     fake.release(&old);
     let done = rig.done(&retry).await;
     assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
     assert_eq!(done.attempt, 1, "the wait used no retry");
+    assert!(!done.waiting_for_earlier_prompt);
     let bodies = posted(&fake);
     assert_eq!(bodies.len(), 2, "one POST of its own: {bodies:?}");
     assert_ne!(bodies[1]["prompt_id"], old.as_str());

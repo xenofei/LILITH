@@ -187,7 +187,17 @@ impl JobRow {
             },
             estimate: self.estimate.clone(),
             queue_position: live.and_then(|l| l.queue_position),
+            waiting_for_earlier_prompt: self.waits_for_earlier_prompt(),
         }
+    }
+
+    /// A retry that still holds the prompt id it copied from the job it retries waits in
+    /// `submitting` until that prompt leaves ComfyUI (Appendix G "Withdrawal").
+    pub fn waits_for_earlier_prompt(&self) -> bool {
+        self.status == JobStatus::Queued
+            && self.substatus == Some(Substatus::Submitting)
+            && self.retry_of.is_some()
+            && self.withdrawn_id.is_some()
     }
 
     /// The spec the row was submitted with, for `kind` (the registered handler's own name).
@@ -1051,6 +1061,38 @@ mod tests {
             withdrawn_id: None,
             estimate: None,
             estimate_key: None,
+        }
+    }
+
+    /// A retry waiting on the prompt it inherited says so in its summary, and only then
+    /// (Appendix G "Withdrawal"): a retry still submitting with no inherited prompt, a job whose
+    /// own prompt was withdrawn, and the retry before or after its submit don't.
+    #[test] // spec: CORE-160, CORE-117
+    fn a_retry_waiting_on_its_inherited_prompt_says_so() {
+        let mut r = row("j_2");
+        r.substatus = Some(Substatus::Submitting);
+        r.retry_of = Some("j_1".into());
+        r.withdrawn_id = Some("p_old".into());
+        assert!(r.summary(None).waiting_for_earlier_prompt);
+        let json = serde_json::to_value(r.summary(None)).unwrap();
+        assert_eq!(json["waiting_for_earlier_prompt"], json!(true));
+        for change in [
+            |r: &mut JobRow| r.withdrawn_id = None,
+            |r: &mut JobRow| r.retry_of = None,
+            |r: &mut JobRow| r.substatus = Some(Substatus::Waiting),
+            |r: &mut JobRow| {
+                r.status = JobStatus::Running;
+                r.substatus = Some(Substatus::Executing);
+            },
+        ] {
+            let mut other = r.clone();
+            change(&mut other);
+            assert!(!other.summary(None).waiting_for_earlier_prompt);
+            let json = serde_json::to_value(other.summary(None)).unwrap();
+            assert!(
+                json.get("waiting_for_earlier_prompt").is_none(),
+                "left out when false"
+            );
         }
     }
 
