@@ -124,7 +124,7 @@ TestCase {
         const mj = Math.round(span / 1000 * 412000)
         return {from: args.from, to: args.to, gpu_mj: Math.round(mj * 0.69), cpu_mj: Math.round(mj * 0.16),
                 system_mj: mj, measured: {gpu: true, cpu: true},
-                energy_cost: {amount: (mj / 3.6e9 * 0.31).toFixed(2), currency: "EUR"}}
+                energy_cost: {amount: (mj / 3.6e9 * 0.31).toFixed(6), currency: "EUR"}}
     }
 
     function test_grab_hardware_live() { // spec: APP-127, APP-129, APP-131, APP-132

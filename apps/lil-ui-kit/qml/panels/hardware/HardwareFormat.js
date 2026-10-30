@@ -71,11 +71,6 @@ function energy(mj) {
     return wh.toFixed(1) + " Wh"
 }
 
-// telemetry.energy's energy_cost: "0.42 EUR".
-function cost(c) {
-    return c ? c.amount + " " + c.currency : ""
-}
-
 // NVML's clock event reasons (telemetry.snapshot `gpu.throttle`) in words.
 const throttleNames = {
     gpu_idle: "Idle",

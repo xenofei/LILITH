@@ -580,12 +580,24 @@ TestCase {
         for (const c of callsTo(t.fake, "telemetry.energy"))
             t.fake.respond(c.id, {status: "ok", structured: {from: c.args.from, to: c.args.to,
                 gpu_mj: 0, cpu_mj: 0, system_mj: 0, measured: {gpu: false, cpu: false}}})
+        compare(named(t.panel, "systemPower").text, "unknown", "the headline is never 0 W (estimated) here")
         const table = named(t.panel, "energyTable")
         for (const p of ["session", "day", "month", "year"]) {
             const name = LilShim.accessibleOf(named(table, "energyRow:" + p)).name
             verify(/not measured on this PC/.test(name), p + ": " + name)
             verify(!/no data yet/.test(name), p + ": " + name)
         }
+        // The rest of the system set: an estimate again. A measured nothing stays a figure.
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:01.000Z", gpu: undefined,
+            system_power_mw: 10000,
+            system_parts: [{part: "gpu", mw: 0, measured: "unknown"}, {part: "cpu", mw: 0, measured: "unknown"},
+                           {part: "rest", mw: 9000, measured: "estimated"}]})})
+        compare(named(t.panel, "systemPower").text, "10 W (estimated)")
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:02.000Z",
+            system_power_mw: 0,
+            system_parts: [{part: "gpu", mw: 0, measured: "measured"}, {part: "cpu", mw: 0, measured: "unknown"},
+                           {part: "rest", mw: 0, measured: "unknown"}]})})
+        compare(named(t.panel, "systemPower").text, "0 W (estimated)")
         // Only the GPU can't be measured here: the CPU is, and today's row says which.
         const u = makePanel()
         answer(u.fake, "telemetry.snapshot", snapshot({gpu: undefined,
@@ -597,6 +609,121 @@ TestCase {
         const day = LilShim.accessibleOf(named(named(u.panel, "energyTable"), "energyRow:day")).name
         verify(/GPU not measured on this PC/.test(day), day)
         verify(/CPU 10 Wh/.test(day), day)
+    }
+
+    function test_cost_shows_through_money_text_and_says_it_is_estimated() { // spec: APP-120, APP-131
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        const calls = callsTo(t.fake, "telemetry.energy")
+        const measured = {gpu: true, cpu: true}
+        const answerPeriod = (i, e) => t.fake.respond(calls[i].id, {status: "ok", structured: Object.assign(
+            {from: calls[i].args.from, to: calls[i].args.to}, e)})
+        // The session: a rate is set and nothing is in the period yet. The rest: real costs.
+        answerPeriod(0, {gpu_mj: 0, cpu_mj: 0, system_mj: 0, measured: {gpu: false, cpu: false},
+                         energy_cost: {amount: "0", currency: "USD"}})
+        answerPeriod(1, {gpu_mj: 3600000, cpu_mj: 0, system_mj: 7200000, measured: measured,
+                         energy_cost: {amount: "0.031234", currency: "EUR"}})
+        answerPeriod(2, {gpu_mj: 3600000, cpu_mj: 0, system_mj: 7200000, measured: measured,
+                         energy_cost: {amount: "0.004", currency: "USD"}})
+        answerPeriod(3, {gpu_mj: 0, cpu_mj: 0, system_mj: 0, measured: measured,
+                         energy_cost: {amount: "0", currency: "USD"}})
+        const table = named(t.panel, "energyTable")
+        const row = p => named(table, "energyRow:" + p)
+        const cost = p => named(row(p), "energyCost")
+        const name = p => LilShim.accessibleOf(row(p)).name
+        compare(cost("session").text, "—", "a period with no figures has no cost")
+        verify(!/cost/.test(name("session")), name("session"))
+        compare(cost("day").text, "0.03 EUR (estimated)", "shown to the currency's minor unit")
+        verify(name("day").indexOf("cost 0.03 EUR (estimated)") >= 0, name("day"))
+        compare(cost("month").text, "< 0.01 USD (estimated)", "under one minor unit")
+        compare(cost("month").textFormat, Text.PlainText, "the \"<\" is never taken for markup")
+        verify(name("month").indexOf("cost < 0.01 USD (estimated)") >= 0, name("month"))
+        compare(cost("year").text, "0.00 USD (estimated)", "a measured nothing costs nothing")
+
+        // The label is never cut off, with the four columns and the longest figures.
+        const u = makePanel()
+        for (const c of callsTo(u.fake, "telemetry.energy"))
+            u.fake.respond(c.id, {status: "ok", structured: {from: c.args.from, to: c.args.to,
+                gpu_mj: 10709000000000, cpu_mj: 10709000000000, system_mj: 21418000000000,
+                measured: {gpu: false, cpu: false}, energy_cost: {amount: "1234567.89", currency: "USD"}}})
+        const day = named(named(u.panel, "energyTable"), "energyRow:day")
+        for (const name of ["energyGpu", "energyCpu", "energyCost"]) {
+            const cell = named(day, name)
+            verify(cell.text.indexOf("(estimated)") > 0, cell.text)
+            verify(!cell.truncated, name + " is cut off: " + cell.text + " in " + cell.width)
+        }
+    }
+
+    function test_a_job_with_no_energy_figures_shows_a_dash() { // spec: APP-131
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        const job = (id, gpu, system, measured) => ({job_id: id, workspace: "loose", from: "2026-10-28T11:00:00.000Z",
+            to: "2026-10-28T11:05:00.000Z", gpu_mj_gross: gpu, gpu_mj_above_idle: gpu, cpu_mj_gross: 0,
+            cpu_mj_above_idle: 0, system_mj: system, gpu_seconds_milli: 0, measured: measured})
+        answer(t.fake, "telemetry.jobs", {jobs: [job("j_none", 0, 0, {gpu: false, cpu: false}),
+                                                 job("j_zero", 0, 0, {gpu: true, cpu: true}),
+                                                 job("j_est", 3600000, 3600000, {gpu: false, cpu: true})]})
+        const table = named(t.panel, "energyTable")
+        const jobRow = id => named(table, "energyJob:" + id)
+        const line = id => named(jobRow(id), "energyJobText").text
+        compare(line("j_none"), "—", "no figures, not 0.0 Wh")
+        compare(LilShim.accessibleOf(jobRow("j_none")).name, "Job j_none: not measured")
+        verify(line("j_zero").indexOf("GPU 0.0 Wh above idle") >= 0, "a measured zero stays measured: " + line("j_zero"))
+        verify(line("j_est").indexOf("1.0 Wh (estimated)  ·  GPU 1.0 Wh (estimated) above idle") >= 0, line("j_est"))
+    }
+
+    function test_a_failed_energy_read_says_so_and_tries_again() { // spec: APP-131
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        const table = named(t.panel, "energyTable")
+        const notice = named(table, "energyNotice")
+        const row = p => named(table, "energyRow:" + p)
+        const failure = {status: "error", error: {code: "store.io", message: "<b>the read</b> failed"}}
+        verify(!notice.visible, "no notice before a failure")
+        const open = () => ({energy: callsTo(t.fake, "telemetry.energy").slice(-4),
+                             jobs: callsTo(t.fake, "telemetry.jobs").slice(-1)[0]})
+        const figures = {gpu_mj: 3600000, cpu_mj: 3600000, system_mj: 7200000, measured: {gpu: true, cpu: true}}
+        const answerAll = calls => {
+            for (const c of calls.energy)
+                t.fake.respond(c.id, {status: "ok", structured: Object.assign({from: c.args.from, to: c.args.to}, figures)})
+            t.fake.respond(calls.jobs.id, {status: "ok", structured: {jobs: [{job_id: "j_1", gpu_mj_above_idle: 3600000,
+                system_mj: 7200000, measured: {gpu: true, cpu: true}}]}})
+        }
+        // The first read fails: no "…" left behind.
+        let calls = open()
+        for (const c of calls.energy)
+            t.fake.respond(c.id, failure)
+        t.fake.respond(calls.jobs.id, failure)
+        verify(notice.visible, "a failed read says so")
+        compare(notice.textFormat, Text.PlainText)
+        verify(!shows(table, "…"), JSON.stringify(texts(table)))
+        compare(named(row("day"), "energySystem").text, "—")
+        verify(/can't be read/.test(LilShim.accessibleOf(row("day")).name), LilShim.accessibleOf(row("day")).name)
+        verify(!shows(table, "the read"), "the core's message isn't the notice")
+
+        // The minute's re-read goes on (shortened here); its answer takes the notice away.
+        table.refreshMs = 50
+        const before = callsTo(t.fake, "telemetry.energy").length
+        tryVerify(() => callsTo(t.fake, "telemetry.energy").length > before, 2000, "it reads again")
+        table.refreshMs = 60000
+        verify(notice.visible, "the notice stays until a read succeeds")
+        calls = open()
+        answerAll(calls)
+        verify(!notice.visible, "the figures are in")
+        compare(named(row("day"), "energySystem").text, "2.0 Wh")
+        verifyShows(table, "j_1", "the job")
+
+        // A later read fails: the old figures don't stay and look current.
+        table.reload()
+        calls = open()
+        compare(named(row("day"), "energySystem").text, "2.0 Wh", "they stay while the read is open")
+        t.fake.respond(calls.energy[1].id, failure)
+        verify(notice.visible, "one period failed")
+        compare(named(row("day"), "energySystem").text, "—", "its old figure is gone")
+        compare(named(row("day"), "energyGpu").text, "—")
+        verify(!shows(row("day"), "Wh"), JSON.stringify(texts(row("day"))))
+        t.fake.respond(calls.jobs.id, failure)
+        verify(!shows(table, "j_1"), "nor do the old jobs")
     }
 
     function test_a_hole_breaks_the_line_and_a_stopped_series_says_so() { // spec: APP-129

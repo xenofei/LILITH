@@ -18,7 +18,8 @@
 //   Rust).
 // - **No CPU temperature** (APP-128): Windows doesn't give it without a driver.
 // - A figure that isn't measured says so: "estimated" (the whole system always, and a part
-//   whose basis in `system_parts` is estimated), "unknown", "not reported", "not measured",
+//   whose basis in `system_parts` is estimated), "unknown" (the whole system too, when nothing
+//   can be measured and the core's 0 means none), "not reported", "not measured",
 //   "rest of system not set", or "last reading" for a GPU that was lost.
 // - Text from outside the panel (the GPU's and the disks' and adapters' names, the core's error
 //   messages, an unknown alert kind) is shown through Core.shownText (P4a-R8) and as plain text.
@@ -225,6 +226,13 @@ Rectangle {
                     .join("  ·  ")
     }
 
+    // The whole system: the core sends 0 for "none" when no part has a source.
+    function systemPowerText(s) {
+        if (s.system_power_mw <= 0 && s.system_parts.every(p => p.measured === "unknown"))
+            return "unknown"
+        return Format.watts(s.system_power_mw) + " (estimated)"
+    }
+
     function gpuPowerText(g) {
         if (g.power_mw <= 0 || basis("gpu") === "unknown")
             return "unknown"
@@ -331,7 +339,7 @@ Rectangle {
                 Text {
                     id: systemPower
                     objectName: "systemPower"
-                    text: root.snapshot ? Format.watts(root.snapshot.system_power_mw) + " (estimated)" : "…"
+                    text: root.snapshot ? root.systemPowerText(root.snapshot) : "…"
                     color: Theme.text
                     font.pixelSize: Theme.fontSize + 4
                     font.bold: true
