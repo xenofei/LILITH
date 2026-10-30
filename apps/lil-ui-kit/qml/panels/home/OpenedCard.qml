@@ -4,9 +4,10 @@
 // target to the Inspector instead; until Task 26 builds Home, the shell holds the card.
 //
 // It shows a target as text only: nothing is fetched, loaded or run from it (AI-222). Every
-// string from outside (the target, a `.lilref` title, a refusal) goes through the core's
-// shownText (P4a-R8), so control, bidi and zero-width characters are removed or marked, and is
-// shown as plain text. Its actions are Copy (the target's text to the clipboard) and Dismiss.
+// string from outside (the target, a `.lilref` title, a refusal) goes through shownLinkText
+// (P4a-R8, P4a-R9), so control, bidi and zero-width characters are removed or marked, what may be
+// a deny token is cut however it is spelled (a sealed ref's hash with it), and it is shown as
+// plain text. Its actions are Copy (the target as it came, to the clipboard) and Dismiss.
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
@@ -18,7 +19,7 @@ LCard {
     property string heading: "Opened"
     // The target as received (empty for a refusal), and how it is shown.
     property string targetText
-    // The target as shown (shownText, at most 300 characters).
+    // The target as shown (shownLinkText, at most 300 characters).
     readonly property string shownTarget: shown(targetText, 300)
     // "Open", "Edit" or "Use as input".
     property string intentText
@@ -45,9 +46,9 @@ LCard {
         visible = true
     }
 
-    // lil_parse::shown_text, from the bridge itself (whatever core the shell was given).
+    // lil_qt::args::shown_outside, from the bridge itself (whatever core the shell was given).
     function shown(text, max) {
-        return Core.shownText(String(text), max)
+        return Core.shownLinkText(String(text), max)
     }
 
     visible: false

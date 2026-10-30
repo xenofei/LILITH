@@ -471,6 +471,22 @@ fn not_a_link(arg: &str) -> String {
     )
 }
 
+/// `text` from a link, a `.lilref`, a target or a title, ready to be shown: as it came, unless
+/// [`cut_secrets`] finds something in its decoded and normalised form (M-18), and then that form,
+/// cut. So `100%25 done.png` still reads as written, and no spelling of a token gets through.
+fn without_secrets(text: &str) -> String {
+    let plain = normalised(&decoded(text));
+    let cut = cut_secrets(&plain);
+    if cut == plain { text.to_string() } else { cut }
+}
+
+/// Such a text as a card, a banner or a log shows it: [`without_secrets`], then at most
+/// `max_chars` of `lil_parse::shown_text` (P4a-R8, P4a-R9). `Core.shownLinkText` to the Opened
+/// card, which so cuts what reaches it however it came.
+pub fn shown_outside(text: &str, max_chars: usize) -> String {
+    lil_parse::shown_text(&without_secrets(text), max_chars)
+}
+
 /// The longest target, in UTF-8 bytes, as an `open/` link carries (Appendix G).
 const MAX_TARGET_BYTES: usize = 4096;
 
@@ -571,7 +587,7 @@ fn lilref(arg: &str) -> Result<Opened, String> {
     let parsed = lil_schema::parse_lilref(&text).map_err(|why| {
         format!(
             "This .lilref file isn't one LILITH opens: {}",
-            lil_parse::shown_text(&why, 200)
+            shown_outside(&why, 200)
         )
     })?;
     Ok(Opened::LilRef {
@@ -1000,9 +1016,9 @@ mod tests {
         assert!(p.smoke_exit && p.no_activate && p.refused.is_none());
     }
 
-    #[test] // spec: APP-020, P4a-R9
-    fn a_refused_link_never_shows_a_token_however_it_is_spelled() {
-        for rest in [
+    /// A deny token, every way it has been spelled to get past the cut.
+    fn token_spellings() -> Vec<String> {
+        vec![
             format!("lil-dev:DENY/{CF}/{TOKEN}"),
             format!("lil-dev:Deny%2F{CF}%2f{TOKEN}"),
             format!("lil-dev:deny%2f{CF}/{TOKEN}"),
@@ -1029,23 +1045,33 @@ mod tests {
             ),
             format!("lil-dev:open/x?t={}%C2%AD{}", &TOKEN[..16], &TOKEN[16..]),
             format!("lil-dev:open/x?t={}%E2%80%8B{}", &TOKEN[..16], &TOKEN[16..]),
-        ] {
+        ]
+    }
+
+    /// `message` shows nothing of the token.
+    fn assert_no_token(rest: &str, message: &str) {
+        let lower = message.to_ascii_lowercase();
+        // Not the token, nor any 20 of its characters in a row.
+        for start in 0..=12 {
+            assert!(
+                !lower.contains(&TOKEN[start..start + 20]),
+                "{rest}: {message}"
+            );
+        }
+        // Nor either half, however it was split (a marked U+200B between them included).
+        for half in [&TOKEN[..16], &TOKEN[16..]] {
+            assert!(!lower.contains(half), "{rest}: {message}");
+        }
+    }
+
+    #[test] // spec: APP-020, P4a-R9
+    fn a_refused_link_never_shows_a_token_however_it_is_spelled() {
+        for rest in token_spellings() {
             let p = plan(&format!("\"{rest}\""));
             let message = p
                 .link_refused
                 .unwrap_or_else(|| panic!("{rest}: not refused"));
-            let lower = message.to_ascii_lowercase();
-            // Not the token, nor any 20 of its characters in a row.
-            for start in 0..=12 {
-                assert!(
-                    !lower.contains(&TOKEN[start..start + 20]),
-                    "{rest}: {message}"
-                );
-            }
-            // Nor either half, however it was split (a marked U+200B between them included).
-            for half in [&TOKEN[..16], &TOKEN[16..]] {
-                assert!(!lower.contains(half), "{rest}: {message}");
-            }
+            assert_no_token(&rest, &message);
             if rest.contains(CF) {
                 assert!(message.contains(CF), "{rest}: the id stays: {message}");
             }
@@ -1095,6 +1121,69 @@ mod tests {
             plan_args(std::slice::from_ref(&short), &env(Channel::Dev)).args,
             [short]
         );
+    }
+
+    #[test] // spec: APP-021, P4a-R9
+    fn a_lilref_never_shows_a_token_however_it_is_spelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.lilref");
+        let open = |text: String| -> BootPlan {
+            std::fs::write(&file, text).unwrap();
+            plan(&format!("\"{}\"", file.display()))
+        };
+        let exact = format!("lil-dev:deny/{CF}/{TOKEN}");
+        for rest in std::iter::once(exact).chain(token_spellings()) {
+            let refused = |text: Value, what: &str| {
+                let p = open(text.to_string());
+                let message = p
+                    .link_refused
+                    .unwrap_or_else(|| panic!("{what} {rest}: not refused"));
+                assert_no_token(&rest, &message);
+            };
+            // Its ref, its version and a field of its own: parse_lilref repeats each.
+            refused(json!({"lilref": 1, "ref": rest}), "ref");
+            refused(json!({"lilref": rest, "ref": sealed()}), "version");
+            refused(
+                json!({"lilref": 1, "ref": sealed(), rest.clone(): 1}),
+                "field",
+            );
+        }
+    }
+
+    #[test] // spec: APP-020, APP-021, P4a-R9
+    fn a_target_or_a_title_as_shown_never_holds_a_token() {
+        for rest in token_spellings() {
+            assert_no_token(&rest, &shown_outside(&rest, 300));
+            // As a title, and a part of a path or an open/ target.
+            assert_no_token(&rest, &shown_outside(&format!("Paper crane {rest}"), 200));
+            assert_no_token(&rest, &shown_outside(&format!("C:\\art\\{rest}.png"), 300));
+        }
+        // An accepted open/ target and drive path reach the window's card through it.
+        for accepted in [
+            format!(r"C:\art\deny\{CF}\{TOKEN}.png"),
+            format!(r"C:\art\{TOKEN}.png"),
+        ] {
+            let opened = plan(&b64(&accepted)).opened;
+            assert_eq!(
+                opened,
+                Some(Opened::Target(accepted.clone())),
+                "kept as it came"
+            );
+            assert_no_token(&accepted, &shown_outside(&accepted, 300));
+            assert_eq!(
+                plan(&format!("\"{accepted}\"")).opened,
+                Some(Opened::Target(accepted.clone()))
+            );
+        }
+        // What has nothing to cut reads as it came, its % and all.
+        for plain in [
+            r"C:\art\100%25 done.png",
+            "Paper crane",
+            "deny",
+            "a deny of b",
+        ] {
+            assert_eq!(shown_outside(plain, 300), plain);
+        }
     }
 
     #[test] // spec: APP-020, QA-050
