@@ -231,6 +231,12 @@ impl qobject::LiveJobsModel {
     fn commit(mut self: Pin<&mut Self>, now_ms: f64) {
         let ops = self.as_mut().rust_mut().live.commit(ms(now_ms));
         self.as_mut().apply_ops(ops);
+        if let Some(listed) = self.live.capped() {
+            tracing::warn!(
+                listed,
+                "the queue read stopped at its page cap: the queued jobs after these aren't listed"
+            );
+        }
         if !self.loaded {
             self.as_mut().rust_mut().loaded = true;
             self.as_mut().loaded_changed();

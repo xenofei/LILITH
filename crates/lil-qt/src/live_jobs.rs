@@ -9,7 +9,8 @@
 //!   ([`LiveJobs::commit`]). Between reads each `jobs` event's job is applied as the full state it
 //!   is ([`LiveJobs::apply_job`]): a job that ended leaves, a running or queued job (or one of a
 //!   status this build doesn't know, P4a-R40) is added or updated; an event that comes while a
-//!   read is out wins over that read when it is as new.
+//!   read is out wins over that read when it is as new. A job of a status this build doesn't
+//!   know is in neither listing, so a read keeps it until an event ends it.
 //! - **Places** come only from the last queue read's entries, never from a job's own
 //!   `queue_position`, which is the place when its summary was made: a job the read lists without
 //!   one is held by a restart; one it doesn't list has no place yet.
@@ -25,6 +26,11 @@
 //! - **Changes** come as [`Op`]s, ranges where they can, that a list model applies in order with
 //!   its begin and end calls ([`apply`] is the same change on a plain list): a job starting is one
 //!   move, not a reset, so a row keeps its delegate.
+//! - **A read cut at [`MAX_PAGES`]** lists that many pages and says so ([`LiveJobs::capped`]): a
+//!   guard against a cursor that never ends.
+//! - **Cost:** every read, event and tick sorts, works out and compares all the live rows, so it
+//!   grows linearly with them: about 0.6 to 0.8 ms at 300, and about 15 to 18 ms at 3,000, past a
+//!   frame; the panel's bench (`bench_jobs_panel`) holds the 300-job case to its bounds.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -90,6 +96,8 @@ struct Read {
     events: HashMap<String, Value>,
     lanes: Option<Value>,
     pages: u32,
+    /// It stopped at [`MAX_PAGES`] with a cursor still to follow.
+    capped: bool,
 }
 
 /// The live rows (module docs).
@@ -101,6 +109,7 @@ pub struct LiveJobs {
     places: HashMap<String, Option<u32>>,
     read: Option<Read>,
     lanes: Vec<Value>,
+    capped: Option<usize>,
 }
 
 fn text<'a>(job: &'a Value, key: &str) -> &'a str {
@@ -245,10 +254,15 @@ impl LiveJobs {
                 read.queue.push(job.clone());
             }
         }
-        page.get("next_cursor")
+        let next = page
+            .get("next_cursor")
             .and_then(Value::as_str)
-            .filter(|c| !c.is_empty() && read.pages < MAX_PAGES)
-            .map(str::to_string)
+            .filter(|c| !c.is_empty());
+        if next.is_some() && read.pages >= MAX_PAGES {
+            read.capped = true;
+            return None;
+        }
+        next.map(str::to_string)
     }
 
     /// The read's `jobs.list {status: "running"}` result.
@@ -281,6 +295,14 @@ impl LiveJobs {
                 jobs.insert(id, job);
             }
         }
+        // A job of a status this build doesn't know is in neither listing: it stays until an
+        // event ends it (P4a-R40), never dropped by a read.
+        for (id, job) in &self.jobs {
+            let status = text(job, "status");
+            if status != "queued" && status != "running" && !jobs.contains_key(id) {
+                jobs.insert(id.clone(), job.clone());
+            }
+        }
         for (id, job) in read.events {
             if ended(&job) {
                 jobs.remove(&id);
@@ -288,6 +310,7 @@ impl LiveJobs {
                 jobs.insert(id, Arc::new(job));
             }
         }
+        self.capped = read.capped.then_some(read.queue.len());
         self.rank.clear();
         self.places.clear();
         for (i, job) in read.queue.iter().enumerate() {
@@ -327,6 +350,12 @@ impl LiveJobs {
         self.refresh(now_ms)
     }
 
+    /// How many queued jobs the last read listed when it stopped at [`MAX_PAGES`] with more to
+    /// come; `None` when it listed them all.
+    pub fn capped(&self) -> Option<usize> {
+        self.capped
+    }
+
     /// Whether `id` is a live row.
     pub fn contains(&self, id: &str) -> bool {
         self.jobs.contains_key(id)
@@ -339,7 +368,8 @@ impl LiveJobs {
 
     /// What the lane headers and the panel's own controls need: `{lanes}` (as
     /// [`LiveJobs::row_lanes`]), `{waiting_for_vram}` (the lanes with a queued job waiting for
-    /// GPU memory) and `{mine}` (the live jobs `app`'s panels started).
+    /// GPU memory), `{mine}` (the live jobs `app`'s panels started) and `{capped}` (as
+    /// [`LiveJobs::capped`], or null).
     pub fn overview(&self, app: &str) -> Value {
         let mut vram: Vec<String> = Vec::new();
         let mut mine = 0_u32;
@@ -359,7 +389,8 @@ impl LiveJobs {
                 mine += 1;
             }
         }
-        serde_json::json!({"lanes": self.row_lanes(), "waiting_for_vram": vram, "mine": mine})
+        serde_json::json!({"lanes": self.row_lanes(), "waiting_for_vram": vram, "mine": mine,
+                           "capped": self.capped})
     }
 
     /// The clock moved on: the rows whose times read differently.
@@ -879,6 +910,50 @@ mod tests {
                 .filter(|o| matches!(o, Op::Move { .. }))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test] // spec: APP-114
+    fn a_job_of_an_unknown_status_stays_through_reads_until_it_ends() {
+        let mut live = LiveJobs::new();
+        read(&mut live, &[], &[vec![queued("q", Some(0), None)]]);
+        let mut odd = job("odd", "paused_by_director", "waiting_quota", "gpu-heavy");
+        live.apply_job(odd.clone(), NOW);
+        // No read can list it: several reads keep it.
+        for _ in 0..3 {
+            read(&mut live, &[], &[vec![queued("q", Some(0), None)]]);
+            assert_eq!(ids(&live), ["q", "odd"]);
+        }
+        // An event that ends it does.
+        odd["status"] = json!("cancelled");
+        odd["updated"] = json!(at(0));
+        live.apply_job(odd, NOW);
+        read(&mut live, &[], &[vec![queued("q", Some(0), None)]]);
+        assert_eq!(ids(&live), ["q"]);
+        // A queued or running job the reads no longer list goes (it ended or moved scope).
+        read(&mut live, &[], &[vec![]]);
+        assert!(live.rows().is_empty());
+    }
+
+    #[test] // spec: APP-114
+    fn a_read_cut_at_the_page_cap_says_how_many_it_lists() {
+        let mut live = LiveJobs::new();
+        live.begin_read();
+        live.set_running(&page(&[], None));
+        for i in 0..MAX_PAGES {
+            let next = live.add_queue_page(&page(
+                &[queued(&format!("q{i:04}"), Some(i), None)],
+                Some("more"),
+            ));
+            assert_eq!(next.is_some(), i + 1 < MAX_PAGES, "page {i}");
+        }
+        live.commit(NOW);
+        assert_eq!(live.rows().len(), MAX_PAGES as usize);
+        assert_eq!(live.capped(), Some(MAX_PAGES as usize));
+        assert_eq!(live.overview("image")["capped"], json!(MAX_PAGES));
+        // A read that ends on its own isn't cut.
+        read(&mut live, &[], &[vec![queued("a", Some(0), None)]]);
+        assert_eq!(live.capped(), None);
+        assert_eq!(live.overview("image")["capped"], Value::Null);
     }
 
     #[test] // spec: APP-114
