@@ -61,6 +61,7 @@ Rectangle {
 
         Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: root.panel.laneLabel(root.lane)
             color: Theme.text
             font.pixelSize: Theme.fontSize + 1
@@ -73,6 +74,7 @@ Rectangle {
             Text {
                 required property string modelData
                 width: column.width
+                textFormat: Text.PlainText
                 text: modelData
                 color: modelData.startsWith("Paused") || modelData.startsWith("Waiting") ? Theme.warning : Theme.textMuted
                 font.pixelSize: Theme.fontSize

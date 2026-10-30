@@ -79,4 +79,20 @@ TestCase {
         compare(estimateCalls(core).length, 0, "no call without a tool")
         compare(chip.Accessible.name, "Estimate: no estimate yet")
     }
+
+    // Its currency comes from outside: markup shows as written, and an <img> in it loads nothing.
+    function test_untrusted_currency_shows_literally_and_loads_nothing() { // spec: APP-140, AI-222
+        const before = TestFiles.networkRequests()
+        const core = createTemporaryObject(fakeComponent, tc)
+        const currency = '<b>x</b><img src="http://127.0.0.1:9/probe.png" width="40" height="40">' + "y".repeat(200)
+        const chip = createTemporaryObject(chipComponent, tc, {core: core, estimate: {
+            money: {source: "prices_yaml", p50: "0.04", p90: "0.05", upper_bound: "0.06", currency: currency},
+            unknown: []}})
+        const label = chip.children[0]
+        compare(label.textFormat, Text.PlainText)
+        verify(label.text.toLowerCase().indexOf("<b>x</b>") >= 0, label.text)
+        verify(label.text.length <= 80, "through shownText: " + label.text.length)
+        wait(300)
+        compare(TestFiles.networkRequests(), before, "no <img> was loaded")
+    }
 }

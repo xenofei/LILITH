@@ -653,6 +653,68 @@ TestCase {
         wait(100)
     }
 
+    // --- Untrusted text (audit finding 4; AI-222). ---
+
+    // Every Text under `item`, shown or not, base controls' included.
+    function allTexts(item, out) {
+        const found = out || []
+        if (typeof item.text === "string" && item.textFormat !== undefined)
+            found.push(item)
+        for (let i = 0; i < item.children.length; ++i)
+            allTexts(item.children[i], found)
+        return found
+    }
+
+    function test_untrusted_text_shows_literally_and_loads_nothing() { // spec: APP-114, AI-222
+        const before = TestFiles.networkRequests()
+        const img = '<img src="http://127.0.0.1:9/probe.png" width="40" height="40">'
+        // Long enough that a path around shownText shows in the length.
+        const bad = name => "<b>" + name + "</b>" + img + "x".repeat(2000)
+        const err = extra => Object.assign({code: "x.y", category: "internal", message: bad("message"), trace_id: "t",
+                                            retry: "after_resolve",
+                                            fix: {user_hint: bad("hint"), ui_action: {id: "retry_job", label: bad("fixlabel")}}},
+                                           extra || {})
+        const failed = job("f1", {status: "failed", substatus: null, finished: iso(1000), kind: bad("kind"),
+                                  origin: {surface: bad("surface")}, priority: bad("priority"), lane: bad("lane"),
+                                  error: err()})
+        const shown = job("f2", {status: "failed", substatus: null, finished: iso(1000),
+                                 origin: {surface: "panel", id: bad("app")},
+                                 error: err({fix: {ui_action: {id: bad("action"), label: bad("otherlabel")}}})})
+        const showJob = job("f3", {status: "failed", substatus: null, finished: iso(1000),
+                                   error: err({fix: {ui_action: {id: "show_job", label: bad("showlabel")}}})})
+        const running = job("r1", {substatus: bad("runsub"), phase: bad("phase"), lane: "cpu"})
+        const unknown = job("r2", {substatus: "interrupted_unknown", error: err({message: bad("unknownmsg")})})
+        const held = queued("q1", 0, {substatus: "queue_paused", pause_reasons: [bad("reason")]})
+        const waits = queued("q2", 1, {substatus: bad("waitsub")})
+        const odd = job("o1", {status: bad("status"), substatus: bad("oddsub"), created: iso(1000)})
+        const t = load({jobs: [failed, shown, showJob, odd], running: [running, unknown], queue: [held, waits],
+                        lanes: [lane({paused: true, reasons: [bad("lanereason")], held: 1})]})
+        // Tall enough to make every row, whatever their text's length.
+        t.window.height = 8000
+        for (const id of ["f1", "f2", "f3", "r1", "r2", "q1", "q2"])
+            row(t.panel, id)
+        tryVerify(() => liveOrder(t.panel).indexOf("o1") >= 0, 2000)
+        row(t.panel, "o1")
+        // A refusal's message in the banner.
+        button(row(t.panel, "q1"), "Run next").click()
+        answer(t.core, c => c.name === "job.move", {status: "error", error: err({message: bad("refusal")})})
+        tryVerify(() => t.panel.banner.visible, 2000)
+        wait(500)
+        compare(TestFiles.networkRequests(), before, "no <img> was loaded")
+        // Every Text is plain, and none shows the whole of what came.
+        const all = allTexts(t.panel)
+        verify(all.length > 20, "the walk found the texts: " + all.length)
+        for (const text of all) {
+            compare(text.textFormat, Text.PlainText, String(text) + ": " + text.text.slice(0, 60))
+            verify(!/x{401}/.test(text.text), "through shownText: " + text.text.slice(0, 60))
+        }
+        const shows = marker => all.some(text => text.text.indexOf("<b>" + marker + "</b>") >= 0)
+        for (const marker of ["kind", "surface", "priority", "lane", "message", "hint", "fixlabel", "app", "otherlabel",
+                              "showlabel", "runsub", "phase", "unknownmsg", "reason", "waitsub", "status", "oddsub",
+                              "lanereason", "refusal"])
+            verify(shows(marker), marker + " is shown as written")
+    }
+
     // --- A burst of `jobs` events (audit finding 9). ---
 
     function test_a_burst_of_events_is_one_pass() { // spec: APP-114, APP-139

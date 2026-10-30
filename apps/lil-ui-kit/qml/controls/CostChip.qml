@@ -8,7 +8,8 @@
 // With `tool` set, it asks `job.estimate {tool, args}` once, `debounceMs` (300 ms) after the last
 // change of `tool` or `args`; an answer to an older call is dropped, and a failed call reads as
 // no estimate. Without `tool` it shows `estimate`. `caps` is a `caps.get` result, for the share
-// of the monthly cap a `money` part is; the panel that shows the chip keeps it current.
+// of the monthly cap a `money` part is; the panel that shows the chip keeps it current. A money
+// part's currency comes from outside: the text goes through `core.shownText` (P4a-R8) and is plain.
 // Role StaticText, named "Estimate: <text>".
 import QtQuick
 import Lilith.Core
@@ -29,7 +30,8 @@ Rectangle {
     readonly property string text: {
         const json = JSON.stringify(shown || null)
         const share = caps ? JobText.capSharePermille(json, JSON.stringify(caps)) : -1
-        return JobText.chipText(json, share)
+        const chip = JobText.chipText(json, share)
+        return core ? core.shownText(chip, 80) : chip
     }
 
     property var _fetched: null
@@ -87,6 +89,7 @@ Rectangle {
     Text {
         id: label
         anchors.centerIn: parent
+        textFormat: Text.PlainText
         text: root.text
         color: Theme.text
         font.pixelSize: Theme.fontSize - 1

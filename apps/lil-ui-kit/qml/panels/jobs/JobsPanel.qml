@@ -89,6 +89,10 @@ Rectangle {
         return out
     }
 
+    // How much of each kind of outside text is shown (Core.shownText).
+    readonly property int nameChars: 60
+    readonly property int messageChars: 300
+
     property var _pendingLanes: ({})
     // The `jobs` events' jobs waiting for this frame's pass.
     property var _pendingJobs: []
@@ -107,44 +111,59 @@ Rectangle {
 
     // --- Words for what the core names (an unknown name shows as it is, P4a-R40). ---
 
+    // Outside text as shown (Core.shownText, P4a-R8): at most `maxChars`, a name's length by default.
+    function shown(text, maxChars) {
+        return core && text !== undefined && text !== null ? core.shownText(String(text), maxChars || nameChars) : ""
+    }
+
+    // `name`'s word in `known`, or the name itself as shown. `name` comes from outside.
+    function word(known, name) {
+        return Object.prototype.hasOwnProperty.call(known, name) ? known[name] : shown(name)
+    }
+
+    // A count with its thousands marked.
+    function grouped(n) {
+        return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+    }
+
     function kindLabel(kind) {
         const known = {"comfy.prompt": "ComfyUI prompt", "comfy.inventory": "ComfyUI inventory",
                        "comfy.install_node": "Node pack install", "test.job": "Test job",
                        "assistant_task": "Director task"}
-        return known[kind] || kind || "Job"
+        return kind ? word(known, kind) : "Job"
     }
 
     function originLabel(origin) {
         if (!origin || !origin.surface)
             return ""
         switch (origin.surface) {
-        case "panel": return origin.id ? "from the " + origin.id + " app" : "from a panel"
+        case "panel": return origin.id ? "from the " + shown(origin.id) + " app" : "from a panel"
         case "mcp": return "from Claude Code"
         case "agent_session": return "from the assistant"
         case "cli": return "from the command line"
         case "core": return "from LILITH"
-        default: return "from " + origin.surface
+        default: return "from " + shown(origin.surface)
         }
     }
 
     // The class, when it isn't your own generations' (`user`).
     function classLabel(priority) {
         const known = {user: "", interactive: "interactive", agent: "agent batch", live: "live"}
-        return priority in known ? known[priority] : (priority || "")
+        return priority ? word(known, priority) : ""
     }
 
     // A held job's reason.
     function reasonLabel(reason) {
         const known = {manual: "Paused by you", fullscreen: "Paused while fullscreen",
                        restart: "Held after a restart"}
-        return known[reason] || reason
+        return word(known, reason)
     }
 
     // A lane's pause: "Paused by you", "Paused while fullscreen", "Paused by you and while
     // fullscreen", an unknown reason by its name.
     function pausedLabel(reasons) {
         const parts = (reasons || []).map(r => r === "manual" ? "by you"
-                                               : r === "fullscreen" ? "while fullscreen" : "by " + r)
+                                               : r === "fullscreen" ? "while fullscreen" : "by " + shown(r))
         if (parts.length === 0)
             return "Paused"
         const last = parts.pop()
@@ -152,14 +171,14 @@ Rectangle {
     }
 
     function laneLabel(lane) {
-        return lane === "gpu-heavy" ? "GPU work" : lane === "cpu" ? "CPU work" : lane
+        return lane === "gpu-heavy" ? "GPU work" : lane === "cpu" ? "CPU work" : shown(lane)
     }
 
     function phaseLabel(phase) {
         const known = {loading_models: "Loading models", encoding: "Encoding", sampling: "Sampling",
                        decoding: "Decoding", saving: "Saving", ingesting: "Bringing in the outputs",
                        other: "Working"}
-        return known[phase] || phase
+        return word(known, phase)
     }
 
     // A running job's substatus: nothing for `executing`, else its words or its name.
@@ -171,7 +190,7 @@ Rectangle {
             return "Retrying (" + retrying[1] + " of " + retrying[2] + ")"
         const known = {cancelling: "Cancelling", interrupted_unknown: "Outcome unknown",
                        ingesting: "Bringing in the outputs"}
-        return known[substatus] || substatus
+        return word(known, substatus)
     }
 
     // --- Rows. ---
@@ -225,7 +244,8 @@ Rectangle {
 
     function failed(what, error) {
         banner.kind = "danger"
-        banner.show(what + ": " + (error && error.message ? error.message : "the core didn't answer."))
+        banner.show(what + ": " + (error && error.message ? shown(error.message, messageChars)
+                                                          : "the core didn't answer."))
     }
 
     function callTool(tool, args, what, onOk) {
@@ -696,8 +716,8 @@ Rectangle {
                     width: parent.width
                     leftPadding: Theme.spacing
                     wrapMode: Text.Wrap
-                    text: "Showing the first " + String(root.capped).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
-                          + " queued jobs"
+                    textFormat: Text.PlainText
+                    text: "Showing the first " + root.grouped(root.capped) + " queued jobs"
                     color: Theme.warning
                     font.pixelSize: Theme.fontSize
                     Component.onCompleted: root.cappedNote = cappedText
@@ -709,6 +729,7 @@ Rectangle {
                     width: parent.width
                     horizontalAlignment: Text.AlignHCenter
                     wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
                     text: "Nothing is running or queued."
                     color: Theme.textMuted
                     font.pixelSize: Theme.fontSize

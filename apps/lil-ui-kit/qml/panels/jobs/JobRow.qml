@@ -20,7 +20,8 @@
 //   and its fix (`retry_job`: the Retry button, labelled by the fix, with the cost and time chip
 //   from the job's own estimate; `show_job`: "Show the job", which selects it; any other: its
 //   label, which does nothing), or cancelled, with Retry.
-// - Jobs of a batch with more than one live job get "Cancel batch".
+// - Jobs of a batch with more than one live job get "Cancel batch (<the live jobs>)".
+// Everything from outside goes through the panel's `shown` (P4a-R8), and every Text is plain.
 // Role ListItem, named "<what>, <status>" without the figures that tick (those are its
 // description); a tap selects it.
 import QtQuick
@@ -89,7 +90,7 @@ Rectangle {
             parts.push("Running")
             parts.push(panel.runningLabel(substatus))
             if (outcomeUnknown && error && error.message)
-                parts.push(error.message)
+                parts.push(panel.shown(error.message, panel.messageChars))
             if (model.phase && !outcomeUnknown)
                 parts.push(panel.phaseLabel(model.phase))
             if (progress && progress.max > 0 && !outcomeUnknown)
@@ -114,17 +115,18 @@ Rectangle {
         } else if (status === "failed") {
             parts.push("Failed")
             if (error && error.message)
-                parts.push(error.message)
+                parts.push(panel.shown(error.message, panel.messageChars))
             if (error && error.fix && error.fix.user_hint)
-                parts.push(error.fix.user_hint)
+                parts.push(panel.shown(error.fix.user_hint, panel.messageChars))
             if (fixAction && fixAction.id !== "retry_job" && fixAction.id !== "show_job")
-                parts.push(fixAction.label)
+                parts.push(panel.shown(fixAction.label))
         } else if (status === "cancelled") {
             parts.push("Cancelled")
         } else {
             // A status this build doesn't know, by its name (P4a-R40).
-            parts.push(status)
-            parts.push(substatus)
+            parts.push(panel.shown(status))
+            if (substatus !== "")
+                parts.push(panel.shown(substatus))
         }
         return parts.filter(p => p !== "").join(" · ")
     }
@@ -160,7 +162,7 @@ Rectangle {
             return model.waiting_for_earlier_prompt ? "Waiting for an earlier ComfyUI prompt to finish"
                                                     : "Submitting"
         default:
-            return substatus
+            return substatus === "" ? "" : panel.shown(substatus)
         }
     }
 
@@ -261,6 +263,7 @@ Rectangle {
 
         Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: root.titleText
             color: Theme.text
             font.pixelSize: Theme.fontSize
@@ -270,6 +273,7 @@ Rectangle {
 
         Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: root.statusText
             color: root.status === "failed" ? Theme.danger : Theme.textMuted
             font.pixelSize: Theme.fontSize
@@ -343,19 +347,21 @@ Rectangle {
                 }
                 LButton {
                     visible: root.retryable
-                    text: root.fixAction && root.fixAction.id === "retry_job" ? root.fixAction.label : "Retry"
+                    text: root.fixAction && root.fixAction.id === "retry_job" ? root.panel.shown(root.fixAction.label)
+                                                                              : "Retry"
                     enabled: root.panel.writable
                     onClicked: root.panel.retryJob(root.jobId)
                 }
                 CostChip {
                     id: chip
                     visible: root.retryable
+                    core: root.panel.core
                     estimate: root.model.estimate || null
                     caps: root.panel.caps
                 }
                 LButton {
                     visible: !!root.fixAction && root.fixAction.id === "show_job"
-                    text: root.fixAction ? root.fixAction.label : ""
+                    text: root.fixAction ? root.panel.shown(root.fixAction.label) : ""
                     onClicked: root.panel.showJob(root.jobId)
                 }
             }
