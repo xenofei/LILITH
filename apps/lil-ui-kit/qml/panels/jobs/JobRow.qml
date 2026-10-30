@@ -11,9 +11,10 @@
 //   applied at most 10 times a second (leading edge: the first at once, then the newest waiting
 //   one every 100 ms); a status event of the job drops the waiting one.
 // - **Queued:** why it waits (a held job names its reasons, "Held after a restart" among them;
-//   "Waiting for GPU memory"; a retry waiting on the earlier ComfyUI prompt it inherited, as the
-//   core says), its place from the queue read ("#3 in queue"; a job a restart holds has none),
-//   its ETA, Run next, Run last and Cancel.
+//   "Waiting for GPU memory"; a job the core has dispatched, which has no place: "Submitting", "In
+//   ComfyUI's queue", or a retry waiting on the earlier ComfyUI prompt it inherited, as the core
+//   says), its place from the queue read ("#3 in queue"; a job a restart holds has none), its ETA,
+//   Run next, Run last and Cancel.
 // - **A status this build doesn't know:** its name and substatus, with the live ones, and Cancel.
 // - **Ended:** done (and "Nothing changed" when every node was cached), failed with its message
 //   and its fix (`retry_job`: the Retry button, labelled by the fix, with the cost and time chip

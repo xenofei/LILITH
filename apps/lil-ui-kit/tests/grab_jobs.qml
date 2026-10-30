@@ -85,6 +85,8 @@ TestCase {
                ok({jobs: jobs, next_cursor: null, lanes: lanes}))
         answer(core, c => c.name === "jobs.list" && c.args.status === "running",
                ok({jobs: jobs.filter(j => j.status === "running"), next_cursor: null, lanes: lanes}))
+        answer(core, c => c.name === "jobs.list" && c.args.status === "queued",
+               ok({jobs: jobs.filter(j => j.status === "queued"), next_cursor: null, lanes: lanes}))
         answer(core, c => c.name === "jobs.list" && c.args.order === "queue",
                ok({jobs: queue, next_cursor: null, lanes: lanes}))
         answer(core, c => c.name === "engines.status",

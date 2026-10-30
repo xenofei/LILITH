@@ -3,7 +3,9 @@
 // tick with 100 live rows costs at most 2 ms. Each piece of GUI-thread work is timed on its own:
 // each page's answer, handled as Core's arrive (FakeCore's own JSON of the page included), and
 // the list's layout that the next frame does (forced at once). The row controls come later, made
-// off the frame's critical path. The numbers are printed as `bench:` lines.
+// off the frame's critical path. And a burst of 300 `jobs` events over 3,000 live jobs (a batch
+// being cancelled) is one pass over them, and holds the GUI thread no longer than the bound below.
+// The numbers are printed as `bench:` lines.
 import QtQuick
 import QtTest
 import Lilith.UiKit
@@ -94,6 +96,18 @@ TestCase {
         timed(open(t.core, c => c.name === "jobs.list" && c.args.status === "running"),
               {jobs: run, next_cursor: null, lanes: lanes()})
         let layout = 0
+        // The `{status: "queued"}` read's pages (the queue again, as the real core's), then the
+        // queue's, whose last one commits the read.
+        let cursor = null
+        do {
+            const asked = open(t.core, c => c.name === "jobs.list" && c.args.status === "queued")
+            const outcome = t.core.jobsListAnswer(asked.args, queue, lanes())
+            cursor = outcome.structured.next_cursor
+            const start = Date.now()
+            t.core.respond(asked.id, outcome)
+            slowest = Math.max(slowest, Date.now() - start)
+            wait(20)
+        } while (cursor)
         for (let at = 0; at < queue.length; at += 100) {
             const more = at + 100 < queue.length
             const call = open(t.core, c => c.name === "jobs.list" && c.args.order === "queue")
@@ -162,4 +176,48 @@ TestCase {
                     + slowest + " ms")
         verify(slowest <= 2, "a tick took " + slowest + " ms")
     }
+
+    // The longest the GUI thread went without running a timer.
+    Timer {
+        id: beat
+        interval: 1
+        repeat: true
+        property real last: 0
+        property real longest: 0
+        onTriggered: {
+            const now = Date.now()
+            longest = Math.max(longest, now - last)
+            last = now
+        }
+    }
+
+    function test_a_burst_of_300_events_over_3000_jobs_keeps_the_window_alive() { // spec: APP-139
+        failOnWarning(/DelegateModel::cancel/)
+        const t = loaded(3000)
+        const read = answerLive(t, [running("r0")], t.queue)
+        tryVerify(() => t.panel.live.count === 3001, 20000)
+        wait(300)
+        beat.longest = 0
+        beat.last = Date.now()
+        beat.start()
+        const start = Date.now()
+        // The first 300 of a batch being cancelled, the rows on screen among them.
+        for (let i = 0; i < 300; ++i)
+            t.core.emit("jobs", "event", {kind: "job", job: job("q" + (10000 + i),
+                                                                {status: "cancelled", substatus: null, finished: iso(),
+                                                                 updated: iso()})})
+        const emitted = Date.now() - start
+        tryVerify(() => t.panel.live.count === 2701, 60000)
+        const applied = Date.now() - start
+        wait(100)
+        beat.stop()
+        console.log("bench: 300 events over 3,000 jobs: events handled in " + emitted + " ms, applied by " + applied
+                    + " ms; the GUI thread's longest hold " + beat.longest + " ms; a read of them: longest answer "
+                    + read.answer + " ms, layout " + read.layout + " ms")
+        verify(beat.longest <= burstHoldMs, "the GUI thread held " + beat.longest + " ms")
+    }
+
+    // A hold a window's user doesn't feel as a freeze, and about twice what this PC measures (36 to
+    // 56 ms; 10.4 s with one sort and one set of model changes per event).
+    readonly property int burstHoldMs: 100
 }

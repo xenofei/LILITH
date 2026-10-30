@@ -4,12 +4,13 @@
 //!
 //! The panel makes the calls and hands over the raw result JSON, never parsed in QML:
 //! - `beginRead(fresh)` (`fresh` after a snapshot or a `resync_required`: nothing is carried
-//!   over), then `setRunning(resultJson)` for `jobs.list {status: "running"}` and
-//!   `addQueuePage(resultJson)` for each `jobs.list {order: "queue"}` page (it returns the next
-//!   page's cursor, empty when the read has them all), then `commit(nowMs)`;
-//! - `applyJob(jobJson, nowMs)` for each `jobs` event's job: 0 when it is no live row, 1 when it
-//!   is one and its status stayed, 2 when it came, went or changed status (the queue order may
-//!   have changed);
+//!   over), then `addRunningPage(resultJson)` for each `jobs.list {status: "running"}` page,
+//!   `addQueuePage(resultJson)` for each `jobs.list {order: "queue"}` page and
+//!   `addQueuedPage(resultJson)` for each `jobs.list {status: "queued"}` page (each returns the
+//!   next page's cursor, empty when the read has them all), then `commit(nowMs)`;
+//! - `applyJobs(jobsJson, nowMs)` for a JSON array of `jobs` events' jobs, in one pass with one
+//!   set of model changes: 0 when none is or was a live row, 1 when one is and the queue stayed,
+//!   2 when the queue may have changed ([`JobChange`]); `applyJob(jobJson, nowMs)` for one;
 //! - `tick(nowMs)`: the clock, which updates only the rows whose times read differently.
 //!
 //! `lanesJson()` is the read's `lanes` (`QueueState`s) as JSON, `overview(app)`
@@ -25,7 +26,7 @@ use cxx_qt_lib::{QByteArray, QModelIndex, QString, QVariant};
 use serde_json::Value;
 
 use super::core_object::qobject::json_variant;
-use crate::live_jobs::{LiveJobs, LiveRow, Op, apply};
+use crate::live_jobs::{JobChange, LiveJobs, LiveRow, Op, apply};
 
 /// `Qt::UserRole`: the first role.
 const USER_ROLE: i32 = 0x0100;
@@ -99,11 +100,15 @@ pub mod qobject {
         #[qinvokable]
         fn add_queue_page(self: Pin<&mut LiveJobsModel>, result_json: &QString) -> QString;
         #[qinvokable]
-        fn set_running(self: Pin<&mut LiveJobsModel>, result_json: &QString);
+        fn add_running_page(self: Pin<&mut LiveJobsModel>, result_json: &QString) -> QString;
+        #[qinvokable]
+        fn add_queued_page(self: Pin<&mut LiveJobsModel>, result_json: &QString) -> QString;
         #[qinvokable]
         fn commit(self: Pin<&mut LiveJobsModel>, now_ms: f64);
         #[qinvokable]
         fn apply_job(self: Pin<&mut LiveJobsModel>, job_json: &QString, now_ms: f64) -> i32;
+        #[qinvokable]
+        fn apply_jobs(self: Pin<&mut LiveJobsModel>, jobs_json: &QString, now_ms: f64) -> i32;
         #[qinvokable]
         fn tick(self: Pin<&mut LiveJobsModel>, now_ms: f64);
         #[qinvokable]
@@ -229,9 +234,16 @@ impl qobject::LiveJobsModel {
         QString::from(next.unwrap_or_default().as_str())
     }
 
-    fn set_running(mut self: Pin<&mut Self>, result_json: &QString) {
-        let result = parse(result_json);
-        self.as_mut().rust_mut().live.set_running(&result);
+    fn add_running_page(mut self: Pin<&mut Self>, result_json: &QString) -> QString {
+        let page = parse(result_json);
+        let next = self.as_mut().rust_mut().live.add_running_page(&page);
+        QString::from(next.unwrap_or_default().as_str())
+    }
+
+    fn add_queued_page(mut self: Pin<&mut Self>, result_json: &QString) -> QString {
+        let page = parse(result_json);
+        let next = self.as_mut().rust_mut().live.add_queued_page(&page);
+        QString::from(next.unwrap_or_default().as_str())
     }
 
     fn commit(mut self: Pin<&mut Self>, now_ms: f64) {
@@ -249,21 +261,25 @@ impl qobject::LiveJobsModel {
         }
     }
 
-    fn apply_job(mut self: Pin<&mut Self>, job_json: &QString, now_ms: f64) -> i32 {
-        let job = parse(job_json);
-        let id = job
-            .get("job_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let before = self.live.status_of(&id);
-        let ops = self.as_mut().rust_mut().live.apply_job(job, ms(now_ms));
-        self.as_mut().apply_ops(ops);
-        let after = self.live.status_of(&id);
-        match (before, after) {
-            (None, None) => 0,
-            (b, a) if b == a => 1,
-            _ => 2,
+    fn apply_job(self: Pin<&mut Self>, job_json: &QString, now_ms: f64) -> i32 {
+        self.apply_values(vec![parse(job_json)], now_ms)
+    }
+
+    fn apply_jobs(self: Pin<&mut Self>, jobs_json: &QString, now_ms: f64) -> i32 {
+        let jobs = match parse(jobs_json) {
+            Value::Array(jobs) => jobs,
+            _ => Vec::new(),
+        };
+        self.apply_values(jobs, now_ms)
+    }
+
+    fn apply_values(mut self: Pin<&mut Self>, jobs: Vec<Value>, now_ms: f64) -> i32 {
+        let applied = self.as_mut().rust_mut().live.apply_jobs(jobs, ms(now_ms));
+        self.as_mut().apply_ops(applied.ops);
+        match applied.change {
+            JobChange::None => 0,
+            JobChange::Shown => 1,
+            JobChange::ReadAgain => 2,
         }
     }
 

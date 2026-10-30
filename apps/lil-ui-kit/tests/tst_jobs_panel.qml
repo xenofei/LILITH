@@ -3,8 +3,9 @@
 // waiting for GPU memory and ComfyUI's outside jobs, run next or last, the batch and all-mine
 // cancels, Pause GPU work, the restart hold's own resume, the queue order and the queued ETA,
 // the retry's cost chip, the raw names of what the app doesn't know, and floating it in the
-// shell; and the live list's source: the running read and every queue page, never a summary's
-// stale place. Every test runs on FakeCore.
+// shell; and the live list's source: the running read, every queue page and the jobs the core has
+// dispatched, as FakeCore's `jobsListAnswer` answers like the real core, never a summary's stale
+// place. Every test runs on FakeCore.
 import QtQuick
 import QtTest
 import Lilith.Shim
@@ -139,18 +140,33 @@ TestCase {
     }
     function isQueueRead(c) { return c.name === "jobs.list" && c.args.order === "queue" }
     function isRunningRead(c) { return c.name === "jobs.list" && c.args.status === "running" }
+    function isQueuedRead(c) { return c.name === "jobs.list" && c.args.status === "queued" }
 
-    // Answers a live read: the running jobs, then the queue in pages of `pageSize`.
-    function answerLive(core, running, queue, lanes, pageSize) {
-        answer(core, isRunningRead, ok({jobs: running, next_cursor: null, lanes: lanes || [lane()]}), "running")
-        const size = pageSize || 100
-        for (let at = 0; at === 0 || at < queue.length; at += size) {
-            const more = at + size < queue.length
-            const call = answer(core, isQueueRead, ok({jobs: queue.slice(at, at + size),
-                                                       next_cursor: more ? "c" + (at + size) : null,
-                                                       lanes: lanes || [lane()]}), "queue page at " + at)
-            compare(call.args.cursor, at === 0 ? undefined : "c" + at, "the cursor of the page before")
+    // Answers one listing of a live read, every page of it, as the real core would over `jobs`.
+    function answerListing(core, pred, jobs, lanes, what) {
+        let cursor = undefined
+        for (;;) {
+            tryVerify(() => openCalls(core, pred).length > 0, 3000, "a call: " + what)
+            const call = openCalls(core, pred)[0]
+            compare(call.args.cursor, cursor, "the cursor of the page before: " + what)
+            const outcome = core.jobsListAnswer(call.args, jobs, lanes)
+            answered[call.id] = true
+            verify(core.respond(call.id, outcome), "answered " + what)
+            cursor = outcome.structured.next_cursor || undefined
+            if (!cursor)
+                return
         }
+    }
+
+    // Answers a live read as the real core does: the running jobs, the queue (`queue` holds every
+    // queued job, those the core has dispatched included, which that read leaves out) and the
+    // `{status: "queued"}` read, in pages.
+    function answerLive(core, running, queue, lanes) {
+        const all = running.concat(queue)
+        const states = lanes || [lane()]
+        answerListing(core, isRunningRead, all, states, "running")
+        answerListing(core, isQueueRead, all, states, "queue")
+        answerListing(core, isQueuedRead, all, states, "queued")
     }
 
     // The panel, loaded: the history page, the live read, the engines and the caps. The running
@@ -161,8 +177,7 @@ TestCase {
         const w = createTemporaryObject(panelWindow, tc, {core: core})
         windows.push(w)
         answer(core, isPage, ok({jobs: s.jobs || [], next_cursor: null, lanes: s.lanes || [lane()]}), "page")
-        answerLive(core, s.running || (s.jobs || []).filter(j => j.status === "running"), s.queue || [],
-                   s.lanes, s.pageSize)
+        answerLive(core, s.running || (s.jobs || []).filter(j => j.status === "running"), s.queue || [], s.lanes)
         answer(core, c => c.name === "engines.status", ok({engines: s.engines || [comfy(0, 0)]}), "engines")
         answer(core, c => c.name === "caps.get", ok(s.caps || {display_currency: "USD", period: "2026-10",
                                                               caps: []}), "caps")
@@ -465,16 +480,19 @@ TestCase {
     }
 
     function test_a_retry_waiting_on_an_earlier_prompt_shows_it_with_cancel() { // spec: APP-114, CORE-160
-        const waiting = queued("j10", 0, {substatus: "submitting", retry_of: "j0", waiting_for_earlier_prompt: true,
-                                          status_seq: [{status: "queued", substatus: "submitting", at: iso(6000)}]})
+        const waiting = queued("j10", undefined, {substatus: "submitting", retry_of: "j0",
+                                                  waiting_for_earlier_prompt: true,
+                                                  status_seq: [{status: "queued", substatus: "submitting", at: iso(6000)}]})
         // A retry slow to submit, and a second attempt, with no inherited prompt: just submitting.
-        const slow = queued("j11", 1, {substatus: "submitting", retry_of: "j0",
-                                       status_seq: [{status: "queued", substatus: "submitting", at: iso(2500)}]})
-        const again = queued("j12", 2, {substatus: "submitting", attempt: 2,
-                                        status_seq: [{status: "queued", substatus: "submitting", at: iso(3000)}]})
+        const slow = queued("j11", undefined, {substatus: "submitting", retry_of: "j0",
+                                               status_seq: [{status: "queued", substatus: "submitting", at: iso(2500)}]})
+        const again = queued("j12", undefined, {substatus: "submitting", attempt: 2,
+                                                status_seq: [{status: "queued", substatus: "submitting", at: iso(3000)}]})
         const t = load({jobs: [waiting, slow, again], queue: [waiting, slow, again]})
         const r = row(t.panel, "j10")
         verify(r.statusText.indexOf("Waiting for an earlier ComfyUI prompt to finish") >= 0, r.statusText)
+        verify(r.statusText.indexOf("#") < 0, "it has no place: " + r.statusText)
+        verify(!button(r, "Run next") && !button(r, "Run last"), "it can't move")
         for (const id of ["j11", "j12"]) {
             const other = row(t.panel, id).statusText
             verify(other.indexOf("Submitting") >= 0 && other.indexOf("earlier") < 0, id + ": " + other)
@@ -508,10 +526,156 @@ TestCase {
         wait(400)
         compare(callsOf(t.core, isQueueRead).length, reads + 1, "one read for the burst")
         answerLive(t.core, [running], [b, a, c])
-        t.core.emit("jobs", "event", {kind: "job", job: queued("j2", 1, {estimate: wallEstimate(60), phase: "x",
-                                                                         updated: iso()})})
+        t.core.emit("jobs", "event", {kind: "job", job: job("j1", {estimate: wallEstimate(20), phase: "sampling",
+                                                                   updated: iso()})})
         wait(400)
-        compare(callsOf(t.core, isQueueRead).length, reads + 1, "the same status needs no read")
+        compare(callsOf(t.core, isQueueRead).length, reads + 1, "a running job's own update needs no read")
+    }
+
+    // --- The jobs the core has dispatched: status queued, in no queue place (audit finding 7a). ---
+
+    function dispatched(id, substatus, over) {
+        return queued(id, undefined, Object.assign({substatus: substatus,
+                                                    status_seq: [{status: "queued", substatus: substatus, at: iso(1000)}]},
+                                                   over || {}))
+    }
+
+    function test_a_dispatched_job_stays_listed_with_no_place() { // spec: APP-114, CORE-160
+        const inEngine = dispatched("j1", "queued_in_engine", {estimate: wallEstimate(30), created: iso(90000)})
+        const next = queued("j2", 0, {estimate: wallEstimate(20), created: iso(20000)})
+        const cpu = job("c1", {lane: "cpu"})
+        const t = load({running: [cpu], queue: [next, inEngine]})
+        compare(liveOrder(t.panel), ["c1", "j1", "j2"], "the running jobs, the dispatched one, then the queue")
+        verify(!t.panel.emptyText.visible)
+        const r = row(t.panel, "j1")
+        verify(r.statusText.indexOf("In ComfyUI's queue") >= 0, r.statusText)
+        verify(r.statusText.indexOf("#") < 0, "no place: " + r.statusText)
+        verify(button(r, "Cancel"), "it can be cancelled")
+        verify(!button(r, "Run next") && !button(r, "Run last"), "it can't move")
+        // Its time is counted ahead of the queue; the queue's places stay the read's.
+        const n = row(t.panel, "j2").statusText
+        verify(n.indexOf("#1 in queue") >= 0 && n.indexOf("about 50 s") >= 0, n)
+        // The read after another job's event still lists it.
+        t.core.emit("jobs", "event", {kind: "job", job: queued("j3", 1, {updated: iso()})})
+        answerLive(t.core, [cpu], [next, inEngine, queued("j3", 1)])
+        tryVerify(() => liveOrder(t.panel).indexOf("j3") >= 0, 2000, JSON.stringify(liveOrder(t.panel)))
+        compare(liveOrder(t.panel), ["c1", "j1", "j2", "j3"])
+    }
+
+    function test_nothing_is_running_is_never_said_with_a_dispatched_job() { // spec: APP-114, CORE-160
+        for (const substatus of ["submitting", "queued_in_engine"]) {
+            answered = {}
+            const t = load({queue: [dispatched("j1", substatus)]})
+            compare(t.panel.live.count, 1, substatus)
+            verify(!t.panel.emptyText.visible, substatus + ": the list doesn't say it is empty")
+            // An event of it, as a retry waiting on an earlier prompt gets, and the read it asks for.
+            t.core.emit("jobs", "event", {kind: "job", job: dispatched("j1", substatus, {updated: iso()})})
+            answerLive(t.core, [], [dispatched("j1", substatus)])
+            wait(50)
+            compare(t.panel.live.count, 1, substatus + " after the read")
+            verify(!t.panel.emptyText.visible, substatus + " after the read")
+        }
+    }
+
+    function test_every_page_of_the_status_reads_is_followed() { // spec: APP-114, CORE-160
+        const running = []
+        for (let i = 0; i < 130; ++i)
+            running.push(job("r" + (1000 + i), {lane: i % 2 ? "cpu" : "gpu-heavy", created: iso(900000 - i)}))
+        const queue = []
+        for (let i = 0; i < 120; ++i)
+            queue.push(queued("q" + (1000 + i), i, {created: iso(1000 + i)}))
+        // Older than them all: on the second `{status: "queued"}` page.
+        queue.push(dispatched("d0", "submitting", {created: iso(800000)}))
+        const t = load({running: running, queue: queue})
+        tryCompare(t.panel.live, "count", 251)
+        compare(callsOf(t.core, isRunningRead).length, 2, "the running read follows next_cursor")
+        compare(callsOf(t.core, isQueuedRead).length, 2, "the queued read follows next_cursor")
+        const order = liveOrder(t.panel)
+        compare(order[130], "d0", "after the running jobs, before the queue")
+    }
+
+    // --- The queue changes with no status change (Appendix G; audit finding 7b). ---
+
+    function test_a_job_released_by_resume_held_gets_its_place_from_a_new_read() { // spec: APP-114, CORE-160
+        const held = queued("j3", undefined, {substatus: "queue_paused", pause_reasons: ["restart"],
+                                              estimate: wallEstimate(30)})
+        const t = load({queue: [held], lanes: [lane({held: 1, restart_held: 1})]})
+        const r = row(t.panel, "j3")
+        verify(r.statusText.indexOf("Held after a restart") >= 0, r.statusText)
+        button(t.panel.laneHeader("gpu-heavy"), "Resume held jobs (1)").click()
+        answer(t.core, c => c.name === "app/queue.resume", okState(lane()), "resume held")
+        wait(300)
+        const reads = callsOf(t.core, isQueueRead).length
+        // The core publishes the job's new state: still queued, so no status changed.
+        const released = queued("j3", 0, {estimate: wallEstimate(30), updated: iso()})
+        t.core.emit("jobs", "event", {kind: "job", job: released})
+        tryVerify(() => callsOf(t.core, isQueueRead).length === reads + 1, 2000, "a read of the queue")
+        answerLive(t.core, [], [released])
+        tryVerify(() => r.statusText.indexOf("#1 in queue") >= 0, 2000, r.statusText)
+        verify(r.statusText.indexOf("about 30 s") >= 0, r.statusText)
+    }
+
+    function test_a_move_from_another_surface_reorders_the_queue() { // spec: APP-114, CORE-160
+        const a = queued("j2", 0), b = queued("j3", 1)
+        const t = load({queue: [a, b]})
+        compare(liveOrder(t.panel), ["j2", "j3"])
+        // Claude Code moved j3: its summary comes on `jobs`, and nothing here called job.move.
+        t.core.emit("jobs", "event", {kind: "job", job: queued("j3", 0, {updated: iso()})})
+        answerLive(t.core, [], [queued("j3", 0), queued("j2", 1)])
+        tryVerify(() => JSON.stringify(liveOrder(t.panel)) === JSON.stringify(["j3", "j2"]), 2000,
+                  JSON.stringify(liveOrder(t.panel)))
+        verify(row(t.panel, "j3").statusText.indexOf("#1 in queue") >= 0, row(t.panel, "j3").statusText)
+        verify(row(t.panel, "j2").statusText.indexOf("#2 in queue") >= 0, row(t.panel, "j2").statusText)
+        compare(callsOf(t.core, c => c.name === "job.move").length, 0)
+    }
+
+    // A list emptied under a row still being made off the frame's path: the view cancels that row
+    // by an index past the list's end, and Qt warns.
+    function test_a_list_emptied_under_a_row_being_made_warns_nothing() { // spec: APP-114, APP-139
+        failOnWarning(/DelegateModel::cancel/)
+        const q = []
+        for (let i = 0; i < 30; ++i)
+            q.push(queued("q" + (100 + i), i))
+        const t = load({queue: q})
+        wait(100)
+        const cancelled = i => t.core.emit("jobs", "event", {kind: "job", job: queued("q" + (100 + i), i, {
+            status: "cancelled", substatus: null, finished: iso(), updated: iso()})})
+        // The first rows go, so the list makes the next ones; the rest go before it can finish.
+        for (let i = 0; i < 3; ++i)
+            cancelled(i)
+        t.panel.applyPendingJobs()
+        t.panel.liveView.forceLayout()
+        for (let i = 3; i < 30; ++i)
+            cancelled(i)
+        t.panel.applyPendingJobs()
+        t.panel.liveView.forceLayout()
+        compare(t.panel.live.count, 0)
+        wait(100)
+    }
+
+    // --- A burst of `jobs` events (audit finding 9). ---
+
+    function test_a_burst_of_events_is_one_pass() { // spec: APP-114, APP-139
+        const q = []
+        for (let i = 0; i < 30; ++i)
+            q.push(queued("q" + (100 + i), i))
+        const t = load({queue: q})
+        wait(100)
+        const passes = t.panel.jobPasses
+        verify(passes !== undefined, "the panel counts its passes")
+        // Twenty of them are cancelled in one burst.
+        for (let i = 0; i < 20; ++i)
+            t.core.emit("jobs", "event", {kind: "job", job: queued("q" + (100 + i), i, {status: "cancelled", substatus: null,
+                                                                                        finished: iso(), updated: iso()})})
+        tryCompare(t.panel.live, "count", 10)
+        wait(50)
+        compare(t.panel.jobPasses - passes, 1, "one pass for the burst")
+        compare(liveOrder(t.panel)[0], "q120")
+        // And one read after it.
+        const open = () => openCalls(t.core, isQueueRead).length
+        tryVerify(() => open() === 1, 2000, "a read")
+        wait(300)
+        compare(open(), 1, "one read for the burst")
     }
 
     function test_caps_are_read_again_on_caps_usage_and_finished_jobs() { // spec: APP-140
@@ -574,7 +738,7 @@ TestCase {
         for (let i = 0; i < 150; ++i)
             q.push(queued("q" + (1000 + i), i, {created: iso(800000 - i * 1000), estimate: wallEstimate(10)}))
         const cpu = queued("c0", 0, {lane: "cpu"})
-        const t = load({jobs: q.slice(50).reverse(), running: [runningJob], queue: q.concat([cpu]), pageSize: 100})
+        const t = load({jobs: q.slice(50).reverse(), running: [runningJob], queue: q.concat([cpu])})
         tryVerify(() => t.panel.live.count === 152, 3000, "every live job: " + t.panel.live.count)
         const order = liveOrder(t.panel)
         compare(order.slice(0, 3), ["r0", "q1000", "q1001"], "the running job, then the front of the queue")
@@ -732,6 +896,7 @@ TestCase {
         windows.push(w)
         answer(core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}))
         answer(core, isRunningRead, ok({jobs: [], next_cursor: null, lanes: [lane()]}))
+        answer(core, isQueuedRead, ok({jobs: [], next_cursor: null, lanes: [lane()]}))
         // A cursor that never ends: one job a page, always more.
         for (let i = 0; i < 100; ++i)
             answer(core, isQueueRead, ok({jobs: [queued("q" + (1000 + i), i)], next_cursor: "c" + (i + 1),

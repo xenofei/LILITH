@@ -1,14 +1,18 @@
 // The Jobs panel (APP-114, APP-139, CORE-160, CORE-161; P4a-R40, P4a-R41), in two lists:
 //
-// - **Running and queued** (`liveView`, over LiveJobsModel): the running jobs first, then the
-//   queued ones in the order they will run, each lane after the other. Its rows come from the
-//   queue's own source (Appendix G "Queue position"): `jobs.list {status: "running"}` and every
-//   page of `jobs.list {order: "queue"}` (following `next_cursor`), read after a load, after a
-//   `job.move` and whenever a `jobs` event shows a job came, went or changed status, coalesced
-//   (one read for a burst, one at a time). Between reads each `jobs` event's job is applied as it
-//   is. The pages' JSON goes to Rust as it came: the order, each job's place (the read's, never a
-//   summary's `queue_position`), its ETA and its elapsed time are worked out there, and the 1 s
-//   clock updates only the rows whose times read differently. Its header holds the lane headers
+// - **Running and queued** (`liveView`, over LiveJobsModel): the running jobs first, then the jobs
+//   the core has dispatched (`submitting`, `queued_in_engine`), then the queued ones in the order
+//   they will run, each lane after the other. Its rows come from the queue's own source (Appendix
+//   G "Queue position"): every page of `jobs.list {status: "running"}`, `{order: "queue"}` and
+//   `{status: "queued"}`, which alone lists the dispatched jobs, following `next_cursor`. They are
+//   read after a load, after a `job.move` and on every `jobs` event of a job that is queued now or
+//   that the list shows as queued, or that came, went or changed status, coalesced (150 ms, one
+//   read at a time). Between reads the `jobs` events' jobs are applied as they are, those of a
+//   frame in one pass with one sort and one set of model changes, so a burst (a batch being
+//   cancelled) holds the GUI thread once, not once per event. The pages' JSON goes to Rust as it
+//   came: the order, each job's place (the read's, never a summary's `queue_position`), its ETA
+//   and its elapsed time are worked out there, and the 1 s clock updates only the rows whose times
+//   read differently. Its header holds the lane headers
 //   (LaneHeader: the pause and its reasons, the held jobs, waiting for GPU memory, ComfyUI's
 //   outside jobs, and QueueControls) and "Cancel all from this app".
 // - **Finished** (`historyView`): the jobs that ended, newest first, from one JsonListModel over
@@ -71,6 +75,8 @@ Rectangle {
     readonly property int historyFillPages: 20
     // The lane header updates applied (at most one per frame).
     property int laneUpdates: 0
+    // The passes of `jobs` events applied to the live rows (at most one per frame).
+    property int jobPasses: 0
 
     readonly property bool writable: jobsModel.loaded && live.loaded
     readonly property var knownLanes: ["gpu-heavy", "cpu"]
@@ -84,6 +90,8 @@ Rectangle {
     }
 
     property var _pendingLanes: ({})
+    // The `jobs` events' jobs waiting for this frame's pass.
+    property var _pendingJobs: []
     property bool _liveReading: false
     property bool _liveAgain: false
     // The read asked for again must carry nothing over (a snapshot or a resync came).
@@ -305,8 +313,9 @@ Rectangle {
             liveCoalesce.start()
     }
 
-    // One read of the live rows: the running jobs and every queue page, then one commit. A
-    // `fresh` read (after a snapshot or a resync) carries nothing over.
+    // One read of the live rows: every page of the running jobs, of the queue and of the queued
+    // jobs, then one commit. A `fresh` read (after a snapshot or a resync) carries nothing over.
+    // The events waiting for this frame's pass go first: they are older than the read.
     function readLive(fresh) {
         if (!core)
             return
@@ -315,9 +324,10 @@ Rectangle {
             _liveFreshAgain = _liveFreshAgain || !!fresh
             return
         }
+        applyPendingJobs()
         _liveReading = true
         live.beginRead(!!fresh)
-        let open = 2
+        let open = 3
         let gone = false
         const done = () => {
             if (gone || --open > 0)
@@ -416,14 +426,27 @@ Rectangle {
             queueEvent(data.state)
         } else if (data.kind === "job" && data.job) {
             const j = data.job
-            const change = live.applyJob(JSON.stringify(j), Date.now())
-            if (change > 0)
-                overviewChanged()
-            if (change === 2)
-                requestLiveRead()
+            _pendingJobs.push(j)
+            if (!jobFrame.running)
+                jobFrame.start()
             if (j.status === "succeeded" || j.status === "failed" || j.status === "cancelled")
                 requestCapsRead()
         }
+    }
+
+    // The events' jobs of this frame, in one pass: one sort and one set of model changes.
+    function applyPendingJobs() {
+        jobFrame.stop()
+        if (_pendingJobs.length === 0)
+            return
+        const jobs = JSON.stringify(_pendingJobs)
+        _pendingJobs = []
+        jobPasses++
+        const change = live.applyJobs(jobs, Date.now())
+        if (change > 0)
+            overviewChanged()
+        if (change === 2)
+            requestLiveRead()
     }
 
     function start() {
@@ -566,6 +589,13 @@ Rectangle {
         }
     }
 
+    // One pass for the job events of a frame.
+    Timer {
+        id: jobFrame
+        interval: 16
+        onTriggered: root.applyPendingJobs()
+    }
+
     // One live read for a burst of job events.
     Timer {
         id: liveCoalesce
@@ -616,6 +646,9 @@ Rectangle {
             clip: true
             model: live
             spacing: 4
+            // No rows made ahead off the frame's path: a list emptied under one being made cancels
+            // it by an index past its end, and Qt warns ("DelegateModel::cancel: index out range").
+            cacheBuffer: 0
             activeFocusOnTab: true
             currentIndex: -1
             boundsBehavior: Flickable.StopAtBounds
@@ -709,6 +742,7 @@ Rectangle {
                 width: historyList.width
                 leftPadding: Theme.spacing
                 bottomPadding: 4
+                textFormat: Text.PlainText
                 text: historyList.count > 0 ? "Finished" : "No finished jobs yet."
                 color: Theme.textMuted
                 font.pixelSize: Theme.fontSize
