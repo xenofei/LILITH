@@ -83,7 +83,10 @@ set_tests_properties(grab_open_card PROPERTIES
     TIMEOUT 300
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
-set_property(TEST tst_open_card grab_open_card APPEND PROPERTY
+# lil-image's own launch path to the shell: this runner claims a test channel's pipe and starts
+# itself again as the second launch (main.cpp's --forward-launch).
+lil_qml_test(tst_launch tst_launch.qml)
+set_property(TEST tst_open_card grab_open_card tst_launch APPEND PROPERTY
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
 
 # The stall watchdog's bench check (label bench): offscreen whatever the preset.

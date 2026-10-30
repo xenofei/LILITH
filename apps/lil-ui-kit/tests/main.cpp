@@ -4,6 +4,8 @@
 #include "lilshim/Fonts.h"
 #include "lilshim/PreviewProvider.h"
 
+#include "lil_qt/src/qt/boot.cxxqt.h"
+#include "lil_qt/src/qt/launch_sink.h"
 #include "lil_qt/src/qt/preview_feed.cxxqt.h"
 #include "lil_qt/src/qt/preview_sink.h"
 
@@ -11,12 +13,15 @@
 #include <kddockwidgets/qtquick/Platform.h>
 
 #include <atomic>
+#include <cstring>
+#include <string>
 
 #include <QCoreApplication>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QQmlNetworkAccessManagerFactory>
 #include <QDir>
+#include <QProcess>
 #include <QFile>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -119,6 +124,62 @@ private:
     int m_dirs = 0;
 };
 
+// TestLaunch (a context property): lil-image's own launch path for tst_launch (review I-5),
+// on a test channel of the process's own. The second launch is this runner started again with
+// `--forward-launch <rest>`, which runs lil_qt::boot_from and claim_instance as main.cpp's step
+// 3b does and exits with their code (main, below).
+class TestLaunch : public QObject
+{
+    Q_OBJECT
+
+public:
+    // A fresh test channel for this process and the launches it starts: its root under the
+    // temporary folder, with roaming, local and profile.
+    Q_INVOKABLE bool useTestChannel()
+    {
+        if (!m_root.isValid())
+            return false;
+        for (const char *dir : {"roaming", "local", "profile"})
+            QDir().mkpath(m_root.filePath(QString::fromLatin1(dir)));
+        qputenv("LIL_CHANNEL", QStringLiteral("test-qml%1").arg(QCoreApplication::applicationPid(), 0, 16).toUtf8());
+        qputenv("LIL_TEST_ROOT", QDir::toNativeSeparators(m_root.path()).toUtf8());
+        return true;
+    }
+
+    // This process claims the app's pipe: -1 when it is the instance (main.cpp's step 3b).
+    Q_INVOKABLE int claim(const QString &rest)
+    {
+        const QByteArray line = ("\"tst\" " + rest).toUtf8();
+        const lil_qt::QtBoot plan = lil_qt::boot_from(rust::Str(line.constData(), size_t(line.size())));
+        if (!plan.refused.empty())
+            return 2;
+        return lil_qt::claim_instance();
+    }
+
+    // Launches go to `window` from now on (main.cpp, once its window is loaded).
+    Q_INVOKABLE void deliverTo(QObject *window)
+    {
+        lil_qt::deliverLaunchesTo(window);
+        lil_qt::launches_ready();
+    }
+
+    // A second launch with the command line's rest `rest`: its exit code.
+    Q_INVOKABLE int secondLaunch(const QString &rest) const
+    {
+        return QProcess::execute(QCoreApplication::applicationFilePath(), {QStringLiteral("--forward-launch"), rest});
+    }
+
+    // The instance's end (main.cpp, after the event loop).
+    Q_INVOKABLE void release()
+    {
+        lil_qt::deliverLaunchesTo(nullptr);
+        lil_qt::release_instance();
+    }
+
+private:
+    QTemporaryDir m_root;
+};
+
 class Setup : public QObject
 {
     Q_OBJECT
@@ -145,6 +206,7 @@ public slots:
         engine->addImageProvider(QStringLiteral("lilpreview"), new lilshim::PreviewProvider);
         engine->rootContext()->setContextProperty(QStringLiteral("BridgeHook"), new BridgeHook(engine));
         engine->rootContext()->setContextProperty(QStringLiteral("TestFiles"), &m_files);
+        engine->rootContext()->setContextProperty(QStringLiteral("TestLaunch"), &m_launch);
         // The theme's bundled face as the application font, as lil-image sets it.
         if (QObject *theme = engine->singletonInstance<QObject *>("Lilith.UiKit", "Theme"))
             lilshim::applyThemeFont(theme->property("fontFamily").toString());
@@ -152,16 +214,32 @@ public slots:
 
 private:
     TestFiles m_files;
+    TestLaunch m_launch;
     CountingNamFactory m_nam;
 };
 
-// APP-137: set before the application object, which QUICK_TEST_MAIN_WITH_SETUP creates, so
+// APP-137: set before the application object, which quick_test_main_with_setup creates, so
 // WebEngine can load later through a Loader.
 static const bool s_shareContexts = [] {
     QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
     return true;
 }();
 
-QUICK_TEST_MAIN_WITH_SETUP(lil_ui_kit, Setup)
+// QUICK_TEST_MAIN_WITH_SETUP's main, with tst_launch's second launch first: `--forward-launch
+// <rest>` runs lil-image's step 3b on the command line `"tst" <rest>`, before any Qt object, and
+// exits with its code (3 when it became the instance instead, which that test never wants).
+int main(int argc, char **argv)
+{
+    if (argc >= 2 && std::strcmp(argv[1], "--forward-launch") == 0) {
+        const std::string line = std::string("\"tst\" ") + (argc >= 3 ? argv[2] : "");
+        const lil_qt::QtBoot plan = lil_qt::boot_from(rust::Str(line.data(), line.size()));
+        if (!plan.refused.empty())
+            return 2;
+        const int code = lil_qt::claim_instance();
+        return code >= 0 ? code : 3;
+    }
+    Setup setup;
+    return quick_test_main_with_setup(argc, argv, "lil_ui_kit", nullptr, &setup);
+}
 
 #include "main.moc"
