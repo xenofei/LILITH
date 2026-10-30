@@ -27,8 +27,9 @@
 //!   move, not a reset, so a row keeps its delegate.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use lil_protocol::estimate::{Estimate, Spread};
+use lil_protocol::estimate::Spread;
 use serde_json::Value;
 
 use crate::format;
@@ -42,7 +43,8 @@ pub const MAX_PAGES: u32 = 100;
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveRow {
     pub id: String,
-    pub job: Value,
+    /// Shared with the live jobs: a row copies a pointer, never the job.
+    pub job: Arc<Value>,
     /// `None`: the last queue read didn't list it; `Some(None)`: listed with no place (a
     /// restart holds it); `Some(Some(n))`: its 0-based place in its lane.
     pub place: Option<Option<u32>>,
@@ -94,18 +96,15 @@ struct Read {
 #[derive(Debug, Default)]
 pub struct LiveJobs {
     rows: Vec<LiveRow>,
-    jobs: HashMap<String, Value>,
+    jobs: HashMap<String, Arc<Value>>,
     rank: HashMap<String, usize>,
     places: HashMap<String, Option<u32>>,
     read: Option<Read>,
     lanes: Vec<Value>,
 }
 
-fn text(job: &Value, key: &str) -> String {
-    job.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+fn text<'a>(job: &'a Value, key: &str) -> &'a str {
+    job.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
 fn job_id(job: &Value) -> Option<String> {
@@ -131,14 +130,11 @@ fn structured(result: &Value) -> &Value {
     result.get("structured").unwrap_or(result)
 }
 
-fn estimate(job: &Value) -> Estimate {
-    job.get("estimate")
-        .and_then(|e| serde_json::from_value(e.clone()).ok())
-        .unwrap_or_default()
-}
-
+/// The job's `estimate.wall_s` as a [`Spread`], read in place.
 fn wall(job: &Value) -> Option<Spread> {
-    estimate(job).wall_s.as_ref()?.spread()
+    let w = job.get("estimate")?.get("wall_s")?;
+    let figure = |key: &str| w.get(key)?.as_str()?.parse::<f64>().ok();
+    Spread::new(figure("p50")?, figure("p90")?)
 }
 
 /// The seconds the job's current run has executed: from its newest `running`/`executing` step,
@@ -153,16 +149,34 @@ fn elapsed_s(job: &Value, now_ms: i64) -> f64 {
                     && s.get("substatus").and_then(Value::as_str) == Some("executing")
             })
         })
-        .and_then(|s| s.get("at").and_then(Value::as_str))
-        .map(str::to_string);
+        .and_then(|s| s.get("at").and_then(Value::as_str));
     let since = step
-        .or_else(|| {
-            job.get("started")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .and_then(|at| format::parse_utc_ms(&at));
+        .or_else(|| job.get("started").and_then(Value::as_str))
+        .and_then(format::parse_utc_ms);
     since.map_or(0.0, |ms| ((now_ms - ms) as f64 / 1000.0).max(0.0))
+}
+
+/// A row's place in the order (module docs): running first, then by lane, then the running
+/// ones oldest first and the rest by the read's order.
+fn order_key<'a>(
+    rank: &HashMap<String, usize>,
+    id: &str,
+    job: &'a Value,
+) -> (u8, u8, &'a str, usize, &'a str) {
+    let running = text(job, "status") == "running";
+    let lane = text(job, "lane");
+    let place = if running {
+        0
+    } else {
+        rank.get(id).copied().unwrap_or(usize::MAX)
+    };
+    (
+        u8::from(!running),
+        lane_rank(lane),
+        lane,
+        place,
+        text(job, "created"),
+    )
 }
 
 fn lane_rank(lane: &str) -> u8 {
@@ -197,8 +211,8 @@ impl LiveJobs {
         let mut lanes: Vec<String> = Vec::new();
         for r in &self.rows {
             let lane = text(&r.job, "lane");
-            if !lane.is_empty() && !lanes.contains(&lane) {
-                lanes.push(lane);
+            if !lane.is_empty() && !lanes.iter().any(|l| l == lane) {
+                lanes.push(lane.to_string());
             }
         }
         lanes.sort_by_key(|l| (lane_rank(l), l.clone()));
@@ -253,20 +267,25 @@ impl LiveJobs {
         let Some(read) = self.read.take() else {
             return Vec::new();
         };
-        let mut jobs: HashMap<String, Value> = HashMap::new();
-        for job in read.running.iter().chain(read.queue.iter()) {
-            if let Some(id) = job_id(job)
-                && !ended(job)
-                && as_new(job, jobs.get(&id))
+        let mut jobs: HashMap<String, Arc<Value>> = HashMap::new();
+        for job in read.running.into_iter().chain(read.queue.iter().cloned()) {
+            if let Some(id) = job_id(&job)
+                && !ended(&job)
+                && as_new(&job, jobs.get(&id).map(Arc::as_ref))
             {
-                jobs.insert(id, job.clone());
+                // A job the rows show as it is keeps its pointer: its row isn't sent again.
+                let job = match self.jobs.get(&id) {
+                    Some(held) if **held == job => held.clone(),
+                    _ => Arc::new(job),
+                };
+                jobs.insert(id, job);
             }
         }
         for (id, job) in read.events {
             if ended(&job) {
                 jobs.remove(&id);
-            } else if as_new(&job, jobs.get(&id)) {
-                jobs.insert(id, job);
+            } else if as_new(&job, jobs.get(&id).map(Arc::as_ref)) {
+                jobs.insert(id, Arc::new(job));
             }
         }
         self.rank.clear();
@@ -300,8 +319,8 @@ impl LiveJobs {
             if self.jobs.remove(&id).is_none() {
                 return Vec::new();
             }
-        } else if as_new(&job, self.jobs.get(&id)) {
-            self.jobs.insert(id, job);
+        } else if as_new(&job, self.jobs.get(&id).map(Arc::as_ref)) {
+            self.jobs.insert(id, Arc::new(job));
         } else {
             return Vec::new();
         }
@@ -311,6 +330,36 @@ impl LiveJobs {
     /// Whether `id` is a live row.
     pub fn contains(&self, id: &str) -> bool {
         self.jobs.contains_key(id)
+    }
+
+    /// A live job's status, `None` for one that isn't live.
+    pub fn status_of(&self, id: &str) -> Option<String> {
+        self.jobs.get(id).map(|j| text(j, "status").to_string())
+    }
+
+    /// What the lane headers and the panel's own controls need: `{lanes}` (as
+    /// [`LiveJobs::row_lanes`]), `{waiting_for_vram}` (the lanes with a queued job waiting for
+    /// GPU memory) and `{mine}` (the live jobs `app`'s panels started).
+    pub fn overview(&self, app: &str) -> Value {
+        let mut vram: Vec<String> = Vec::new();
+        let mut mine = 0_u32;
+        for r in &self.rows {
+            if text(&r.job, "substatus") == "waiting_for_vram" {
+                let lane = text(&r.job, "lane");
+                if !vram.iter().any(|l| l == lane) {
+                    vram.push(lane.to_string());
+                }
+            }
+            let origin = r.job.get("origin");
+            let surface = origin
+                .and_then(|o| o.get("surface"))
+                .and_then(Value::as_str);
+            let id = origin.and_then(|o| o.get("id")).and_then(Value::as_str);
+            if surface == Some("panel") && id == Some(app) {
+                mine += 1;
+            }
+        }
+        serde_json::json!({"lanes": self.row_lanes(), "waiting_for_vram": vram, "mine": mine})
     }
 
     /// The clock moved on: the rows whose times read differently.
@@ -331,9 +380,15 @@ impl LiveJobs {
     }
 
     fn refresh(&mut self, now_ms: i64) -> Vec<Op> {
-        let mut rows: Vec<LiveRow> = self
-            .jobs
-            .iter()
+        let rank = &self.rank;
+        let mut order: Vec<(&String, &Arc<Value>)> = self.jobs.iter().collect();
+        order.sort_by(|a, b| {
+            order_key(rank, a.0, a.1)
+                .cmp(&order_key(rank, b.0, b.1))
+                .then_with(|| a.0.cmp(b.0))
+        });
+        let mut rows: Vec<LiveRow> = order
+            .into_iter()
             .map(|(id, job)| LiveRow {
                 id: id.clone(),
                 job: job.clone(),
@@ -343,23 +398,6 @@ impl LiveJobs {
                 batch_size: 0,
             })
             .collect();
-        let rank = &self.rank;
-        rows.sort_by_cached_key(|r| {
-            let running = text(&r.job, "status") == "running";
-            let lane = text(&r.job, "lane");
-            (
-                u8::from(!running),
-                lane_rank(&lane),
-                lane,
-                if running {
-                    0
-                } else {
-                    rank.get(&r.id).copied().unwrap_or(usize::MAX)
-                },
-                text(&r.job, "created"),
-                r.id.clone(),
-            )
-        });
         derive(&mut rows, now_ms);
         let ops = diff(&self.rows, &rows);
         self.rows = rows;
@@ -371,46 +409,48 @@ impl LiveJobs {
 fn derive(rows: &mut [LiveRow], now_ms: i64) {
     let mut batches: HashMap<String, u32> = HashMap::new();
     for r in rows.iter() {
-        *batches.entry(text(&r.job, "batch_id")).or_default() += 1;
+        *batches
+            .entry(text(&r.job, "batch_id").to_string())
+            .or_default() += 1;
     }
     // Each lane's running job: its time left, or `None` without a `wall_s`.
     let mut running: HashMap<String, Option<f64>> = HashMap::new();
     for r in rows.iter() {
         if text(&r.job, "status") == "running" && text(&r.job, "substatus") != "interrupted_unknown"
         {
-            let lane = text(&r.job, "lane");
-            running.entry(lane).or_insert_with(|| {
-                format::running_left(&estimate(&r.job), elapsed_s(&r.job, now_ms))
-            });
+            running
+                .entry(text(&r.job, "lane").to_string())
+                .or_insert_with(|| {
+                    wall(&r.job).map(|w| format::left_of(&w, elapsed_s(&r.job, now_ms)))
+                });
         }
     }
     // The `wall_s` of the jobs listed so far in each lane, in order.
     let mut ahead: HashMap<String, Vec<Option<Spread>>> = HashMap::new();
     for r in rows.iter_mut() {
-        let status = text(&r.job, "status");
-        let substatus = text(&r.job, "substatus");
-        r.batch_size = batches.get(&text(&r.job, "batch_id")).copied().unwrap_or(1);
+        let job = r.job.clone();
+        let (status, substatus) = (text(&job, "status"), text(&job, "substatus"));
+        r.batch_size = batches.get(text(&job, "batch_id")).copied().unwrap_or(1);
         r.eta_text.clear();
         r.elapsed_text.clear();
-        match status.as_str() {
+        match status {
             "running" if substatus != "interrupted_unknown" => {
-                let elapsed = elapsed_s(&r.job, now_ms);
+                let elapsed = elapsed_s(&job, now_ms);
                 r.elapsed_text = format::elapsed_text(elapsed);
-                let eta = format::eta_text(&estimate(&r.job), elapsed);
-                if eta != format::NO_TIME {
-                    r.eta_text = eta;
+                if let Some(w) = wall(&job) {
+                    r.eta_text = format::left_text(Some(format::left_of(&w, elapsed)));
                 }
             }
             "queued" => {
                 let Some(Some(place)) = r.place else {
                     continue;
                 };
-                let lane = text(&r.job, "lane");
-                let own = wall(&r.job);
-                let listed = ahead.entry(lane.clone()).or_default();
+                let lane = text(&job, "lane");
+                let own = wall(&job);
+                let listed = ahead.entry(lane.to_string()).or_default();
                 if substatus != "queue_paused" {
                     let mut before: Vec<Option<&Spread>> = Vec::with_capacity(listed.len() + 1);
-                    let left = match running.get(&lane) {
+                    let left = match running.get(lane) {
                         Some(Some(left)) => Some(*left),
                         Some(None) => {
                             before.push(None);
@@ -688,6 +728,14 @@ mod tests {
         live.apply_job(net, NOW);
         assert_eq!(ids(&live), ["g1", "cpu1", "q1", "odd", "net"]);
         assert_eq!(live.row_lanes(), ["gpu-heavy", "cpu", "network"]);
+        let overview = live.overview("image");
+        assert_eq!(overview["lanes"], json!(["gpu-heavy", "cpu", "network"]));
+        assert_eq!(overview["waiting_for_vram"], json!([]));
+        assert_eq!(
+            overview["mine"],
+            json!(0),
+            "none of them came from the image app's panels"
+        );
         // A job that ends leaves.
         let mut done = running("g1", "gpu-heavy", None, 5);
         done["status"] = json!("succeeded");

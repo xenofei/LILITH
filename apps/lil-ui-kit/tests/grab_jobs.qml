@@ -81,16 +81,19 @@ TestCase {
         const shell = createTemporaryObject(shellComponent, tc, {core: core})
         shell.visible = true
         tryVerify(() => shell.docks.jobs.content && shell.docks.jobs.content.width > 0, 5000)
-        answer(core, c => c.name === "jobs.list" && c.args.order === undefined,
+        answer(core, c => c.name === "jobs.list" && c.args.order === undefined && c.args.status === undefined,
                ok({jobs: jobs, next_cursor: null, lanes: lanes}))
+        answer(core, c => c.name === "jobs.list" && c.args.status === "running",
+               ok({jobs: jobs.filter(j => j.status === "running"), next_cursor: null, lanes: lanes}))
         answer(core, c => c.name === "jobs.list" && c.args.order === "queue",
                ok({jobs: queue, next_cursor: null, lanes: lanes}))
         answer(core, c => c.name === "engines.status",
                ok({engines: [{engine: "comfyui", state: "ready", outside_jobs: outside || {running: 0, queued: 0}}]}))
         answer(core, c => c.name === "caps.get", ok({display_currency: "USD", period: "2026-10", caps: []}))
         const panel = shell.docks.jobs.content
-        tryVerify(() => panel.model.loaded && panel.view.count === jobs.length, 5000)
-        wait(300)
+        tryVerify(() => panel.model.loaded && panel.live.loaded
+                        && panel.liveView.count + panel.historyView.count === jobs.length, 5000)
+        wait(500)
         compare(shell.width, 1280)
         const img = grabImage(shell.contentItem)
         const dpr = shell.devicePixelRatio

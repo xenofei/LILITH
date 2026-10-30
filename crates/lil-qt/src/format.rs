@@ -60,11 +60,26 @@ pub fn chip_text(e: &Estimate, cap_share_permille: Option<u32>) -> String {
 
 /// A running job's time left (module docs).
 pub fn eta_text(e: &Estimate, elapsed_s: f64) -> String {
-    match running_left(e, elapsed_s) {
+    left_text(running_left(e, elapsed_s))
+}
+
+/// [`eta_text`]'s words for a time left already worked out (`None`: no `wall_s`).
+pub fn left_text(left: Option<f64>) -> String {
+    match left {
         None => NO_TIME.to_string(),
         Some(left) if left < 0.5 => "under 1 s left".to_string(),
         Some(left) => format!("about {} left", duration(left)),
     }
+}
+
+/// The seconds left of a run whose `wall_s` is `wall`, never below 0.
+pub fn left_of(wall: &Spread, elapsed_s: f64) -> f64 {
+    let elapsed = if elapsed_s.is_finite() {
+        elapsed_s
+    } else {
+        0.0
+    };
+    (wall.p50() - elapsed).max(0.0)
 }
 
 /// A running job's seconds left by its `wall_s` p50, never below 0; `None` without `wall_s`.

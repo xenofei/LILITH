@@ -6,12 +6,13 @@
 //! - `beginRead()`, then `setRunning(resultJson)` for `jobs.list {status: "running"}` and
 //!   `addQueuePage(resultJson)` for each `jobs.list {order: "queue"}` page (it returns the next
 //!   page's cursor, empty when the read has them all), then `commit(nowMs)`;
-//! - `applyJob(jobJson, nowMs)` for each `jobs` event's job: true when it was or now is a live
-//!   row;
+//! - `applyJob(jobJson, nowMs)` for each `jobs` event's job: 0 when it is no live row, 1 when it
+//!   is one and its status stayed, 2 when it came, went or changed status (the queue order may
+//!   have changed);
 //! - `tick(nowMs)`: the clock, which updates only the rows whose times read differently.
 //!
-//! `lanesJson()` is the read's `lanes` (`QueueState`s) as JSON, `rowLanes()` the lanes the rows
-//! are in, as JSON; `get(row)` a row as a map; `rowOf(jobId)` its row, or -1; `loaded` turns true
+//! `lanesJson()` is the read's `lanes` (`QueueState`s) as JSON, `overview(app)`
+//! [`LiveJobs::overview`] as JSON; `get(row)` a row as a map; `rowOf(jobId)` its row, or -1; `loaded` turns true
 //! at the first commit. Roles: the `JobSummary` fields, `waiting_for_earlier_prompt` among them,
 //! and `place` (the queue read's place, null without one), `in_read` (whether the read listed it),
 //! `eta_text`, `elapsed_text` and `batch_size`.
@@ -101,13 +102,13 @@ pub mod qobject {
         #[qinvokable]
         fn commit(self: Pin<&mut LiveJobsModel>, now_ms: f64);
         #[qinvokable]
-        fn apply_job(self: Pin<&mut LiveJobsModel>, job_json: &QString, now_ms: f64) -> bool;
+        fn apply_job(self: Pin<&mut LiveJobsModel>, job_json: &QString, now_ms: f64) -> i32;
         #[qinvokable]
         fn tick(self: Pin<&mut LiveJobsModel>, now_ms: f64);
         #[qinvokable]
         fn lanes_json(self: &LiveJobsModel) -> QString;
         #[qinvokable]
-        fn row_lanes(self: &LiveJobsModel) -> QString;
+        fn overview(self: &LiveJobsModel, app: &QString) -> QString;
         #[qinvokable]
         fn get(self: &LiveJobsModel, row: i32) -> QVariant;
         #[qinvokable]
@@ -236,17 +237,22 @@ impl qobject::LiveJobsModel {
         }
     }
 
-    fn apply_job(mut self: Pin<&mut Self>, job_json: &QString, now_ms: f64) -> bool {
+    fn apply_job(mut self: Pin<&mut Self>, job_json: &QString, now_ms: f64) -> i32 {
         let job = parse(job_json);
         let id = job
             .get("job_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let was = self.live.contains(&id);
+        let before = self.live.status_of(&id);
         let ops = self.as_mut().rust_mut().live.apply_job(job, ms(now_ms));
         self.as_mut().apply_ops(ops);
-        was || self.live.contains(&id)
+        let after = self.live.status_of(&id);
+        match (before, after) {
+            (None, None) => 0,
+            (b, a) if b == a => 1,
+            _ => 2,
+        }
     }
 
     fn tick(mut self: Pin<&mut Self>, now_ms: f64) {
@@ -258,15 +264,15 @@ impl qobject::LiveJobsModel {
         QString::from(&Value::Array(self.live.lanes().to_vec()).to_string())
     }
 
-    fn row_lanes(&self) -> QString {
-        QString::from(&serde_json::json!(self.live.row_lanes()).to_string())
+    fn overview(&self, app: &QString) -> QString {
+        QString::from(&self.live.overview(&app.to_string()).to_string())
     }
 
     fn get(&self, row: i32) -> QVariant {
         let Some(r) = usize::try_from(row).ok().and_then(|r| self.shown.get(r)) else {
             return QVariant::default();
         };
-        let mut map = r.job.clone();
+        let mut map = (*r.job).clone();
         if let Value::Object(m) = &mut map {
             m.insert(
                 "place".into(),
@@ -294,7 +300,25 @@ impl qobject::LiveJobsModel {
             return;
         }
         let root = QModelIndex::default();
+        // Updates of rows next to each other are one `dataChanged` over their range.
+        let mut changed: Option<(usize, usize)> = None;
         for op in ops {
+            if let Op::Update { at, .. } = &op {
+                apply(&mut self.as_mut().rust_mut().shown, &op);
+                changed = match changed {
+                    Some((first, last)) if *at == last + 1 => Some((first, *at)),
+                    other => {
+                        if let Some((first, last)) = other {
+                            self.as_mut().changed(first, last);
+                        }
+                        Some((*at, *at))
+                    }
+                };
+                continue;
+            }
+            if let Some((first, last)) = changed.take() {
+                self.as_mut().changed(first, last);
+            }
             match &op {
                 Op::Remove { first, last } => {
                     // SAFETY: begun and ended around the change, on the GUI thread.
@@ -331,19 +355,24 @@ impl qobject::LiveJobsModel {
                         unsafe { self.as_mut().end_move_rows() };
                     }
                 }
-                Op::Update { at, .. } => {
-                    apply(&mut self.as_mut().rust_mut().shown, &op);
-                    let index = self.index(to_i32(*at), 0, &root);
-                    self.as_mut()
-                        .data_changed(&index, &index, &cxx_qt_lib::QList::default());
-                }
+                Op::Update { .. } => {}
             }
+        }
+        if let Some((first, last)) = changed {
+            self.as_mut().changed(first, last);
         }
         let count = to_i32(self.shown.len());
         if count != self.count {
             self.as_mut().rust_mut().count = count;
             self.count_changed();
         }
+    }
+
+    fn changed(self: Pin<&mut Self>, first: usize, last: usize) {
+        let root = QModelIndex::default();
+        let top = self.index(to_i32(first), 0, &root);
+        let bottom = self.index(to_i32(last), 0, &root);
+        self.data_changed(&top, &bottom, &cxx_qt_lib::QList::default());
     }
 
     pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {

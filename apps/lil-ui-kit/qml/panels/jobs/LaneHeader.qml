@@ -1,7 +1,7 @@
 // A lane's header in the Jobs panel (APP-114, CORE-160): its name, its pause and the reasons for
 // it (an unknown reason by its name), how many jobs it holds, "Waiting for GPU memory" while a
-// queued job of it waits for VRAM, ComfyUI's outside jobs (the GPU lane), and its QueueControls.
-// Role Grouping, named "<lane>: <what it says>"; `text` is all it says, one line each.
+// queued job of it waits for VRAM, ComfyUI's outside jobs (the GPU lane), and its QueueControls
+// (for a lane this build knows; another lane shows by its name, P4a-R40). Role Grouping, named "<lane>: <what it says>"; `text` is all it says, one line each.
 import QtQuick
 import Lilith.UiKit
 
@@ -14,7 +14,7 @@ Rectangle {
     // Its QueueState, or null before the first read.
     property var queueState: null
 
-    readonly property bool waitingForVram: (panel.queueByLane[lane] || []).some(j => j.substatus === "waiting_for_vram")
+    readonly property bool waitingForVram: panel.vramLanes.indexOf(lane) >= 0
     readonly property string outsideText: {
         if (lane !== "gpu-heavy")
             return ""
@@ -80,7 +80,9 @@ Rectangle {
             }
         }
 
+        // `app/queue.*` names only the lanes this build knows.
         QueueControls {
+            visible: root.panel.knownLanes.indexOf(root.lane) >= 0
             width: parent.width
             panel: root.panel
             lane: root.lane

@@ -1,26 +1,31 @@
-// The Jobs panel (APP-114, APP-139, CORE-160, CORE-161; P4a-R40, P4a-R41): every job of the
-// session's scope, newest first from `jobs.list`, kept live by the `jobs` topic (one
-// JsonListModel), shown by lane: the running job, then the queued ones in queue order, then the
-// rest, newest first. Each lane has a header (LaneHeader: its pause and its reasons, waiting for
-// GPU memory, ComfyUI's outside jobs, and its QueueControls); each job a row (JobRow: live
-// progress at most 10 times a second, its preview, its ETA, and its controls).
+// The Jobs panel (APP-114, APP-139, CORE-160, CORE-161; P4a-R40, P4a-R41), in two lists:
 //
-// - **Queue order** (Appendix G "Queue position"): the model's live inserts go to the top, so the
-//   panel reads `jobs.list {order: "queue"}` itself, after a load, after a `job.move` and on every
-//   `jobs` event of a job that is queued now or shown as queued, coalesced (one read for a burst,
-//   at most one at a time). That read gives each queued job's place, the lanes' `QueueState`s,
-//   and the jobs ahead of each queued job for its ETA (JobText.queuedEtaText).
-// - **Lanes** come from that read and from the `{kind: "queue", state}` events on `jobs`, applied
-//   as full states, a burst coalesced into one header update per frame.
-// - **Outside jobs** come from `engines.status` and the `engines` topic (ComfyUI's entry).
-// - **Caps:** `caps.get` is read at load and again, throttled to once a second, on
-//   `caps` and `usage` events and when a job reaches a final status; the retry's cost chip shows
-//   the share of the monthly cap from it.
-// - **Writes** (run next or last, the cancels, retry, pause and resume) wait until the model has
-//   loaded; their refusals show in the banner. A reload comes only from a snapshot or a
-//   `resync_required` (the model's own, and the panel's reads with it), never from `ready`.
+// - **Running and queued** (`liveView`, over LiveJobsModel): the running jobs first, then the
+//   queued ones in the order they will run, each lane after the other. Its rows come from the
+//   queue's own source (Appendix G "Queue position"): `jobs.list {status: "running"}` and every
+//   page of `jobs.list {order: "queue"}` (following `next_cursor`), read after a load, after a
+//   `job.move` and whenever a `jobs` event shows a job came, went or changed status, coalesced
+//   (one read for a burst, one at a time). Between reads each `jobs` event's job is applied as it
+//   is. The pages' JSON goes to Rust as it came: the order, each job's place (the read's, never a
+//   summary's `queue_position`), its ETA and its elapsed time are worked out there, and the 1 s
+//   clock updates only the rows whose times read differently. Its header holds the lane headers
+//   (LaneHeader: the pause and its reasons, the held jobs, waiting for GPU memory, ComfyUI's
+//   outside jobs, and QueueControls) and "Cancel all from this app".
+// - **Finished** (`historyView`): the jobs that ended, newest first, from one JsonListModel over
+//   `jobs.list` with the `jobs` topic. A job of a status this build doesn't know is shown with the
+//   live ones, by its name (P4a-R40).
+//
+// Each row is a JobRow. The lanes come from the read and from the `{kind: "queue", state}` events
+// on `jobs`, applied as full states, at most one header update per frame. Outside jobs come from
+// `engines.status` and the `engines` topic. `caps.get` is read at load and again, at most once a
+// second, on `caps` and `usage` events and when a job ends, for the retry's cost chip. Writes
+// wait until both lists have loaded, and refusals show in the banner. A snapshot or a
+// `resync_required` of `jobs` reads everything again; `ready` never does.
 //
 // Ctrl+Shift+P is the top bar's (Task 20): the panel's Pause calls the same `app/queue.*`.
+//
+// For later panels: a delegate's `required property int index` can lag behind a
+// SortFilterProxyModel re-sort (Qt 6.12), so places are read from the view (`ListView.indexAt`).
 import QtQuick
 import QtQml.Models
 import Lilith.Core
@@ -31,11 +36,16 @@ Rectangle {
 
     required property var core
     required property string title
+    // The app whose own jobs "Cancel all from this app" cancels (its jobs' `origin.id`).
+    property string app: "image"
 
     property alias model: jobsModel
-    property alias view: list
+    property alias live: live
+    property alias liveView: liveList
+    property alias historyView: historyList
     property alias banner: banner
-    property alias emptyText: emptyText
+    // The live list's "Nothing is running or queued." line (made in its header).
+    property Item emptyText: null
 
     // lane -> QueueState.
     property var lanes: ({})
@@ -43,30 +53,38 @@ Rectangle {
     property var outsideJobs: ({running: 0, queued: 0})
     // caps.get's view, or null.
     property var caps: null
-    // lane -> its queued JobSummaries in queue order (the queue read); job_id -> its place.
-    property var queueByLane: ({})
-    property var queueRank: ({})
-    // batch_id -> its unfinished jobs the panel knows of.
-    property var batchSizes: ({})
-    // Now, for elapsed times and ETAs, once a second.
-    property real nowMs: Date.now()
-    // The lane header updates applied (one per coalesced burst).
+    // The live rows' lanes, the lanes with a job waiting for GPU memory, and how many of the
+    // live jobs this app's panels started (LiveJobsModel.overview).
+    property var rowLanes: []
+    property var vramLanes: []
+    property int mine: 0
+    // The lane header updates applied (at most one per frame).
     property int laneUpdates: 0
 
-    readonly property bool writable: jobsModel.loaded
-    readonly property var laneOrder: ["gpu-heavy", "cpu"]
+    readonly property bool writable: jobsModel.loaded && live.loaded
+    readonly property var knownLanes: ["gpu-heavy", "cpu"]
+    readonly property var headerLanes: {
+        const out = knownLanes.slice()
+        for (const l of rowLanes.concat(Object.keys(lanes))) {
+            if (out.indexOf(l) < 0)
+                out.push(l)
+        }
+        return out
+    }
 
     property var _pendingLanes: ({})
-    property bool _queueReading: false
-    property bool _queueAgain: false
+    property bool _liveReading: false
+    property bool _liveAgain: false
     property bool _capsReading: false
+    // Request id -> {ok, fail}: the calls whose answer goes to Rust as it came.
+    property var _raw: ({})
 
     color: Theme.surface
 
     Accessible.role: Accessible.Pane
     Accessible.name: title
 
-    // --- Words for what the core names (an unknown name shows as it is). ---
+    // --- Words for what the core names (an unknown name shows as it is, P4a-R40). ---
 
     function kindLabel(kind) {
         const known = {"comfy.prompt": "ComfyUI prompt", "comfy.inventory": "ComfyUI inventory",
@@ -86,6 +104,12 @@ Rectangle {
         case "core": return "from LILITH"
         default: return "from " + origin.surface
         }
+    }
+
+    // The class, when it isn't your own generations' (`user`).
+    function classLabel(priority) {
+        const known = {user: "", interactive: "interactive", agent: "agent batch", live: "live"}
+        return priority in known ? known[priority] : (priority || "")
     }
 
     // A held job's reason.
@@ -117,22 +141,35 @@ Rectangle {
         return known[phase] || phase
     }
 
+    // A running job's substatus: nothing for `executing`, else its words or its name.
+    function runningLabel(substatus) {
+        if (!substatus || substatus === "executing")
+            return ""
+        const retrying = /^retrying_(\d+)_of_(\d+)$/.exec(substatus)
+        if (retrying)
+            return "Retrying (" + retrying[1] + " of " + retrying[2] + ")"
+        const known = {cancelling: "Cancelling", interrupted_unknown: "Outcome unknown",
+                       ingesting: "Bringing in the outputs"}
+        return known[substatus] || substatus
+    }
+
     // --- Rows. ---
 
-    // The row of `jobId` that the view has made, or null. (A row's own `index` can lag behind a
-    // re-sort, so places are read from the view.)
+    // The row of `jobId` that a view has made, or null.
     function rowFor(jobId) {
-        const kids = list.contentItem.children
-        for (let i = 0; i < kids.length; ++i) {
-            if (kids[i].jobId === jobId)
-                return kids[i]
+        for (const view of [liveList, historyList]) {
+            const kids = view.contentItem.children
+            for (let i = 0; i < kids.length; ++i) {
+                if (kids[i].jobId === jobId)
+                    return kids[i]
+            }
         }
         return null
     }
 
     // The header of `lane`.
     function laneHeader(lane) {
-        const kids = list.headerItem ? list.headerItem.children : []
+        const kids = liveList.headerItem ? liveList.headerItem.children : []
         for (let i = 0; i < kids.length; ++i) {
             if (kids[i].lane === lane)
                 return kids[i]
@@ -142,76 +179,25 @@ Rectangle {
 
     // Selects the job's row (a fix's "Show the job", show_job).
     function showJob(jobId) {
-        let at = -1
-        const made = rowFor(jobId)
-        if (made) {
-            at = list.indexAt(made.x + 1, made.y + 1)
-        }
+        let view = liveList
+        let at = live.rowOf(jobId)
         if (at < 0) {
-            const role = roleOf("job_id")
-            for (let i = 0; i < sorted.rowCount() && at < 0; ++i) {
-                if (sorted.data(sorted.index(i, 0), role) === jobId)
+            view = historyList
+            const made = rowFor(jobId)
+            if (made && made.ListView.view === historyList)
+                at = historyList.indexAt(made.x + 1, made.y + 1)
+            const role = 0x0100 + jobsModel.roleNames.indexOf("job_id")
+            for (let i = 0; i < history.rowCount() && at < 0; ++i) {
+                if (history.data(history.index(i, 0), role) === jobId)
                     at = i
             }
         }
         if (at < 0)
             return false
-        list.currentIndex = at
-        list.positionViewAtIndex(at, ListView.Contain)
-        list.forceActiveFocus(Qt.OtherFocusReason)
+        view.currentIndex = at
+        view.positionViewAtIndex(at, ListView.Contain)
+        view.forceActiveFocus(Qt.OtherFocusReason)
         return true
-    }
-
-    function roleOf(name) {
-        return 0x0100 + jobsModel.roleNames.indexOf(name)
-    }
-
-    // The running job of `lane` among the rows the model holds, or null.
-    function runningIn(lane) {
-        for (let i = 0; i < jobsModel.rowCount(); ++i) {
-            const j = jobsModel.get(i)
-            if (j && j.status === "running" && j.lane === lane)
-                return j
-        }
-        return null
-    }
-
-    // When the job's current run began executing (status_seq), else when it started; ms.
-    function executingSince(job) {
-        const seq = job.status_seq || []
-        for (let i = seq.length - 1; i >= 0; --i) {
-            if (seq[i].status === "running" && seq[i].substatus === "executing")
-                return Date.parse(seq[i].at)
-        }
-        return job.started ? Date.parse(job.started) : NaN
-    }
-
-    // The seconds the job has run since it began executing.
-    function elapsedS(job) {
-        const since = executingSince(job)
-        return isNaN(since) ? 0 : Math.max(0, (nowMs - since) / 1000)
-    }
-
-    // A queued job's finish (Appendix G): the running job's time left, the jobs ahead of it in
-    // its lane (each place the panel can't see counted as a job with no estimate), and its own.
-    function queuedEta(job) {
-        const queue = queueByLane[job.lane] || []
-        const at = queue.findIndex(q => q.job_id === job.job_id)
-        if (at < 0)
-            return ""
-        const ahead = queue.slice(0, at).filter(q => q.queue_position !== undefined && q.queue_position !== null)
-                           .map(q => q.estimate || null)
-        const unseen = Math.max(0, (job.queue_position || 0) - ahead.length)
-        for (let i = 0; i < unseen; ++i)
-            ahead.push(null)
-        let left = -1
-        const running = runningIn(job.lane)
-        if (running) {
-            left = JobText.runningLeft(JSON.stringify(running.estimate || null), elapsedS(running))
-            if (left < 0)
-                ahead.unshift(null)
-        }
-        return JobText.queuedEtaText(left, JSON.stringify(ahead), JSON.stringify(job.estimate || null))
     }
 
     // --- Calls. ---
@@ -230,7 +216,7 @@ Rectangle {
 
     function moveJob(jobId, to) {
         callTool("job.move", {job_id: jobId, to: to}, to === "next" ? "Couldn't run it next" : "Couldn't run it last",
-                 () => root.requestQueueRead())
+                 () => root.requestLiveRead())
     }
 
     function cancelJob(jobId) {
@@ -242,7 +228,11 @@ Rectangle {
     }
 
     function cancelAllMine() {
-        callTool("job.cancel", {all_mine: true}, "Couldn't cancel your jobs")
+        callTool("job.cancel", {all_mine: true}, "Couldn't cancel this app's jobs", r => {
+            const n = ((r.structured || {}).jobs || []).length
+            banner.kind = "ok"
+            banner.show(n === 1 ? "Cancelled 1 job." : "Cancelled " + n + " jobs.")
+        })
     }
 
     function retryJob(jobId) {
@@ -280,63 +270,85 @@ Rectangle {
         laneUpdates++
     }
 
-    // A `{kind: "queue", state}` event: coalesced into one header update per frame.
+    // A `{kind: "queue", state}` event: at most one header update per frame.
     function queueEvent(state) {
         if (!state || !state.lane)
             return
         const pending = Object.assign({}, _pendingLanes)
         pending[state.lane] = state
         _pendingLanes = pending
-        laneFrame.restart()
+        if (!laneFrame.running)
+            laneFrame.start()
     }
 
-    function requestQueueRead() {
-        if (!queueCoalesce.running)
-            queueCoalesce.start()
+    // A call whose result JSON goes on as it came (`ok(json)`), or its error (`fail(error)`).
+    function rawCall(tool, args, ok, fail) {
+        const id = core.call(tool, JSON.stringify(args))
+        _raw[id] = {ok: ok, fail: fail}
     }
 
-    function readQueue() {
+    function requestLiveRead() {
+        if (!liveCoalesce.running)
+            liveCoalesce.start()
+    }
+
+    // One read of the live rows: the running jobs and every queue page, then one commit.
+    function readLive() {
         if (!core)
             return
-        if (_queueReading) {
-            _queueAgain = true
+        if (_liveReading) {
+            _liveAgain = true
             return
         }
-        _queueReading = true
-        CoreCall.call(core, "jobs.list", {order: "queue", limit: 500}, {owner: root,
-            ok: r => {
-                root._queueReading = false
-                const s = r.structured || {}
-                const byLane = {}
-                const rank = {}
-                ;(s.jobs || []).forEach((j, i) => {
-                    if (!byLane[j.lane])
-                        byLane[j.lane] = []
-                    byLane[j.lane].push(j)
-                    rank[j.job_id] = i
-                })
-                const batches = {}
-                for (const j of s.jobs || [])
-                    batches[j.batch_id] = (batches[j.batch_id] || 0) + 1
-                for (let i = 0; i < jobsModel.rowCount(); ++i) {
-                    const j = jobsModel.get(i)
-                    if (j && j.status === "running")
-                        batches[j.batch_id] = (batches[j.batch_id] || 0) + 1
-                }
-                root.queueByLane = byLane
-                root.queueRank = rank
-                root.batchSizes = batches
-                root.applyLanes(s.lanes)
-                queueSorter.invalidate()
-                if (root._queueAgain) {
-                    root._queueAgain = false
-                    root.requestQueueRead()
-                }
-            },
-            error: () => {
-                root._queueReading = false
-                retryQueue.start()
-            }})
+        _liveReading = true
+        live.beginRead()
+        let open = 2
+        let gone = false
+        const done = () => {
+            if (gone || --open > 0)
+                return
+            live.commit(Date.now())
+            root._liveReading = false
+            root.overviewChanged()
+            root.applyLanes(JSON.parse(live.lanesJson()))
+            if (root._liveAgain) {
+                root._liveAgain = false
+                root.requestLiveRead()
+            }
+        }
+        const fail = () => {
+            if (gone)
+                return
+            gone = true
+            root._liveReading = false
+            retryLive.start()
+        }
+        rawCall("jobs.list", {status: "running", limit: 100}, json => {
+            if (!gone) {
+                live.setRunning(json)
+                done()
+            }
+        }, fail)
+        const page = cursor => rawCall("jobs.list", cursor ? {order: "queue", limit: 100, cursor: cursor}
+                                                           : {order: "queue", limit: 100}, json => {
+            if (gone)
+                return
+            const next = live.addQueuePage(json)
+            if (next !== "")
+                page(next)
+            else
+                done()
+        }, fail)
+        page("")
+    }
+
+    function overviewChanged() {
+        const o = JSON.parse(live.overview(app))
+        if (JSON.stringify(o.lanes) !== JSON.stringify(rowLanes))
+            rowLanes = o.lanes
+        if (JSON.stringify(o.waiting_for_vram) !== JSON.stringify(vramLanes))
+            vramLanes = o.waiting_for_vram
+        mine = o.mine
     }
 
     function readEngines() {
@@ -370,8 +382,8 @@ Rectangle {
 
     function onJobsEvent(kind, data) {
         if (kind !== "event") {
-            // A snapshot or a resync: the model reloads; the panel reads its own state again.
-            readQueue()
+            // A snapshot or a resync: the history reloads itself; the panel reads its own state.
+            readLive()
             readEngines()
             readCaps()
             return
@@ -382,8 +394,11 @@ Rectangle {
             queueEvent(data.state)
         } else if (data.kind === "job" && data.job) {
             const j = data.job
-            if (j.status === "queued" || queueRank[j.job_id] !== undefined || j.status === "running")
-                requestQueueRead()
+            const change = live.applyJob(JSON.stringify(j), Date.now())
+            if (change > 0)
+                overviewChanged()
+            if (change === 2)
+                requestLiveRead()
             if (j.status === "succeeded" || j.status === "failed" || j.status === "cancelled")
                 requestCapsRead()
         }
@@ -403,12 +418,45 @@ Rectangle {
         })
         CoreCall.subscribe(core, "caps", root, () => root.requestCapsRead())
         CoreCall.subscribe(core, "usage", root, () => root.requestCapsRead())
-        readQueue()
+        readLive()
         readEngines()
         readCaps()
     }
 
     Component.onCompleted: start()
+    Component.onDestruction: {
+        for (const id in _raw) {
+            try {
+                core.cancel(id)
+            } catch (e) {
+                // The core object went first.
+            }
+        }
+        _raw = {}
+    }
+
+    Connections {
+        target: root.core
+        ignoreUnknownSignals: true
+        function onCallFinished(id, json) {
+            const h = root._raw[id]
+            if (!h)
+                return
+            delete root._raw[id]
+            h.ok(json)
+        }
+        function onCallFailed(id, json) {
+            const h = root._raw[id]
+            if (!h)
+                return
+            delete root._raw[id]
+            h.fail(JSON.parse(json))
+        }
+    }
+
+    LiveJobsModel {
+        id: live
+    }
 
     JsonListModel {
         id: jobsModel
@@ -424,48 +472,43 @@ Rectangle {
                     "started", "finished", "attempt", "progress", "error", "retry_of", "batch_id", "index",
                     "status_seq", "origin", "phase", "subtasks", "indeterminate", "unresponsive",
                     "pause_reasons", "estimate", "queue_position", "watchdog", "all_cached"]
+
+        // A job of a status this build doesn't know shows with the live ones.
+        onLoadedChanged: {
+            if (!loaded)
+                return
+            const role = 0x0100 + roleNames.indexOf("status")
+            const known = ["queued", "running", "succeeded", "failed", "cancelled"]
+            for (let i = 0; i < rowCount(); ++i) {
+                if (known.indexOf(data(index(i, 0), role)) < 0
+                        && live.applyJob(JSON.stringify(get(i)), Date.now()) > 0)
+                    root.overviewChanged()
+            }
+        }
     }
 
-    // By lane, then running, queued in queue order, the rest newest first.
+    // The jobs that ended, newest first as the list gives them.
     SortFilterProxyModel {
-        id: sorted
+        id: history
         model: jobsModel
-        sorters: [
-            FunctionSorter {
-                id: queueSorter
-                component RowData: QtObject {
-                    property string job_id
-                    property string lane
-                    property string status
-                    property string created
-                }
-                function compare(lhs: RowData, rhs: RowData): int {
-                    const laneRank = l => { const i = root.laneOrder.indexOf(l); return i < 0 ? 9 : i }
-                    const group = s => s === "running" ? 0 : s === "queued" ? 1 : 2
-                    const keys = d => [laneRank(d.lane), group(d.status),
-                                       d.status === "queued" && root.queueRank[d.job_id] !== undefined
-                                           ? root.queueRank[d.job_id] : 1e9]
-                    const a = keys(lhs), b = keys(rhs)
-                    for (let i = 0; i < a.length; ++i) {
-                        if (a[i] !== b[i])
-                            return a[i] < b[i] ? -1 : 1
-                    }
-                    // Newest first.
-                    return lhs.created > rhs.created ? -1 : lhs.created < rhs.created ? 1
-                         : lhs.job_id < rhs.job_id ? -1 : lhs.job_id > rhs.job_id ? 1 : 0
-                }
+        filters: [
+            AnyOfFilter {
+                ValueFilter { roleName: "status"; value: "succeeded" }
+                ValueFilter { roleName: "status"; value: "failed" }
+                ValueFilter { roleName: "status"; value: "cancelled" }
             }
         ]
     }
 
+    // The clock: only the live rows' times.
     Timer {
         interval: 1000
         repeat: true
         running: true
-        onTriggered: root.nowMs = Date.now()
+        onTriggered: live.tick(Date.now())
     }
 
-    // One header update per frame for a burst of queue events.
+    // At most one header update per frame for queue events.
     Timer {
         id: laneFrame
         interval: 16
@@ -476,17 +519,17 @@ Rectangle {
         }
     }
 
-    // One queue read for a burst of job events.
+    // One live read for a burst of job events.
     Timer {
-        id: queueCoalesce
+        id: liveCoalesce
         interval: 150
-        onTriggered: root.readQueue()
+        onTriggered: root.readLive()
     }
 
     Timer {
-        id: retryQueue
+        id: retryLive
         interval: 2000
-        onTriggered: root.readQueue()
+        onTriggered: root.readLive()
     }
 
     // caps.get at most once a second.
@@ -510,72 +553,111 @@ Rectangle {
         visible: false
     }
 
-    ListView {
-        id: list
+    Item {
+        id: lists
         anchors {
             left: parent.left; right: parent.right; bottom: parent.bottom
             top: banner.visible ? banner.bottom : parent.top
             topMargin: Theme.spacing
         }
-        clip: true
-        model: sorted
-        spacing: 4
-        activeFocusOnTab: true
-        currentIndex: -1
-        boundsBehavior: Flickable.StopAtBounds
 
-        Accessible.role: Accessible.List
-        Accessible.name: root.title
+        ListView {
+            id: liveList
+            anchors { left: parent.left; right: parent.right; top: parent.top }
+            // As tall as it needs, up to 60 % of the panel; the finished list has the rest.
+            height: Math.min(contentHeight, parent.height * 0.6)
+            clip: true
+            model: live
+            spacing: 4
+            activeFocusOnTab: true
+            currentIndex: -1
+            boundsBehavior: Flickable.StopAtBounds
 
-        header: Column {
-            id: headerColumn
-            width: list.width
-            spacing: Theme.spacing
-            bottomPadding: Theme.spacing
+            Accessible.role: Accessible.List
+            Accessible.name: "Running and queued"
 
-            // The dock's title bar names the panel; this row holds the panel-wide control.
-            Item {
-                width: parent.width
-                height: cancelAll.visible ? cancelAll.implicitHeight : 0
-                LButton {
-                    id: cancelAll
-                    anchors { right: parent.right; rightMargin: Theme.spacing }
-                    visible: list.count > 0
-                    text: "Cancel all mine"
-                    enabled: root.writable
-                    onClicked: root.cancelAllMine()
+            header: Column {
+                id: headerColumn
+                width: liveList.width
+                spacing: Theme.spacing
+                bottomPadding: Theme.spacing
+
+                Item {
+                    width: parent.width
+                    height: cancelAll.visible ? cancelAll.implicitHeight : 0
+                    LButton {
+                        id: cancelAll
+                        anchors { right: parent.right; rightMargin: Theme.spacing }
+                        visible: root.mine > 0
+                        text: "Cancel all from this app"
+                        enabled: root.writable
+                        onClicked: root.cancelAllMine()
+                    }
+                }
+
+                Repeater {
+                    model: root.headerLanes
+                    LaneHeader {
+                        required property string modelData
+                        width: headerColumn.width
+                        panel: root
+                        lane: modelData
+                        queueState: root.lanes[modelData] || null
+                        // Another lane shows only when there is something to say.
+                        visible: modelData === "gpu-heavy" || root.rowLanes.indexOf(modelData) >= 0
+                                 || (queueState && (queueState.paused || queueState.held > 0))
+                    }
+                }
+
+                Text {
+                    id: liveEmptyText
+                    visible: live.loaded && live.count === 0
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.Wrap
+                    text: "Nothing is running or queued."
+                    color: Theme.textMuted
+                    font.pixelSize: Theme.fontSize
+                    Component.onCompleted: root.emptyText = liveEmptyText
                 }
             }
 
-            Repeater {
-                model: root.laneOrder
-                LaneHeader {
-                    required property string modelData
-                    width: headerColumn.width
-                    panel: root
-                    lane: modelData
-                    queueState: root.lanes[modelData] || null
-                    // The CPU lane shows only when there is something to say.
-                    visible: modelData === "gpu-heavy" || (queueState && (queueState.paused || queueState.held > 0))
-                }
+            delegate: JobRow {
+                width: liveList.width
+                panel: root
             }
         }
 
-        delegate: JobRow {
-            width: list.width
-            panel: root
-        }
+        ListView {
+            id: historyList
+            anchors {
+                left: parent.left; right: parent.right; bottom: parent.bottom
+                top: liveList.bottom; topMargin: Theme.spacing
+            }
+            clip: true
+            model: history
+            spacing: 4
+            activeFocusOnTab: true
+            currentIndex: -1
+            boundsBehavior: Flickable.StopAtBounds
 
-        Text {
-            id: emptyText
-            visible: jobsModel.loaded && list.count === 0
-            anchors { left: parent.left; right: parent.right; margins: 2 * Theme.spacing }
-            y: list.headerItem ? list.headerItem.height + Theme.spacing : 0
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.Wrap
-            text: "No jobs yet. Jobs you, an agent or LILITH start show here."
-            color: Theme.textMuted
-            font.pixelSize: Theme.fontSize
+            Accessible.role: Accessible.List
+            Accessible.name: "Finished"
+
+            header: Text {
+                width: historyList.width
+                leftPadding: Theme.spacing
+                bottomPadding: 4
+                text: historyList.count > 0 ? "Finished" : "No finished jobs yet."
+                color: Theme.textMuted
+                font.pixelSize: Theme.fontSize
+                font.bold: historyList.count > 0
+            }
+
+            delegate: JobRow {
+                width: historyList.width
+                panel: root
+            }
         }
     }
 }

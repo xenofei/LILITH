@@ -32,6 +32,10 @@
 //! The Hardware panel's Qt-free part: [`series`] (chart resolutions, per-pixel downsampling, the
 //! chart buffer and the energy table's periods, APP-129, APP-131), served to QML by the
 //! bridge's `Hardware` singleton and `ChartSeries` objects.
+//!
+//! The Jobs panel's Qt-free parts: [`format`] (the cost and time chip's and the ETAs' words,
+//! APP-114, APP-140) and [`live_jobs`] (the running and queued jobs in run order, with their
+//! places, ETAs and times); the bridge's `JobText` and `LiveJobsModel` serve them to QML.
 
 #[cfg(feature = "qt")]
 extern crate cxx_qt_lib;
