@@ -428,12 +428,23 @@ fn cut_secrets(text: &str) -> String {
     out
 }
 
-/// What the Opened card says of a refused link: its decoded form, secrets cut, at most 80
-/// characters as shown text.
+/// `text` without what a reader can't see and that can split a word: C0 and C1 controls and the
+/// default-ignorable characters (`lil_parse::without_default_ignorables`; soft hyphen,
+/// zero-width space and the like). The bidirectional controls stay, for `shown_text` to mark.
+fn normalised(text: &str) -> String {
+    lil_parse::without_default_ignorables(text)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// What the Opened card says of a refused link: decoded, then normalised, then its secrets cut,
+/// then at most 80 characters as shown text, in that order, so nothing inside a token hides it
+/// from the cut (review M-11, M-18).
 fn not_a_link(arg: &str) -> String {
     format!(
         "This link isn't one LILITH opens: {}",
-        lil_parse::shown_text(&cut_secrets(&decoded(arg)), SHOWN_CHARS)
+        lil_parse::shown_text(&cut_secrets(&normalised(&decoded(arg))), SHOWN_CHARS)
     )
 }
 
@@ -983,6 +994,17 @@ mod tests {
             format!("lil-dev:deny/{TOKEN}"),
             format!("lil-dev:x?t={}", TOKEN.to_uppercase()),
             format!("lil-dev:deny/{CF}/%30%30{}", &TOKEN[2..]),
+            // Review M-18's spellings: a token split by an invisible character, outside any
+            // deny/.
+            format!("lil-dev:open/x?t={}%00{}", &TOKEN[..16], &TOKEN[16..]),
+            format!("lil-dev:x/y?t={}%01{}", &TOKEN[..16], &TOKEN[16..]),
+            format!(
+                "https://example.com/?t={}%C2%85{}",
+                &TOKEN[..16],
+                &TOKEN[16..]
+            ),
+            format!("lil-dev:open/x?t={}%C2%AD{}", &TOKEN[..16], &TOKEN[16..]),
+            format!("lil-dev:open/x?t={}%E2%80%8B{}", &TOKEN[..16], &TOKEN[16..]),
         ] {
             let p = plan(&format!("\"{rest}\""));
             let message = p
@@ -995,6 +1017,10 @@ mod tests {
                     !lower.contains(&TOKEN[start..start + 20]),
                     "{rest}: {message}"
                 );
+            }
+            // Nor either half, however it was split (a marked U+200B between them included).
+            for half in [&TOKEN[..16], &TOKEN[16..]] {
+                assert!(!lower.contains(half), "{rest}: {message}");
             }
             if rest.contains(CF) {
                 assert!(message.contains(CF), "{rest}: the id stays: {message}");
