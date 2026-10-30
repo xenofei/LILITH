@@ -425,10 +425,15 @@ async fn read_line(r: &mut BufReader<impl AsyncRead + Unpin>) -> io::Result<Valu
     }
 }
 
-/// `a` and `b` are the same file: both canonical paths, compared without regard to ASCII case.
+/// `a` and `b` are the same file: the same volume and file id, once links are followed, never a
+/// comparison of paths, which folds characters the file system tells apart. A hard link is the
+/// same file. A path that can't be read, or a volume without file ids, says no.
 fn same_file(a: &Path, b: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).map(|c| c.to_string_lossy().to_lowercase());
-    matches!((canon(a), canon(b)), (Ok(a), Ok(b)) if a == b)
+    let id = |p: &Path| {
+        let identity = lil_platform::fs::identity(&std::fs::canonicalize(p).ok()?).ok()?;
+        Some((identity.volume_serial, identity.file_id?))
+    };
+    matches!((id(a), id(b)), (Some(a), Some(b)) if a == b)
 }
 
 /// Who this process is, as ARCH-027 compares a pipe peer with it: its exe, its token user and
@@ -1015,6 +1020,24 @@ mod tests {
 
     fn this_identity() -> Identity {
         Identity::of_this_process().unwrap()
+    }
+
+    #[test] // spec: ARCH-027
+    fn the_same_file_is_told_by_its_identity_not_by_a_folded_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = dir.path().join("a-k.exe");
+        // U+212A, the Kelvin sign, lowercases to `k`, yet names another file.
+        let kelvin = dir.path().join("a-\u{212A}.exe");
+        std::fs::write(&k, "one").unwrap();
+        std::fs::write(&kelvin, "two").unwrap();
+        assert!(same_file(&k, &k));
+        assert!(!same_file(&k, &kelvin), "two files");
+        assert!(same_file(&k, &dir.path().join("A-K.EXE")), "ASCII case");
+        assert!(!same_file(&k, &dir.path().join("missing.exe")));
+        // Not a second copy, however like it.
+        let copy = dir.path().join("copy.exe");
+        std::fs::copy(&k, &copy).unwrap();
+        assert!(!same_file(&k, &copy));
     }
 
     #[test] // spec: ARCH-027
