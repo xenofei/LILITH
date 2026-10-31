@@ -97,8 +97,8 @@ pub fn in_front(window: isize) -> bool {
 /// Whether the left button is down now, by `GetAsyncKeyState`: the button mapped to the logical left
 /// one (`SM_SWAPBUTTON`, as its documentation says to). No message can change it, but it isn't the
 /// physical button against a program: it follows injected input too (measured: 100 injected presses,
-/// none read as up). So it tells a trip through Windows' input from a posted message, not a hand from
-/// `SendInput`, which the source tells. A failed call reads as up.
+/// none read as up). So it tells a trip through Windows' input from a posted message alone, not a hand
+/// from `SendInput`, which the source tells. A failed call reads as up.
 pub fn left_button_physically_down() -> bool {
     // SAFETY: plain queries.
     unsafe {

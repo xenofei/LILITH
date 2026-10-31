@@ -432,6 +432,32 @@ TestCase {
         compare(Shapes.answers(fake).length, 0)
     }
 
+    // A click that brings the window forward: the activation can reach QML right after its words.
+    function test_coming_to_the_front_keeps_words_just_set() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const bar = panel.dialog.bar
+        const other = createTemporaryObject(otherWindow, null)
+        other.requestActivate()
+        tryVerify(() => other.active && !bar.inFront, 2000, "another window is in front")
+        bar.refuse("brought_forward", "Approve")
+        const words = bar.reason
+        verify(words.indexOf("off Approve") >= 0, words)
+        tc.Window.window.requestActivate()
+        tryVerify(() => bar.inFront, 2000)
+        compare(bar.reason, words, "just set: they stay")
+
+        // Words from a while before are old by the time the window is back.
+        other.requestActivate()
+        tryVerify(() => other.active && !bar.inFront, 2000)
+        bar.refuse("not_in_front", "Approve")
+        wait(1100)
+        tc.Window.window.requestActivate()
+        tryVerify(() => bar.inFront, 2000)
+        compare(bar.reason, "", "old: they go")
+        closeDialog(panel)
+    }
+
     function test_approve_waits_500_ms_and_for_the_front() { // spec: P4a-R10
         const panel = makePanel([crane])
         panel.showConfirmation(crane.id)

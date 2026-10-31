@@ -386,6 +386,8 @@ fn pointer_message(
                 origin = ?msg.origin,
                 device = ?msg.device,
                 in_send = msg.sent,
+                // No position: whether the message's own point is where the cursor is now.
+                on_time = msg.message_at == msg.at,
                 seen = counts.seen,
                 real = counts.real,
                 sent = counts.sent,

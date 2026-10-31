@@ -12,23 +12,27 @@
 //! **A warped cursor.** The Hello rules hold it off only for a still hand: under a moving hand, the
 //! hand's next real moves would rebuild the rest. So a move that isn't real, to a place other than
 //! where the cursor last was, on a button, means the pointer must really leave that button first
-//! ([`GateRefusal::Reenter`]), and only a real message ends that. What can't be told apart: Windows'
-//! own move (it reports `IMO_SYSTEM`, as for a warp) while the hand happens to be moving, when
-//! something changes the windows under it, reads as a warp; the cost is a move off and back, with
-//! words. A residual: a warp that lands just off a button, with the hand carrying on onto it, arrives
-//! by the hand's own real moves, and this gate doesn't tell that from an arrival with no warp. And a
-//! warp merged into the hand's next move, if Windows reports that one move as a real one, isn't seen
-//! at all: unmeasured until `tools/sandbox/confirm-check.ps1`'s step (l) reports it.
+//! ([`GateRefusal::Reenter`]), and only a real message ends that. A real move read late, whose own
+//! point isn't where the cursor is now, doesn't count as a place and ends nothing: a warp can land
+//! while it waits in the queue. What can't be told apart: Windows' own move (it reports `IMO_SYSTEM`,
+//! as for a warp) while the hand happens to be moving, when something changes the windows under it,
+//! reads as a warp; the cost is a move off and back, with words. This is a heuristic over what
+//! messages report, with residuals. A warp that lands just off a button, with the hand carrying on
+//! onto it, arrives by the hand's own real moves, and this gate doesn't tell that from an arrival with
+//! no warp. A warp merged into the hand's next move, if Windows reports that one move as a real one,
+//! isn't seen at all: unmeasured until `tools/sandbox/confirm-check.ps1`'s step (l) reports it. And a
+//! late real move with no move of Windows' own after it reads the same as that.
 //!
 //! **What can't be told.** Microsoft documents `IMO_HARDWARE` as covering a UIAccess application's
-//! injection too, so one reads as a hand. It documents that such an application must be signed and
-//! installed in a protected folder, unless a local policy turns that off. A public technique may reuse
-//! a signed process's token instead; that is unmeasured here. What a posted
+//! injection too, so one reads as a hand. It documents that such an application must be signed, and
+//! installed in a protected folder unless a local policy turns the folder rule off. A public technique
+//! may reuse a signed process's token instead; that is unmeasured here. What a posted
 //! message's source reports isn't documented, so the source isn't the only factor: at a press the
 //! left button must be down, and at a release up (`GetAsyncKeyState`: [`Seen::physically_down`]). That
 //! state follows real and injected input alike, measured: 100 injected presses, none read as up. So it
 //! proves no more than that a press or release really went through Windows' input, which a posted
-//! message doesn't; against `SendInput` it's the source that refuses. A click that went by before the
+//! message alone doesn't; against `SendInput`, or a posted press alongside one, it's the source that
+//! refuses. A click that went by before the
 //! thread read it is refused, and says so.
 //!
 //! **How a click reaches it.** QML's event comes after the message, through Qt's queue, and by then
@@ -279,8 +283,11 @@ impl PointerGate {
         }
         let real = is_real_pointer(msg.origin, msg.device, msg.sent);
         let serial = s.target.map(|t| t.serial);
-        // Only a real message: a program can warp the cursor off and back, or post a move.
-        if real && self.reenter.is_some() && serial != self.reenter {
+        // Where the message says the cursor was is where it is now. A hand's move still in the queue
+        // when a warp lands reads as real, from the old place, with the cursor at the new one.
+        let on_time = msg.message_at == msg.at;
+        // Only a real message, on time: a program can warp the cursor off and back, or post a move.
+        if real && on_time && self.reenter.is_some() && serial != self.reenter {
             self.reenter = None;
         }
         // A real move ends a rest's small moves near where it was; a warp lands anywhere. If it lands
@@ -294,14 +301,18 @@ impl PointerGate {
         {
             self.reenter = Some(t.serial);
         }
-        // Only from input: a posted message leaves the queue before it, and the filter reads the cursor
-        // for each, so a program could otherwise record a warp's place before Windows' own move says so.
-        if input && msg.at.is_some() {
+        // Only from a move of input, on time. A posted message leaves the queue before input, and the
+        // filter reads the cursor for each message, so anything else could record a warp's place before
+        // Windows' own move says so.
+        if s.kind == PointerKind::Move && input && on_time && msg.at.is_some() {
             self.last_at = msg.at;
         }
         if let Some(t) = s.target.filter(|t| t.changed) {
             self.gate.restart(msg.at);
-            self.press_refused = None;
+            // A press that brought the window forward stays that, whatever coming forward did here.
+            self.press_refused = self
+                .press_refused
+                .filter(|&refused| refused == GateRefusal::Click(Refusal::NotInFront));
             self.press_serial = None;
             self.token = None;
             self.press_token = None;
@@ -953,6 +964,143 @@ mod tests {
         assert_eq!(
             click_on_two(&mut r, (153, 116), same),
             Err(GateRefusal::Reenter)
+        );
+    }
+
+    /// A hand's move read after the warp landed: its own point is the old place, and the cursor reads
+    /// the new one.
+    fn late(at: (i32, i32), message_at: (i32, i32)) -> PointerMsg {
+        PointerMsg {
+            message_at: Some(message_at),
+            ..hardware(at)
+        }
+    }
+
+    fn click_on_one(r: &mut Replay, at: (i32, i32)) -> Result<(), GateRefusal> {
+        r.advance(HOVER_BEFORE_PRESS);
+        r.press(hardware(at));
+        r.advance(Duration::from_millis(60));
+        r.release(hardware(at));
+        r.qml_click()
+    }
+
+    #[test] // spec: P4a-R10
+    fn a_real_move_read_after_a_warp_doesnt_count_as_a_place() {
+        let mut r = Replay::new();
+        r.mv(hardware(OFF));
+        r.mv(hardware((60, 60)));
+        r.seen(PointerKind::Move, late(ON, (61, 60)), Replay::target_at(ON));
+        r.mv(system(ON));
+        r.mv(hardware((151, 115)));
+        r.mv(hardware((152, 115)));
+        assert_eq!(click_on_one(&mut r, (152, 115)), Err(GateRefusal::Reenter));
+    }
+
+    /// Both warps hidden by a hand's moves read late: the one with the cursor off clears nothing.
+    #[test] // spec: P4a-R10
+    fn a_new_amount_with_both_warps_hidden_by_late_moves_still_needs_the_re_entry() {
+        let new_amount = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let same = Target {
+            changed: false,
+            ..new_amount
+        };
+        for windows_own_moves in [true, false] {
+            let mut r = Replay::new();
+            r.rest_on_the_button();
+            r.seen(PointerKind::Move, hardware((151, 116)), Some(new_amount));
+            r.seen(PointerKind::Move, late(OFF, (152, 116)), None);
+            if windows_own_moves {
+                r.seen(PointerKind::Move, system(OFF), None);
+            }
+            r.seen(PointerKind::Move, late((153, 116), (51, 50)), Some(same));
+            if windows_own_moves {
+                r.seen(PointerKind::Move, system((153, 116)), Some(same));
+            }
+            r.seen(PointerKind::Move, hardware((154, 116)), Some(same));
+            r.seen(PointerKind::Move, hardware((155, 116)), Some(same));
+            r.advance(HOVER_BEFORE_PRESS);
+            assert_eq!(
+                click_on_two(&mut r, (155, 116), same),
+                Err(GateRefusal::Reenter)
+            );
+        }
+    }
+
+    /// What isn't a move says nothing of where a hand put the cursor, whatever its origin reads.
+    #[test] // spec: P4a-R10
+    fn only_a_move_counts_as_a_place() {
+        let cases: [(PointerKind, fn((i32, i32)) -> PointerMsg); 6] = [
+            (PointerKind::Leave, system),
+            (PointerKind::CaptureChanged, system),
+            (PointerKind::CancelMode, system),
+            (PointerKind::MouseActivate, system),
+            (PointerKind::Press, injected),
+            (PointerKind::Release, injected),
+        ];
+        for (kind, origin) in cases {
+            let mut r = Replay::new();
+            r.mv(hardware(OFF));
+            r.mv(hardware((60, 60)));
+            r.seen(kind, origin(ON), Replay::target_at(ON));
+            r.mv(system(ON));
+            r.mv(hardware((151, 115)));
+            r.mv(hardware((152, 115)));
+            assert_eq!(
+                click_on_one(&mut r, (152, 115)),
+                Err(GateRefusal::Reenter),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A fast hand's moves all read a moment late, with no warp: nothing to refuse.
+    #[test] // spec: P4a-R10
+    fn a_hand_whose_moves_read_late_needs_no_re_entry() {
+        let mut r = Replay::new();
+        r.mv(hardware(OFF));
+        r.seen(PointerKind::Move, late((80, 80), (60, 60)), None);
+        r.seen(PointerKind::Move, late((90, 90), (80, 80)), None);
+        r.seen(
+            PointerKind::Move,
+            late((120, 110), (90, 90)),
+            Replay::target_at((120, 110)),
+        );
+        r.seen(
+            PointerKind::Move,
+            late(ON, (120, 110)),
+            Replay::target_at(ON),
+        );
+        r.mv(hardware(ON));
+        r.mv(hardware((151, 115)));
+        assert_eq!(click_on_one(&mut r, (151, 115)), Ok(()));
+    }
+
+    /// The window comes to the front between the activating click's press and its release, so the
+    /// release finds a new button: the click still reads as what it was.
+    #[test] // spec: P4a-R10
+    fn the_activating_click_keeps_its_words_across_the_new_button() {
+        let back = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.seen(
+            PointerKind::MouseActivate,
+            posted(ON),
+            Replay::target_at(ON),
+        );
+        r.press(hardware(ON));
+        r.seen(PointerKind::Release, hardware(ON), Some(back));
+        r.gate.take_press(2, r.now);
+        assert_eq!(
+            r.gate.take_click(2, r.now),
+            Err(GateRefusal::Click(Refusal::NotInFront))
         );
     }
 

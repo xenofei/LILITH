@@ -34,6 +34,7 @@ Column {
     // The answer went through: nothing more goes out.
     property bool sent: false
     property string reason
+    property real _reasonAtMs: -1000
     readonly property bool connected: CoreGate.ready(root)
     readonly property bool buttonsOn: open && !busy && !sent
     readonly property bool live: buttonsOn && connected
@@ -58,9 +59,12 @@ Column {
 
     onInFrontChanged: {
         restartClock()
-        if (inFront)
+        // Old words go. Ones just set stay: the activation can reach QML right after the click that
+        // caused it was refused, and those words say what to do next.
+        if (inFront && ConfirmInput.nowMs() - _reasonAtMs >= 1000)
             reason = ""
     }
+    onReasonChanged: _reasonAtMs = ConfirmInput.nowMs()
     onVisibleChanged: restartClock()
     // Words from before it could answer again are old news. An answer that fails with the core still
     // there sets its words after this.

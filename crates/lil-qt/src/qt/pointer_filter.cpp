@@ -154,9 +154,11 @@ void pointerWatch(const QVariant &item)
         pointer_guard(SetWindowsHookExW(WH_CALLWNDPROC, sentHook, nullptr, GetCurrentThreadId()) != nullptr);
     }
     s_watched.removeIf([](const Watched &w) { return !w.item; });
-    pointerUnwatch(item);
+    // Nothing was watched until now, so what the gate knew is old. Watching a button again isn't that:
+    // a press that is down, or a re-entry it is owed, still stands.
     if (s_watched.isEmpty())
         pointer_gate_reset();
+    pointerUnwatch(item);
     Watched watched;
     watched.item = quick;
     watched.serial = s_nextSerial++;
