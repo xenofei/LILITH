@@ -1,6 +1,10 @@
 // The app's main window: a KDDockWidgets main window (DockingArea) holding one dock per panel of
 // Panels.js (APP-001, ARCH-010). It starts hidden; main.cpp shows it through lilshim::activate,
-// with or without the focus. Later tasks add the top bar.
+// with or without the focus.
+//
+// Top (APP-006, APP-016, APP-034): the top bar (TopBar) and the connection and no-workspace banners
+// stack above the shell's own banners and the docks. `eventLog` runs from the shell's start, so
+// Diagnostics shows the events from before it was opened.
 //
 // Layout (APP-002 to APP-004, P4a-R16, P4a-R33): when it is made it restores the last layout from
 // `stateDir` in APP-003's order (DockLayout: the windows exist, the dock factory is registered,
@@ -11,7 +15,7 @@
 //
 // Keys (APP-011): the plan 4a shortcut map (ShellState.shortcuts), all global: one per panel,
 // F6 and Shift+F6 to the next and previous panel, and Ctrl+Shift+P, which emits
-// gpuPauseToggleRequested() for the top bar's pause control (Task 20). Closing a panel announces
+// gpuPauseToggleRequested() for the top bar's pause control. Closing a panel announces
 // the key that opens it again (Accessible.announce, a UI Automation notification).
 //
 // Open requests (APP-014, APP-020, APP-065, P4a-R21; the block marked "Open requests" below):
@@ -77,6 +81,15 @@ Window {
 
     signal gpuPauseToggleRequested()
 
+    property alias topBar: topBar
+    property alias connectionBanner: connectionBanner
+    property alias noWorkspaceBanner: noWorkspaceBanner
+    property EventLogModel eventLog: EventLogModel {
+        core: root.core
+    }
+
+    onGpuPauseToggleRequested: topBar.togglePause()
+
     // --- Open requests (Task 19) ---
     // The shim the window is activated through: LilShim, or a test's fake.
     property var shim: LilShim
@@ -95,8 +108,33 @@ Window {
     title: core && core.project ? "LILITH — " + core.project : "LILITH"
     color: Theme.bg
 
+    Column {
+        id: shellTop
+        width: parent.width
+
+        TopBar {
+            id: topBar
+            width: parent.width
+            core: root.core
+        }
+
+        ConnectionBanner {
+            id: connectionBanner
+            width: parent.width
+            core: root.core
+        }
+
+        NoWorkspaceBanner {
+            id: noWorkspaceBanner
+            width: parent.width
+            core: root.core
+            onWarned: text => topBar.showNotice(text, "warning")
+        }
+    }
+
     LBanner {
         id: layoutBanner
+        anchors.top: shellTop.bottom
         width: parent.width
         kind: "warning"
     }
@@ -104,7 +142,7 @@ Window {
     // --- Open requests (Task 19): while another program holds the launch channel ---
     LBanner {
         id: instanceBanner
-        anchors.top: layoutBanner.visible ? layoutBanner.bottom : parent.top
+        anchors.top: layoutBanner.visible ? layoutBanner.bottom : shellTop.bottom
         width: parent.width
         kind: "warning"
     }
@@ -113,7 +151,7 @@ Window {
     KDDW.DockingArea {
         id: dockingArea
         anchors.top: instanceBanner.visible ? instanceBanner.bottom
-                   : layoutBanner.visible ? layoutBanner.bottom : parent.top
+                   : layoutBanner.visible ? layoutBanner.bottom : shellTop.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom

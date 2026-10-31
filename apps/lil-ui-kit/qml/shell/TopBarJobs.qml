@@ -1,0 +1,237 @@
+// What the top bar knows of the jobs (APP-006): how many run and wait, and the lanes' states. It
+// follows the `jobs` topic and shows nothing itself.
+//
+// Counts come from the queue's own source, as the Jobs panel's live list does (Appendix G "Queue
+// position"): `jobs.list {status: "running"}` and every page of `jobs.list {order: "queue"}`, whose
+// JSON goes to a LiveJobsModel of its own as it came, never parsed here. A `jobs` event is one job,
+// never a count: it goes to the model, and one that came, went or changed status asks for a read
+// 150 ms after the last such event (and at most 1 s after the first, so a steady stream still
+// reads). One read is out at a time. A snapshot or a `resync_required` reads afresh; `ready` never
+// does. The model's clock isn't run: nothing here shows a time.
+//
+// Lanes come from the read and from `{kind: "queue", state}` events, applied as full states, at
+// most one update per frame. An event that comes during a read is newer than that read's lanes.
+import QtQuick
+import Lilith.Core
+import Lilith.UiKit
+
+Item {
+    id: root
+
+    required property var core
+
+    readonly property alias loaded: live.loaded
+    property int running: 0
+    property int queued: 0
+    // How many queued jobs the last read listed when it stopped at its page cap, else -1.
+    property int capped: -1
+    // lane -> QueueState.
+    property var lanes: ({})
+    // The lane updates applied (at most one per frame).
+    property int laneUpdates: 0
+
+    // A job reached a terminal status.
+    signal jobEnded()
+
+    readonly property int _maxWaitMs: 1000
+    property real _dueSince: 0
+    property bool _reading: false
+    property bool _again: false
+    // The next read must carry nothing over (a snapshot or a resync came).
+    property bool _fresh: false
+    property var _pendingLanes: ({})
+    property var _lanesDuringRead: ({})
+    // Request id -> {ok, fail}: the calls whose answer goes to the model as it came.
+    property var _raw: ({})
+
+    visible: false
+
+    function applyLanes(states) {
+        const next = Object.assign({}, lanes)
+        for (const s of states || []) {
+            if (s && s.lane)
+                next[s.lane] = s
+        }
+        lanes = next
+        laneUpdates++
+    }
+
+    function queueEvent(state) {
+        if (!state || !state.lane)
+            return
+        if (_reading)
+            _lanesDuringRead[state.lane] = state
+        _pendingLanes[state.lane] = state
+        if (!laneFrame.running)
+            laneFrame.start()
+    }
+
+    function updateCounts() {
+        const o = JSON.parse(live.overview(""))
+        running = o.running
+        queued = o.queued
+        capped = o.capped === null || o.capped === undefined ? -1 : o.capped
+    }
+
+    function rawCall(args, ok, fail) {
+        const id = core.call("jobs.list", JSON.stringify(args))
+        _raw[id] = {ok: ok, fail: fail}
+    }
+
+    function requestRead() {
+        const now = Date.now()
+        if (_dueSince === 0)
+            _dueSince = now
+        if (now - _dueSince < _maxWaitMs)
+            coalesce.restart()
+        else if (!coalesce.running)
+            coalesce.start()
+    }
+
+    function read() {
+        if (!core)
+            return
+        if (_reading) {
+            _again = true
+            return
+        }
+        const fresh = _fresh
+        _fresh = false
+        _reading = true
+        _lanesDuringRead = {}
+        live.beginRead(fresh)
+        let open = 2
+        let gone = false
+        const done = () => {
+            if (gone || --open > 0)
+                return
+            live.commit(Date.now())
+            root._reading = false
+            root.updateCounts()
+            root.applyLanes(JSON.parse(live.lanesJson()))
+            root.applyLanes(Object.keys(root._lanesDuringRead).map(k => root._lanesDuringRead[k]))
+            if (root._again) {
+                root._again = false
+                if (root._fresh)
+                    root.read()
+                else
+                    root.requestRead()
+            }
+        }
+        const fail = () => {
+            if (gone)
+                return
+            gone = true
+            root._reading = false
+            root._fresh = root._fresh || fresh
+            root._again = false
+            retry.start()
+        }
+        rawCall({status: "running", limit: 100}, json => {
+            if (!gone) {
+                live.setRunning(json)
+                done()
+            }
+        }, fail)
+        const page = cursor => rawCall(cursor ? {order: "queue", limit: 100, cursor: cursor}
+                                              : {order: "queue", limit: 100}, json => {
+            if (gone)
+                return
+            const next = live.addQueuePage(json)
+            if (next !== "")
+                page(next)
+            else
+                done()
+        }, fail)
+        page("")
+    }
+
+    function onJobsEvent(kind, data) {
+        if (kind !== "event") {
+            _fresh = true
+            read()
+            return
+        }
+        if (!data)
+            return
+        if (data.kind === "queue") {
+            queueEvent(data.state)
+        } else if (data.kind === "job" && data.job) {
+            const j = data.job
+            const change = live.applyJob(JSON.stringify(j), Date.now())
+            if (change > 0)
+                updateCounts()
+            if (change === 2)
+                requestRead()
+            if (j.status === "succeeded" || j.status === "failed" || j.status === "cancelled")
+                jobEnded()
+        }
+    }
+
+    Component.onCompleted: {
+        if (!core)
+            return
+        CoreCall.subscribe(core, "jobs", root, (kind, seq, data) => root.onJobsEvent(kind, data))
+        read()
+    }
+
+    Component.onDestruction: {
+        for (const id in _raw) {
+            try {
+                core.cancel(id)
+            } catch (e) {
+                // The core object went first.
+            }
+        }
+        _raw = {}
+    }
+
+    Connections {
+        target: root.core
+        ignoreUnknownSignals: true
+        function onCallFinished(id, json) {
+            const h = root._raw[id]
+            if (!h)
+                return
+            delete root._raw[id]
+            h.ok(json)
+        }
+        function onCallFailed(id, json) {
+            const h = root._raw[id]
+            if (!h)
+                return
+            delete root._raw[id]
+            h.fail(JSON.parse(json))
+        }
+    }
+
+    LiveJobsModel {
+        id: live
+    }
+
+    Timer {
+        id: coalesce
+        interval: 150
+        onTriggered: {
+            root._dueSince = 0
+            root.read()
+        }
+    }
+
+    Timer {
+        id: retry
+        interval: 2000
+        onTriggered: root.read()
+    }
+
+    // At most one lane update per frame.
+    Timer {
+        id: laneFrame
+        interval: 16
+        onTriggered: {
+            const pending = root._pendingLanes
+            root._pendingLanes = {}
+            root.applyLanes(Object.keys(pending).map(k => pending[k]))
+        }
+    }
+}

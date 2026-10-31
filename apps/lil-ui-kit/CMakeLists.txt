@@ -65,4 +65,16 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/jobs/LaneHeader.qml
         qml/panels/jobs/QueueControls.qml)
 
+# Task 20: the top bar, its switchers and the shell's connection and no-workspace banners.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/shell/TopBar.qml
+        qml/shell/TopBarJobs.qml
+        qml/shell/StatusIndicator.qml
+        qml/shell/SwitcherPopup.qml
+        qml/shell/ProjectSwitcher.qml
+        qml/shell/WorkspaceSwitcher.qml
+        qml/shell/ConnectionBanner.qml
+        qml/shell/NoWorkspaceBanner.qml)
+
 add_subdirectory(tests)
