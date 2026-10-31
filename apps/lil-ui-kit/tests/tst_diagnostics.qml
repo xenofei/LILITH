@@ -138,7 +138,7 @@ TestCase {
     }
 
     function failed(error) {
-        return {status: "error", error: Object.assign({category: "transient", trace_id: "tr_0000000000000001", retry: "never"}, error)}
+        return {status: "error", error: Object.assign({category: "user_fixable", trace_id: "t_0000000000000001", retry: "after_resolve"}, error)}
     }
 
     function isTool(name) {
@@ -356,7 +356,8 @@ TestCase {
         const panel = makePanel(core)
         const job = n => ({job_id: "j_" + n, status: "queued"})
         load(core, {"jobs.running": ok({jobs: [job(1)], next_cursor: null,
-                                        lanes: [{lane: "gpu-heavy", paused: false, reasons: [], held: 0, restart_held: 0, withdrawn: 0}]}),
+                                        lanes: [{lane: "gpu-heavy", paused: false, reasons: [], held: 0, restart_held: 0, withdrawn: 0},
+                                                {lane: "cpu", paused: false, reasons: [], held: 0, restart_held: 0, withdrawn: 0}]}),
                     "jobs.queued": ok({jobs: Array.from({length: 100}, (x, n) => job(n)), next_cursor: "more", lanes: []})})
         tryVerify(() => shows(panel.queue, "1 running, 100 or more queued"), 5000, texts(panel.queue).join(" | "))
         verify(shows(panel.queue, "GPU work: not paused"), texts(panel.queue).join(" | "))
@@ -863,7 +864,7 @@ TestCase {
     function test_no_configured_comfyui_means_no_report_read() { // spec: CORE-164
         const core = makeCore()
         const panel = makePanel(core)
-        answer(core, isTool("engines.status"), ok({engines: [comfy({class: "none", state: "stopped", launch_profile: null, version: undefined, inventory: undefined})]}))
+        answer(core, isTool("engines.status"), ok({engines: [{engine: "comfyui", class: "none", state: "stopped", url: "http://127.0.0.1:8188", listen: "unknown", outside_jobs: {running: 0, queued: 0}, restart_needed: false, launch_profile: null, asset_catalogue: "unknown"}]}))
         tryVerify(() => shows(panel.models, "ComfyUI isn't configured"), 5000, texts(panel.models).join(" | "))
         wait(50)
         compare(callsOf(core, "models.report"), [], "no engine.not_configured for a panel nobody asked of")
