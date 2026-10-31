@@ -275,7 +275,7 @@ TestCase {
         verify(panel.banner.text.indexOf("j_00000000000000ff") >= 0
                && panel.banner.text.indexOf("isn't in the list") >= 0, panel.banner.text)
         compare(panel.liveView.currentIndex, -1)
-        compare(panel.wantedJob, "", "it has stopped looking")
+        compare(panel.wantedJob, "j_00000000000000ff", "it has stopped reading, but a later event can still land it")
         // Once loaded, the same at once; and a request for a job that's there replaces it.
         launch(shell, {kind: "task", job: "j_00000000000000ee"})
         verify(panel.banner.text.indexOf("j_00000000000000ee") >= 0, panel.banner.text)

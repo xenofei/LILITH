@@ -40,7 +40,7 @@
 // so markup shows as written and an <img> in it loads nothing (AI-222).
 //
 // showJob(id, focus) selects a job's row. A link can ask for it before the first read has returned
-// (P4a-R21), so the panel remembers the job (`wantedJob`) and tries again after each read that loads
+// (P4a-R21), so the panel remembers the job (`wantedJob`) and tries again after each event and read that loads
 // rows, paging back through the history while it looks, until it lands, a new request replaces it,
 // or the reads have finished without the row: then the banner says the job isn't in the list. The
 // keyboard focus moves to the row only when asked, and not if it has moved on while the panel looked.
@@ -121,6 +121,9 @@ Rectangle {
     property bool _wantedFocus: false
     // The banner is saying a job isn't in the list.
     property bool _saysNotListed: false
+    // The wanted job wasn't found in what there is to read: it stays wanted, for an event to bring,
+    // but nothing is read for it any more, and landing takes no focus.
+    property bool _wantedGaveUp: false
 
     // Writes need the core (APP-034): the buttons are marked `requiresCore`, and calls check here.
     readonly property bool writable: jobsModel.loaded && live.loaded && !!core && core.connection === "ready"
@@ -271,6 +274,7 @@ Rectangle {
     function showJob(jobId, focus) {
         wantedJob = jobId
         _wantedFocus = focus !== false
+        _wantedGaveUp = false
         if (_saysNotListed) {
             _saysNotListed = false
             banner.close()
@@ -312,6 +316,14 @@ Rectangle {
     // You chose a row: a job still being looked for must not take the selection from you.
     function personSelected() {
         wantedJob = ""
+        clearNotListed()
+    }
+
+    function clearNotListed() {
+        if (_saysNotListed) {
+            _saysNotListed = false
+            banner.close()
+        }
     }
 
     // Lands on the wanted job if a read or an event has brought its row. The focus goes along only if it is
@@ -323,14 +335,17 @@ Rectangle {
         while (focused && focused !== root)
             focused = focused.parent
         const focusStayed = !root.Window.activeFocusItem || focused === root
-        if (landOnJob(wantedJob, _wantedFocus && focusStayed))
+        if (landOnJob(wantedJob, _wantedFocus && focusStayed)) {
             wantedJob = ""
+            clearNotListed()
+        }
     }
 
-    // The reads have finished without the wanted job.
+    // The reads have finished without the wanted job. It stays wanted: its event may be on the way.
     function wantedJobNotListed() {
         const id = shown(wantedJob)
-        wantedJob = ""
+        _wantedGaveUp = true
+        _wantedFocus = false
         _saysNotListed = true
         banner.kind = "warning"
         banner.show("Job " + id + (_historyCutAt >= 0 ? " isn't in the newest " + grouped(_historyCutAt) + " jobs."
@@ -757,7 +772,7 @@ Rectangle {
         tryWantedJob()
         if (!jobsModel.loaded || _historyAsked)
             return
-        const seeking = wantedJob !== "" && live.loaded
+        const seeking = wantedJob !== "" && live.loaded && !_wantedGaveUp
         const top = jobsModel.index(-1, 0)
         if ((historyList.count >= Math.max(20, Math.ceil(historyList.height / 40)) && !seeking)
                 || !jobsModel.canFetchMore(top)) {
@@ -864,8 +879,23 @@ Rectangle {
         ListView {
             id: liveList
             anchors { left: parent.left; right: parent.right; top: parent.top }
-            // As tall as it needs, up to 60 % of the panel; the finished list has the rest.
-            height: Math.min(contentHeight, parent.height * 0.6)
+            // As tall as it needs, up to 60 % of the panel; the finished list has the rest. Delayed:
+            // the height changes which rows are made, and that the content's height.
+            Binding on height {
+                value: Math.min(liveList.contentHeight, liveList.parent.height * 0.6)
+                delayed: true
+            }
+            // A ListView's header grows upward, past the top of the view: `originY` moves and
+            // `contentY` stays. The lanes come with the first read, so the header grows after the
+            // list is made, and it would start out of view. So a view that was at its start stays
+            // there as the start moves; scrolled away it is left be. (The old origin, since a scroll
+            // can move the origin before `contentY` says it changed.)
+            property real _originWas: 0
+            onOriginYChanged: {
+                if (contentY <= _originWas + 1)
+                    contentY = originY
+                _originWas = originY
+            }
             clip: true
             model: live
             spacing: 4

@@ -69,6 +69,7 @@ TestCase {
     // KDDockWidgets' names are process-wide: a shell of the test before deletes its docks later.
     function init() {
         answered = {}
+        failOnWarning(/Binding loop/)
         wait(100)
     }
 
@@ -321,6 +322,186 @@ TestCase {
         const w = createTemporaryObject(panelWindow, tc, {core: core})
         windows.push(w)
         return {window: w, panel: w.panel, core: core}
+    }
+
+    // The top of the live list's header, and the lane's own control, are inside the view.
+    function headerInView(panel) {
+        const v = panel.liveView
+        if (!v.headerItem || !panel.laneHeader("gpu-heavy"))
+            return false
+        const button = panel.laneHeader("gpu-heavy")
+        return v.headerItem.mapToItem(v, 0, 0).y >= -1 && v.contentY <= v.originY + 1
+               && button.mapToItem(v, 0, 0).y >= -1
+    }
+
+    function test_the_header_is_in_view_on_open_and_as_rows_come() { // spec: APP-114, CORE-160
+        // The lanes come with the first read, so the header grows after the list is made: Pause
+        // must not start above the view.
+        const paused = [lane({paused: true, reasons: ["manual"], held: 3}), lane({lane: "cpu"})]
+        // More rows than the list's share of the panel holds: then it can scroll, and did.
+        const first = [Shapes.job("r1", "running"), Shapes.job("r2", "running")]
+        const waiting = []
+        for (let i = 0; i < 3; ++i)
+            waiting.push(Shapes.job("q" + i, "queued", {queue_position: i}))
+        const t = load({lanes: paused, running: first, queue: waiting})
+        tryVerify(() => t.panel.liveView.count === 5 && t.panel.liveView.headerItem.height > 100, 2000, "the rows and the lane headers")
+        wait(100)
+        verify(headerInView(t.panel), "in view on open: contentY " + t.panel.liveView.contentY + ", originY " + t.panel.liveView.originY)
+
+        // More rows arrive, by an event and by the read it starts.
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("r3", "running")})
+        answerLive(t.core, first.concat([Shapes.job("r3", "running")]), waiting, paused)
+        tryVerify(() => t.panel.live.count === 6, 2000)
+        wait(100)
+        verify(headerInView(t.panel), "in view after rows arrive")
+
+        // The panel's height changes.
+        t.window.height = 500
+        tryVerify(() => t.panel.height === 500, 2000)
+        wait(50)
+        verify(headerInView(t.panel), "in view at another height")
+        t.window.height = 780
+        wait(50)
+        verify(headerInView(t.panel), "and back")
+    }
+
+    function test_the_view_does_not_jump_while_you_have_scrolled() { // spec: APP-114
+        const queue = []
+        for (let i = 0; i < 40; ++i)
+            queue.push(Shapes.job("q" + i, "queued", {queue_position: i}))
+        const t = load({queue: queue})
+        const v = t.panel.liveView
+        tryVerify(() => v.count === 40 && v.contentHeight > v.height + 400 && headerInView(t.panel), 3000,
+                  "a long list that can scroll, from its top")
+
+        const away = v.originY + 300
+        v.contentY = away
+        // The header grows above, and a row comes.
+        t.core.emit("jobs", "event", {kind: "queue", state: lane({paused: true, reasons: ["manual"], held: 3})})
+        tryVerify(() => t.panel.lanes["gpu-heavy"].paused, 2000)
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("r1", "running")})
+        answerLive(t.core, [Shapes.job("r1", "running")], queue)
+        tryVerify(() => v.count === 41, 2000)
+        wait(50)
+        compare(v.contentY, away, "you stay where you scrolled")
+
+        // Back at the top, the view follows the header again.
+        v.contentY = v.originY
+        t.core.emit("jobs", "event", {kind: "queue", state: lane()})
+        tryVerify(() => !t.panel.lanes["gpu-heavy"].paused, 2000)
+        wait(50)
+        verify(headerInView(t.panel), "from the top it stays at the top")
+    }
+
+    // Every listing of a read refused, as a lost connection refuses them.
+    function refuseLive(core) {
+        const no = Shapes.refusal("core.unreachable", "No core.")
+        answer(core, isRunningRead, no, "the running read")
+        answer(core, isQueueRead, no, "the queue read")
+        answer(core, isQueuedRead, no, "the queued read")
+    }
+
+    function pauseControl(panel) {
+        return findText(panel.laneHeader("gpu-heavy"), ["Pause", "Resume"])
+    }
+
+    function findText(item, texts) {
+        if (texts.indexOf(item.text) >= 0)
+            return item
+        for (let i = 0; i < item.children.length; ++i) {
+            const found = findText(item.children[i], texts)
+            if (found)
+                return found
+        }
+        return null
+    }
+
+    function test_the_pause_recovers_after_failed_reads() { // spec: ARCH-100, CORE-160
+        const paused = [lane({paused: true, reasons: ["manual"]})]
+        const t = load({lanes: paused})
+        const button = pauseControl(t.panel)
+        verify(button)
+        tryVerify(() => button.enabled, 2000)
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(!button.enabled, "waiting for the read")
+
+        // The read fails, twice: the control stays off, and it is asked again.
+        refuseLive(t.core)
+        verify(!t.panel.lanesCurrent, "a failed read isn't current")
+        verify(!button.enabled)
+        tryVerify(() => openCalls(t.core, isRunningRead).length > 0, 3500, "read again")
+        refuseLive(t.core)
+        verify(!t.panel.lanesCurrent)
+        tryVerify(() => openCalls(t.core, isRunningRead).length > 0, 3500, "and again")
+
+        // Then it works: the state is the new core's, and the control comes back by itself.
+        answerLive(t.core, [], [], [lane()])
+        tryVerify(() => t.panel.lanesCurrent, 2000, "it recovers")
+        tryVerify(() => button.enabled, 2000)
+        compare(pauseControl(t.panel).text, "Pause", "a restart ended the pause")
+    }
+
+    function test_a_read_asked_for_during_a_failing_one_goes_at_once() { // spec: ARCH-100, CORE-160
+        const t = load()
+        const reads = () => t.core.calls.filter(isRunningRead).length
+        // The connection flaps: `ready` finds a read out, so it asks for another.
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: null})
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: null})
+        const before = reads()
+
+        // The old connection's read fails: the one asked for goes now, not after the 2 s retry.
+        refuseLive(t.core)
+        compare(reads(), before + 1, "at once")
+        verify(!t.panel.lanesCurrent)
+        answerLive(t.core, [], [])
+        tryVerify(() => t.panel.lanesCurrent, 2000, "and that one counts")
+    }
+
+    function test_a_wanted_job_can_land_after_the_panel_gave_up() { // spec: APP-114, P4a-R21
+        // Everything is loaded: a link's job isn't there, and no more history can be fetched.
+        const t = load()
+        verify(!t.panel.showJob("j9", false))
+        verify(t.panel.banner.visible)
+        verify(t.panel.banner.text.indexOf("isn't in the list") >= 0, t.panel.banner.text)
+
+        // Its event comes a moment later.
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("j9", "running")})
+        tryCompare(t.panel, "wantedJob", "", 2000, "it landed")
+        compare(t.panel.live.get(t.panel.liveView.currentIndex).job_id, "j9")
+        verify(!t.panel.banner.visible, "and the words went")
+
+        // What comes after giving up doesn't say it again: the words are said once.
+        verify(!t.panel.showJob("j8", false))
+        verify(t.panel.banner.visible)
+        t.panel.banner.close()
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("old", "succeeded")})
+        tryVerify(() => t.panel.historyView.count === 1, 2000, "a row came, which looks again")
+        wait(50)
+        verify(!t.panel.banner.visible, "said once")
+        compare(t.panel.wantedJob, "j8")
+        answerLiveIfAsked(t.core)
+
+        // A selection by you still drops it, and the words with it.
+        verify(!t.panel.showJob("j7", false))
+        verify(t.panel.banner.visible)
+        const r = t.panel.rowFor("j9")
+        verify(r)
+        wait(50)
+        mouseClick(r, 5, 5)
+        compare(t.panel.wantedJob, "")
+        verify(!t.panel.banner.visible)
+        const chosen = t.panel.liveView.currentIndex
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("j7", "running")})
+        tryVerify(() => t.panel.live.rowOf("j7") >= 0, 2000)
+        compare(t.panel.live.get(t.panel.liveView.currentIndex).job_id, "j9", "still yours: " + chosen)
+    }
+
+    function answerLiveIfAsked(core) {
+        if (openCalls(core, isRunningRead).length > 0)
+            answerLive(core, [Shapes.job("j9", "running")], [])
     }
 
     function test_a_wanted_job_lands_when_an_event_brings_it() { // spec: APP-114, P4a-R21
@@ -1189,6 +1370,8 @@ TestCase {
         // A status this build doesn't know shows with the live jobs, by name, and can be cancelled.
         tryVerify(() => liveOrder(t.panel).indexOf("j4") >= 0, 2000, JSON.stringify(liveOrder(t.panel)))
         compare(liveOrder(t.panel).slice(0, 3).sort(), ["j1", "j2", "j3"], "the running ones first")
+        // Under the lane headers, it may be below the view: its row is made when it is scrolled to.
+        t.panel.liveView.positionViewAtIndex(liveOrder(t.panel).indexOf("j4"), ListView.Contain)
         const o = row(t.panel, "j4")
         verify(o.statusText.indexOf("paused_by_director") >= 0 && o.statusText.indexOf("planning") >= 0, o.statusText)
         verify(o.titleText.indexOf("bulk") >= 0, o.titleText)
