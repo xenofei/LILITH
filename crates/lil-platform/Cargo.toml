@@ -59,6 +59,8 @@ features = [
     "Win32_Foundation",
     # The NVIDIA adapter's LUID, for the PDH GPU memory instances (CORE-059).
     "Win32_Graphics_Dxgi",
+    # DWMWA_CLOAKED: whether a window that takes clicks can be seen (lil_qt's pointer gate).
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",

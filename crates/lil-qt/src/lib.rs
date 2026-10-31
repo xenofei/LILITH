@@ -39,9 +39,9 @@
 //! with their places, ETAs and times); the bridge's `JobText` and `LiveJobsModel` serve them to
 //! QML.
 //!
-//! The confirm dialog's Qt-free parts (P4a-R10): [`answer_gate`] (when it takes an answer) and
-//! [`pointer_gate`] (whether a click on Approve came from a real pointer); the bridge's
-//! `ConfirmInput` serves them to QML.
+//! The confirm dialog's Qt-free parts (P4a-R10): [`answer_gate`] (when it takes an answer),
+//! [`pointer_gate`] (whether a click on Approve came from a real pointer) and [`confirm_text`] (what
+//! it shows of the action); the bridge's `ConfirmInput` serves them to QML.
 
 #[cfg(feature = "qt")]
 extern crate cxx_qt_lib;
@@ -52,6 +52,7 @@ pub mod qt;
 pub mod answer_gate;
 pub mod app_state;
 pub mod args;
+pub mod confirm_text;
 pub mod counts;
 pub mod csv;
 pub mod format;

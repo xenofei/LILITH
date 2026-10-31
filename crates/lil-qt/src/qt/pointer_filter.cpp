@@ -1,7 +1,9 @@
-// The native event filter behind ConfirmInput (P4a-R10). Mouse messages reach a native event filter
-// in the event dispatcher, after they leave the thread's queue and before they are dispatched;
-// Windows' own sent messages (capture, activation) reach it in the window procedure. It changes
-// nothing: every message goes on to Qt. With nothing watched it reads nothing.
+// The native side of ConfirmInput (P4a-R10). Mouse messages reach a native event filter in the event
+// dispatcher, after they leave the thread's queue and before they are dispatched; Windows' own sent
+// messages (capture, activation) reach it in the window procedure. A mouse message another program
+// *sends* reaches neither: Qt keeps input messages out of the window procedure's filter, so a thread
+// hook (WH_CALLWNDPROC, which sees sent messages only) tells the gate. Neither changes anything:
+// every message goes on to Qt. With nothing watched the filter reads nothing.
 #include "lil_qt/src/qt/pointer_filter.h"
 #include "lil_qt/src/qt/confirm_input.cxxqt.h"
 
@@ -59,21 +61,39 @@ std::optional<PointerMessage> kindOf(const MSG &m)
     }
 }
 
-// The item's rectangle on the screen, in physical pixels, when it is visible on `hwnd`.
+// The item's rectangle on the screen, in physical pixels, as it is drawn: without what a scrolling
+// ancestor clips. None when it isn't visible on `hwnd`.
 std::optional<RECT> placeOn(HWND hwnd, const POINT &origin, const QQuickItem &item)
 {
     QQuickWindow *window = item.window();
     if (!window || !window->handle() || reinterpret_cast<HWND>(window->winId()) != hwnd
         || !item.isVisible() || !item.isEnabled())
         return std::nullopt;
+    QRectF box = item.mapRectToScene(item.boundingRect());
+    for (const QQuickItem *parent = item.parentItem(); parent; parent = parent->parentItem()) {
+        if (parent->clip())
+            box &= parent->mapRectToScene(parent->boundingRect());
+    }
+    if (box.isEmpty())
+        return std::nullopt;
     const qreal scale = window->effectiveDevicePixelRatio();
-    const QPointF topLeft = item.mapToScene(QPointF(0, 0)) * scale;
     RECT rect;
-    rect.left = origin.x + LONG(std::lround(topLeft.x()));
-    rect.top = origin.y + LONG(std::lround(topLeft.y()));
-    rect.right = rect.left + LONG(std::lround(item.width() * scale));
-    rect.bottom = rect.top + LONG(std::lround(item.height() * scale));
+    rect.left = origin.x + LONG(std::lround(box.left() * scale));
+    rect.top = origin.y + LONG(std::lround(box.top() * scale));
+    rect.right = origin.x + LONG(std::lround(box.right() * scale));
+    rect.bottom = origin.y + LONG(std::lround(box.bottom() * scale));
     return rect;
+}
+
+// Sees every message sent to a window of this thread, from any thread, before its window procedure.
+LRESULT CALLBACK sentHook(int code, WPARAM wparam, LPARAM lparam)
+{
+    if (code == HC_ACTION) {
+        const UINT message = reinterpret_cast<const CWPSTRUCT *>(lparam)->message;
+        if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK || message == WM_LBUTTONUP)
+            pointer_sent();
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
 }
 
 class PointerFilter : public QAbstractNativeEventFilter
@@ -130,6 +150,7 @@ void pointerWatch(const QVariant &item)
     if (!filter && QCoreApplication::instance()) {
         filter = new PointerFilter;
         QCoreApplication::instance()->installNativeEventFilter(filter);
+        pointer_guard(SetWindowsHookExW(WH_CALLWNDPROC, sentHook, nullptr, GetCurrentThreadId()) != nullptr);
     }
     s_watched.removeIf([](const Watched &w) { return !w.item; });
     pointerUnwatch(item);
