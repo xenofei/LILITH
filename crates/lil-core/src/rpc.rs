@@ -1,10 +1,12 @@
 //! The production [`Router`] (ARCH-029, ARCH-031, QA-010): per connection a small state
 //! machine around `core/hello`. Infrastructure, not a CORE-014 module.
 //!
-//! - [`ConnState::AwaitingHello`]: only `core/hello` is served; anything else is -32001. A
-//!   hello that fails with an error result (an unknown workspace, a token with the wrong
-//!   caller kind) leaves the connection here, so the client may try again until the hello
-//!   timeout.
+//! - [`ConnState::AwaitingHello`]: only `core/hello` and `core/prove` are served; anything else
+//!   is -32001. A hello that fails with an error result (an unknown workspace, a token with the
+//!   wrong caller kind) leaves the connection here, so the client may try again until the hello
+//!   timeout. `core/prove` (Appendix G "Connections") sets the event a client names, whatever
+//!   its version, and leaves the connection here too; the transport answers it the same way
+//!   before there is a router ([`answer_prove`]). After a hello, refused or not, it is -32600.
 //! - An invalid engine token is terminal (ARCH-050: the connection "is refused", never
 //!   downgraded): the `caller.engine_token_invalid` reply is queued, then the connection is
 //!   closed. The writer still sends that reply (its flush grace); nothing read after that
@@ -117,7 +119,7 @@ use crate::lifecycle::{DrainReason, Lifecycle};
 use crate::meter::Caps;
 use crate::session::Session;
 use crate::tools::Dispatcher;
-use crate::transport::{ConnCtx, ConnObserver, Router};
+use crate::transport::{ConnCtx, ConnObserver, Router, answer_prove};
 use crate::workspace::{WorkspaceRef, resolve_workspace};
 
 /// Where a connection stands in the handshake.
@@ -416,10 +418,16 @@ impl RpcRouter {
             (ConnState::AwaitingHello, method::HELLO) => {
                 return self.hello(conn, id, req.params).await;
             }
+            (ConnState::AwaitingHello, method::PROVE) => answer_prove(id, req.params),
             (ConnState::AwaitingHello, _) => fault(
                 id,
                 rpc_code::HANDSHAKE_REQUIRED,
                 "call core/hello first on this connection",
+            ),
+            (_, method::PROVE) => fault(
+                id,
+                rpc_code::INVALID_REQUEST,
+                "core/prove comes before core/hello on a connection",
             ),
             (_, method::HELLO) => fault(
                 id,

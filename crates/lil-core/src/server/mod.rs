@@ -2,6 +2,9 @@
 //! them through the [`crate::transport`] (the named-pipe listener, ARCH-024–026, ARCH-033, whose
 //! items are re-exported here), and shuts down.
 //!
+//! - The pipe is served from the moment it is claimed, before the suite `state.db` opens: until
+//!   the router exists, a connection gets `core/prove` answered and nothing else
+//!   ([`crate::transport`]). A core that can't start closes its connections and the pipe first.
 //! - [`RunningCore`] shuts down once the [`Lifecycle`] drains (ARCH-021): the lifecycle's
 //!   wait and steps, then the open workspaces close (their `state.db` first, then
 //!   `core.lock`), then the state databases close, then the pipe.
@@ -72,6 +75,7 @@ use lil_platform::desktop_fake::FakeDesktop;
 use lil_platform::session_end::{PowerEvent, SessionEnd, SessionEndSim, SessionEndWatcher};
 use lil_platform::{Env, process};
 use lil_protocol::CallerKind;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -257,10 +261,11 @@ pub async fn start(cfg: CoreConfig) -> Result<RunningCore, CoreExit> {
 /// it may release the `running` rows of an earlier core). A newer database is
 /// [`CoreExit::StateTooNew`], a damaged one [`CoreExit::StateDamaged`], one with a hot
 /// rollback journal [`CoreExit::StateHotJournal`], anything else [`CoreExit::Startup`]; each
-/// is logged with the path, nothing on disk is changed, and the pipe is released as this
+/// is logged with the path, nothing on disk is changed, and the pipe is released before this
 /// returns.
 ///
-/// Then it serves, opens the default workspace in the background (a failure is logged; the
+/// It answers `core/prove` throughout (Appendix G "Connections"). Once its router is built it
+/// serves everything else, opens the default workspace in the background (a failure is logged; the
 /// first call in it tries again), ticks the idle check every [`IDLE_TICK`] (or `idle_after`,
 /// if a test channel set it shorter), watches the session end and, on a test channel, the
 /// test parent. Each of these begins a fatal drain, after which the core exits 4
@@ -278,10 +283,25 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             lifecycle.begin_drain(DrainReason::Fatal(what.to_string()));
         })
     };
+    // Served from here on, so a client can have this core prove it holds the pipe before the
+    // suite `state.db` opens; the rest waits for the router (`transport`).
+    let (router_tx, late_router) = watch::channel(None);
+    let stop = CancellationToken::new();
+    let serving = tokio::spawn(serve_with(
+        listener,
+        late_router,
+        Arc::new(ServerStats::default()),
+        stop.clone(),
+        cfg.pipe_instance_fault.clone(),
+    ));
+    if let Some(hook) = &cfg.before_state_open {
+        hook();
+    }
     let state = match open_suite_state(&cfg.env, on_fatal) {
         Ok(state) => Arc::new(state),
         Err(exit) => {
-            drop(listener);
+            stop.cancel();
+            let _ = serving.await;
             return Err(exit);
         }
     };
@@ -629,15 +649,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         router = router.with_observer(test_holds);
     }
     let router: Arc<dyn Router> = Arc::new(router);
-    let stats = Arc::new(ServerStats::default());
-    let stop = CancellationToken::new();
-    let serving = tokio::spawn(serve_with(
-        listener,
-        router,
-        stats,
-        stop.clone(),
-        cfg.pipe_instance_fault.clone(),
-    ));
+    // None left to tell: the pipe's listener failed, which the supervisor below reports.
+    let _ = router_tx.send(Some(router));
 
     if let Some(ws) = hub.default_ref() {
         let (hub, jobs, telemetry) = (hub.clone(), jobs.clone(), telemetry.clone());

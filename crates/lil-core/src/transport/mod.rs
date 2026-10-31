@@ -10,6 +10,10 @@
 //! - Each connection runs in [`conn`]: NDJSON framing and the order rules of the [`Router`].
 //!   After the handshake at most [`MAX_IN_FLIGHT_PER_CONN`] requests of one connection run at
 //!   once; the next line is read only when one of them has ended (backpressure on the pipe).
+//! - The running core serves the pipe from the moment it has claimed it, before it has a router,
+//!   which needs the suite `state.db` ([`LateRouter`]). Until then a connection gets
+//!   [`answer_prove`] for a `core/prove` and nothing else: every other line waits for the router
+//!   (Appendix G "Connections").
 
 mod conn;
 
@@ -19,9 +23,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use lil_platform::pipe::{CreateError, client_pid, create_instance};
-use lil_protocol::{Id, Request, Response, encode_response_capped};
+use lil_platform::pipe::{CreateError, client_pid, create_instance, set_proof_event};
+use lil_protocol::{
+    Id, Outcome, ProveParams, ProveResult, Request, Response, RpcError, encode_response_capped,
+    rpc_code,
+};
+use serde_json::Value;
 use tokio::net::windows::named_pipe::NamedPipeServer;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -70,6 +79,32 @@ impl ConnCtx {
         let _ = self.outbound.send(self.response_line(response)).await;
     }
 }
+
+/// The answer to a `core/prove` (Appendix G "Connections"): sets the proof event its params name,
+/// and does nothing else. A name that isn't of a proof's shape, or that can't be opened and set,
+/// is -32602.
+pub fn answer_prove(id: Id, params: Option<Value>) -> Response {
+    let params = params.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let set = serde_json::from_value::<ProveParams>(params)
+        .map_err(|e| format!("invalid params: {e}"))
+        .and_then(|p| {
+            set_proof_event(&p.name).map_err(|e| format!("invalid params: the proof: {e}"))
+        });
+    match set {
+        Ok(()) => {
+            let proved = Outcome::Ok(ProveResult { proved: true });
+            let result = serde_json::to_value(&proved).expect("an Outcome serialises");
+            Response::Result { id, result }
+        }
+        Err(message) => Response::Error {
+            id: Some(id),
+            error: RpcError::new(rpc_code::INVALID_PARAMS, message),
+        },
+    }
+}
+
+/// The router of a pipe that may be served before the router exists: `None` until then.
+pub(crate) type LateRouter = watch::Receiver<Option<Arc<dyn Router>>>;
 
 /// Decides what each request on a connection gets.
 pub trait Router: Send + Sync + 'static {
@@ -166,14 +201,15 @@ pub async fn serve(
     stats: Arc<ServerStats>,
     stop: CancellationToken,
 ) -> io::Result<()> {
-    serve_with(listener, router, stats, stop, None).await
+    let (_router, late) = watch::channel(Some(router));
+    serve_with(listener, late, stats, stop, None).await
 }
 
 /// [`serve`], with the in-process tests' fault ([`CoreConfig::pipe_instance_fault`]) run
 /// before each new instance.
 pub(crate) async fn serve_with(
     listener: Listener,
-    router: Arc<dyn Router>,
+    router: LateRouter,
     stats: Arc<ServerStats>,
     stop: CancellationToken,
     fault: Option<PipeInstanceFault>,

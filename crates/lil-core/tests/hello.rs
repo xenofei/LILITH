@@ -1,15 +1,16 @@
-//! `core/hello` over the real pipe of an in-process core (ARCH-024, ARCH-029, ARCH-030,
-//! ARCH-045, QA-010): the session, the frozen version check, strict params, the
+//! `core/hello` over the real pipe of an in-process core (ARCH-024, ARCH-027, ARCH-029, ARCH-030,
+//! ARCH-045, QA-010): `core/prove`, the session, the frozen version check, strict params, the
 //! connection-state rules and the test app's `ui:test` claim.
 //!
 //! Wall-clock durations here are failure deadlines only, never measurements (QA-031).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lil_core::identity::TrustedDirs;
 use lil_core::{CoreConfig, CoreThread, start_in_thread};
 use lil_platform::Env;
+use lil_platform::pipe::ProofEvent;
 use lil_testkit::{FakeClock, RawPipe, SeqIds, TestApp, TestEnv, ensure_built, merge_hello};
 use serde_json::{Value, json};
 
@@ -52,7 +53,7 @@ fn hello_returns_session_and_shared_capabilities() {
     let instance = result["instance_id"].as_str().expect("instance_id");
     assert!(session.starts_with("s_"), "{response}");
     assert!(instance.starts_with("c_"), "{response}");
-    assert_eq!(result["protocol"], "1.2", "{response}");
+    assert_eq!(result["protocol"], "1.3", "{response}");
     assert_eq!(result["build_id"], lil_protocol::BUILD_ID, "{response}");
     assert_eq!(
         result["schema_hash"],
@@ -70,10 +71,10 @@ fn hello_returns_session_and_shared_capabilities() {
     assert_eq!(second["result"]["status"], "ok", "{second}");
     assert_eq!(second["result"]["instance_id"], instance, "{second}");
     assert_ne!(second["result"]["session_id"], session, "{second}");
-    // The session runs at the lower minor, 1.2, and shares the core's list: protocol 1.1's
-    // five capabilities, then `queue.v1`, `desktop.v1` and `context.v1` (later plan-4a
-    // capabilities may follow them).
-    assert_eq!(second["result"]["protocol"], "1.2", "{second}");
+    // The session runs at the lower minor, 1.3, and shares the core's list: protocol 1.1's
+    // five capabilities, then `queue.v1`, `desktop.v1` and `context.v1` (later capabilities
+    // follow them).
+    assert_eq!(second["result"]["protocol"], "1.3", "{second}");
     let shared = second["result"]["capabilities"].as_array().unwrap();
     assert_eq!(
         shared[..8],
@@ -168,7 +169,7 @@ fn major_mismatch_with_unknown_params_is_incompatible_not_invalid_params() {
             "{response}"
         );
         assert_eq!(
-            result["error"]["data"]["core_protocol"], "1.2",
+            result["error"]["data"]["core_protocol"], "1.3",
             "{response}"
         );
         assert!(
@@ -228,6 +229,122 @@ fn second_hello_is_invalid_request() {
     assert_eq!(first["result"]["status"], "ok", "{first}");
     let second = pipe.hello(json!({}));
     assert_eq!(second["error"]["code"], -32600, "{second}");
+}
+
+#[test] // spec: ARCH-027, ARCH-029
+fn prove_sets_only_a_proofs_event_and_leaves_hello_working() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut pipe = RawPipe::connect(&env);
+    let proof = ProofEvent::new().unwrap();
+    let hex = proof.name().rsplit('-').next().unwrap().to_string();
+    // Not a proof's name, or not only a name: refused, with nothing set.
+    for params in [
+        json!({}),
+        json!({"name": 1}),
+        json!({"name": r"Local\other"}),
+        json!({"name": format!(r"Global\lil-launch-proof-{hex}")}),
+        json!({"name": proof.name().to_uppercase()}),
+        json!({"name": proof.name(), "workspace": "none"}),
+    ] {
+        let refused = pipe.call("core/prove", params.clone());
+        assert_eq!(refused["error"]["code"], -32602, "{params}: {refused}");
+        assert!(!proof.is_set(), "{params}");
+    }
+    // A proof's shape that names no event.
+    let none = format!(r"Local\lil-launch-proof-{}", "0".repeat(32));
+    let refused = pipe.call("core/prove", json!({ "name": none }));
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+
+    let proved = pipe.call("core/prove", json!({"name": proof.name()}));
+    assert_eq!(
+        proved["result"],
+        json!({"status": "ok", "proved": true}),
+        "{proved}"
+    );
+    assert!(proof.is_set());
+    // It started nothing: the connection still has to say hello, and can.
+    let waiting = pipe.call("tools/list", json!({}));
+    assert_eq!(waiting["error"]["code"], -32001, "{waiting}");
+    let hello = pipe.hello(json!({}));
+    assert_eq!(hello["result"]["status"], "ok", "{hello}");
+
+    // After a hello it is refused like a second hello, and sets nothing.
+    let late = ProofEvent::new().unwrap();
+    let refused = pipe.call("core/prove", json!({"name": late.name()}));
+    assert_eq!(refused["error"]["code"], -32600, "{refused}");
+    assert!(!late.is_set());
+}
+
+#[test] // spec: ARCH-027, ARCH-023
+fn another_majors_client_is_answered_prove_and_then_refused_as_ever() {
+    let env = TestEnv::new();
+    let _core = core(&env);
+    let mut pipe = RawPipe::connect(&env);
+    let proof = ProofEvent::new().unwrap();
+    let proved = pipe.call("core/prove", json!({"name": proof.name()}));
+    assert_eq!(proved["result"]["status"], "ok", "{proved}");
+    assert!(proof.is_set());
+    let hello = pipe.hello(json!({"protocol": "9.0"}));
+    assert_eq!(
+        hello["result"]["error"]["code"], "protocol.incompatible",
+        "{hello}"
+    );
+    let late = ProofEvent::new().unwrap();
+    let refused = pipe.call("core/prove", json!({"name": late.name()}));
+    assert_eq!(refused["error"]["code"], -32600, "{refused}");
+    assert!(!late.is_set());
+}
+
+#[test] // spec: ARCH-027, ARCH-029
+fn prove_is_answered_before_the_state_db_opens_and_a_hello_waits_for_the_core_to_serve() {
+    /// What a client saw while the core stood right before opening its `state.db`.
+    struct Seen {
+        pipe: RawPipe,
+        proved: Value,
+        event_set: bool,
+        state_db_there: bool,
+        hello_answered: Option<String>,
+    }
+    let env = Arc::new(TestEnv::new());
+    let seen: Arc<Mutex<Option<Seen>>> = Arc::default();
+    let before_state_open = {
+        let (env, seen) = (env.clone(), seen.clone());
+        Arc::new(move || {
+            let env = env.clone();
+            // RawPipe has a runtime of its own, and this runs inside the core's.
+            let client = std::thread::spawn(move || {
+                let mut pipe = RawPipe::connect(&env);
+                let proof = ProofEvent::new().unwrap();
+                let proved = pipe.call("core/prove", json!({"name": proof.name()}));
+                pipe.send_line(&request(7, "core/hello", merge_hello(json!({}))));
+                Seen {
+                    proved,
+                    event_set: proof.is_set(),
+                    state_db_there: env.env.suite_state_db().exists(),
+                    hello_answered: pipe.read_line(Duration::from_millis(300)),
+                    pipe,
+                }
+            });
+            *seen.lock().unwrap() = Some(client.join().expect("the client's checks"));
+        })
+    };
+    let _core = start_in_thread(CoreConfig {
+        clock: FakeClock::new(),
+        ids: Arc::new(SeqIds::new()),
+        test_parent_pid: None,
+        before_state_open: Some(before_state_open),
+        ..CoreConfig::for_env(env.env.clone()).expect("core config")
+    });
+    let mut seen = seen.lock().unwrap().take().expect("the hook ran");
+    assert_eq!(seen.proved["result"]["proved"], true, "{}", seen.proved);
+    assert!(seen.event_set);
+    assert!(!seen.state_db_there, "the state.db was open already");
+    assert_eq!(seen.hello_answered, None, "a hello waits for the router");
+    // Now the core serves, and the hello that waited is answered.
+    let hello = read(&mut seen.pipe);
+    assert_eq!(hello["id"], 7, "{hello}");
+    assert_eq!(hello["result"]["status"], "ok", "{hello}");
 }
 
 #[test] // spec: ARCH-029

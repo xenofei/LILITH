@@ -190,6 +190,9 @@ pub struct CoreConfig {
     /// creation error. The core then stops as after a fatal error (exit 4).
     #[doc(hidden)]
     pub pipe_instance_fault: Option<PipeInstanceFault>,
+    /// In-process tests: runs with the pipe claimed and served, right before the suite `state.db`
+    /// opens.
+    pub before_state_open: Option<Arc<dyn Fn() + Send + Sync>>,
     /// In-process tests only (`None` from [`CoreConfig::for_env`]): runs before each step of
     /// watching the test parent, and an `Err` is that step's error. `NotFound` at `Open` means
     /// the parent is gone (exit 0); any other error stops the core as after a fatal error
@@ -248,6 +251,7 @@ impl CoreConfig {
             watch: WatchConfig::default(),
             git_env: Vec::new(),
             pipe_instance_fault: None,
+            before_state_open: None,
             parent_watch_fault: None,
             #[cfg(test)]
             panic_on_method: None,

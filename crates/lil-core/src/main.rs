@@ -5,7 +5,8 @@
 //! having touched nothing, not even its log), then the log, then the suite `state.db` (a newer
 //! one exits 6, a damaged one 5, one with a hot rollback journal 7, any other failure 2;
 //! nothing on disk is changed and the pipe is released first), then serving until the core
-//! shuts down (ARCH-021). Startup failures exit with [`CoreExit::code`]; a shutdown exits with
+//! shuts down (ARCH-021). `core/prove` is answered from the claim on, before the `state.db` opens
+//! (Appendix G "Connections"). Startup failures exit with [`CoreExit::code`]; a shutdown exits with
 //! its report's code: 4 after a fatal error (a state actor that died, a pipe instance that
 //! could not be created, a test parent that cannot be watched), else 0.
 
