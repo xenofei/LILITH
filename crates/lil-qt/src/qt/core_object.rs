@@ -5,10 +5,15 @@
 //!   `unavailable`), `coreProtocol`, `workspace` (`{id, path}`, or null), `project` (the
 //!   app's project as the last `app/set_context` answered it, empty for none: the project
 //!   switcher tells it through `noteProject`, since the session keeps its project per connection),
+//!   `unavailable` (while `connection` is `unavailable`: `{reason, cause, code?, retry?}`, `cause`
+//!   one of `start_failed`, `cannot_start`, `untrusted`, `refused` or `other`, and `code` and `retry`
+//!   those of a refused hello; else null),
 //!   `channelScheme`, `startTimes` (`{firstFrameMs, interactiveMs}` of this start, APP-136, as
 //!   they become known) and `buildId`.
-//! - **Requests:** `call(tool, argsJson)`, `appCall(method, paramsJson)` and
-//!   `setWorkspace(id)` return a request id (a string, never an object) at once; the outcome
+//!   A session state is stored whole before any of these signal, so a handler or a binding never
+//!   reads a half-updated state; `connection` signals last.
+//! - **Requests:** `call(tool, argsJson)`, `appCall(method, paramsJson)`, `setWorkspace(id)` and
+//!   `useDefaultWorkspace()` (a new hello on what `suite.toml` says now) return a request id (a string, never an object) at once; the outcome
 //!   comes later as `callFinished(id, resultJson)`, `callFailed(id, errorJson)` or
 //!   `callPendingConfirmation(id, pendingJson)`, never before the method has returned. A
 //!   tool call's pending confirmation keeps the request open: once the confirmation is
@@ -81,6 +86,7 @@ pub mod qobject {
         #[qproperty(QString, core_protocol, READ, NOTIFY)]
         #[qproperty(QVariant, workspace, READ, NOTIFY)]
         #[qproperty(QString, project, READ, NOTIFY)]
+        #[qproperty(QVariant, unavailable, READ, NOTIFY)]
         #[qproperty(QString, channel_scheme, READ, NOTIFY)]
         #[qproperty(QVariant, start_times, READ, NOTIFY)]
         type Core = super::CoreRust;
@@ -116,6 +122,11 @@ pub mod qobject {
         /// Switches to workspace `id` with a new hello (P4a-R34).
         #[qinvokable]
         fn set_workspace(self: Pin<&mut Core>, id: &QString) -> QString;
+
+        /// A new hello on the workspace `suite.toml` names as the default now (a way out of a
+        /// refused hello), or on none when there is no usable default.
+        #[qinvokable]
+        fn use_default_workspace(self: Pin<&mut Core>) -> QString;
 
         /// Sets the `project` property: what `app/set_context` answered, empty for none.
         #[qinvokable]
@@ -176,6 +187,9 @@ pub struct CoreRust {
     core_protocol: QString,
     workspace: QVariant,
     project: QString,
+    unavailable: QVariant,
+    /// `unavailable` as it came, to tell a change.
+    unavailable_json: String,
     channel_scheme: QString,
     start_times: QVariant,
     /// The open requests, with the task to abort on a cancel.
@@ -191,6 +205,8 @@ impl Default for CoreRust {
             core_protocol: QString::default(),
             workspace: QVariant::default(),
             project: QString::default(),
+            unavailable: qobject::json_variant("null"),
+            unavailable_json: "null".to_string(),
             channel_scheme: QString::default(),
             start_times: qobject::json_variant("{}"),
             requests: Requests::new(),
@@ -245,22 +261,39 @@ fn apply(mut core: Pin<&mut Core>, batch: Vec<Delivery>) {
     for delivery in batch {
         match delivery {
             Delivery::State(view) => {
+                // Stored whole first: whatever runs on a signal reads this state, not half of it.
                 let connection = QString::from(view.connection);
-                if core.connection != connection {
+                let connection_changed = core.connection != connection;
+                if connection_changed {
                     core.as_mut().rust_mut().connection = connection;
-                    core.as_mut().connection_changed();
                 }
-                if let Some(protocol) = view.core_protocol {
-                    let protocol = QString::from(protocol.as_str());
-                    if core.core_protocol != protocol {
-                        core.as_mut().rust_mut().core_protocol = protocol;
-                        core.as_mut().core_protocol_changed();
-                    }
+                let protocol = view.core_protocol.map(|p| QString::from(p.as_str()));
+                let protocol_changed = protocol.as_ref().is_some_and(|p| core.core_protocol != *p);
+                if let (true, Some(protocol)) = (protocol_changed, protocol) {
+                    core.as_mut().rust_mut().core_protocol = protocol;
                 }
+                let workspace_changed = view.workspace.is_some();
                 if let Some(workspace) = view.workspace {
                     let json = workspace.unwrap_or_else(|| "null".to_string());
                     core.as_mut().rust_mut().workspace = qobject::json_variant(&json);
+                }
+                let unavailable_json = view.unavailable.unwrap_or_else(|| "null".to_string());
+                let unavailable_changed = core.unavailable_json != unavailable_json;
+                if unavailable_changed {
+                    core.as_mut().rust_mut().unavailable = qobject::json_variant(&unavailable_json);
+                    core.as_mut().rust_mut().unavailable_json = unavailable_json;
+                }
+                if protocol_changed {
+                    core.as_mut().core_protocol_changed();
+                }
+                if unavailable_changed {
+                    core.as_mut().unavailable_changed();
+                }
+                if workspace_changed {
                     core.as_mut().workspace_changed();
+                }
+                if connection_changed {
+                    core.as_mut().connection_changed();
                 }
             }
             Delivery::Finished { id, json } => {
@@ -379,6 +412,10 @@ impl qobject::Core {
     pub fn set_workspace(self: Pin<&mut Self>, ws: &QString) -> QString {
         let ws = ws.to_string();
         self.request(move |runtime, id| runtime.set_workspace(id, ws))
+    }
+
+    pub fn use_default_workspace(self: Pin<&mut Self>) -> QString {
+        self.request(Runtime::use_default_workspace)
     }
 
     pub fn cancel(mut self: Pin<&mut Self>, request_id: &QString) -> bool {
