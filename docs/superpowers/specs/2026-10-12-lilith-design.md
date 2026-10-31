@@ -1291,7 +1291,7 @@ In M1 these are panels inside the Image studio; a separate Hub app hosts them la
 **Backups and diagnostics**
 
 - **APP-133** [M1] **Backups** (reached from Diagnostics; in the Hub later): per destination — last successful backup, size, next run, estimated monthly cost, quota used/remaining where available, protection level, partial-backup file lists; warnings; **Add destination**; and restore into a side folder. Behaviour is specified in §7.4.
-- **APP-134** [M1] **Diagnostics:** component versions, engine health, recent errors, event log, telemetry summary, a **backup status line**, and "Export diagnostics bundle" (redacted — secrets, Claude Code profile labels and emails removed). (plan 4a ruling, 2026-10-30) The event log keeps the newest 1,000 events of every topic the app follows, and leaves out what repeats state it already carries at a high rate: `telemetry` `sample`, `job:<id>` `progress` and the frames of `preview:<job_id>`. The panel says so.
+- **APP-134** [M1] **Diagnostics:** component versions, engine health, recent errors, event log, telemetry summary, a **backup status line**, and "Export diagnostics bundle" (redacted — secrets, Claude Code profile labels and emails removed). (plan 4a ruling, 2026-10-30) The event log keeps the newest 1,000 events of every topic the app follows, and leaves out what repeats state it already carries at a high rate: `telemetry` `sample`, `job:<id>` `progress` and the frames of `preview:<job_id>`. (plan 4a ruling, 2026-10-31) It leaves out `job:<id>` `status` too, the same summary as that change's `jobs` event. The panel says what it leaves out and that older rows leave.
 
 ### 3.6a Prompt Studio surfaces
 
