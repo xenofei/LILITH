@@ -13,6 +13,8 @@ Item {
     property string kind: "info"
     property bool closable: true
     readonly property alias closeButton: closeButton
+    // Buttons of its own, between the text and Dismiss.
+    property alias actions: actionRow.data
 
     signal closed()
 
@@ -83,12 +85,20 @@ Item {
 
         Text {
             width: row.width - (closeButton.visible ? closeButton.width + row.spacing : 0)
+                   - (actionRow.visible ? actionRow.width + row.spacing : 0)
             anchors.verticalCenter: parent.verticalCenter
             text: root.text
             textFormat: Text.PlainText
             color: Theme.text
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap
+        }
+
+        Row {
+            id: actionRow
+            visible: children.length > 0
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Theme.spacing
         }
 
         LIconButton {

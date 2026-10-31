@@ -12,6 +12,9 @@
 //   })
 //   call.cancel()                 // drops the callbacks (and Core's request); false once settled
 //
+//   CoreCall.setWorkspace(Core, id, {owner: root, ok: hello => ..., error: error => ...})
+//                                 // a new hello naming workspace `id` (P4a-R34)
+//
 //   const sub = CoreCall.subscribe(Core, "jobs", root,
 //                                  (kind, seq, data) => ...)  // optional: this topic's events
 //   sub.unsubscribe()             // once; the owner's destruction does it too
@@ -71,6 +74,13 @@ function appCall(core, method, params, handlers) {
     const h = handlers || {}
     const watcher = watch(h.owner)
     return track(core, core.appCall(method, JSON.stringify(params || {})), h, true, watcher)
+}
+
+// The same for `Core.setWorkspace`.
+function setWorkspace(core, id, handlers) {
+    const h = handlers || {}
+    const watcher = watch(h.owner)
+    return track(core, core.setWorkspace(id), h, true, watcher)
 }
 
 // Follows `topic` for `owner` until `unsubscribe()` or the owner's destruction, whichever comes

@@ -34,6 +34,7 @@ QtObject {
     property var cancelled: []    // request ids
     property var subscribed: []   // the topics followed, in the order they were first followed
     property var resends: []      // {id, retryToken}
+    property int retries: 0       // retryNow() calls
 
     signal callFinished(string id, string resultJson)
     signal callFailed(string id, string errorJson)
@@ -84,7 +85,8 @@ QtObject {
         }
     }
     function subscriberCount(topic) { return _counts[topic] || 0 }
-    function retryNow() {}
+    function retryNow() { retries++ }
+    function noteProject(slug) { project = slug }
     function lastSeq(topic) { return topic in _seqs ? _seqs[topic] : -1 }
     function shownText(text, maxChars) {
         return text.length <= maxChars ? text : text.slice(0, Math.max(0, maxChars - 1)) + "…"
