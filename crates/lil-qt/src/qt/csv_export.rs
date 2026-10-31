@@ -5,8 +5,8 @@
 //! thread. `why` says why the write failed and what became of the file that was there.
 //!
 //! - `file` is a `file:` URL (the file dialog's); `path` in the signals is its local path.
-//! - When the object goes (the app is closing), it waits for a write under way, so no temporary
-//!   file stays behind.
+//! - When the object goes (the app is closing), it waits for a write under way, at most
+//!   [`crate::csv::CLOSE_WAIT`], so normally no temporary file stays behind.
 //! - `busy` is true from a `save` until its signal. A `save` while busy, or one whose arguments
 //!   don't read (not a local file, `rowsJson` not a JSON array, `columnsJson` not an array of
 //!   strings), returns false and writes nothing; else it returns true and its signal follows.
@@ -61,7 +61,7 @@ pub struct CsvExportRust {
 impl Drop for CsvExportRust {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            crate::csv::wait_for_write(worker, crate::csv::CLOSE_WAIT);
         }
     }
 }

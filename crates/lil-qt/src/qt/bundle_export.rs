@@ -9,8 +9,8 @@
 //! - `busy` is true from a `save` until its signal. A `save` while busy, or one whose `file` isn't
 //!   a local file, returns false and writes nothing; else it returns true and its signal follows.
 //! - The log names no path: a bundle's folder can name the owner's files.
-//! - When the object goes (the app is closing), it waits for a copy under way, so no temporary file
-//!   stays behind. A bundle holds at most tens of MiB.
+//! - When the object goes (the app is closing), it waits for a copy under way, at most
+//!   [`crate::csv::CLOSE_WAIT`], so normally no temporary file stays behind.
 
 use core::pin::Pin;
 
@@ -57,7 +57,7 @@ pub struct BundleExportRust {
 impl Drop for BundleExportRust {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            crate::csv::wait_for_write(worker, crate::csv::CLOSE_WAIT);
         }
     }
 }

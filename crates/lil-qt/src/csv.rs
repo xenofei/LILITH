@@ -50,6 +50,23 @@ pub fn export(path: &Path, rows: &[Value], columns: &[&str]) -> io::Result<()> {
     write_kept(path, text.as_bytes())
 }
 
+/// How long closing the app waits for a write under way: a stalled drive then costs a stray
+/// temporary file, not a process that stays around.
+pub const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for `worker` at most `limit`, and leaves it running after that. Whether it ended.
+pub fn wait_for_write(worker: std::thread::JoinHandle<()>, limit: std::time::Duration) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while !worker.is_finished() {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = worker.join();
+    true
+}
+
 /// Writes `bytes` to the file you picked, replacing what is there. A failure says why and what
 /// became of the file that was there (a file of the same name is kept as a hidden backup until
 /// the new one is in).
@@ -142,6 +159,16 @@ fn text_of(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: APP-117
+    fn closing_waits_for_a_write_but_not_for_ever() {
+        let quick = std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(30)));
+        assert!(wait_for_write(quick, std::time::Duration::from_secs(5)));
+        let stuck = std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(2)));
+        let began = std::time::Instant::now();
+        assert!(!wait_for_write(stuck, std::time::Duration::from_millis(50)));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    }
     use serde_json::json;
 
     #[test] // spec: APP-117
