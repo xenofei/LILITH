@@ -5,6 +5,8 @@
 //! thread. `why` says why the write failed and what became of the file that was there.
 //!
 //! - `file` is a `file:` URL (the file dialog's); `path` in the signals is its local path.
+//! - When the object goes (the app is closing), it waits for a write under way, so no temporary
+//!   file stays behind.
 //! - `busy` is true from a `save` until its signal. A `save` while busy, or one whose arguments
 //!   don't read (not a local file, `rowsJson` not a JSON array, `columnsJson` not an array of
 //!   strings), returns false and writes nothing; else it returns true and its signal follows.
@@ -53,6 +55,15 @@ pub mod qobject {
 #[derive(Default)]
 pub struct CsvExportRust {
     busy: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CsvExportRust {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn set_busy(mut obj: Pin<&mut qobject::CsvExport>, busy: bool) {
@@ -99,12 +110,15 @@ impl qobject::CsvExport {
                 // An export whose object is gone has nobody to tell.
                 let _ = thread.queue(move |obj| finish(obj, &path, outcome));
             });
-        if let Err(e) = spawned {
-            let why = e.to_string();
-            tracing::warn!(error = %why, "the usage CSV export didn't start");
-            let _ = self
-                .qt_thread()
-                .queue(move |obj| finish(obj, &shown, Err(why)));
+        match spawned {
+            Ok(worker) => self.as_mut().rust_mut().worker = Some(worker),
+            Err(e) => {
+                let why = e.to_string();
+                tracing::warn!(error = %why, "the usage CSV export didn't start");
+                let _ = self
+                    .qt_thread()
+                    .queue(move |obj| finish(obj, &shown, Err(why)));
+            }
         }
         true
     }

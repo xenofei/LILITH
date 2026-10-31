@@ -67,7 +67,7 @@ pub fn write_kept(path: &Path, bytes: &[u8]) -> io::Result<()> {
     match crate::layout_file::write_replacing_with(path, bytes, backup_name) {
         Ok(()) => {
             if existed && let Err(e) = std::fs::remove_file(&backup) {
-                tracing::warn!(error = %e, "the old CSV's backup wasn't deleted");
+                tracing::warn!(error = %e, "the old file's backup wasn't deleted");
             }
             Ok(())
         }
