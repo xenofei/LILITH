@@ -9,7 +9,8 @@
 //!   one of `start_failed`, `cannot_start`, `untrusted`, `refused` or `other`, and `code` and `retry`
 //!   those of a refused hello; else null),
 //!   `channelScheme`, `startTimes` (`{firstFrameMs, interactiveMs}` of this start, APP-136, as
-//!   they become known) and `buildId`.
+//!   they become known), `buildId` (this app's own) and `coreBuildId` (the `build_id` of the core's
+//!   hello; empty until one is in).
 //!   A session state is stored whole before any of these signal, so a handler or a binding never
 //!   reads a half-updated state; `connection` signals last.
 //! - **Requests:** `call(tool, argsJson)`, `appCall(method, paramsJson)`, `setWorkspace(id)` and
@@ -84,6 +85,7 @@ pub mod qobject {
         #[qproperty(QString, build_id, READ, CONSTANT)]
         #[qproperty(QString, connection, READ, NOTIFY)]
         #[qproperty(QString, core_protocol, READ, NOTIFY)]
+        #[qproperty(QString, core_build_id, READ, NOTIFY)]
         #[qproperty(QVariant, workspace, READ, NOTIFY)]
         #[qproperty(QString, project, READ, NOTIFY)]
         #[qproperty(QVariant, unavailable, READ, NOTIFY)]
@@ -185,6 +187,7 @@ pub struct CoreRust {
     build_id: QString,
     connection: QString,
     core_protocol: QString,
+    core_build_id: QString,
     workspace: QVariant,
     project: QString,
     unavailable: QVariant,
@@ -203,6 +206,7 @@ impl Default for CoreRust {
             build_id: QString::from(lil_protocol::session::BUILD_ID),
             connection: QString::from("connecting"),
             core_protocol: QString::default(),
+            core_build_id: QString::default(),
             workspace: QVariant::default(),
             project: QString::default(),
             unavailable: qobject::json_variant("null"),
@@ -272,6 +276,11 @@ fn apply(mut core: Pin<&mut Core>, batch: Vec<Delivery>) {
                 if let (true, Some(protocol)) = (protocol_changed, protocol) {
                     core.as_mut().rust_mut().core_protocol = protocol;
                 }
+                let build_id = view.core_build_id.map(|b| QString::from(b.as_str()));
+                let build_id_changed = build_id.as_ref().is_some_and(|b| core.core_build_id != *b);
+                if let (true, Some(build_id)) = (build_id_changed, build_id) {
+                    core.as_mut().rust_mut().core_build_id = build_id;
+                }
                 let workspace_changed = view.workspace.is_some();
                 if let Some(workspace) = view.workspace {
                     let json = workspace.unwrap_or_else(|| "null".to_string());
@@ -285,6 +294,9 @@ fn apply(mut core: Pin<&mut Core>, batch: Vec<Delivery>) {
                 }
                 if protocol_changed {
                     core.as_mut().core_protocol_changed();
+                }
+                if build_id_changed {
+                    core.as_mut().core_build_id_changed();
                 }
                 if unavailable_changed {
                     core.as_mut().unavailable_changed();

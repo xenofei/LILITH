@@ -106,6 +106,8 @@ pub struct StateView {
     /// `connecting`, `ready`, `reconnecting`, `incompatible` or `unavailable`.
     pub connection: &'static str,
     pub core_protocol: Option<String>,
+    /// The `build_id` of the core's hello.
+    pub core_build_id: Option<String>,
     /// The hello's workspace as JSON (`None` inside: no workspace).
     pub workspace: Option<Option<String>>,
     /// While unavailable, why as JSON: `{reason, cause, code?, retry?}`.
@@ -117,6 +119,7 @@ impl StateView {
         let only = |connection| StateView {
             connection,
             core_protocol: None,
+            core_build_id: None,
             workspace: None,
             unavailable: None,
         };
@@ -130,12 +133,14 @@ impl StateView {
             SessionState::Incompatible { core_protocol } => StateView {
                 connection: "incompatible",
                 core_protocol: Some(core_protocol.clone()),
+                core_build_id: None,
                 workspace: None,
                 unavailable: None,
             },
             SessionState::Ready(hello) => StateView {
                 connection: "ready",
                 core_protocol: Some(hello.protocol.clone()),
+                core_build_id: Some(hello.build_id.clone()),
                 workspace: Some(hello.workspace.as_ref().map(to_json)),
                 unavailable: None,
             },
@@ -356,6 +361,7 @@ impl Runtime {
             None => shared.gui.push(Delivery::State(StateView {
                 connection: "unavailable",
                 core_protocol: None,
+                core_build_id: None,
                 workspace: Some(None),
                 unavailable: Some(
                     json!({"reason": "This process has no core session.", "cause": "other"})
