@@ -24,8 +24,14 @@ TestCase {
         property string verdict: ""
         property int taken: 0
         property int watches: 0
-        function watch(item) { ++watches }
-        function unwatch(item) {}
+        // What is watched now.
+        property var live: []
+        function watch(item) {
+            ++watches
+            if (live.indexOf(item) < 0)
+                live = live.concat([item])
+        }
+        function unwatch(item) { live = live.filter(i => i !== item) }
         function notePress(item) {}
         function takeClick(item) {
             ++taken
@@ -86,6 +92,7 @@ TestCase {
         hand.verdict = ""
         hand.taken = 0
         hand.watches = 0
+        hand.live = []
         fakeShim.activations = []
         fake.connection = "ready"
         tc.Window.window.requestActivate()
@@ -287,6 +294,20 @@ TestCase {
         tryCompare(card.rowRepeater, "count", 1)
         compare(card.rowRepeater.itemAt(0).keyText.text, "\u200E\u05D0key")
         compare(card.rowRepeater.itemAt(0).valueText.text, "\u200E\u05D0\u05D1 (ok)\n\u200E↳ second")
+    }
+
+    // `א 100 ב 900 ג` keeps its text, and draws with its numbers swapped: what is shown can differ
+    // from what a click means, and the card says so beside it.
+    function test_right_to_left_letters_say_so_beside_the_value() { // spec: APP-115, P4a-R8
+        const panel = makePanel([Shapes.view({id: "cf_00000000000000af",
+                                              arguments: {amounts: "\u05D0 100 \u05D1 900 \u05D2", path: "C:\\art"}})])
+        const card = panel.cardRepeater.itemAt(0)
+        tryCompare(card.rowRepeater, "count", 2)
+        const note = card.rowRepeater.itemAt(0).rightToLeftLine
+        verify(note.visible)
+        verify(note.text.indexOf("right-to-left") >= 0, note.text)
+        compare(plain(card.rowRepeater.itemAt(0).valueText.text), "\u05D0 100 \u05D1 900 \u05D2", "the text as it is")
+        verify(!card.rowRepeater.itemAt(1).rightToLeftLine.visible)
     }
 
     function test_the_queue_has_a_limit() { // spec: P4a-R10
@@ -834,6 +855,35 @@ TestCase {
         tryVerify(() => line.text.indexOf("banner") >= 0, 1000)
         tryVerify(() => line.lineCount <= 2, 1000, line.lineCount + ": " + line.text)
         closeDialog(panel)
+    }
+
+    // A window raised under a moving hand: "a click meant for the window underneath".
+    function test_coming_to_the_front_is_a_new_button_to_the_gate() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const other = createTemporaryObject(otherWindow, null)
+        other.requestActivate()
+        tryVerify(() => other.active && !panel.dialog.bar.inFront, 2000, "another window is in front")
+        const before = hand.watches
+        tc.Window.window.requestActivate()
+        tryVerify(() => panel.dialog.bar.inFront, 2000)
+        verify(hand.watches > before, "the gate starts again")
+        closeDialog(panel)
+    }
+
+    // So a person's ordinary clicks elsewhere go past no filter: the panel loads at the shell's start.
+    function test_only_a_button_on_screen_is_watched() { // spec: P4a-R10
+        const capped = Shapes.view({id: "cf_00000000000000e3", covers: ["cap"], cap: [Shapes.capHit()]})
+        const panel = makePanel([crane, capped])
+        compare(hand.live.length, 0, "the dialog is closed")
+        openDialog(panel, crane.id)
+        compare(hand.live.length, 1, "Approve")
+        closeDialog(panel)
+        compare(hand.live.length, 0, "closed again")
+        openDialog(panel, capped.id)
+        compare(hand.live.length, 2, "Allow once and Raise")
+        closeDialog(panel)
+        tryCompare(hand, "live", [], 1000, "and closed")
     }
 
     function test_a_rest_doesnt_survive_the_buttons_going_off_and_on() { // spec: P4a-R10

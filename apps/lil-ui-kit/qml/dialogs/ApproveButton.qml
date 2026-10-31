@@ -33,7 +33,9 @@ Item {
     // The native gate: ConfirmInput, or a test's fake with watch, unwatch, notePress and takeClick.
     property var pointerSource: ConfirmInput
     property bool primary: true
+    property bool _completed: false
     property bool _watching: false
+    readonly property bool _front: Window.active
     property string _pressKey
 
     // The click is the hand's as far as Windows can tell; the caller still asks the answer gate.
@@ -58,13 +60,30 @@ Item {
         }
     }
 
+    // Watched only while it shows, so with no dialog open the native filter reads nothing, and a
+    // person's clicks elsewhere go past it untouched.
+    function _syncWatch() {
+        const wanted = _completed && visible
+        if (wanted === _watching)
+            return
+        _watching = wanted
+        if (wanted)
+            pointerSource.watch(root)
+        else
+            pointerSource.unwatch(root)
+    }
+
+    onVisibleChanged: _syncWatch()
     onTargetKeyChanged: if (_watching) pointerSource.watch(root)
     // Back on after being off (the core away, an answer out, what's shown not read): a new button to
     // the gate too. A hand that rested before it went off moves off and back, and is told so.
     onEnabledChanged: if (_watching && enabled) pointerSource.watch(root)
+    // Its window came to the front under whatever the hand was doing: the same. A hand on the title bar
+    // comes to the button by moving, so that person's first click counts.
+    on_FrontChanged: if (_watching && _front) pointerSource.watch(root)
     Component.onCompleted: {
-        pointerSource.watch(root)
-        _watching = true
+        _completed = true
+        _syncWatch()
     }
     Component.onDestruction: pointerSource.unwatch(root)
 

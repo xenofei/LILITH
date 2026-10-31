@@ -4,17 +4,28 @@
 //!
 //! It stands on the Windows Hello window's rules ([`ClickGate`]), audited there and not repeated
 //! here: only a press and a release that Windows reports as `IMO_HARDWARE` from a mouse or
-//! touchpad, handled on the window's own thread, after a real rest on the button. Posted messages,
-//! `SendInput` and a warped cursor all fail one of those. Raw input stays off (that window's own
-//! rule without it): raw input goes to one window per process, and the shell has many. A still hand
-//! whose rest Windows ended with a move of its own needs a small move, and the dialog says so.
+//! touchpad, handled on the window's own thread, after a real rest on the button. Posted messages
+//! and `SendInput` fail one of those. Raw input stays off (that window's own rule without it): raw
+//! input goes to one window per process, and the shell has many. A still hand whose rest Windows
+//! ended with a move of its own needs a small move, and the dialog says so.
+//!
+//! **A warped cursor.** The Hello rules hold it off only for a still hand: under a moving hand, the
+//! hand's next real moves would rebuild the rest. So a move that isn't real, to a place other than
+//! where the cursor last was, on a button, means the pointer must really leave that button first
+//! ([`GateRefusal::Reenter`]), and only a real message ends that. What can't be told apart: Windows'
+//! own move (it reports `IMO_SYSTEM`, as for a warp) while the hand happens to be moving, when
+//! something changes the windows under it, reads as a warp; the cost is a move off and back, with
+//! words. And a warp that lands just off a button, with the hand carrying on onto it, reads as the
+//! hand's own arrival: nothing in Windows' input says otherwise.
 //!
 //! **What can't be told.** Microsoft documents `IMO_HARDWARE` as covering a UIAccess application's
 //! injection too, so one (it needs an installed, signed binary) reads as a hand. What a posted
 //! message's source reports isn't documented, so the source isn't the only factor: at a press the
-//! physical left button must be down, and at a release up (`GetAsyncKeyState`, documented as the
-//! physical button's state, which no message changes: [`Seen::physically_down`]). A click that went
-//! by before the thread read it is refused, and says so.
+//! left button must be down, and at a release up (`GetAsyncKeyState`: [`Seen::physically_down`]). That
+//! state follows real and injected input alike, measured: 100 injected presses, none read as up. So it
+//! proves no more than that a press or release really went through Windows' input, which a posted
+//! message doesn't; against `SendInput` it's the source that refuses. A click that went by before the
+//! thread read it is refused, and says so.
 //!
 //! **How a click reaches it.** QML's event comes after the message, through Qt's queue, and by then
 //! nothing can say where it came from. So the native event filter (`src/qt/pointer_filter.cpp`)
@@ -35,7 +46,8 @@
 //! **What this adds to the Hello window's rules**, since the buttons here aren't windows of their
 //! own: where a button is comes from Qt at each message. A button that moved since the last message
 //! (a card arrived above it, the list scrolled, its window moved), or that wasn't there, or whose
-//! confirmation or amount changed ([`Target::serial`], a new one each time), starts again, and with
+//! confirmation or amount changed, or that came back on, or whose window came to the front
+//! ([`Target::serial`], a new one each time), starts again, and with
 //! the cursor on it the pointer must leave and come back: nothing changes under a hand and keeps its
 //! rest ([`GateRefusal::Reenter`]). A press that brought the window to the front (`WM_MOUSEACTIVATE`),
 //! or with another window in front (`GetForegroundWindow`, which a program can't fake with a message),
@@ -96,7 +108,8 @@ pub struct Seen {
     /// The window under the cursor is the message's window, and it isn't see-through, cloaked or
     /// minimized.
     pub exposed: bool,
-    /// The physical left button is down now.
+    /// `GetAsyncKeyState` has the left button down now: what Windows' input has done, real or injected,
+    /// which no message changes.
     pub physically_down: bool,
     /// `TME_LEAVE` is armed on the message's window (moves only).
     pub tracked: bool,
@@ -120,8 +133,10 @@ pub enum GateRefusal {
     Click(Refusal),
     /// What the button stands for changed, or it moved, appeared or came on, under the cursor.
     Reenter,
-    /// The physical button didn't agree with the message.
+    /// The button's state didn't agree with the message.
     ButtonState,
+    /// QML's events came past [`TOKEN_LIFETIME`]: too late to tell.
+    Stalled,
     /// The window under the point isn't this one, or this one can't be seen.
     NotExposed,
     /// The hook that sees sent messages couldn't be set.
@@ -137,6 +152,7 @@ impl GateRefusal {
             GateRefusal::Click(other) => other.name(),
             GateRefusal::Reenter => "reenter",
             GateRefusal::ButtonState => "button_state",
+            GateRefusal::Stalled => "stalled",
             GateRefusal::NotExposed => "not_exposed",
             GateRefusal::NoGuard => "no_guard",
         }
@@ -157,6 +173,9 @@ impl GateRefusal {
             "button_state" => Some(format!(
                 "That click was too quick for LILITH to check. Hold the click a moment longer on {label}."
             )),
+            "stalled" => Some(format!(
+                "LILITH was too busy to check that click in time, so it didn't count. Click {label} again."
+            )),
             "not_exposed" => Some(format!(
                 "This window is covered, see-through, off the screen or hidden, so a click on {label} doesn't count. Something may have changed it: bring it back and look before you click."
             )),
@@ -168,6 +187,30 @@ impl GateRefusal {
     }
 }
 
+/// At most one line a second of one kind, for what a program can make happen as often as it likes:
+/// it can't use up the day's log and push out later evidence. The counts are in the next line.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LogLimit {
+    last: Option<Instant>,
+}
+
+impl LogLimit {
+    pub const fn new() -> LogLimit {
+        LogLimit { last: None }
+    }
+
+    /// Whether a line may go now.
+    pub fn due(&mut self, now: Instant) -> bool {
+        let due = self
+            .last
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
 /// See the module docs.
 #[derive(Debug, Default)]
 pub struct PointerGate {
@@ -176,8 +219,10 @@ pub struct PointerGate {
     current: Option<u64>,
     /// `WM_MOUSEACTIVATE` came: the next press brought the window to the front.
     activated: bool,
-    /// The pointer must leave this button before it counts again.
+    /// The pointer must really leave this button before it counts again.
     reenter: Option<u64>,
+    /// Where the cursor was at the last message.
+    last_at: Option<(i32, i32)>,
     /// Why the press that is down doesn't count, beyond what [`ClickGate`] judges.
     press_refused: Option<GateRefusal>,
     /// Which button the press that is down was on.
@@ -187,6 +232,8 @@ pub struct PointerGate {
     press_token: Option<(u64, Instant)>,
     /// QML's press on this button took a press token.
     qml_pressed: Option<u64>,
+    /// QML's press on this button came after its token had run out.
+    qml_press_late: Option<u64>,
     token: Option<(u64, Instant)>,
     refused: Option<(u64, GateRefusal, Instant)>,
     no_guard: bool,
@@ -222,9 +269,22 @@ impl PointerGate {
         if msg.origin == InputOrigin::Hardware && !msg.sent {
             self.counts.real += 1;
         }
+        let real = is_real_pointer(msg.origin, msg.device, msg.sent);
         let serial = s.target.map(|t| t.serial);
-        if self.reenter.is_some() && serial != self.reenter {
+        // Only a real message: a program can warp the cursor off and back, or post a move.
+        if real && self.reenter.is_some() && serial != self.reenter {
             self.reenter = None;
+        }
+        // A real move ends a rest's small moves near where it was; a warp lands anywhere. If it lands
+        // on a button, the rest is the program's, whatever the hand does there next.
+        let input = !msg.sent && msg.origin != InputOrigin::Unavailable;
+        if s.kind == PointerKind::Move && !real && input && msg.at != self.last_at {
+            if let Some(t) = s.target.filter(|t| contains(t.rect, msg.at)) {
+                self.reenter = Some(t.serial);
+            }
+        }
+        if msg.at.is_some() {
+            self.last_at = msg.at;
         }
         if let Some(t) = s.target.filter(|t| t.changed) {
             self.gate.restart(msg.at);
@@ -241,9 +301,13 @@ impl PointerGate {
             .target
             .is_some_and(|t| contains(t.rect, msg.at) && contains(t.rect, msg.message_at));
         let must_reenter = serial.is_some() && serial == self.reenter;
-        let real = is_real_pointer(msg.origin, msg.device, msg.sent);
         match s.kind {
             PointerKind::Move => {
+                // A hand moving: an activation with no press after it (a title bar) is over. Windows'
+                // own move can come between an activation and its press, and doesn't count.
+                if real {
+                    self.activated = false;
+                }
                 // From one button straight to another: the rest was on the first.
                 if serial.is_some() && self.current.is_some() && serial != self.current {
                     self.gate.button_move(false, msg, now);
@@ -256,6 +320,7 @@ impl PointerGate {
                 self.token = None;
                 self.refused = None;
                 self.qml_pressed = None;
+                self.qml_press_late = None;
                 let activated = std::mem::take(&mut self.activated);
                 self.press_refused = if activated || !s.in_front {
                     Some(GateRefusal::Click(Refusal::NotInFront))
@@ -285,6 +350,8 @@ impl PointerGate {
                     Err(GateRefusal::Click(Refusal::NotPointer))
                 } else if let Some(refused) = press_refused {
                     Err(refused)
+                } else if must_reenter {
+                    Err(GateRefusal::Reenter)
                 } else if let Some(refusal) = refusal {
                     Err(GateRefusal::Click(refusal))
                 } else if !armed || press_serial != serial {
@@ -323,17 +390,16 @@ impl PointerGate {
         self.counts.sent += 1;
         self.press_token = None;
         self.qml_pressed = None;
+        self.qml_press_late = None;
         self.token = None;
         self.refused = None;
     }
 
     /// QML's own press on button `serial`: it takes that button's press token, if there is one.
     pub fn take_press(&mut self, serial: u64, now: Instant) {
-        self.qml_pressed = self
-            .press_token
-            .take()
-            .filter(|&(s, at)| s == serial && fresh(at, now))
-            .map(|(s, _)| s);
+        let token = self.press_token.take().filter(|&(s, _)| s == serial);
+        self.qml_pressed = token.filter(|&(_, at)| fresh(at, now)).map(|(s, _)| s);
+        self.qml_press_late = token.filter(|&(_, at)| !fresh(at, now)).map(|(s, _)| s);
     }
 
     /// QML's own click on button `serial`: `Ok` when the hand made it, used up here, else which
@@ -342,14 +408,19 @@ impl PointerGate {
         let token = self.token.take();
         let refused = self.refused.take();
         let pressed = self.qml_pressed.take();
+        let press_late = self.qml_press_late.take() == Some(serial);
         if self.no_guard {
             return Err(GateRefusal::NoGuard);
         }
         if pressed == Some(serial) && token.is_some_and(|(s, at)| s == serial && fresh(at, now)) {
             return Ok(());
         }
+        // The hand's click, or a refusal already made, that only QML's events are late for.
+        let token_late = token.is_some_and(|(s, at)| s == serial && !fresh(at, now));
         match refused {
             Some((s, refusal, at)) if s == serial && fresh(at, now) => Err(refusal),
+            Some((s, _, _)) if s == serial => Err(GateRefusal::Stalled),
+            _ if token_late || press_late => Err(GateRefusal::Stalled),
             _ => Err(GateRefusal::Click(Refusal::NotPointer)),
         }
     }
@@ -628,11 +699,11 @@ mod tests {
         let mut r = Replay::new();
         r.mv(hardware(OFF));
         r.advance(Duration::from_secs(1));
-        r.mv(msg(InputOrigin::System, InputDevice::Mouse, false, ON));
+        r.mv(system(ON));
         r.advance(Duration::from_secs(1));
         r.press(hardware(ON));
         r.release(hardware(ON));
-        assert_eq!(r.qml_click(), Err(NO_MOVE));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Reenter));
     }
 
     #[test] // spec: P4a-R10
@@ -734,6 +805,220 @@ mod tests {
         r.seen(PointerKind::Release, hardware((153, 116)), Some(same));
         r.gate.take_press(2, r.now);
         assert_eq!(r.gate.take_click(2, r.now), Err(GateRefusal::Reenter));
+    }
+
+    fn system(at: (i32, i32)) -> PointerMsg {
+        msg(InputOrigin::System, InputDevice::Mouse, false, at)
+    }
+
+    /// A click on button 2, with QML's events.
+    fn click_on_two(r: &mut Replay, at: (i32, i32), same: Target) -> Result<(), GateRefusal> {
+        r.seen(PointerKind::Press, hardware(at), Some(same));
+        r.advance(Duration::from_millis(60));
+        r.seen(PointerKind::Release, hardware(at), Some(same));
+        r.gate.take_press(2, r.now);
+        r.gate.take_click(2, r.now)
+    }
+
+    /// The audit's replay, and its posted move: only a real message with the cursor off the button
+    /// ends the rule, not a program moving the cursor off and back.
+    #[test] // spec: P4a-R10
+    fn refuses_a_programs_warp_as_a_way_round_the_re_entry() {
+        let new_amount = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let same = Target {
+            changed: false,
+            ..new_amount
+        };
+        let off: [fn((i32, i32)) -> PointerMsg; 3] = [system, posted, injected];
+        for away in off {
+            // With and without Windows' own move as the cursor comes back.
+            for back in [true, false] {
+                let mut r = Replay::new();
+                r.rest_on_the_button();
+                r.seen(PointerKind::Move, hardware((151, 116)), Some(new_amount));
+                r.seen(PointerKind::Move, away(OFF), None);
+                if back {
+                    r.seen(PointerKind::Move, system((151, 116)), Some(same));
+                }
+                r.seen(PointerKind::Move, hardware((152, 116)), Some(same));
+                r.seen(PointerKind::Move, hardware((153, 116)), Some(same));
+                r.advance(HOVER_BEFORE_PRESS);
+                assert_eq!(
+                    click_on_two(&mut r, (153, 116), same),
+                    Err(GateRefusal::Reenter)
+                );
+                // The hand really off and back does end it.
+                r.seen(PointerKind::Move, hardware(OFF), None);
+                r.seen(PointerKind::Move, hardware((101, 101)), Some(same));
+                r.seen(PointerKind::Move, hardware(ON), Some(same));
+                r.advance(HOVER_BEFORE_PRESS);
+                assert_eq!(click_on_two(&mut r, ON, same), Ok(()));
+            }
+        }
+    }
+
+    /// A program with a low-level hook could time a warp for a hand heading to Deny, next door.
+    #[test] // spec: P4a-R10
+    fn refuses_a_warp_under_a_moving_hand() {
+        let warps: [fn((i32, i32)) -> PointerMsg; 2] = [system, injected];
+        for warp in warps {
+            let mut r = Replay::new();
+            r.mv(hardware(OFF));
+            r.mv(hardware((60, 60)));
+            r.mv(warp(ON));
+            r.mv(hardware((151, 115)));
+            r.mv(hardware((152, 115)));
+            r.advance(HOVER_BEFORE_PRESS);
+            r.press(hardware((152, 115)));
+            r.advance(Duration::from_millis(60));
+            r.release(hardware((152, 115)));
+            assert_eq!(r.qml_click(), Err(GateRefusal::Reenter));
+            r.rest_on_the_button();
+            r.press(hardware(ON));
+            r.advance(Duration::from_millis(60));
+            r.release(hardware(ON));
+            assert_eq!(r.qml_click(), Ok(()), "off and back ends it");
+        }
+    }
+
+    /// What a hand does, with what Windows and other programs add around it.
+    #[test] // spec: P4a-R10
+    fn a_normal_hand_never_trips_the_warp_rule() {
+        let mut r = Replay::new();
+        r.mv(hardware(OFF));
+        // Windows' own move off the button, somewhere new: a warp, maybe, but nowhere that matters.
+        r.mv(system((60, 60)));
+        for x in (70..150).step_by(7) {
+            r.mv(hardware((x, 80)));
+        }
+        r.mv(hardware((101, 101)));
+        r.mv(hardware(ON));
+        // Windows' own move where the cursor already is.
+        r.mv(system(ON));
+        // A program's posted move: the message says elsewhere, the cursor is here.
+        r.mv(PointerMsg {
+            message_at: Some((160, 120)),
+            ..posted(ON)
+        });
+        r.mv(hardware((151, 115)));
+        r.advance(HOVER_BEFORE_PRESS);
+        r.press(hardware((151, 115)));
+        r.advance(Duration::from_millis(60));
+        r.release(hardware((151, 115)));
+        assert_eq!(r.qml_click(), Ok(()));
+    }
+
+    /// `ApproveButton` watches again when its window comes to the front, so the next message finds a
+    /// new button. With the cursor on it: "a click meant for the window underneath".
+    #[test] // spec: P4a-R10
+    fn refuses_a_window_raised_under_a_moving_hand() {
+        let raised = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let same = Target {
+            changed: false,
+            ..raised
+        };
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.seen(PointerKind::Leave, posted(ON), None);
+        r.advance(Duration::from_secs(5));
+        r.seen(PointerKind::Move, system(ON), Some(raised));
+        r.seen(PointerKind::Move, hardware((151, 115)), Some(same));
+        r.seen(PointerKind::Move, hardware((152, 115)), Some(same));
+        r.advance(HOVER_BEFORE_PRESS);
+        assert_eq!(
+            click_on_two(&mut r, (152, 115), same),
+            Err(GateRefusal::Reenter)
+        );
+    }
+
+    /// A person's normal case: the title bar brings the window forward, and the hand goes to Approve.
+    /// The first message after it finds the cursor off the button, so nothing needs a re-entry, and
+    /// the title bar's activation says nothing of a click a minute later.
+    #[test] // spec: P4a-R10
+    fn accepts_a_click_after_a_title_bar_brought_the_window_forward() {
+        let same = Target {
+            serial: 2,
+            rect: RECT,
+            changed: false,
+        };
+        let mut r = Replay::new();
+        r.seen(PointerKind::MouseActivate, posted(OFF), None);
+        r.seen(PointerKind::Move, system(OFF), None);
+        r.advance(Duration::from_secs(60));
+        r.seen(PointerKind::Move, hardware((60, 60)), None);
+        r.seen(PointerKind::Move, hardware((101, 101)), Some(same));
+        r.seen(PointerKind::Move, hardware(ON), Some(same));
+        r.advance(HOVER_BEFORE_PRESS);
+        assert_eq!(click_on_two(&mut r, ON, same), Ok(()));
+    }
+
+    /// Windows' own move can come between the activation and its press: that's still that press.
+    #[test] // spec: P4a-R10
+    fn refuses_the_activating_click_past_windows_own_move() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.seen(
+            PointerKind::MouseActivate,
+            posted(ON),
+            Replay::target_at(ON),
+        );
+        r.mv(system(ON));
+        r.press(hardware(ON));
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Click(Refusal::NotInFront)));
+    }
+
+    /// A button that comes back between a press and its release: what to do, not a false alarm.
+    #[test] // spec: P4a-R10
+    fn says_to_come_back_when_the_button_came_back_during_the_click() {
+        let back = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.press(hardware(ON));
+        r.seen(PointerKind::Release, hardware(ON), Some(back));
+        r.gate.take_press(2, r.now);
+        assert_eq!(r.gate.take_click(2, r.now), Err(GateRefusal::Reenter));
+    }
+
+    /// QML's events more than a token's lifetime late: the words say that, not that it wasn't a hand.
+    #[test] // spec: P4a-R10
+    fn says_so_when_a_click_came_too_late_to_check() {
+        // Both late.
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.press(hardware(ON));
+        r.release(hardware(ON));
+        r.advance(TOKEN_LIFETIME + Duration::from_millis(200));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Stalled));
+        // Only QML's press late: the release was just now.
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.press(hardware(ON));
+        r.advance(TOKEN_LIFETIME + Duration::from_millis(200));
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Stalled));
+        // A refusal that came late is late too.
+        let mut r = Replay::new();
+        r.press(hardware(ON));
+        r.release(hardware(ON));
+        r.advance(TOKEN_LIFETIME + Duration::from_millis(200));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Stalled));
+        // Nothing to be late: no press or release was seen at all.
+        let mut r = Replay::new();
+        r.advance(TOKEN_LIFETIME + Duration::from_millis(200));
+        assert_eq!(r.qml_click(), Err(NOT_POINTER));
     }
 
     /// The review's replay: the amount changes under a resting hand, a program posts `WM_MOUSELEAVE`,
@@ -902,7 +1187,7 @@ mod tests {
         r.press(hardware(ON));
         r.release(hardware(ON));
         r.advance(TOKEN_LIFETIME + Duration::from_millis(1));
-        assert_eq!(r.qml_click(), Err(NOT_POINTER));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Stalled));
         // A release that left a token; a new press, posted, drops it.
         let mut r = Replay::new();
         r.rest_on_the_button();
@@ -965,6 +1250,17 @@ mod tests {
     }
 
     #[test] // spec: P4a-R10
+    fn the_log_limit_lets_one_line_a_second_through() {
+        let mut limit = LogLimit::default();
+        let start = Instant::now();
+        assert!(limit.due(start));
+        assert!(!limit.due(start));
+        assert!(!limit.due(start + Duration::from_millis(999)));
+        assert!(limit.due(start + Duration::from_secs(1)));
+        assert!(!limit.due(start + Duration::from_millis(1500)));
+    }
+
+    #[test] // spec: P4a-R10
     fn every_refusal_has_words() {
         for refusal in [
             GateRefusal::Click(Refusal::NotInFront),
@@ -974,6 +1270,7 @@ mod tests {
             GateRefusal::Click(Refusal::NoMove),
             GateRefusal::Reenter,
             GateRefusal::ButtonState,
+            GateRefusal::Stalled,
             GateRefusal::NotExposed,
             GateRefusal::NoGuard,
         ] {

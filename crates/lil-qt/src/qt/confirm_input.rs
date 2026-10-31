@@ -22,14 +22,16 @@
 
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::thread::LocalKey;
+use std::time::Instant;
 
 use cxx_qt_lib::{QString, QVariant};
+use lil_platform::hello::is_real_pointer;
 use lil_platform::input_source;
 
 use crate::answer_gate::{AnswerGate, AnswerRefusal, InputKind};
 use crate::confirm_text;
-use crate::pointer_gate::{GateRefusal, PointerGate, PointerKind, Seen, Target};
+use crate::pointer_gate::{GateRefusal, LogLimit, PointerGate, PointerKind, Seen, Target};
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -168,10 +170,21 @@ thread_local! {
     static GATE: RefCell<PointerGate> = RefCell::new(PointerGate::new());
     /// The button the last move was on, for the log.
     static LAST_ON: Cell<u64> = const { Cell::new(0) };
-    static LAST_SENT_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
+    static SENT_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
+    static PRESS_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
+    static RELEASE_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
+    static ARRIVAL_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
+    static REFUSAL_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
 }
 
-const SENT_LOG_EVERY: Duration = Duration::from_secs(1);
+fn log_due(limit: &'static LocalKey<Cell<LogLimit>>) -> bool {
+    limit.with(|cell| {
+        let mut limit = cell.get();
+        let due = limit.due(Instant::now());
+        cell.set(limit);
+        due
+    })
+}
 
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -239,6 +252,9 @@ impl qobject::ConfirmInput {
     }
 
     fn log_refusal(&self, name: &QString) {
+        if !log_due(&REFUSAL_LINES) {
+            return;
+        }
         let counts = GATE.with(|g| g.borrow().counts());
         tracing::info!(
             refusal = %name,
@@ -330,8 +346,10 @@ fn pointer_message(
         PointerMessage::MouseActivate => PointerKind::MouseActivate,
         _ => return,
     };
-    // The source first, before any other call on this thread (as the Hello window reads it).
+    // The source first of what is read here. The filter has already read the cursor and where the
+    // buttons are, and none of that takes a message, so this is still the source of this one.
     let msg = input_source::pointer_msg(window, lparam);
+    let real = is_real_pointer(msg.origin, msg.device, msg.sent);
     // Only a press and a release are judged by these, so a move doesn't pay for them.
     let judged = matches!(kind, PointerKind::Press | PointerKind::Release);
     let physically_down = judged && input_source::left_button_physically_down();
@@ -363,7 +381,7 @@ fn pointer_message(
         if serial == 0 {
             LAST_ON.set(0);
         }
-        if arrived {
+        if arrived && (real || log_due(&ARRIVAL_LINES)) {
             tracing::info!(
                 origin = ?msg.origin,
                 device = ?msg.device,
@@ -375,7 +393,17 @@ fn pointer_message(
             );
         }
     }
-    if serial != 0 && judged {
+    // A hand's are always worth a line, and come at a hand's rate. A program's come as often as it
+    // likes, a press and a release each limited on their own, so a pair still shows both.
+    let line_due = serial != 0
+        && judged
+        && (real
+            || log_due(if kind == PointerKind::Press {
+                &PRESS_LINES
+            } else {
+                &RELEASE_LINES
+            }));
+    if line_due {
         tracing::info!(
             kind = ?kind,
             origin = ?msg.origin,
@@ -399,13 +427,7 @@ fn pointer_sent() {
         gate.sent_input();
         gate.counts()
     });
-    // At most one line a second, so a program can't use up the day's log. The count is in the next.
-    let now = Instant::now();
-    let due = LAST_SENT_LOG
-        .get()
-        .is_none_or(|at| now.duration_since(at) >= SENT_LOG_EVERY);
-    if due {
-        LAST_SENT_LOG.set(Some(now));
+    if log_due(&SENT_LINES) {
         tracing::info!(
             seen = counts.seen,
             real = counts.real,

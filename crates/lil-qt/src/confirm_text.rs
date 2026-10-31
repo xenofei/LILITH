@@ -3,7 +3,11 @@
 //!
 //! - **Nothing invisible.** Every Unicode format and default-ignorable character, every control, the
 //!   line and paragraph separators, tabs and the blank lookalikes (U+2800, the Hangul fillers) show as
-//!   `⟨U+XXXX⟩` ([`marked`]). The markers count: a value's real size on screen is what is limited.
+//!   `⟨U+XXXX⟩` ([`marked`]). So do private-use and noncharacter code points, U+FFFC, and combining
+//!   marks past a few in a row. The markers count: a value's real size on screen is what is limited.
+//!   Lookalike letters stay as they are, by design.
+//! - **Right-to-left letters say so.** They can reorder what is around them, and a marker can't show
+//!   that, so the row carries `rtl` and the card says it beside the value.
 //! - **A value can't draw a boundary.** A real line break starts a new line with a continuation mark
 //!   ([`CONTINUATION`]), so a value's extra line can't pass for another argument. Each key is shown in
 //!   a place of its own by the card. Any other line-breaking character is a marker.
@@ -28,6 +32,9 @@ pub const CONTINUATION: &str = "↳ ";
 /// Blank lines in a row from this many on show as one line.
 const BLANK_RUN: usize = 2;
 
+/// How many combining marks in a row show as themselves. Pointed Hebrew reaches four.
+const COMBINING_RUN: usize = 4;
+
 /// The most arguments shown, each a row to lay out. More is past the bound.
 pub const SHOWN_ROWS_MAX: usize = 1000;
 
@@ -35,6 +42,16 @@ pub const SHOWN_ROWS_MAX: usize = 1000;
 pub fn is_marked(c: char) -> bool {
     c.is_control()
         || lil_parse::is_invisible(c)
+        // Noncharacters: the last two of every plane, and these.
+        || u32::from(c) & 0xfffe == 0xfffe
+        || matches!(
+            c,
+            '\u{fdd0}'..='\u{fdef}'
+            // Private use: what it draws depends on the font.
+            | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}'
+            // The object replacement character, and a blank that takes up room.
+            | '\u{fffc}' | '\u{16fe4}'
+        )
         || matches!(
             c,
             // The bidirectional controls, which is_invisible leaves to shown_text.
@@ -51,21 +68,50 @@ pub fn is_marked(c: char) -> bool {
         )
 }
 
-/// `s` on one line, with everything [`is_marked`] says as `⟨U+XXXX⟩`.
+/// `s` on one line, with everything [`is_marked`] says as `⟨U+XXXX⟩`, and any combining marks past
+/// [`COMBINING_RUN`] in a row.
 pub fn marked(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    let mut run = 0;
     for c in s.chars() {
-        push_marked(&mut out, c);
+        run = if is_combining(c) { run + 1 } else { 0 };
+        if is_marked(c) || run > COMBINING_RUN {
+            out.push_str(&format!("\u{27e8}U+{:04X}\u{27e9}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
     }
     out
 }
 
-fn push_marked(out: &mut String, c: char) {
-    if is_marked(c) {
-        out.push_str(&format!("\u{27e8}U+{:04X}\u{27e9}", u32::from(c)));
-    } else {
-        out.push(c);
-    }
+/// The marks that stack over and under a letter, so that a long run draws over other lines. Real
+/// writing keeps to a few.
+fn is_combining(c: char) -> bool {
+    matches!(
+        c,
+        '\u{300}'..='\u{36f}' | '\u{483}'..='\u{489}'
+        | '\u{591}'..='\u{5bd}' | '\u{5bf}' | '\u{5c1}'..='\u{5c2}' | '\u{5c4}'..='\u{5c5}' | '\u{5c7}'
+        | '\u{610}'..='\u{61a}' | '\u{64b}'..='\u{65f}' | '\u{670}'
+        | '\u{6d6}'..='\u{6dc}' | '\u{6df}'..='\u{6e4}' | '\u{6e7}'..='\u{6e8}' | '\u{6ea}'..='\u{6ed}'
+        | '\u{e31}' | '\u{e34}'..='\u{e3a}' | '\u{e47}'..='\u{e4e}'
+        | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}'
+        | '\u{2de0}'..='\u{2dff}' | '\u{a66f}'..='\u{a672}' | '\u{a674}'..='\u{a67d}'
+        | '\u{fe20}'..='\u{fe2f}'
+        | '\u{1d165}'..='\u{1d169}' | '\u{1d16d}'..='\u{1d172}' | '\u{1d17b}'..='\u{1d182}'
+        | '\u{1d185}'..='\u{1d18b}' | '\u{1d1aa}'..='\u{1d1ad}'
+    )
+}
+
+/// Whether what is shown holds a right-to-left letter. By the bidirectional rules such a letter can
+/// reorder the numbers and words around it, and no marker can show that: the card says so instead.
+fn has_right_to_left(shown: &str) -> bool {
+    shown.chars().any(|c| {
+        matches!(
+            c,
+            '\u{590}'..='\u{8ff}' | '\u{fb1d}'..='\u{fdff}' | '\u{fe70}'..='\u{fefe}'
+            | '\u{10800}'..='\u{10fff}' | '\u{1e800}'..='\u{1efff}'
+        )
+    })
 }
 
 /// A short name from outside (a tool, a caller, a project): [`marked`], then `shown_text`'s limit.
@@ -81,6 +127,8 @@ pub struct ShownArgument {
     pub text: String,
     /// Part of it isn't shown.
     pub cut: bool,
+    /// It holds right-to-left letters, so it can draw in another order than it reads.
+    pub rtl: bool,
 }
 
 /// A whole action as shown.
@@ -181,6 +229,7 @@ pub fn shown_action_within(arguments: &Value, bound: usize) -> ShownAction {
         let whole = whole && key_whole;
         over |= !whole;
         rows.push(ShownArgument {
+            rtl: has_right_to_left(&shown_key) || has_right_to_left(&text),
             key: shown_key,
             text,
             cut: !whole,
@@ -302,6 +351,82 @@ mod tests {
 
     fn one(value: Value) -> ShownArgument {
         shown_action(&json!({ "a": value })).rows.remove(0)
+    }
+
+    /// `א 100 ב 900 ג` keeps its text, and by the bidi rules draws with the numbers swapped.
+    #[test] // spec: APP-115, P4a-R8
+    fn right_to_left_letters_say_so_beside_the_value() {
+        for rtl in [
+            "א 100 ב 900 ג",
+            "pay 100 to \u{5d0}",
+            "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}",
+            "\u{fb50}",
+            "\u{10800}",
+            "\u{1e900}",
+        ] {
+            let row = one(json!(rtl));
+            assert!(row.rtl, "{rtl}");
+            assert_eq!(row.text, rtl, "the text stays as it is");
+        }
+        for not in [
+            "C:\\art\\crane.png",
+            "caf\u{e9} 100",
+            "\u{442}\u{435}\u{441}\u{442}",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            // Only a marker of it is left.
+            "\u{200f}",
+        ] {
+            assert!(!one(json!(not)).rtl, "{not}");
+        }
+        let keyed = shown_action(&json!({"\u{5d0}": "x"}));
+        assert!(keyed.rows[0].rtl, "a key too");
+    }
+
+    #[test] // spec: APP-115, P4a-R8
+    fn what_a_reader_cant_tell_shows_as_a_marker() {
+        for (c, name) in [
+            ('\u{fffc}', "U+FFFC"),
+            ('\u{16fe4}', "U+16FE4"),
+            ('\u{e000}', "U+E000"),
+            ('\u{f8ff}', "U+F8FF"),
+            ('\u{f0000}', "U+F0000"),
+            ('\u{10fffd}', "U+10FFFD"),
+            ('\u{fdd0}', "U+FDD0"),
+            ('\u{fdef}', "U+FDEF"),
+            ('\u{fffe}', "U+FFFE"),
+            ('\u{ffff}', "U+FFFF"),
+            ('\u{1fffe}', "U+1FFFE"),
+            ('\u{10ffff}', "U+10FFFF"),
+        ] {
+            assert_eq!(
+                marked(&format!("a{c}b")),
+                format!("a\u{27e8}{name}\u{27e9}b")
+            );
+        }
+        // Lookalikes stay, by design, and so does what only looks odd.
+        for plain in ["\u{430}pple", "\u{fffd}", "\u{e9}", "e\u{301}"] {
+            assert_eq!(marked(plain), plain);
+        }
+    }
+
+    #[test] // spec: APP-115, P4a-R8
+    fn a_long_stack_of_combining_marks_shows_as_markers() {
+        // Real writing stacks a few: Vietnamese two, pointed Hebrew up to four.
+        assert_eq!(marked("e\u{302}\u{301}"), "e\u{302}\u{301}");
+        let four = "\u{5d0}\u{5b0}\u{5bc}\u{591}\u{592}";
+        assert_eq!(marked(four), four);
+        // Past that, what is drawn over the line above and below is a marker.
+        assert_eq!(
+            marked("a\u{336}\u{337}\u{338}\u{339}\u{33a}\u{33b}b"),
+            "a\u{336}\u{337}\u{338}\u{339}\u{27e8}U+033A\u{27e9}\u{27e8}U+033B\u{27e9}b"
+        );
+        // Thai marks, and the run starts again after a letter.
+        assert_eq!(
+            marked("\u{e01}\u{e49}\u{e49}\u{e49}\u{e49}\u{e49}"),
+            "\u{e01}\u{e49}\u{e49}\u{e49}\u{e49}\u{27e8}U+0E49\u{27e9}"
+        );
+        let two = "a\u{301}\u{301}\u{301}b\u{301}\u{301}\u{301}";
+        assert_eq!(marked(two), two);
     }
 
     /// Each character class the security review named.

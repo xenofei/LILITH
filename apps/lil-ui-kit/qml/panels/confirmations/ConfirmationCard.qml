@@ -92,6 +92,7 @@ LCard {
                 readonly property alias keyText: keyText
                 readonly property alias valueText: valueText
                 readonly property alias cutLine: cutLine
+                readonly property alias rightToLeftLine: rightToLeftLine
                 width: facts.width
                 height: argumentColumn.implicitHeight
 
@@ -130,6 +131,19 @@ LCard {
                         color: Theme.text
                         font.pixelSize: Theme.fontSize
                         wrapMode: Text.WrapAnywhere
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+
+                    Text {
+                        id: rightToLeftLine
+                        width: parent.width
+                        visible: argument.modelData.rtl
+                        text: "This has right-to-left letters, so its numbers and words can draw in a different order than they read."
+                        textFormat: Text.PlainText
+                        color: Theme.warning
+                        font.pixelSize: Theme.fontSize
+                        wrapMode: Text.Wrap
                         Accessible.role: Accessible.StaticText
                         Accessible.name: text
                     }

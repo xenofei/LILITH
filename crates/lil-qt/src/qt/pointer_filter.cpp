@@ -3,7 +3,8 @@
 // messages (capture, activation) reach it in the window procedure. A mouse message another program
 // *sends* reaches neither: Qt keeps input messages out of the window procedure's filter, so a thread
 // hook (WH_CALLWNDPROC, which sees sent messages only) tells the gate. Neither changes anything:
-// every message goes on to Qt. With nothing watched the filter reads nothing.
+// every message goes on to Qt. A button is watched only while it shows (ApproveButton), and with nothing
+// watched the filter reads nothing and tracks nothing, so ordinary clicks in the app go past untouched.
 #include "lil_qt/src/qt/pointer_filter.h"
 #include "lil_qt/src/qt/confirm_input.cxxqt.h"
 

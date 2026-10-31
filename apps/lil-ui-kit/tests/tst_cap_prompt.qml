@@ -22,8 +22,14 @@ TestCase {
         id: hand
         property string verdict: ""
         property int watches: 0
-        function watch(item) { ++watches }
-        function unwatch(item) {}
+        // What is watched now.
+        property var live: []
+        function watch(item) {
+            ++watches
+            if (live.indexOf(item) < 0)
+                live = live.concat([item])
+        }
+        function unwatch(item) { live = live.filter(i => i !== item) }
         function notePress(item) {}
         function takeClick(item) { return verdict }
     }
@@ -71,6 +77,7 @@ TestCase {
         fake.calls = []
         hand.verdict = ""
         hand.watches = 0
+        hand.live = []
         fake.connection = "ready"
         tc.Window.window.requestActivate()
         tryVerify(() => tc.Window.active, 2000, "the test window is in front")
@@ -187,6 +194,19 @@ TestCase {
         w.parentOn = true
         for (const c of marked)
             verify(c.enabled, "back again: " + c)
+    }
+
+    // A prompt inline in a panel: watched while it shows, and it answers when it comes back.
+    function test_an_inline_prompt_is_watched_while_it_shows() { // spec: P4a-R10
+        const prompt = makePrompt()
+        compare(hand.live.length, 2, "Allow once and Raise")
+        prompt.visible = false
+        compare(hand.live.length, 0, "hidden")
+        prompt.visible = true
+        compare(hand.live.length, 2, "shown again")
+        wait(550)
+        mouseClick(prompt.allowOnceButton)
+        compare(Shapes.answers(fake).length, 1, "and it still answers")
     }
 
     function test_every_control_waits_for_the_core() { // spec: APP-034
