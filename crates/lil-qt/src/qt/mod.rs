@@ -11,6 +11,7 @@ use lil_client::ClientConfig;
 use lil_protocol::CallerKind;
 
 pub mod boot;
+pub mod bundle_export;
 pub mod core_object;
 pub mod csv_export;
 pub mod hardware;

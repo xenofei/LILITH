@@ -46,6 +46,17 @@ pub fn csv(rows: &[Value], columns: &[&str]) -> String {
 /// # Errors
 /// When the file can't be written; the error says what became of the file at `path`.
 pub fn export(path: &Path, rows: &[Value], columns: &[&str]) -> io::Result<()> {
+    let text = format!("{BOM}{}", csv(rows, columns));
+    write_kept(path, text.as_bytes())
+}
+
+/// Writes `bytes` to the file you picked, replacing what is there. A failure says why and what
+/// became of the file that was there (a file of the same name is kept as a hidden backup until
+/// the new one is in).
+///
+/// # Errors
+/// The write failed.
+pub fn write_kept(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let backup_name = |name: &str| format!(".{name}.lil-bak");
     let name = path
         .file_name()
@@ -53,8 +64,7 @@ pub fn export(path: &Path, rows: &[Value], columns: &[&str]) -> io::Result<()> {
         .unwrap_or_default();
     let backup = path.with_file_name(backup_name(&name));
     let existed = path.try_exists().unwrap_or(false);
-    let text = format!("{BOM}{}", csv(rows, columns));
-    match crate::layout_file::write_replacing_with(path, text.as_bytes(), backup_name) {
+    match crate::layout_file::write_replacing_with(path, bytes, backup_name) {
         Ok(()) => {
             if existed && let Err(e) = std::fs::remove_file(&backup) {
                 tracing::warn!(error = %e, "the old CSV's backup wasn't deleted");
