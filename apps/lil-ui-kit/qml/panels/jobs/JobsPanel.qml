@@ -42,8 +42,10 @@
 // showJob(id, focus) selects a job's row. A link can ask for it before the first read has returned
 // (P4a-R21), so the panel remembers the job (`wantedJob`) and tries again after each event and read that loads
 // rows, paging back through the history while it looks, until it lands, a new request replaces it,
-// or the reads have finished without the row: then the banner says the job isn't in the list. The
-// keyboard focus moves to the row only when asked, and not if it has moved on while the panel looked.
+// or the reads have finished without the row: then the banner says the job isn't in the list, and
+// the job's event may still land it for a short while (`wantedKeptMs`), unless the person dismisses
+// the words, moves a list or selects a row, or the workspace changes. The keyboard focus moves to
+// the row only when asked, and not if it has moved on while the panel looked.
 //
 // Ctrl+Shift+P is the top bar's (Task 20): the panel's Pause calls the same `app/queue.*`.
 //
@@ -121,9 +123,12 @@ Rectangle {
     property bool _wantedFocus: false
     // The banner is saying a job isn't in the list.
     property bool _saysNotListed: false
-    // The wanted job wasn't found in what there is to read: it stays wanted, for an event to bring,
-    // but nothing is read for it any more, and landing takes no focus.
+    // The wanted job wasn't found in what there is to read: it stays wanted for `wantedKeptMs`, for
+    // an event to bring, but nothing is read for it any more, and landing takes no focus.
     property bool _wantedGaveUp: false
+    property int wantedKeptMs: 30000
+    // The workspace the panel last saw, to tell a switch from a reconnect.
+    property string _workspaceId
 
     // Writes need the core (APP-034): the buttons are marked `requiresCore`, and calls check here.
     readonly property bool writable: jobsModel.loaded && live.loaded && !!core && core.connection === "ready"
@@ -326,6 +331,16 @@ Rectangle {
         }
     }
 
+    // You moved a list: a job kept after giving up must not move it back. The words stay: still true.
+    function personMoved() {
+        if (_wantedGaveUp)
+            wantedJob = ""
+    }
+
+    function workspaceId() {
+        return core && core.workspace ? String(core.workspace.id) : ""
+    }
+
     // Lands on the wanted job if a read or an event has brought its row. The focus goes along only if it is
     // still in this panel, or nowhere: the person may have gone on while the panel looked.
     function tryWantedJob() {
@@ -385,6 +400,7 @@ Rectangle {
         callTool("job.cancel", {all_mine: true}, "Couldn't cancel this app's jobs", r => {
             const jobs = (r.structured || {}).jobs || []
             const jobsWord = jobs.length === 1 ? "1 job." : jobs.length + " jobs."
+            root._saysNotListed = false
             banner.kind = "ok"
             // A running job only begins to cancel: its row says "Cancelling" until it stops.
             banner.show((jobs.every(j => j.status === "cancelled") ? "Cancelled " : "Cancelling or cancelled ")
@@ -672,7 +688,10 @@ Rectangle {
         readCaps()
     }
 
-    Component.onCompleted: start()
+    Component.onCompleted: {
+        _workspaceId = workspaceId()
+        start()
+    }
     Component.onDestruction: {
         for (const id in _raw) {
             try {
@@ -696,6 +715,18 @@ Rectangle {
                 root.lanesCurrent = false
                 root._losses++
             }
+        }
+        function onWorkspaceChanged() {
+            const id = root.workspaceId()
+            if (id === root._workspaceId)
+                return
+            // A job asked for before the first hello is still being looked for; any other belonged
+            // to the workspace it was asked in.
+            if (root._workspaceId !== "" || root._wantedGaveUp) {
+                root.wantedJob = ""
+                root.clearNotListed()
+            }
+            root._workspaceId = id
         }
         function onCallFinished(id, json) {
             const h = root._raw[id]
@@ -847,6 +878,13 @@ Rectangle {
         onTriggered: root.readLive()
     }
 
+    // A kept job's event may be on the way, not for ever. The words stay: still true.
+    Timer {
+        interval: root.wantedKeptMs
+        running: root._wantedGaveUp && root.wantedJob !== ""
+        onTriggered: root.wantedJob = ""
+    }
+
     // caps.get at most once a second.
     Timer {
         id: capsThrottle
@@ -866,6 +904,13 @@ Rectangle {
         id: banner
         anchors { left: parent.left; right: parent.right; top: parent.top; margins: Theme.spacing }
         visible: false
+        // You dismissed "isn't in the list": nothing more is waited for.
+        onClosed: {
+            if (root._saysNotListed) {
+                root._saysNotListed = false
+                root.wantedJob = ""
+            }
+        }
     }
 
     Item {
@@ -879,12 +924,8 @@ Rectangle {
         ListView {
             id: liveList
             anchors { left: parent.left; right: parent.right; top: parent.top }
-            // As tall as it needs, up to 60 % of the panel; the finished list has the rest. Delayed:
-            // the height changes which rows are made, and that the content's height.
-            Binding on height {
-                value: Math.min(liveList.contentHeight, liveList.parent.height * 0.6)
-                delayed: true
-            }
+            // As tall as it needs, up to 60 % of the panel; the finished list has the rest.
+            height: Math.min(contentHeight, parent.height * 0.6)
             // A ListView's header grows upward, past the top of the view: `originY` moves and
             // `contentY` stays. The lanes come with the first read, so the header grows after the
             // list is made, and it would start out of view. So a view that was at its start stays
@@ -899,6 +940,7 @@ Rectangle {
             clip: true
             model: live
             spacing: 4
+            onMovementStarted: root.personMoved()
             // No rows made ahead off the frame's path: a list emptied under one being made cancels
             // it by an index past its end, and Qt warns ("DelegateModel::cancel: index out range").
             cacheBuffer: 0
@@ -1005,6 +1047,7 @@ Rectangle {
             clip: true
             model: history
             spacing: 4
+            onMovementStarted: root.personMoved()
             activeFocusOnTab: true
             currentIndex: -1
             boundsBehavior: Flickable.StopAtBounds

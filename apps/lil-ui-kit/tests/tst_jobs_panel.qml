@@ -175,7 +175,7 @@ TestCase {
     // read lists the running jobs of `jobs` unless `running` says otherwise.
     function load(setup) {
         const s = setup || {}
-        const core = createTemporaryObject(fakeComponent, tc)
+        const core = createTemporaryObject(fakeComponent, tc, s.workspace ? {workspace: s.workspace} : {})
         const w = createTemporaryObject(panelWindow, tc, {core: core})
         windows.push(w)
         answer(core, isPage, ok({jobs: s.jobs || [], next_cursor: null, lanes: s.lanes || [lane()]}), "page")
@@ -303,6 +303,7 @@ TestCase {
         const t = load({jobs: [job("j1", batch), queued("j2", 0, Object.assign({index: 1}, batch)),
                                queued("j4", 1)],
                         queue: [queued("j2", 0, Object.assign({index: 1}, batch)), queued("j4", 1)]})
+        verify(!t.panel.showJob("kept", false), "kept, for its event")
         verify(!button(row(t.panel, "j4"), "Cancel batch"), "a batch of one has no batch cancel")
         button(row(t.panel, "j2"), "Cancel batch (2)").click()
         compare(answer(t.core, c => c.name === "job.cancel", ok({jobs: []})).args, {batch_id: "b_9"})
@@ -314,6 +315,10 @@ TestCase {
                 {all_mine: true})
         tryVerify(() => t.panel.banner.visible && t.panel.banner.text === "Cancelled 2 jobs.", 2000,
                   t.panel.banner.text)
+        // The job's landing has no words of its own to close: these are about something else.
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("kept", "running")})
+        tryCompare(t.panel, "wantedJob", "", 2000, "it landed")
+        verify(t.panel.banner.visible, "the words about the cancel stay")
     }
 
     // The panel with nothing answered yet: a link can ask for a job before any read is in.
@@ -474,13 +479,14 @@ TestCase {
         verify(!t.panel.banner.visible, "and the words went")
 
         // What comes after giving up doesn't say it again: the words are said once.
+        let said = 0
+        t.panel.banner.announced.connect(() => ++said)
         verify(!t.panel.showJob("j8", false))
-        verify(t.panel.banner.visible)
-        t.panel.banner.close()
+        compare(said, 1)
         t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("old", "succeeded")})
         tryVerify(() => t.panel.historyView.count === 1, 2000, "a row came, which looks again")
         wait(50)
-        verify(!t.panel.banner.visible, "said once")
+        compare(said, 1, "said once")
         compare(t.panel.wantedJob, "j8")
         answerLiveIfAsked(t.core)
 
@@ -497,6 +503,94 @@ TestCase {
         t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("j7", "running")})
         tryVerify(() => t.panel.live.rowOf("j7") >= 0, 2000)
         compare(t.panel.live.get(t.panel.liveView.currentIndex).job_id, "j9", "still yours: " + chosen)
+    }
+
+    function test_a_kept_job_stays_in_its_workspace() { // spec: APP-114, P4a-R21
+        const a = {id: "wsA", path: "D:/art/a"}
+        const t = load({workspace: a})
+        verify(!t.panel.showJob("old1", false))
+        verify(t.panel.banner.visible)
+
+        // A reconnect to the same workspace isn't a switch.
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: a})
+        compare(t.panel.wantedJob, "old1", "a reconnect keeps it")
+        verify(t.panel.banner.visible)
+
+        t.core.applyState({connection: "connecting"})
+        t.core.applyState({connection: "ready", workspace: {id: "wsB", path: "D:/art/b"}})
+        compare(t.panel.wantedJob, "", "another workspace's")
+        verify(!t.panel.banner.visible, "the words are about the other workspace")
+
+        // `jobs` can still carry the old workspace's events after a switch.
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("old1", "running")})
+        tryVerify(() => t.panel.live.rowOf("old1") >= 0, 2000)
+        compare(t.panel.liveView.currentIndex, -1, "it takes no selection here")
+    }
+
+    function test_a_link_before_the_first_hello_survives_it() { // spec: APP-114, P4a-R21
+        const t = unanswered()
+        verify(!t.panel.showJob("j9", false))
+        t.core.applyState({connection: "ready", workspace: {id: "wsA", path: "D:/art/a"}})
+        compare(t.panel.wantedJob, "j9", "the workspace wasn't known yet: it hasn't changed")
+    }
+
+    function test_a_kept_job_ends_after_a_while() { // spec: APP-114, P4a-R21
+        const t = load()
+        t.panel.wantedKeptMs = 1000
+        verify(!t.panel.showJob("old1", false))
+        wait(700)
+        // A new link has its own time.
+        verify(!t.panel.showJob("old2", false))
+        wait(700)
+        compare(t.panel.wantedJob, "old2", "the first link's time doesn't end the second's")
+        tryCompare(t.panel, "wantedJob", "", 2000, "it ends")
+        verify(t.panel.banner.visible, "the words are still true")
+
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("old2", "running")})
+        tryVerify(() => t.panel.live.rowOf("old2") >= 0, 2000)
+        compare(t.panel.liveView.currentIndex, -1, "its event no longer takes the selection")
+    }
+
+    function test_dismissing_the_words_ends_a_kept_job() { // spec: APP-114, P4a-R21
+        const t = load()
+        verify(!t.panel.showJob("old1", false))
+        t.panel.banner.closeButton.click()
+        verify(!t.panel.banner.visible)
+        compare(t.panel.wantedJob, "", "nothing more is waited for")
+
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("old1", "running")})
+        tryVerify(() => t.panel.live.rowOf("old1") >= 0, 2000)
+        compare(t.panel.liveView.currentIndex, -1, "its event takes no selection")
+    }
+
+    function test_moving_a_list_ends_a_kept_job() { // spec: APP-114, P4a-R21
+        const queue = []
+        const finished = []
+        for (let i = 0; i < 40; ++i) {
+            queue.push(Shapes.job("q" + i, "queued", {queue_position: i}))
+            finished.push(Shapes.job("f" + i, "succeeded"))
+        }
+        const t = load({jobs: finished, queue: queue})
+        const v = t.panel.liveView
+        tryVerify(() => v.count === 40 && v.contentHeight > v.height + 400, 3000, "a list that can move")
+        tryVerify(() => t.panel.historyView.count === 40, 3000, "and the finished one")
+
+        // Each list, by the wheel, as a person moves it.
+        for (const list of [v, t.panel.historyView]) {
+            verify(!t.panel.showJob("old1", false))
+            compare(t.panel.wantedJob, "old1")
+            wait(50)
+            mouseWheel(list, list.width / 2, list.height / 2, 0, -240)
+            compare(t.panel.wantedJob, "", "you moved it: " + list.Accessible.name)
+            tryVerify(() => !list.moving, 3000, "it settles")
+        }
+        const y = v.contentY
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("old1", "running")})
+        tryVerify(() => t.panel.live.rowOf("old1") >= 0, 2000)
+        wait(50)
+        compare(v.currentIndex, -1, "its event takes no selection")
+        compare(v.contentY, y, "and doesn't move the list back")
     }
 
     function answerLiveIfAsked(core) {
