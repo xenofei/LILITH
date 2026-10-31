@@ -78,8 +78,9 @@ TestCase {
             "workspace.unsupported", "This core serves only the default workspace, \"D:/art/quay\". To use \"D:/art/harbor\" instead, make it the default with `lil workspace use \"D:/art/harbor\"`.")})
         save(shell, "top-bar-refused.png")
 
-        // Connected, with no workspace at all: a first run. The read after `ready` is in, so the
-        // figures are live, and the banner has read that no default exists.
+        // Connected, with no workspace open and no default to fall back on. Not a first run: jobs,
+        // a paused lane and spend still show. The read after `ready` is in, so the figures are live,
+        // and the banner has read that no default exists.
         fake.applyState({connection: "ready", workspace: null})
         verify(shell.noWorkspaceBanner.visible)
         tryVerify(() => {
