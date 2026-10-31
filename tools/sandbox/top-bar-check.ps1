@@ -16,10 +16,12 @@
            docked panel closes it; a press on a floating dock window closes it.
        (d) `lil workspace use` while the app stays connected: the banner names it, and "Use the
            default workspace" gets out.
-       (e) the test core is killed (by its recorded PID): "Reconnecting…" shows, the pause control is
-           off and Ctrl+Shift+P says why, and nothing reaches the core. The app's session starts a new
-           core: the connection and the counts come back, and the pause control waited for the fresh
-           read (a restart ended the pause, so it must then offer Pause, not Resume).
+       (e) the test core is killed (by its recorded PID): "Reconnecting…" shows and the pause control
+           is off. The app's session starts a new core: the connection and the counts come back, and
+           the pause control waited for the fresh read (a restart ended the pause, so it must then
+           offer Pause, never the old Resume). A press after that works. A press during the outage
+           isn't tried: the session is back within a second, so it couldn't be aimed (tst_top_bar
+           covers it).
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first. The tree holds
   no names from a dialog's file list, navigation pane, address bar or breadcrumb.
   3. lil-image is closed, the test core stopped (only the PIDs recorded here), the test channel's
@@ -408,8 +410,6 @@ try {
     $sawReconnecting = $false
     $sawBanner = $false
     $earlyEnabled = $false
-    $pressed = $false
-    $sawNotice = $false
     $end = (Get-Date).AddSeconds(60)
     $done = $false
     while (-not $done -and (Get-Date) -lt $end) {
@@ -427,11 +427,6 @@ try {
             if ($connName -like '*Reconnecting*') { $sawReconnecting = $true }
             if (Find-NameStarting 'Reconnecting… ') { $sawBanner = $true }
             if ($enabled) { $earlyEnabled = $true }
-            if (-not $pressed -and $connName -like '*Reconnecting*') {
-                Send-Keys '^+p'
-                $pressed = $true
-            }
-            if (Find-NameStarting 'GPU work can''t be paused or resumed until the core is connected.') { $sawNotice = $true }
         } else {
             # The fresh read landed when counts show; before it, the control must be off.
             if ($jobsName -eq 'Jobs: —' -and $enabled) { $earlyEnabled = $true }
@@ -443,15 +438,17 @@ try {
     $seen | ForEach-Object { Write-Host "(e) saw: $_" }
     Check $sawReconnecting '(e) the connection indicator said Reconnecting'
     Check $sawBanner '(e) the "Reconnecting…" banner showed'
-    Check $pressed '(e) Ctrl+Shift+P was pressed during the outage'
-    Check $sawNotice '(e) that press said why it could do nothing'
     Check (-not $earlyEnabled) '(e) the pause control stayed off until the fresh read, and never offered the old Resume'
     Check $done '(e) the connection and the counts came back, and the control offers Pause: the restart ended the pause'
     $newCore = Get-CorePid
     Check ($newCore -gt 0 -and $newCore -ne $victim) "(e) a new core runs, pid $newCore"
     $lane = Get-GpuLane
-    Check ($lane.paused -eq $false) '(e) the core says the GPU lane is not paused: the press during the outage reached nothing'
+    Check ($lane.paused -eq $false) '(e) the core says the GPU lane is not paused: a restart ended it'
     Check ($null -eq (Find-NameStarting 'Reconnecting… ')) '(e) the banner went'
+    Send-Keys '^+p'
+    [void](Wait-For { Find-Named 'Resume GPU work' } 10 'Resume GPU work after the restart')
+    $lane = Get-GpuLane
+    Check ($lane.paused -eq $true -and ($lane.reasons -contains 'manual')) '(e) a press after the fresh read pauses the new core'
 } catch {
     Fail "the top bar check stopped: $_"
     try {
