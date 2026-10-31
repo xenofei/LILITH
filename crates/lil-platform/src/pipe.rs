@@ -29,7 +29,8 @@ use windows::Win32::Security::{
 use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 use windows::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows::Win32::System::Threading::{
-    CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
+    CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent,
+    WaitForSingleObject,
 };
 use windows::core::{HSTRING, PWSTR};
 
@@ -188,10 +189,19 @@ pub fn server_pid(client: &NamedPipeClient) -> io::Result<u32> {
 /// Every proof event's name, then 32 hex digits: the session's `Local\` namespace.
 const PROOF_PREFIX: &str = r"Local\lil-launch-proof-";
 
+/// `D:P(A;;<rights>;;;<user_sid>)`: a protected DACL granting the user what the server's set and
+/// the client's wait need, and nobody else anything. The default DACL won't do: an elevated
+/// token's leaves the user's SID out, and so would shut out a server at Medium. No integrity label
+/// is given, so the event has the implicit Medium one whichever level makes it.
+fn proof_sddl(user_sid: &str) -> String {
+    let rights = EVENT_MODIFY_STATE.0 | SYNCHRONIZATION_SYNCHRONIZE.0;
+    format!("D:P(A;;{rights:#x};;;{user_sid})")
+}
+
 /// A pipe server's proof of who it is (Appendix G "Apps"), for when its PID can't vouch for it:
 /// `GetNamedPipeServerProcessId` names the pipe's creator, even after that process has died and
-/// the handle has passed to another. A fresh unsignalled event with a random 128-bit name and
-/// default security, which the server must open with `EVENT_MODIFY_STATE` and set
+/// the handle has passed to another. A fresh unsignalled event with a random 128-bit name and the
+/// security of [`proof_sddl`], which the server must open with `EVENT_MODIFY_STATE` and set
 /// ([`set_proof_event`]). A process at a lower integrity level can't get that right (no write
 /// up), and an AppContainer can't reach the name.
 #[derive(Debug)]
@@ -210,10 +220,22 @@ impl ProofEvent {
         for b in random {
             name.push_str(&format!("{b:02x}"));
         }
-        // SAFETY: the name outlives the call, and the handle it returns is owned from here on.
+        let descriptor = LocalDescriptor::from_sddl(&proof_sddl(&current_user_sid()?))?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0.0,
+            bInheritHandle: false.into(),
+        };
+        // SAFETY: the name, `attributes` and its descriptor outlive the call, and the handle it
+        // returns is owned from here on.
         let event = unsafe {
-            let handle = CreateEventW(None, true, false, &HSTRING::from(name.as_str()))
-                .map_err(|e| io_error(&e))?;
+            let handle = CreateEventW(
+                Some(&raw const attributes),
+                true,
+                false,
+                &HSTRING::from(name.as_str()),
+            )
+            .map_err(|e| io_error(&e))?;
             let existed = GetLastError() == ERROR_ALREADY_EXISTS;
             let event = OwnedHandle::from_raw_handle(handle.0);
             if existed {
@@ -233,6 +255,11 @@ impl ProofEvent {
     pub fn is_set(&self) -> bool {
         // SAFETY: the handle is open while `self` lives.
         unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 0) == WAIT_OBJECT_0 }
+    }
+
+    /// The access-allowed and access-denied entries of its DACL. Errors as [`instance_dacl`].
+    pub fn dacl(&self) -> io::Result<Vec<DaclEntry>> {
+        handle_dacl(HANDLE(self.event.as_raw_handle()))
     }
 }
 
@@ -280,13 +307,19 @@ pub struct DaclEntry {
 /// The access-allowed and access-denied entries of the instance's DACL, in order, with their
 /// access masks. Errors as [`instance_dacl_sids`].
 pub fn instance_dacl(server: &NamedPipeServer) -> io::Result<Vec<DaclEntry>> {
+    handle_dacl(HANDLE(server.as_raw_handle()))
+}
+
+/// The entries of the DACL of the kernel object `handle`, which was opened with READ_CONTROL.
+fn handle_dacl(handle: HANDLE) -> io::Result<Vec<DaclEntry>> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the handle is the server's open pipe handle (opened with READ_CONTROL as part of
-    // its read access); the out-pointers are valid. `sd` owns the memory `dacl` points into.
+    // SAFETY: the caller's handle is open with READ_CONTROL (a pipe server's as part of its read
+    // access, an event's by making it); the out-pointers are valid. `sd` owns the memory `dacl`
+    // points into.
     unsafe {
         GetSecurityInfo(
-            HANDLE(server.as_raw_handle()),
+            handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             None,

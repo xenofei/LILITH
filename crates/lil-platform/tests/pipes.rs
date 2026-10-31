@@ -158,3 +158,14 @@ fn a_proof_event_is_set_only_through_its_own_name() {
     set_proof_event(proof.name()).unwrap();
     assert!(proof.is_set());
 }
+
+#[test] // spec: ARCH-027, APP-013
+fn a_proof_events_dacl_allows_this_user_alone_what_the_exchange_needs() {
+    const EVENT_MODIFY_STATE_AND_SYNCHRONIZE: u32 = 0x0010_0002;
+    let proof = ProofEvent::new().unwrap();
+    let entries = proof.dacl().unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(entries[0].allowed, "{entries:?}");
+    assert_eq!(entries[0].sid, current_user_sid().unwrap(), "{entries:?}");
+    assert_eq!(entries[0].mask, EVENT_MODIFY_STATE_AND_SYNCHRONIZE);
+}

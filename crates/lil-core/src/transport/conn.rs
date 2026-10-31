@@ -2,9 +2,6 @@
 //!
 //! - Lines are read by one `FramedRead` with a `LinesCodec` capped at `MAX_LINE_BYTES`. A
 //!   writer task drains the outbound queue (`OUTBOUND_CAPACITY`), one line per message.
-//! - Until the core has its router, a `core/prove` is answered ([`answer_prove`]) and the first
-//!   other line waits for the router, unread lines behind it; a connection that ends before
-//!   there is a router never reaches one.
 //! - `Router::opened` runs first and `Router::closed` exactly once, at the end, also when a
 //!   handler on the reader panicked (a drop guard; the panic then ends the connection).
 //! - While the router reports no handshake, each request is awaited before the next line is
@@ -30,22 +27,17 @@ use std::time::Duration;
 
 use codec::Frame;
 use futures_util::{FutureExt as _, StreamExt as _};
-use lil_protocol::{Response, RpcError, method, parse_request, rpc_code};
+use lil_protocol::{Response, RpcError, parse_request, rpc_code};
 use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, LinesCodecError};
 use tokio_util::sync::CancellationToken;
 
-use super::{ConnCtx, LateRouter, MAX_IN_FLIGHT_PER_CONN, OUTBOUND_CAPACITY, Router, answer_prove};
+use super::{ConnCtx, MAX_IN_FLIGHT_PER_CONN, OUTBOUND_CAPACITY, Router};
 
 /// How long a closed connection may still spend writing the lines queued before it closed.
 const FLUSH_GRACE: Duration = Duration::from_secs(1);
-
-/// A connection's lines.
-type Lines = FramedRead<ReadHalf<NamedPipeServer>, codec::LineCodec>;
-/// One read of [`Lines`].
-type Read = Result<Frame, LinesCodecError>;
 
 /// Serves one connected pipe instance until the client leaves, an over-long line arrives or
 /// `close` is cancelled.
@@ -53,7 +45,7 @@ pub(super) async fn run(
     server: NamedPipeServer,
     conn_id: u64,
     client_pid: u32,
-    mut router: LateRouter,
+    router: Arc<dyn Router>,
     close: CancellationToken,
 ) {
     let (read, write) = tokio::io::split(server);
@@ -69,12 +61,6 @@ pub(super) async fn run(
     let writer = tokio::spawn(write_lines(write, queue, close.clone(), finish.clone()));
 
     tracing::debug!(conn_id, client_pid, "connection opened");
-    let mut lines = FramedRead::new(read, Frame::codec());
-    let Some((router, first)) = until_router(&mut lines, &ctx, &mut router).await else {
-        finish.cancel();
-        let _ = writer.await;
-        return;
-    };
     router.opened(&ctx);
     {
         // Runs `closed` and lets the writer finish however reading ends, panics included.
@@ -83,7 +69,7 @@ pub(super) async fn run(
             ctx: &ctx,
             finish: &finish,
         };
-        read_lines(lines, first, &ctx, &router).await;
+        read_lines(read, &ctx, &router).await;
     }
     let _ = writer.await;
 }
@@ -110,62 +96,15 @@ impl Drop for Ending<'_> {
     }
 }
 
-/// The router, once the core has it, and the line read meanwhile that waits for it. `None`: the
-/// connection ended first. Meanwhile each `core/prove` is answered.
-async fn until_router(
-    lines: &mut Lines,
-    ctx: &ConnCtx,
-    late: &mut LateRouter,
-) -> Option<(Arc<dyn Router>, Option<Read>)> {
-    let mut first = None;
-    loop {
-        tokio::select! {
-            biased;
-            () = ctx.close.cancelled() => return None,
-            router = the_router(late) => return Some((router?, first)),
-            next = lines.next(), if first.is_none() => {
-                let next = next?;
-                let prove = match &next {
-                    Ok(Frame::Line(line)) => parse_request(line)
-                        .ok()
-                        .filter(|req| req.method == method::PROVE),
-                    _ => None,
-                };
-                match prove {
-                    // A notification is nothing the core acts on.
-                    Some(req) => {
-                        if let Some(id) = req.id {
-                            send(ctx, &answer_prove(id, req.params)).await;
-                        }
-                    }
-                    None => first = Some(next),
-                }
-            }
-        }
-    }
-}
-
-/// The router, once it is there. `None`: the core gave up before it had one.
-async fn the_router(late: &mut LateRouter) -> Option<Arc<dyn Router>> {
-    late.wait_for(Option::is_some).await.ok()?.clone()
-}
-
-async fn read_lines(
-    mut lines: Lines,
-    mut first: Option<Read>,
-    ctx: &Arc<ConnCtx>,
-    router: &Arc<dyn Router>,
-) {
+async fn read_lines(read: ReadHalf<NamedPipeServer>, ctx: &Arc<ConnCtx>, router: &Arc<dyn Router>) {
+    let mut lines = FramedRead::new(read, Frame::codec());
     // Never closed, so acquiring fails only if it did.
     let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONN));
     loop {
-        let next = match first.take() {
-            Some(read) => Some(read),
-            None => tokio::select! {
-                biased;
-                () = ctx.close.cancelled() => return,
-                next = lines.next() => next,
-            },
+        let next = tokio::select! {
+            biased;
+            () = ctx.close.cancelled() => return,
+            next = lines.next() => next,
         };
         let line = match next {
             // End of stream; a partial last line has been dropped by the codec.
