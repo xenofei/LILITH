@@ -192,6 +192,22 @@ fn app_set_context_sets_the_session_project() {
     );
 }
 
+#[test] // spec: ARCH-088, ARCH-098, APP-006
+fn app_set_context_answers_the_effective_project() {
+    let env = TestEnv::new();
+    let ws = default_workspace(&env, "effective");
+    let _core = CoreFixture::start(&env);
+
+    let mut app = app_4a(&env, Some(&ws), &[]);
+    let read = app_ok(&mut app, "app/set_context", json!({}));
+    assert_eq!(read["project"], Value::Null, "{read}");
+    assert_eq!(read["effective_project"], "sketchbook", "{read}");
+
+    let mut bare = app_4a(&env, None, &[]);
+    let read = app_ok(&mut bare, "app/set_context", json!({}));
+    assert_eq!(read["effective_project"], Value::Null, "{read}");
+}
+
 #[test] // spec: APP-006
 fn projects_and_workspaces_are_listed() {
     let env = TestEnv::new();

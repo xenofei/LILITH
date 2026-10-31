@@ -604,8 +604,9 @@ mod tests {
         // `app/confirmation.answer`'s optional `toast_token` (Appendix G "Deny from a toast"),
         // and `app/set_context`'s params and result (Appendix G "Session and listing tools").
         // The `HandlersWire` description changed (the scheme only, plan 4a ruling 2026-10-25):
-        // no wire value changed, so no protocol bump.
-        assert_eq!(h, "815b9a5e6f201285");
+        // no wire value changed, so no protocol bump. `app/set_context`'s result gained the
+        // additive `effective_project` within 1.2, which plan 4a hasn't released.
+        assert_eq!(h, "cbd599bda7731f66");
     }
 
     #[test] // spec: ARCH-029

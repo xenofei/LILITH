@@ -372,12 +372,14 @@ fn given<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>
     Option::<String>::deserialize(d).map(Some)
 }
 
-/// `app/set_context`'s result: the session's workspace (chosen by its `core/hello`) and the
-/// project it now has.
+/// `app/set_context`'s result: the session's workspace (chosen by its `core/hello`), the
+/// project it has set, and the project a call naming none would use now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SetContextResult {
     pub workspace: Option<crate::session::WorkspaceInfo>,
     pub project: Option<String>,
+    #[serde(default)]
+    pub effective_project: Option<String>,
 }
 
 #[cfg(test)]
@@ -407,10 +409,12 @@ mod tests {
                 path: r"C:\ws".into(),
             }),
             project: None,
+            effective_project: Some("sketchbook".to_string()),
         };
         assert_eq!(
             serde_json::to_value(&result).unwrap(),
-            json!({"workspace": {"id": "0123456789abcdef", "path": r"C:\ws"}, "project": null})
+            json!({"workspace": {"id": "0123456789abcdef", "path": r"C:\ws"}, "project": null,
+                   "effective_project": "sketchbook"})
         );
     }
 
