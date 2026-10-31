@@ -5,6 +5,7 @@
 import QtQuick
 import QtTest
 import Lilith.UiKit
+import "CoreShapes.js" as Shapes
 
 TestCase {
     id: tc
@@ -15,7 +16,10 @@ TestCase {
 
     Component {
         id: fakeComponent
-        FakeCore { project: "sketchbook" }
+        FakeCore {
+            project: "sketchbook"
+            workspace: ({id: "ws1", path: "D:/art/harbor"})
+        }
     }
 
     Component {
@@ -52,11 +56,23 @@ TestCase {
 
     property var answered: ({})
 
-    function answer(core, pred, outcome) {
-        let call = null
-        tryVerify(() => (call = core.calls.find(c => pred(c) && !answered[c.id]) || null) !== null, 5000)
-        answered[call.id] = true
-        verify(core.respond(call.id, outcome))
+    // Every call still open that the panel and the top bar make, answered as the core does.
+    function answerAll(core, jobs, lanes, outside) {
+        for (const c of core.calls.filter(c => !answered[c.id])) {
+            let outcome = null
+            if (c.name === "jobs.list")
+                outcome = core.jobsListAnswer(c.args, jobs, lanes)
+            else if (c.name === "engines.status")
+                outcome = ok({engines: [{engine: "comfyui", state: "ready", outside_jobs: outside || {running: 0, queued: 0}}]})
+            else if (c.name === "caps.get")
+                outcome = Shapes.tool(Shapes.capsView([]))
+            else if (c.name === "app/set_context")
+                outcome = Shapes.context(core.workspace, null, "sketchbook")
+            if (outcome) {
+                answered[c.id] = true
+                core.respond(c.id, outcome)
+            }
+        }
     }
 
     function distinctColours(img) {
@@ -75,26 +91,19 @@ TestCase {
         return n
     }
 
-    function grab(state, jobs, queue, lanes, outside) {
+    function grab(state, jobs, lanes, outside) {
         answered = {}
         const core = createTemporaryObject(fakeComponent, tc)
         const shell = createTemporaryObject(shellComponent, tc, {core: core})
         shell.visible = true
         tryVerify(() => shell.docks.jobs.content && shell.docks.jobs.content.width > 0, 5000)
-        answer(core, c => c.name === "jobs.list" && c.args.order === undefined && c.args.status === undefined,
-               ok({jobs: jobs, next_cursor: null, lanes: lanes}))
-        answer(core, c => c.name === "jobs.list" && c.args.status === "running",
-               ok({jobs: jobs.filter(j => j.status === "running"), next_cursor: null, lanes: lanes}))
-        answer(core, c => c.name === "jobs.list" && c.args.status === "queued",
-               ok({jobs: jobs.filter(j => j.status === "queued"), next_cursor: null, lanes: lanes}))
-        answer(core, c => c.name === "jobs.list" && c.args.order === "queue",
-               ok({jobs: queue, next_cursor: null, lanes: lanes}))
-        answer(core, c => c.name === "engines.status",
-               ok({engines: [{engine: "comfyui", state: "ready", outside_jobs: outside || {running: 0, queued: 0}}]}))
-        answer(core, c => c.name === "caps.get", ok({display_currency: "USD", period: "2026-10", caps: []}))
         const panel = shell.docks.jobs.content
-        tryVerify(() => panel.model.loaded && panel.live.loaded
-                        && panel.liveView.count + panel.historyView.count === jobs.length, 5000)
+        tryVerify(() => {
+            answerAll(core, jobs, lanes, outside)
+            return panel.model.loaded && panel.live.loaded && shell.topBar.jobs.current
+                   && panel.liveView.count + panel.historyView.count === jobs.length
+        }, 5000)
+        core.emit("telemetry", "event", Shapes.sample(Shapes.gpu()))
         wait(500)
         compare(shell.width, 1280)
         const img = grabImage(shell.contentItem)
@@ -126,7 +135,7 @@ TestCase {
                                            trace_id: "t", retry: "after_resolve",
                                            fix: {ui_action: {id: "retry_job", label: "Retry the job"}}}})
         const done = job("j_5", {status: "succeeded", substatus: null, started: iso(90000), finished: iso(70000)})
-        grab("running", [running, next, agent, failed, done], [next, agent], [lane()], {running: 0, queued: 1})
+        grab("running", [running, next, agent, failed, done], [lane()], {running: 0, queued: 1})
     }
 
     function test_grab_jobs_paused() { // spec: APP-114, CORE-160
@@ -136,11 +145,10 @@ TestCase {
                                  origin: {surface: "cli"}})
         const held2 = job("j_8", {substatus: "queue_paused", pause_reasons: ["restart", "manual"],
                                   origin: {surface: "cli"}})
-        grab("paused", [paused, held, held2], [paused, held, held2],
-             [lane({paused: true, reasons: ["manual"], held: 3, restart_held: 2})])
+        grab("paused", [paused, held, held2], [lane({paused: true, reasons: ["manual"], held: 3, restart_held: 2})])
     }
 
     function test_grab_jobs_empty() { // spec: APP-114
-        grab("empty", [], [], [lane()])
+        grab("empty", [], [lane()])
     }
 }

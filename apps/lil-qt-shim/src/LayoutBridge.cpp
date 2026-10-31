@@ -97,6 +97,11 @@ void LayoutBridge::step(const QString &name, const QJsonObject &fields)
 bool LayoutBridge::eventFilter(QObject *watched, QEvent *event)
 {
     const QEvent::Type type = event->type();
+    if (type == QEvent::MouseButtonPress || type == QEvent::TouchBegin || type == QEvent::TabletPress) {
+        if (auto *window = qobject_cast<QWindow *>(watched))
+            emit windowPressed(window);
+        return false;
+    }
     if (type != QEvent::Close && type != QEvent::Move && type != QEvent::Resize)
         return false;
     const auto it = m_watched.constFind(watched);

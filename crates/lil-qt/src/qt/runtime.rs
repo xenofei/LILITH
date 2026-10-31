@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use lil_client::session::{Session, SessionState};
+use lil_client::session::{Session, SessionState, UnavailableCause};
 use lil_client::{ClientConfig, ClientError};
 use lil_protocol::codes::{CONFIRM_EXPIRED, PARAMS_INVALID};
 use lil_protocol::{
@@ -108,6 +108,8 @@ pub struct StateView {
     pub core_protocol: Option<String>,
     /// The hello's workspace as JSON (`None` inside: no workspace).
     pub workspace: Option<Option<String>>,
+    /// While unavailable, why as JSON: `{reason, cause, code?, retry?}`.
+    pub unavailable: Option<String>,
 }
 
 impl StateView {
@@ -116,20 +118,26 @@ impl StateView {
             connection,
             core_protocol: None,
             workspace: None,
+            unavailable: None,
         };
         match state {
             SessionState::Connecting => only("connecting"),
             SessionState::Reconnecting { .. } => only("reconnecting"),
-            SessionState::Unavailable { .. } => only("unavailable"),
+            SessionState::Unavailable { reason, cause } => StateView {
+                unavailable: Some(unavailable_json(reason, cause)),
+                ..only("unavailable")
+            },
             SessionState::Incompatible { core_protocol } => StateView {
                 connection: "incompatible",
                 core_protocol: Some(core_protocol.clone()),
                 workspace: None,
+                unavailable: None,
             },
             SessionState::Ready(hello) => StateView {
                 connection: "ready",
                 core_protocol: Some(hello.protocol.clone()),
                 workspace: Some(hello.workspace.as_ref().map(to_json)),
+                unavailable: None,
             },
         }
     }
@@ -349,6 +357,10 @@ impl Runtime {
                 connection: "unavailable",
                 core_protocol: None,
                 workspace: Some(None),
+                unavailable: Some(
+                    json!({"reason": "This process has no core session.", "cause": "other"})
+                        .to_string(),
+                ),
             })),
         }
         rt.spawn(flusher(shared.clone()));
@@ -448,6 +460,39 @@ impl Runtime {
         Some(self.rt().spawn(task).abort_handle())
     }
 
+    /// `Core.useDefaultWorkspace`: a new hello on what `suite.toml` names as the default now, or
+    /// on none when there is no usable default. Its outcome is delivered for `id`.
+    pub fn use_default_workspace(&self, id: String) -> Option<AbortHandle> {
+        let shared = self.shared().clone();
+        let task = async move {
+            let outcome = match shared.session() {
+                Ok(session) => {
+                    let env = session.env();
+                    let ws = tokio::task::spawn_blocking(move || {
+                        lil_client::resolve_workspace(&env, None, &env.local_dir())
+                            .map_or_else(|_| NO_WORKSPACE.to_string(), |ws| ws.id)
+                    })
+                    .await
+                    .unwrap_or_else(|_| NO_WORKSPACE.to_string());
+                    session.set_workspace(&ws).await
+                }
+                Err(e) => Err(e),
+            };
+            let delivery = match outcome {
+                Ok(hello) => Delivery::Finished {
+                    id,
+                    json: to_json(&hello),
+                },
+                Err(e) => Delivery::Failed {
+                    id,
+                    json: to_json(&client_error(&e, &lil_client::mint_id("t"))),
+                },
+            };
+            shared.gui.push(delivery);
+        };
+        Some(self.rt().spawn(task).abort_handle())
+    }
+
     /// Delivers `params.invalid` for `id`: its arguments weren't a JSON object.
     fn fail(&self, id: String, why: &str) {
         let error = ErrorBody::new(&PARAMS_INVALID, why, lil_client::mint_id("t"));
@@ -530,6 +575,25 @@ fn parse_object(text: &str) -> Result<Map<String, Value>, String> {
         Ok(_) => Err("The arguments must be a JSON object.".to_string()),
         Err(e) => Err(format!("The arguments aren't valid JSON: {e}")),
     }
+}
+
+/// [`StateView::unavailable`].
+fn unavailable_json(reason: &str, cause: &UnavailableCause) -> String {
+    let mut out = json!({"reason": reason});
+    out["cause"] = json!(match cause {
+        UnavailableCause::StartFailed(_) => "start_failed",
+        UnavailableCause::CannotStart => "cannot_start",
+        UnavailableCause::Untrusted => "untrusted",
+        UnavailableCause::Refused(_) => "refused",
+        UnavailableCause::Other => "other",
+    });
+    if let UnavailableCause::Refused(error) = cause {
+        // The core's own words name the fix.
+        out["reason"] = json!(error.message);
+        out["code"] = json!(error.code);
+        out["retry"] = serde_json::to_value(error.retry).unwrap_or(Value::Null);
+    }
+    out.to_string()
 }
 
 /// The workspace id a hello names (`none` for none).
@@ -940,6 +1004,41 @@ mod tests {
             kind: EventKind::Event,
             data: json!({"pad": "p".repeat(bytes)}),
         })
+    }
+
+    /// A refused hello reaches the banner in the core's words, with what it takes to get out;
+    /// any other cause keeps the client's reason.
+    #[test] // spec: ARCH-100
+    fn an_unavailable_state_carries_its_cause() {
+        let refused = ErrorBody::new(
+            &lil_protocol::codes::WORKSPACE_UNSUPPORTED,
+            "This core serves only the default workspace, \"B\".",
+            "t_1",
+        );
+        let view = StateView::of(&SessionState::Unavailable {
+            reason: "The core refused the hello.".into(),
+            cause: UnavailableCause::Refused(Box::new(refused)),
+        });
+        assert_eq!(view.connection, "unavailable");
+        let shown: Value = serde_json::from_str(view.unavailable.as_deref().unwrap()).unwrap();
+        assert_eq!(shown["cause"], "refused");
+        assert_eq!(shown["code"], "workspace.unsupported");
+        assert_eq!(shown["retry"], "after_resolve");
+        assert_eq!(
+            shown["reason"],
+            "This core serves only the default workspace, \"B\"."
+        );
+
+        let view = StateView::of(&SessionState::Unavailable {
+            reason: "Cannot start the core.".into(),
+            cause: UnavailableCause::CannotStart,
+        });
+        let shown: Value = serde_json::from_str(view.unavailable.as_deref().unwrap()).unwrap();
+        assert_eq!(shown["cause"], "cannot_start");
+        assert_eq!(shown["reason"], "Cannot start the core.");
+        assert_eq!(shown.get("code"), None);
+
+        assert_eq!(StateView::of(&SessionState::Connecting).unavailable, None);
     }
 
     #[test] // spec: APP-026

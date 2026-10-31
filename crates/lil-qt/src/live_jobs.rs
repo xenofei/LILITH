@@ -39,6 +39,11 @@
 //!   move, not a reset, so a row keeps its delegate.
 //! - **A read cut at [`MAX_PAGES`]** lists that many pages and says so ([`LiveJobs::capped`]): a
 //!   guard against a cursor that never ends.
+//! - **Counts only** ([`LiveJobs::counts_only`], the top bar's): the same rules for what is live, but
+//!   no rows. Each job is kept as its id, status and `updated`, and nothing is sorted or worked out,
+//!   so a job's event costs a map lookup; [`LiveJobs::counts`] says how many run and how many wait.
+//!   Every queued job is in `jobs.list {status: "queued"}`, so its pages are all this reader needs of
+//!   the queued ones, and a job's event asks for a read only when its status changed.
 //! - **Cost:** every read, pass of events and tick sorts, works out and compares all the live rows,
 //!   so it grows linearly with them: about 0.6 to 0.8 ms at 300, and about 15 to 18 ms at 3,000,
 //!   past a frame. The panel applies the events of a frame in one pass, so a burst costs one of
@@ -150,6 +155,13 @@ pub struct LiveJobs {
     read: Option<Read>,
     lanes: Vec<Value>,
     capped: Option<usize>,
+    no_rows: bool,
+}
+
+/// What a counts-only reader keeps of a job.
+fn slim(job: &Value) -> Value {
+    serde_json::json!({"job_id": job.get("job_id"), "status": job.get("status"),
+                       "updated": job.get("updated")})
 }
 
 fn text<'a>(job: &'a Value, key: &str) -> &'a str {
@@ -278,6 +290,25 @@ impl LiveJobs {
         LiveJobs::default()
     }
 
+    /// A reader that keeps no rows (module docs).
+    pub fn counts_only() -> LiveJobs {
+        LiveJobs {
+            no_rows: true,
+            ..LiveJobs::default()
+        }
+    }
+
+    /// How many live jobs are running, and how many aren't (queued, or of a status this build
+    /// doesn't know, P4a-R40).
+    pub fn counts(&self) -> (usize, usize) {
+        let running = self
+            .jobs
+            .values()
+            .filter(|j| text(j, "status") == "running")
+            .count();
+        (running, self.jobs.len() - running)
+    }
+
     /// The rows, in order.
     pub fn rows(&self) -> &[LiveRow] {
         &self.rows
@@ -323,6 +354,7 @@ impl LiveJobs {
     /// One page of `jobs.list {order: "queue"}` (the call's result): the cursor of the next page
     /// to ask for, or `None` once the read has them all (or [`MAX_PAGES`] of them).
     pub fn add_queue_page(&mut self, result: &Value) -> Option<String> {
+        let no_rows = self.no_rows;
         let read = self.read.as_mut()?;
         let page = structured(result);
         if read.lanes.is_none() {
@@ -332,7 +364,8 @@ impl LiveJobs {
             if let Some(id) = job_id(job)
                 && read.seen.insert(id)
             {
-                read.queue.push(job.clone());
+                read.queue
+                    .push(if no_rows { slim(job) } else { job.clone() });
             }
         }
         next_cursor(page, &mut read.queue_pages, &mut read.capped)
@@ -340,15 +373,21 @@ impl LiveJobs {
 
     /// One page of `jobs.list {status: "running"}`: as [`LiveJobs::add_queue_page`].
     pub fn add_running_page(&mut self, result: &Value) -> Option<String> {
+        let no_rows = self.no_rows;
         let read = self.read.as_mut()?;
         let page = structured(result);
-        read.running.extend(jobs_of(page).cloned());
+        read.running
+            .extend(jobs_of(page).map(|j| if no_rows { slim(j) } else { j.clone() }));
         next_cursor(page, &mut read.running_pages, &mut read.status_cut)
     }
 
     /// One page of `jobs.list {status: "queued"}`: as [`LiveJobs::add_queue_page`], taking only
-    /// the jobs that hold no place in a queue, which the queue read doesn't list.
+    /// the jobs that hold no place in a queue, which the queue read doesn't list. A counts-only
+    /// reader takes them all.
     pub fn add_queued_page(&mut self, result: &Value) -> Option<String> {
+        if self.no_rows {
+            return self.add_queue_page(result);
+        }
         let read = self.read.as_mut()?;
         let page = structured(result);
         read.dispatched
@@ -427,6 +466,7 @@ impl LiveJobs {
             let Some(id) = job_id(&job) else {
                 continue;
             };
+            let job = if self.no_rows { slim(&job) } else { job };
             let before = self.status_of(&id);
             if let Some(read) = self.read.as_mut() {
                 read.events.insert(id.clone(), job.clone());
@@ -441,7 +481,7 @@ impl LiveJobs {
             let queued = |s: &Option<String>| s.as_deref() == Some("queued");
             change = change.max(if before.is_none() && after.is_none() {
                 JobChange::None
-            } else if queued(&before) || queued(&after) || before != after {
+            } else if before != after || (!self.no_rows && (queued(&before) || queued(&after))) {
                 JobChange::ReadAgain
             } else {
                 JobChange::Shown
@@ -521,6 +561,9 @@ impl LiveJobs {
     }
 
     fn refresh(&mut self, now_ms: i64) -> Vec<Op> {
+        if self.no_rows {
+            return Vec::new();
+        }
         let rank = &self.rank;
         let mut order: Vec<(&String, &Arc<Value>)> = self.jobs.iter().collect();
         order.sort_by(|a, b| {
@@ -877,6 +920,48 @@ mod tests {
         assert_eq!(row(&live, "h").eta_text, "");
     }
 
+    /// The top bar's reader: the same rules for what is live, and nothing kept of a job but what
+    /// a count needs.
+    #[test] // spec: APP-006, APP-139
+    fn a_counts_only_reader_counts_as_the_rows_would_and_keeps_no_rows() {
+        let mut live = LiveJobs::counts_only();
+        let mut odd = job("odd", "paused_by_director", "planning", "gpu-heavy");
+        odd["created"] = json!(at(500));
+        read(
+            &mut live,
+            &[running("g1", "gpu-heavy", None, 5)],
+            &[vec![
+                queued("q1", Some(0), None),
+                queued("q2", Some(1), None),
+            ]],
+        );
+        assert_eq!(live.counts(), (1, 2));
+        assert!(live.rows().is_empty(), "no rows are kept");
+        assert_eq!(
+            live.jobs["q1"].as_object().map(serde_json::Map::len),
+            Some(3),
+            "only the id, status and updated"
+        );
+        // Unknown statuses count as queued and stay through a read; a job that ends leaves; an
+        // event as new as the read wins over it.
+        assert!(live.apply_job(odd, NOW).is_empty());
+        assert_eq!(live.status_of("odd").as_deref(), Some("paused_by_director"));
+        assert_eq!(live.counts(), (1, 3));
+        let mut done = running("g1", "gpu-heavy", None, 5);
+        done["status"] = json!("succeeded");
+        done["updated"] = json!(at(0));
+        live.apply_job(done, NOW);
+        assert_eq!(live.counts(), (0, 3));
+        read(&mut live, &[], &[vec![queued("q1", Some(0), None)]]);
+        assert_eq!(live.counts(), (0, 2), "the read says; `odd` stays");
+        // A fresh read carries nothing over.
+        live.begin_fresh_read();
+        live.add_running_page(&json!({"jobs": []}));
+        live.add_queued_page(&json!({"jobs": [], "next_cursor": null}));
+        live.commit(NOW);
+        assert_eq!(live.counts(), (0, 0));
+    }
+
     #[test] // spec: APP-114, CORE-160
     fn running_jobs_come_first_in_every_lane_and_unknown_statuses_with_the_queue() {
         let mut live = LiveJobs::new();
@@ -902,6 +987,11 @@ mod tests {
             overview["mine"],
             json!(0),
             "none of them came from the image app's panels"
+        );
+        assert_eq!(
+            live.counts(),
+            (2, 3),
+            "a job of a status this build doesn't know counts with the queued ones (P4a-R40)"
         );
         // A job that ends leaves.
         let mut done = running("g1", "gpu-heavy", None, 5);

@@ -251,7 +251,10 @@ Rectangle {
     Accessible.description: timeText
 
     TapHandler {
-        onTapped: root.ListView.view.currentIndex = root.ListView.view.indexAt(root.x + 1, root.y + 1)
+        onTapped: {
+            root.panel.personSelected()
+            root.ListView.view.currentIndex = root.ListView.view.indexAt(root.x + 1, root.y + 1)
+        }
     }
 
     Column {
@@ -323,30 +326,35 @@ Rectangle {
 
                 LButton {
                     visible: root.movable
+                    requiresCore: true
                     text: "Run next"
                     enabled: root.panel.writable
                     onClicked: root.panel.moveJob(root.jobId, "next")
                 }
                 LButton {
                     visible: root.movable
+                    requiresCore: true
                     text: "Run last"
                     enabled: root.panel.writable
                     onClicked: root.panel.moveJob(root.jobId, "last")
                 }
                 LButton {
                     visible: root.active
+                    requiresCore: true
                     text: "Cancel"
                     enabled: root.panel.writable
                     onClicked: root.panel.cancelJob(root.jobId)
                 }
                 LButton {
                     visible: root.active && (root.model.batch_size || 0) >= 2
+                    requiresCore: true
                     text: "Cancel batch (" + root.model.batch_size + ")"
                     enabled: root.panel.writable
                     onClicked: root.panel.cancelBatch(root.model.batch_id)
                 }
                 LButton {
                     visible: root.retryable
+                    requiresCore: true
                     text: root.fixAction && root.fixAction.id === "retry_job" ? root.panel.shown(root.fixAction.label)
                                                                               : "Retry"
                     enabled: root.panel.writable && !root.panel.busyRetries[root.jobId]

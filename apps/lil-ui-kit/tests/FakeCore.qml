@@ -16,6 +16,7 @@
 // confirm.denied or confirm.expired. Outcomes are signalled at once (Core's come later, from the
 // event loop): a test responds only after the call has returned.
 import QtQuick
+import Lilith.Core
 
 QtObject {
     id: fake
@@ -24,6 +25,7 @@ QtObject {
     property string connection: "ready"
     property string coreProtocol: "1.2"
     property var workspace: null
+    property var unavailable: null
     property string project: ""
     property string channelScheme: "lil-test-fake"
     property var startTimes: ({})
@@ -34,6 +36,7 @@ QtObject {
     property var cancelled: []    // request ids
     property var subscribed: []   // the topics followed, in the order they were first followed
     property var resends: []      // {id, retryToken}
+    property int retries: 0       // retryNow() calls
 
     signal callFinished(string id, string resultJson)
     signal callFailed(string id, string errorJson)
@@ -55,6 +58,7 @@ QtObject {
     function call(tool, argsJson) { return _request("call", tool, argsJson) }
     function appCall(method, paramsJson) { return _request("appCall", method, paramsJson) }
     function setWorkspace(id) { return _request("setWorkspace", id, "") }
+    function useDefaultWorkspace() { return _request("useDefaultWorkspace", "", "") }
 
     function cancel(id) {
         if (!(id in _open))
@@ -84,10 +88,23 @@ QtObject {
         }
     }
     function subscriberCount(topic) { return _counts[topic] || 0 }
-    function retryNow() {}
+    function retryNow() { retries++ }
+    function noteProject(slug) { project = slug }
     function lastSeq(topic) { return topic in _seqs ? _seqs[topic] : -1 }
-    function shownText(text, maxChars) {
-        return text.length <= maxChars ? text : text.slice(0, Math.max(0, maxChars - 1)) + "…"
+    // The real one (lil_parse::shown_text), so a test sees what the user would.
+    function shownText(text, maxChars) { return Core.shownText(text, maxChars) }
+
+    // A session state as Core applies one: every field stored before any signal, `connection`
+    // signalling last. A QML property signals as it is set, so here the fields it depends on are
+    // set first. `state` is {connection, coreProtocol?, workspace?, unavailable?}; `workspace` left
+    // out stays as it is, as for every state but `ready`.
+    function applyState(state) {
+        if (state.coreProtocol !== undefined)
+            coreProtocol = state.coreProtocol
+        unavailable = state.unavailable || null
+        if (state.workspace !== undefined)
+            workspace = state.workspace
+        connection = state.connection
     }
 
     // The test's side.

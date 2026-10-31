@@ -18,12 +18,13 @@ Flow {
 
     readonly property bool yourPause: !!queueState && (queueState.reasons || []).indexOf("manual") >= 0
     readonly property int restartHeld: queueState ? queueState.restart_held || 0 : 0
-    readonly property bool free: panel.writable && !panel.busyLanes[lane]
+    readonly property bool free: panel.writable && panel.lanesCurrent && !panel.busyLanes[lane]
 
     spacing: Theme.spacing
 
     LButton {
         id: pauseButton
+        requiresCore: true
         text: root.yourPause ? "Resume" : "Pause"
         Accessible.name: text + " " + root.panel.laneLabel(root.lane)
         enabled: root.free
@@ -31,6 +32,7 @@ Flow {
     }
 
     LButton {
+        requiresCore: true
         visible: root.restartHeld > 0
         text: "Resume held jobs (" + root.restartHeld + ")"
         enabled: root.free

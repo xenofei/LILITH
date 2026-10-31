@@ -45,6 +45,150 @@ TestCase {
         tryVerify(() => item.activeFocus, 2000, "the focus is on " + item)
     }
 
+    Component {
+        id: fakeComponent
+        FakeCore {}
+    }
+
+    // Each base control marked `requiresCore`, under an item holding a core.
+    Component {
+        id: gatedPage
+        Window {
+            id: gated
+            width: 480
+            height: 400
+            visible: true
+            property var core: null
+            property bool allowed: true
+            property alias button: gatedButton
+            property alias iconButton: gatedIconButton
+            property alias toggle: gatedToggle
+            property alias field: gatedField
+            property alias unmarked: unmarkedButton
+            property alias own: ownCore
+            Column {
+                id: holder
+                property var core: gated.core
+                LButton { id: gatedButton; requiresCore: true; text: "Run"; enabled: gated.allowed }
+                LIconButton { id: gatedIconButton; requiresCore: true; glyph: "x"; text: "Remove" }
+                LToggle { id: gatedToggle; requiresCore: true; text: "Keep" }
+                LTextField { id: gatedField; requiresCore: true; label: "Name" }
+                LButton { id: unmarkedButton; text: "Plain" }
+            }
+            // Its own core wins: a popup's items have no ancestor to ask.
+            LButton { id: ownCore; y: 200; requiresCore: true; core: gated.core; text: "Own" }
+        }
+    }
+
+    Component {
+        id: orphanPage
+        Window {
+            visible: true
+            property alias orphan: orphan
+            LButton { id: orphan; requiresCore: true; text: "Nowhere" }
+        }
+    }
+
+    function test_requires_core_disables_every_base_control_unless_ready() { // spec: APP-034, APP-156
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(gatedPage, tc, {core: core})
+        const marked = [w.button, w.iconButton, w.toggle, w.field, w.own]
+        for (const c of marked)
+            verify(c.enabled, "ready: " + c)
+
+        core.connection = "reconnecting"
+        for (const c of marked)
+            verify(!c.enabled, "at once: " + c)
+        verify(w.unmarked.enabled, "an unmarked control doesn't care")
+        // Its own binding keeps working: it decides again when the core is back.
+        w.allowed = false
+        core.connection = "ready"
+        verify(!w.button.enabled, "`enabled: allowed` is what it goes back to")
+        w.allowed = true
+        verify(w.button.enabled, "and that binding is alive")
+        w.allowed = false
+        verify(!w.button.enabled)
+        w.allowed = true
+        for (const state of ["connecting", "incompatible", "unavailable"]) {
+            core.connection = state
+            verify(!w.button.enabled, state)
+            core.connection = "ready"
+            verify(w.button.enabled, "back from " + state)
+        }
+
+        // Unmarking lifts it.
+        core.connection = "reconnecting"
+        w.button.requiresCore = false
+        verify(w.button.enabled)
+    }
+
+    Component {
+        id: disabledParentPage
+        Window {
+            id: under
+            width: 480
+            height: 400
+            visible: true
+            property var core: null
+            property bool parentOn: true
+            property alias button: plainButton
+            property alias iconButton: plainIcon
+            property alias toggle: plainToggle
+            property alias field: plainField
+            Column {
+                enabled: under.parentOn
+                property var core: under.core
+                LButton { id: plainButton; requiresCore: true; text: "Run" }
+                LIconButton { id: plainIcon; requiresCore: true; glyph: "x"; text: "Remove" }
+                LToggle { id: plainToggle; requiresCore: true; text: "Keep" }
+                LTextField { id: plainField; requiresCore: true; label: "Name" }
+            }
+        }
+    }
+
+    // `enabled` reads the effective value, so a gate that engages under a disabled parent must not
+    // keep that `false` as the control's own.
+    function test_a_gate_engaged_under_a_disabled_parent_comes_back() { // spec: APP-034, APP-156
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(disabledParentPage, tc, {core: core})
+        const marked = [w.button, w.iconButton, w.toggle, w.field]
+        for (const c of marked)
+            verify(c.enabled, "starts live: " + c)
+
+        // Parent off, then the core lost; parent on, then the core back.
+        w.parentOn = false
+        core.connection = "reconnecting"
+        w.parentOn = true
+        for (const c of marked)
+            verify(!c.enabled, "the gate still holds: " + c)
+        core.connection = "ready"
+        for (const c of marked)
+            verify(c.enabled, "back: " + c)
+
+        // The core back first, under the parent.
+        w.parentOn = false
+        core.connection = "reconnecting"
+        core.connection = "ready"
+        for (const c of marked)
+            verify(!c.enabled, "the parent still holds: " + c)
+        w.parentOn = true
+        for (const c of marked)
+            verify(c.enabled, "back: " + c)
+
+        // The other order.
+        core.connection = "reconnecting"
+        w.parentOn = false
+        core.connection = "ready"
+        w.parentOn = true
+        for (const c of marked)
+            verify(c.enabled, "back: " + c)
+    }
+
+    function test_requires_core_with_no_core_to_ask_stays_disabled() { // spec: APP-034
+        const w = createTemporaryObject(orphanPage, tc)
+        verify(!w.orphan.enabled, "fails closed")
+    }
+
     function test_keyboard_operates_every_control() { // spec: APP-156
         const p = createTemporaryObject(page, tc)
         p.requestActivate()

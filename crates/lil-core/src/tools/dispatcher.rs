@@ -248,7 +248,8 @@ impl Dispatcher {
     /// read-write workspace); `Some(None)` forgets the session's, so its calls fall back to the
     /// hint, then `sketchbook`; `None` (no `project` given) changes nothing and answers the
     /// project the session has set, if any. The workspace is the session's, chosen by its
-    /// `core/hello`.
+    /// `core/hello`. `effective_project` in each answer is the project a call naming none would
+    /// use now, read without writing anything, and `None` when there is no workspace to open.
     ///
     /// # Errors
     /// `workspace.required` for a slug in a session without a workspace; the session's
@@ -273,6 +274,7 @@ impl Dispatcher {
             return Ok(SetContextResult {
                 workspace,
                 project: self.inner.active.get(&session.id),
+                effective_project: self.effective_project(session, trace_id).await,
             });
         };
         let Some(slug) = project else {
@@ -280,6 +282,7 @@ impl Dispatcher {
             return Ok(SetContextResult {
                 workspace,
                 project: None,
+                effective_project: self.effective_project(session, trace_id).await,
             });
         };
         let Some(open) = self.inner.open_workspace(session, trace_id).await? else {
@@ -303,7 +306,20 @@ impl Dispatcher {
         Ok(SetContextResult {
             workspace,
             project: Some(slug.to_string()),
+            effective_project: Some(slug.to_string()),
         })
+    }
+
+    /// The project a call naming none would use now; `None` when the session's workspace is
+    /// none, or can't be opened (`{}` and `null` never fail on that).
+    async fn effective_project(&self, session: &Session, trace_id: &str) -> Option<String> {
+        let open = self
+            .inner
+            .open_workspace(session, trace_id)
+            .await
+            .ok()
+            .flatten()?;
+        Some(self.inner.project_of(session, &open, None).await)
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is

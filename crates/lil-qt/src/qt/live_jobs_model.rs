@@ -13,6 +13,10 @@
 //!   2 when the queue may have changed ([`JobChange`]); `applyJob(jobJson, nowMs)` for one;
 //! - `tick(nowMs)`: the clock, which updates only the rows whose times read differently.
 //!
+//! With `countsOnly` set before the first read (the top bar's reader) it keeps no rows, only
+//! [`LiveJobs::counts`] as `runningCount` and `queuedCount`, and `cappedCount` (how many queued
+//! jobs a read stopped at its page cap listed, else -1), so a job's event is a map lookup.
+//!
 //! `lanesJson()` is the read's `lanes` (`QueueState`s) as JSON, `overview(app)`
 //! [`LiveJobs::overview`] as JSON; `get(row)` a row as a map; `rowOf(jobId)` its row, or -1; `loaded` turns true
 //! at the first commit. Roles: the `JobSummary` fields, `waiting_for_earlier_prompt` among them,
@@ -93,8 +97,13 @@ pub mod qobject {
         #[qml_element]
         #[qproperty(bool, loaded, READ, NOTIFY)]
         #[qproperty(i32, count, READ, NOTIFY)]
+        #[qproperty(bool, counts_only, READ, WRITE = set_counts_only, NOTIFY)]
+        #[qproperty(i32, running_count, READ, NOTIFY)]
+        #[qproperty(i32, queued_count, READ, NOTIFY)]
+        #[qproperty(i32, capped_count, READ, NOTIFY)]
         type LiveJobsModel = super::LiveJobsModelRust;
 
+        fn set_counts_only(self: Pin<&mut LiveJobsModel>, counts_only: bool);
         #[qinvokable]
         fn begin_read(self: Pin<&mut LiveJobsModel>, fresh: bool);
         #[qinvokable]
@@ -178,6 +187,10 @@ pub use qobject::LiveJobsModel;
 pub struct LiveJobsModelRust {
     loaded: bool,
     count: i32,
+    counts_only: bool,
+    running_count: i32,
+    queued_count: i32,
+    capped_count: i32,
     live: LiveJobs,
     shown: Vec<LiveRow>,
 }
@@ -219,6 +232,42 @@ fn field(row: &LiveRow, name: &str) -> QVariant {
 }
 
 impl qobject::LiveJobsModel {
+    fn set_counts_only(mut self: Pin<&mut Self>, counts_only: bool) {
+        if self.counts_only == counts_only {
+            return;
+        }
+        let mut rust = self.as_mut().rust_mut();
+        rust.counts_only = counts_only;
+        rust.live = if counts_only {
+            LiveJobs::counts_only()
+        } else {
+            LiveJobs::new()
+        };
+        self.counts_only_changed();
+    }
+
+    /// `runningCount`, `queuedCount` and `cappedCount`, for a `countsOnly` model.
+    fn update_counts(mut self: Pin<&mut Self>) {
+        if !self.counts_only {
+            return;
+        }
+        let (running, queued) = self.live.counts();
+        let (running, queued) = (to_i32(running), to_i32(queued));
+        let capped = self.live.capped().map_or(-1, to_i32);
+        if self.running_count != running {
+            self.as_mut().rust_mut().running_count = running;
+            self.as_mut().running_count_changed();
+        }
+        if self.queued_count != queued {
+            self.as_mut().rust_mut().queued_count = queued;
+            self.as_mut().queued_count_changed();
+        }
+        if self.capped_count != capped {
+            self.as_mut().rust_mut().capped_count = capped;
+            self.as_mut().capped_count_changed();
+        }
+    }
+
     fn begin_read(mut self: Pin<&mut Self>, fresh: bool) {
         let live = &mut self.as_mut().rust_mut().live;
         if fresh {
@@ -249,6 +298,7 @@ impl qobject::LiveJobsModel {
     fn commit(mut self: Pin<&mut Self>, now_ms: f64) {
         let ops = self.as_mut().rust_mut().live.commit(ms(now_ms));
         self.as_mut().apply_ops(ops);
+        self.as_mut().update_counts();
         if let Some(listed) = self.live.capped() {
             tracing::warn!(
                 listed,
@@ -276,6 +326,9 @@ impl qobject::LiveJobsModel {
     fn apply_values(mut self: Pin<&mut Self>, jobs: Vec<Value>, now_ms: f64) -> i32 {
         let applied = self.as_mut().rust_mut().live.apply_jobs(jobs, ms(now_ms));
         self.as_mut().apply_ops(applied.ops);
+        if applied.change == JobChange::ReadAgain {
+            self.as_mut().update_counts();
+        }
         match applied.change {
             JobChange::None => 0,
             JobChange::Shown => 1,

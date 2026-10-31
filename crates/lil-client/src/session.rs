@@ -484,6 +484,11 @@ impl Session {
         let _ = self.commands.send(Command::Retry);
     }
 
+    /// The configuration's environment (its channel's folders).
+    pub fn env(&self) -> lil_platform::Env {
+        lock(&self.shared.cfg).env.clone()
+    }
+
     /// Stops the session: its connection closes, calls in flight end with
     /// [`ClientError::Closed`] and [`Session::events`] ends.
     pub async fn close(mut self) {

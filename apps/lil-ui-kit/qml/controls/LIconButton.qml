@@ -3,9 +3,27 @@
 import QtQuick
 import QtQuick.Templates as T
 import Lilith.UiKit
+import "../core/CoreGate.js" as CoreGate
 
 T.Button {
     id: control
+
+    // Disabled unless the core is ready, whatever `enabled` says: the rule and how its core is
+    // found are in CoreGate.js. Later panels mark their actions with this.
+    property bool requiresCore: false
+    property var core: null
+    // A binding of its own, not the default `true`. `enabled` reads the effective value, so a gate
+    // that takes over under a disabled parent would otherwise save `false` as this control's own,
+    // and restore it for good. It must read a property: one with no dependency doesn't survive.
+    enabled: control.requiresCore || true
+
+    Binding {
+        target: control
+        property: "enabled"
+        when: control.requiresCore && !CoreGate.ready(control)
+        value: false
+        restoreMode: Binding.RestoreBindingOrValue
+    }
 
     property string glyph
 

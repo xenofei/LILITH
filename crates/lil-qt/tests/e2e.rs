@@ -124,19 +124,28 @@ fn own_folder() -> PathBuf {
 /// as `ui:test`, ready.
 struct Rig {
     probe: Probe,
-    _core: CoreFixture,
+    core: Option<CoreFixture>,
     env: TestEnv,
 }
 
 impl Rig {
     /// `prepare` runs before the core starts (`suite.toml`, a fake ComfyUI).
     fn start(prepare: impl FnOnce(&TestEnv)) -> Rig {
+        Rig::start_on(|env| {
+            prepare(env);
+            lil_protocol::NO_WORKSPACE.to_string()
+        })
+    }
+
+    /// As [`Rig::start`], with the session's first hello naming the workspace `prepare` returns.
+    fn start_on(prepare: impl FnOnce(&TestEnv) -> String) -> Rig {
         let env = TestEnv::new();
-        prepare(&env);
+        let workspace = prepare(&env);
         let core = CoreFixture::start_exe(&env, &own_folder().join("lil-core.exe"));
         let mut cfg = ClientConfig::for_env(env.env.clone(), "ui:test".parse().unwrap())
             .expect("a client configuration");
         cfg.start = StartPolicy::NoStart;
+        cfg.workspace = workspace;
         let mut probe = Probe::start(cfg);
         probe.wait_for(
             "the connection",
@@ -144,7 +153,7 @@ impl Rig {
         );
         Rig {
             probe,
-            _core: core,
+            core: Some(core),
             env,
         }
     }
@@ -168,6 +177,27 @@ enum Seen {
         at: Instant,
     },
     Connection(String),
+    /// What a handler of `connectionChanged` reads: `connection`, `coreProtocol` and the id of
+    /// `workspace` at that moment.
+    State(String, String, Option<String>),
+}
+
+/// The id in `Core.workspace`.
+fn workspace_id(core: &Core) -> Option<String> {
+    core.workspace()
+        .value::<cxx_qt_lib::QMap<cxx_qt_lib::QMapPair_QString_QVariant>>()
+        .and_then(|m| m.get(&QString::from("id")))
+        .and_then(|v| v.value::<QString>())
+        .map(|s| s.to_string())
+}
+
+/// A string field of `Core.unavailable`.
+fn unavailable_field(core: &Core, field: &str) -> Option<String> {
+    core.unavailable()
+        .value::<cxx_qt_lib::QMap<cxx_qt_lib::QMapPair_QString_QVariant>>()
+        .and_then(|m| m.get(&QString::from(field)))
+        .and_then(|v| v.value::<QString>())
+        .map(|s| s.to_string())
 }
 
 /// A `Core` on a Qt event loop of its own thread, driven through its invokables.
@@ -231,6 +261,11 @@ impl Probe {
                 .as_mut()
                 .on_connection_changed(move |core| {
                     let _ = t.send(Seen::Connection(core.connection().to_string()));
+                    let _ = t.send(Seen::State(
+                        core.connection().to_string(),
+                        core.core_protocol().to_string(),
+                        workspace_id(&core),
+                    ));
                 })
                 .release();
             thread_tx.send(pinned.qt_thread()).expect("the test waits");
@@ -659,6 +694,189 @@ fn set_workspace_switches_or_fails_with_the_cores_code() {
                 rig.probe.finished(&still)["structured"]["text"],
                 "still here"
             );
+        },
+    );
+}
+
+/// A state is stored whole before any signal, so nothing reads half of it: a screen reader would
+/// otherwise hear "No workspace is open" on every start, as `ready` came before the workspace.
+#[test] // spec: APP-033, APP-156
+fn a_state_is_whole_when_connection_signals() {
+    launch("a_state_is_whole_when_connection_signals", || {
+        let mut served = PathBuf::new();
+        let mut rig = Rig::start_on(|env| {
+            served = env.make_workspace("served");
+            env.register_workspace(&served, true);
+            env.workspace_id(&served)
+        });
+        let expected = rig.env.workspace_id(&served);
+        match rig.probe.wait_for(
+            "the state at `ready`",
+            |s| matches!(s, Seen::State(c, _, _) if c == "ready"),
+        ) {
+            Seen::State(_, protocol, workspace) => {
+                assert!(!protocol.is_empty(), "the protocol is in already");
+                assert_eq!(workspace.as_deref(), Some(expected.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+}
+
+/// "Make this the default" against the real core: from `workspace.set_default`'s answer on, the
+/// old session's every tool call is refused, and a new hello with the answer's id gets it back.
+#[test] // spec: ARCH-030, ARCH-090, APP-006
+fn after_set_default_the_old_session_is_refused_until_a_new_hello() {
+    launch(
+        "after_set_default_the_old_session_is_refused_until_a_new_hello",
+        || {
+            let (mut a, mut b) = (PathBuf::new(), PathBuf::new());
+            let mut rig = Rig::start_on(|env| {
+                a = env.make_workspace("a");
+                b = env.make_workspace("b");
+                env.register_workspace(&a, true);
+                env.register_workspace(&b, false);
+                env.workspace_id(&a)
+            });
+            rig.probe.subscribe("workspace");
+            // The answer to a call made after the subscribe shows that it reached the core.
+            let fence = rig.probe.call("test.echo", json!({"text": "fence"}));
+            rig.probe.finished(&fence);
+            let id = rig.probe.call(
+                "workspace.set_default",
+                json!({"path": b.display().to_string()}),
+            );
+            let answer = rig.probe.finished(&id);
+            let new_id = answer["structured"]["id"].as_str().unwrap().to_string();
+            assert_eq!(new_id, rig.env.workspace_id(&b), "{answer}");
+            // The top bar follows this, so another client's move shows without a list read.
+            match rig.probe.wait_for(
+                "default_changed",
+                |s| matches!(s, Seen::Event { topic, .. } if topic == "workspace"),
+            ) {
+                Seen::Event { kind, data, .. } => {
+                    assert_eq!(kind, "event");
+                    assert_eq!(data["kind"], "default_changed", "{data}");
+                    assert_eq!(data["id"], new_id.as_str(), "{data}");
+                }
+                other => panic!("{other:?}"),
+            }
+
+            for (tool, args) in [
+                ("test.echo", json!({"text": "old"})),
+                ("workspaces.list", json!({})),
+            ] {
+                let id = rig.probe.call(tool, args);
+                match rig.probe.outcome(&id) {
+                    Seen::Failed(_, error) => {
+                        assert_eq!(error["code"], "workspace.unsupported", "{tool}: {error}");
+                    }
+                    other => panic!("{tool} on the old session: {other:?}"),
+                }
+            }
+
+            let ws = QString::from(new_id.as_str());
+            let id = rig
+                .probe
+                .on_gui(move |core| core.set_workspace(&ws).to_string());
+            assert_eq!(rig.probe.finished(&id)["workspace"]["id"], new_id.as_str());
+            let id = rig.probe.call("test.echo", json!({"text": "new"}));
+            assert_eq!(rig.probe.finished(&id)["structured"]["text"], "new");
+            let id = rig.probe.app_call("app/set_context", json!({}));
+            let context = rig.probe.finished(&id);
+            assert_eq!(context["effective_project"], "sketchbook", "{context}");
+        },
+    );
+}
+
+/// The no-workspace banner reads the list again on this: a session with no workspace hears of it.
+#[test] // spec: APP-016, ARCH-090
+fn default_changed_reaches_a_session_with_no_workspace() {
+    launch(
+        "default_changed_reaches_a_session_with_no_workspace",
+        || {
+            let mut b = PathBuf::new();
+            let mut rig = Rig::start(|env| {
+                b = env.make_workspace("b");
+                env.register_workspace(&b, false);
+            });
+            rig.probe.subscribe("workspace");
+            let fence = rig.probe.call("workspaces.list", json!({}));
+            rig.probe.finished(&fence);
+            let id = rig.probe.call(
+                "workspace.set_default",
+                json!({"path": b.display().to_string()}),
+            );
+            let answer = rig.probe.finished(&id);
+            match rig.probe.wait_for(
+                "default_changed",
+                |s| matches!(s, Seen::Event { topic, .. } if topic == "workspace"),
+            ) {
+                Seen::Event { data, .. } => {
+                    assert_eq!(data["id"], answer["structured"]["id"], "{data}");
+                }
+                other => panic!("{other:?}"),
+            }
+        },
+    );
+}
+
+/// `lil workspace use` elsewhere, then a lost connection: the hello names the old workspace and is
+/// refused. `Core.unavailable` carries the core's words, and `useDefaultWorkspace` gets out.
+#[test] // spec: ARCH-100, ARCH-090
+fn a_refused_hello_shows_its_cause_and_the_default_gets_out() {
+    launch(
+        "a_refused_hello_shows_its_cause_and_the_default_gets_out",
+        || {
+            let (mut a, mut b) = (PathBuf::new(), PathBuf::new());
+            let mut rig = Rig::start_on(|env| {
+                a = env.make_workspace("a");
+                b = env.make_workspace("b");
+                env.register_workspace(&a, true);
+                env.register_workspace(&b, false);
+                env.workspace_id(&a)
+            });
+            // Another client's `lil workspace use`: the core is down, and suite.toml moves on.
+            rig.core = None;
+            rig.env.register_workspace(&b, true);
+            rig.probe.wait_for(
+                "the lost connection",
+                |s| matches!(s, Seen::Connection(c) if c == "reconnecting"),
+            );
+            rig.core = Some(CoreFixture::start_exe(
+                &rig.env,
+                &own_folder().join("lil-core.exe"),
+            ));
+            rig.probe.wait_for(
+                "the refused hello",
+                |s| matches!(s, Seen::Connection(c) if c == "unavailable"),
+            );
+            let (cause, code, reason) = rig.probe.on_gui(|core| {
+                (
+                    unavailable_field(&core, "cause"),
+                    unavailable_field(&core, "code"),
+                    unavailable_field(&core, "reason"),
+                )
+            });
+            assert_eq!(cause.as_deref(), Some("refused"));
+            assert_eq!(code.as_deref(), Some("workspace.unsupported"));
+            let reason = reason.unwrap_or_default();
+            assert!(reason.contains("lil workspace use"), "the fix: {reason}");
+
+            let id = rig
+                .probe
+                .on_gui(|core| core.use_default_workspace().to_string());
+            let hello = rig.probe.finished(&id);
+            let new_id = rig.env.workspace_id(&b);
+            assert_eq!(hello["workspace"]["id"], new_id.as_str(), "{hello}");
+            poll("the workspace property", || {
+                let shown = rig.probe.on_gui(|core| workspace_id(&core));
+                (shown.as_deref() == Some(new_id.as_str())).then_some(())
+            });
+            poll("the cause cleared", || {
+                let cause = rig.probe.on_gui(|core| unavailable_field(&core, "cause"));
+                cause.is_none().then_some(())
+            });
         },
     );
 }

@@ -30,17 +30,22 @@
 // `usage` events and when a job ends, for the retry's cost chip. Writes wait until both lists have
 // loaded, and refusals show in the banner; Pause, Resume and Retry also wait for their own call,
 // so a double-click can't undo itself. A snapshot or a `resync_required` of `jobs` reads everything
-// again; `ready` never does.
+// again. `ready` reloads no model, but a read of the live rows follows it, since a same-core reconnect
+// gets no mark: `lanesCurrent` is false from a loss or a mark until a read made after it has landed,
+// and Pause and Resume wait for it, because a core restart ends a pause and the old state must not
+// decide which of them a press sends.
 //
 // Everything from outside (messages, hints, fix labels, kinds, origins, classes, lanes, statuses,
 // substatuses, phases, reasons) is shown through Core.shownText (P4a-R8), and every Text is plain,
 // so markup shows as written and an <img> in it loads nothing (AI-222).
 //
 // showJob(id, focus) selects a job's row. A link can ask for it before the first read has returned
-// (P4a-R21), so the panel remembers the job (`wantedJob`) and tries again after each read that loads
+// (P4a-R21), so the panel remembers the job (`wantedJob`) and tries again after each event and read that loads
 // rows, paging back through the history while it looks, until it lands, a new request replaces it,
-// or the reads have finished without the row: then the banner says the job isn't in the list. The
-// keyboard focus moves to the row only when asked, and not if it has moved on while the panel looked.
+// or the reads have finished without the row: then the banner says the job isn't in the list, and
+// the job's event may still land it for a short while (`wantedKeptMs`), unless the person dismisses
+// the words, moves a list or selects a row, or the workspace changes. The keyboard focus moves to
+// the row only when asked, and not if it has moved on while the panel looked.
 //
 // Ctrl+Shift+P is the top bar's (Task 20): the panel's Pause calls the same `app/queue.*`.
 //
@@ -50,6 +55,7 @@ import QtQuick
 import QtQml.Models
 import Lilith.Core
 import Lilith.UiKit
+import "PausedText.js" as PausedText
 
 Rectangle {
     id: root
@@ -117,8 +123,19 @@ Rectangle {
     property bool _wantedFocus: false
     // The banner is saying a job isn't in the list.
     property bool _saysNotListed: false
+    // The wanted job wasn't found in what there is to read: it stays wanted for `wantedKeptMs`, for
+    // an event to bring, but nothing is read for it any more, and landing takes no focus.
+    property bool _wantedGaveUp: false
+    property int wantedKeptMs: 30000
+    // The workspace the panel last saw, to tell a switch from a reconnect.
+    property string _workspaceId
 
-    readonly property bool writable: jobsModel.loaded && live.loaded
+    // Writes need the core (APP-034): the buttons are marked `requiresCore`, and calls check here.
+    readonly property bool writable: jobsModel.loaded && live.loaded && !!core && core.connection === "ready"
+    // See the header.
+    property bool lanesCurrent: true
+    // Connection losses so far: a read that spans one doesn't speak for the new connection.
+    property int _losses: 0
     readonly property var knownLanes: ["gpu-heavy", "cpu"]
     readonly property var headerLanes: {
         const out = knownLanes.slice()
@@ -206,16 +223,11 @@ Rectangle {
     // A lane's pause: "Paused by you", "Paused while fullscreen", "Paused by you and while
     // fullscreen", an unknown reason by its name.
     function pausedLabel(reasons) {
-        const parts = (reasons || []).map(r => r === "manual" ? "by you"
-                                               : r === "fullscreen" ? "while fullscreen" : "by " + shown(r))
-        if (parts.length === 0)
-            return "Paused"
-        const last = parts.pop()
-        return "Paused " + (parts.length ? parts.join(", ") + " and " : "") + last
+        return PausedText.label(reasons, core)
     }
 
     function laneLabel(lane) {
-        return lane === "gpu-heavy" ? "GPU work" : lane === "cpu" ? "CPU work" : shown(lane)
+        return PausedText.laneLabel(lane, core)
     }
 
     function phaseLabel(phase) {
@@ -267,6 +279,7 @@ Rectangle {
     function showJob(jobId, focus) {
         wantedJob = jobId
         _wantedFocus = focus !== false
+        _wantedGaveUp = false
         if (_saysNotListed) {
             _saysNotListed = false
             banner.close()
@@ -305,7 +318,30 @@ Rectangle {
         return true
     }
 
-    // Lands on the wanted job if a read has brought its row. The focus goes along only if it is
+    // You chose a row: a job still being looked for must not take the selection from you.
+    function personSelected() {
+        wantedJob = ""
+        clearNotListed()
+    }
+
+    function clearNotListed() {
+        if (_saysNotListed) {
+            _saysNotListed = false
+            banner.close()
+        }
+    }
+
+    // You moved a list: a job kept after giving up must not move it back. The words stay: still true.
+    function personMoved() {
+        if (_wantedGaveUp)
+            wantedJob = ""
+    }
+
+    function workspaceId() {
+        return core && core.workspace ? String(core.workspace.id) : ""
+    }
+
+    // Lands on the wanted job if a read or an event has brought its row. The focus goes along only if it is
     // still in this panel, or nowhere: the person may have gone on while the panel looked.
     function tryWantedJob() {
         if (wantedJob === "")
@@ -314,14 +350,17 @@ Rectangle {
         while (focused && focused !== root)
             focused = focused.parent
         const focusStayed = !root.Window.activeFocusItem || focused === root
-        if (landOnJob(wantedJob, _wantedFocus && focusStayed))
+        if (landOnJob(wantedJob, _wantedFocus && focusStayed)) {
             wantedJob = ""
+            clearNotListed()
+        }
     }
 
-    // The reads have finished without the wanted job.
+    // The reads have finished without the wanted job. It stays wanted: its event may be on the way.
     function wantedJobNotListed() {
         const id = shown(wantedJob)
-        wantedJob = ""
+        _wantedGaveUp = true
+        _wantedFocus = false
         _saysNotListed = true
         banner.kind = "warning"
         banner.show("Job " + id + (_historyCutAt >= 0 ? " isn't in the newest " + grouped(_historyCutAt) + " jobs."
@@ -361,6 +400,7 @@ Rectangle {
         callTool("job.cancel", {all_mine: true}, "Couldn't cancel this app's jobs", r => {
             const jobs = (r.structured || {}).jobs || []
             const jobsWord = jobs.length === 1 ? "1 job." : jobs.length + " jobs."
+            root._saysNotListed = false
             banner.kind = "ok"
             // A running job only begins to cancel: its row says "Cancelling" until it stops.
             banner.show((jobs.every(j => j.status === "cancelled") ? "Cancelled " : "Cancelling or cancelled ")
@@ -390,7 +430,7 @@ Rectangle {
     // core answers at once, so without that a double-click of Pause pauses and then resumes,
     // withdrawing the prompts on the way. The control stays enabled, so it keeps the focus.
     function queueCall(method, params, what) {
-        if (!writable || busyLanes[params.lane])
+        if (!writable || !lanesCurrent || busyLanes[params.lane])
             return
         const answered = _laneAnswered[params.lane]
         if (answered !== undefined && Date.now() - answered < Qt.styleHints.mouseDoubleClickInterval)
@@ -482,6 +522,7 @@ Rectangle {
             return
         }
         applyPendingJobs()
+        const losses = _losses
         _liveReading = true
         _newerLanes = {}
         live.beginRead(!!fresh)
@@ -499,6 +540,8 @@ Rectangle {
             root.overviewChanged()
             const newer = root._newerLanes
             root.applyLanes(JSON.parse(live.lanesJson()).filter(s => !newer[s.lane]))
+            if (losses === root._losses && !root._liveFreshAgain)
+                root.lanesCurrent = true
             if (root.wantedJob !== "")
                 root.fillHistory()
             if (root._liveAgain) {
@@ -517,6 +560,14 @@ Rectangle {
             gone = true
             root._liveReading = false
             root._liveReadFailed = true
+            // One was asked for meanwhile (`ready`, a mark): it needn't wait out the retry.
+            if (root._liveAgain) {
+                const again = root._liveFreshAgain
+                root._liveAgain = false
+                root._liveFreshAgain = false
+                root.readLive(again)
+                return
+            }
             retryLive.start()
         }
         // A listing, each page after the page before.
@@ -581,6 +632,7 @@ Rectangle {
         if (kind !== "event") {
             // A snapshot or a resync: the history reloads itself; the panel reads its own state
             // afresh, and the reload hands back the unknown-status jobs the core still lists.
+            lanesCurrent = false
             readLive(true)
             readEngines()
             readCaps()
@@ -613,6 +665,8 @@ Rectangle {
             overviewChanged()
         if (change === 2)
             requestLiveRead()
+        // An event can bring the row a link asked for, before any read does.
+        tryWantedJob()
     }
 
     function start() {
@@ -634,7 +688,10 @@ Rectangle {
         readCaps()
     }
 
-    Component.onCompleted: start()
+    Component.onCompleted: {
+        _workspaceId = workspaceId()
+        start()
+    }
     Component.onDestruction: {
         for (const id in _raw) {
             try {
@@ -649,6 +706,28 @@ Rectangle {
     Connections {
         target: root.core
         ignoreUnknownSignals: true
+        function onConnectionChanged() {
+            if (root.core.connection === "ready") {
+                retryLive.stop()
+                if (!root.lanesCurrent || !live.loaded)
+                    root.readLive()
+            } else {
+                root.lanesCurrent = false
+                root._losses++
+            }
+        }
+        function onWorkspaceChanged() {
+            const id = root.workspaceId()
+            if (id === root._workspaceId)
+                return
+            // A job asked for before the first hello is still being looked for; any other belonged
+            // to the workspace it was asked in.
+            if (root._workspaceId !== "" || root._wantedGaveUp) {
+                root.wantedJob = ""
+                root.clearNotListed()
+            }
+            root._workspaceId = id
+        }
         function onCallFinished(id, json) {
             const h = root._raw[id]
             if (!h)
@@ -724,7 +803,7 @@ Rectangle {
         tryWantedJob()
         if (!jobsModel.loaded || _historyAsked)
             return
-        const seeking = wantedJob !== "" && live.loaded
+        const seeking = wantedJob !== "" && live.loaded && !_wantedGaveUp
         const top = jobsModel.index(-1, 0)
         if ((historyList.count >= Math.max(20, Math.ceil(historyList.height / 40)) && !seeking)
                 || !jobsModel.canFetchMore(top)) {
@@ -799,6 +878,13 @@ Rectangle {
         onTriggered: root.readLive()
     }
 
+    // A kept job's event may be on the way, not for ever. The words stay: still true.
+    Timer {
+        interval: root.wantedKeptMs
+        running: root._wantedGaveUp && root.wantedJob !== ""
+        onTriggered: root.wantedJob = ""
+    }
+
     // caps.get at most once a second.
     Timer {
         id: capsThrottle
@@ -818,6 +904,13 @@ Rectangle {
         id: banner
         anchors { left: parent.left; right: parent.right; top: parent.top; margins: Theme.spacing }
         visible: false
+        // You dismissed "isn't in the list": nothing more is waited for.
+        onClosed: {
+            if (root._saysNotListed) {
+                root._saysNotListed = false
+                root.wantedJob = ""
+            }
+        }
     }
 
     Item {
@@ -833,15 +926,32 @@ Rectangle {
             anchors { left: parent.left; right: parent.right; top: parent.top }
             // As tall as it needs, up to 60 % of the panel; the finished list has the rest.
             height: Math.min(contentHeight, parent.height * 0.6)
+            // A ListView's header grows upward, past the top of the view: `originY` moves and
+            // `contentY` stays. The lanes come with the first read, so the header grows after the
+            // list is made, and it would start out of view. So a view that was at its start stays
+            // there as the start moves; scrolled away it is left be. (The old origin, since a scroll
+            // can move the origin before `contentY` says it changed.)
+            property real _originWas: 0
+            onOriginYChanged: {
+                if (contentY <= _originWas + 1)
+                    contentY = originY
+                _originWas = originY
+            }
             clip: true
             model: live
             spacing: 4
+            onMovementStarted: root.personMoved()
             // No rows made ahead off the frame's path: a list emptied under one being made cancels
             // it by an index past its end, and Qt warns ("DelegateModel::cancel: index out range").
             cacheBuffer: 0
             activeFocusOnTab: true
             currentIndex: -1
             boundsBehavior: Flickable.StopAtBounds
+            Keys.onPressed: event => {
+                if (event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+                    root.personSelected()
+                event.accepted = false
+            }
 
             Accessible.role: Accessible.List
             Accessible.name: "Running and queued"
@@ -857,6 +967,7 @@ Rectangle {
                     height: cancelAll.visible ? cancelAll.implicitHeight : 0
                     LButton {
                         id: cancelAll
+                        requiresCore: true
                         anchors { right: parent.right; rightMargin: Theme.spacing }
                         visible: root.mine > 0
                         text: "Cancel all from this app"
@@ -936,9 +1047,15 @@ Rectangle {
             clip: true
             model: history
             spacing: 4
+            onMovementStarted: root.personMoved()
             activeFocusOnTab: true
             currentIndex: -1
             boundsBehavior: Flickable.StopAtBounds
+            Keys.onPressed: event => {
+                if (event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+                    root.personSelected()
+                event.accepted = false
+            }
 
             Accessible.role: Accessible.List
             Accessible.name: "Finished"

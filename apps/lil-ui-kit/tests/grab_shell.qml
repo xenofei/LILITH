@@ -15,6 +15,7 @@ TestCase {
     FakeCore {
         id: fake
         project: "sketchbook"
+        workspace: ({id: "ws1", path: "D:/art/harbor"})
     }
 
     Component {
@@ -40,6 +41,7 @@ TestCase {
     }
 
     function test_grab_shell_default_layout() { // spec: APP-004, APP-012
+        // The "—", disabled Pause and "Looking for finished jobs…": what a person sees until the first answers.
         const shell = createTemporaryObject(shellComponent, tc)
         shell.visible = true
         tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000)

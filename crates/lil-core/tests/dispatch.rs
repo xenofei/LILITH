@@ -173,6 +173,7 @@ fn set_context_changes_the_session_project() {
     let id = env.workspace_id(&ws);
     assert_eq!(set["result"]["status"], "ok", "{set}");
     assert_eq!(set["result"]["project"], "harbor", "{set}");
+    assert_eq!(set["result"]["effective_project"], "harbor", "{set}");
     assert_eq!(set["result"]["workspace"]["id"], id.as_str(), "{set}");
     let path = set["result"]["workspace"]["path"].as_str().unwrap();
     assert!(
@@ -194,15 +195,27 @@ fn set_context_changes_the_session_project() {
     let unchanged = app.call("app/set_context", json!({}));
     assert_eq!(unchanged["result"]["status"], "ok", "{unchanged}");
     assert_eq!(unchanged["result"]["project"], "harbor", "{unchanged}");
+    assert_eq!(
+        unchanged["result"]["effective_project"], "harbor",
+        "{unchanged}"
+    );
     assert_eq!(context(&mut app), "harbor");
 
     // `null` forgets the session's project: it falls back to the hint.
     let cleared = app.call("app/set_context", json!({"project": null}));
     assert_eq!(cleared["result"]["status"], "ok", "{cleared}");
     assert_eq!(cleared["result"]["project"], Value::Null, "{cleared}");
+    assert_eq!(
+        cleared["result"]["effective_project"], "sketchbook",
+        "{cleared}"
+    );
     assert_eq!(context(&mut app), "sketchbook");
     let unchanged = app.call("app/set_context", json!({}));
     assert_eq!(unchanged["result"]["project"], Value::Null, "{unchanged}");
+    assert_eq!(
+        unchanged["result"]["effective_project"], "sketchbook",
+        "{unchanged}"
+    );
 
     // A session without a workspace has no project to set; it can still clear.
     let mut bare = lil_testkit::TestApp::start_with_capabilities(&env, None, &[], CAPS_1_2);
@@ -214,9 +227,57 @@ fn set_context_changes_the_session_project() {
     let cleared = bare.call("app/set_context", json!({"project": null}));
     assert_eq!(
         cleared["result"],
-        json!({"status": "ok", "workspace": null, "project": null}),
+        json!({"status": "ok", "workspace": null, "project": null, "effective_project": null}),
         "{cleared}"
     );
+    let unchanged = bare.call("app/set_context", json!({}));
+    assert_eq!(
+        unchanged["result"]["effective_project"],
+        Value::Null,
+        "{unchanged}"
+    );
+}
+
+/// The answer's `effective_project` is what a call naming none would use: the hint before
+/// `sketchbook`. Reading it pins nothing and writes no hint (Appendix G; review I8).
+#[test] // spec: ARCH-088, ARCH-098
+fn set_context_answers_the_effective_project_and_writes_nothing() {
+    let env = TestEnv::new();
+    let ws = context_workspace(&env);
+    let _core = app_core(&env);
+    let hint = ws.join(r".lilith\state.json");
+
+    let mut first = lil_testkit::TestApp::start_with_capabilities(&env, Some(&ws), &[], CAPS_1_2);
+    let read = first.call("app/set_context", json!({}));
+    assert_eq!(read["result"]["project"], Value::Null, "{read}");
+    assert_eq!(read["result"]["effective_project"], "sketchbook", "{read}");
+    first.call("app/set_context", json!({"project": "harbor"}));
+    let written = std::fs::read(&hint).unwrap();
+
+    // A new session has no project of its own: it would use the hint, and says so.
+    let mut second = lil_testkit::TestApp::start_with_capabilities(&env, Some(&ws), &[], CAPS_1_2);
+    let read = second.call("app/set_context", json!({}));
+    assert_eq!(
+        read["result"]["project"],
+        Value::Null,
+        "the fallback isn't pinned: {read}"
+    );
+    assert_eq!(read["result"]["effective_project"], "harbor", "{read}");
+    let out = second.tool("project.context", json!({}), None);
+    assert_eq!(
+        out["structured"]["project"], "harbor",
+        "what a call really uses: {out}"
+    );
+    assert_eq!(
+        std::fs::read(&hint).unwrap(),
+        written,
+        "reading writes no hint"
+    );
+
+    // Another client moves the hint: the next read says so.
+    first.call("app/set_context", json!({"project": "sketchbook"}));
+    let read = second.call("app/set_context", json!({}));
+    assert_eq!(read["result"]["effective_project"], "sketchbook", "{read}");
 }
 
 #[test] // spec: ARCH-088, APP-043
