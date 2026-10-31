@@ -29,8 +29,9 @@
   while the app's window is in front, and a real press only where its window is under the point;
   otherwise the check fails and sends nothing.
   3. lil-image is closed, the test core stopped (only the PIDs recorded here), the test channel's
-     registry keys and temporary root removed, and the pop-up told it is done. Anything left behind
-     fails the run. Exit 0 only when every check passed and the cleanup was complete.
+     registry keys, temporary root and Qt cache folder (%LOCALAPPDATA%\LILITH-test-topbarcheck)
+     removed, and the pop-up told it is done. Anything left behind fails the run. Exit 0 only when
+     every check passed and the cleanup was complete.
   -DryRun does step 2's channel set-up and the guards' self-test only, with no pop-up, no window and
   no input.
 #>
@@ -116,6 +117,14 @@ function Exit-TestChannel {
         try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
     }
     if (Test-Path -LiteralPath $root) { Fail "cleanup: $root is still there" }
+    # The organisation name is the channel's (apps/lil-image/main.cpp), so Qt's qmlcache goes to the
+    # real local data folder, outside the test root. Exactly this channel's folder: on any other
+    # channel this function has returned above.
+    $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+    for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
+        try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+    }
+    if (Test-Path -LiteralPath $cache) { Fail "cleanup: $cache is still there" }
     foreach ($id in $corePids) {
         $p = Get-Process -Id $id -ErrorAction SilentlyContinue
         if ($p -and $p.ProcessName -eq 'lil-core' -and $p.Path -and $p.Path.StartsWith($Deploy, [StringComparison]::OrdinalIgnoreCase)) {

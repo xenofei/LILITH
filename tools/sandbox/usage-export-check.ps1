@@ -19,8 +19,9 @@
      it was; after the cancel the file and the folder are unchanged. Real keys go only while the
      app's window is in front; otherwise the check fails and sends nothing.
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first.
-  4. lil-image is closed, the test core stopped, the temporary root removed, and the pop-up told
-     it is done. Exit 0 only when every check passed.
+  4. lil-image is closed, the test core stopped, the temporary root and the test channel's Qt cache
+     folder (%LOCALAPPDATA%\LILITH-test-usagecheck) removed, and the pop-up told it is done. Exit 0
+     only when every check passed and that folder is gone.
   -DryRun does step 3's seeding and the disk checks' self-test only: no pop-up, no window.
 #>
 param(
@@ -119,6 +120,14 @@ function Exit-TestChannel {
         try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
     }
     if (Test-Path -LiteralPath $root) { Write-Host "note: $root could not be removed yet" }
+    # The organisation name is the channel's (apps/lil-image/main.cpp), so Qt's qmlcache goes to the
+    # real local data folder, outside the test root. Exactly this channel's folder: on any other
+    # channel this function has returned above.
+    $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+    for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
+        try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+    }
+    if (Test-Path -LiteralPath $cache) { Fail "cleanup: $cache is still there" }
 }
 
 if (-not ('LilUsageCheck.Win' -as [type])) {
