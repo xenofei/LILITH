@@ -28,14 +28,20 @@
     (b) Space and Enter on Approve answer nothing, and say why.
     (c) A window move restarts the clock: Invoke on Deny right after a SetWindowPos is refused as too soon.
     (e) Enter on Deny denies; UI Automation's Invoke on Deny denies.
-    (s) The sweep: 20 injected press and release pairs on Approve at each hold of 5, 10, 20, 40 and 80 ms.
-        Injected input is refused by the source whatever else happens; this measures what the physical
-        button reads when the GUI thread gets to the message, so how often that factor would refuse a
-        click of that length. A table goes to the output and to -DiagDir\sweep.txt.
+    (s) The sweep: 5 injected press and release pairs on Approve at each hold of 5, 10, 20, 40 and 80 ms,
+        a little over a second apart (a program's lines in the log are limited to one a second of each
+        kind). Injected input is refused by the source whatever else happens; this measures what the
+        button's state reads when the GUI thread gets to the message, so how often that factor would
+        refuse a click of that length. A table goes to the output and to -DiagDir\sweep.txt.
+    (m) InitializeTouchInjection and InjectTouchInput at Approve's centre, then InjectSyntheticPointerInput
+        with a pen: `pending`, and what the log says is measured (`not_pointer`, if QML gets a click at
+        all). An API that isn't there, or that fails, is recorded as not checked.
+    (p) The Confirmations panel floated in the shell, and whether its window is layered, read without a
+        click: what that would mean for `not_exposed` is measured, not judged.
 
   The gesture (the only part that needs a person), with a real rest on Approve in place: the script
   checks the cursor was off Approve, moved onto it by a real pointer move (the log's `origin`), and stayed
-  for 300 ms. It warps nothing.
+  for 300 ms. It warps nothing, here or in (j).
     (f) A posted press and release: `pending` from the core, and the log's press and release must read
         origin Unavailable. Anything else, Hardware or System, means a posted message can inherit a source:
         the check FAILS, loudly (tell the controller at once).
@@ -45,9 +51,15 @@
         `pending`, and the log's origin isn't Hardware.
     (i) A real click: `approved`, and the log's press and release say origin Hardware, physically down at
         the press and up at the release. A refused try shows why on the pop-up, and can be tried again.
+    (j) A person's normal way back: click outside the window, click its title bar once, move onto Approve,
+        rest, click. Coming to the front makes a new button to the gate, but the hand comes to it by
+        moving, so the first click counts: `approved`, with no `brought_forward` and no `not_pointer`.
+        Any other refusal (too soon, or the words to move off and back) is measured and can be retried.
   Then, with no hand again:
-    (d) A change to the raise amount by UI Automation's value shows on the button. A posted WM_CHAR is
-        measured and reported, not judged. It restarts the core with a cap, so it comes after the gesture.
+    (d) A change to the raise amount by UI Automation's value re-arms the gate: Invoke on Cancel right
+        after it is refused as too soon, half a second after the window had settled, and the button shows
+        the amount. A posted WM_CHAR is measured and reported, not judged. It restarts the core with a
+        cap, so it comes after the gesture.
   On any failure the window's reason, the log's lines for that step and the UIA tree go to -DiagDir first.
 
   Real input goes only while the app's window is in front and under the point, and an injected click only
@@ -62,7 +74,8 @@
   window: its confirmations, the retry that reads them, the cap and the core's restart), and cleans up.
 
   What it can't check: a see-through (layered) window under a real click, a fake overlay above the card, and
-  a touchpad tap (the sweep's short holds are only a guess at one).
+  a touchpad tap (the sweep's short holds are only a guess at one). It runs no overlay, reuses no other
+  process's token, and changes no system setting.
 #>
 param(
     [string]$Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
@@ -231,6 +244,72 @@ public struct POINT { public int X; public int Y; }
 [DllImport("user32.dll", EntryPoint = "SendNotifyMessageW")] public static extern bool SendNotifyMessage(System.IntPtr hwnd, uint msg, System.IntPtr wp, System.IntPtr lp);
 [DllImport("user32.dll")] public static extern System.IntPtr SetThreadDpiAwarenessContext(System.IntPtr context);
 [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
+[DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] public static extern System.IntPtr GetWindowLongPtr(System.IntPtr hwnd, int index);
+[DllImport("user32.dll", SetLastError = true)] public static extern bool GetLayeredWindowAttributes(System.IntPtr hwnd, out uint key, out byte alpha, out uint flags);
+
+// What (m) injects, as winuser.h lays it out on x64 (the dry run checks the sizes).
+public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+public struct POINTER_INFO {
+    public uint pointerType; public uint pointerId; public uint frameId; public uint pointerFlags;
+    public System.IntPtr sourceDevice; public System.IntPtr hwndTarget;
+    public POINT ptPixelLocation; public POINT ptHimetricLocation; public POINT ptPixelLocationRaw; public POINT ptHimetricLocationRaw;
+    public uint dwTime; public uint historyCount; public int InputData; public uint dwKeyStates;
+    public ulong PerformanceCount; public int ButtonChangeType;
+}
+public struct POINTER_TOUCH_INFO {
+    public POINTER_INFO pointerInfo; public uint touchFlags; public uint touchMask;
+    public RECT rcContact; public RECT rcContactRaw; public uint orientation; public uint pressure;
+}
+public struct POINTER_PEN_INFO {
+    public POINTER_INFO pointerInfo; public uint penFlags; public uint penMask;
+    public uint pressure; public uint rotation; public int tiltX; public int tiltY;
+}
+// POINTER_TYPE_INFO for a pen: its union is as long as the touch member, so the padding makes up the rest.
+public struct PEN_TYPE_INFO { public uint type; public POINTER_PEN_INFO penInfo; public ulong pad0; public ulong pad1; public ulong pad2; }
+public static int TouchInfoSize() { return Marshal.SizeOf(typeof(POINTER_TOUCH_INFO)); }
+public static int PenTypeInfoSize() { return Marshal.SizeOf(typeof(PEN_TYPE_INFO)); }
+
+[DllImport("user32.dll", SetLastError = true)] static extern bool InitializeTouchInjection(uint maxCount, uint mode);
+[DllImport("user32.dll", SetLastError = true)] static extern bool InjectTouchInput(uint count, ref POINTER_TOUCH_INFO contact);
+[DllImport("user32.dll", SetLastError = true)] static extern System.IntPtr CreateSyntheticPointerDevice(uint type, uint maxCount, uint mode);
+[DllImport("user32.dll", SetLastError = true)] static extern bool InjectSyntheticPointerInput(System.IntPtr device, ref PEN_TYPE_INFO info, uint count);
+[DllImport("user32.dll")] static extern void DestroySyntheticPointerDevice(System.IntPtr device);
+
+const uint INRANGE = 0x2, INCONTACT = 0x4, DOWN = 0x10000, UP = 0x40000;
+
+static POINTER_INFO PointerAt(uint type, int x, int y, uint flags) {
+    POINTER_INFO p = new POINTER_INFO();
+    p.pointerType = type;
+    p.pointerFlags = flags;
+    p.ptPixelLocation.X = x;
+    p.ptPixelLocation.Y = y;
+    return p;
+}
+// Each returns 0, or the error that stopped it.
+public static int TouchTap(int x, int y, int holdMs) {
+    if (!InitializeTouchInjection(1, 3)) return Marshal.GetLastWin32Error();
+    POINTER_TOUCH_INFO t = new POINTER_TOUCH_INFO();
+    t.pointerInfo = PointerAt(2, x, y, INRANGE | INCONTACT | DOWN);
+    if (!InjectTouchInput(1, ref t)) return Marshal.GetLastWin32Error();
+    System.Threading.Thread.Sleep(holdMs);
+    t.pointerInfo = PointerAt(2, x, y, UP);
+    if (!InjectTouchInput(1, ref t)) return Marshal.GetLastWin32Error();
+    return 0;
+}
+public static int PenTap(int x, int y, int holdMs) {
+    System.IntPtr device = CreateSyntheticPointerDevice(3, 1, 3);
+    if (device == System.IntPtr.Zero) return Marshal.GetLastWin32Error();
+    try {
+        PEN_TYPE_INFO p = new PEN_TYPE_INFO();
+        p.type = 3;
+        p.penInfo.pointerInfo = PointerAt(3, x, y, INRANGE | INCONTACT | DOWN);
+        if (!InjectSyntheticPointerInput(device, ref p, 1)) return Marshal.GetLastWin32Error();
+        System.Threading.Thread.Sleep(holdMs);
+        p.penInfo.pointerInfo = PointerAt(3, x, y, INRANGE | UP);
+        if (!InjectSyntheticPointerInput(device, ref p, 1)) return Marshal.GetLastWin32Error();
+        return 0;
+    } finally { DestroySyntheticPointerDevice(device); }
+}
 '@
 }
 function Get-WindowProcessId([System.IntPtr]$hwnd) {
@@ -289,7 +368,12 @@ function Get-LogLines {
     return $out
 }
 $script:stepStart = 0
-function Start-Step { $script:stepStart = @(Get-LogLines).Count }
+# The app logs a program's press, release or arrival and any refusal at most once a second of each kind:
+# the wait leaves this step's first line of each free to come.
+function Start-Step {
+    Start-Sleep -Milliseconds 1100
+    $script:stepStart = @(Get-LogLines).Count
+}
 function Get-LogSinceStep { return @(Get-LogLines) | Select-Object -Skip $script:stepStart }
 # The new lines on a press or release, in order, as objects: {kind, origin, in_send, physically_down, ...}.
 function Get-PointerLines {
@@ -334,6 +418,8 @@ if ($DryRun) {
     $sample = '{"timestamp":"t","level":"INFO","fields":{"message":"a press or release on a confirmation''s button","kind":"Press","origin":"Hardware","physically_down":true,"sent":3},"target":"lil_qt"}'
     $parsed = ($sample | ConvertFrom-Json).fields
     Check ($parsed.kind -eq 'Press' -and $parsed.origin -eq 'Hardware' -and $parsed.physically_down -eq $true) 'dry run: a log line of that shape parses'
+    # winuser.h's sizes on x64: what InjectTouchInput and InjectSyntheticPointerInput will read.
+    Check ([LilConfirmCheck.Win]::TouchInfoSize() -eq 144 -and [LilConfirmCheck.Win]::PenTypeInfoSize() -eq 152) "dry run: (m)'s structures have Windows' sizes ($([LilConfirmCheck.Win]::TouchInfoSize()), $([LilConfirmCheck.Win]::PenTypeInfoSize()))"
     Enter-TestChannel
     try {
         [void](Invoke-Lil @('workspace', 'init', (Join-Path $root 'places\harbor'), '--default'))
@@ -364,8 +450,8 @@ $what = if ($NoHand) { 'checks the confirm window (a window, synthesized clicks 
         else { 'checks the confirm window (a window, synthesized clicks and keys). When this turns blue it needs you' }
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
-               '-What', $what, '-WarnSec', '10', '-RunSec', '480',
-               '-CapSec', '900', '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-What', $what, '-WarnSec', '10', '-RunSec', '720',
+               '-CapSec', '1500', '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -424,7 +510,7 @@ function Get-WindowReason {
     if (-not $script:main) { return '' }
     # The window may have gone: an answered confirmation can't throw the check that reads this.
     try {
-        foreach ($p in 'That ', 'No key answers', 'Approve just', 'Move the', 'What ', 'Wait a moment', 'Press and release', 'Bring this window', 'This window is covered', 'LILITH couldn') {
+        foreach ($p in 'That ', 'No key answers', 'Approve just', 'Move the', 'What ', 'Wait a moment', 'Press and release', 'Bring this window', 'This window is covered', 'LILITH couldn', 'LILITH was') {
             $e = Find-Starting $p
             if ($e) { return $e.Current.Name }
         }
@@ -487,23 +573,27 @@ function Open-Window([string]$id, [string]$button = 'Approve') {
     if (-not $first.FindFirst($TS::Descendants, (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Button)))) {
         Write-Host 'measured: the window element found first has no buttons, a fresh one does: UI Automation kept an early view'
     }
-    $script:deny = Wait-For { $b = Find-Named 'Deny'; if (-not $b) { $b = Find-Named 'Cancel' }; $b } 10 'Deny'
+    $script:deny = Wait-For { Find-Deny } 10 'Deny'
     [void](Wait-For { if ($script:deny.Current.IsEnabled) { $true } } 30 'the buttons to turn on')
     Show-App
     Move-ClearOfPopUp
 }
-# The pop-up is click-through, but it mustn't hide the buttons: it sits at the top of the primary screen,
-# and takes up to 284 of the system's scaled pixels when it says what to do. The whole window stays on
-# the screen, or its clicks wouldn't count.
+function Find-Deny {
+    $found = Find-Named 'Deny'
+    if ($found) { return $found }
+    return (Find-Named 'Cancel')
+}
+# The pop-up is click-through, but it mustn't hide the window, whose title bar (j) needs: it sits at the
+# top of the primary screen, and takes up to 284 of the system's scaled pixels when it says what to do.
+# The whole window stays on the screen, or its clicks wouldn't count.
 function Move-ClearOfPopUp {
     $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $b = Get-Rect $script:approve
-    $clear = $work.Top + [int](300 * [LilConfirmCheck.Win]::GetDpiForSystem() / 96)
-    if ($b.Top -ge $clear -or $b.Left -ge $work.Right -or $b.Right -le $work.Left) { return }
     $w = Get-Rect $script:main
-    $newTop = [math]::Min($w.Top + ($clear - $b.Top), $work.Bottom - $w.Height)
+    $clear = $work.Top + [int](300 * [LilConfirmCheck.Win]::GetDpiForSystem() / 96)
+    if ($w.Top -ge $clear -or $w.Left -ge $work.Right -or $w.Right -le $work.Left) { return }
+    $newTop = [math]::Min($clear, $work.Bottom - $w.Height)
     if ($newTop -le $w.Top) { return }
-    $hwnd =[System.IntPtr]$script:main.Current.NativeWindowHandle
+    $hwnd = [System.IntPtr]$script:main.Current.NativeWindowHandle
     [void][LilConfirmCheck.Win]::SetWindowPos($hwnd, [System.IntPtr]::Zero, [int]$w.Left, [int]$newTop, 0, 0, 0x0015)
     # The answer gate's half second starts again with a move.
     Start-Sleep -Milliseconds 800
@@ -577,6 +667,70 @@ function Hold-Ms([int]$ms) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $ms) { }
 }
+# Asks for a real click on Approve until the core has an answer or the time is up: the answer. A refused
+# try's words go on the pop-up. UI Automation only after a refusal: its calls keep the app's GUI thread
+# busy, and that mustn't delay the read of a real press.
+function Wait-RealClick([string]$cue) {
+    $end = (Get-Date).AddSeconds($HandSec)
+    $answer = 'pending'
+    $said = ''
+    $refusedSoFar = 0
+    while ((Get-Date) -lt $end) {
+        $answer = Get-Answer $script:id
+        if ($answer -ne 'pending') { break }
+        $left = [int]($end - (Get-Date)).TotalSeconds
+        $refusedNow = @(Get-Refusals).Count
+        if ($refusedNow -ne $refusedSoFar) { $refusedSoFar = $refusedNow; $said = Get-WindowReason }
+        $text = "$cue`n($left s left)"
+        if ($said) { $text += "`nLast try: $said" }
+        Set-Cue $text
+        Start-Sleep -Milliseconds 300
+    }
+    return $answer
+}
+# The refusals' names in this step's log.
+function Get-RefusalNames { @(Get-Refusals | ForEach-Object { (($_ | ConvertFrom-Json).fields).refusal }) }
+# The shell's main window, found afresh: one found while it was being made can stay empty.
+function Find-Shell {
+    $all = Retry-Walk { $AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)) }
+    $found = @($all | Where-Object { $_.Current.Name -like 'LILITH*' }) | Select-Object -First 1
+    if ($found) { $script:main = $found }
+    return $found
+}
+function Find-InShell([string]$name) {
+    if (-not (Find-Shell)) { return $null }
+    return (Find-Named $name)
+}
+# Invokes the first element of that name that can be invoked, if any.
+function Invoke-AnyNamed([string]$name) {
+    $all = Retry-Walk { $script:main.FindAll($TS::Descendants, (Prop $AE::NameProperty $name)) }
+    foreach ($e in $all) {
+        $pattern = $null
+        if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+            $pattern.Invoke()
+            return
+        }
+    }
+}
+# UI Automation shows a floating dock as a window under the main one, or at the top.
+function Find-FloatingWindow([string]$name) {
+    $window = [System.Windows.Automation.AndCondition]::new(
+        (Prop $AE::ProcessIdProperty $script:app.Id), (Prop $AE::NameProperty $name),
+        (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Window)))
+    $found = Retry-Walk { $AE::RootElement.FindFirst($TS::Children, $window) }
+    if ($found) { return $found }
+    return (Retry-Walk { $script:main.FindFirst($TS::Descendants, $window) })
+}
+# Whether the foreground window is, or isn't, the app's, within the person's time for one stage.
+function Wait-Front([bool]$ours) {
+    $end = (Get-Date).AddSeconds($HandSec)
+    while ((Get-Date) -lt $end) {
+        $front = Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())
+        if (($front -eq $script:app.Id) -eq $ours) { return $true }
+        Start-Sleep -Milliseconds 100
+    }
+    return $false
+}
 
 try {
     $channelUp = $false
@@ -640,7 +794,7 @@ try {
             Check ($answer -eq 'denied') "(e) Invoke on Deny denied it (the core says: $answer)"
         }
 
-        # (s) How often the physical-button read would refuse a click of each length. Injected input
+        # (s) How often the button-state read would refuse a click of each length. Injected input
         # is refused by the source whatever this reads: only the read is being measured.
         Step '(s)' {
             $script:id = New-Confirmation
@@ -655,7 +809,7 @@ try {
                 if ($stopped) { break }
                 Start-Step
                 $pairs = 0
-                for ($i = 0; $i -lt 20; ++$i) {
+                for ($i = 0; $i -lt 5; ++$i) {
                     # Never a click that can land anywhere but Approve.
                     if (-not (Test-OnApprove)) {
                         Fail "(s) stopped at a hold of $hold ms: the cursor isn't inside Approve, so nothing more was injected"
@@ -669,7 +823,7 @@ try {
                     Hold-Ms $hold
                     [LilConfirmCheck.Win]::mouse_event(4, 0, 0, 0, [System.UIntPtr]::Zero)
                     ++$pairs
-                    Start-Sleep -Milliseconds 40
+                    Start-Sleep -Milliseconds 1100
                 }
                 Start-Sleep -Milliseconds 400
                 $lines = @(Get-PointerLines)
@@ -691,9 +845,84 @@ try {
             [void][LilConfirmCheck.Win]::SetCursorPos([int]$w.X + 20, [int]$w.Y + 10)
         }
 
+        # (m) Touch and pen never count. Only at Approve's centre, in front, checked right before each.
+        Step '(m)' {
+            $script:id = New-Confirmation
+            Open-Window $script:id
+            foreach ($way in 'touch', 'pen') {
+                Start-Step
+                $r = Get-Rect $script:approve
+                $x = [int]($r.X + $r.Width / 2)
+                $y = [int]($r.Y + $r.Height / 2)
+                Assert-AppInFront
+                Assert-AppAt $x $y
+                $failed = 0
+                try {
+                    $failed = if ($way -eq 'touch') { [LilConfirmCheck.Win]::TouchTap($x, $y, 60) } else { [LilConfirmCheck.Win]::PenTap($x, $y, 60) }
+                } catch [System.EntryPointNotFoundException] {
+                    $failed = -1
+                }
+                if ($failed -ne 0) {
+                    $note = "(m) $way not checked: $(if ($failed -lt 0) { 'Windows has no such API here' } else { "the injection failed, error $failed" })"
+                    Write-Host $note
+                    $results.Add($note)
+                    continue
+                }
+                Start-Sleep -Milliseconds 700
+                Check ((Get-Answer $script:id) -eq 'pending') "(m) $way on Approve answered nothing"
+                $names = (Get-RefusalNames) -join ', '
+                $origins = (@(Get-PointerLines) | ForEach-Object { "$($_.kind) origin=$($_.origin) device=$($_.device)" }) -join '; '
+                $measured = "(m) $way measured: refusals: [$names]; presses and releases the filter saw: [$origins]; the window: $(Get-WindowReason)"
+                Write-Host $measured
+                $results.Add($measured)
+            }
+        }
+
+        # (p) A floated panel's window: if it is layered and not fully opaque, not_exposed would refuse
+        # every click on a dialog in it. Read only.
+        Step '(p)' {
+            Close-App
+            $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
+            [void](Wait-For { Find-Shell } 40 'the shell')
+            $float = $null
+            try { $float = Wait-For { Find-InShell 'Float Confirmations' } 15 'its Float button' } catch { }
+            if (-not $float) {
+                # Tabbed with Jobs: its tab first.
+                Invoke-AnyNamed 'Confirmations'
+                try { $float = Wait-For { Find-InShell 'Float Confirmations' } 5 'its Float button' } catch { }
+            }
+            $window = $null
+            if ($float) {
+                Invoke-Uia $float
+                try { $window = Wait-For { Find-FloatingWindow 'Confirmations' } 10 'the floating window' } catch { }
+            }
+            if (-not $window) {
+                $note = "(p) not checked: the panel didn't float (Float button found: $([bool]$float))"
+                Write-Host $note
+                $results.Add($note)
+            } else {
+                $hwnd = [System.IntPtr]$window.Current.NativeWindowHandle
+                $style = [LilConfirmCheck.Win]::GetWindowLongPtr($hwnd, -20).ToInt64()
+                $text = "ex-style 0x$($style.ToString('X')), not layered, so not_exposed wouldn't refuse for that"
+                if ($style -band 0x80000) {
+                    [uint32]$key = 0; [byte]$alpha = 0; [uint32]$flags = 0
+                    if ([LilConfirmCheck.Win]::GetLayeredWindowAttributes($hwnd, [ref]$key, [ref]$alpha, [ref]$flags)) {
+                        $seen = (-not ($flags -band 2) -or $alpha -eq 255) -and -not ($flags -band 1)
+                        $text = "ex-style 0x$($style.ToString('X')), layered, alpha $alpha, flags $flags, so not_exposed $(if ($seen) { "wouldn't refuse" } else { 'WOULD REFUSE every click there' })"
+                    } else {
+                        $text = "ex-style 0x$($style.ToString('X')), layered, its attributes can't be read, so not_exposed WOULD REFUSE every click there"
+                    }
+                }
+                $measured = "(p) measured: the floating Confirmations window: $text"
+                Write-Host $measured
+                $results.Add($measured)
+            }
+            Close-App
+        }
+
         # The gesture: before (d), so the suite file's edit and the core's restart can't touch it.
         if ($NoHand) {
-            Fail 'the gesture (f, g, h, i) was NOT checked: -NoHand'
+            Fail 'the gesture (f, g, h, i, j) was NOT checked: -NoHand'
         } else {
             Step 'the gesture' {
                 $script:id = New-Confirmation
@@ -805,7 +1034,9 @@ try {
                             $lines = @(Get-PointerLines)
                             Check ($lines.Count -eq 2) "(h) the gate read both ($($lines.Count) lines)"
                             Check (@($lines | Where-Object { $_.origin -eq 'Hardware' }).Count -eq 0) "(h) the source isn't hardware: $(($lines | ForEach-Object { $_.origin }) -join ', ')"
-                            Check ((Get-WindowReason) -ne '') "(h) and the window says why: $(Get-WindowReason)"
+                            # This step's own refusal, in this step's log: (f) left the same words on screen.
+                            Check (@(Get-RefusalNames) -contains 'not_pointer') "(h) refused as not_pointer in this step's log: [$((Get-RefusalNames) -join ', ')]"
+                            Check ((Get-WindowReason) -like 'That click didn''t come from*') "(h) and the window says why: $(Get-WindowReason)"
                         }
                     }
                 }
@@ -817,27 +1048,11 @@ try {
                 Start-Sleep -Milliseconds 250
                 Try-Beep 659 250
                 Write-Host "NOW: move off Approve and back, wait a moment, click once. ($HandSec s)"
-                $end = (Get-Date).AddSeconds($HandSec)
-                $answer = 'pending'
-                $said = ''
-                $refusedSoFar = 0
-                while ((Get-Date) -lt $end) {
-                    $answer = Get-Answer $script:id
-                    if ($answer -ne 'pending') { break }
-                    $left = [int]($end - (Get-Date)).TotalSeconds
-                    # UI Automation only after a refusal: its calls keep the app's GUI thread busy, and
-                    # that mustn't delay the read of a real press.
-                    $refusedNow = @(Get-Refusals).Count
-                    if ($refusedNow -ne $refusedSoFar) { $refusedSoFar = $refusedNow; $said = Get-WindowReason }
-                    $text = "Now: move off Approve and back, wait a moment, click once`n($left s left)"
-                    if ($said) { $text += "`nLast try: $said" }
-                    Set-Cue $text
-                    Start-Sleep -Milliseconds 300
-                }
+                $answer = Wait-RealClick 'Now: move off Approve and back, wait a moment, click once'
                 if ($answer -eq 'pending') {
                     Set-Cue 'Timed out: no click on Approve counted. The evidence is saved.'
                 } else {
-                    Set-Cue 'That was the last thing needed from you. Stay off the mouse until this says the PC is free.'
+                    Set-Cue 'Thanks. Stay off the mouse: one more short step comes soon, and this turns blue for it.'
                 }
                 $lines = @(Get-PointerLines)
                 Write-Host "(i) measured: $(($lines | ForEach-Object { "$($_.kind) origin=$($_.origin) device=$($_.device) physically_down=$($_.physically_down) by_messages_down=$($_.by_messages_down)" }) -join '; ')"
@@ -852,6 +1067,47 @@ try {
                 Clear-Cue
             }
             Clear-Cue
+
+            # (j) A person's normal way back to the window. Coming to the front makes Approve a new
+            # button to the gate, and the hand arrives on it by moving, so the first click counts.
+            Step '(j)' {
+                $script:id = New-Confirmation
+                # It may wait here for Windows to let the window come to the front, and says so.
+                Open-Window $script:id
+                Start-Step
+                Set-Cue 'Now: click once outside the LILITH Confirm window, on the empty desktop'
+                Try-Beep 1047 400
+                Write-Host "NOW: click once outside the window. ($HandSec s)"
+                if (-not (Wait-Front $false)) {
+                    Set-Cue 'Timed out: the window stayed in front. The check goes on.'
+                    Fail "(j) timed out after $HandSec s: the window stayed in front, so it never came back to it"
+                    Start-Sleep -Seconds 3
+                } else {
+                    Set-Cue 'Now: click the title bar of the LILITH Confirm window, once'
+                    Try-Beep 880 400
+                    Write-Host "NOW: click the window's title bar once. ($HandSec s)"
+                    if (-not (Wait-Front $true)) {
+                        Set-Cue 'Timed out: the window never came back to the front. The check goes on.'
+                        Fail "(j) timed out after $HandSec s: the window never came back to the front"
+                        Start-Sleep -Seconds 3
+                    } else {
+                        $cue = 'Now: move onto Approve, wait a moment, click once'
+                        Try-Beep 659 250
+                        Write-Host "NOW: $cue. ($HandSec s)"
+                        $answer = Wait-RealClick $cue
+                        Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve counted. The evidence is saved.' } else { 'That was the last thing needed from you. Stay off the mouse until this says the PC is free.' })
+                        $names = @(Get-RefusalNames)
+                        $measured = "(j) measured: refusals before it counted: [$($names -join ', ')]"
+                        Write-Host $measured
+                        $results.Add($measured)
+                        Check ($answer -eq 'approved') "(j) after a title-bar click, a real click on Approve approved it (the core says: $answer)"
+                        Check (@($names | Where-Object { $_ -in 'brought_forward', 'not_pointer' }).Count -eq 0) '(j) and no refusal said it brought the window forward or was not a pointer'
+                        Start-Sleep -Seconds 3
+                    }
+                }
+                Clear-Cue
+            }
+            Clear-Cue
         }
 
         # (d) The raise amount, on a confirmation that also passes a cap. The suite's cap: 1 USD.
@@ -863,7 +1119,13 @@ try {
             $field = Wait-For { Find-Named 'New limit for The monthly cap' } 10 'the amount field'
             $vp = $null
             if (-not $field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { throw 'the field has no Value pattern' }
+            # The window has settled, so a too-soon now comes from the change alone.
+            Start-Sleep -Milliseconds 700
+            Start-Step
             $vp.SetValue('25')
+            Invoke-Uia $script:deny
+            Check (@(Get-RefusalNames) -contains 'too_soon') "(d) right after the change the gate had re-armed: Cancel was too soon: [$((Get-RefusalNames) -join ', ')]"
+            Check ((Get-Answer $script:id) -eq 'pending') '(d) and nothing was answered'
             $b = Wait-For { Find-Button 'Raise the cap to 25' } 5 'the button to show the amount'
             Pass "(d) a program's value on the field shows on the button: $($b.Current.Name)"
             $field.SetFocus()
