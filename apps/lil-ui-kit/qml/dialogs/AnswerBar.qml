@@ -45,7 +45,7 @@ Column {
         if (connection === "reconnecting" || connection === "connecting")
             return "Not connected to the core yet: the buttons come back when it is."
         return bannerBehind
-            ? "Not connected to the core, and this may not clear by itself. Close this and use the banner at the top of the window. Closing answers nothing: this stays waiting."
+            ? "Not connected to the core, and this may not clear by itself. Close this and use the banner in the main LILITH window. Closing answers nothing: this stays waiting."
             : "Not connected to the core, so this can't be answered for now. It is still waiting."
     }
     readonly property alias reasonLine: reasonLine
@@ -62,7 +62,9 @@ Column {
             reason = ""
     }
     onVisibleChanged: restartClock()
-    onLiveChanged: if (live) restartClock()
+    // Words from before it could answer again are old news. An answer that fails with the core still
+    // there sets its words after this.
+    onLiveChanged: if (live) rearm()
     onShownKeyChanged: rearm()
     Component.onCompleted: restartClock()
     // Another confirmation in the same dialog: a new answer, and the clock starts again.
@@ -154,9 +156,8 @@ Column {
         width: parent.width
         // Its room is kept: a popup is centred, so a reason arriving would move the buttons.
         height: Math.max(implicitHeight, 2 * (font.pixelSize + 4))
-        text: root.reason !== "" ? root.reason
-            : root.open && !root.connected ? root.awayWords
-            : ""
+        // With the core away, what is true now, whatever failed on the way there.
+        text: root.open && !root.connected ? root.awayWords : root.reason
         textFormat: Text.PlainText
         color: Theme.warning
         font.pixelSize: Theme.fontSize

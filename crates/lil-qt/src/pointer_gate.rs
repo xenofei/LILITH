@@ -118,7 +118,7 @@ pub struct Counts {
 pub enum GateRefusal {
     /// One of the Hello window's rules.
     Click(Refusal),
-    /// What the button stands for changed, or it moved or appeared, under the cursor.
+    /// What the button stands for changed, or it moved, appeared or came on, under the cursor.
     Reenter,
     /// The physical button didn't agree with the message.
     ButtonState,
@@ -152,7 +152,7 @@ impl GateRefusal {
             "no_rest" => click(Refusal::NoRest),
             "no_move" => click(Refusal::NoMove),
             "reenter" => Some(format!(
-                "What is shown here changed, or {label} moved. Move the pointer off it, check what it says, then come back and click it."
+                "{label} just came on, or what it stands for changed or moved. Move the pointer off it, check what it says, then come back and click it."
             )),
             "button_state" => Some(format!(
                 "That click was too quick for LILITH to check. Hold the click a moment longer on {label}."

@@ -8,11 +8,16 @@
 // What is on screen is what a click approves, so an open dialog's confirmation is never swapped. A link
 // or a card that asks for another while the dialog is open waits, and the dialog says so; the next one
 // opens only when this one is closed, as a new dialog, with the gate armed from the start.
+//
+// While the core isn't ready nothing opens by itself: what waits, and any link, shows when the core is
+// back. The dialog's words send the person to the banner, so it mustn't come straight back over it. A
+// person's own click on a card still opens that one.
 import QtQuick
 import QtQuick.Templates as T
 import Lilith.Core
 import Lilith.UiKit
 import "../../dialogs/ConfirmText.js" as Words
+import "../../core/CoreGate.js" as CoreGate
 
 Rectangle {
     id: root
@@ -29,6 +34,7 @@ Rectangle {
     property bool _popupCounted: false
     readonly property int waitingCount: _waiting.length
     readonly property int waitingMax: 20
+    readonly property bool coreReady: CoreGate.ready(root)
     readonly property alias list: list
     readonly property alias banner: banner
     readonly property alias pendingTab: pendingTab
@@ -47,17 +53,27 @@ Rectangle {
     Accessible.role: Accessible.Pane
     Accessible.name: title
 
-    // A `confirm` link, or a card's button: the dialog on it, or in words why not, or a wait.
+    onCoreReadyChanged: if (coreReady) Qt.callLater(_showNext)
+
+    // A `confirm` link. The shell also passes its focus flag, which means nothing here.
     function showConfirmation(id) {
+        _show(id, false)
+    }
+
+    // The dialog on `id`, or in words why not, or a wait. `byHand`: a person's click on a card, which
+    // opens whether or not the core is ready.
+    function _show(id, byHand) {
         if (dialog.confirmationId !== "") {
             if (id !== dialog.confirmationId && _wait(id))
                 waitingNotice.Accessible.announce(waitingNotice.text)
             return
         }
-        if (!list.loaded) {
+        if (!list.loaded || (!coreReady && !byHand)) {
             _wait(id)
             return
         }
+        // Shown now, it doesn't come round again.
+        _waiting = _waiting.filter(waiting => waiting !== id)
         banner.visible = false
         const view = list.view(id)
         if (view && view.state === "pending") {
@@ -88,7 +104,7 @@ Rectangle {
     }
 
     function _showNext() {
-        if (dialog.confirmationId !== "" || !list.loaded || _waiting.length === 0)
+        if (dialog.confirmationId !== "" || !list.loaded || !coreReady || _waiting.length === 0)
             return
         const id = _waiting[0]
         _waiting = _waiting.slice(1)
@@ -172,7 +188,7 @@ Rectangle {
                     id: reviewButton
                     text: "Review and answer"
                     Accessible.description: card.title
-                    onClicked: root.showConfirmation(card.cid)
+                    onClicked: root._show(card.cid, true)
                 }
             }
         }
@@ -231,8 +247,9 @@ Rectangle {
                 width: parent.width
                 visible: root.waitingCount > 0
                 text: root.waitingCount === 1
-                      ? "Another confirmation is waiting. It shows after you close this one."
-                      : MoneyText.count(String(root.waitingCount)) + " more confirmations are waiting. The next shows after you close this one."
+                      ? "Another confirmation is waiting. It shows after you close this one" + _afterClose
+                      : MoneyText.count(String(root.waitingCount)) + " more confirmations are waiting. The next shows after you close this one" + _afterClose
+                readonly property string _afterClose: root.coreReady ? "." : ", once the core is back."
                 textFormat: Text.PlainText
                 color: Theme.warning
                 font.pixelSize: Theme.fontSize

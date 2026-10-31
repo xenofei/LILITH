@@ -424,7 +424,7 @@ function Get-WindowReason {
     if (-not $script:main) { return '' }
     # The window may have gone: an answered confirmation can't throw the check that reads this.
     try {
-        foreach ($p in 'That ', 'No key answers', 'Move the', 'What ', 'Wait a moment', 'Press and release', 'Bring this window', 'This window is covered', 'LILITH couldn') {
+        foreach ($p in 'That ', 'No key answers', 'Approve just', 'Move the', 'What ', 'Wait a moment', 'Press and release', 'Bring this window', 'This window is covered', 'LILITH couldn') {
             $e = Find-Starting $p
             if ($e) { return $e.Current.Name }
         }

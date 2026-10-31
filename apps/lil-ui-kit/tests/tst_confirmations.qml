@@ -400,7 +400,7 @@ TestCase {
         for (const [verdict, words] of [["no_rest", "came too soon"], ["no_move", "Move the pointer a little"],
                                         ["no_real_press", "Press and release"],
                                         ["brought_forward", "brought this window to the front"],
-                                        ["reenter", "Move the pointer off it"],
+                                        ["reenter", "Approve just came on, or what it stands for changed or moved. Move the pointer off it"],
                                         ["button_state", "Hold the click a moment longer"],
                                         ["not_exposed", "covered, see-through, off the screen or hidden"],
                                         ["no_guard", "is off. Deny still works"]]) {
@@ -718,6 +718,8 @@ TestCase {
 
         fake.connection = "unavailable"
         tryVerify(() => line.text.indexOf("banner") >= 0, 1000, line.text)
+        // A floating panel's popup is in its own window; the banner is always in the main one.
+        verify(line.text.indexOf("the banner in the main LILITH window") >= 0, line.text)
         verify(line.text.indexOf("come back") < 0, "no promise: " + line.text)
         verify(panel.closeDialogButton.visible)
         verify(!dialog.denyButton.enabled && !dialog.approveButton.enabled)
@@ -735,6 +737,102 @@ TestCase {
         openDialog(panel, crane.id)
         verify(!panel.closeDialogButton.visible, "and the dialog is back to being answered")
         verify(panel.dialog.denyButton.enabled)
+        closeDialog(panel)
+    }
+
+    // The words send the person to the banner: the modal doesn't come straight back. What waits shows
+    // when the core is back, and a person's own click on a card still opens that one.
+    function test_closing_while_the_core_is_away_holds_whats_waiting() { // spec: APP-034, APP-044
+        const two = Shapes.view({id: "cf_00000000000000b2", arguments: {path: "C:\\two"}})
+        const three = Shapes.view({id: "cf_00000000000000b3", arguments: {path: "C:\\three"}})
+        const panel = makePanel([crane, two, three])
+        openDialog(panel, crane.id)
+        panel.showConfirmation(two.id)
+        compare(panel.waitingCount, 1)
+        verify(panel.waitingNotice.text.indexOf("core is back") < 0, panel.waitingNotice.text)
+
+        fake.connection = "unavailable"
+        tryVerify(() => panel.waitingNotice.text.indexOf("core is back") >= 0, 1000, panel.waitingNotice.text)
+        closeDialog(panel)
+        wait(100)
+        verify(!panel.dialogPopup.visible, "the next one waits for the core")
+        compare(panel.dialog.confirmationId, "")
+        compare(panel.waitingCount, 1)
+
+        // A link the shell held for the open dialog, or a new one, called as the shell calls it: (id, focus).
+        panel.showConfirmation(three.id, true)
+        wait(100)
+        verify(!panel.dialogPopup.visible, "a link waits too")
+        compare(panel.waitingCount, 2)
+
+        // A person's own click.
+        let cardOf = id => {
+            for (let i = 0; i < panel.cardRepeater.count; ++i) {
+                if (panel.cardRepeater.itemAt(i).cid === id)
+                    return panel.cardRepeater.itemAt(i)
+            }
+            return null
+        }
+        mouseClick(cardOf(crane.id).reviewButton)
+        tryVerify(() => panel.dialogPopup.opened, 2000, "a person's own click opens it")
+        compare(panel.dialog.confirmationId, crane.id)
+        compare(panel.waitingCount, 2)
+        closeDialog(panel)
+        wait(100)
+        verify(!panel.dialogPopup.visible, "and closing it holds the rest again")
+
+        fake.connection = "ready"
+        tryVerify(() => panel.dialogPopup.opened, 2000, "the core is back: the next one shows")
+        compare(panel.dialog.confirmationId, two.id)
+        compare(panel.waitingCount, 1)
+        closeDialog(panel)
+        tryVerify(() => panel.dialogPopup.opened, 2000, "and the one after it, as usual")
+        compare(panel.dialog.confirmationId, three.id)
+        closeDialog(panel)
+        compare(Shapes.answers(fake).length, 0)
+    }
+
+    // The usual way into an outage: an answer fails as the core goes.
+    function test_an_answer_that_fails_as_the_core_goes_leaves_no_stale_words() { // spec: APP-034, APP-044
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        const line = dialog.bar.reasonLine
+        const lost = {status: "error", error: {code: "core.unreachable", message: "The core isn't reachable."}}
+        mouseClick(dialog.denyButton)
+        let sent = Shapes.answers(fake)
+        compare(sent.length, 1)
+        fake.connection = "reconnecting"
+        fake.respond(sent[0].id, lost)
+        tryVerify(() => !dialog.bar.busy, 1000)
+        verify(line.text.indexOf("the buttons come back") >= 0, "what is true now: " + line.text)
+
+        fake.connection = "ready"
+        tryCompare(line, "text", "", 1000, "the failure is old news")
+        compare(dialog.bar.reason, "")
+
+        // A failure with the core still there stays until the next try.
+        wait(550)
+        mouseClick(dialog.denyButton)
+        sent = Shapes.answers(fake)
+        compare(sent.length, 2)
+        fake.respond(sent[1].id, lost)
+        tryVerify(() => !dialog.bar.busy, 1000)
+        compare(line.text, "The core isn't reachable.")
+        closeDialog(panel)
+    }
+
+    function test_the_long_words_fit_the_room_kept_for_them() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const line = panel.dialog.bar.reasonLine
+        panel.dialog.bar.refuse("reenter", "Approve")
+        verify(line.text.indexOf("just came on") > 0, line.text)
+        tryVerify(() => line.lineCount <= 2, 1000, line.lineCount + ": " + line.text)
+        panel.dialog.bar.reason = ""
+        fake.connection = "unavailable"
+        tryVerify(() => line.text.indexOf("banner") >= 0, 1000)
+        tryVerify(() => line.lineCount <= 2, 1000, line.lineCount + ": " + line.text)
         closeDialog(panel)
     }
 

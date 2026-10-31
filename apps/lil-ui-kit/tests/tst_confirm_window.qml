@@ -187,6 +187,15 @@ TestCase {
         verify(!dialog.approveButton.activeFocus)
     }
 
+    function test_the_long_words_fit_here_too() { // spec: P4a-R10
+        const w = makeWindow([first])
+        launch(w, {kind: "confirm", id: first.id})
+        const bar = w.dialogOf(first.id).bar
+        bar.refuse("reenter", "Approve")
+        verify(bar.reasonLine.text.indexOf("just came on") > 0, bar.reasonLine.text)
+        tryVerify(() => bar.reasonLine.lineCount <= 2, 1000, bar.reasonLine.lineCount + ": " + bar.reasonLine.text)
+    }
+
     // This window has no shell banner and no Close, so its words don't send anyone to them.
     function test_a_core_thats_gone_says_only_what_is_true_here() { // spec: APP-034
         const w = makeWindow([first])
