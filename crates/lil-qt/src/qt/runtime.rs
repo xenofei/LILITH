@@ -644,9 +644,17 @@ async fn flusher(shared: Arc<Shared>) {
 }
 
 async fn watch_state(shared: Arc<Shared>, mut state: tokio::sync::watch::Receiver<SessionState>) {
+    /// The most of a reason the log keeps: it can hold a server's words.
+    const REASON_LOGGED: usize = 2000;
     loop {
         let (view, ready) = {
             let st = state.borrow_and_update();
+            // Once per change, so the app's log says why. A session's connection carries no deny
+            // token (`single_instance::send_deny` has its own), and the cut holds if that changes.
+            if let SessionState::Unavailable { reason, .. } = &*st {
+                let reason = crate::args::shown_outside(reason, REASON_LOGGED);
+                tracing::warn!(reason, "the core isn't available");
+            }
             (StateView::of(&st), matches!(*st, SessionState::Ready(_)))
         };
         shared.gui.push(Delivery::State(view));
