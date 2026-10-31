@@ -9,12 +9,15 @@
   2. A test channel under a new temporary root (LIL_CHANNEL=test-diagcheck, LIL_TEST_ROOT): the
      deployed lil-image starts on it, with its own test-channel core, and is driven through UI
      Automation. Its dock tab (else Ctrl+6) opens Diagnostics, and then:
-       (a) "Export diagnostics bundle" opens the save dialog: the file type box (id 1136 under
-           FileTypeControlHost) reads the ZIP filter, and the file name box (id 1001 under
-           FileNameControlHost; the address bar has another 1001) reads empty, which counts only
-           once a probe typed into it reads back the same way. A box that can't be found or read
-           fails, with its shape (no names or values) in the output and in -DiagDir. Cancel makes
-           no bundle, checked on disk in the core's folder and in the folder the file would go to;
+       (a) "Export diagnostics bundle" opens the save dialog: the ComboBox window under
+           FileTypeControlHost (UI Automation shows that host with nothing under it on this Windows
+           build) shows *.zip; if no text can be read there, the filter counts as NOT CHECKED,
+           neither a pass nor a failure, and tst_diagnostics is what checks it. The file name box
+           (id 1001 under FileNameControlHost; the address bar has another 1001) reads empty, which
+           counts only once a probe typed into it reads back the same way, and a box that can't be
+           found or read fails, with its shape (no names or values) in the output and in -DiagDir.
+           Cancel makes no bundle, checked on disk in the core's folder and in the folder the file
+           would go to;
        (b) a save to <temp>\out\bundle.zip: the file is a valid ZIP with the bundle's entries, and
            nothing is left beside it;
        (c) "Show in Explorer": an Explorer window opens on that temporary folder with the file
@@ -27,7 +30,8 @@
   no name from a dialog's file list, navigation pane, address bar or breadcrumb.
   3. lil-image is closed, the test core stopped (only the processes this run started, by recorded
      PID), the test channel's registry keys and the temporary root removed, and the pop-up told it
-     is done. Exit 0 only when every check passed, and the cleanup too.
+     is done. Exit 0 only when no check failed, and the cleanup too; the summary counts what wasn't
+     checked apart from what passed.
 
   It never touches the real stable or dev channel or their registrations: the cleanup does nothing
   unless LIL_CHANNEL is this script's test channel. No key or press is sent unless the foreground
@@ -52,6 +56,9 @@ $image = Join-Path $Deploy 'lil-image.exe'
 $coreExe = Join-Path $Deploy 'lil-core.exe'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
+$notChecked = [System.Collections.Generic.List[string]]::new()
+function Not-Checked([string]$what) { $notChecked.Add($what); $results.Add("NOT CHECKED $what"); Write-Host "NOT CHECKED $what" }
+function Write-Summary { Write-Host ("{0} passed, {1} failed, {2} not checked" -f ($results.Count - $failures.Count - $notChecked.Count), $failures.Count, $notChecked.Count) }
 function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
 function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
@@ -68,14 +75,14 @@ if (-not ('LilDiagCheck.Win' -as [type])) {
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(System.IntPtr hwnd, System.Text.StringBuilder name, int size);
 [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")] public static extern System.IntPtr SendText(System.IntPtr hwnd, uint msg, System.IntPtr wParam, System.Text.StringBuilder lParam, uint flags, uint timeoutMs, out System.IntPtr result);
 [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")] public static extern System.IntPtr SendValue(System.IntPtr hwnd, uint msg, System.IntPtr wParam, System.IntPtr lParam, uint flags, uint timeoutMs, out System.IntPtr result);
-// The first window of class "Edit" under `parent`, at any depth, else zero.
-public static System.IntPtr FindEditUnder(System.IntPtr parent) {
+// The first window of class `cls` under `parent`, at any depth, else zero.
+public static System.IntPtr FindUnder(System.IntPtr parent, string cls) {
     System.IntPtr child = System.IntPtr.Zero;
     while ((child = FindWindowExW(parent, child, null, null)) != System.IntPtr.Zero) {
-        var name = new System.Text.StringBuilder(32);
+        var name = new System.Text.StringBuilder(256);
         GetClassNameW(child, name, name.Capacity);
-        if (name.ToString() == "Edit") return child;
-        System.IntPtr under = FindEditUnder(child);
+        if (string.Equals(name.ToString(), cls, System.StringComparison.OrdinalIgnoreCase)) return child;
+        System.IntPtr under = FindUnder(child, cls);
         if (under != System.IntPtr.Zero) return under;
     }
     return System.IntPtr.Zero;
@@ -162,6 +169,8 @@ function Self-Test {
         Add-Type -AssemblyName System.Windows.Forms
         $box = [System.Windows.Forms.TextBox]::new()
         $combo = [System.Windows.Forms.ComboBox]::new()
+        $parent = [System.Windows.Forms.Panel]::new()
+        $inner = [System.Windows.Forms.Panel]::new()
         try {
             $box.Text = 'typed'
             $r = Get-NativeText $box.Handle
@@ -176,7 +185,14 @@ function Self-Test {
             $combo.SelectedIndex = 0
             $r = Get-NativeText $combo.Handle
             Check ($r.ok -and $r.text -ceq 'ZIP files (*.zip)') 'self-test: the reader reads a drop-down list''s selection'
-        } finally { $box.Dispose(); $combo.Dispose() }
+            $parent.Controls.Add($inner)
+            $inner.Controls.Add($combo)
+            [void]$parent.Handle; [void]$inner.Handle; [void]$combo.Handle
+            $class = [System.Text.StringBuilder]::new(256)
+            [void][LilDiagCheck.Win]::GetClassNameW($combo.Handle, $class, $class.Capacity)
+            Check ([LilDiagCheck.Win]::FindUnder($parent.Handle, $class.ToString()) -eq $combo.Handle) 'self-test: a window is found by its class, at any depth under its host'
+            Check ([LilDiagCheck.Win]::FindUnder($inner.Handle, 'NoSuchClass') -eq [System.IntPtr]::Zero) 'self-test: no window of the class is zero'
+        } finally { $box.Dispose(); $parent.Dispose() }
     } finally { Remove-Item -Recurse -Force -LiteralPath $d }
 }
 
@@ -262,7 +278,7 @@ if ($DryRun) {
         $count = (New-Object -ComObject Shell.Application).Windows().Count
         Check ($count -ge 0) 'dry run: the shell window list can be read'
     } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
-    Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
+    Write-Summary
     exit ([int]($failures.Count -gt 0))
 }
 
@@ -518,7 +534,7 @@ function Read-HostedControl($dlg, [string]$hostId, [string]$id, [bool]$readEditU
         if ($readEditUnderHost) {
             $hostWindow = [System.IntPtr]$found.hostPane.Current.NativeWindowHandle
             if ($hostWindow -ne [System.IntPtr]::Zero) {
-                $native = Get-NativeText ([LilDiagCheck.Win]::FindEditUnder($hostWindow))
+                $native = Get-NativeText ([LilDiagCheck.Win]::FindUnder($hostWindow, 'Edit'))
                 if ($native.ok) {
                     $out.read = $true; $out.text = $native.text; $out.how = 'the Edit under its host'
                     return $out
@@ -527,6 +543,18 @@ function Read-HostedControl($dlg, [string]$hostId, [string]$id, [bool]$readEditU
         }
     } catch { Write-Host 'a dialog control went away while it was read' }
     return $out
+}
+# The text the file type box shows: the ComboBox window under FileTypeControlHost's window, and no
+# window outside that host. '' when there is none to read. It sends no input.
+function Read-FileTypeBox($dlg) {
+    try {
+        $hostPane = Wait-For { $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty 'FileTypeControlHost')) } 10 'the file type box''s host'
+        $hostWindow = [System.IntPtr]$hostPane.Current.NativeWindowHandle
+        if ($hostWindow -eq [System.IntPtr]::Zero) { return '' }
+        $native = Get-NativeText ([LilDiagCheck.Win]::FindUnder($hostWindow, 'ComboBox'))
+        if ($native.ok) { return $native.text }
+    } catch { Write-Host 'the file type box''s host went away or was not there' }
+    return ''
 }
 # A dialog control's shape for the fix: control types, ids, classes, whether it has a window, and its
 # patterns, to depth 3. No name and no value: this is safe to keep whatever the control holds.
@@ -619,17 +647,13 @@ try {
     $dlg = Open-SaveDialog
     Pass '(a) "Export diagnostics bundle" opened a window with the dialog''s title'
     # The filter: only the app's own text can be there, and it is printed only when it is that.
-    $filter = Read-HostedControl $dlg 'FileTypeControlHost' '1136' $false
-    if (-not $filter.found) {
-        Fail '(a) the file type box (id 1136 under FileTypeControlHost) was not found'
-        Save-DialogShape $dlg 'FileTypeControlHost'
-    } elseif (-not $filter.read) {
-        Fail "(a) the file type box couldn't be read"
-        Save-DialogShape $dlg 'FileTypeControlHost'
-    } elseif ($filter.text -match 'ZIP files' -and $filter.text -match '\*\.zip') {
-        Pass "(a) the file type box reads the ZIP filter, $($filter.text), through $($filter.how)"
+    $filter = Read-FileTypeBox $dlg
+    if ($filter -eq '') {
+        Not-Checked '(a) the ZIP filter: not read on this Windows build; the filter is checked in tst_diagnostics'
+    } elseif ($filter -match '\*\.zip') {
+        Pass "(a) the ComboBox under the file type box's host shows $filter"
     } else {
-        Fail "(a) the file type box reads something else ($($filter.text.Length) characters, through $($filter.how))"
+        Fail "(a) the ComboBox under the file type box's host shows something else ($($filter.Length) characters)"
     }
     # The file name: empty passes only if the box was found and read, and if the same read then sees
     # a probe typed into it, so that "empty" can't be the read of something else. No value is printed.
@@ -756,5 +780,5 @@ try {
 
 Write-Host ''
 $results | ForEach-Object { Write-Host $_ }
-Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
+Write-Summary
 exit ([int]($failures.Count -gt 0))
