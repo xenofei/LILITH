@@ -51,6 +51,11 @@
         `pending`, and the log's origin isn't Hardware.
     (i) A real click: `approved`, and the log's press and release say origin Hardware, physically down at
         the press and up at the release. A refused try shows why on the pop-up, and can be tried again.
+    (l) No click, and no pass or fail: while a person keeps the mouse moving near Approve for 10 s, the
+        script warps off it and back onto it every 500 ms, after the same front and point checks, and
+        reports each arrival line's `origin`, and how many read Hardware right after a warp. Any that do
+        mean Windows can merge a warp into the hand's next move and report it as real, where the gate's
+        warp rule can't see it. A program's arrival lines are limited to one a second; a hand's aren't.
     (j) A person's normal way back: click outside the window, click its title bar once, move onto Approve,
         rest, click. Coming to the front makes a new button to the gate, but the hand comes to it by
         moving, so the first click counts: `approved`, with no `brought_forward` and no `not_pointer`.
@@ -1068,12 +1073,76 @@ try {
             }
             Clear-Cue
 
-            # (j) A person's normal way back to the window. Coming to the front makes Approve a new
-            # button to the gate, and the hand arrives on it by moving, so the first click counts.
-            Step '(j)' {
+            # (l) A measurement, no click: can a warp merge into the hand's next move and read as real?
+            $script:readyForJ = $false
+            Step '(l)' {
                 $script:id = New-Confirmation
                 # It may wait here for Windows to let the window come to the front, and says so.
                 Open-Window $script:id
+                $script:readyForJ = $true
+                Start-Step
+                $r = Get-Rect $script:approve
+                $onX = [int]($r.X + $r.Width / 2)
+                $onY = [int]($r.Y + $r.Height / 2)
+                # Just above Approve, inside the window: no button there is ever clicked.
+                $offY = [int]($r.Y - 2 * $r.Height)
+                $cue = 'Now: keep moving the mouse around near Approve for 10 seconds. Do not click. The pointer will jump: that is the test.'
+                Set-Cue $cue
+                Try-Beep 1047 400
+                Write-Host "NOW: $cue"
+                # A moment for the hand to start.
+                Start-Sleep -Seconds 2
+                $warps = [System.Collections.Generic.List[datetime]]::new()
+                $stopped = ''
+                $end = (Get-Date).AddSeconds(10)
+                try {
+                    while ((Get-Date) -lt $end) {
+                        Assert-AppInFront
+                        Assert-AppAt $onX $offY
+                        [void][LilConfirmCheck.Win]::SetCursorPos($onX, $offY)
+                        Start-Sleep -Milliseconds 250
+                        Assert-AppInFront
+                        Assert-AppAt $onX $onY
+                        $warps.Add([datetime]::UtcNow)
+                        [void][LilConfirmCheck.Win]::SetCursorPos($onX, $onY)
+                        Start-Sleep -Milliseconds 250
+                        Set-Cue "$cue`n($([int]($end - (Get-Date)).TotalSeconds) s left)"
+                    }
+                } catch { $stopped = "$_" }
+                # Off the button, and it's the hand's from here.
+                Set-Cue 'Stop moving the mouse, and do not click. The next step comes in a moment.'
+                Start-Sleep -Milliseconds 500
+                $moves = @(Get-Moves)
+                $origins = @($moves | ForEach-Object { $_.origin })
+                $hardware = @($origins | Where-Object { $_ -eq 'Hardware' }).Count
+                # A Hardware arrival within 50 ms after a warp onto Approve.
+                $merged = 0
+                $timed = $true
+                foreach ($line in @(Get-LogSinceStep)) {
+                    if ($line -notlike "*a move onto a confirmation's button*") { continue }
+                    $o = $line | ConvertFrom-Json
+                    if ($o.fields.origin -ne 'Hardware') { continue }
+                    try {
+                        $at = ([datetimeoffset]$o.timestamp).UtcDateTime
+                        if (@($warps | Where-Object { ($at - $_).TotalMilliseconds -ge 0 -and ($at - $_).TotalMilliseconds -lt 50 }).Count -gt 0) { ++$merged }
+                    } catch { $timed = $false }
+                }
+                $stoppedNote = if ($stopped) { " It stopped early: $stopped" } else { '' }
+                $timedNote = if ($timed) { '' } else { " (some lines' times couldn't be read)" }
+                $measured = "(l) measured: $($warps.Count) warps onto Approve; arrival lines by origin: [$($origins -join ', ')]; Hardware: $hardware, of which right after a warp (within 50 ms): $merged$timedNote.$stoppedNote"
+                Write-Host $measured
+                $results.Add($measured)
+                Start-Sleep -Seconds 2
+            }
+
+            # (j) A person's normal way back to the window. Coming to the front makes Approve a new
+            # button to the gate, and the hand arrives on it by moving, so the first click counts.
+            Step '(j)' {
+                # (l)'s window if it opened: a new one could wait for minutes on Windows again.
+                if (-not $script:readyForJ) {
+                    $script:id = New-Confirmation
+                    Open-Window $script:id
+                }
                 Start-Step
                 Set-Cue 'Now: click once outside the LILITH Confirm window, on the empty desktop'
                 Try-Beep 1047 400
