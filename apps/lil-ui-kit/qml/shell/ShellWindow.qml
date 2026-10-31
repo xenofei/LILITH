@@ -287,6 +287,13 @@ Window {
             return null
         const dock = dockComponent.createObject(root, {panel: panel, core: root.core})
         docks[id] = dock
+        // Diagnostics reaches the shell (it opens Backups and Jobs), and takes the shell's event
+        // log when it keeps one.
+        const content = dock.content
+        if (content && content.shell !== undefined)
+            content.shell = root
+        if (content && content.eventLog !== undefined && root.eventLog)
+            content.eventLog = root.eventLog
         dock.isOpenChanged.connect(() => root.panelOpenChanged(dock))
         return dock
     }

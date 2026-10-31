@@ -799,7 +799,9 @@ TestCase {
         const dock = shell.docks.hardware
         const panel = dock.content
         verify(String(panel).startsWith("HardwarePanel"), "the Hardware panel replaces its placeholder: " + panel)
-        answer(fake, "telemetry.snapshot", snapshot())
+        // The shell's other panels ask for a snapshot too (Diagnostics): every one gets it.
+        for (const c of callsTo(fake, "telemetry.snapshot"))
+            fake.respond(c.id, {status: "ok", structured: snapshot()})
         const zoom = find(panel, item => String(item).startsWith("LButton") && item.text === "24 h")
         panel.windowS = 24 * 3600
         verify(zoom.checked)

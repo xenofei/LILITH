@@ -79,4 +79,23 @@ qt_target_qml_sources(lil-ui-kit
         qml/core/CoreGate.js
         qml/panels/jobs/PausedText.js)
 
+# Task 25: the Diagnostics and Backups panels.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/panels/diagnostics/DiagnosticsPanel.qml
+        qml/panels/diagnostics/VersionsCard.qml
+        qml/panels/diagnostics/EnginesCard.qml
+        qml/panels/diagnostics/QueueSummary.qml
+        qml/panels/diagnostics/RecentErrors.qml
+        qml/panels/diagnostics/EventLog.qml
+        qml/panels/diagnostics/TelemetrySummary.qml
+        qml/panels/diagnostics/ModelsReport.qml
+        qml/panels/diagnostics/NotificationPathCard.qml
+        qml/panels/diagnostics/StatusLines.qml
+        qml/panels/diagnostics/LineText.qml
+        qml/panels/diagnostics/ToolRead.qml
+        qml/panels/diagnostics/DiagnosticsText.js
+        qml/panels/diagnostics/NotificationText.js
+        qml/panels/backups/BackupsPanel.qml)
+
 add_subdirectory(tests)

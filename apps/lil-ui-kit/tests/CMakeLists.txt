@@ -178,3 +178,15 @@ set_tests_properties(bench_jobs_panel PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 25: the Diagnostics and Backups panels, on the shell's 1280 x 800 offscreen screen (the
+# float test makes a shell).
+lil_qml_test(tst_diagnostics tst_diagnostics.qml)
+set_property(TEST tst_diagnostics APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+add_test(NAME grab_diagnostics COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/grab_diagnostics.qml)
+set_tests_properties(grab_diagnostics PROPERTIES
+    LABELS grabs
+    TIMEOUT 300
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
