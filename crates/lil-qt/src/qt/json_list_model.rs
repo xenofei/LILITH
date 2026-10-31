@@ -778,9 +778,11 @@ impl Entry {
 /// The log's roles, in [`Entry::field`]'s order.
 const EVENT_LOG_ROLES: [&str; 5] = ["topic", "kind", "seq", "text", "receivedMs"];
 
-/// Whether the log leaves an event out: a `telemetry` `sample`, a `job:<id>` `progress` or a frame
-/// of `preview:<job_id>` (APP-134). Each repeats state it already carries, and the Telemetry card
-/// and the Jobs panel show them. A session mark (`snapshot`, `resync_required`) stays.
+/// Whether the log leaves an event out: a `telemetry` `sample`, a `job:<id>` `progress` or `status`,
+/// or a frame of `preview:<job_id>` (APP-134). Each repeats state it already carries, and the
+/// Telemetry card and the Jobs panel show them; a `status` is the same summary as that change's
+/// `jobs` event, which stays. A job's other events and a session mark (`snapshot`,
+/// `resync_required`) stay.
 fn is_heartbeat(topic: &str, kind: &str, data_json: &str) -> bool {
     if kind != "event" {
         return false;
@@ -788,15 +790,18 @@ fn is_heartbeat(topic: &str, kind: &str, data_json: &str) -> bool {
     if topic.starts_with("preview:") {
         return true;
     }
-    let beat = if topic == "telemetry" {
-        "sample"
+    let beats: &[&str] = if topic == "telemetry" {
+        &["sample"]
     } else if topic.starts_with("job:") {
-        "progress"
+        &["progress", "status"]
     } else {
         return false;
     };
-    serde_json::from_str::<Value>(data_json)
-        .is_ok_and(|data| data.get("kind").and_then(Value::as_str) == Some(beat))
+    serde_json::from_str::<Value>(data_json).is_ok_and(|data| {
+        data.get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| beats.contains(&kind))
+    })
 }
 
 /// An event's data as the log shows it (module docs).

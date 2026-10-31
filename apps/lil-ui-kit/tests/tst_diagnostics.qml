@@ -571,6 +571,8 @@ TestCase {
         load(core)
         verify(shows(panel.log, "Telemetry samples, job progress and preview frames aren't kept here"),
                texts(panel.log).join(" | "))
+        verify(shows(panel.log, "It keeps the newest 1,000, so a long batch pushes older rows out. Recent errors keep their own list."),
+               texts(panel.log).join(" | "))
         core.emit("diagnostics", "event", {kind: "error", code: "store.io", tool: "asset.get", at: "2026-10-30T10:00:00Z"})
         for (let i = 0; i < 1000; ++i)
             core.emit("telemetry", "event", {kind: "sample", snapshot: snapshot()})

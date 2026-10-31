@@ -25,7 +25,7 @@ TestCase {
         compare(log.rowCount(), 0)
         for (let i = 0; i < 1003; ++i)
             core.emit("jobs", "event", {kind: "job", job: {job_id: "j" + i, status: "queued"}})
-        core.emit("job:j1", "event", {kind: "status", job: {job_id: "j1", status: "running"}})
+        core.emit("job:j1", "event", {kind: "retrying", attempt: 2, of: 3})
         core.emit("confirmations", "resync_required", null)
         compare(log.rowCount(), 1000)
         // Oldest first: the first 5 of 1,005 are gone.
@@ -61,6 +61,28 @@ TestCase {
         compare(log.rowCount(), 1000)
     }
 
+    // A job's `status` is the same summary as its `jobs` event (the core publishes one value on both):
+    // an ordinary batch of about 100 images must not clear what came before it. Each job here is what
+    // a real one sends: four changes on both topics and a queue event, and its progress.
+    function test_a_batch_of_111_keeps_the_early_error() { // spec: APP-134
+        const core = createTemporaryObject(fakeComponent, tc)
+        const log = createTemporaryObject(logComponent, tc, {core: core})
+        core.emit("diagnostics", "event", {kind: "error", code: "store.io", tool: "asset.get", at: "2026-10-30T10:00:00.000Z"})
+        core.emit("engines", "event", {kind: "status", engine: {engine: "comfyui", state: "ready"}})
+        for (let i = 0; i < 111; ++i) {
+            const id = "j_" + i
+            for (const status of ["queued", "running", "running", "succeeded"]) {
+                const job = {job_id: id, status: status}
+                core.emit("jobs", "event", {kind: "job", job: job})
+                core.emit("job:" + id, "event", {kind: "status", job: job})
+            }
+            core.emit("job:" + id, "event", {kind: "progress", value: 1, max: 2})
+            core.emit("jobs", "event", {kind: "queue", state: {lane: "gpu-heavy", paused: false, reasons: [], held: 0, restart_held: 0, withdrawn: 0}})
+        }
+        verify(log.get(0).text.indexOf("store.io") >= 0, "the error is still the first row: " + log.get(0).text)
+        compare(log.rowCount(), 2 + 111 * 5, "each job's four `jobs` events and its queue event")
+    }
+
     // What repeats state at a high rate is left out, whatever follows it; everything else stays.
     function test_heartbeats_stay_out() { // spec: APP-134
         const core = createTemporaryObject(fakeComponent, tc)
@@ -69,6 +91,7 @@ TestCase {
         for (let i = 0; i < 1000; ++i) {
             core.emit("telemetry", "event", {kind: "sample", snapshot: {ts: "2026-10-30T10:00:00Z"}})
             core.emit("job:j1", "event", {kind: "progress", value: i, max: 1000})
+            core.emit("job:j1", "event", {kind: "status", job: {job_id: "j1", status: "running"}})
             core.emit("preview:j1", "event", {format: "png", data_b64: "AAAA"})
         }
         compare(log.rowCount(), 1, "1,000 of each push nothing out")
@@ -79,7 +102,7 @@ TestCase {
                       ["telemetry", "event", {kind: "alert_cleared", id: "a"}],
                       ["telemetry", "resync_required", null],
                       ["telemetry", "snapshot", {ts: "2026-10-30T10:00:00Z"}],
-                      ["job:j1", "event", {kind: "status", job: {job_id: "j1", status: "failed"}}],
+                      ["jobs", "event", {kind: "job", job: {job_id: "j1", status: "failed"}}],
                       ["job:j1", "event", {kind: "retrying"}],
                       ["job:j1", "event", {kind: "watchdog"}],
                       ["job:j1", "resync_required", null],
