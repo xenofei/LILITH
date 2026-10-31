@@ -51,6 +51,10 @@ pub use workspace::{
 /// the current user that it could inspect).
 pub(crate) const WRONG_FOLDER: &str = "its executable is not in the folder this client trusts";
 
+/// The `Untrusted` reason for a server that didn't set the proof's event (`core/prove`, Appendix G
+/// "Connections").
+pub(crate) const NOT_PROVED: &str = "it did not prove that it holds the pipe";
+
 /// The core executable's file name, next to the client's own executable.
 pub const CORE_EXE: &str = "lil-core.exe";
 
@@ -291,6 +295,13 @@ impl fmt::Display for ClientError {
                 // Only a same-user core in another folder can be asked to drain.
                 if reason.starts_with(WRONG_FOLDER) {
                     f.write_str(" `lil core stop` can ask it to finish.")?;
+                }
+                // Says what an old core does, and nothing about what this server is.
+                if reason == NOT_PROVED {
+                    f.write_str(
+                        " A core from an older LILITH build can't answer this either: it ends by \
+                         itself when idle, or it can be ended by hand in Task Manager.",
+                    )?;
                 }
                 Ok(())
             }

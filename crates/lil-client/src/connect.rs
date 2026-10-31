@@ -62,7 +62,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::conn::{Conn, EventStream};
-use crate::{ClientConfig, ClientError, StartFailure, StartPolicy, WRONG_FOLDER};
+use crate::{ClientConfig, ClientError, NOT_PROVED, StartFailure, StartPolicy, WRONG_FOLDER};
 
 /// The first pause between attempts to open the pipe.
 const BACKOFF_START: Duration = Duration::from_millis(25);
@@ -77,8 +77,6 @@ const NORMAL_EXIT: u32 = 0;
 const EARLY_CLOSE_WAIT: Duration = Duration::from_secs(10);
 /// How long an automatic drain-and-replace waits for the old core's pipe to go.
 const REPLACE_WAIT: Duration = Duration::from_secs(60);
-/// The `Untrusted` reason for a server that didn't set the proof's event.
-const NOT_PROVED: &str = "it did not prove that it holds the pipe";
 
 /// A connection with a session on the core.
 pub struct Client {
