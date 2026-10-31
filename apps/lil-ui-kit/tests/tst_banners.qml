@@ -206,6 +206,11 @@ TestCase {
         // A refusal marked `never` can't be retried.
         t.core.applyState({connection: "unavailable", unavailable: {reason: "No.", cause: "refused", code: "core.refused", retry: "never"}})
         verify(!banner.retryButton.visible)
+
+        // A failed proof, in `ClientError::Untrusted`'s words: the cut at 300 only costs the path.
+        t.core.applyState({connection: "unavailable", unavailable: Shapes.otherCause("untrusted", "The LILITH core pipe names pid 4294967295 as its server, but whoever holds it did not prove that it does, so this client does not trust it. A core from an older LILITH build can't answer this: it ends once no LILITH app is open and it has been idle, or you can end it in Task Manager. That pid is C:\\" + "long folder\\".repeat(30) + "lil-core.exe.")})
+        verify(banner.text.indexOf("Task Manager.") >= 0, banner.text)
+        verify(banner.text.indexOf("lil-core.exe") < 0, banner.text)
     }
 
     function test_a_refused_workspace_says_so_and_has_a_way_out() { // spec: ARCH-100, ARCH-090
