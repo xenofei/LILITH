@@ -53,7 +53,7 @@
   Real input goes only while the app's window is in front and under the point, and an injected click only
   while the cursor is inside Approve's own rectangle, checked right before each input: a drifted hand is
   never clicked onto Deny. 3. lil-image is closed, the test core stopped (only the PIDs recorded here, only
-  on this channel), the channel's registry keys and temporary root removed, and the pop-up told it is done.
+  on this channel), the channel's registry keys, temporary root and Qt cache folder removed, and the pop-up told it is done.
   Anything left behind fails the run. Exit 0 only when every check passed and the cleanup was complete:
   -NoHand can't pass.
 
@@ -160,6 +160,16 @@ function Exit-TestChannel {
         try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
     }
     if (Test-Path -LiteralPath $root) { Fail "cleanup: $root is still there" }
+    if ($script:channelMine) {
+        # Qt's own cache goes by the application name and the channel: a folder in the real local data
+        # folder, outside the test root. Exactly this channel's folder: on any other channel this
+        # function has returned above.
+        $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+        for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
+            try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+        }
+        if (Test-Path -LiteralPath $cache) { Fail "cleanup: $cache is still there" }
+    }
     foreach ($id in $corePids) {
         $p = Get-Process -Id $id -ErrorAction SilentlyContinue
         if ($p -and $p.ProcessName -eq 'lil-core' -and $p.Path -and $p.Path.StartsWith($Deploy, [StringComparison]::OrdinalIgnoreCase)) {
@@ -384,11 +394,18 @@ function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     }
     throw "timed out after $sec s waiting for $what"
 }
+# UI Automation can throw for a whole walk while the tree moves: such a walk is tried again.
+function Retry-Walk([scriptblock]$walk) {
+    for ($i = 0; ; ++$i) {
+        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
+    }
+}
 function Find-Named([string]$name) {
-    return $script:main.FindFirst($TS::Descendants, (Prop $AE::NameProperty $name))
+    return Retry-Walk { $script:main.FindFirst($TS::Descendants, (Prop $AE::NameProperty $name)) }
 }
 function Find-Starting([string]$prefix) {
-    foreach ($e in $script:main.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+    $all = Retry-Walk { $script:main.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) }
+    foreach ($e in $all) {
         try { if ($e.Current.Name.StartsWith($prefix)) { return $e } } catch { }
     }
     return $null
@@ -396,7 +413,8 @@ function Find-Starting([string]$prefix) {
 # A button whose name starts `prefix`: the notes beside the buttons start with the same words.
 function Find-Button([string]$prefix) {
     $buttons = Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Button)
-    foreach ($e in $script:main.FindAll($TS::Descendants, $buttons)) {
+    $all = Retry-Walk { $script:main.FindAll($TS::Descendants, $buttons) }
+    foreach ($e in $all) {
         try { if ($e.Current.Name.StartsWith($prefix)) { return $e } } catch { }
     }
     return $null
