@@ -757,6 +757,20 @@ TestCase {
         compare(t.bar.movedReason, "", "this session's own workspace is the default again")
     }
 
+    function test_a_list_left_open_as_a_refusal_ends_closes() { // spec: ARCH-100, APP-006
+        // It has nothing in it, and nothing would fill it. No click of its own ends this one.
+        const t = load()
+        t.core.applyState({connection: "unavailable", unavailable: Shapes.refusedHello("workspace.unknown", "The folder is gone.")})
+        for (const sw of [t.bar.workspaceSwitcher, t.bar.projectSwitcher]) {
+            mouseClick(sw.button)
+            tryVerify(() => sw.popup.opened)
+            verify(sw.popup.defaultButton.visible)
+            t.core.applyState({connection: "ready", workspace: workspaceOne})
+            tryVerify(() => !sw.popup.visible, 2000, "the refusal ended")
+            t.core.applyState({connection: "unavailable", unavailable: Shapes.refusedHello("workspace.unknown", "The folder is gone.")})
+        }
+    }
+
     function test_a_refused_list_read_is_the_same_state() { // spec: ARCH-090, ARCH-100
         // The event can be missed; the core's real refusal says the same.
         const t = load()

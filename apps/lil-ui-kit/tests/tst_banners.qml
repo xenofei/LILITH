@@ -509,6 +509,21 @@ TestCase {
         verify(banner.createButton.enabled)
     }
 
+    function test_the_list_is_read_each_time_the_banner_shows() { // spec: APP-016
+        // A session that loses its workspace: the banner wasn't showing when the shell was made.
+        const t = load()
+        const reads = () => t.core.calls.filter(named("workspaces.list")).length
+        const before = reads()
+        const banner = t.shell.noWorkspaceBanner
+        verify(!banner.visible)
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(banner.visible)
+        compare(reads(), before + 1)
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: [
+            {id: "ws1", path: "E:/art/harbor", name: "Harbor", default: true, served: false, missing: true}]}))
+        verify(banner.defaultButton.visible)
+    }
+
     function test_banners_stack_above_the_docks() { // spec: APP-001
         const t = load(null)
         const shell = t.shell
