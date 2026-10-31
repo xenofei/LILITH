@@ -112,7 +112,7 @@ fn is_blank(line: &str) -> bool {
     line.chars().all(|c| c.is_whitespace() && !is_marked(c))
 }
 
-/// A value as lines: its text in [`shown`] form. Returns the text and whether it was all shown.
+/// A value as it is shown, within `left` characters, which it uses up; and whether all of it went in.
 fn shown_value(raw: &str, left: &mut usize) -> (String, bool) {
     let mut out = String::new();
     let mut first = true;

@@ -12,7 +12,8 @@
 //!    thread (`single_instance`), and the forwarded launches are routed on one more,
 //!    `lil-launches`, so a `.lilref` read never holds up the pipe (review M-8).
 //! 3. Each launch the window must show (this start's own first, then each forwarded one; a
-//!    forwarded deny is sent on a thread of its own, and the window hears only its id) waits
+//!    forwarded deny is sent on a thread of its own, and the window hears only its id, once the
+//!    core has taken it) waits
 //!    here until `main.cpp` has named its window (`lil_qt::deliverLaunchesTo`,
 //!    `src/qt/launch_sink.h`) and called `launches_ready()`; from then on each goes to the
 //!    window as it comes, and the window says when it has taken one (`launch_handled`).
