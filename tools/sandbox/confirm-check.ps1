@@ -53,13 +53,17 @@
         the press and up at the release. A refused try shows why on the pop-up, and can be tried again.
     (l) No click, and no pass or fail: while a person keeps the mouse moving near Approve for 10 s, the
         script warps off it and back onto it every 500 ms, after the same front and point checks, and
-        reports each arrival line's `origin`, and how many read Hardware right after a warp. Any that do
-        mean Windows can merge a warp into the hand's next move and report it as real, where the gate's
-        warp rule can't see it. A program's arrival lines are limited to one a second; a hand's aren't.
+        reports each arrival line's `origin` (with `/late` when the message's own point wasn't where the
+        cursor then was), and how many read Hardware right after a warp. Any that do, on time, mean Windows
+        can merge a warp into the hand's next move and report it as real, where the gate's warp rule can't
+        see it. A program's arrival lines are limited to one a second; a hand's aren't.
     (j) A person's normal way back: click outside the window, click its title bar once, move onto Approve,
         rest, click. Coming to the front makes a new button to the gate, but the hand comes to it by
         moving, so the first click counts: `approved`, with no `brought_forward` and no `not_pointer`.
         Any other refusal (too soon, or the words to move off and back) is measured and can be retried.
+    (q) Click outside, then click Approve straight on in the window that isn't in front: refused as
+        `brought_forward`, with the words that say to move off and come back. Doing that approves. What
+        the window said is reported.
   Then, with no hand again:
     (d) A change to the raise amount by UI Automation's value re-arms the gate: Invoke on Cancel right
         after it is refused as too soon, half a second after the window had settled, and the button shows
@@ -455,8 +459,8 @@ $what = if ($NoHand) { 'checks the confirm window (a window, synthesized clicks 
         else { 'checks the confirm window (a window, synthesized clicks and keys). When this turns blue it needs you' }
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
-               '-What', $what, '-WarnSec', '10', '-RunSec', '720',
-               '-CapSec', '1500', '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-What', $what, '-WarnSec', '10', '-RunSec', '900',
+               '-CapSec', '1800', '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -1109,12 +1113,13 @@ try {
                         Set-Cue "$cue`n($([int]($end - (Get-Date)).TotalSeconds) s left)"
                     }
                 } catch { $stopped = "$_" }
-                # Off the button, and it's the hand's from here.
+                # The last warp left the cursor on Approve. Nothing moves it from here but the hand.
                 Set-Cue 'Stop moving the mouse, and do not click. The next step comes in a moment.'
                 Start-Sleep -Milliseconds 500
                 $moves = @(Get-Moves)
-                $origins = @($moves | ForEach-Object { $_.origin })
-                $hardware = @($origins | Where-Object { $_ -eq 'Hardware' }).Count
+                # Each arrival's origin, and whether the message's own point was where the cursor then was.
+                $origins = @($moves | ForEach-Object { "$($_.origin)$(if ($_.on_time -eq $false) { '/late' })" })
+                $hardware = @($moves | Where-Object { $_.origin -eq 'Hardware' }).Count
                 # A Hardware arrival within 50 ms after a warp onto Approve.
                 $merged = 0
                 $timed = $true
@@ -1138,8 +1143,10 @@ try {
             # (j) A person's normal way back to the window. Coming to the front makes Approve a new
             # button to the gate, and the hand arrives on it by moving, so the first click counts.
             Step '(j)' {
-                # (l)'s window if it opened: a new one could wait for minutes on Windows again.
-                if (-not $script:readyForJ) {
+                # (l)'s window and confirmation if they are still good: a new window could wait for
+                # minutes on Windows again. A stray click on Approve during (l) would have answered it,
+                # and an answer here would pass this with nothing tested.
+                if (-not $script:readyForJ -or (Get-Answer $script:id) -ne 'pending') {
                     $script:id = New-Confirmation
                     Open-Window $script:id
                 }
@@ -1164,13 +1171,68 @@ try {
                         Try-Beep 659 250
                         Write-Host "NOW: $cue. ($HandSec s)"
                         $answer = Wait-RealClick $cue
-                        Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve counted. The evidence is saved.' } else { 'That was the last thing needed from you. Stay off the mouse until this says the PC is free.' })
+                        Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve counted. The evidence is saved.' } else { 'Thanks. Stay off the mouse: one more short step comes soon, and this turns blue for it.' })
                         $names = @(Get-RefusalNames)
                         $measured = "(j) measured: refusals before it counted: [$($names -join ', ')]"
                         Write-Host $measured
                         $results.Add($measured)
                         Check ($answer -eq 'approved') "(j) after a title-bar click, a real click on Approve approved it (the core says: $answer)"
                         Check (@($names | Where-Object { $_ -in 'brought_forward', 'not_pointer' }).Count -eq 0) '(j) and no refusal said it brought the window forward or was not a pointer'
+                        Start-Sleep -Seconds 3
+                    }
+                }
+                Clear-Cue
+            }
+            Clear-Cue
+
+            # (q) A click straight on Approve in a window that isn't in front: refused, and its words say
+            # what works, since coming to the front made a new button.
+            Step '(q)' {
+                $expected = 'That click brought this window to the front. Move the pointer off Approve, then come back and click it.'
+                $script:id = New-Confirmation
+                # It may wait here for Windows to let the window come to the front, and says so.
+                Open-Window $script:id
+                Start-Step
+                Set-Cue 'Now: click once outside the LILITH Confirm window, on the empty desktop'
+                Try-Beep 1047 400
+                Write-Host "NOW: click once outside the window. ($HandSec s)"
+                if (-not (Wait-Front $false)) {
+                    Set-Cue 'Timed out: the window stayed in front. The check goes on.'
+                    Fail "(q) timed out after $HandSec s: the window stayed in front, so no click could bring it forward"
+                    Start-Sleep -Seconds 3
+                } else {
+                    Set-Cue 'Now: click Approve once, in the LILITH Confirm window, while it is not in front'
+                    Try-Beep 880 400
+                    Write-Host "NOW: click Approve once. ($HandSec s)"
+                    # No UI Automation while waiting: it would keep the app's GUI thread busy for the click.
+                    $end = (Get-Date).AddSeconds($HandSec)
+                    $answer = 'pending'
+                    while ((Get-Date) -lt $end -and $answer -eq 'pending' -and @(Get-Refusals).Count -eq 0) {
+                        Start-Sleep -Milliseconds 200
+                        $answer = Get-Answer $script:id
+                    }
+                    Start-Sleep -Milliseconds 300
+                    $names = @(Get-RefusalNames)
+                    $said = Get-WindowReason
+                    $measured = "(q) measured: the first click: the core says $answer; refusals: [$($names -join ', ')]; the window said: $said"
+                    Write-Host $measured
+                    $results.Add($measured)
+                    if ($names.Count -eq 0) {
+                        Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve came. The evidence is saved.' } else { 'That click answered it, and it should not have. The evidence is saved.' })
+                        Fail "(q) the click on Approve in a window not in front wasn't refused (the core says: $answer)"
+                        Start-Sleep -Seconds 3
+                    } else {
+                        Check ($names[0] -eq 'brought_forward') "(q) it was refused as brought_forward: $($names[0])"
+                        Check ($answer -eq 'pending') '(q) and it answered nothing'
+                        Check ($said -eq $expected) "(q) and the window says what works: $said"
+                        Start-Step
+                        Try-Beep 659 250
+                        $answer = Wait-RealClick 'Now: move the pointer off Approve, then come back and click it'
+                        Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve counted. The evidence is saved.' } else { 'That was the last thing needed from you. Stay off the mouse until this says the PC is free.' })
+                        $measured = "(q) measured: refused again before it counted: [$((Get-RefusalNames) -join ', ')]"
+                        Write-Host $measured
+                        $results.Add($measured)
+                        Check ($answer -eq 'approved') "(q) and doing that approved it (the core says: $answer)"
                         Start-Sleep -Seconds 3
                     }
                 }
