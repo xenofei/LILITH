@@ -104,6 +104,24 @@ Window {
     property string shownJob
     property string shownConfirmation
     property var _openRequests: null
+    // Links that came while a confirmation was open, oldest first.
+    property var _heldLaunches: []
+
+    function _runHeldLaunches() {
+        if (OpenPrompts.count > 0 || !layoutSettled)
+            return
+        const held = _heldLaunches
+        _heldLaunches = []
+        held.forEach(handleLaunch)
+    }
+    onLayoutSettledChanged: _runHeldLaunches()
+
+    Connections {
+        target: OpenPrompts
+        function onCountChanged() {
+            root._runHeldLaunches()
+        }
+    }
     // --- end of open requests ---
 
     width: 1280
@@ -563,6 +581,29 @@ Window {
         // This start runs without the app's pipe: the bridge's words for why.
         if (typeof launch.pipe_notice === "string" && launch.pipe_notice !== "")
             instanceBanner.show(launch.pipe_notice)
+        // A dialog opened before the layout has settled would close as the panel moves into its
+        // place, with nothing said: the link waits.
+        if (launch.kind === "confirm" && !layoutSettled) {
+            shownConfirmation = launch.id
+            _heldLaunches = _heldLaunches.concat([launch])
+            return
+        }
+        // While a confirmation is open, no link moves the focus or changes what is around it
+        // (P4a-R10): a link to another confirmation waits in the panel, and the window only flashes;
+        // any other link waits until none is open.
+        if (OpenPrompts.count > 0) {
+            if (launch.kind !== "confirm") {
+                _heldLaunches = _heldLaunches.concat([launch])
+                return
+            }
+            if (launch.activate !== false)
+                shim.activate(root, false)
+            shownConfirmation = launch.id
+            const panel = docks.confirmations ? docks.confirmations.content : null
+            if (panel)
+                panel.showConfirmation(launch.id)
+            return
+        }
         if (launch.activate !== false)
             shim.activate(root, focus)
         if (launch.kind === "target" || launch.kind === "ref" || launch.kind === "lilref") {

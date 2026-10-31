@@ -1,8 +1,9 @@
-// One confirmation's facts (APP-115, APP-045): who asked, the exact action, the files, packages and
-// scripts it names, the kind of request and the time left. The tool and every argument are what the
-// core sent, not a summary, shown as plain text through Core.shownText (P4a-R8): U+202E is a marker,
-// control characters are gone, and a value too long to show says so. Children go under the facts
-// (the panel's button).
+// One confirmation's facts (APP-115, APP-045): who asked, the exact action, the kind of request and
+// the time left. The tool and every argument are what the core sent, not a summary, as plain text
+// (lil_qt::confirm_text, P4a-R8): every invisible character is a marker, a value's extra lines carry a
+// continuation mark and its key stands apart, so a value can't pass for another argument, and a value
+// that isn't all shown says so. No list of files: until a tool declares its paths, the exact arguments
+// are what is true. Children go under the facts (the panel's button).
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
@@ -14,24 +15,27 @@ LCard {
     required property var core
     required property string confirmationId
     property var view: null
+    // Above 0: at most this many characters of each value (the panel's list, whose button opens the
+    // whole action). The dialog shows it all.
+    property int previewChars: 0
     default property alias footer: footerSlot.data
 
-    // The arguments as shown.
-    readonly property var argumentRows: view ? Words.argumentRows(view.arguments, _shown) : []
-    readonly property var files: view ? Words.filesOf(view.arguments, _shown) : []
+    // The arguments as shown: [{key, text, cut}].
+    readonly property var argumentRows: view && view.shown ? view.shown.rows : []
     readonly property string whoText: view ? Words.who(view.caller_kind, _shown) : ""
     readonly property string actionText: view ? _shown(view.tool, 200) : ""
     readonly property string kindText: !view ? ""
-        : Words.coversCap(view) && (view.covers || []).indexOf("confirm") >= 0 ? "Agent request and spending cap"
+        : Words.coversCap(view) && Words.coversConfirm(view) ? "Agent request and spending cap"
         : Words.coversCap(view) ? "Spending cap" : "Agent request"
     property real nowMs: Date.now()
     readonly property string leftText: view && view.state === "pending" ? Words.timeLeft(view.expires_at, nowMs) : ""
     readonly property bool ranOut: !!view && view.state === "pending" && leftText === ""
     readonly property string countdownText: leftText !== "" ? "Expires in " + leftText : ""
     readonly property alias factsLine: factsLine
+    readonly property alias rowRepeater: rowRepeater
 
     function _shown(text, max) {
-        return Core.shownText(String(text), max)
+        return ConfirmInput.shownLine(String(text), max)
     }
 
     title: !view ? _shown(confirmationId, 60) : whoText + " asks to run " + actionText
@@ -63,19 +67,6 @@ LCard {
         }
 
         Text {
-            objectName: "files"
-            width: parent.width
-            visible: root.files.length > 0
-            text: "Files, packages and scripts:\n" + root.files.join("\n")
-            textFormat: Text.PlainText
-            color: Theme.text
-            font.pixelSize: Theme.fontSize
-            wrapMode: Text.WrapAnywhere
-            Accessible.role: Accessible.StaticText
-            Accessible.name: text
-        }
-
-        Text {
             width: parent.width
             visible: root.argumentRows.length > 0
             text: "Exact action:"
@@ -85,30 +76,70 @@ LCard {
         }
 
         Repeater {
+            id: rowRepeater
             model: root.argumentRows
-            delegate: Column {
+            delegate: Item {
+                id: argument
                 required property var modelData
+                readonly property bool previewCut: root.previewChars > 0 && modelData.text.length > root.previewChars
+                readonly property alias keyText: keyText
+                readonly property alias valueText: valueText
+                readonly property alias cutLine: cutLine
                 width: facts.width
+                height: argumentColumn.implicitHeight
 
-                Text {
-                    width: parent.width
-                    text: (modelData.key !== "" ? modelData.key + ": " : "") + modelData.text
-                    textFormat: Text.PlainText
-                    color: Theme.text
-                    font.pixelSize: Theme.fontSize
-                    wrapMode: Text.WrapAnywhere
-                    Accessible.role: Accessible.StaticText
-                    Accessible.name: text
+                // A frame a value's text can't draw.
+                Rectangle {
+                    width: 2
+                    height: parent.height
+                    color: Theme.surfaceRaised
                 }
 
-                Text {
-                    width: parent.width
-                    visible: modelData.cut
-                    text: "This value is longer than what is shown here, so part of it can't be read."
-                    textFormat: Text.PlainText
-                    color: Theme.warning
-                    font.pixelSize: Theme.fontSize
-                    wrapMode: Text.Wrap
+                Column {
+                    id: argumentColumn
+                    x: Theme.spacing
+                    width: parent.width - x
+
+                    Text {
+                        id: keyText
+                        width: parent.width
+                        visible: text !== ""
+                        text: argument.modelData.key
+                        textFormat: Text.PlainText
+                        color: Theme.textMuted
+                        font.pixelSize: Theme.fontSize
+                        font.bold: true
+                        wrapMode: Text.WrapAnywhere
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+
+                    Text {
+                        id: valueText
+                        width: parent.width
+                        text: argument.previewCut ? argument.modelData.text.slice(0, root.previewChars) + "…"
+                                                  : argument.modelData.text
+                        textFormat: Text.PlainText
+                        color: Theme.text
+                        font.pixelSize: Theme.fontSize
+                        wrapMode: Text.WrapAnywhere
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+
+                    Text {
+                        id: cutLine
+                        width: parent.width
+                        visible: argument.modelData.cut || argument.previewCut
+                        text: argument.modelData.cut ? "This value is longer than LILITH can show, so part of it can't be read."
+                                                     : "Review and answer shows all of this value."
+                        textFormat: Text.PlainText
+                        color: Theme.warning
+                        font.pixelSize: Theme.fontSize
+                        wrapMode: Text.Wrap
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
                 }
             }
         }

@@ -1,13 +1,8 @@
 // The words of a confirmation (APP-046, APP-115), for the confirm dialog, the cap prompt, the
 // Confirmations panel and the confirm window. Everything from outside goes through `shown`
-// (Core.shownText, P4a-R8), which removes controls and marks bidi and zero-width characters: the
-// arguments came from the agent.
+// (ConfirmInput.shownLine, which marks every invisible character, then shown_text's limit). The
+// arguments themselves are lil_qt::confirm_text's, from the JSON as the core sent it: `view.shown`.
 .pragma library
-
-// How much of one argument's value is shown. Past it the card says so: nothing is cut silently.
-const VALUE_CHARS = 4000
-// How many files are listed; the arguments show them all the same.
-const FILES_MAX = 100
 
 function who(callerKind, shown) {
     const kind = String(callerKind)
@@ -25,71 +20,25 @@ function coversCap(view) {
     return !!view && (view.covers || []).indexOf("cap") >= 0
 }
 
+function coversConfirm(view) {
+    return !!view && (view.covers || []).indexOf("confirm") >= 0
+}
+
+// What the dialog shows of this confirmation, as one string: when it changes, the gate re-arms.
+function fingerprint(view) {
+    if (!view)
+        return ""
+    return [view.id, view.tool, view.caller_kind, view.project || "", JSON.stringify(view.covers),
+            JSON.stringify(view.cap || null), view.shown ? view.shown.digest : "unread"].join("|")
+}
+
 // "14:02" in local time, from an RFC 3339 time.
 function clock(iso) {
     return Qt.formatTime(new Date(iso), "HH:mm")
 }
 
-// A value as its lines, each normalised and joined again, so a script reads as lines and its
-// control characters are gone: {text, cut}.
-function valueText(value, shown) {
-    const raw = typeof value === "string" ? value : JSON.stringify(value, null, 2)
-    let left = VALUE_CHARS
-    const out = []
-    let cut = false
-    for (const line of String(raw).split(/\r\n|\r|\n/)) {
-        if (left <= 0) {
-            cut = true
-            break
-        }
-        cut = cut || line.length > left
-        out.push(shown(line, left))
-        left -= line.length
-    }
-    return {text: out.join("\n"), cut: cut}
-}
-
-// The call's arguments, in the order they came: [{key, text, cut}].
-function argumentRows(args, shown) {
-    if (args === null || args === undefined)
-        return []
-    if (typeof args !== "object" || Array.isArray(args)) {
-        const v = valueText(args, shown)
-        return [{key: "", text: v.text, cut: v.cut}]
-    }
-    return Object.keys(args).map(key => {
-        const v = valueText(args[key], shown)
-        return {key: shown(key, 200), text: v.text, cut: v.cut}
-    })
-}
-
-// The files, packages and scripts the arguments name (APP-115): the text values under a key that
-// names one, however deep, one line each (a script's text isn't a name). The core sends no list of its
-// own, so this reads the arguments, which the card shows in full as well.
-function filesOf(args, shown) {
-    const named = /(path|paths|file|files|folder|folders|dir|directory|package|packages|script|scripts|target|targets|source|destination|dest|output|url)$/i
-    const out = []
-    function visit(value, key) {
-        if (out.length >= FILES_MAX)
-            return
-        if (typeof value === "string") {
-            if (value.indexOf("\n") >= 0 || value.indexOf("\r") >= 0)
-                return
-            const text = shown(value, 500)
-            if (key && out.indexOf(text) < 0)
-                out.push(text)
-        } else if (Array.isArray(value)) {
-            value.forEach(v => visit(v, key))
-        } else if (value && typeof value === "object") {
-            Object.keys(value).forEach(k => visit(value[k], named.test(k)))
-        }
-    }
-    visit(args, false)
-    return out
-}
-
-// What has become of it, once it isn't pending. `fromToast`: this window was told a notification's
-// Deny went out for it.
+// What has become of it, once it isn't pending. `fromToast`: the core took a notification's Deny
+// for it.
 function outcome(view, fromToast) {
     switch (view.state) {
     case "approved":

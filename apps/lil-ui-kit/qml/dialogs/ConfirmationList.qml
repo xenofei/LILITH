@@ -8,8 +8,13 @@
 // 30 s. `loaded` is false until a load is in, and a dialog holds its answers meanwhile. Events during
 // a load are held and applied after it. Each event is the row's full state, and they can overtake
 // one another, so one that says pending never undoes an ending. The rows stay made across a reload.
+//
+// Each row carries `shown`: its arguments as the card shows them, from the JSON as it came
+// (ConfirmInput.shownActions), {rows: [{key, text, cut}], over, digest}. QML's own parse rounds big
+// integers and reorders integer-like keys, so `arguments` is never what is shown.
 import QtQuick
 import QtQml.Models
+import Lilith.Core
 import Lilith.UiKit
 
 Item {
@@ -35,6 +40,13 @@ Item {
         return revision >= 0 && Object.prototype.hasOwnProperty.call(_rows, id) ? _rows[id] : null
     }
 
+    function _withShown(rows, raw) {
+        const shown = JSON.parse(ConfirmInput.shownActions(raw))
+        for (const v of rows)
+            v.shown = shown[v.id]
+        return rows
+    }
+
     function reload() {
         const generation = ++_generation
         loaded = false
@@ -42,10 +54,10 @@ Item {
         const got = {}
         const fetch = state => CoreCall.appCall(core, "app/confirmations.list", {state: state, limit: listLimit}, {
             owner: root,
-            ok: result => {
+            ok: (result, raw) => {
                 if (generation !== _generation)
                     return
-                got[state] = result.confirmations
+                got[state] = _withShown(result.confirmations, raw)
                 if (got.pending && got.history)
                     _apply(got.pending, got.history)
             },
@@ -117,7 +129,8 @@ Item {
         return false
     }
 
-    // A row's new state, from an event or an answer's own result.
+    // A row's new state, from an event, or an answer's own result (which has no `shown`: a row's
+    // arguments never change).
     function apply(v) {
         if (loaded)
             _upsert(v)
@@ -129,6 +142,8 @@ Item {
         const old = view(v.id)
         if (old && old.state !== "pending" && v.state === "pending")
             return
+        if (!v.shown)
+            v.shown = old && old.shown ? old.shown : {rows: [], over: true, digest: ""}
         _rows[v.id] = v
         if (v.state === "pending") {
             if (!_has(pending, v.id))
@@ -159,11 +174,11 @@ Item {
     }
 
     Component.onCompleted: {
-        CoreCall.subscribe(core, "confirmations", root, (kind, seq, data) => {
+        CoreCall.subscribe(core, "confirmations", root, (kind, seq, data, raw) => {
             if (kind === "snapshot" || kind === "resync_required")
                 root.reload()
             else if (kind === "event" && data && data.confirmation)
-                root.apply(data.confirmation)
+                root.apply(root._withShown([data.confirmation], raw)[0])
         })
         reload()
     }

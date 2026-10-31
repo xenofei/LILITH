@@ -20,6 +20,7 @@ TestCase {
         id: hand
         function watch(item) {}
         function unwatch(item) {}
+        function notePress(item) {}
         function takeClick(item) { return "" }
     }
 
@@ -64,6 +65,11 @@ TestCase {
         w.handleLaunchJson(JSON.stringify(Object.assign({intent: "open", focus: true, activate: true}, fields)))
     }
 
+    function inFront(w) {
+        w.requestActivate()
+        tryVerify(() => w.active, 2000)
+    }
+
     function test_title_and_walk() { // spec: APP-048, APP-156
         const w = makeWindow([first])
         compare(w.title, "LILITH — Confirm")
@@ -71,6 +77,52 @@ TestCase {
         tryVerify(() => w.dialogOf(first.id), 2000)
         compare(walk.report(w.contentItem), [])
         verify(walk.interactiveCount(w.contentItem) >= 2)
+    }
+
+    function test_initial_focus_is_deny_and_enter_never_approves() { // spec: P4a-R10
+        const w = makeWindow([first])
+        inFront(w)
+        launch(w, {kind: "confirm", id: first.id})
+        const dialog = w.dialogOf(first.id)
+        tryVerify(() => dialog.denyButton.activeFocus, 2000, "Deny has the focus")
+        verify(!dialog.approveButton.activeFocus)
+        wait(550)
+        keyClick(Qt.Key_Return)
+        const sent = Shapes.answers(fake)
+        compare(sent.length, 1)
+        compare(sent[0].args, {confirmation_id: first.id, answer: "deny"})
+    }
+
+    function test_focus_comes_when_the_first_card_arrives_and_a_quiet_launch_takes_none() { // spec: P4a-R10
+        // Asked before the lists are in: Deny takes the focus when they come.
+        const w = createTemporaryObject(windowComponent, tc)
+        w.visible = true
+        inFront(w)
+        launch(w, {kind: "confirm", id: first.id})
+        Shapes.answerLists(fake, [first], [])
+        tryVerify(() => w.list.loaded, 2000)
+        tryVerify(() => w.dialogOf(first.id).denyButton.activeFocus, 2000, "Deny has the focus")
+        // A second link adds below and leaves the focus where it is.
+        const quiet = createTemporaryObject(windowComponent, tc)
+        quiet.visible = true
+        Shapes.answerLists(fake, [first], [])
+        tryVerify(() => quiet.list.loaded, 2000)
+        inFront(quiet)
+        launch(quiet, {kind: "confirm", id: first.id, focus: false, activate: false})
+        const dialog = quiet.dialogOf(first.id)
+        wait(50)
+        verify(!dialog.denyButton.activeFocus, "a launch with no focus takes none")
+    }
+
+    function test_a_second_link_doesnt_move_the_focus() { // spec: P4a-R10, P4a-R11
+        const w = makeWindow([first, second])
+        inFront(w)
+        launch(w, {kind: "confirm", id: first.id})
+        const dialog = w.dialogOf(first.id)
+        tryVerify(() => dialog.denyButton.activeFocus, 2000)
+        launch(w, {kind: "confirm", id: second.id})
+        wait(50)
+        verify(dialog.denyButton.activeFocus, "the focus stays on what is being read")
     }
 
     function test_answered_elsewhere_shows_state() { // spec: APP-054
@@ -162,12 +214,13 @@ TestCase {
 
     function test_a_deny_url_reaching_the_open_window_denies_without_changing_focus() { // spec: P4a-R9, P4a-R11
         const w = makeWindow([first])
-        launch(w, {kind: "confirm", id: first.id, activate: false})
+        launch(w, {kind: "confirm", id: first.id, activate: false, focus: false})
         const dialog = w.dialogOf(first.id)
-        // The bridge sends the deny and only tells the window (args::deny_notice_json); the two can
-        // come in either order.
+        // Once the core has taken the deny, the bridge tells the window (args::deny_notice_json); the
+        // event and the notice can come in either order.
         launch(w, {kind: "deny", id: first.id, activate: false, focus: false})
         compare(fakeShim.activations.length, 0, "the window doesn't take the focus")
+        verify(!dialog.denyButton.activeFocus)
         verify(dialog.pending, "the core has the say")
         compare(Shapes.answers(fake).length, 0, "the window sends nothing itself")
         const denied = Shapes.answeredView(first, "denied", "app")
@@ -177,6 +230,16 @@ TestCase {
         verify(!dialog.denyButton.visible)
     }
 
+    function test_a_deny_with_no_notice_reads_as_the_apps() { // spec: P4a-R9
+        // A link whose token the core refused tells the window nothing, so nothing is mislabelled.
+        const w = makeWindow([first])
+        launch(w, {kind: "confirm", id: first.id, activate: false})
+        const dialog = w.dialogOf(first.id)
+        fake.emit("confirmations", "event", Shapes.event("answered", Shapes.answeredView(first, "denied", "app")))
+        tryVerify(() => !dialog.pending, 2000)
+        verify(dialog.stateLine.text.indexOf("Answered in the app") === 0, dialog.stateLine.text)
+    }
+
     function test_a_lost_pipe_says_so() { // spec: P4a-R11
         const w = makeWindow([first])
         launch(w, {kind: "confirm", id: first.id, activate: false, pipe_notice: "Another program holds the pipe."})
@@ -184,12 +247,11 @@ TestCase {
         compare(w.instanceBanner.text, "Another program holds the pipe.")
     }
 
-    function test_a_real_answer_from_the_window_goes_through_the_gates() { // spec: P4a-R10
+    function test_an_answer_the_gate_passes_sends_approve_for_the_id_on_screen() { // spec: P4a-R10
         const w = makeWindow([first])
         launch(w, {kind: "confirm", id: first.id})
         const dialog = w.dialogOf(first.id)
-        w.requestActivate()
-        tryVerify(() => w.active, 2000)
+        inFront(w)
         wait(550)
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 1)
@@ -197,5 +259,40 @@ TestCase {
         fake.respond(Shapes.answers(fake)[0].id, Shapes.answerResult(Shapes.answeredView(first, "approved")))
         tryVerify(() => !dialog.pending, 2000)
         verify(!dialog.approveButton.visible)
+    }
+
+    function test_the_clock_starts_again_when_the_window_moves_or_resizes() { // spec: P4a-R10
+        const w = makeWindow([first])
+        launch(w, {kind: "confirm", id: first.id})
+        const dialog = w.dialogOf(first.id)
+        inFront(w)
+        wait(550)
+        for (const change of [() => { w.x += 40 }, () => { w.y += 40 }, () => { w.width += 40 }, () => { w.height += 40 }]) {
+            const since = dialog.bar.visibleSinceMs
+            change()
+            tryVerify(() => dialog.bar.visibleSinceMs > since, 1000, "the clock starts again")
+            mouseClick(dialog.approveButton)
+            compare(Shapes.answers(fake).length, 0, "too soon")
+            verify(dialog.bar.reason.indexOf("Wait a moment") === 0, dialog.bar.reason)
+            wait(550)
+        }
+        mouseClick(dialog.approveButton)
+        compare(Shapes.answers(fake).length, 1)
+    }
+
+    function test_approve_waits_for_the_whole_action_here_too() { // spec: APP-115, P4a-R10
+        let lines = []
+        for (let i = 0; i < 200; ++i)
+            lines.push("line " + i)
+        const long = Shapes.view({id: "cf_0000000000000104", arguments: {script: lines.join("\n")}})
+        const w = makeWindow([long])
+        launch(w, {kind: "confirm", id: long.id})
+        const dialog = w.dialogOf(long.id)
+        tryVerify(() => dialog.scroller.overflows, 2000)
+        verify(!dialog.approveButton.enabled)
+        verify(dialog.moreBelow.visible && dialog.blockedLine.visible)
+        verify(dialog.denyButton.enabled)
+        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
+        tryVerify(() => dialog.approveButton.enabled, 1000)
     }
 }

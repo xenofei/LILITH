@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include <QAccessible>
 #include <QAccessibleActionInterface>
@@ -253,6 +254,29 @@ public:
     // the event dispatcher takes them as it takes a program's PostMessage to the app's window.
     Q_INVOKABLE bool postClickToHiddenWindow() const
     {
+        const HWND hidden = hiddenWindow();
+        return hidden && PostMessageW(hidden, WM_MOUSEMOVE, 0, 0) && PostMessageW(hidden, WM_LBUTTONDOWN, MK_LBUTTON, 0)
+               && PostMessageW(hidden, WM_LBUTTONUP, 0, 0);
+    }
+
+    // Sends a press and a release to that window from another thread, as another program's
+    // SendMessage does. It returns at once: this thread answers them from its event loop.
+    Q_INVOKABLE bool sendClickFromAnotherThread() const
+    {
+        const HWND hidden = hiddenWindow();
+        if (!hidden)
+            return false;
+        std::thread([hidden] {
+            SendMessageW(hidden, WM_LBUTTONDOWN, MK_LBUTTON, 0);
+            SendMessageW(hidden, WM_LBUTTONUP, 0, 0);
+        }).detach();
+        return true;
+    }
+
+private:
+    // A window of this thread, never shown.
+    static HWND hiddenWindow()
+    {
         static const HWND hidden = [] {
             WNDCLASSW cls{};
             cls.lpfnWndProc = DefWindowProcW;
@@ -260,8 +284,7 @@ public:
             RegisterClassW(&cls);
             return CreateWindowExW(0, cls.lpszClassName, L"", 0, 0, 0, 10, 10, nullptr, nullptr, nullptr, nullptr);
         }();
-        return hidden && PostMessageW(hidden, WM_MOUSEMOVE, 0, 0) && PostMessageW(hidden, WM_LBUTTONDOWN, MK_LBUTTON, 0)
-               && PostMessageW(hidden, WM_LBUTTONUP, 0, 0);
+        return hidden;
     }
 };
 

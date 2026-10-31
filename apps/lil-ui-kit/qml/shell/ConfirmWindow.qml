@@ -1,9 +1,13 @@
 // The confirm window (APP-048, APP-049, P4a-R11): the minimal window a notification's Open, a `confirm`
 // link or `lil confirm-window` opens when the app isn't running. It shows one ConfirmDialog per
-// confirmation it was asked about, or with no id every pending one, and a later link adds to it.
-// `handleLaunchJson` takes the launches as the shell does (lil_qt::args::launch_json). A notification's
-// Deny comes to this process's pipe too: the bridge sends it, and a launch of kind `deny` only tells
-// the window, which doesn't take the focus, so the card can say where the deny came from.
+// confirmation it was asked about, or with no id every pending one, and a later link only adds below,
+// so nothing changes under a hand already on its way to a button. `handleLaunchJson` takes the launches
+// as the shell does (lil_qt::args::launch_json). A notification's Deny comes to this process's pipe too:
+// the bridge sends it, and once the core has taken it a launch of kind `deny` tells the window, which
+// doesn't take the focus, so the card can say where the deny came from.
+//
+// The first pending dialog's Deny has the focus (P4a-R10), unless the launch said to take none, or the
+// owner is already somewhere in the window. Enter there denies, and no key ever approves.
 //
 // While the core isn't connected the buttons are off and a banner says so; the dialogs stay, and a
 // resync reads their live state (ConfirmationList).
@@ -21,8 +25,10 @@ Window {
     property var pointerSource: ConfirmInput
     // Every pending confirmation shows, not only those asked about.
     property bool showAll: false
-    // id -> true: a notification's Deny went out for it.
+    // id -> true: the core took a notification's Deny for it.
     property var toastDenied: ({})
+    // A launch asked for the focus, and no dialog has been able to take it yet.
+    property bool _focusWanted: false
     readonly property alias list: list
     readonly property alias banner: banner
     readonly property alias instanceBanner: instanceBanner
@@ -35,6 +41,8 @@ Window {
     visible: false
     title: "LILITH — Confirm"
     color: Theme.bg
+
+    Component.onCompleted: LilShim.applyPalette(Theme.palette)
 
     function handleLaunchJson(json) {
         handleLaunch(JSON.parse(json))
@@ -55,6 +63,11 @@ Window {
             const denied = Object.assign({}, toastDenied)
             denied[launch.id] = true
             toastDenied = denied
+            return
+        }
+        if (launch.focus !== false && launch.kind !== "deny") {
+            _focusWanted = true
+            _focusFirst()
         }
     }
 
@@ -69,6 +82,26 @@ Window {
     function _addPending() {
         for (let i = list.pendingModel.count - 1; i >= 0; --i)
             add(list.pendingModel.get(i).cid)
+    }
+
+    // Deny of the first pending dialog takes the focus, once there is one, unless the keyboard is
+    // already on something in the window.
+    function _focusFirst() {
+        if (!_focusWanted)
+            return
+        const onSomething = activeFocusItem && activeFocusItem !== contentItem
+        if (onSomething) {
+            _focusWanted = false
+            return
+        }
+        for (let i = 0; i < dialogs.count; ++i) {
+            const d = dialogs.itemAt(i)
+            if (d && d.pending) {
+                _focusWanted = false
+                d.focusDeny()
+                return
+            }
+        }
     }
 
     // The dialog on `id`, once made.
@@ -86,7 +119,13 @@ Window {
     ConfirmationList {
         id: list
         core: root.core
-        onLoadedChanged: if (loaded && root.showAll) root._addPending()
+        onLoadedChanged: {
+            if (!loaded)
+                return
+            if (root.showAll)
+                root._addPending()
+            Qt.callLater(root._focusFirst)
+        }
     }
 
     Connections {
@@ -94,6 +133,7 @@ Window {
         function onCountChanged() {
             if (root.showAll)
                 root._addPending()
+            Qt.callLater(root._focusFirst)
         }
     }
 
@@ -144,6 +184,7 @@ Window {
         Repeater {
             id: dialogs
             model: shown
+            onItemAdded: Qt.callLater(root._focusFirst)
             delegate: ConfirmDialog {
                 required property string cid
                 width: column.width
@@ -153,6 +194,7 @@ Window {
                 loaded: list.loaded
                 pointerSource: root.pointerSource
                 fromToast: root.toastDenied[cid] === true
+                cardMaxHeight: Math.max(160, root.height / 2)
                 onAnswered: confirmation => list.apply(confirmation)
             }
         }

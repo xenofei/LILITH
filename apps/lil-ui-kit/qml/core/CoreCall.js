@@ -21,6 +21,9 @@
 //                                  (kind, seq, data) => ...)  // optional: this topic's events
 //   sub.unsubscribe()             // once; the owner's destruction does it too
 //
+// `ok` and a subscription's `onEvent` also get the JSON text as it came, last: a caller that must not
+// lose what parsing does to it (a big integer, the order of integer-like keys) reads that.
+//
 // Each call settles once: ok or error. A pending confirmation is told to `pending` and, with
 // autoRetry (the default), the request stays open: Core waits for the confirmation's answer,
 // sends the call again once with its retry token when it is approved, and the result (or
@@ -100,7 +103,7 @@ function subscribe(core, topic, owner, onEvent) {
     let on = true
     function onCoreEvent(t, kind, seq, json) {
         if (on && t === topic)
-            onEvent(kind, seq, JSON.parse(json))
+            onEvent(kind, seq, JSON.parse(json), json)
     }
     function off() {
         if (!on)
@@ -160,7 +163,7 @@ function track(core, id, h, endsAtPending, watcher) {
         if (rid !== id || !close())
             return
         if (h.ok)
-            h.ok(JSON.parse(json))
+            h.ok(JSON.parse(json), json)
     }
     function onFailed(rid, json) {
         if (rid !== id || !close())

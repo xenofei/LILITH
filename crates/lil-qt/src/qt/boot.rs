@@ -33,7 +33,7 @@ use lil_platform::Env;
 
 use crate::args::{BootPlan, Mode, deny_notice_json, launch_json};
 use crate::single_instance::{
-    Forwarded, InstanceServer, Routed, Start, restart_untaken, route, start,
+    Forwarded, InstanceServer, Routed, Start, restart_untaken, route_then, start,
 };
 
 #[cxx_qt::bridge]
@@ -247,19 +247,16 @@ fn claim_instance() -> i32 {
 /// One forwarded launch: shown by the window, or a deny sent without it.
 fn take(forwarded: &Forwarded, env: &Env) {
     let deny_env = env.clone();
-    match route(forwarded, env, move || deny_cfg(&deny_env)) {
+    // Once the core has taken a deny, the confirm window says where it came from; the shell ignores
+    // this.
+    let denied = |id: &str| deliver(deny_notice_json(id), None);
+    match route_then(forwarded, env, move || deny_cfg(&deny_env), denied) {
         Routed::Show(plan) => {
             if let Some(json) = launch_json(&plan, true) {
                 deliver(json, Some(forwarded.args.clone()));
             }
         }
-        Routed::Deny(handle) => {
-            lock(&DENIES).push(handle);
-            // The confirm window says where the deny came from; the shell ignores this.
-            if let Some(json) = deny_notice_json(&crate::args::plan_args(&forwarded.args, env)) {
-                deliver(json, None);
-            }
-        }
+        Routed::Deny(handle) => lock(&DENIES).push(handle),
         Routed::Nothing => {}
     }
 }

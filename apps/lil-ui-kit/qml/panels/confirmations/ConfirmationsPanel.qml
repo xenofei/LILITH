@@ -1,9 +1,13 @@
 // The Confirmations panel (APP-115, APP-044, APP-046, APP-054): pending agent requests and cap
-// confirmations, each a card with who asked, the exact action and the files, and a History tab.
-// Answering happens only in the shared dialog (ConfirmDialog), a modal popup over the panel's window:
-// a card's "Review and answer", or a `confirm` link through showConfirmation(id). Answering anywhere
-// clears a card everywhere (the `confirmations` topic, ConfirmationList). While the dialog is open the
-// shell's shortcuts stay quiet (OpenPrompts).
+// confirmations, each a card with who asked and the exact action, and a History tab. Answering happens
+// only in the shared dialog (ConfirmDialog), a modal popup over the panel's window: a card's "Review and
+// answer", or a `confirm` link through showConfirmation(id). Answering anywhere clears a card everywhere
+// (the `confirmations` topic, ConfirmationList). While the dialog is open the shell's shortcuts stay
+// quiet (OpenPrompts).
+//
+// What is on screen is what a click approves, so an open dialog's confirmation is never swapped. A link
+// or a card that asks for another while the dialog is open waits, and the dialog says so; the next one
+// opens only when this one is closed, as a new dialog, with the gate armed from the start.
 import QtQuick
 import QtQuick.Templates as T
 import Lilith.Core
@@ -20,8 +24,10 @@ Rectangle {
 
     // "pending" or "history".
     property string tab: "pending"
-    property string _wanted
+    // Asked for while the lists were loading, or while the dialog was open, oldest first.
+    property var _waiting: []
     property bool _popupCounted: false
+    readonly property int waitingCount: _waiting.length
     readonly property alias list: list
     readonly property alias banner: banner
     readonly property alias pendingTab: pendingTab
@@ -33,19 +39,28 @@ Rectangle {
     readonly property alias dialogPopup: popup
     readonly property alias dialog: dialog
     readonly property alias closeDialogButton: closeDialogButton
+    readonly property alias waitingNotice: waitingNotice
 
     color: Theme.surface
 
     Accessible.role: Accessible.Pane
     Accessible.name: title
 
-    // A `confirm` link, or a card's button: the dialog on it, or in words why not.
+    // A `confirm` link, or a card's button: the dialog on it, or in words why not, or a wait.
     function showConfirmation(id) {
-        banner.visible = false
-        if (!list.loaded) {
-            _wanted = id
+        if (dialog.confirmationId !== "") {
+            if (id !== dialog.confirmationId && _waiting.indexOf(id) < 0) {
+                _waiting = _waiting.concat([id])
+                waitingNotice.Accessible.announce(waitingNotice.text)
+            }
             return
         }
+        if (!list.loaded) {
+            if (_waiting.indexOf(id) < 0)
+                _waiting = _waiting.concat([id])
+            return
+        }
+        banner.visible = false
         const view = list.view(id)
         if (view && view.state === "pending") {
             tab = "pending"
@@ -58,16 +73,26 @@ Rectangle {
         }
     }
 
+    function _holdShortcuts(on) {
+        if (_popupCounted !== on) {
+            _popupCounted = on
+            OpenPrompts.count += on ? 1 : -1
+        }
+    }
+
+    function _showNext() {
+        if (dialog.confirmationId !== "" || !list.loaded || _waiting.length === 0)
+            return
+        const id = _waiting[0]
+        _waiting = _waiting.slice(1)
+        showConfirmation(id)
+        Qt.callLater(_showNext)
+    }
+
     ConfirmationList {
         id: list
         core: root.core
-        onLoadedChanged: {
-            if (loaded && root._wanted !== "") {
-                const id = root._wanted
-                root._wanted = ""
-                root.showConfirmation(id)
-            }
-        }
+        onLoadedChanged: if (loaded) root._showNext()
     }
 
     LBanner {
@@ -105,7 +130,7 @@ Rectangle {
         y: tabs.y + tabs.height + Theme.spacing
         width: parent.width - 2 * Theme.spacing
         visible: root.tab === "pending" && list.pendingModel.count === 0
-        text: list.error && !list.loaded ? Words.errorWords(list.error, (t, n) => Core.shownText(t, n))
+        text: list.error && !list.loaded ? Words.errorWords(list.error, (t, n) => ConfirmInput.shownLine(t, n))
             : list.loaded ? "Nothing is waiting for your answer." : "Reading the confirmations…"
         textFormat: Text.PlainText
         color: Theme.textMuted
@@ -134,6 +159,7 @@ Rectangle {
                 core: root.core
                 confirmationId: cid
                 view: list.view(cid)
+                previewChars: 300
 
                 LButton {
                     id: reviewButton
@@ -179,20 +205,35 @@ Rectangle {
         }
 
         onOpened: {
-            OpenPrompts.count += 1
-            root._popupCounted = true
+            root._holdShortcuts(true)
             dialog.focusDeny()
         }
         onClosed: {
-            OpenPrompts.count -= 1
-            root._popupCounted = false
+            root._holdShortcuts(false)
             dialog.confirmationId = ""
+            Qt.callLater(root._showNext)
         }
 
         Column {
             id: popupColumn
             width: popup.availableWidth
             spacing: Theme.spacing
+
+            Text {
+                id: waitingNotice
+                width: parent.width
+                visible: root.waitingCount > 0
+                text: root.waitingCount === 1
+                      ? "Another confirmation is waiting. It shows after you close this one."
+                      : MoneyText.count(String(root.waitingCount)) + " more confirmations are waiting. The next shows after you close this one."
+                textFormat: Text.PlainText
+                color: Theme.warning
+                font.pixelSize: Theme.fontSize
+                font.bold: true
+                wrapMode: Text.Wrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
 
             ConfirmDialog {
                 id: dialog
@@ -202,7 +243,7 @@ Rectangle {
                 view: confirmationId !== "" ? list.view(confirmationId) : null
                 loaded: list.loaded
                 pointerSource: root.pointerSource
-                cardMaxHeight: popup.parent ? Math.max(120, popup.parent.height - 260) : 400
+                cardMaxHeight: popup.parent ? Math.max(120, popup.parent.height - 320) : 400
                 onAnswered: confirmation => list.apply(confirmation)
             }
 
@@ -215,5 +256,5 @@ Rectangle {
         }
     }
 
-    Component.onDestruction: if (_popupCounted) OpenPrompts.count -= 1
+    Component.onDestruction: _holdShortcuts(false)
 }

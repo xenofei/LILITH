@@ -26,8 +26,8 @@ ListView {
         id: row
         required property string cid
         readonly property var view: root.list.view(cid)
-        readonly property string actionText: view ? Core.shownText(String(view.tool), 200) : ""
-        readonly property string whoText: view ? Words.who(view.caller_kind, (t, n) => Core.shownText(t, n)) : ""
+        readonly property string actionText: view ? ConfirmInput.shownLine(String(view.tool), 200) : ""
+        readonly property string whoText: view ? Words.who(view.caller_kind, (t, n) => ConfirmInput.shownLine(t, n)) : ""
         readonly property string outcomeText: view ? Words.outcome(view, false) : ""
 
         width: ListView.view.width

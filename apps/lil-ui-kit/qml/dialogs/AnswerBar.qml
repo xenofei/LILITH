@@ -3,10 +3,12 @@
 // each ApproveButton's `clicked` calls approve(label, cap), its `refused` calls refuse(name, label);
 // a DenyButton's `activated` calls deny(kind, button).
 //
-// The clock runs from when the bar came up with its window in front, and starts again whenever the
-// window leaves the front, so the click that brought it forward doesn't count. `live` is what the
-// buttons' `enabled` binds to: the confirmation is open, no answer is out or sent, and the core is
-// connected (`connection`: Task 20's `requiresCore` isn't in this base).
+// The clock runs from when the bar came up with its window in front, and starts again whenever
+// anything could have put a button under a hand that meant something else: the window leaves the
+// front, moves or is resized (as the Hello window's does), what is shown changes (`shownKey`), rearm(),
+// or the buttons come back on (`live`). `live` is what the buttons' `enabled` binds to: the
+// confirmation is open, no answer is out or sent, and the core is connected (`connection`: Task 20's
+// `requiresCore` isn't in this base).
 //
 // A refusal is never silent: `reason` shows under the buttons, is announced, and its name goes to
 // the log, with nothing of the input.
@@ -20,6 +22,8 @@ Column {
 
     required property var core
     required property string confirmationId
+    // Everything the owner reads about what these buttons answer.
+    property string shownKey
     // Still waiting for an answer, as far as the dialog knows.
     property bool open: true
     property bool inFront: Window.active
@@ -39,20 +43,39 @@ Column {
 
     spacing: Theme.spacing
 
-    onInFrontChanged: _mark()
-    onVisibleChanged: _mark()
-    Component.onCompleted: _mark()
+    onInFrontChanged: {
+        restartClock()
+        if (inFront)
+            reason = ""
+    }
+    onVisibleChanged: restartClock()
+    onLiveChanged: if (live) restartClock()
+    onShownKeyChanged: rearm()
+    Component.onCompleted: restartClock()
     // Another confirmation in the same dialog: a new answer, and the clock starts again.
     onConfirmationIdChanged: {
         busy = false
         sent = false
-        _mark()
+        rearm()
     }
 
-    function _mark() {
+    Connections {
+        target: root.Window.window
+        function onXChanged() { root.restartClock() }
+        function onYChanged() { root.restartClock() }
+        function onWidthChanged() { root.restartClock() }
+        function onHeightChanged() { root.restartClock() }
+    }
+
+    function restartClock() {
         visibleSinceMs = inFront && visible ? ConfirmInput.nowMs() : -1
-        if (visibleSinceMs >= 0 && !busy)
-            reason = ""
+    }
+
+    // What these buttons answer has changed: a click needs the half second again, and any words
+    // about the old one go.
+    function rearm() {
+        restartClock()
+        reason = ""
     }
 
     function refuse(name, label) {
@@ -101,14 +124,15 @@ Column {
                 if (id !== confirmationId)
                     return
                 busy = false
-                reason = Words.errorWords(error, (t, n) => Core.shownText(t, n))
+                reason = Words.errorWords(error, (t, n) => ConfirmInput.shownLine(t, n))
                 Accessible.announce(reason)
             }
         })
     }
 
-    Row {
+    Flow {
         id: row
+        width: parent.width
         spacing: Theme.spacing
     }
 

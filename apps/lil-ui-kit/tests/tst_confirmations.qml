@@ -23,8 +23,10 @@ TestCase {
         id: hand
         property string verdict: ""
         property int taken: 0
-        function watch(item) {}
+        property int watches: 0
+        function watch(item) { ++watches }
         function unwatch(item) {}
+        function notePress(item) {}
         function takeClick(item) {
             ++taken
             return verdict
@@ -33,7 +35,10 @@ TestCase {
 
     QtObject {
         id: fakeShim
-        function activate(window, takeFocus) {}
+        property var activations: []
+        function activate(window, takeFocus) {
+            activations = activations.concat([{window: window, takeFocus: takeFocus}])
+        }
     }
 
     Component {
@@ -65,12 +70,23 @@ TestCase {
         }
     }
 
+    Component {
+        id: otherWindow
+        Window {
+            width: 100
+            height: 100
+            visible: true
+        }
+    }
+
     A11yWalk { id: walk }
 
     function init() {
         fake.calls = []
         hand.verdict = ""
         hand.taken = 0
+        hand.watches = 0
+        fakeShim.activations = []
         fake.connection = "ready"
         tc.Window.window.requestActivate()
         tryVerify(() => tc.Window.active, 2000, "the test window is in front")
@@ -93,9 +109,17 @@ TestCase {
         wait(550)
     }
 
+    function closeDialog(panel) {
+        panel.dialogPopup.close()
+        tryVerify(() => !panel.dialogPopup.visible, 2000, "the dialog closes")
+    }
+
     readonly property var crane: Shapes.view({
         id: "cf_00000000000000a1", tool: "asset.delete", caller_kind: "mcp", project: "sketchbook",
         arguments: {path: "C:\\art\\crane.png", packages: ["left-pack", "right-pack"], force: true}
+    })
+    readonly property var heron: Shapes.view({
+        id: "cf_00000000000000a7", tool: "dangerous.tool", caller_kind: "mcp", arguments: {path: "C:\\everything"}
     })
 
     function test_card_shows_who_the_exact_action_and_the_files() { // spec: APP-115
@@ -106,10 +130,15 @@ TestCase {
         compare(card.actionText, "asset.delete")
         verify(card.title.indexOf("Claude Code") >= 0 && card.title.indexOf("asset.delete") >= 0, card.title)
         verify(card.factsLine.text.indexOf("sketchbook") >= 0, card.factsLine.text)
-        compare(card.files, ["C:\\art\\crane.png", "left-pack", "right-pack"])
-        const rows = card.argumentRows.map(r => r.key + "=" + r.text)
-        verify(rows[0] === "path=C:\\art\\crane.png", rows[0])
-        verify(rows[2] === "force=true", rows[2])
+        // The files are in the exact arguments, under the keys they came with: no guessed list.
+        compare(card.argumentRows.map(r => r.key), ["path", "packages", "force"])
+        compare(card.argumentRows[0].text, "C:\\art\\crane.png")
+        verify(card.argumentRows[1].text.indexOf("left-pack") >= 0 && card.argumentRows[1].text.indexOf("right-pack") >= 0)
+        compare(card.argumentRows[2].text, "true")
+        tryCompare(card.rowRepeater, "count", 3)
+        compare(card.rowRepeater.itemAt(0).keyText.text, "path")
+        compare(card.rowRepeater.itemAt(0).valueText.text, "C:\\art\\crane.png")
+        verify(!("files" in card), "no list guessed from the names of the arguments")
         compare(walk.report(panel), [])
         verify(walk.interactiveCount(panel) >= 3, "tabs and the card's button")
     }
@@ -118,28 +147,121 @@ TestCase {
         const before = TestFiles.networkRequests()
         const evil = Shapes.view({
             id: "cf_00000000000000a2", tool: "evil\u202E.tool", caller_kind: "weird\u0007caller",
-            arguments: {"k\u202Ey": "a\u202Eb\u0007c\u0001d\nsecond\tline", img: '<img src="http://127.0.0.1:9/p.png">'}
+            arguments: {"k\u202Ey": "a\u202Eb\u0007c\u0001d\nsecond\tline\u2028third",
+                        tag: "ok\u{E0041}\u{E0001}", img: '<img src="http://127.0.0.1:9/p.png">'}
         })
         const panel = makePanel([evil])
         const card = panel.cardRepeater.itemAt(0)
         compare(card.actionText, "evil⟨U+202E⟩.tool")
-        compare(card.whoText, "weirdcaller")
+        compare(card.whoText, "weird⟨U+0007⟩caller")
         compare(card.argumentRows[0].key, "k⟨U+202E⟩y")
-        verify(card.argumentRows[0].text.indexOf("a⟨U+202E⟩bcd") === 0, card.argumentRows[0].text)
-        verify(card.argumentRows[0].text.indexOf("\n") > 0, "a script still reads as lines")
-        verify(card.argumentRows[0].text.indexOf("\u0007") < 0 && card.argumentRows[0].text.indexOf("\u0001") < 0)
-        verify(card.argumentRows[0].text.indexOf("\t") < 0)
+        compare(card.argumentRows[0].text, "a⟨U+202E⟩b⟨U+0007⟩c⟨U+0001⟩d\n↳ second⟨U+0009⟩line⟨U+2028⟩third")
+        compare(card.argumentRows[1].text, "ok⟨U+E0041⟩⟨U+E0001⟩")
         wait(200)
         compare(TestFiles.networkRequests(), before, "markup loads nothing")
     }
 
-    function test_a_value_too_long_to_show_says_so() { // spec: APP-115
-        const long = "x".repeat(5000) + "THE-END"
-        const panel = makePanel([Shapes.view({id: "cf_00000000000000a3", arguments: {script: long}})])
-        const row = panel.cardRepeater.itemAt(0).argumentRows[0]
-        verify(row.cut, "it says part isn't shown")
-        verify(row.text.indexOf("THE-END") < 0)
-        verify(row.text.length <= 4001, "at most what the card shows: " + row.text.length)
+    function test_a_value_cant_pass_for_another_argument() { // spec: APP-115
+        const panel = makePanel([Shapes.view({id: "cf_00000000000000a8",
+                                              arguments: {a: "x\npath: C:\\safe", path: "C:\\evil"}})])
+        const card = panel.cardRepeater.itemAt(0)
+        tryCompare(card.rowRepeater, "count", 2)
+        compare(card.rowRepeater.itemAt(0).valueText.text, "x\n↳ path: C:\\safe")
+        compare(card.rowRepeater.itemAt(1).keyText.text, "path")
+    }
+
+    function test_numbers_and_key_order_are_the_cores_not_qmls() { // spec: APP-115
+        const panel = makePanel([])
+        // The event's text as the core writes it: JSON.parse would round the number and move "1" first.
+        const raw = '{"kind":"pending","confirmation":{"id":"cf_00000000000000a9","tool":"t","caller_kind":"mcp",'
+                    + '"covers":["confirm"],"state":"pending","created":"2026-10-30T00:00:00Z",'
+                    + '"expires_at":"2099-01-01T00:00:00Z","arguments":{"z":"last-key-first","1":"one","n":9007199254740993}}}'
+        fake.coreEvent("confirmations", "event", 1, raw)
+        tryCompare(panel.cardRepeater, "count", 1)
+        const card = panel.cardRepeater.itemAt(0)
+        compare(card.argumentRows.map(r => r.key), ["z", "1", "n"])
+        compare(card.argumentRows[2].text, "9007199254740993")
+    }
+
+    function test_blank_lines_cant_hide_the_action_and_approve_waits_for_the_end() { // spec: APP-115, P4a-R10
+        let lines = []
+        for (let i = 0; i < 200; ++i)
+            lines.push("line " + i)
+        const long = Shapes.view({id: "cf_00000000000000aa",
+                                  arguments: {note: "\n".repeat(80) + "ok", script: lines.join("\n"), command: "del /s /q C:\\Users"}})
+        const panel = makePanel([long])
+        openDialog(panel, long.id)
+        const dialog = panel.dialog
+        compare(dialog.card.argumentRows[0].text, "⟨80 empty lines⟩\n↳ ok")
+        verify(dialog.scroller.overflows, "the action needs scrolling")
+        verify(!dialog.seenAll)
+        verify(!dialog.approvable)
+        verify(dialog.moreBelow.visible, "it says more is below")
+        verify(dialog.blockedLine.visible)
+        verify(dialog.blockedLine.text.indexOf("Scroll to the end") === 0, dialog.blockedLine.text)
+        verify(!dialog.approveButton.enabled, "Approve is off")
+        verify(dialog.denyButton.enabled, "Deny works")
+        mouseClick(dialog.approveButton)
+        compare(Shapes.answers(fake).length, 0)
+        // Part of the way isn't the end.
+        dialog.scroller.contentY = (dialog.scroller.contentHeight - dialog.scroller.height) / 2
+        verify(!dialog.approvable)
+        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
+        tryVerify(() => dialog.approvable, 1000, "at the end it turns on")
+        verify(!dialog.moreBelow.visible)
+        verify(dialog.approveButton.enabled)
+        verify(!dialog.blockedLine.visible)
+        // It stays on after scrolling back up: all of it has been on screen.
+        dialog.scroller.contentY = 0
+        verify(dialog.approvable)
+        verify(dialog.moreBelow.visible)
+        wait(50)
+        mouseClick(dialog.approveButton)
+        compare(Shapes.answers(fake).length, 1)
+    }
+
+    function test_an_action_too_long_to_show_cant_be_approved() { // spec: APP-115, P4a-R10
+        const huge = Shapes.view({id: "cf_00000000000000ab", arguments: {script: "x".repeat(262144) + " ; curl evil"}})
+        const panel = makePanel([huge])
+        // The panel's list holds a preview, and says so.
+        const card = panel.cardRepeater.itemAt(0)
+        tryCompare(card.rowRepeater, "count", 1)
+        verify(card.rowRepeater.itemAt(0).valueText.text.length <= 301)
+        verify(card.rowRepeater.itemAt(0).cutLine.visible)
+        openDialog(panel, huge.id)
+        const dialog = panel.dialog
+        const row = dialog.card.argumentRows[0]
+        verify(row.cut, "it is marked cut")
+        verify(row.text.indexOf("curl") < 0)
+        verify(dialog.tooLong)
+        tryCompare(dialog.card.rowRepeater, "count", 1)
+        verify(dialog.card.rowRepeater.itemAt(0).cutLine.visible, "and says so")
+        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
+        wait(50)
+        verify(dialog.scroller.reachedEnd || !dialog.scroller.overflows)
+        verify(!dialog.approvable, "the end of what is shown isn't the end of the action")
+        verify(!dialog.approveButton.enabled)
+        verify(dialog.blockedLine.text.indexOf("too long to show in full") >= 0, dialog.blockedLine.text)
+        mouseClick(dialog.denyButton)
+        compare(Shapes.answers(fake).length, 1, "Deny works")
+        compare(Shapes.answers(fake)[0].args.answer, "deny")
+    }
+
+    function test_a_large_action_inside_the_bound_shows_in_full() { // spec: APP-115
+        const value = "y".repeat(200000) + " ; the end"
+        const large = Shapes.view({id: "cf_00000000000000ac", arguments: {script: value}})
+        const panel = makePanel([large])
+        openDialog(panel, large.id)
+        const dialog = panel.dialog
+        const row = dialog.card.argumentRows[0]
+        verify(!row.cut && !dialog.tooLong)
+        compare(row.text, value)
+        tryCompare(dialog.card.rowRepeater, "count", 1)
+        compare(dialog.card.rowRepeater.itemAt(0).valueText.text, value)
+        tryVerify(() => dialog.scroller.overflows, 5000, "it scrolls")
+        verify(!dialog.approvable)
+        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
+        tryVerify(() => dialog.approvable, 2000)
     }
 
     function test_initial_focus_is_deny_and_enter_does_not_approve() { // spec: P4a-R10
@@ -199,7 +321,11 @@ TestCase {
         const dialog = panel.dialog
         for (const [verdict, words] of [["no_rest", "came too soon"], ["no_move", "Move the pointer a little"],
                                         ["no_real_press", "Press and release"],
-                                        ["brought_forward", "brought this window to the front"]]) {
+                                        ["brought_forward", "brought this window to the front"],
+                                        ["reenter", "Move the pointer off it"],
+                                        ["button_state", "went by before LILITH could check it"],
+                                        ["not_exposed", "covered, see-through or hidden"],
+                                        ["no_guard", "is off. Deny still works"]]) {
             hand.verdict = verdict
             mouseClick(dialog.approveButton)
             verify(dialog.bar.reason.indexOf(words) >= 0, verdict + ": " + dialog.bar.reason)
@@ -212,25 +338,43 @@ TestCase {
         panel.showConfirmation(crane.id)
         tryVerify(() => panel.dialogPopup.opened, 2000)
         const dialog = panel.dialog
-        wait(100)
-        dialog.bar.inFront = true
-        dialog.bar.visibleSinceMs = ConfirmInput.nowMs()
+        tryVerify(() => dialog.bar.inFront, 2000)
+        wait(50)
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 0, "too soon")
         verify(dialog.bar.reason.indexOf("Wait a moment") === 0, dialog.bar.reason)
         wait(550)
-        dialog.bar.inFront = false
+        // The real Window.active, as another window takes the front.
+        const other = createTemporaryObject(otherWindow, null)
+        other.requestActivate()
+        tryVerify(() => other.active && !dialog.bar.inFront, 2000, "another window is in front")
+        wait(550)
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 0, "not in front")
         verify(dialog.bar.reason.indexOf("to the front") >= 0, dialog.bar.reason)
         // Back in front: the half second starts again.
-        dialog.bar.inFront = true
+        tc.Window.window.requestActivate()
+        tryVerify(() => dialog.bar.inFront, 2000)
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 0, "again too soon")
         wait(550)
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 1)
         compare(Shapes.answers(fake)[0].args, {confirmation_id: crane.id, answer: "approve"})
+    }
+
+    function test_the_clock_starts_again_when_the_buttons_come_back() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        fake.connection = "reconnecting"
+        tryVerify(() => !dialog.bar.live, 1000)
+        wait(550)
+        fake.connection = "ready"
+        tryVerify(() => dialog.bar.live, 1000)
+        mouseClick(dialog.approveButton)
+        compare(Shapes.answers(fake).length, 0, "the buttons just came back on")
+        verify(dialog.bar.reason.indexOf("Wait a moment") === 0, dialog.bar.reason)
     }
 
     function test_one_answer_sends_one_app_call() { // spec: APP-044
@@ -249,42 +393,91 @@ TestCase {
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 1, "and none after it")
         verify(dialog.stateLine.text.indexOf("Answered in the app at ") === 0, dialog.stateLine.text)
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
+        closeDialog(panel)
         compare(OpenPrompts.count, 0)
     }
 
-    function test_the_dialog_answers_one_confirmation_then_another() { // spec: APP-044
-        const next = Shapes.view({id: "cf_00000000000000a4", tool: "next.tool"})
-        const capOne = Shapes.view({id: "cf_00000000000000a5", covers: ["cap"], cap: [Shapes.capHit()]})
-        const capTwo = Shapes.view({id: "cf_00000000000000a6", covers: ["cap"], cap: [Shapes.capHit()]})
-        const panel = makePanel([crane, next, capOne, capTwo])
-        openDialog(panel, crane.id)
-        mouseClick(panel.dialog.denyButton)
-        const sent = Shapes.answers(fake)
-        fake.respond(sent[0].id, Shapes.answerResult(Shapes.answeredView(crane, "denied")))
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
-        openDialog(panel, next.id)
-        verify(panel.dialog.bar.live, "the first answer doesn't hold the next one's buttons")
-        compare(panel.dialog.card.actionText, "next.tool")
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
-        // The same for two caps, whose prompt the dialog keeps.
-        openDialog(panel, capOne.id)
-        tryVerify(() => panel.dialog.capPrompt.bar.inFront, 2000)
+    // The review's scenario, through a real link: a program starts `confirm/<dangerous id>` while the
+    // owner's hand is on its way to Approve on the harmless one.
+    function test_a_link_never_swaps_the_open_dialog() { // spec: P4a-R10, P4a-R11
+        wait(100)
+        const shell = createTemporaryObject(shellComponent, tc)
+        verify(shell)
+        shell.visible = true
+        tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000)
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        const panel = shell.docks.confirmations.content
+        panel.pointerSource = hand
+        Shapes.answerLists(fake, [crane, heron], [])
+        tryVerify(() => panel.list.loaded, 2000)
+        const link = id => shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: id, focus: true, activate: true}))
+        link(crane.id)
+        tryVerify(() => panel.dialogPopup.opened, 2000)
+        const dialog = panel.dialog
+        tryVerify(() => dialog.bar.inFront, 2000)
         wait(550)
-        mouseClick(panel.dialog.capPrompt.allowOnceButton)
-        const third = Shapes.answers(fake)[1]
-        compare(third.args.confirmation_id, capOne.id)
-        fake.respond(third.id, Shapes.answerResult(Shapes.answeredView(capOne, "approved")))
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
-        openDialog(panel, capTwo.id)
-        verify(panel.dialog.capPrompt.visible, "the next cap's prompt shows")
-        verify(panel.dialog.capPrompt.bar.live)
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
+        const watches = hand.watches
+        const since = dialog.bar.visibleSinceMs
+        const activations = fakeShim.activations.length
+
+        link(heron.id)
+        compare(dialog.confirmationId, crane.id, "the dialog stays on what was read")
+        compare(dialog.card.actionText, "asset.delete")
+        verify(panel.waitingNotice.visible, "it says another is waiting")
+        verify(panel.waitingNotice.text.indexOf("Another confirmation is waiting") === 0, panel.waitingNotice.text)
+        compare(hand.watches, watches, "nothing changed, so nothing re-armed")
+        compare(dialog.bar.visibleSinceMs, since)
+        compare(fakeShim.activations.length, activations + 1)
+        verify(!fakeShim.activations[activations].takeFocus, "the window only flashes")
+        verify(dialog.denyButton.activeFocus, "and the focus stays")
+        link(heron.id)
+        compare(panel.waitingCount, 1, "once")
+
+        // The click is bound to what is on screen.
+        mouseClick(dialog.approveButton)
+        const sent = Shapes.answers(fake)
+        compare(sent.length, 1)
+        compare(sent[0].args.confirmation_id, crane.id)
+        fake.respond(sent[0].id, Shapes.answerResult(Shapes.answeredView(crane, "approved")))
+        tryCompare(panel.list.pendingModel, "count", 1)
+        // Answered: it stays on its outcome until it is closed.
+        compare(dialog.confirmationId, crane.id)
+        verify(dialog.stateLine.visible)
+        verify(panel.waitingNotice.visible)
+        const beforeClose = hand.watches
+        panel.closeDialogButton.clicked()
+        tryVerify(() => panel.dialogPopup.opened && dialog.confirmationId === heron.id, 2000,
+                  "the waiting one opens as a new dialog")
+        compare(dialog.card.actionText, "dangerous.tool")
+        verify(hand.watches > beforeClose, "its button is new to the gate")
+        verify(!panel.waitingNotice.visible)
+        tryVerify(() => dialog.denyButton.activeFocus, 2000, "Deny has the focus")
+        mouseClick(dialog.approveButton)
+        compare(Shapes.answers(fake).length, 1, "the half second starts again")
+        verify(dialog.bar.reason.indexOf("Wait a moment") === 0, dialog.bar.reason)
+        closeDialog(panel)
+    }
+
+    function test_other_links_wait_for_the_dialog() { // spec: P4a-R10
+        wait(100)
+        const shell = createTemporaryObject(shellComponent, tc)
+        shell.visible = true
+        tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000)
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        const panel = shell.docks.confirmations.content
+        panel.pointerSource = hand
+        Shapes.answerLists(fake, [crane], [])
+        tryVerify(() => panel.list.loaded, 2000)
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: true, activate: true}))
+        tryVerify(() => panel.dialogPopup.opened, 2000)
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000)
+        shell.handleLaunchJson(JSON.stringify({kind: "task", job: "j_0123456789abcdef", focus: true, activate: true}))
+        verify(panel.dialog.denyButton.activeFocus, "a task link doesn't pull the focus out of the dialog")
+        compare(shell.shownJob, "", "it waits")
+        closeDialog(panel)
+        tryCompare(shell, "shownJob", "j_0123456789abcdef", 2000, "and runs once the dialog is closed")
     }
 
     function test_confirm_expired_reads_as_plain_words() { // spec: P4a-R10
@@ -306,7 +499,7 @@ TestCase {
         fake.emit("confirmations", "event", Shapes.event("answered", Shapes.answeredView(crane, "denied")))
         tryCompare(panel.list.pendingModel, "count", 0)
         compare(panel.cardRepeater.count, 0, "the card is gone")
-        verify(panel.emptyText.visible)
+        tryVerify(() => panel.emptyText.visible, 1000)
         const dialog = panel.dialog
         verify(dialog.stateLine.text.indexOf("Answered in the app at ") === 0, dialog.stateLine.text)
         verify(!dialog.bar.visible, "the open dialog has no buttons now")
@@ -317,7 +510,7 @@ TestCase {
         const answered = Shapes.answeredView(Shapes.view({id: "cf_00000000000000b1"}), "approved")
         const panel = makePanel([crane], [answered])
         panel.showConfirmation("cf_00000000000000ff")
-        verify(panel.banner.visible)
+        tryVerify(() => panel.banner.visible, 1000)
         verify(panel.banner.text.indexOf("doesn't know that confirmation") >= 0, panel.banner.text)
         verify(!panel.dialogPopup.opened)
         panel.showConfirmation(answered.id)
@@ -329,8 +522,7 @@ TestCase {
         verify(!later.dialogPopup.opened)
         Shapes.answerLists(fake, [crane], [])
         tryVerify(() => later.dialogPopup.opened, 2000, "it opens once they are")
-        later.dialogPopup.close()
-        tryVerify(() => !later.dialogPopup.visible)
+        closeDialog(later)
     }
 
     function test_history_tab_shows_confirmed_via() { // spec: APP-046
@@ -404,18 +596,45 @@ TestCase {
         tryVerify(() => panel.list.loaded)
     }
 
+    function test_the_dialog_answers_one_confirmation_then_another() { // spec: APP-044
+        const next = Shapes.view({id: "cf_00000000000000a4", tool: "next.tool"})
+        const capOne = Shapes.view({id: "cf_00000000000000a5", covers: ["cap"], cap: [Shapes.capHit()]})
+        const capTwo = Shapes.view({id: "cf_00000000000000a6", covers: ["cap"], cap: [Shapes.capHit()]})
+        const panel = makePanel([crane, next, capOne, capTwo])
+        openDialog(panel, crane.id)
+        mouseClick(panel.dialog.denyButton)
+        const sent = Shapes.answers(fake)
+        fake.respond(sent[0].id, Shapes.answerResult(Shapes.answeredView(crane, "denied")))
+        closeDialog(panel)
+        openDialog(panel, next.id)
+        verify(panel.dialog.bar.live, "the first answer doesn't hold the next one's buttons")
+        compare(panel.dialog.card.actionText, "next.tool")
+        closeDialog(panel)
+        // The same for two caps, whose prompt the dialog keeps.
+        openDialog(panel, capOne.id)
+        tryVerify(() => panel.dialog.capPrompt.bar.inFront, 2000)
+        wait(550)
+        mouseClick(panel.dialog.capPrompt.allowOnceButton)
+        const third = Shapes.answers(fake)[1]
+        compare(third.args.confirmation_id, capOne.id)
+        fake.respond(third.id, Shapes.answerResult(Shapes.answeredView(capOne, "approved")))
+        closeDialog(panel)
+        openDialog(panel, capTwo.id)
+        verify(panel.dialog.capPrompt.visible, "the next cap's prompt shows")
+        verify(panel.dialog.capPrompt.bar.live)
+        closeDialog(panel)
+    }
+
     function test_the_dialog_passes_the_accessibility_walk() { // spec: APP-156
         const capped = Shapes.view({id: "cf_00000000000000e1", covers: ["cap"], cap: [Shapes.capHit()]})
         const panel = makePanel([crane, capped])
         openDialog(panel, crane.id)
         compare(walk.report(panel.dialogPopup.contentItem), [])
         verify(walk.interactiveCount(panel.dialogPopup.contentItem) >= 2)
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
+        closeDialog(panel)
         openDialog(panel, capped.id)
         compare(walk.report(panel.dialogPopup.contentItem), [])
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
+        closeDialog(panel)
     }
 
     function test_app_wide_shortcuts_stay_quiet_under_the_dialog() { // spec: P4a-R10, APP-011
@@ -445,8 +664,7 @@ TestCase {
             verify(panel.dialog.denyButton.activeFocus, seq + " moved the focus out of the dialog")
             verify(!shell.docks.home.panelHasFocus, seq + " reached the panels")
         }
-        panel.dialogPopup.close()
-        tryVerify(() => !panel.dialogPopup.visible)
+        closeDialog(panel)
         compare(OpenPrompts.count, 0)
         keySequence("Ctrl+Shift+P")
         compare(spy.count, 2, "and works again once it is closed")
@@ -458,14 +676,15 @@ TestCase {
         SignalSpy { signalName: "gpuPauseToggleRequested" }
     }
 
-    // The gate and the filter, with the real native event loop and no window on screen: a mouse
-    // message posted to a hidden window reaches the gate, which doesn't call it real.
+    // The filter and the hook, with the real native event loop and no window on screen. On this
+    // thread no hardware input has ever been read: this shows the plumbing, not what Windows would
+    // report beside a real hand, which tools/sandbox/confirm-check.ps1 measures.
     Component {
         id: watchedComponent
         ApproveButton { width: 80; height: 30 }
     }
 
-    function test_a_posted_message_reaches_the_gate_and_is_not_real() { // spec: P4a-R10
+    function test_the_filter_reads_posted_messages_from_the_event_loop() { // spec: P4a-R10
         const button = createTemporaryObject(watchedComponent, tc)
         verify(button)
         const seen = ConfirmInput.seenMessages()
@@ -473,7 +692,19 @@ TestCase {
         verify(TestInput.postClickToHiddenWindow())
         tryVerify(() => ConfirmInput.seenMessages() >= seen + 2, 2000, "the filter read them: "
                   + ConfirmInput.seenMessages())
-        compare(ConfirmInput.realMessages(), real, "none of them is called real")
+        compare(ConfirmInput.realMessages(), real)
+        compare(ConfirmInput.takeClick(button), "not_pointer")
+    }
+
+    function test_the_hook_sees_a_pair_sent_from_another_thread() { // spec: P4a-R10
+        const button = createTemporaryObject(watchedComponent, tc)
+        verify(button)
+        const sent = ConfirmInput.sentMessages()
+        const seen = ConfirmInput.seenMessages()
+        verify(TestInput.sendClickFromAnotherThread())
+        tryVerify(() => ConfirmInput.sentMessages() >= sent + 2, 2000, "the hook saw them: "
+                  + ConfirmInput.sentMessages())
+        compare(ConfirmInput.seenMessages(), seen, "the filter never did")
         compare(ConfirmInput.takeClick(button), "not_pointer")
     }
 }
