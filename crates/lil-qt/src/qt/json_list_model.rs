@@ -51,8 +51,10 @@
 //!   topic left.
 //!
 //! **`EventLogModel`** (Diagnostics' event log): the newest [`EVENT_LOG_ROWS`] events of every
-//! topic the app follows, oldest first, from when it was made: the shell makes one at start. It
-//! reads `core`'s `coreEvent` and subscribes to nothing itself. Roles `topic`, `kind`, `seq`,
+//! topic the app follows, oldest first, from when it was made: the shell makes one at start. What
+//! repeats state at a high rate is left out ([`is_heartbeat`]), or one running job would push
+//! everything else out in about 100 s. It reads `core`'s `coreEvent` and subscribes to nothing
+//! itself. Roles `topic`, `kind`, `seq`,
 //! `text` (the event's data as JSON, cut to [`EVENT_LOG_TEXT_CHARS`] characters, with no image
 //! bytes: a preview shows its format and size, never `data_b64`) and `receivedMs` (Unix ms);
 //! `get(row)` as for the list model.
@@ -776,6 +778,27 @@ impl Entry {
 /// The log's roles, in [`Entry::field`]'s order.
 const EVENT_LOG_ROLES: [&str; 5] = ["topic", "kind", "seq", "text", "receivedMs"];
 
+/// Whether the log leaves an event out: a `telemetry` `sample`, a `job:<id>` `progress` or a frame
+/// of `preview:<job_id>` (APP-134). Each repeats state it already carries, and the Telemetry card
+/// and the Jobs panel show them. A session mark (`snapshot`, `resync_required`) stays.
+fn is_heartbeat(topic: &str, kind: &str, data_json: &str) -> bool {
+    if kind != "event" {
+        return false;
+    }
+    if topic.starts_with("preview:") {
+        return true;
+    }
+    let beat = if topic == "telemetry" {
+        "sample"
+    } else if topic.starts_with("job:") {
+        "progress"
+    } else {
+        return false;
+    };
+    serde_json::from_str::<Value>(data_json)
+        .is_ok_and(|data| data.get("kind").and_then(Value::as_str) == Some(beat))
+}
+
 /// An event's data as the log shows it (module docs).
 fn log_text(data_json: &str) -> String {
     let mut text = data_json.to_string();
@@ -848,11 +871,16 @@ impl qobject::EventLogModel {
         seq: f64,
         data_json: &QString,
     ) {
+        let (topic, kind, data_json) =
+            (topic.to_string(), kind.to_string(), data_json.to_string());
+        if is_heartbeat(&topic, &kind, &data_json) {
+            return;
+        }
         let entry = Entry {
-            topic: topic.to_string(),
-            kind: kind.to_string(),
+            topic,
+            kind,
             seq,
-            text: log_text(&data_json.to_string()),
+            text: log_text(&data_json),
             received_ms: now_ms(),
         };
         if self.entries.len() >= EVENT_LOG_ROWS {
