@@ -100,7 +100,7 @@ TestCase {
     function engine(over) {
         return Object.assign({
             engine: "comfyui", class: "owned", state: "ready", url: "http://127.0.0.1:8188", pid: 4242, version: "0.42.1",
-            listen: "loopback", outside_jobs: {running: 0, queued: 0}, restart_needed: false,
+            listen: "loopback", outside_jobs: {running: 0, queued: 0}, restart_needed: false, models_root_set: true,
             inventory: {models: 412, refreshed: "2026-10-30T10:00:00Z"},
             launch_profile: {reserve_vram_gb: "1.5", preview_method: "taesd", manager: false, dynamic_vram: true,
                              flags: ["--reserve-vram", "1.5", "--preview-method", "taesd"]},

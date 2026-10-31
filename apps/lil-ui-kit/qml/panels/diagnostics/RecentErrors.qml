@@ -21,6 +21,26 @@ LCard {
 
     onRowsChanged: syncRows()
 
+    // The keyboard focus out of `doomed` rows' buttons, to the next tab stop outside them, rather than
+    // to nothing as they go.
+    function leaveRows(doomed) {
+        const holder = doomed.find(r => r && r.jobButton.activeFocus)
+        if (!holder)
+            return
+        const inDoomed = item => {
+            for (let p = item; p; p = p.parent) {
+                if (doomed.indexOf(p) >= 0)
+                    return true
+            }
+            return false
+        }
+        let next = holder.jobButton.nextItemInFocusChain(true)
+        for (let n = 0; next && inDoomed(next) && n < 60; ++n)
+            next = next.nextItemInFocusChain(true)
+        if (next && !inDoomed(next))
+            next.forceActiveFocus(Qt.TabFocusReason)
+    }
+
     // `rowsModel` made the same as `rows`, moving a kept row rather than making it again.
     function syncRows() {
         const wanted = rows.map(r => ({
@@ -40,10 +60,17 @@ LCard {
             }
             if (at !== i)
                 rowsModel.move(at, i, 1)
+            if (wanted[i].last_job_id === "")
+                leaveRows([rowsRepeater.itemAt(i)])
             rowsModel.set(i, wanted[i])
         }
-        if (rowsModel.count > wanted.length)
+        if (rowsModel.count > wanted.length) {
+            const going = []
+            for (let i = wanted.length; i < rowsModel.count; ++i)
+                going.push(rowsRepeater.itemAt(i))
+            leaveRows(going)
             rowsModel.remove(wanted.length, rowsModel.count - wanted.length)
+        }
     }
 
     function headLine(row) {
@@ -95,9 +122,11 @@ LCard {
         }
 
         Repeater {
+            id: rowsRepeater
             model: rowsModel
             delegate: Column {
                 id: row
+                readonly property alias jobButton: jobButton
                 required property string code
                 required property int times
                 required property string first_at
@@ -121,6 +150,7 @@ LCard {
                     text: Words.shown(root.core, row.last_message, 600)
                 }
                 LButton {
+                    id: jobButton
                     visible: row.last_job_id !== ""
                     text: "Show the job"
                     Accessible.name: "Show the job of " + Words.shown(root.core, row.code, 120)

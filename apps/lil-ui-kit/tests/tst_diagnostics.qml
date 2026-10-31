@@ -164,7 +164,7 @@ TestCase {
         return Object.assign({
             engine: "comfyui", class: "owned", state: "ready", url: "http://127.0.0.1:8188", pid: 4242,
             version: "0.42.1", listen: "loopback", outside_jobs: {running: 0, queued: 0},
-            restart_needed: false, inventory: {models: 1234, refreshed: "2026-10-30T10:00:00Z"},
+            restart_needed: false, models_root_set: true, inventory: {models: 1234, refreshed: "2026-10-30T10:00:00Z"},
             launch_profile: {reserve_vram_gb: "1.5", preview_method: "taesd", manager: false, dynamic_vram: true,
                              flags: ["--reserve-vram", "1.5", "--preview-method", "taesd"]},
             asset_catalogue: "off"
@@ -882,8 +882,8 @@ TestCase {
     function test_no_configured_comfyui_means_no_report_read() { // spec: CORE-164
         const core = makeCore()
         const panel = makePanel(core)
-        answer(core, isTool("engines.status"), ok({engines: [{engine: "comfyui", class: "none", state: "stopped", url: "http://127.0.0.1:8188", listen: "unknown", outside_jobs: {running: 0, queued: 0}, restart_needed: false, launch_profile: null, asset_catalogue: "unknown"}]}))
-        tryVerify(() => shows(panel.models, "ComfyUI isn't configured"), 5000, texts(panel.models).join(" | "))
+        answer(core, isTool("engines.status"), ok({engines: [{engine: "comfyui", class: "none", state: "stopped", url: "http://127.0.0.1:8188", listen: "unknown", outside_jobs: {running: 0, queued: 0}, restart_needed: false, models_root_set: false, launch_profile: null, asset_catalogue: "unknown"}]}))
+        tryVerify(() => shows(panel.models, "There is no model inventory until ComfyUI's folder is set"), 5000, texts(panel.models).join(" | "))
         wait(50)
         compare(callsOf(core, "models.report"), [], "no engine.not_configured for a panel nobody asked of")
         verify(shows(panel.engines, "ComfyUI isn't configured"), texts(panel.engines).join(" | "))
@@ -894,11 +894,11 @@ TestCase {
         tryVerify(() => shows(panel.models, "No inventory yet"), 5000)
     }
 
-    function test_an_attached_engine_with_no_inventory_means_no_report_read() { // spec: CORE-164
+    function test_no_root_means_no_report_read_whatever_the_engine() { // spec: CORE-164
         const core = makeCore()
         const panel = makePanel(core)
-        answer(core, isTool("engines.status"), ok({engines: [comfy({class: "attached", launch_profile: null, inventory: undefined})]}))
-        tryVerify(() => shows(panel.models, "This attached ComfyUI has no model inventory yet"), 5000, texts(panel.models).join(" | "))
+        answer(core, isTool("engines.status"), ok({engines: [comfy({class: "attached", launch_profile: null, inventory: undefined, models_root_set: false})]}))
+        tryVerify(() => shows(panel.models, "There is no model inventory until ComfyUI's folder is set"), 5000, texts(panel.models).join(" | "))
         wait(50)
         compare(callsOf(core, "models.report"), [], "models.report would fail with no root, and the core would record it")
         // Shown again, still none.
@@ -908,11 +908,65 @@ TestCase {
         tryVerify(() => panel.shown, 5000)
         wait(2100)
         compare(callsOf(core, "models.report"), [])
-        // A root's inventory arrives as the core's `status` event: now the report has something.
-        core.emit("engines", "event", {kind: "status", engine: comfy({class: "attached", launch_profile: null})})
-        answer(core, isTool("models.report"), ok(report()))
-        tryVerify(() => shows(panel.models, "0 model files"), 5000, texts(panel.models).join(" | "))
-        verify(!shows(panel.models, "This attached ComfyUI"), texts(panel.models).join(" | "))
+        // The same for an engine that has a launch profile but no root, stopped.
+        core.emit("engines", "event", {kind: "status", engine: comfy({class: "none", state: "stopped", inventory: undefined, models_root_set: false})})
+        wait(1100)
+        compare(callsOf(core, "models.report"), [])
+        // A root set, on an attached engine with no inventory yet: the report says so itself.
+        core.emit("engines", "event", {kind: "status", engine: comfy({class: "attached", launch_profile: null, inventory: undefined})})
+        answer(core, isTool("models.report"), ok(report({refreshed: null})))
+        tryVerify(() => shows(panel.models, "No inventory yet"), 5000, texts(panel.models).join(" | "))
+        verify(!shows(panel.models, "folder is set"), texts(panel.models).join(" | "))
+    }
+
+    function test_hidden_cards_follow_nothing() { // spec: ARCH-121
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        const topics = ["engines", "diagnostics", "desktop", "telemetry", "jobs"]
+        for (const topic of topics)
+            verify(core.subscriberCount(topic) >= 2, topic + ": the panel's own and a card's")
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        for (const topic of topics)
+            compare(core.subscriberCount(topic), 1, topic + ": only the panel's own, for the log")
+        panel.visible = true
+        tryVerify(() => panel.shown, 5000)
+        for (const topic of topics)
+            verify(core.subscriberCount(topic) >= 2, topic + " again")
+    }
+
+    function test_focus_moves_on_when_its_row_goes() { // spec: APP-156
+        const core = makeCore()
+        const shell = fakeShellComponent.createObject(tc)
+        const panel = makePanel(core, {shell: shell})
+        const row = (code, job) => Object.assign({code: code, count: 1, first_at: "2026-10-30T09:00:00Z", last_at: "2026-10-30T10:00:00Z", last_message: "It failed."},
+                                                 job ? {last_tool: "comfy.prompt", last_job_id: job} : {})
+        load(core, {"diagnostics.recent": ok({errors: [row("a.one", "j_1"), row("b.two", "j_2")]})})
+        tryVerify(() => panel.errors.rowsModel.count === 2, 5000)
+        const win = panel.Window.window
+        const inPanel = item => {
+            for (let p = item; p; p = p.parent) {
+                if (p === panel)
+                    return true
+            }
+            return false
+        }
+        const focusOnRow = n => find(panel.errors, i => i.visible && i.text === "Show the job" && typeof i.click === "function"
+                                                         && i.Accessible.name.indexOf(n) >= 0).forceActiveFocus(Qt.TabFocusReason)
+        // Its row goes.
+        focusOnRow("a.one")
+        core.emit("diagnostics", "resync_required", null)
+        answer(core, isTool("diagnostics.recent"), ok({errors: [row("b.two", "j_2")]}))
+        tryVerify(() => panel.errors.rowsModel.count === 1, 5000)
+        verify(inPanel(win.activeFocusItem), "the focus stays in the panel: " + win.activeFocusItem)
+        // Its row stays, with no job to show any more.
+        focusOnRow("b.two")
+        wait(1100)
+        core.emit("diagnostics", "resync_required", null)
+        answer(core, isTool("diagnostics.recent"), ok({errors: [row("b.two", "")]}))
+        tryVerify(() => button(panel.errors, "Show the job") === null, 5000)
+        verify(inPanel(win.activeFocusItem), "the focus stays in the panel: " + win.activeFocusItem)
     }
 
     function test_engine_lines_say_what_is_wrong() { // spec: ARCH-121
