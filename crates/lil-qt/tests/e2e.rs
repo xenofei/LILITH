@@ -472,6 +472,66 @@ fn a_cap_pending_call_retries_after_an_app_answer() {
     });
 }
 
+/// What the Confirmations panel reads, from a real core: the fixtures in
+/// `apps/lil-ui-kit/tests/ConfirmShapes.js` hold these fields, and `covers` names what the
+/// confirmation is about, not files. A deny is recorded `confirmed_via: app`, goes to the history
+/// with its time, and a second answer gets `confirm.already_answered`.
+#[test] // spec: APP-044, APP-046, APP-115
+fn the_confirmation_fixtures_are_what_the_core_sends() {
+    launch("the_confirmation_fixtures_are_what_the_core_sends", || {
+        let mut rig = Rig::start(|env| env.suite_toml_set(MONTHLY_1));
+        let call = rig.probe.call("test.destructive", json!({"cost": "5"}));
+        let Seen::Pending(_, pending) = rig.probe.outcome(&call) else {
+            panic!("expected a pending confirmation");
+        };
+        let id = pending["confirmation_id"].clone();
+        let list = rig.probe.app_call(
+            "app/confirmations.list",
+            json!({"state": "pending", "limit": 500}),
+        );
+        let listed = rig.probe.finished(&list);
+        let row = &listed["confirmations"][0];
+        assert_eq!(row["id"], id, "{listed}");
+        assert_eq!(row["tool"], "test.destructive");
+        assert_eq!(row["arguments"]["cost"], "5");
+        assert_eq!(row["caller_kind"], "ui:test");
+        assert_eq!(row["covers"], json!(["cap"]));
+        assert_eq!(row["state"], "pending");
+        assert!(row["created"].is_string() && row["expires_at"].is_string());
+        for absent in ["confirmed_via", "answered"] {
+            assert!(row.get(absent).is_none(), "{absent}: {row}");
+        }
+        let hit = &row["cap"][0];
+        assert_eq!(hit["cap"], "monthly", "{row}");
+        for field in ["limit", "settled", "held", "estimate", "currency"] {
+            assert!(hit[field].is_string(), "{field}: {row}");
+        }
+        let answer = rig.probe.app_call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": id, "answer": "deny"}),
+        );
+        let answered = rig.probe.finished(&answer);
+        let row = &answered["confirmation"];
+        assert_eq!(row["state"], "denied", "{answered}");
+        assert_eq!(row["confirmed_via"], "app");
+        assert!(row["answered"].is_string());
+        let list = rig.probe.app_call(
+            "app/confirmations.list",
+            json!({"state": "history", "limit": 500}),
+        );
+        let listed = rig.probe.finished(&list);
+        assert_eq!(listed["confirmations"][0]["id"], id, "{listed}");
+        let again = rig.probe.app_call(
+            "app/confirmation.answer",
+            json!({"confirmation_id": id, "answer": "approve", "cap": {"action": "allow_once"}}),
+        );
+        let Seen::Failed(_, error) = rig.probe.outcome(&again) else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(error["code"], "confirm.already_answered", "{error}");
+    });
+}
+
 /// APP-027, APP-139: a job's progress reaches QML leading-edge, then at most 10 times a second,
 /// and the last value it shows is the newest. A burst of 300 steps from the fake ComfyUI comes
 /// through as a handful of updates, 100 ms or more apart, the last one at 300 of 300.
