@@ -28,14 +28,21 @@
      Then the app's log is read for QML errors from these panels.
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first. The tree holds
   no name from a dialog's file list, navigation pane, address bar or breadcrumb.
-  3. lil-image is closed, the test core stopped (only the processes this run started, by recorded
-     PID), the test channel's registry keys and the temporary root removed, and the pop-up told it
-     is done. Exit 0 only when no check failed, and the cleanup too; the summary counts what wasn't
+  3. lil-image is closed, the test core stopped (`lil core stop`, then by the PID that
+     `lil --no-start status` gave on the test channel, and only if it runs from this deploy folder),
+     the test channel's registry keys and the temporary root removed, and the pop-up told it is
+     done. Exit 0 only when no check failed, and the cleanup too; the summary counts what wasn't
      checked apart from what passed.
 
-  It never touches the real stable or dev channel or their registrations: the cleanup does nothing
-  unless LIL_CHANNEL is this script's test channel. No key or press is sent unless the foreground
-  window, and the window under the target's point, are lil-image's (the run fails instead).
+  It refuses to start if a core already runs on the test channel, and then stops nothing: that core
+  isn't this run's, and the app would attach to it. It never touches the real stable or dev channel
+  or their registrations: the cleanup does nothing unless LIL_CHANNEL is this script's test channel.
+  No key or press is sent unless the foreground window, and the window under the target's point, are
+  lil-image's (the run fails instead).
+
+  One trace stays outside the test channel, and it is left alone: the save dialog's own history
+  (ComDlg32 OpenSavePidlMRU, under the user's registry) gains an entry for the saved file. Windows
+  writes it, and this script doesn't clean the user's registry.
 
   -DryRun does the disk checks' self-test, and a bundle from the test core through `lil call`, with
   the same cleanup: no pop-up, no lil-image, no window.
@@ -201,20 +208,39 @@ $channel = 'test-diagcheck'
 $root = Join-Path ([IO.Path]::GetTempPath()) ("lil-diagcheck-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $outDir = Join-Path $root 'out'
 $coreBundles = Join-Path $root "local\LILITH-$channel\diagnostics"
-# The lil-core.exe processes of this deploy folder that this run started, by PID.
-$script:corePidsBefore = @()
-$script:corePids = @()
-function Get-DeployCorePids {
-    @(Get-CimInstance Win32_Process -Filter "Name = 'lil-core.exe'" |
-        Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $coreExe, [StringComparison]::OrdinalIgnoreCase) } |
-        ForEach-Object { [int]$_.ProcessId })
+# The PIDs that `lil --no-start status` named on the test channel since this run found it free.
+$corePids = [System.Collections.Generic.HashSet[int]]::new()
+# A core was on the test channel when this run came: not this run's, so nothing here stops it.
+$script:channelTaken = $false
+# The core on the test channel, recorded, or 0 for none. The channel in the answer must be the test
+# channel's, whatever the environment says.
+function Get-CorePid {
+    $o = & $lil --no-start status 2>&1
+    if ($LASTEXITCODE -ne 0) { return 0 }
+    $m = [regex]::Match(($o -join "`n"), 'pid (\d+), channel (\S+?)\)')
+    if (-not $m.Success -or $m.Groups[2].Value -cne $channel) { return 0 }
+    $id = [int]$m.Groups[1].Value
+    [void]$corePids.Add($id)
+    return $id
+}
+# The recorded process `id`, if it is still a core run from this deploy folder (a PID can be reused).
+function Get-RecordedCore([int]$id) {
+    $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+    if ($p -and $p.Path -and [string]::Equals($p.Path, $coreExe, [StringComparison]::OrdinalIgnoreCase)) { return $p }
+    return $null
 }
 function Enter-TestChannel {
     $env:LIL_CHANNEL = $channel
     $env:LIL_TEST_ROOT = $root
     New-Item -ItemType Directory $root | Out-Null
     foreach ($s in 'roaming', 'local', 'profile', 'out') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
-    $script:corePidsBefore = Get-DeployCorePids
+    # The pipe's name comes from the channel alone, so a core left by a crashed run would serve this
+    # run from its old root.
+    $o = & $lil --no-start status 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $script:channelTaken = $true
+        throw "a core already runs on $channel. It isn't this run's, so nothing was started and it wasn't stopped: run ``lil core stop`` with LIL_CHANNEL=$channel and LIL_TEST_ROOT set, or end it, then run this again"
+    }
     # The core finds no workspace from this folder.
     Set-Location -LiteralPath $root
 }
@@ -223,36 +249,44 @@ function Invoke-Lil([string[]]$a) {
     if ($LASTEXITCODE -ne 0) { throw "lil $($a -join ' ') exited $LASTEXITCODE`: $($o -join ' ')" }
     return ($o -join "`n")
 }
-function Note-CorePids {
-    $script:corePids = @(Get-DeployCorePids | Where-Object { $script:corePidsBefore -notcontains $_ })
-}
 # Each step's failure counts in the exit code. Unless this is the test channel it does nothing: a
 # setup that failed early must not run `lil core stop` against another channel's core.
 function Exit-TestChannel {
     if ($env:LIL_CHANNEL -ne $channel) { return }
-    Note-CorePids
-    try { [void](& $lil core stop 2>&1) } catch { }
-    foreach ($id in $script:corePids) {
-        $p = Get-Process -Id $id -ErrorAction SilentlyContinue
-        if ($p -and -not $p.WaitForExit(10000)) {
-            Write-Host "stopping the test core this run started (pid $id)"
-            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
-            [void]$p.WaitForExit(5000)
+    if ($script:channelTaken) {
+        Write-Host 'the core on the test channel is not this run''s: it stays, with the channel''s registry keys'
+    } else {
+        try { [void](Get-CorePid) } catch { }
+        try { [void](& $lil core stop 2>&1) } catch { }
+        foreach ($id in $corePids) {
+            $p = Get-RecordedCore $id
+            if ($p -and -not $p.WaitForExit(10000)) {
+                Write-Host "stopping the test core, pid $id"
+                Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+                [void]$p.WaitForExit(5000)
+            }
         }
+        $alive = @($corePids | Where-Object { Get-RecordedCore $_ })
+        Check ($alive.Count -eq 0) "cleanup: none of the $($corePids.Count) core PID(s) from lil status on the test channel still runs"
     }
-    $alive = @($script:corePids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-    Check ($alive.Count -eq 0) "cleanup: none of the $($script:corePids.Count) core process(es) this run recorded still runs"
     Set-Location -LiteralPath $Repo
     Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
     $keysLeft = 0
-    foreach ($k in "HKCU:\Software\LILITH-$channel", "HKCU:\Software\Classes\lil-$channel") {
+    # Each exactly the test channel's: its registry root, its scheme, and Windows' notification
+    # settings entry, which a toast would make.
+    $capitalised = $channel.Substring(0, 1).ToUpperInvariant() + $channel.Substring(1)
+    $keys = if ($script:channelTaken) { @() } else {
+        "HKCU:\Software\LILITH-$channel", "HKCU:\Software\Classes\lil-$channel",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\LILITH.Suite.$capitalised"
+    }
+    foreach ($k in $keys) {
         if (Test-Path $k) {
             Write-Host "removing the test channel's $k"
             try { Remove-Item -Recurse -Force $k } catch { Write-Host "couldn't remove it: $_" }
         }
         if (Test-Path $k) { ++$keysLeft }
     }
-    Check ($keysLeft -eq 0) "cleanup: neither of the test channel's two registry keys is left ($keysLeft)"
+    Check ($keysLeft -eq 0) "cleanup: none of the test channel's $($keys.Count) registry keys is left ($keysLeft)"
     for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $root); ++$i) {
         try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
     }
@@ -268,8 +302,9 @@ if ($DryRun) {
         $r = @(Test-Bundle $path)
         Check ($r.Count -eq 0) "dry run: the test core's bundle passes the disk check ($($r -join '; '))"
         Check ((Split-Path -Parent $path) -eq $coreBundles) 'dry run: the bundle is in the folder the cancel check watches'
-        Note-CorePids
-        Check ($script:corePids.Count -ge 1) "dry run: a lil-core.exe of this deploy folder that wasn't there before is recorded ($($script:corePids.Count))"
+        $id = Get-CorePid
+        Check ($id -ne 0) 'dry run: lil --no-start status names a core on the test channel'
+        Check ($null -ne (Get-RecordedCore $id)) 'dry run: that PID runs from this deploy folder'
         Check (Test-Path -LiteralPath $image) 'dry run: lil-image.exe is deployed'
         Check (Test-Path -LiteralPath (Join-Path $Deploy 'qml\QtQuick\Dialogs')) 'dry run: QtQuick\Dialogs is deployed'
         Check (Test-Path -LiteralPath (Join-Path $Repo 'tools\sandbox\hands-off.ps1')) 'dry run: the hands-off pop-up is there'
@@ -361,6 +396,16 @@ function Send-Keys([string]$keys, $e, $win, [string]$what) {
     Assert-InputGoesToApp $e $win $what
     [System.Windows.Forms.SendKeys]::SendWait($keys)
 }
+# The masks of what a dump holds of this PC's paths: the temporary root and the profile folder, in
+# either separator (the app's own paths use `/`).
+function Hide-Paths([string]$text) {
+    foreach ($pair in @(@($root, '<root>'), @($env:USERPROFILE, '%USERPROFILE%'))) {
+        foreach ($form in @($pair[0], $pair[0].Replace('\', '/'), $pair[0].Replace('\', '\\'))) {
+            $text = [regex]::Replace($text, [regex]::Escape($form), $pair[1], [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        }
+    }
+    return $text
+}
 # A press of a control of the app's main window or a floating dock, once that holds: its Invoke
 # pattern, else Space with the focus on it.
 function Invoke-Element($e, [string]$what) {
@@ -442,7 +487,7 @@ function Save-UiaTree([string]$path) {
             $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
             $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
             # The panel's own banner can name the temporary folder, which names the account.
-            $name = $name.Replace($root, '<root>').Replace($env:USERPROFILE, '%USERPROFILE%')
+            $name = Hide-Paths $name
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
             # The save dialog's file list, navigation pane and address bar or breadcrumb: the
             # node alone, nothing under it.
@@ -603,7 +648,8 @@ function Save-As($dlg, [string]$path) {
         Show-Element $dlg
         try { $box.SetFocus() } catch { }
         Send-Keys '^a' $box $dlg 'the file name box'
-        Send-Keys (Escape-Keys $path) $box $dlg 'the file name box'
+        # Each character after its own check: a window taking the focus gets none of the rest.
+        foreach ($key in [regex]::Matches((Escape-Keys $path), '\{.\}|.')) { Send-Keys $key.Value $box $dlg 'the file name box' }
         Write-Host 'file name: typed'
         Start-Sleep -Milliseconds 300
         Send-Keys '{ENTER}' $box $dlg 'the file name box'
@@ -634,6 +680,7 @@ try {
     Enter-TestChannel
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
+    [void](Wait-For { if ((Get-CorePid) -ne 0) { $true } } 30 'a core on the test channel')
     # The shell's window is titled "LILITH" (or "LILITH — <project>"); else the first one.
     Start-Sleep -Seconds 1
     $wins = App-Windows
@@ -713,6 +760,7 @@ try {
 
     # (c) Show in Explorer.
     $show = Wait-For { Find-Named $script:main 'Show in Explorer' } 10 'Show in Explorer'
+    $shellWindows = (New-Object -ComObject Shell.Application).Windows().Count
     Invoke-Element $show 'Show in Explorer'
     $window = $null
     try { $window = Wait-For { Find-ExplorerWindow $outDir } 20 'an Explorer window on the temporary folder' } catch { }
@@ -732,13 +780,15 @@ try {
         try {
             $window.Quit()
             [void](Wait-For { if (-not (Find-ExplorerWindow $outDir)) { $true } } 10 'that Explorer window to close')
-            Pass '(c) Quit went to that window alone, and no window is on the folder now'
+            Pass '(c) Quit went to that window, and no window is on the folder now'
+            $nowOpen = (New-Object -ComObject Shell.Application).Windows().Count
+            Check ($nowOpen -eq $shellWindows) "(c) the shell lists as many windows as before Show in Explorer ($shellWindows, then $nowOpen)"
         } catch { Fail "(c) that Explorer window didn't close: close it by hand ($_)" }
     }
 
     # (d) Open Backups: the status line's words, and the panel's own beside them.
     $line = 'No backups yet: backups arrive in a later version of LILITH'
-    Check ((Count-Named $line) -ge 1) '(d) the backup status line is in the UIA tree'
+    Check ((Count-Named $line) -eq 1) '(d) the backup status line is in the UIA tree once: the closed panel''s isn''t'
     $windowsBefore = (App-Windows).Count
     $open = Wait-For { Find-Named $script:main 'Open Backups' } 10 'Open Backups'
     Invoke-Element $open 'Open Backups'
@@ -771,7 +821,7 @@ try {
         if ($log) {
             $bad = @($log | Get-Content | Where-Object { $_ -match 'panels/(diagnostics|backups)' -and $_ -match 'TypeError|ReferenceError|Cannot |is not|Binding loop|Unable to' })
             Check ($bad.Count -eq 0) "no line of the app's log names these panels with an error word ($($bad.Count))"
-            $bad | Select-Object -First 3 | ForEach-Object { Write-Host (($_.Replace($root, '<root>').Replace($root.Replace('\', '\\'), '<root>')) -replace '^(.{300}).*$', '$1…') }
+            $bad | Select-Object -First 3 | ForEach-Object { Write-Host ((Hide-Paths $_) -replace '^(.{300}).*$', '$1…') }
         } else { Fail "the app's log wasn't found" }
     } catch { Fail "the app's log couldn't be read: $_" }
     Exit-TestChannel
