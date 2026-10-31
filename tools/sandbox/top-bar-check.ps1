@@ -101,7 +101,7 @@ function Exit-TestChannel {
 # What the core says of the GPU lane, from another session (the test channel's `lil`).
 function Get-GpuLane {
     $json = Invoke-Lil @('call', 'jobs.list', '{"limit":1}')
-    $lanes = ($json | ConvertFrom-Json).lanes
+    $lanes = ($json | ConvertFrom-Json).structured.lanes
     return ($lanes | Where-Object { $_.lane -eq 'gpu-heavy' })
 }
 # What on disk says this check changed nothing: suite.toml, and the folders under the root's places.
