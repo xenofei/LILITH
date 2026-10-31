@@ -11,6 +11,7 @@ LCard {
     id: root
 
     required property var core
+    property bool active: true
 
     readonly property int pageSize: 100
 
@@ -56,10 +57,16 @@ LCard {
         tool: "jobs.list"
         args: ({status: "running", limit: root.pageSize})
         topic: "jobs"
-        onResultChanged: root.applyLanes(result ? result.lanes : [])
+        active: root.active
+        onAnswered: (structured, current) => {
+            if (current && structured)
+                root.applyLanes(structured.lanes)
+        }
         onTopicEvent: data => {
             if (data && data.kind === "queue" && data.state) {
                 root.applyLanes([data.state])
+                root.runningRead.eventApplied()
+                root.queuedRead.eventApplied()
             } else if (data && data.kind === "job") {
                 root.runningRead.request()
                 root.queuedRead.request()
@@ -71,7 +78,11 @@ LCard {
         core: root.core
         tool: "jobs.list"
         args: ({status: "queued", limit: root.pageSize})
-        onResultChanged: root.applyLanes(result ? result.lanes : [])
+        active: root.active
+        onAnswered: (structured, current) => {
+            if (current && structured)
+                root.applyLanes(structured.lanes)
+        }
     }
 
     title: "Queue"

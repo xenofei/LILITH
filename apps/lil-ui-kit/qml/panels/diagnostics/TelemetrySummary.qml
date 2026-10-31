@@ -11,11 +11,13 @@ LCard {
     id: root
 
     required property var core
+    property bool active: true
 
     property var snapshot: null
 
     readonly property var gpu: snapshot ? snapshot.gpu || null : null
-    readonly property bool read: snapshot !== null
+    // A real sample: what the core has before its first one (Snapshot::empty) reads all zeros.
+    readonly property bool read: !!snapshot && !!snapshot.ram && snapshot.ram.total_mib > 0
 
     function apply(next) {
         if (next && (!snapshot || !(next.ts < snapshot.ts)))
@@ -26,6 +28,7 @@ LCard {
         core: root.core
         tool: "telemetry.snapshot"
         topic: "telemetry"
+        active: root.active
         onResultChanged: root.apply(result)
         onTopicEvent: data => {
             if (data && data.kind === "sample")
@@ -43,6 +46,11 @@ LCard {
             visible: text !== ""
             tone: "warning"
             text: Words.errorText(root.core, root.snapshotRead.error)
+        }
+        LineText {
+            visible: !root.read
+            tone: "muted"
+            text: "No hardware reading yet."
         }
         LineText {
             visible: root.read

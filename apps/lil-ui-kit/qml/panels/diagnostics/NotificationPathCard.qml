@@ -12,6 +12,8 @@ LCard {
     required property var core
     // desktop.get's notification_path, null until it is read.
     property var path: null
+    // Why it couldn't be read, in words; "" for none.
+    property string problem
 
     readonly property var problems: NotificationText.problems(path)
 
@@ -21,6 +23,11 @@ LCard {
         width: parent.width
         spacing: 2
 
+        LineText {
+            visible: root.problem !== ""
+            tone: "warning"
+            text: root.problem
+        }
         LineText {
             visible: !!root.path && root.problems.length === 0
             text: NotificationText.reachable

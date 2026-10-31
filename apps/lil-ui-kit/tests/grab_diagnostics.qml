@@ -108,6 +108,10 @@ TestCase {
         }, over || {})
     }
 
+    function capture(at) {
+        return {system_stats: {system: {comfyui_version: "0.42.1"}, devices: []}, driver: "999.10", comfyui: "abc1234", nodes: [], captured: at}
+    }
+
     function snapshot() {
         return {ts: "2026-10-30T10:00:00Z",
                 gpu: {name: "Example GPU", driver: "999.10", util_pct: 42, power_mw: 180000, temp_c: 63, sm_clock_mhz: 2000,
@@ -120,7 +124,7 @@ TestCase {
     function load(core, over) {
         const o = over || {}
         answer(core, isTool("engines.status"), {engines: [o.engine || engine()]})
-        answer(core, isTool("engines.environment"), o.environment || {captures: [{captured: "2026-10-30T10:00:00Z"}], changes: []})
+        answer(core, isTool("engines.environment"), o.environment || {captures: [capture("2026-10-30T10:00:00Z")], changes: []})
         answer(core, isTool("diagnostics.recent"), {errors: o.errors || []})
         answer(core, isTool("desktop.get"), {notifications: {}, quiet_while_fullscreen: true, fullscreen_autopause: true,
             keep_awake_gpu: true, keep_awake_available: o.keepAwake !== false,
@@ -136,9 +140,12 @@ TestCase {
                        {lane: "cpu", paused: false, reasons: [], held: 0, restart_held: 0, withdrawn: 0}]
         answer(core, c => c.name === "jobs.list" && c.args.status === "running", {jobs: [{job_id: "j_1"}], next_cursor: null, lanes: lanes})
         answer(core, c => c.name === "jobs.list" && c.args.status === "queued", {jobs: [{job_id: "j_2"}, {job_id: "j_3"}], next_cursor: null, lanes: lanes})
-        for (let i = 0; i < 24; ++i)
-            core.emit(i % 3 ? "telemetry" : "jobs", "event", i % 3 ? {kind: "sample", ts: "2026-10-30T10:00:0" + (i % 10) + "Z"}
-                                                                   : {kind: "job", job: {job_id: "j_" + i, status: "running"}})
+        // What the log really holds: events of the followed topics, as the core publishes them.
+        for (let i = 0; i < 8; ++i) {
+            core.emit("jobs", "event", {kind: "job", job: {job_id: "j_000000000000000" + i, kind: "comfy.prompt", status: "running"}})
+            core.emit("engines", "event", {kind: "status", engine: engine()})
+            core.emit("diagnostics", "event", {kind: "error", code: "store.io", tool: "asset.get", at: "2026-10-30T10:00:0" + i + ".000Z"})
+        }
     }
 
     function problems() {
@@ -146,7 +153,7 @@ TestCase {
             engine: engine({version: undefined, class: "attached", launch_profile: null, listen: "all_interfaces",
                             url: "http://0.0.0.0:8188", restart_needed: true, asset_catalogue: "on",
                             outside_jobs: {running: 1, queued: 2}, suite_job: "j_0123456789abcdef"}),
-            environment: {captures: [{captured: "2026-10-30T10:00:00Z"}, {captured: "2026-10-29T10:00:00Z"}],
+            environment: {captures: [capture("2026-10-30T10:00:00Z"), capture("2026-10-29T10:00:00Z")],
                           changes: [{what: "driver", from: "998.20", to: "999.10", change: "changed"},
                                     {what: "node", name: "ComfyUI-Example", to: "1.2 (abc1234)", change: "added"}]},
             errors: [{code: "comfyui.out_of_memory", count: 3, first_at: "2026-10-30T09:00:00Z", last_at: "2026-10-30T10:00:00Z",
@@ -196,7 +203,7 @@ TestCase {
         return createTemporaryObject(panelComponent, tc, {core: core, shell: fakeShellComponent.createObject(tc)})
     }
 
-    function test_grab_all_in_order() { // spec: ARCH-121, APP-134, QA-083
+    function test_grab_all_in_order() { // spec: ARCH-121, APP-134
         const core = fakeComponent.createObject(tc)
         const host = makeHost(core)
         load(core)
@@ -223,6 +230,8 @@ TestCase {
         host.panel.exportTo("file:///" + dir + "/lilith.zip")
         answer(core, isTool("diagnostics.bundle"), {path: dir + "/source.zip", bytes: 5, files: ["manifest.json", "errors.json"], redactions: 12})
         tryVerify(() => host.panel.explorerButton.visible, 5000)
+        // A grab can end up on a PR: this process's temporary folder names the account.
+        host.panel.banner.text = host.panel.banner.text.split(dir).join("%TEMP%")
         save(host, "bundle-saved")
     }
 

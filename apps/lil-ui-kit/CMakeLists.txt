@@ -85,6 +85,7 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/diagnostics/DiagnosticsPanel.qml
         qml/panels/diagnostics/VersionsCard.qml
         qml/panels/diagnostics/EnginesCard.qml
+        qml/panels/diagnostics/ProvidersCard.qml
         qml/panels/diagnostics/QueueSummary.qml
         qml/panels/diagnostics/RecentErrors.qml
         qml/panels/diagnostics/EventLog.qml

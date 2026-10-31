@@ -3,10 +3,12 @@
 // lines (backups, keep-awake, this start's times), the notification path, the recent errors by
 // code, the event log and the model inventory, with "Export diagnostics bundle".
 //
-// Each card reads its tools once when made and follows its topics (ToolRead). `shell` and
-// `eventLog` are the shell's, filled in when it makes the dock (ShellWindow.createDock): with no
-// shell the buttons that open another panel do nothing, and with no `eventLog` the panel keeps
-// its own EventLogModel.
+// Each card reads its tools when the panel is first shown, reads them again each time it is shown
+// again (at most once in 2 s, so "Run lil doctor to fix" clears once you have), and follows its
+// topics while shown (ToolRead). Behind a tab it reads nothing; it only keeps the topics followed,
+// so that the event log hears them from the start. `shell` and `eventLog` are the shell's, filled in
+// when it makes the dock (ShellWindow.createDock): with no shell the buttons that open another panel
+// do nothing, and with no `eventLog` the panel keeps its own EventLogModel.
 //
 // The export: you pick the file in a save dialog (the panel never names a path), then
 // `diagnostics.bundle` writes its zip in the core's folder and BundleExport copies it to your file,
@@ -40,8 +42,15 @@ Rectangle {
     property string fixJobId
     property bool exporting: false
 
+    // Whether the cards are live. What the shell does while it lays itself out isn't a show, nor a
+    // flicker (floating and re-docking moves the item) a hide.
+    property bool shown: false
+    readonly property bool isOnScreen: visible && width > 0 && height > 0
+                                       && Window.window !== null && Window.window.visible
+
     readonly property alias versions: versionsCard
     readonly property alias engines: enginesCard
+    readonly property alias providers: providersCard
     readonly property alias queue: queueCard
     readonly property alias telemetry: telemetryCard
     readonly property alias status: statusLines
@@ -62,6 +71,20 @@ Rectangle {
     Accessible.role: Accessible.Pane
     Accessible.name: title
 
+    onIsOnScreenChanged: settle.restart()
+
+    Component.onCompleted: {
+        settle.restart()
+        for (const topic of ["engines", "diagnostics", "desktop", "telemetry", "jobs"])
+            CoreCall.subscribe(core, topic, root)
+    }
+
+    Timer {
+        id: settle
+        interval: root.isOnScreen ? 50 : 500
+        onTriggered: root.shown = root.isOnScreen
+    }
+
     function showJob(jobId) {
         if (shell)
             shell.openPanelOn("jobs", "showJob", jobId, true)
@@ -74,17 +97,26 @@ Rectangle {
             dialogLoader.active = true
     }
 
+    // Selects the bundle in Explorer, or says why it can't.
+    function showBundle() {
+        if (!shim.showInExplorer(exportedPath))
+            showProblem("Explorer can't show " + Words.shown(core, exportedPath, 260)
+                        + ": it has moved since, or it isn't a .zip file.")
+    }
+
     // Exports a new bundle to `file`, a file: URL you picked.
     function exportTo(file) {
         exporting = true
         fixJobId = ""
+        panelBanner.close()
         CoreCall.call(core, "diagnostics.bundle", {}, {
             owner: root,
             ok: r => root.copyBundle(file, r.structured),
             error: e => {
                 root.exporting = false
                 root.fixJobId = Words.fixJob(e)
-                root.showProblem("The diagnostics bundle wasn't made: " + Words.errorText(root.core, e))
+                root.showProblem("The diagnostics bundle wasn't made: "
+                                 + Words.errorText(root.core, e, root.fixJobId !== ""))
             }
         })
     }
@@ -94,7 +126,7 @@ Rectangle {
         if (!bundleExport.save(file, bundle.path)) {
             exporting = false
             exportedPath = bundle.path
-            showProblem("The diagnostics bundle wasn't saved: pick a file on this PC. It is still at "
+            showProblem("The diagnostics bundle wasn't saved: pick a file on this PC. The bundle is still at "
                         + Words.shown(core, bundle.path, 260) + ".")
         }
     }
@@ -109,7 +141,10 @@ Rectangle {
     readonly property ToolRead desktopRead: ToolRead {
         core: root.core
         tool: "desktop.get"
+        // Never the core's 10 s cache: what you fixed a moment ago shows.
+        args: ({fresh: true})
         topic: "desktop"
+        active: root.shown
         onTopicEvent: data => {
             // The event's notification path is as it was at the change: read it afresh.
             if (data && data.kind === "settings")
@@ -135,13 +170,13 @@ Rectangle {
                              + MoneyText.count(String(b.redactions || 0)) + " values redacted. Nothing is sent "
                              + "anywhere: it leaves this PC only when you hand it on.")
         }
-        onFailed: (path, why) => {
+        onFailed: (path, why, bundleRead) => {
             const b = root._bundle || {}
             root.exporting = false
-            root.exportedPath = b.path || ""
+            root.exportedPath = bundleRead ? b.path || "" : ""
             root.showProblem("The diagnostics bundle wasn't saved as " + Words.shown(root.core, path, 260) + ": "
-                             + Words.shown(root.core, why, 400) + " It is still at "
-                             + Words.shown(root.core, b.path, 260) + ".")
+                             + Words.shown(root.core, why, 400)
+                             + (bundleRead ? " The bundle is still at " + Words.shown(root.core, b.path, 260) + "." : ""))
         }
     }
 
@@ -173,7 +208,7 @@ Rectangle {
 
         LButton {
             id: exportButton
-            text: "Export diagnostics bundle"
+            text: root.exporting || bundleExport.busy ? "Exporting…" : "Export diagnostics bundle"
             enabled: !root.exporting && !bundleExport.busy
             onClicked: root.chooseFile()
         }
@@ -182,7 +217,7 @@ Rectangle {
             id: explorerButton
             visible: root.exportedPath !== ""
             text: "Show in Explorer"
-            onClicked: root.shim.showInExplorer(root.exportedPath)
+            onClicked: root.showBundle()
         }
 
         LButton {
@@ -282,20 +317,28 @@ Rectangle {
                     id: enginesCard
                     width: parent.width
                     core: root.core
+                    active: root.shown
                     gpu: telemetryCard.gpu
                     gpuRead: telemetryCard.read
+                }
+
+                ProvidersCard {
+                    id: providersCard
+                    width: parent.width
                 }
 
                 QueueSummary {
                     id: queueCard
                     width: parent.width
                     core: root.core
+                    active: root.shown
                 }
 
                 TelemetrySummary {
                     id: telemetryCard
                     width: parent.width
                     core: root.core
+                    active: root.shown
                 }
 
                 StatusLines {
@@ -315,6 +358,7 @@ Rectangle {
                     width: parent.width
                     core: root.core
                     path: root.desktopRead.result ? root.desktopRead.result.notification_path : null
+                    problem: Words.errorText(root.core, root.desktopRead.error)
                 }
             }
 
@@ -326,6 +370,7 @@ Rectangle {
                     id: recentErrors
                     width: parent.width
                     core: root.core
+                    active: root.shown
                     onShowJob: jobId => root.showJob(jobId)
                 }
 
@@ -340,6 +385,9 @@ Rectangle {
                     id: modelsCard
                     width: parent.width
                     core: root.core
+                    active: root.shown
+                    enginesKnown: enginesCard.known
+                    notConfigured: enginesCard.notConfigured
                 }
             }
         }

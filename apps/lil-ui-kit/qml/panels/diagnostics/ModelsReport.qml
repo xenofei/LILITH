@@ -1,5 +1,7 @@
 // The model inventory (CORE-164), from `models.report`, read again when an `engines` event shows a
-// newer inventory. The states are the inventory's glossary; nothing is moved or deleted because of
+// newer inventory, and not read at all while ComfyUI isn't configured (the tool would fail, and the
+// core would record that as an error nobody caused). The states are the inventory's glossary;
+// nothing is moved or deleted because of
 // one. Unless `registry` is `ok` the report can't tell what is recorded, so the card says why and
 // calls no file orphan or missing. Paths, families and names are untrusted: plain text, normalised
 // (P4a-R8). One tab stop; the arrow keys move through the rows.
@@ -13,6 +15,10 @@ LCard {
     id: root
 
     required property var core
+    property bool active: true
+    // The Engines card has its first answer, and whether it says ComfyUI isn't configured.
+    property bool enginesKnown: true
+    property bool notConfigured: false
 
     readonly property alias view: list
     readonly property var report: reportRead.result
@@ -28,6 +34,16 @@ LCard {
 
     function count(n) {
         return MoneyText.count(String(n))
+    }
+
+    // A file's size in the unit that reads: "500 B", "30 KiB", "144 MiB", "6.5 GiB".
+    function sizeText(bytes) {
+        const units = [[1073741824, " GiB"], [1048576, " MiB"], [1024, " KiB"]]
+        for (const [size, unit] of units) {
+            if (bytes >= size)
+                return Format.oneDecimal(bytes / size) + unit
+        }
+        return Format.group(bytes) + " B"
     }
 
     readonly property string registryText: {
@@ -90,7 +106,7 @@ LCard {
         const e = row.entry
         if (row.missing)
             return "recorded in registry/models.yaml as " + Words.shown(core, e.model_id, 80) + ", not on disk"
-        const parts = [Format.gib(e.size / 1048576)]
+        const parts = [sizeText(e.size)]
         if (e.model_name)
             parts.push(Words.shown(core, e.model_name, 120))
         if (e.family)
@@ -105,6 +121,7 @@ LCard {
         core: root.core
         tool: "models.report"
         topic: "engines"
+        active: root.active && root.enginesKnown && !root.notConfigured
         onTopicEvent: data => {
             const inventory = data && data.engine ? data.engine.inventory : null
             const refreshed = inventory ? inventory.refreshed : ""
@@ -126,9 +143,14 @@ LCard {
         spacing: Theme.spacing
 
         LineText {
+            visible: root.notConfigured
+            tone: "muted"
+            text: "ComfyUI isn't configured, so there is no model inventory."
+        }
+        LineText {
             visible: text !== ""
             tone: "warning"
-            text: Words.errorText(root.core, reportRead.error)
+            text: root.notConfigured ? "" : Words.errorText(root.core, reportRead.error)
         }
         LineText {
             visible: text !== ""

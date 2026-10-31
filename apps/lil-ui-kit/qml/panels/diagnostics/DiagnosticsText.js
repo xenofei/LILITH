@@ -20,17 +20,17 @@ function when(core, iso) {
     return isNaN(date.getTime()) ? shown(core, iso, 40) : Qt.formatDateTime(date, "yyyy-MM-dd HH:mm:ss")
 }
 
-// An ErrorBody in words: its message, its hint, and its fix's label unless the panel offers that
-// fix as a button (`show_job`). An action this build doesn't know is shown by its label and does
-// nothing else.
-function errorText(core, error) {
+// An ErrorBody in words: its message, its hint, and its fix's label, unless `fixHasButton` (the
+// panel offers that fix as a button: `show_job` with its job). Any other action is shown by its
+// label and does nothing else.
+function errorText(core, error, fixHasButton) {
     if (!error)
         return ""
     const parts = [shown(core, error.message, 400)]
     const fix = error.fix || null
     if (fix && fix.user_hint)
         parts.push(shown(core, fix.user_hint, 300))
-    if (fix && fix.ui_action && fix.ui_action.id !== "show_job")
+    if (fix && fix.ui_action && !fixHasButton)
         parts.push(shown(core, fix.ui_action.label, 80))
     return parts.filter(p => p !== "").join(" ")
 }

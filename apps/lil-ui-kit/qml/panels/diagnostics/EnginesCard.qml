@@ -1,8 +1,9 @@
 // Engine health and VRAM (ARCH-121, QA-083), the launch profile and the asset catalogue (ARCH-126,
 // ARCH-065) and what changed in the engine's environment (CORE-130, CORE-166). It reads
 // `engines.status` and `engines.environment` and follows `engines`, whose events each carry an
-// engine's full state; an engine becoming ready reads the environment again, since that is when
-// one is recorded. Nothing an engine reports is trusted text (P4a-R8).
+// engine's full state; a `status` event reads the environment again, since the inventory job keeps
+// a capture after the engine is ready and says so that way. Nothing an engine reports is trusted
+// text (P4a-R8).
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
@@ -13,16 +14,21 @@ LCard {
     id: root
 
     required property var core
+    property bool active: true
     // The telemetry snapshot's GPU, or null.
     property var gpu: null
-    // Whether a telemetry snapshot has been read, so "no GPU" isn't said before.
+    // Whether a real telemetry sample has been read, so "no GPU" isn't said before.
     property bool gpuRead: false
 
     property var engines: []
+    // The first status read has its answer, either way.
+    readonly property bool known: statusRead.loaded || statusRead.error !== null
+    // The core reports ComfyUI with no launch profile and nothing running: no `[engines.comfyui]`.
+    readonly property bool notConfigured: engines.some(e => isUnconfigured(e))
 
     readonly property string vramText: {
         if (!gpuRead)
-            return "GPU memory: " + Words.notKnown
+            return "GPU memory: not read yet"
         if (!gpu)
             return "No GPU reading"
         if (!gpu.measured)
@@ -34,9 +40,15 @@ LCard {
         return Words.shown(core, text, maxChars)
     }
 
+    function isUnconfigured(e) {
+        return e.class === "none" && !e.launch_profile
+    }
+
     // The head line: "ComfyUI 0.42.1 · owned · ready".
     function headLine(e) {
         const name = e.engine === "comfyui" ? "ComfyUI" : shown(e.engine, 40)
+        if (isUnconfigured(e))
+            return name + " isn't configured"
         const version = e.version ? " " + shown(e.version, 80) : " (version not known)"
         const parts = [name + version]
         if (e.class !== "none")
@@ -49,7 +61,11 @@ LCard {
     function detailLines(e) {
         const lines = []
         const add = (text, tone) => lines.push({text: text, tone: tone || ""})
-        if (e.url) {
+        if (isUnconfigured(e))
+            return lines
+        if (e.state === "unreachable")
+            add("The core started it, but it doesn't answer.", "warning")
+        if (e.url && e.state !== "stopped") {
             if (e.listen === "all_interfaces")
                 add("Listens on every network address: " + shown(e.url, 200), "warning")
             else if (e.listen === "loopback")
@@ -74,10 +90,8 @@ LCard {
                 + shown(profile.preview_method, 40) + ", Manager " + (profile.manager ? "on" : "off")
                 + ", dynamic VRAM " + (profile.dynamic_vram ? "allowed" : "off"))
             add("Launch flags: " + shown((profile.flags || []).join(" "), 400))
-        } else if (e.class === "attached") {
-            add("An attached ComfyUI keeps its own launch settings.", "muted")
         } else {
-            add("No launch profile: ComfyUI isn't configured.", "muted")
+            add("An attached ComfyUI keeps its own launch settings.", "muted")
         }
         if (e.asset_catalogue === "on")
             add("ComfyUI's asset catalogue is on", "warning")
@@ -90,11 +104,13 @@ LCard {
 
     function changeLine(c) {
         const name = c.what === "node" ? shown(c.name, 120) : c.what === "driver" ? "GPU driver" : "ComfyUI"
+        // A custom node's folder need name neither a version nor a commit.
+        const version = v => shown(v, 120) || "version not known"
         if (c.change === "added")
-            return name + ": added, " + shown(c.to, 120)
+            return name + ": added, " + version(c.to)
         if (c.change === "removed")
-            return name + ": removed, was " + shown(c.from, 120)
-        return name + ": " + shown(c.from, 120) + " → " + shown(c.to, 120)
+            return name + ": removed, " + (c.from ? "was " + version(c.from) : "version not known")
+        return name + ": " + version(c.from) + " → " + version(c.to)
     }
 
     function upsert(engine) {
@@ -111,13 +127,17 @@ LCard {
         core: root.core
         tool: "engines.status"
         topic: "engines"
-        onResultChanged: root.engines = result && result.engines ? result.engines : []
+        active: root.active
+        onAnswered: (structured, current) => {
+            if (current)
+                root.engines = structured && structured.engines ? structured.engines : []
+        }
         onTopicEvent: data => {
             if (!data || !data.engine)
                 return
-            const before = root.engines.find(e => e.engine === data.engine.engine)
+            root.statusRead.eventApplied()
             root.upsert(data.engine)
-            if (data.engine.state === "ready" && (!before || before.state !== "ready"))
+            if (data.kind === "status")
                 root.environmentRead.request()
         }
     }
@@ -125,6 +145,7 @@ LCard {
     readonly property ToolRead environmentRead: ToolRead {
         core: root.core
         tool: "engines.environment"
+        active: root.active
     }
 
     readonly property var environment: environmentRead.result
@@ -157,6 +178,7 @@ LCard {
 
                 LineText {
                     text: root.headLine(parent.modelData)
+                    tone: parent.modelData.state === "unreachable" ? "warning" : ""
                     font.bold: true
                 }
                 Repeater {
@@ -172,6 +194,11 @@ LCard {
 
         LineText { text: root.vramText }
 
+        LineText {
+            visible: text !== ""
+            tone: "warning"
+            text: Words.errorText(root.core, root.environmentRead.error)
+        }
         LineText {
             visible: root.environmentRead.loaded && root.captures.length === 0
             tone: "muted"

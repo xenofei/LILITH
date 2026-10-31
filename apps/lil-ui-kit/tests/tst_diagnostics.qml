@@ -28,7 +28,11 @@ TestCase {
         QtObject {
             property var shown: []
             property var versions: ({qt: "6.12.0", webEngine: "6.140.0", kddockwidgets: "2.5.0"})
-            function showInExplorer(path) { shown = shown.concat([path]) }
+            property bool accepts: true
+            function showInExplorer(path) {
+                shown = shown.concat([path])
+                return accepts
+            }
             function componentVersions() { return versions }
         }
     }
@@ -46,6 +50,11 @@ TestCase {
     Component {
         id: logComponent
         EventLogModel {}
+    }
+
+    Component {
+        id: bundleExportComponent
+        BundleExport {}
     }
 
     // The panel alone in a window of the shell's size (a TestCase itself isn't visible).
@@ -129,7 +138,7 @@ TestCase {
     }
 
     function failed(error) {
-        return {status: "error", error: Object.assign({category: "unavailable", trace_id: "t_fake", retry: "never"}, error)}
+        return {status: "error", error: Object.assign({category: "transient", trace_id: "tr_0000000000000001", retry: "never"}, error)}
     }
 
     function isTool(name) {
@@ -163,7 +172,9 @@ TestCase {
 
     function desktop(over) {
         return Object.assign({
-            notifications: {job_failed: true}, quiet_while_fullscreen: true, fullscreen_autopause: true,
+            notifications: {job_finished: true, job_failed: true, confirmation_waiting: true, cap_alert: true,
+                            director_decision: true, agent_activity: true},
+            quiet_while_fullscreen: true, fullscreen_autopause: true,
             keep_awake_gpu: true, keep_awake_available: true,
             notification_path: {toasts: "ready", shortcut: "ok", handlers: "ok"}
         }, over || {})
@@ -176,8 +187,26 @@ TestCase {
                   mem_clock_mhz: 9000, throttle: [], vram_total_mib: 16384, vram_used_mib: 9728, measured: true},
             processes: [], cpu: {util_permille: 125, per_core_permille: [], package_power_mw: 0, measured: false},
             ram: {total_mib: 65536, used_mib: 32768}, disks: [], sizes: {}, net: [], system_power_mw: 240000,
-            system_parts: [], alerts: [], gpu_users: []
+            system_parts: [{part: "gpu", mw: 120000, measured: "measured"}, {part: "cpu", mw: 0, measured: "unknown"},
+                           {part: "rest", mw: 0, measured: "unknown"}],
+            alerts: [], gpu_users: []
         }, over || {})
+    }
+
+    // What `telemetry.snapshot` answers before the first sample (Snapshot::empty).
+    function emptySnapshot() {
+        return {ts: "2026-10-30T10:00:00Z", processes: [],
+                cpu: {util_permille: 0, per_core_permille: [], package_power_mw: 0, measured: false},
+                ram: {total_mib: 0, used_mib: 0}, disks: [], sizes: {}, net: [], system_power_mw: 0,
+                system_parts: [{part: "gpu", mw: 0, measured: "unknown"}, {part: "cpu", mw: 0, measured: "unknown"},
+                               {part: "rest", mw: 0, measured: "unknown"}],
+                alerts: [], gpu_users: []}
+    }
+
+    // A capture as `engines.environment` holds it.
+    function capture(at) {
+        return {system_stats: {system: {comfyui_version: "0.42.1"}, devices: []}, driver: "999.1", comfyui: "abc1234",
+                nodes: [], captured: at}
     }
 
     function report(over) {
@@ -241,7 +270,7 @@ TestCase {
 
     // --- Versions and engines -------------------------------------------------------------------
 
-    function test_versions_and_engine_health() { // spec: ARCH-121, APP-134, QA-083
+    function test_versions_and_engine_health() { // spec: ARCH-121, APP-134
         const core = makeCore()
         const panel = makePanel(core)
         load(core)
@@ -313,7 +342,7 @@ TestCase {
     function test_the_environments_changes_are_listed() { // spec: CORE-130, CORE-166
         const core = makeCore()
         const panel = makePanel(core)
-        load(core, {"engines.environment": ok({captures: [{captured: "2026-10-30T10:00:00Z"}, {captured: "2026-10-29T10:00:00Z"}],
+        load(core, {"engines.environment": ok({captures: [capture("2026-10-30T10:00:00Z"), capture("2026-10-29T10:00:00Z")],
             changes: [{what: "driver", from: "998", to: "999.1", change: "changed"},
                       {what: "node", name: "<b>pack</b>", to: "1.2 (abc)", change: "added"},
                       {what: "comfyui", from: "aaa", change: "removed"}]})})
@@ -322,7 +351,7 @@ TestCase {
         verify(shows(panel.engines, "ComfyUI: removed, was aaa"))
     }
 
-    function test_the_queue_is_shown() { // spec: ARCH-121, QA-083
+    function test_the_queue_is_shown() { // spec: ARCH-121
         const core = makeCore()
         const panel = makePanel(core)
         const job = n => ({job_id: "j_" + n, status: "queued"})
@@ -345,6 +374,56 @@ TestCase {
         compare(callsOf(core, "jobs.list").length, reads + 2, "one read for the burst so far")
     }
 
+    function test_a_read_older_than_an_engine_event_doesnt_overwrite_it() { // spec: ARCH-100, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        // The read is open when the event comes; its answer is older than the event.
+        const open = nextCall(core, isTool("engines.status"))
+        core.emit("engines", "event", {kind: "status", engine: comfy({state: "ready"})})
+        tryVerify(() => shows(panel.engines, "· owned · ready"), 5000)
+        answered[open.id] = true
+        core.respond(open.id, ok({engines: [comfy({state: "starting"})]}))
+        verify(shows(panel.engines, "· owned · ready"), texts(panel.engines).join(" | "))
+        verify(!shows(panel.engines, "starting"))
+        // A fresh read follows, and its answer is the state.
+        answer(core, isTool("engines.status"), ok({engines: [comfy({state: "ready", version: "0.50"})]}))
+        tryVerify(() => shows(panel.engines, "ComfyUI 0.50 · owned · ready"), 5000)
+    }
+
+    function test_a_read_older_than_a_queue_event_doesnt_overwrite_it() { // spec: ARCH-100, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        const lane = paused => ({lane: "gpu-heavy", paused: paused, reasons: paused ? ["manual"] : [], held: 0, restart_held: 0, withdrawn: 0})
+        const running = nextCall(core, c => c.name === "jobs.list" && c.args.status === "running")
+        const queued = nextCall(core, c => c.name === "jobs.list" && c.args.status === "queued")
+        core.emit("jobs", "event", {kind: "queue", state: lane(true)})
+        tryVerify(() => shows(panel.queue, "GPU work: paused by you"), 5000, texts(panel.queue).join(" | "))
+        for (const c of [running, queued]) {
+            answered[c.id] = true
+            core.respond(c.id, ok({jobs: [{job_id: "j_1", status: c.args.status}], next_cursor: null, lanes: [lane(false)]}))
+        }
+        verify(shows(panel.queue, "GPU work: paused by you"), texts(panel.queue).join(" | "))
+        // The counts of that answer still count; a fresh read follows.
+        verify(shows(panel.queue, "1 running, 1 queued"), texts(panel.queue).join(" | "))
+        answer(core, c => c.name === "jobs.list" && c.args.status === "running", ok({jobs: [], next_cursor: null, lanes: [lane(true)]}))
+        answer(core, c => c.name === "jobs.list" && c.args.status === "queued", ok({jobs: [], next_cursor: null, lanes: [lane(true)]}))
+        tryVerify(() => shows(panel.queue, "0 running, 0 queued"), 5000, texts(panel.queue).join(" | "))
+        verify(shows(panel.queue, "GPU work: paused by you"))
+    }
+
+    function test_telemetry_says_so_before_the_first_sample() { // spec: APP-134
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core, {"telemetry.snapshot": ok(emptySnapshot())})
+        tryVerify(() => shows(panel.telemetry, "No hardware reading yet"), 5000, texts(panel.telemetry).join(" | "))
+        for (const zero of ["CPU 0", "RAM 0", "No hardware alerts", "No GPU reading"])
+            verify(!shows(panel.telemetry, zero), zero)
+        verify(shows(panel.engines, "GPU memory: not read yet"), texts(panel.engines).join(" | "))
+        verify(!shows(panel.engines, "No GPU reading"))
+        core.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({ts: "2026-10-30T10:00:05Z"})})
+        tryVerify(() => shows(panel.telemetry, "Test GPU: 40 % load"), 5000)
+    }
+
     function test_telemetry_summary_follows_the_samples() { // spec: ARCH-121, APP-134
         const core = makeCore()
         const panel = makePanel(core)
@@ -355,7 +434,7 @@ TestCase {
         verify(shows(panel.telemetry, "240 W, estimated"))
         verify(shows(panel.telemetry, "No hardware alerts"))
         const later = snapshot({ts: "2026-10-30T10:00:05Z", gpu: Object.assign(snapshot().gpu, {util_pct: 90, vram_used_mib: 2048}),
-                                alerts: [{id: "a", kind: "gpu_hot"}]})
+                                alerts: [{id: "gpu_temperature", kind: "temperature", value: 88, since: "2026-10-30T10:00:05.000Z"}]})
         core.emit("telemetry", "event", {kind: "sample", snapshot: later})
         tryVerify(() => shows(panel.telemetry, "Test GPU: 90 % load"), 5000)
         verify(shows(panel.telemetry, "1 hardware alert"))
@@ -367,7 +446,7 @@ TestCase {
 
     // --- Errors ---------------------------------------------------------------------------------
 
-    function test_recent_errors_are_grouped_by_code() { // spec: ARCH-121, QA-083
+    function test_recent_errors_are_grouped_by_code() { // spec: ARCH-121
         const core = makeCore()
         const shell = fakeShellComponent.createObject(tc)
         const panel = makePanel(core, {shell: shell})
@@ -426,7 +505,76 @@ TestCase {
         verify(!panel.log.following)
         core.emit("things", "event", {n: "x"})
         wait(50)
-        verify(!panel.log.view.atYEnd, "stays where you read")
+        verify(lastRowShown(panel.log.view) < 900, "stays where you read: " + lastRowShown(panel.log.view))
+    }
+
+    // The last row on screen, read from the view rather than `atYEnd`, which goes stale at the cap.
+    function lastRowShown(view) {
+        return view.indexAt(20, view.contentY + view.height - 2)
+    }
+
+    function test_event_log_follows_the_newest_past_the_cap() { // spec: ARCH-121, APP-134
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        let n = 0
+        for (let batch = 0; batch < 26; ++batch) {
+            for (let i = 0; i < 100; ++i)
+                core.emit("things", "event", {n: n++})
+            wait(20)
+            const count = panel.log.view.count
+            tryVerify(() => lastRowShown(panel.log.view) >= count - 2, 2000,
+                      "after " + n + " events the last row on screen is " + lastRowShown(panel.log.view))
+        }
+        compare(panel.log.view.count, 1000)
+        verify(panel.log.following)
+        const newest = panel.log.view.itemAtIndex(999)
+        verify(newest, "the newest row is made")
+        verify(shows(newest, '"n":' + (n - 1)), texts(newest).join(" | "))
+    }
+
+    function test_the_keyboard_moves_from_the_newest_row() { // spec: APP-156
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        for (let i = 0; i < 200; ++i)
+            core.emit("things", "event", {n: i})
+        const view = panel.log.view
+        tryVerify(() => lastRowShown(view) >= 198, 5000)
+        panel.Window.window.requestActivate()
+        tryVerify(() => panel.Window.window.active, 5000)
+        view.forceActiveFocus(Qt.TabFocusReason)
+        const end = view.contentY
+        compare(view.currentIndex, 199, "the current row is the newest")
+        keyClick(Qt.Key_Down)
+        wait(50)
+        verify(view.contentY >= end - 1, "stays at the end: " + view.contentY + " from " + end)
+        verify(panel.log.following)
+        keyClick(Qt.Key_Up)
+        tryVerify(() => view.currentIndex === 198, 2000, "one row back: " + view.currentIndex)
+        verify(view.contentY >= end - 40, "one row, not the top: " + view.contentY + " from " + end)
+        verify(!panel.log.following, "reading back")
+        core.emit("things", "event", {n: "x"})
+        wait(50)
+        compare(view.currentIndex, 198, "a new event leaves the reader's row")
+        verify(!panel.log.following)
+        keyClick(Qt.Key_Down)
+        keyClick(Qt.Key_Down)
+        tryVerify(() => panel.log.following, 2000, "back at the newest, it follows again")
+    }
+
+    function test_event_log_says_what_it_leaves_out() { // spec: APP-134
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        verify(shows(panel.log, "Telemetry samples, job progress and preview frames aren't kept here"),
+               texts(panel.log).join(" | "))
+        core.emit("diagnostics", "event", {kind: "error", code: "store.io", tool: "asset.get", at: "2026-10-30T10:00:00Z"})
+        for (let i = 0; i < 1000; ++i)
+            core.emit("telemetry", "event", {kind: "sample", snapshot: snapshot()})
+        tryVerify(() => shows(panel.log, "1 event"), 5000, texts(panel.log).join(" | "))
+        compare(panel.log.view.count, 1, "1,000 samples push nothing out")
+        verify(panel.log.model.get(0).text.indexOf("store.io") >= 0)
     }
 
     function test_event_log_takes_the_shells_model_when_it_has_one() { // spec: ARCH-121
@@ -451,6 +599,7 @@ TestCase {
     // --- The bundle -----------------------------------------------------------------------------
 
     function bundleOf(dir) {
+        // As the core names one.
         const source = dir + "/lilith-diagnostics-20261030T100000Z.zip"
         verify(TestFiles.write(source, "the bundle's bytes"))
         return {path: source, bytes: 18, files: ["manifest.json", "versions.json"], redactions: 12345}
@@ -531,6 +680,84 @@ TestCase {
         compare(shell.opened, [{id: "jobs", method: "showJob", arg: "j_77", focus: true}])
     }
 
+    function test_a_show_job_fix_with_no_button_keeps_its_label() { // spec: ARCH-121
+        const fix = {ui_action: {id: "show_job", label: "Show the job"}, user_hint: "Look at it."}
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core, {"models.report": failed({code: "x.y", message: "No report.", fix: fix})})
+        tryVerify(() => shows(panel.models, "No report."), 5000)
+        verify(shows(panel.models, "Show the job"), "a card has no button, so its label stays: " + texts(panel.models).join(" | "))
+        const dir = TestFiles.newDir("bundle-fix")
+        panel.exportTo("file:///" + dir + "/a.zip")
+        answer(core, isTool("diagnostics.bundle"), failed({code: "x.y", message: "No bundle.", fix: fix}))
+        tryVerify(() => panel.banner.visible, 5000)
+        verify(!panel.fixButton.visible, "no job to open")
+        verify(panel.banner.text.indexOf("Show the job") >= 0, panel.banner.text)
+    }
+
+    function test_a_file_explorer_cant_show_is_said() { // spec: ARCH-121
+        const core = makeCore()
+        const shim = makeShim()
+        const panel = makePanel(core, {shim: shim})
+        load(core)
+        const dir = TestFiles.newDir("bundle-moved")
+        const source = bundleOf(dir)
+        panel.exportTo("file:///" + dir + "/picked.zip")
+        answer(core, isTool("diagnostics.bundle"), ok(source))
+        tryVerify(() => panel.explorerButton.visible, 5000)
+        shim.accepts = false
+        panel.explorerButton.click()
+        compare(panel.banner.kind, "danger")
+        verify(panel.banner.text.indexOf("Explorer can't show") >= 0, panel.banner.text)
+        verify(panel.banner.text.indexOf(dir + "/picked.zip") >= 0, panel.banner.text)
+    }
+
+    function test_a_bundle_that_cant_be_read_isnt_called_still_there() { // spec: ARCH-121
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        const dir = TestFiles.newDir("bundle-gone")
+        panel.exportTo("file:///" + dir + "/picked.zip")
+        answer(core, isTool("diagnostics.bundle"), ok({path: dir + "/gone.zip", bytes: 1, files: [], redactions: 0}))
+        tryVerify(() => !panel.exporter.busy && panel.banner.visible, 5000)
+        compare(panel.banner.kind, "danger")
+        verify(panel.banner.text.indexOf("couldn't be read") >= 0, panel.banner.text)
+        verify(panel.banner.text.indexOf("still at") < 0, panel.banner.text)
+        verify(!panel.explorerButton.visible, "nothing to show")
+        compare(TestFiles.list(dir), [], "nothing was written")
+    }
+
+    function test_a_second_export_says_it_is_under_way() { // spec: ARCH-121
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        const dir = TestFiles.newDir("bundle-second")
+        const source = bundleOf(dir)
+        panel.exportTo("file:///" + dir + "/one.zip")
+        answer(core, isTool("diagnostics.bundle"), ok(source))
+        tryVerify(() => panel.explorerButton.visible && panel.banner.visible, 5000)
+        panel.exportTo("file:///" + dir + "/two.zip")
+        verify(!panel.banner.visible, "the old banner goes")
+        compare(panel.exportButton.text, "Exporting…")
+        answer(core, isTool("diagnostics.bundle"), ok(source))
+        tryVerify(() => panel.banner.visible && !panel.exporter.busy, 5000)
+        compare(panel.exportButton.text, "Export diagnostics bundle")
+        verify(panel.banner.text.indexOf("two.zip") >= 0, panel.banner.text)
+    }
+
+    function test_going_mid_copy_leaves_no_temporary_file() { // spec: ARCH-121
+        const dir = TestFiles.newDir("bundle-going")
+        const source = dir + "/source.zip"
+        verify(TestFiles.write(source, "x".repeat(64 * 1024 * 1024)))
+        const exporter = bundleExportComponent.createObject(tc)
+        verify(exporter.save("file:///" + dir + "/kept.zip", source))
+        exporter.destroy()
+        wait(0)
+        const names = TestFiles.list(dir)
+        verify(names.indexOf("kept.zip") >= 0, names.join(", "))
+        verify(!names.some(n => n.indexOf("lil-tmp") >= 0), "left: " + names.join(", "))
+    }
+
     function test_explorer_takes_only_an_existing_zip() { // spec: ARCH-121
         const dir = TestFiles.newDir("explorer")
         const zip = dir + "/a.zip"
@@ -593,13 +820,24 @@ TestCase {
     function test_models_report_before_the_first_inventory_and_when_not_configured() { // spec: CORE-164
         const core = makeCore()
         const panel = makePanel(core)
-        load(core, {"models.report": ok(report({refreshed: null}))})
+        load(core, {"engines.status": ok({engines: [comfy({inventory: undefined})]}),
+                    "models.report": ok(report({refreshed: null}))})
         tryVerify(() => shows(panel.models, "No inventory yet"), 5000, texts(panel.models).join(" | "))
-        // A newer inventory reads the report again; the same one doesn't.
+        // The core's `status` event when the job keeps the capture: the environment is read again.
+        const environments = callsOf(core, "engines.environment").length
+        core.emit("engines", "event", {kind: "status", engine: comfy({inventory: undefined})})
+        answer(core, isTool("engines.environment"), ok({captures: [capture("2026-10-30T10:00:00Z")], changes: []}))
+        tryVerify(() => shows(panel.engines, "Engine environment recorded"), 5000, texts(panel.engines).join(" | "))
+        compare(callsOf(core, "engines.environment").length, environments + 1)
+        verify(shows(panel.models, "No inventory yet"), "no new inventory yet")
+        // Its `status` event when the job keeps the inventory (set_inventory, core test
+        // engines_topic_says_when_the_inventory_and_the_capture_are_kept): the report is read again;
+        // the same inventory isn't.
         const before = callsOf(core, "models.report").length
         core.emit("engines", "event", {kind: "status", engine: comfy()})
         answer(core, isTool("models.report"), ok(report()))
         tryVerify(() => shows(panel.models, "0 model files"), 5000, texts(panel.models).join(" | "))
+        verify(shows(panel.engines, "1,234 model files"))
         compare(callsOf(core, "models.report").length, before + 1)
         core.emit("engines", "event", {kind: "status", engine: comfy({state: "starting"})})
         wait(1100)
@@ -610,6 +848,49 @@ TestCase {
         answered = {}
         load(core2, {"models.report": failed({code: "engine.not_configured", message: "ComfyUI has no root."})})
         tryVerify(() => shows(panel2.models, "ComfyUI has no root."), 5000, texts(panel2.models).join(" | "))
+    }
+
+    function test_model_sizes_read_in_their_own_unit() { // spec: CORE-164
+        const core = makeCore()
+        const panel = makePanel(core)
+        const entry = (path, size) => ({path: path, size: size, sha256: "a", family: "x", states: [], untrusted: true})
+        load(core, {"models.report": ok(report({models: [entry("a", 500), entry("b", 30 * 1024), entry("c", 144 * 1048576), entry("d", 6.5 * 1073741824)]}))})
+        tryVerify(() => panel.models.view.itemAtIndex(3) !== null, 5000)
+        for (const [row, size] of [[0, "500 B"], [1, "30 KiB"], [2, "144 MiB"], [3, "6.5 GiB"]])
+            verify(shows(panel.models.view.itemAtIndex(row), size), size + ": " + texts(panel.models.view.itemAtIndex(row)).join(" | "))
+    }
+
+    function test_no_configured_comfyui_means_no_report_read() { // spec: CORE-164
+        const core = makeCore()
+        const panel = makePanel(core)
+        answer(core, isTool("engines.status"), ok({engines: [comfy({class: "none", state: "stopped", launch_profile: null, version: undefined, inventory: undefined})]}))
+        tryVerify(() => shows(panel.models, "ComfyUI isn't configured"), 5000, texts(panel.models).join(" | "))
+        wait(50)
+        compare(callsOf(core, "models.report"), [], "no engine.not_configured for a panel nobody asked of")
+        verify(shows(panel.engines, "ComfyUI isn't configured"), texts(panel.engines).join(" | "))
+        verify(!shows(panel.engines, "Where it listens"), texts(panel.engines).join(" | "))
+        // Configured later: it reads.
+        core.emit("engines", "event", {kind: "status", engine: comfy({state: "stopped", class: "none", inventory: undefined})})
+        answer(core, isTool("models.report"), ok(report({refreshed: null})))
+        tryVerify(() => shows(panel.models, "No inventory yet"), 5000)
+    }
+
+    function test_engine_lines_say_what_is_wrong() { // spec: ARCH-121
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core, {"engines.status": ok({engines: [comfy({state: "unreachable"})]}),
+                    "engines.environment": ok({captures: [capture("2026-10-30T10:00:00Z"), capture("2026-10-29T10:00:00Z")],
+                        changes: [{what: "node", name: "pack_a", change: "added"},
+                                  {what: "node", name: "pack_b", change: "removed"},
+                                  {what: "node", name: "pack_c", from: "1.0", change: "changed"}]})})
+        tryVerify(() => shows(panel.engines, "pack_c"), 5000, texts(panel.engines).join(" | "))
+        const head = find(panel.engines, i => typeof i.tone === "string" && i.text.indexOf("· unreachable") >= 0)
+        verify(head, texts(panel.engines).join(" | "))
+        compare(head.tone, "warning")
+        verify(shows(panel.engines, "pack_a: added, version not known"), texts(panel.engines).join(" | "))
+        verify(shows(panel.engines, "pack_b: removed, version not known"))
+        verify(shows(panel.engines, "pack_c: 1.0 → version not known"))
+        verify(!texts(panel.engines).some(t => /, $|→ $|was $/.test(t)), "no line ends on nothing")
     }
 
     // --- The notification path and the status lines ---------------------------------------------
@@ -659,6 +940,14 @@ TestCase {
         verify(!shows(panel.notifications, NotificationText.reachable))
     }
 
+    function test_a_failed_desktop_read_is_said() { // spec: APP-146
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core, {"desktop.get": failed({code: "core.bug", message: "The desktop can't be read."})})
+        tryVerify(() => shows(panel.notifications, "The desktop can't be read."), 5000, texts(panel.notifications).join(" | "))
+        verify(shows(panel.status, "Keep-awake: not known"), texts(panel.status).join(" | "))
+    }
+
     function test_keep_awake_unavailable_is_said() { // spec: ARCH-127
         const core = makeCore()
         const panel = makePanel(core)
@@ -683,7 +972,7 @@ TestCase {
         tryVerify(() => shows(panel.status, "This start: first frame in 377 ms, interactive in 1,414 ms"), 5000, texts(panel.status).join(" | "))
     }
 
-    function test_backup_status_line_and_the_backups_panel_empty_state() { // spec: APP-133, APP-134, QA-083
+    function test_backup_status_line_and_the_backups_panel_empty_state() { // spec: APP-133, APP-134
         const line = "No backups yet: backups arrive in a later version of LILITH"
         const core = makeCore()
         const shell = fakeShellComponent.createObject(tc)
@@ -746,6 +1035,113 @@ TestCase {
         compare(reads("diagnostics.recent"), recent + 1)
     }
 
+    function test_a_panel_behind_a_tab_reads_nothing() { // spec: ARCH-121, APP-136
+        const core = makeCore()
+        const shell = createTemporaryObject(shellComponent, tc, {core: core})
+        shell.visible = true
+        const dock = shell.docks.diagnostics
+        tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
+        const panel = dock.content
+        verify(!panel.visible, "a tab behind")
+        const own = ["diagnostics.recent", "desktop.get", "models.report", "engines.environment"]
+        for (const name of own)
+            compare(callsOf(core, name), [], name + " isn't read behind a tab")
+        // The log still hears the topics only this panel follows, from the start.
+        for (const topic of ["diagnostics", "desktop"])
+            verify(core.subscriberCount(topic) >= 1, topic)
+        // A job's change behind the tab costs no read of its own.
+        const lists = callsOf(core, "jobs.list").filter(c => c.args.limit === 100 && c.args.status === "queued").length
+        // First shown, it reads.
+        dock.setAsCurrentTab()
+        tryVerify(() => panel.visible && panel.width > 0, 5000)
+        for (const name of own.slice(0, 2))
+            tryVerify(() => callsOf(core, name).length === 1, 5000, name)
+        compare(callsOf(core, "jobs.list").filter(c => c.args.limit === 100 && c.args.status === "queued").length, lists + 1)
+        // And behind a tab again it follows no more, but for the log.
+        shell.docks.hardware.setAsCurrentTab()
+        tryVerify(() => !panel.visible, 5000)
+        tryVerify(() => !panel.shown, 5000)
+        const reads = callsOf(core, "diagnostics.recent").length
+        core.emit("diagnostics", "event", {kind: "error", code: "x", at: "2026-10-30T10:00:00Z"})
+        wait(1100)
+        compare(callsOf(core, "diagnostics.recent").length, reads)
+        shell.destroy()
+        wait(100)
+    }
+
+    function test_shown_again_it_reads_afresh() { // spec: APP-146, CORE-164
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core, {"desktop.get": ok(desktop({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}))})
+        tryVerify(() => shows(panel.notifications, "The Start-menu shortcut is missing"), 5000)
+        compare(callsOf(core, "desktop.get")[0].args.fresh, true, "never the 10 s cache")
+        wait(2100)
+        // You run lil doctor, and come back.
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        panel.visible = true
+        const call = answer(core, isTool("desktop.get"), ok(desktop()))
+        compare(call.args.fresh, true)
+        tryVerify(() => shows(panel.notifications, "Nothing stands in the way"), 5000, texts(panel.notifications).join(" | "))
+        for (const name of ["models.report", "engines.environment", "engines.status", "diagnostics.recent", "telemetry.snapshot"])
+            answer(core, isTool(name), ok(name === "models.report" ? report() : name === "engines.environment" ? {captures: [], changes: []}
+                                          : name === "engines.status" ? {engines: [comfy()]} : name === "diagnostics.recent" ? {errors: []} : snapshot()))
+        // Back and forth: at most once in 2 s, the last answer still fresh at the end.
+        const reads = callsOf(core, "desktop.get").length
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        panel.visible = true
+        wait(100)
+        compare(callsOf(core, "desktop.get").length, reads, "within 2 s of the last read")
+        tryVerify(() => callsOf(core, "desktop.get").length === reads + 1, 5000, "the read held back")
+    }
+
+    function test_a_short_flicker_of_the_panel_reads_nothing() { // spec: ARCH-116
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        wait(2100)
+        const calls = core.calls.length
+        panel.visible = false
+        wait(20)
+        panel.visible = true
+        wait(800)
+        compare(core.calls.length, calls)
+        verify(panel.shown)
+    }
+
+    function test_a_first_read_open_when_ready_comes_is_retried() { // spec: APP-033
+        const core = makeCore()
+        core.connection = "connecting"
+        const panel = makePanel(core)
+        const open = nextCall(core, isTool("engines.environment"))
+        core.connection = "ready"
+        answered[open.id] = true
+        core.respond(open.id, failed({code: "core.unreachable", message: "Not connected."}))
+        answer(core, isTool("engines.environment"), ok({captures: [capture("2026-10-30T10:00:00Z")], changes: []}))
+        tryVerify(() => shows(panel.engines, "Engine environment recorded"), 5000, texts(panel.engines).join(" | "))
+    }
+
+    function test_a_re_read_keeps_the_focus_on_a_rows_button() { // spec: APP-156
+        const core = makeCore()
+        const shell = fakeShellComponent.createObject(tc)
+        const panel = makePanel(core, {shell: shell})
+        const row = (count, message) => ({code: "comfyui.out_of_memory", count: count, first_at: "2026-10-30T09:00:00Z", last_at: "2026-10-30T10:00:00Z",
+                                          last_message: message, last_tool: "comfy.prompt", last_job_id: "j_0123"})
+        load(core, {"diagnostics.recent": ok({errors: [row(2, "First.")]})})
+        tryVerify(() => button(panel.errors, "Show the job") !== null, 5000)
+        const show = button(panel.errors, "Show the job")
+        show.forceActiveFocus(Qt.TabFocusReason)
+        verify(show.activeFocus)
+        core.emit("diagnostics", "event", {kind: "error", code: "comfyui.out_of_memory", at: "2026-10-30T10:00:00Z"})
+        answer(core, isTool("diagnostics.recent"), ok({errors: [{code: "new.one", count: 1, first_at: "2026-10-30T10:00:00Z", last_at: "2026-10-30T10:00:00Z", last_message: "New."}, row(3, "Second.")]}))
+        tryVerify(() => shows(panel.errors, "Second."), 5000, texts(panel.errors).join(" | "))
+        verify(shows(panel.errors, "3 times"))
+        verify(button(panel.errors, "Show the job") === show, "the same button")
+        verify(show.activeFocus, "the focus stays on it")
+        compare(panel.errors.rowsModel.count, 2)
+    }
+
     function test_a_first_read_that_failed_reads_again_when_ready() { // spec: APP-033
         const core = makeCore()
         core.connection = "connecting"
@@ -787,6 +1183,24 @@ TestCase {
         compare(TestFiles.networkRequests(), 0, "and loaded nothing")
     }
 
+    function test_providers_and_claude_code_say_when_they_come() { // spec: QA-083
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        // What plan 4a delivers of QA-083, each on the panel...
+        tryVerify(() => shows(panel.engines, "ComfyUI 0.42.1 · owned · ready"), 5000)
+        verify(shows(panel.versions, "Core 0.0.0+fakecore"))
+        verify(shows(panel.errors, "No errors"))
+        verify(shows(panel.telemetry, "Test GPU"))
+        verify(shows(panel.queue, "running"))
+        verify(shows(panel.status, "No backups yet"))
+        // ...and what it doesn't says so.
+        verify(shows(panel.providers, "Provider health"), texts(panel.providers).join(" | "))
+        verify(shows(panel.providers, "Claude Code"))
+        verify(shows(panel.providers, "later version of LILITH"))
+        compare(panel.providers.title, "Providers and Claude Code")
+    }
+
     // --- Floating, and the gate -----------------------------------------------------------------
 
     function test_float_and_redock_keeps_diagnostics_state() { // spec: ARCH-116
@@ -801,6 +1215,7 @@ TestCase {
         dock.setAsCurrentTab()
         tryVerify(() => panel.visible && panel.width > 0, 5000, "the diagnostics tab is in front")
         // The other panels ask the same tools here, so the panel's state comes from an event.
+        tryVerify(() => panel.shown, 5000)
         core.emit("engines", "event", {kind: "status", engine: comfy()})
         tryVerify(() => shows(panel.engines, "ComfyUI 0.42.1 · owned · ready"), 5000)
         core.emit("things", "event", {n: 1})
