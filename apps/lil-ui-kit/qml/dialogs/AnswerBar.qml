@@ -37,6 +37,17 @@ Column {
     readonly property bool connected: CoreGate.ready(root)
     readonly property bool buttonsOn: open && !busy && !sent
     readonly property bool live: buttonsOn && connected
+    // This shows in the shell's modal dialog: its Close leads to the shell's banner, which has the
+    // way out of what doesn't clear by itself (a refused workspace, a failed start).
+    property bool bannerBehind: false
+    readonly property string awayWords: {
+        const connection = core ? core.connection : ""
+        if (connection === "reconnecting" || connection === "connecting")
+            return "Not connected to the core yet: the buttons come back when it is."
+        return bannerBehind
+            ? "Not connected to the core, and this may not clear by itself. Close this and use the banner at the top of the window. Closing answers nothing: this stays waiting."
+            : "Not connected to the core, so this can't be answered for now. It is still waiting."
+    }
     readonly property alias reasonLine: reasonLine
     default property alias buttons: row.data
 
@@ -144,7 +155,7 @@ Column {
         // Its room is kept: a popup is centred, so a reason arriving would move the buttons.
         height: Math.max(implicitHeight, 2 * (font.pixelSize + 4))
         text: root.reason !== "" ? root.reason
-            : root.open && !root.connected ? "Not connected to the core: the buttons come back when it is."
+            : root.open && !root.connected ? root.awayWords
             : ""
         textFormat: Text.PlainText
         color: Theme.warning

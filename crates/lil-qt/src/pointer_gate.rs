@@ -681,6 +681,37 @@ mod tests {
         assert_eq!(r.qml_click(), Ok(()));
     }
 
+    /// The buttons went off and on under a cursor that never moved, so the gate saw no message in
+    /// between: `ApproveButton` watches again, and the next message finds a new button at that spot.
+    #[test] // spec: P4a-R10
+    fn refuses_a_rest_from_before_the_button_went_off_and_on() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        let back_on = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let same = Target {
+            changed: false,
+            ..back_on
+        };
+        r.seen(PointerKind::Press, hardware(ON), Some(back_on));
+        r.seen(PointerKind::Release, hardware(ON), Some(same));
+        r.gate.take_press(2, r.now);
+        assert_eq!(r.gate.take_click(2, r.now), Err(GateRefusal::Reenter));
+        // Off it and back.
+        r.seen(PointerKind::Move, hardware(OFF), None);
+        r.seen(PointerKind::Move, hardware((101, 101)), Some(same));
+        r.seen(PointerKind::Move, hardware(ON), Some(same));
+        r.advance(HOVER_BEFORE_PRESS);
+        r.seen(PointerKind::Press, hardware(ON), Some(same));
+        r.advance(Duration::from_millis(80));
+        r.seen(PointerKind::Release, hardware(ON), Some(same));
+        r.gate.take_press(2, r.now);
+        assert_eq!(r.gate.take_click(2, r.now), Ok(()));
+    }
+
     #[test] // spec: P4a-R10
     fn refuses_a_moving_hand_on_a_button_that_changed_under_it() {
         // The swap the review found: the hand keeps moving and rests after the change.

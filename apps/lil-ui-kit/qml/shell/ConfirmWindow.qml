@@ -104,6 +104,15 @@ Window {
         }
     }
 
+    // The dialogs can answer again, and nothing has the keyboard: the same rule, while this window
+    // has it. Qt gives it back to a control that held it.
+    function _focusBack() {
+        if (!active)
+            return
+        _focusWanted = true
+        _focusFirst()
+    }
+
     // The dialog on `id`, once made.
     function dialogOf(id) {
         for (let i = 0; i < dialogs.count; ++i) {
@@ -196,6 +205,7 @@ Window {
                 fromToast: root.toastDenied[cid] === true
                 cardMaxHeight: Math.max(160, root.height / 2)
                 onAnswered: confirmation => list.apply(confirmation)
+                onLiveAgain: Qt.callLater(root._focusBack)
             }
         }
     }

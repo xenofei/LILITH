@@ -59,6 +59,9 @@ Item {
     }
 
     onTargetKeyChanged: if (_watching) pointerSource.watch(root)
+    // Back on after being off (the core away, an answer out, what's shown not read): a new button to
+    // the gate too. A hand that rested before it went off moves off and back, and is told so.
+    onEnabledChanged: if (_watching && enabled) pointerSource.watch(root)
     Component.onCompleted: {
         pointerSource.watch(root)
         _watching = true

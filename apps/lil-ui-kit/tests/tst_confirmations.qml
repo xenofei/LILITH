@@ -703,6 +703,156 @@ TestCase {
         closeDialog(panel)
     }
 
+    // A refused workspace or a failed start doesn't clear by itself, and what clears it is on the
+    // banner behind the dim: Close is the way there, and closing answers nothing.
+    function test_close_is_the_way_out_while_the_core_is_away() { // spec: APP-034, APP-044
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        const line = dialog.bar.reasonLine
+        verify(!panel.closeDialogButton.visible, "a pending dialog is answered, not closed")
+
+        fake.connection = "reconnecting"
+        tryVerify(() => panel.closeDialogButton.visible, 1000)
+        verify(line.text.indexOf("come back") >= 0, "this one does clear by itself: " + line.text)
+
+        fake.connection = "unavailable"
+        tryVerify(() => line.text.indexOf("banner") >= 0, 1000, line.text)
+        verify(line.text.indexOf("come back") < 0, "no promise: " + line.text)
+        verify(panel.closeDialogButton.visible)
+        verify(!dialog.denyButton.enabled && !dialog.approveButton.enabled)
+        tryVerify(() => panel.closeDialogButton.y >= dialog.y + dialog.height, 1000, "laid out under the dialog")
+
+        const calls = fake.calls.length
+        mouseClick(panel.closeDialogButton)
+        tryVerify(() => !panel.dialogPopup.visible, 2000, "closed")
+        compare(Shapes.answers(fake).length, 0, "closing answers nothing")
+        compare(fake.calls.length, calls, "and asks nothing of the core")
+        compare(panel.list.view(crane.id).state, "pending")
+        compare(panel.list.pendingModel.count, 1, "it stays waiting")
+
+        fake.connection = "ready"
+        openDialog(panel, crane.id)
+        verify(!panel.closeDialogButton.visible, "and the dialog is back to being answered")
+        verify(panel.dialog.denyButton.enabled)
+        closeDialog(panel)
+    }
+
+    function test_a_rest_doesnt_survive_the_buttons_going_off_and_on() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const before = hand.watches
+        fake.connection = "reconnecting"
+        tryVerify(() => !panel.dialog.approveButton.enabled, 1000)
+        compare(hand.watches, before, "going off is nothing to the gate")
+        fake.connection = "ready"
+        tryVerify(() => panel.dialog.approveButton.enabled, 1000)
+        verify(hand.watches > before, "coming back is a new button to the gate")
+        closeDialog(panel)
+    }
+
+    function test_the_keyboard_comes_back_to_deny_after_an_outage() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        tryVerify(() => dialog.denyButton.activeFocus, 2000)
+        fake.connection = "reconnecting"
+        tryVerify(() => !dialog.denyButton.activeFocus, 1000, "it can't hold it while off")
+        fake.connection = "ready"
+        tryVerify(() => dialog.denyButton.activeFocus, 1000, "it has it back")
+        verify(!dialog.approveButton.activeFocus)
+        wait(550)
+        keyClick(Qt.Key_Return)
+        const sent = Shapes.answers(fake)
+        compare(sent.length, 1, "Enter works with no Tab first")
+        compare(sent[0].args.answer, "deny")
+        fake.respond(sent[0].id, Shapes.answerResult(Shapes.answeredView(crane, "denied")))
+        closeDialog(panel)
+    }
+
+    function test_the_keyboard_comes_back_to_cancel_from_the_amount_field() { // spec: P4a-R10
+        const capped = Shapes.view({id: "cf_00000000000000e2", covers: ["cap"], cap: [Shapes.capHit()]})
+        const panel = makePanel([capped])
+        openDialog(panel, capped.id)
+        const prompt = panel.dialog.capPrompt
+        const field = prompt.raises.itemAt(0).field
+        field.forceActiveFocus()
+        verify(field.activeFocus)
+        fake.connection = "reconnecting"
+        tryVerify(() => !field.activeFocus, 1000)
+        fake.connection = "ready"
+        tryVerify(() => field.activeFocus, 1000, "the field has it back, where it was")
+        verify(!prompt.allowOnceButton.activeFocus)
+
+        // Close held it during the outage, and Close has gone: Cancel, never Allow once.
+        fake.connection = "reconnecting"
+        tryVerify(() => panel.closeDialogButton.visible, 1000)
+        panel.closeDialogButton.forceActiveFocus()
+        fake.connection = "ready"
+        tryVerify(() => prompt.cancelButton.activeFocus, 1000)
+        verify(!prompt.allowOnceButton.activeFocus)
+        closeDialog(panel)
+    }
+
+    function test_the_keyboard_goes_to_deny_when_close_held_it() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        fake.connection = "reconnecting"
+        tryVerify(() => panel.closeDialogButton.visible, 1000)
+        panel.closeDialogButton.forceActiveFocus()
+        verify(panel.closeDialogButton.activeFocus)
+        fake.connection = "ready"
+        tryVerify(() => dialog.denyButton.activeFocus, 1000)
+        verify(!dialog.approveButton.activeFocus)
+        closeDialog(panel)
+    }
+
+    function test_the_keyboard_is_left_alone_when_it_is_elsewhere() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        // On something else in the dialog.
+        dialog.approveButton.forceActiveFocus()
+        verify(dialog.approveButton.activeFocus)
+        dialog.focusDenyIfLost()
+        verify(dialog.approveButton.activeFocus, "it stays on what has it")
+
+        // Another window has the keyboard.
+        fake.connection = "reconnecting"
+        tryVerify(() => panel.closeDialogButton.visible, 1000)
+        panel.closeDialogButton.forceActiveFocus()
+        const other = createTemporaryObject(otherWindow, null)
+        other.requestActivate()
+        tryVerify(() => other.active && !dialog.bar.inFront, 2000, "another window is in front")
+        fake.connection = "ready"
+        tryVerify(() => dialog.denyButton.enabled, 1000)
+        wait(50)
+        tc.Window.window.requestActivate()
+        tryVerify(() => dialog.bar.inFront, 2000)
+        verify(!dialog.denyButton.activeFocus, "nothing was taken while it was away")
+        closeDialog(panel)
+    }
+
+    // An answer that is out holds the buttons off, whatever the core does meanwhile.
+    function test_an_answer_out_holds_the_buttons_across_an_outage() { // spec: APP-034, P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        mouseClick(dialog.denyButton)
+        const sent = Shapes.answers(fake)
+        compare(sent.length, 1)
+        verify(!dialog.denyButton.enabled && !dialog.approveButton.enabled, "off with the answer out")
+        fake.connection = "reconnecting"
+        tryVerify(() => !dialog.bar.connected, 1000)
+        fake.connection = "ready"
+        tryVerify(() => dialog.bar.connected, 1000)
+        verify(!dialog.denyButton.enabled && !dialog.approveButton.enabled, "the core back doesn't free them")
+        fake.respond(sent[0].id, {status: "error", error: {code: "core.busy", message: "busy"}})
+        tryVerify(() => dialog.denyButton.enabled && dialog.approveButton.enabled, 1000, "the failed answer does")
+        closeDialog(panel)
+    }
+
     function test_the_dialog_passes_the_accessibility_walk() { // spec: APP-156
         const capped = Shapes.view({id: "cf_00000000000000e1", covers: ["cap"], cap: [Shapes.capHit()]})
         const panel = makePanel([crane, capped])

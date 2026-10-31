@@ -165,6 +165,38 @@ TestCase {
         verify(shown.stateLine.text.indexOf("cancelled") > 0, shown.stateLine.text)
     }
 
+    function test_the_keyboard_comes_back_after_an_outage() { // spec: P4a-R10
+        const w = makeWindow([first])
+        launch(w, {kind: "confirm", id: first.id})
+        const dialog = w.dialogOf(first.id)
+        tryVerify(() => dialog.denyButton.activeFocus, 2000)
+        fake.connection = "reconnecting"
+        tryVerify(() => !dialog.denyButton.activeFocus, 1000)
+        fake.connection = "ready"
+        tryVerify(() => dialog.denyButton.activeFocus, 1000, "Enter works with no Tab first")
+        verify(!dialog.approveButton.activeFocus)
+
+        // The keyboard went elsewhere meanwhile, and that has gone: nothing has it now.
+        fake.connection = "reconnecting"
+        tryVerify(() => !dialog.denyButton.activeFocus, 1000)
+        w.contentItem.forceActiveFocus()
+        fake.connection = "ready"
+        tryVerify(() => dialog.denyButton.activeFocus, 1000, "Deny takes it")
+        verify(!dialog.approveButton.activeFocus)
+    }
+
+    // This window has no shell banner and no Close, so its words don't send anyone to them.
+    function test_a_core_thats_gone_says_only_what_is_true_here() { // spec: APP-034
+        const w = makeWindow([first])
+        launch(w, {kind: "confirm", id: first.id})
+        const line = w.dialogOf(first.id).bar.reasonLine
+        fake.connection = "unavailable"
+        tryVerify(() => line.text !== "", 1000)
+        verify(line.text.indexOf("banner") < 0 && line.text.indexOf("Close") < 0, line.text)
+        verify(line.text.indexOf("come back") < 0, line.text)
+        verify(line.text.indexOf("still waiting") >= 0, line.text)
+    }
+
     function test_reconnect_keeps_the_dialog_and_its_state() { // spec: APP-033, APP-048
         const w = makeWindow([first])
         launch(w, {kind: "confirm", id: first.id})

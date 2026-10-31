@@ -140,6 +140,55 @@ TestCase {
         verify(row.children[2].text.indexOf("Limit when this was asked: 1.00 USD") === 0, row.children[2].text)
     }
 
+    // tst_controls' case for the base controls: a gate engaged under a disabled parent comes back,
+    // and neither a gate nor a parent keeps the other's `false`.
+    Component {
+        id: disabledParentPage
+        Item {
+            id: under
+            width: 480
+            height: 400
+            visible: true
+            property var core: null
+            property bool parentOn: true
+            property alias deny: plainDeny
+            property alias approve: plainApprove
+            Column {
+                enabled: under.parentOn
+                property var core: under.core
+                DenyButton { id: plainDeny; requiresCore: true; text: "Deny" }
+                ApproveButton { id: plainApprove; requiresCore: true; pointerSource: hand }
+            }
+        }
+    }
+
+    function test_the_answer_buttons_gate_under_a_disabled_parent() { // spec: APP-034, P4a-R10
+        const w = createTemporaryObject(disabledParentPage, tc, {core: fake})
+        const marked = [w.deny, w.approve]
+        for (const c of marked)
+            verify(c.enabled, "starts live: " + c)
+
+        // Parent off, then the core lost; parent on, then the core back.
+        w.parentOn = false
+        fake.connection = "reconnecting"
+        w.parentOn = true
+        for (const c of marked)
+            verify(!c.enabled, "the gate still holds: " + c)
+        fake.connection = "ready"
+        for (const c of marked)
+            verify(c.enabled, "back: " + c)
+
+        // The core back first, under the parent.
+        w.parentOn = false
+        fake.connection = "reconnecting"
+        fake.connection = "ready"
+        for (const c of marked)
+            verify(!c.enabled, "the parent still holds: " + c)
+        w.parentOn = true
+        for (const c of marked)
+            verify(c.enabled, "back again: " + c)
+    }
+
     function test_every_control_waits_for_the_core() { // spec: APP-034
         const prompt = makePrompt()
         const row = prompt.raises.itemAt(0)

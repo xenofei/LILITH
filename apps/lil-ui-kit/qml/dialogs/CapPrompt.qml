@@ -38,6 +38,8 @@ Column {
     property string alsoApproves
     // Whether the buttons that approve may turn on, and why not, next to them (the dialog's).
     property bool approvable: true
+    // AnswerBar's.
+    property bool bannerBehind: false
     property string blockedWhy
 
     readonly property alias bar: bar
@@ -154,6 +156,7 @@ Column {
         confirmationId: root.confirmationId
         shownKey: root.shownKey
         open: root.open && !root.ended
+        bannerBehind: root.bannerBehind
         onAnswered: confirmation => {
             root.ended = true
             root.answered(confirmation)

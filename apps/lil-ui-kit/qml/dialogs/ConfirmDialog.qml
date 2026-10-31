@@ -48,6 +48,8 @@ Column {
         : scroller.contentY > scroller.seenTo
           ? "You jumped past part of the request. Scroll back up to where you stopped: " + unseenPercent + "% hasn't been on screen yet."
           : "Scroll through all of the request: " + unseenPercent + "% hasn't been on screen yet. This turns on once every line has been."
+    // AnswerBar's.
+    property bool bannerBehind: false
     readonly property alias header: header
     readonly property alias card: card
     readonly property alias scroller: scroller
@@ -66,6 +68,32 @@ Column {
             capPromptLoader.item.focusCancel()
         else
             denyButton.forceActiveFocus(Qt.TabFocusReason)
+    }
+
+    // The bar that answers here: an answer can go.
+    readonly property bool live: isCap && capPromptLoader.item ? capPromptLoader.item.bar.live : bar.live
+    property bool _wasLive: false
+    // It could answer, couldn't for a while, and can again.
+    signal liveAgain()
+    onLiveChanged: {
+        if (live && _wasLive)
+            liveAgain()
+        if (live)
+            _wasLive = true
+    }
+
+    // Qt gives the keyboard back to a control that had it when that control comes back on. This is for
+    // when nothing has it by then (the panel's Close held it, and has gone): Deny, never Approve, and
+    // only while this window has the keyboard and nothing in the dialog holds it.
+    function focusDenyIfLost() {
+        const window = root.Window.window
+        if (!window || !window.active)
+            return
+        for (let item = window.activeFocusItem; item; item = item.parent) {
+            if (item === root)
+                return
+        }
+        focusDeny()
     }
 
     onShownKeyChanged: scroller.startAgain()
@@ -198,6 +226,7 @@ Column {
         confirmationId: root.confirmationId
         shownKey: root.shownKey
         open: root.pending && root.loaded && !card.ranOut
+        bannerBehind: root.bannerBehind
         onAnswered: confirmation => root.answered(confirmation)
 
         DenyButton {
@@ -254,6 +283,7 @@ Column {
             cap: root.view ? root.view.cap : []
             pointerSource: root.pointerSource
             open: !card.ranOut && root.loaded
+            bannerBehind: root.bannerBehind
             followTopic: false
             shownKey: root.shownKey
             alsoApproves: Words.coversConfirm(root.view) ? ConfirmInput.shownLine(String(root.view.tool), 60) : ""

@@ -251,12 +251,16 @@ Rectangle {
                 loaded: list.loaded
                 pointerSource: root.pointerSource
                 cardMaxHeight: popup.parent ? Math.max(120, popup.parent.height - 320) : 400
+                bannerBehind: true
                 onAnswered: confirmation => list.apply(confirmation)
+                onLiveAgain: if (popup.opened) Qt.callLater(dialog.focusDenyIfLost)
             }
 
+            // Also while the core is away: the way out of that is on the banner behind the dim.
+            // Closing answers nothing, and the confirmation stays waiting.
             LButton {
                 id: closeDialogButton
-                visible: !dialog.pending
+                visible: !dialog.pending || !dialog.bar.connected
                 text: "Close"
                 onClicked: popup.close()
             }
