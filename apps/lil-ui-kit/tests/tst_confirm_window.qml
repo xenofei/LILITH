@@ -177,9 +177,11 @@ TestCase {
         verify(!dialog.approveButton.activeFocus)
 
         // The keyboard went elsewhere meanwhile, and that has gone: nothing has it now.
+        w.requestActivate()
+        tryVerify(() => w.active, 2000, "the window has the keyboard")
         fake.connection = "reconnecting"
         tryVerify(() => !dialog.denyButton.activeFocus, 1000)
-        w.contentItem.forceActiveFocus()
+        dialog.denyButton.focus = false
         fake.connection = "ready"
         tryVerify(() => dialog.denyButton.activeFocus, 1000, "Deny takes it")
         verify(!dialog.approveButton.activeFocus)
