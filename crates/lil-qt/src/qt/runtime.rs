@@ -106,6 +106,8 @@ pub struct StateView {
     /// `connecting`, `ready`, `reconnecting`, `incompatible` or `unavailable`.
     pub connection: &'static str,
     pub core_protocol: Option<String>,
+    /// The `build_id` of the core's hello.
+    pub core_build_id: Option<String>,
     /// The hello's workspace as JSON (`None` inside: no workspace).
     pub workspace: Option<Option<String>>,
     /// While unavailable, why as JSON: `{reason, cause, code?, retry?}`.
@@ -117,6 +119,7 @@ impl StateView {
         let only = |connection| StateView {
             connection,
             core_protocol: None,
+            core_build_id: None,
             workspace: None,
             unavailable: None,
         };
@@ -130,12 +133,15 @@ impl StateView {
             SessionState::Incompatible { core_protocol } => StateView {
                 connection: "incompatible",
                 core_protocol: Some(core_protocol.clone()),
+                // No hello: the build of the core before this one is no longer the core's.
+                core_build_id: Some(String::new()),
                 workspace: None,
                 unavailable: None,
             },
             SessionState::Ready(hello) => StateView {
                 connection: "ready",
                 core_protocol: Some(hello.protocol.clone()),
+                core_build_id: Some(hello.build_id.clone()),
                 workspace: Some(hello.workspace.as_ref().map(to_json)),
                 unavailable: None,
             },
@@ -356,6 +362,7 @@ impl Runtime {
             None => shared.gui.push(Delivery::State(StateView {
                 connection: "unavailable",
                 core_protocol: None,
+                core_build_id: None,
                 workspace: Some(None),
                 unavailable: Some(
                     json!({"reason": "This process has no core session.", "cause": "other"})
@@ -1003,7 +1010,35 @@ async fn resend(
 
 #[cfg(test)]
 mod tests {
+    use lil_protocol::session::{CoreInfo, HelloResult};
+
     use super::*;
+
+    #[test] // spec: ARCH-121
+    fn the_core_build_id_is_the_hello_s_and_goes_with_an_incompatible_core() {
+        let hello = HelloResult {
+            session_id: "s_0000000000000001".into(),
+            instance_id: "i_1".into(),
+            protocol: "1.2".into(),
+            build_id: "9.9.9+another-build".into(),
+            schema_hash: String::new(),
+            capabilities: Vec::new(),
+            caller_kind: "ui:test".into(),
+            workspace: None,
+            core: CoreInfo {
+                pid: 1,
+                channel: "test-fake".into(),
+                pipe: "fake".into(),
+            },
+        };
+        let ready = StateView::of(&SessionState::Ready(Box::new(hello)));
+        assert_eq!(ready.core_build_id.as_deref(), Some("9.9.9+another-build"));
+        let other = StateView::of(&SessionState::Incompatible {
+            core_protocol: "2.0".into(),
+        });
+        assert_eq!(other.core_build_id.as_deref(), Some(""));
+        assert_eq!(StateView::of(&SessionState::Connecting).core_build_id, None);
+    }
 
     fn event(topic: &str, seq: u64, bytes: usize) -> Delivery {
         Delivery::Event(EventParams {

@@ -5,6 +5,8 @@
 //! thread. `why` says why the write failed and what became of the file that was there.
 //!
 //! - `file` is a `file:` URL (the file dialog's); `path` in the signals is its local path.
+//! - The thread goes on [`crate::csv::WRITES`], which `main` waits for when the event loop ends.
+//! - The log names no file: the app's log goes into a diagnostics bundle.
 //! - `busy` is true from a `save` until its signal. A `save` while busy, or one whose arguments
 //!   don't read (not a local file, `rowsJson` not a JSON array, `columnsJson` not an array of
 //!   strings), returns false and writes nothing; else it returns true and its signal follows.
@@ -92,19 +94,22 @@ impl qobject::CsvExport {
             .spawn(move || {
                 let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
                 let outcome = crate::csv::export(std::path::Path::new(&path), &rows, &columns)
-                    .map_err(|e| e.to_string());
-                if let Err(why) = &outcome {
-                    tracing::warn!(error = %why, "the usage CSV wasn't written");
-                }
+                    .map_err(|e| {
+                        tracing::warn!(kind = ?e.kind(), "the usage CSV wasn't written");
+                        e.to_string()
+                    });
                 // An export whose object is gone has nobody to tell.
                 let _ = thread.queue(move |obj| finish(obj, &path, outcome));
             });
-        if let Err(e) = spawned {
-            let why = e.to_string();
-            tracing::warn!(error = %why, "the usage CSV export didn't start");
-            let _ = self
-                .qt_thread()
-                .queue(move |obj| finish(obj, &shown, Err(why)));
+        match spawned {
+            Ok(worker) => crate::csv::WRITES.add(worker),
+            Err(e) => {
+                let why = e.to_string();
+                tracing::warn!(kind = ?e.kind(), "the usage CSV export didn't start");
+                let _ = self
+                    .qt_thread()
+                    .queue(move |obj| finish(obj, &shown, Err(why)));
+            }
         }
         true
     }

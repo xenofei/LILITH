@@ -75,7 +75,7 @@ struct SubmitResult {
 const STATUS_DESCRIPTION: &str = "Returns each engine the core manages (ComfyUI): whether the core \
     started it (owned) or someone else did (attached), its state, URL, process, version, where it \
     listens, prompts from outside the suite (suite jobs wait for them), whether a node install \
-    needs a restart, how many model files its inventory holds, the launch profile an owned \
+    needs a restart, whether its models folder is set (models_root_set), how many model files its inventory holds, the launch profile an owned \
     ComfyUI starts with, and whether ComfyUI's asset catalogue is on.";
 const REPORT_DESCRIPTION: &str = "Returns ComfyUI's model files from the newest inventory: each \
     file's path, size, SHA-256, model family (from its header) and states: orphan (no \

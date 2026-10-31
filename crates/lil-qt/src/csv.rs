@@ -20,6 +20,10 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -46,6 +50,108 @@ pub fn csv(rows: &[Value], columns: &[&str]) -> String {
 /// # Errors
 /// When the file can't be written; the error says what became of the file at `path`.
 pub fn export(path: &Path, rows: &[Value], columns: &[&str]) -> io::Result<()> {
+    let text = format!("{BOM}{}", csv(rows, columns));
+    write_kept(path, text.as_bytes())
+}
+
+/// How long closing the app waits for the exports under way, then how long those told to stop have
+/// to do it: a stalled drive then costs a stray temporary file, not a process that stays around.
+pub const CLOSE_WAIT: Duration = Duration::from_secs(10);
+pub const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// How the wait for the writes ended ([`Writes::wait`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct WritesEnded {
+    /// Some were still going at the limit, and were told to stop: one still writing keeps the old
+    /// file and removes its temporary one; one past its last chunk goes on to replace the file.
+    pub stopped: bool,
+    /// How many didn't stop in the grace, each with a temporary file that may stay.
+    pub running: usize,
+}
+
+/// The exports' writer threads, which `main` waits for after its event loop: nothing else does, since
+/// the panels that started them aren't destroyed before the process ends.
+pub struct Writes {
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    closing: AtomicBool,
+}
+
+impl Writes {
+    pub const fn new() -> Writes {
+        Writes {
+            workers: Mutex::new(Vec::new()),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    pub fn add(&self, worker: JoinHandle<()>) {
+        let mut workers = self.lock();
+        workers.retain(|w| !w.is_finished());
+        workers.push(worker);
+    }
+
+    /// Whether a write under way should stop.
+    pub fn closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<JoinHandle<()>>> {
+        self.workers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn running(&self) -> usize {
+        self.lock().iter().filter(|w| !w.is_finished()).count()
+    }
+
+    fn wait_up_to(&self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        while self.running() > 0 {
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// Waits for the writes at most `limit`, then tells those still going to stop and gives them
+    /// `grace`. It never waits longer than the two.
+    pub fn wait(&self, limit: Duration, grace: Duration) -> WritesEnded {
+        if self.wait_up_to(limit) {
+            return WritesEnded {
+                stopped: false,
+                running: 0,
+            };
+        }
+        self.closing.store(true, Ordering::SeqCst);
+        self.wait_up_to(grace);
+        WritesEnded {
+            stopped: true,
+            running: self.running(),
+        }
+    }
+}
+
+impl Default for Writes {
+    fn default() -> Self {
+        Writes::new()
+    }
+}
+
+/// This process's exports.
+pub static WRITES: Writes = Writes::new();
+
+/// Writes `bytes` to the file you picked, replacing what is there. A failure says why and what
+/// became of the file that was there (a file of the same name is kept as a hidden backup until
+/// the new one is in).
+///
+/// # Errors
+/// The write failed.
+pub fn write_kept(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_kept_unless(path, bytes, &|| WRITES.closing())
+}
+
+fn write_kept_unless(path: &Path, bytes: &[u8], stop: &dyn Fn() -> bool) -> io::Result<()> {
     let backup_name = |name: &str| format!(".{name}.lil-bak");
     let name = path
         .file_name()
@@ -53,11 +159,10 @@ pub fn export(path: &Path, rows: &[Value], columns: &[&str]) -> io::Result<()> {
         .unwrap_or_default();
     let backup = path.with_file_name(backup_name(&name));
     let existed = path.try_exists().unwrap_or(false);
-    let text = format!("{BOM}{}", csv(rows, columns));
-    match crate::layout_file::write_replacing_with(path, text.as_bytes(), backup_name) {
+    match crate::layout_file::write_replacing_stoppable(path, bytes, backup_name, stop) {
         Ok(()) => {
             if existed && let Err(e) = std::fs::remove_file(&backup) {
-                tracing::warn!(error = %e, "the old CSV's backup wasn't deleted");
+                tracing::warn!(error = %e, "the old file's backup wasn't deleted");
             }
             Ok(())
         }
@@ -132,6 +237,56 @@ fn text_of(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    #[test] // spec: ARCH-121, APP-117
+    fn closing_waits_for_the_writes_then_tells_them_to_stop() {
+        // A write that ends: no stop.
+        let writes = Writes::new();
+        writes.add(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(30))
+        }));
+        assert_eq!(
+            writes.wait(Duration::from_secs(5), Duration::from_secs(1)),
+            WritesEnded {
+                stopped: false,
+                running: 0
+            }
+        );
+        assert!(!writes.closing());
+
+        // One that is still going at the limit is told to stop, and has the grace to do it.
+        let writes = Arc::new(Writes::new());
+        let seen = writes.clone();
+        writes.add(std::thread::spawn(move || {
+            while !seen.closing() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
+        assert_eq!(
+            writes.wait(Duration::from_millis(50), Duration::from_secs(5)),
+            WritesEnded {
+                stopped: true,
+                running: 0
+            }
+        );
+
+        // One that can't stop (a stalled drive) doesn't hold the process.
+        let writes = Writes::new();
+        writes.add(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(3))
+        }));
+        let began = Instant::now();
+        assert_eq!(
+            writes.wait(Duration::from_millis(30), Duration::from_millis(30)),
+            WritesEnded {
+                stopped: true,
+                running: 1
+            }
+        );
+        assert!(began.elapsed() < Duration::from_secs(2));
+    }
     use serde_json::json;
 
     #[test] // spec: APP-117

@@ -11,6 +11,7 @@ use lil_client::ClientConfig;
 use lil_protocol::CallerKind;
 
 pub mod boot;
+pub mod bundle_export;
 pub mod core_object;
 pub mod csv_export;
 pub mod hardware;
@@ -37,6 +38,11 @@ pub mod ffi {
         /// One line of the Qt log bridge (`lilshim::logEvent`, a Qt message among them) into
         /// the app's log: a Qt message with its `qt_category`.
         fn log_line(line: &str);
+
+        /// The event loop has ended: waits for the exports under way, at most
+        /// `csv::CLOSE_WAIT`, then tells them to stop (`csv::Writes::wait`), and logs what became
+        /// of them. No panel's destruction can do this: the shell's docks outlive the event loop.
+        fn wait_for_exports();
 
         /// `main.cpp` measured `first_frame` or `interactive` (APP-136): `Core.startTimes`.
         fn note_start_time(what: &str, ms: f64);
@@ -132,6 +138,24 @@ fn log_line(line: &str) {
 
 /// `firstFrameMs` and `interactiveMs`, once noted.
 static START_TIMES: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
+
+fn wait_for_exports() {
+    let ended = crate::csv::WRITES.wait(crate::csv::CLOSE_WAIT, crate::csv::CLOSE_GRACE);
+    if ended.stopped {
+        tracing::warn!(
+            still_running = ended.running,
+            "closing told an export that took too long to stop: one still writing leaves the \
+             file you picked as it was, and one past its last chunk replaces it"
+        );
+    }
+    if ended.running > 0 {
+        tracing::error!(
+            still_running = ended.running,
+            "an export didn't stop as the app closed: a .lil-tmp file may stay beside the file \
+             you picked"
+        );
+    }
+}
 
 fn note_start_time(what: &str, ms: f64) {
     let key = match what {

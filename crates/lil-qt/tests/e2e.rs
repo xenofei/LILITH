@@ -386,11 +386,17 @@ fn call_finishes_through_the_core_object() {
                 core.connection().to_string(),
                 core.channel_scheme().to_string(),
                 core.core_protocol().to_string(),
+                core.core_build_id().to_string(),
             )
         });
         assert_eq!(props.0, "ready");
         assert_eq!(props.1, rig.env.env.activation_scheme());
         assert_eq!(props.2, lil_protocol::PROTOCOL.to_string());
+        assert_eq!(
+            props.3,
+            lil_protocol::session::BUILD_ID,
+            "the hello's build id"
+        );
         let id = rig.probe.call("test.echo", json!({"text": "hi"}));
         assert!(id.starts_with("rq_"), "{id}");
         let result = rig.probe.finished(&id);

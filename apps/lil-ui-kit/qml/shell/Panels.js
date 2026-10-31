@@ -21,12 +21,13 @@ const all = [
      action: "panel.hardware"},
     {id: "usage", title: "Usage & spend", source: "../panels/usage/UsagePanel.qml", area: "bottom",
      action: "panel.usage"},
-    {id: "diagnostics", title: "Diagnostics", source: "PlaceholderPanel.qml", area: "bottom",
+    {id: "diagnostics", title: "Diagnostics", source: "../panels/diagnostics/DiagnosticsPanel.qml", area: "bottom",
      action: "panel.diagnostics"},
     {id: "settings", title: "Settings", source: "PlaceholderPanel.qml", area: "bottom",
      action: "panel.settings"},
-    // Opened from Diagnostics (APP-008, APP-133); Task 25 decides where it opens.
-    {id: "backups", title: "Backups", source: "PlaceholderPanel.qml", area: "", action: ""},
+    // Opened from Diagnostics' backup status line (APP-008, APP-133): the Default layout leaves it
+    // closed, and it has no shortcut.
+    {id: "backups", title: "Backups", source: "../panels/backups/BackupsPanel.qml", area: "", action: ""},
 ]
 
 function byId(id) {

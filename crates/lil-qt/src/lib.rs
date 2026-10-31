@@ -83,19 +83,21 @@ const CLEAR_PREFIXES: [&str; 7] = [
 ];
 
 /// The Vulkan loader's layer and driver variables, removed by name, compared the same way.
-const CLEAR_EXACT: [&str; 5] = [
+const CLEAR_EXACT: [&str; 6] = [
     "VK_INSTANCE_LAYERS",
     "VK_LAYER_PATH",
     "VK_ADD_LAYER_PATH",
     "VK_ICD_FILENAMES",
     "VK_DRIVER_FILES",
+    "TZ",
 ];
 
 /// The environment variables to remove before Qt is initialised (Checkpoint A I-3, as ruled at
 /// review): every name starting with `QT_`, `QML_`, `QML2_`, `QSG_`, `QV4_`, `QTWEBENGINE` or
 /// `VK_LOADER_`, and `VK_INSTANCE_LAYERS`, `VK_LAYER_PATH`, `VK_ADD_LAYER_PATH`,
-/// `VK_ICD_FILENAMES` and `VK_DRIVER_FILES`, from `names` (the process's variable names),
-/// keeping each name as it was spelled.
+/// `VK_ICD_FILENAMES` and `VK_DRIVER_FILES`, and `TZ`, from `names` (the process's variable
+/// names), keeping each name as it was spelled. `TZ` is there because the C runtime gives QML's
+/// local time from it, and the core's and the bridge's calendar come from Windows (CORE-012).
 pub fn qt_env_to_clear<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     names
         .into_iter()
@@ -155,8 +157,12 @@ mod tests {
             "VK_DRIVER_FILES",
             "VK_LOADER_DEBUG",
             "VK_LOADER_LAYERS_ENABLE",
+            "TZ",
+            "tz",
         ];
         let kept = [
+            "TZDIR",
+            "XTZ",
             "PATH",
             "QTDIR",
             "XQT_QPA_PLATFORM",

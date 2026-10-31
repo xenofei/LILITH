@@ -23,8 +23,17 @@ public:
     // lilshim::isModuleLoaded: whether `dll` is loaded in this process.
     Q_INVOKABLE bool isModuleLoaded(const QString &dll) const;
 
-    // lilshim::showInExplorer (not available until Task 25).
-    Q_INVOKABLE void showInExplorer(const QString &path) const;
+    // lilshim::showInExplorer: false when it couldn't.
+    Q_INVOKABLE bool showInExplorer(const QString &path) const;
+
+    // lilshim::explorerSelectArgument: what showInExplorer would run, for a test that opens no
+    // window.
+    Q_INVOKABLE QString explorerSelectArgument(const QString &path) const;
+
+    // The versions the core can't tell (Diagnostics; no protocol field carries them), each empty
+    // when it can't be read: {qt (the running Qt), webEngine (the Qt WebEngine this build pairs
+    // with, read without loading it, APP-137), kddockwidgets}.
+    Q_INVOKABLE QVariantMap componentVersions() const;
 
     // What the accessibility layer (UI Automation's source) exposes for `item`:
     // {role: QAccessible::Role (QML's Accessible.Role), name, focusable, actions: [action names

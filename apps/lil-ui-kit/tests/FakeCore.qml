@@ -30,6 +30,7 @@ QtObject {
     property string channelScheme: "lil-test-fake"
     property var startTimes: ({})
     readonly property string buildId: "0.0.0+fake"
+    property string coreBuildId: "0.0.0+fakecore"
 
     // What the code under test asked.
     property var calls: []        // {id, kind: "call" | "appCall" | "setWorkspace", name, args}
