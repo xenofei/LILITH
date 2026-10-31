@@ -5,10 +5,10 @@
 //
 // Each card reads its tools when the panel is first shown, reads them again each time it is shown
 // again (at most once in 2 s, so "Run lil doctor to fix" clears once you have), and follows its
-// topics while shown (ToolRead). Behind a tab it reads nothing; it only keeps the topics followed,
-// so that the event log hears them from the start. `shell` and `eventLog` are the shell's, filled in
-// when it makes the dock (ShellWindow.createDock): with no shell the buttons that open another panel
-// do nothing, and with no `eventLog` the panel keeps its own EventLogModel.
+// topics while shown (ToolRead). Behind a tab it reads nothing and follows nothing; the shell keeps
+// those topics followed for the event log. `shell` and `eventLog` are the shell's, filled in when it
+// makes the dock (ShellWindow.createDock): with no shell the buttons that open another panel do
+// nothing, and with no `eventLog` the panel keeps its own EventLogModel.
 //
 // The export: you pick the file in a save dialog (the panel never names a path), then
 // `diagnostics.bundle` writes its zip in the core's folder and BundleExport copies it to your file,
@@ -73,11 +73,7 @@ Rectangle {
 
     onIsOnScreenChanged: settle.restart()
 
-    Component.onCompleted: {
-        settle.restart()
-        for (const topic of ["engines", "diagnostics", "desktop", "telemetry", "jobs"])
-            CoreCall.subscribe(core, topic, root)
-    }
+    Component.onCompleted: settle.restart()
 
     Timer {
         id: settle

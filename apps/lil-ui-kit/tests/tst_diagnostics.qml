@@ -925,15 +925,15 @@ TestCase {
         load(core)
         const topics = ["engines", "diagnostics", "desktop", "telemetry", "jobs"]
         for (const topic of topics)
-            verify(core.subscriberCount(topic) >= 2, topic + ": the panel's own and a card's")
+            verify(core.subscriberCount(topic) >= 1, topic + ": a card's")
         panel.visible = false
         tryVerify(() => !panel.shown, 5000)
         for (const topic of topics)
-            compare(core.subscriberCount(topic), 1, topic + ": only the panel's own, for the log")
+            compare(core.subscriberCount(topic), 0, topic + ": no card's")
         panel.visible = true
         tryVerify(() => panel.shown, 5000)
         for (const topic of topics)
-            verify(core.subscriberCount(topic) >= 2, topic + " again")
+            verify(core.subscriberCount(topic) >= 1, topic + " again")
     }
 
     function test_focus_moves_on_when_its_row_goes() { // spec: APP-156
@@ -1129,6 +1129,33 @@ TestCase {
         compare(reads("diagnostics.recent"), recent + 1)
     }
 
+    // The top bar follows `telemetry` at a sample a second: 17 minutes of them, and more, must leave
+    // what came before Diagnostics was opened in the shell's log.
+    function test_the_shells_log_keeps_the_events_from_before_the_panel_opened() { // spec: APP-134
+        const core = makeCore()
+        const shell = createTemporaryObject(shellComponent, tc, {core: core})
+        shell.visible = true
+        tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
+        core.emit("diagnostics", "event", {kind: "error", code: "store.io", tool: "asset.get", at: "2026-10-30T10:00:00.000Z"})
+        core.emit("engines", "event", {kind: "status", engine: comfy()})
+        const kept = shell.eventLog.rowCount()
+        for (let i = 0; i < 1100; ++i)
+            core.emit("telemetry", "event", {kind: "sample", snapshot: snapshot()})
+        compare(shell.eventLog.rowCount(), kept, "no sample takes a row")
+        const texts = []
+        for (let i = 0; i < kept; ++i)
+            texts.push(shell.eventLog.get(i).text)
+        verify(texts.some(t => t.indexOf("store.io") >= 0), "the error is there")
+        // A sample's own alert is an event of its own, and stays.
+        core.emit("telemetry", "event", {kind: "alert", alert: {id: "gpu_temperature", kind: "temperature", value: 88, since: "2026-10-30T10:00:05.000Z"}})
+        compare(shell.eventLog.rowCount(), kept + 1)
+        // Opened now, the panel shows them.
+        const dock = shell.docks.diagnostics
+        dock.setAsCurrentTab()
+        const panel = dock.content
+        tryVerify(() => panel.visible && panel.log.view.count === kept + 1, 5000, "the panel shows the shell's rows")
+    }
+
     function test_a_panel_behind_a_tab_reads_nothing() { // spec: ARCH-121, APP-136
         const core = makeCore()
         const shell = createTemporaryObject(shellComponent, tc, {core: core})
@@ -1141,9 +1168,11 @@ TestCase {
         const own = ["diagnostics.recent", "desktop.get", "models.report", "engines.environment"]
         for (const name of own)
             compare(callsOf(core, name), [], name + " isn't read behind a tab")
-        // The log still hears the topics only this panel follows, from the start.
-        for (const topic of ["diagnostics", "desktop"])
+        // The shell keeps the log's topics followed, whatever is shown, and its log is the panel's.
+        for (const topic of shell.eventLogTopics)
             verify(core.subscriberCount(topic) >= 1, topic)
+        verify(shell.docks.diagnostics.content.eventLog === shell.eventLog, "the panel shows the shell's log")
+        compare(panel.log.model, shell.eventLog)
         // A job's change behind the tab costs no read of its own.
         const lists = callsOf(core, "jobs.list").filter(c => c.args.limit === 100 && c.args.status === "queued").length
         // First shown, it reads.

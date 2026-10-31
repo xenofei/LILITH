@@ -3,8 +3,10 @@
 // with or without the focus.
 //
 // Top (APP-006, APP-016, APP-034): the top bar (TopBar) and the connection and no-workspace banners
-// stack above the shell's own banners and the docks. `eventLog` runs from the shell's start, so
-// Diagnostics shows the events from before it was opened.
+// stack above the shell's own banners and the docks. `eventLog` runs from the shell's start, and the
+// shell follows the topics Diagnostics reads whatever is shown (`eventLogTopics`), so Diagnostics
+// shows the events from before it was opened. The log keeps the newest 1,000 of them, without what
+// repeats state at a high rate, such as the telemetry samples the top bar follows (EventLogModel).
 //
 // Layout (APP-002 to APP-004, P4a-R16, P4a-R33): when it is made it restores the last layout from
 // `stateDir` in APP-003's order (DockLayout: the windows exist, the dock factory is registered,
@@ -87,6 +89,8 @@ Window {
     property EventLogModel eventLog: EventLogModel {
         core: root.core
     }
+    readonly property var eventLogTopics: ["engines", "diagnostics", "desktop", "telemetry", "jobs"]
+    property var _eventLogSubscriptions: []
 
     onGpuPauseToggleRequested: topBar.togglePause()
 
@@ -264,6 +268,8 @@ Window {
         _settling = false
         if (core)
             _openRequests = CoreCall.subscribe(core, "open_requests:image", root, onOpenRequest)
+        if (core)
+            _eventLogSubscriptions = eventLogTopics.map(topic => CoreCall.subscribe(core, topic, root))
     }
 
     // KDDockWidgets keeps a dock (and its unique name) after its QML item goes, so the shell
@@ -273,6 +279,8 @@ Window {
         // While the core (a test's own FakeCore child among them) is still there.
         if (_openRequests)
             _openRequests.unsubscribe()
+        for (const subscription of _eventLogSubscriptions)
+            subscription.unsubscribe()
         for (const id in docks) {
             if (docks[id])
                 docks[id].deleteDockWidgetLater()
