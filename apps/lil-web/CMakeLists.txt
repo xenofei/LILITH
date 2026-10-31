@@ -14,3 +14,5 @@ set_target_properties(lil-web PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${QT_QML_OUTPUT_DIRECTORY}/Lilith/Web
     RUNTIME_OUTPUT_DIRECTORY ${QT_QML_OUTPUT_DIRECTORY}/Lilith/Web)
 target_link_libraries(lil-web PRIVATE Qt6::Quick Qt6::WebEngineQuick)
+# Task 25: the version alone, for LilShim.componentVersions; the shim links nothing of WebEngine.
+target_compile_definitions(lil-qt-shim-qml PRIVATE LIL_WEBENGINE_VERSION="${Qt6WebEngineQuick_VERSION}")

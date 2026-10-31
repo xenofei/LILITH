@@ -32,6 +32,18 @@ void LilShim::showInExplorer(const QString &path) const
     lilshim::showInExplorer(path);
 }
 
+QString LilShim::explorerSelectArgument(const QString &path) const
+{
+    return lilshim::explorerSelectArgument(path);
+}
+
+QVariantMap LilShim::componentVersions() const
+{
+    return {{"qt", QString::fromLatin1(qVersion())},
+            {"webEngine", QStringLiteral(LIL_WEBENGINE_VERSION)},
+            {"kddockwidgets", QStringLiteral(LIL_KDDW_VERSION)}};
+}
+
 QVariantMap LilShim::accessibleOf(QObject *item) const
 {
     QAccessibleInterface *iface = item ? QAccessible::queryAccessibleInterface(item) : nullptr;

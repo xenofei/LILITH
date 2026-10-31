@@ -38,3 +38,7 @@ qt_add_resources(lil-qt-shim lil-fonts
     PREFIX /lilith/fonts
     BASE fonts
     FILES fonts/inter/Inter-Regular.ttf fonts/inter/Inter-Bold.ttf)
+# Task 25: KDDockWidgets' version for LilShim.componentVersions (it has no version constant of its
+# own to include); apps/lil-web gives the WebEngine version beside it.
+file(STRINGS ${kddockwidgets_SOURCE_DIR}/version.txt LIL_KDDW_VERSION LIMIT_COUNT 1)
+target_compile_definitions(lil-qt-shim-qml PRIVATE LIL_KDDW_VERSION="${LIL_KDDW_VERSION}")

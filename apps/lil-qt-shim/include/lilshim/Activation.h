@@ -21,9 +21,12 @@ LILSHIM_EXPORT void activate(QWindow *w, bool takeFocus);
 // (GetModuleHandleW). Tests use it to check that WebEngine stays out until its panel loads.
 LILSHIM_EXPORT bool isModuleLoaded(const QString &dll);
 
-// Shows `path` selected in Explorer. Not available yet: Task 25 fills it, for paths under the
-// diagnostics folder only, launching explorer.exe with arguments and never through a shell.
-// Until then it logs a warning and does nothing.
+// The command line that shows `path` selected in Explorer, or empty when `path` isn't an absolute
+// path of an existing .zip file: a diagnostics bundle, in the core's folder or where you saved it.
+LILSHIM_EXPORT QString explorerSelectArgument(const QString &path);
+
+// Shows `path` selected in Explorer, launching explorer.exe with arguments and never through a
+// shell; a path explorerSelectArgument refuses logs a warning and does nothing.
 LILSHIM_EXPORT void showInExplorer(const QString &path);
 
 } // namespace lilshim
