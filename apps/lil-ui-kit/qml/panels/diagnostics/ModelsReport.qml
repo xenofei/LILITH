@@ -1,6 +1,7 @@
 // The model inventory (CORE-164), from `models.report`, read again when an `engines` event shows a
-// newer inventory, and not read at all while ComfyUI isn't configured (the tool would fail, and the
-// core would record that as an error nobody caused). The states are the inventory's glossary;
+// newer inventory, and not read at all while ComfyUI isn't configured or is attached with no inventory
+// (the tool would fail without `root`, and the core would record that as an error nobody caused). The
+// states are the inventory's glossary;
 // nothing is moved or deleted because of
 // one. Unless `registry` is `ok` the report can't tell what is recorded, so the card says why and
 // calls no file orphan or missing. Paths, families and names are untrusted: plain text, normalised
@@ -19,6 +20,7 @@ LCard {
     // The Engines card has its first answer, and whether it says ComfyUI isn't configured.
     property bool enginesKnown: true
     property bool notConfigured: false
+    property bool attachedWithNoInventory: false
 
     readonly property alias view: list
     readonly property var report: reportRead.result
@@ -121,7 +123,7 @@ LCard {
         core: root.core
         tool: "models.report"
         topic: "engines"
-        active: root.active && root.enginesKnown && !root.notConfigured
+        active: root.active && root.enginesKnown && !root.notConfigured && !root.attachedWithNoInventory
         onTopicEvent: data => {
             const inventory = data && data.engine ? data.engine.inventory : null
             const refreshed = inventory ? inventory.refreshed : ""
@@ -148,9 +150,15 @@ LCard {
             text: "ComfyUI isn't configured, so there is no model inventory."
         }
         LineText {
+            visible: root.attachedWithNoInventory
+            tone: "muted"
+            text: "This attached ComfyUI has no model inventory yet. One appears once its models are read, "
+                  + "which takes root under [engines.comfyui] in suite.toml."
+        }
+        LineText {
             visible: text !== ""
             tone: "warning"
-            text: root.notConfigured ? "" : Words.errorText(root.core, reportRead.error)
+            text: root.notConfigured || root.attachedWithNoInventory ? "" : Words.errorText(root.core, reportRead.error)
         }
         LineText {
             visible: text !== ""

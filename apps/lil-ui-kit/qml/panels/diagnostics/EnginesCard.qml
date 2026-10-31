@@ -25,6 +25,10 @@ LCard {
     readonly property bool known: statusRead.loaded || statusRead.error !== null
     // The core reports ComfyUI with no launch profile and nothing running: no `[engines.comfyui]`.
     readonly property bool notConfigured: engines.some(e => isUnconfigured(e))
+    // `engines.status` doesn't say whether `root` is set. An attached ComfyUI with no inventory has no
+    // root, or its first inventory is still being read: asking `models.report` fails in the first
+    // case, and the core records that as an error. Its `status` event says when an inventory is kept.
+    readonly property bool attachedWithNoInventory: engines.some(e => e.class === "attached" && !e.inventory)
 
     readonly property string vramText: {
         if (!gpuRead)

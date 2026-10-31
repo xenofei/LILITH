@@ -876,6 +876,27 @@ TestCase {
         tryVerify(() => shows(panel.models, "No inventory yet"), 5000)
     }
 
+    function test_an_attached_engine_with_no_inventory_means_no_report_read() { // spec: CORE-164
+        const core = makeCore()
+        const panel = makePanel(core)
+        answer(core, isTool("engines.status"), ok({engines: [comfy({class: "attached", launch_profile: null, inventory: undefined})]}))
+        tryVerify(() => shows(panel.models, "This attached ComfyUI has no model inventory yet"), 5000, texts(panel.models).join(" | "))
+        wait(50)
+        compare(callsOf(core, "models.report"), [], "models.report would fail with no root, and the core would record it")
+        // Shown again, still none.
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        panel.visible = true
+        tryVerify(() => panel.shown, 5000)
+        wait(2100)
+        compare(callsOf(core, "models.report"), [])
+        // A root's inventory arrives as the core's `status` event: now the report has something.
+        core.emit("engines", "event", {kind: "status", engine: comfy({class: "attached", launch_profile: null})})
+        answer(core, isTool("models.report"), ok(report()))
+        tryVerify(() => shows(panel.models, "0 model files"), 5000, texts(panel.models).join(" | "))
+        verify(!shows(panel.models, "This attached ComfyUI"), texts(panel.models).join(" | "))
+    }
+
     function test_engine_lines_say_what_is_wrong() { // spec: ARCH-121
         const core = makeCore()
         const panel = makePanel(core)

@@ -390,6 +390,7 @@ Rectangle {
                     active: root.shown
                     enginesKnown: enginesCard.known
                     notConfigured: enginesCard.notConfigured
+                    attachedWithNoInventory: enginesCard.attachedWithNoInventory
                 }
             }
         }
