@@ -217,11 +217,25 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_replacing_with(path, bytes, |name| format!("{name}.bak"))
 }
 
+/// How much [`write_replacing_stoppable`] writes between asking whether to stop.
+const WRITE_CHUNK: usize = 1024 * 1024;
+
 /// [`write_replacing`], keeping the old file under `backup(<name>)` beside it.
 pub(crate) fn write_replacing_with(
     path: &Path,
     bytes: &[u8],
     backup: impl Fn(&str) -> String,
+) -> io::Result<()> {
+    write_replacing_stoppable(path, bytes, backup, &|| false)
+}
+
+/// [`write_replacing_with`], asking `stop` between chunks. Told to stop (`ErrorKind::Interrupted`), or
+/// when the temporary file can't be written, it removes that file and leaves the old one as it was.
+pub(crate) fn write_replacing_stoppable(
+    path: &Path,
+    bytes: &[u8],
+    backup: impl Fn(&str) -> String,
+    stop: &dyn Fn() -> bool,
 ) -> io::Result<()> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::new(
@@ -233,10 +247,22 @@ pub(crate) fn write_replacing_with(
     let name = name.to_string_lossy();
     let temp = dir.join(format!(".{name}.lil-tmp"));
     let backup = dir.join(backup(&name));
-    {
+    let written = (|| {
         let mut file = std::fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        lil_platform::fs::flush(&file)?;
+        for chunk in bytes.chunks(WRITE_CHUNK) {
+            if stop() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "the app closed before the write ended",
+                ));
+            }
+            file.write_all(chunk)?;
+        }
+        lil_platform::fs::flush(&file)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
     }
     let swapped = if path.try_exists()? {
         match lil_platform::fs::replace_file(path, &temp, &backup) {
@@ -289,6 +315,31 @@ pub fn set_aside(path: &Path, utc: &str) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // spec: ARCH-121
+    fn a_write_told_to_stop_leaves_no_temporary_file_and_the_old_file_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kept.zip");
+        std::fs::write(&path, b"old").unwrap();
+        let backup = |name: &str| format!(".{name}.bak");
+        let asked = std::cell::Cell::new(0);
+        let stop = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        let bytes = vec![7u8; 3 * WRITE_CHUNK];
+        let e = write_replacing_stoppable(&path, &bytes, backup, &stop).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["kept.zip"], "nothing beside it");
+        // Told nothing, it writes the whole file.
+        write_replacing_stoppable(&path, &bytes, backup, &|| false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), bytes.len());
+    }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect { x, y, w, h }

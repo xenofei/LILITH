@@ -6,6 +6,7 @@
 
 #include "lil_qt/src/qt/boot.cxxqt.h"
 #include "lil_qt/src/qt/launch_sink.h"
+#include "lil_qt/src/qt/mod.cxxqt.h"
 #include "lil_qt/src/qt/preview_feed.cxxqt.h"
 #include "lil_qt/src/qt/preview_sink.h"
 
@@ -23,6 +24,9 @@
 #include <QDir>
 #include <QProcess>
 #include <QFile>
+#include <QFileInfo>
+#include <QProcessEnvironment>
+#include <QUrl>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QStandardPaths>
@@ -105,6 +109,32 @@ public:
         if (!f.open(QIODevice::ReadOnly))
             return {};
         return QString::fromUtf8(f.readAll());
+    }
+
+    // A file of `bytes` zero bytes (written fast: the system only reads it back as zeros).
+    Q_INVOKABLE bool writeSized(const QString &path, qint64 bytes)
+    {
+        QFile f(path);
+        return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.resize(bytes);
+    }
+
+    Q_INVOKABLE qint64 size(const QString &path) const { return QFileInfo(path).size(); }
+
+    // This runner again, on the QML file at `url`, with `LIL_CLOSE_DIR` set to `dir`: its exit code,
+    // once the whole process has ended.
+    Q_INVOKABLE int runQml(const QUrl &url, const QString &dir) const
+    {
+        QProcess child;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("LIL_CLOSE_DIR"), dir);
+        child.setProcessEnvironment(env);
+        child.setProgram(QCoreApplication::applicationFilePath());
+        child.setArguments({QStringLiteral("-input"), url.toLocalFile()});
+        child.setProcessChannelMode(QProcess::ForwardedChannels);
+        child.start();
+        if (!child.waitForFinished(120000))
+            return -1;
+        return child.exitCode();
     }
 
     Q_INVOKABLE QStringList list(const QString &dir) const
@@ -242,7 +272,10 @@ int main(int argc, char **argv)
     // shell that started the tests has.
     qunsetenv("TZ");
     Setup setup;
-    return quick_test_main_with_setup(argc, argv, "lil_ui_kit", nullptr, &setup);
+    const int rc = quick_test_main_with_setup(argc, argv, "lil_ui_kit", nullptr, &setup);
+    // As lil-image does after its event loop.
+    lil_qt::wait_for_exports();
+    return rc;
 }
 
 #include "main.moc"

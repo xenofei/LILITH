@@ -312,6 +312,8 @@ int main(int, char **)
     // No launch is taken from here on, before the window and the engine go.
     lil_qt::deliverLaunchesTo(nullptr);
     lil_qt::release_instance();
+    // An export under way finishes, or at the limit stops and cleans up, before the process ends.
+    lil_qt::wait_for_exports();
     lilshim::logEvent(QStringLiteral("exit"), {{"code", rc}});
     return rc;
 }

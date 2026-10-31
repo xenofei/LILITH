@@ -9,8 +9,7 @@
 //! - `busy` is true from a `save` until its signal. A `save` while busy, or one whose `file` isn't
 //!   a local file, returns false and writes nothing; else it returns true and its signal follows.
 //! - The log names no path: a bundle's folder can name the owner's files.
-//! - When the object goes (the app is closing), it waits for a copy under way, at most
-//!   [`crate::csv::CLOSE_WAIT`], so normally no temporary file stays behind.
+//! - The thread goes on [`crate::csv::WRITES`], which `main` waits for when the event loop ends.
 
 use core::pin::Pin;
 
@@ -51,15 +50,6 @@ pub mod qobject {
 #[derive(Default)]
 pub struct BundleExportRust {
     busy: bool,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for BundleExportRust {
-    fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            crate::csv::wait_for_write(worker, crate::csv::CLOSE_WAIT);
-        }
-    }
 }
 
 /// Why a copy failed, and whether the core's zip could be read at all.
@@ -116,7 +106,7 @@ impl qobject::BundleExport {
                 let _ = thread.queue(move |obj| finish(obj, &path, outcome));
             });
         match spawned {
-            Ok(worker) => self.as_mut().rust_mut().worker = Some(worker),
+            Ok(worker) => crate::csv::WRITES.add(worker),
             Err(e) => {
                 let why = e.to_string();
                 tracing::warn!(kind = ?e.kind(), "the diagnostics bundle's copy didn't start");
