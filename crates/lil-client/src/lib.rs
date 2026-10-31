@@ -3,7 +3,8 @@
 //!
 //! [`Client::connect`] finds the channel's core, or starts one on demand as a detached
 //! process (ARCH-004, ARCH-018, ARCH-019). It verifies the process serving the pipe before
-//! saying anything to it (ARCH-027), then says `core/hello` (ARCH-029). A core with an older
+//! saying anything to it (ARCH-027), has whoever holds the pipe prove itself (`core/prove`,
+//! Appendix G "Connections"), then says `core/hello` (ARCH-029). A core with an older
 //! major protocol is drained and replaced (unless the client may not start a core); a newer
 //! one is left running and this client reports itself incompatible (ARCH-023, ARCH-014). The
 //! client then calls tools, minting idempotency keys (ARCH-110), and follows events

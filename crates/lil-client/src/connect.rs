@@ -13,14 +13,22 @@
 //! 2. **Verify** (ARCH-027): the pipe's server PID is opened at once; its user must be the
 //!    current user and its executable must be in `server_dirs`, else
 //!    [`ClientError::Untrusted`]. Nothing is sent to an untrusted server.
-//! 3. **`core/hello`.** The core claims its pipe before it opens the suite `state.db`, so the
+//! 3. **`core/prove`** (Appendix G "Connections"): the pid names the pipe's creator, whoever holds
+//!    the pipe now, so the holder proves itself before it hears anything about this client. The
+//!    client calls `core/prove` with the name of a fresh event ([`ProofEvent`]) and then looks at
+//!    the event: whatever the server answered, without the event set it is
+//!    [`ClientError::Untrusted`], and nothing more is sent. So there is no fallback: a core from
+//!    before protocol 1.3 answers -32001, and this client can't talk to it. The proof shares the
+//!    hello's deadline and its early close (below), so a slow start of this client's own core is
+//!    [`ClientError::Timeout`] at worst, never untrusted.
+//! 4. **`core/hello`.** The core claims its pipe before it opens the suite `state.db`, so the
 //!    connection may close before the hello reply when that core then fails to start. If this
 //!    client spawned that core, its exit code (waited for up to 10 s) says why. Otherwise the
 //!    find loop runs once more (the client's own core then reports its failure); a second
 //!    early close is [`ClientError::Closed`]. A server that cannot be inspected because it is
 //!    gone is the same race; one that cannot be inspected for any other reason (another
 //!    user's process) is [`ClientError::Untrusted`].
-//! 4. **Version direction** (controller ruling 4). On `protocol.incompatible` a client whose
+//! 5. **Version direction** (controller ruling 4). On `protocol.incompatible` a client whose
 //!    major is greater than the core's sends `core/drain` on that connection, waits up to 60 s
 //!    for the pipe to go, starts a new core and says hello once more. Any other client, and
 //!    any client under [`StartPolicy::NoStart`] (it could not start the replacement), reports
@@ -35,16 +43,16 @@ use std::time::Duration;
 use lil_platform::IdSource as _;
 use lil_platform::RandomIds;
 use lil_platform::paths::folder_key;
-use lil_platform::pipe::{ConnectError, open_client, server_pid};
+use lil_platform::pipe::{ConnectError, ProofEvent, open_client, server_pid};
 use lil_platform::process::{
     ProcessHandle, ProcessInfo, ProcessInspector as _, SpawnRequest, SystemInspector,
     current_user_sid, spawn_detached,
 };
 use lil_protocol::codes::{CORE_DRAINING, PROTOCOL_INCOMPATIBLE, WORKSPACE_UNKNOWN};
 use lil_protocol::{
-    CAPABILITIES, DrainResult, HelloParams, HelloResult, NO_WORKSPACE, Outcome, RpcError,
-    SubscribeParams, SubscribeResult, ToolCallParams, ToolDescriptor, ToolOutput, ToolsListResult,
-    UnsubscribeParams, UnsubscribeResult, method, rpc_code, schema_hash,
+    CAPABILITIES, DrainResult, HelloParams, HelloResult, NO_WORKSPACE, Outcome, ProveParams,
+    RpcError, SubscribeParams, SubscribeResult, ToolCallParams, ToolDescriptor, ToolOutput,
+    ToolsListResult, UnsubscribeParams, UnsubscribeResult, method, rpc_code, schema_hash,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -69,6 +77,8 @@ const NORMAL_EXIT: u32 = 0;
 const EARLY_CLOSE_WAIT: Duration = Duration::from_secs(10);
 /// How long an automatic drain-and-replace waits for the old core's pipe to go.
 const REPLACE_WAIT: Duration = Duration::from_secs(60);
+/// The `Untrusted` reason for a server that didn't set the proof's event.
+const NOT_PROVED: &str = "it did not prove that it holds the pipe";
 
 /// A connection with a session on the core.
 pub struct Client {
@@ -305,7 +315,8 @@ pub enum DrainOutcome {
 ///
 /// The hello names no workspace (a stop does not depend on one). A core owned by the current
 /// user is asked even when its executable is not in `server_dirs`: a drain is harmless and
-/// clears a foreign core (ARCH-027). A core whose protocol is newer than this client's refuses
+/// clears a foreign core (ARCH-027). Either way the holder of the pipe proves itself first, as
+/// the module docs say. A core whose protocol is newer than this client's refuses
 /// the drain: [`ClientError::Incompatible`]. A core that is draining already refuses the hello
 /// with `core.draining`, and this waits for it to go.
 pub async fn drain_and_wait(
@@ -335,8 +346,11 @@ pub async fn drain_and_wait(
         Err(e) if gone(&e) => Err(None),
         Err(e) => return Err(ClientError::Io(e)),
     };
-    match inspected {
-        Ok(info) => check_user(&info)?,
+    let info = match inspected {
+        Ok(info) => {
+            check_user(&info)?;
+            info
+        }
         // A server that cannot be verified is never asked (ARCH-027).
         Err(Some(untrusted)) => return Err(untrusted),
         // The server went away under us.
@@ -345,9 +359,18 @@ pub async fn drain_and_wait(
             wait_gone(&pipe_name, deadline).await?;
             return Ok(DrainOutcome::Stopped);
         }
-    }
+    };
 
     let conn = Conn::start(pipe);
+    match prove(&conn, deadline, &info).await {
+        // The server went away under us.
+        Err(ClientError::Closed) => {
+            drop(conn);
+            wait_gone(&pipe_name, deadline).await?;
+            return Ok(DrainOutcome::Stopped);
+        }
+        proved => proved?,
+    }
     let hello = hello_params(cfg, NO_WORKSPACE);
     match timeout_at(deadline, conn.call(method::HELLO, hello)).await {
         Err(_) => return Err(ClientError::Timeout),
@@ -371,6 +394,30 @@ pub async fn drain_and_wait(
     drop(conn);
     wait_gone(&pipe_name, deadline).await?;
     Ok(DrainOutcome::Stopped)
+}
+
+/// Step 3 of the module docs on `conn`, whose server was reported as `server`: `Ok` only with the
+/// event set. [`ClientError::Closed`] is the connect race, for the caller to take as it takes a
+/// hello's.
+async fn prove(conn: &Conn, deadline: Instant, server: &ProcessInfo) -> Result<(), ClientError> {
+    let proof = ProofEvent::new().map_err(ClientError::Io)?;
+    let params = to_value(&ProveParams {
+        name: proof.name().to_string(),
+    });
+    match timeout_at(deadline, conn.call(method::PROVE, params)).await {
+        Err(_) => return Err(ClientError::Timeout),
+        Ok(Err(ClientError::Closed)) => return Err(ClientError::Closed),
+        // What the server said counts for nothing: the event being set is the proof.
+        Ok(_) => {}
+    }
+    if proof.is_set() {
+        return Ok(());
+    }
+    Err(ClientError::Untrusted {
+        pid: server.pid,
+        image: server.image.clone(),
+        reason: NOT_PROVED.to_string(),
+    })
 }
 
 /// Sends `core/drain` on `conn`. A connection that closes instead of answering counts as
@@ -437,7 +484,8 @@ async fn handshake_from(
     }
 }
 
-/// Steps 2 and 3 on the pipe `finder` opened: verify the server, then say hello.
+/// Steps 2 to 4 on the pipe `finder` opened: verify the server, have it prove it holds the pipe,
+/// then say hello.
 async fn greet(
     cfg: &ClientConfig,
     finder: &mut Finder<'_>,
@@ -460,9 +508,13 @@ async fn greet(
     check_dir(cfg, &info)?;
 
     let conn = Conn::start(pipe);
+    let deadline = finder.hello_deadline(pid);
+    match prove(&conn, deadline, &info).await {
+        Err(ClientError::Closed) => return Err(finder.closed_early(Some(pid)).await),
+        proved => proved?,
+    }
     let hello = hello_params(cfg, &cfg.workspace);
-    let result = match timeout_at(finder.hello_deadline(pid), conn.call(method::HELLO, hello)).await
-    {
+    let result = match timeout_at(deadline, conn.call(method::HELLO, hello)).await {
         Err(_) => return Err(ClientError::Timeout),
         Ok(Err(ClientError::Closed)) => return Err(finder.closed_early(Some(pid)).await),
         Ok(Err(e)) => return Err(e),
@@ -1037,6 +1089,108 @@ mod tests {
         );
     }
 
+    /// A server that holds the pipe and doesn't set the event, whatever it answers: `greet` and
+    /// the stop path call it untrusted, and it hears nothing but the proof.
+    #[test] // spec: ARCH-027
+    fn an_answer_without_the_event_set_is_no_proof() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for answer in [
+            json!({"result": {"status": "ok", "proved": true}}),
+            json!({"error": {"code": rpc_code::METHOD_NOT_FOUND, "message": "method not found"}}),
+            json!({"error": {"code": rpc_code::HANDSHAKE_REQUIRED, "message": "call core/hello"}}),
+        ] {
+            // A fake on `env`'s pipe that gives `answer` to everything, and says what it read.
+            let exchange = |env: &TestEnv| {
+                let server = lil_platform::pipe::create_instance(&env.env.pipe_name(), true);
+                let answer = answer.clone();
+                async move {
+                    let server = server.expect("fake server");
+                    server.connect().await.expect("accept");
+                    let (read, mut write) = tokio::io::split(server);
+                    let mut lines = BufReader::new(read).lines();
+                    let mut got = Vec::new();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let mut reply = answer.clone();
+                        reply["jsonrpc"] = json!("2.0");
+                        reply["id"] = request["id"].clone();
+                        let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                        let _ = write.flush().await;
+                        got.push(request["method"].clone());
+                    }
+                    got
+                }
+            };
+            let not_proved = |result: Result<(), ClientError>| match result {
+                Err(ClientError::Untrusted { reason, pid, .. }) => {
+                    assert_eq!(reason, NOT_PROVED);
+                    assert_eq!(pid, std::process::id());
+                }
+                other => panic!("{answer}: expected Untrusted, got {other:?}"),
+            };
+            rt.block_on(async {
+                let env = TestEnv::new();
+                let mut cfg = ClientConfig::for_env(env.env.clone(), CallerKind::Cli).unwrap();
+                cfg.start = StartPolicy::NoStart;
+                let (greeted, got) = tokio::join!(
+                    async { Client::connect(&cfg).await.map(|_| ()) },
+                    exchange(&env)
+                );
+                not_proved(greeted);
+                assert_eq!(got, [method::PROVE], "{answer}");
+
+                let env = TestEnv::new();
+                let cfg = ClientConfig::for_env(env.env.clone(), CallerKind::Cli).unwrap();
+                let (stopped, got) = tokio::join!(
+                    async {
+                        drain_and_wait(&cfg, Duration::from_secs(30))
+                            .await
+                            .map(|_| ())
+                    },
+                    exchange(&env)
+                );
+                not_proved(stopped);
+                assert_eq!(got, [method::PROVE], "{answer}");
+            });
+        }
+    }
+
+    /// A server that never answers the proof gets the path's deadline and nothing more.
+    #[test] // spec: ARCH-027
+    fn a_server_silent_to_the_proof_times_out_and_hears_nothing_more() {
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = TestEnv::new();
+            let mut cfg = ClientConfig::for_env(env.env.clone(), CallerKind::Cli).unwrap();
+            cfg.start = StartPolicy::NoStart;
+            cfg.start_timeout = Duration::from_millis(200);
+            let server = lil_platform::pipe::create_instance(&env.env.pipe_name(), true)
+                .expect("fake server");
+            let fake = async {
+                server.connect().await.expect("accept");
+                let mut lines = BufReader::new(server).lines();
+                let mut got = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    got.push(request["method"].clone());
+                }
+                got
+            };
+            let (greeted, got) =
+                tokio::join!(async { Client::connect(&cfg).await.map(|_| ()) }, fake);
+            assert!(matches!(greeted, Err(ClientError::Timeout)), "{greeted:?}");
+            assert_eq!(got, [method::PROVE]);
+        });
+    }
+
     /// A second `lil core stop` while the core drains: the core refuses its hello with
     /// `core.draining` (Appendix G "Connections"), and that is a core already stopping, so
     /// this waits for its pipe to go instead of failing.
@@ -1056,6 +1210,17 @@ mod tests {
                 server.connect().await.expect("accept");
                 let (read, mut write) = tokio::io::split(server);
                 let mut lines = BufReader::new(read).lines();
+                let line = lines.next_line().await.unwrap().expect("a proof");
+                let prove: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(prove["method"], method::PROVE, "{prove}");
+                let name = prove["params"]["name"].as_str().unwrap();
+                lil_platform::pipe::set_proof_event(name).unwrap();
+                let proved = json!({"status": "ok", "proved": true});
+                let reply = json!({"jsonrpc": "2.0", "id": prove["id"], "result": proved});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
                 let line = lines.next_line().await.unwrap().expect("a hello");
                 let hello: Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(hello["method"], method::HELLO, "{hello}");
