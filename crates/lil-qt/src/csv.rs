@@ -62,8 +62,8 @@ pub const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// How the wait for the writes ended ([`Writes::wait`]).
 #[derive(Debug, PartialEq, Eq)]
 pub struct WritesEnded {
-    /// Some were still going at the limit, and were told to stop: each keeps the old file and
-    /// removes its temporary one.
+    /// Some were still going at the limit, and were told to stop: one still writing keeps the old
+    /// file and removes its temporary one; one past its last chunk goes on to replace the file.
     pub stopped: bool,
     /// How many didn't stop in the grace, each with a temporary file that may stay.
     pub running: usize,

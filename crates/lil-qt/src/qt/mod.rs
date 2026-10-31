@@ -144,14 +144,15 @@ fn wait_for_exports() {
     if ended.stopped {
         tracing::warn!(
             still_running = ended.running,
-            "closing stopped an export that took too long: the file you picked is as it was"
+            "closing told an export that took too long to stop: one still writing leaves the \
+             file you picked as it was, and one past its last chunk replaces it"
         );
     }
     if ended.running > 0 {
         tracing::error!(
             still_running = ended.running,
-            "an export didn't stop as the app closed: a hidden .lil-tmp file may stay beside the \
-             file you picked"
+            "an export didn't stop as the app closed: a .lil-tmp file may stay beside the file \
+             you picked"
         );
     }
 }
