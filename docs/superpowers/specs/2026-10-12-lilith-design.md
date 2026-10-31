@@ -1266,7 +1266,7 @@ In M1 these are panels inside the Image studio; a separate Hub app hosts them la
   - (owner decision 2026-10-19; plan 4b) Each job also shows its `phase` and `subtasks`, elapsed and remaining time, and the "unresponsive" badge, all from the job record (CORE-117): the badge follows ARCH-072's stall rule on `last_progress_at`, and is a display flag only. Remaining time comes from the estimator (CORE-161). A batch's jobs are grouped under its `batch_id`, and a run with every node cached says "nothing changed".
   - Filters (status, kind, who started it, from `origin`), and "Clear inactive", which hides finished jobs from the panel without deleting their records.
   - (owner decision 2026-10-20; plan 4a) Queue controls (CORE-160): run next or last, cancel a batch or all of yours, and Pause GPU work.
-- **APP-115** [M1] **Confirmations:** pending agent requests (who asked, the exact action, the files/packages/scripts involved), approve/deny, history; pending cap confirmations.
+- **APP-115** [M1] **Confirmations:** pending agent requests (who asked, the exact action, the files/packages/scripts involved), approve/deny, history; pending cap confirmations. (plan 4a clarification, 2026-10-30) Until a tool declares which paths a call touches, the card shows the exact arguments in full, which is what can be said truly, and no list of files guessed from argument names. A `files` field the core derives from each tool's declaration is plan 4b's.
 
 **Usage & spend**
 
