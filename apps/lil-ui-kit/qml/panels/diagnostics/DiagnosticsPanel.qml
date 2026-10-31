@@ -42,11 +42,13 @@ Rectangle {
     property string fixJobId
     property bool exporting: false
 
-    // Whether the cards are live. What the shell does while it lays itself out isn't a show, nor a
-    // flicker (floating and re-docking moves the item) a hide.
+    // Whether the cards are live. What the shell does while it lays itself out isn't a show (each
+    // tab can be in front for a moment), nor a flicker (floating and re-docking moves the item) a
+    // hide.
     property bool shown: false
     readonly property bool isOnScreen: visible && width > 0 && height > 0
                                        && Window.window !== null && Window.window.visible
+                                       && (!shell || shell.layoutSettled !== false)
 
     readonly property alias versions: versionsCard
     readonly property alias engines: enginesCard

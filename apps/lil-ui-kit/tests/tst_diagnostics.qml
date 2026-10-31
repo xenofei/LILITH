@@ -1044,6 +1044,7 @@ TestCase {
         tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
         const panel = dock.content
         verify(!panel.visible, "a tab behind")
+        wait(200)
         const own = ["diagnostics.recent", "desktop.get", "models.report", "engines.environment"]
         for (const name of own)
             compare(callsOf(core, name), [], name + " isn't read behind a tab")

@@ -141,15 +141,13 @@ TestCase {
         compare(seen.bytes, 72)
         compare(seen.url, preview.source.toString())
 
-        // Nothing QML holds carries the bytes: the preview's properties, the log's rows.
+        // Nothing QML holds carries the bytes: the preview's properties; the event log keeps no
+        // frame at all (APP-134).
         for (const key in preview) {
             const value = preview[key]
             if (typeof value === "string")
                 verify(value.indexOf(twoWide) < 0 && value.length < 200, key)
         }
-        const row = log.get(log.rowCount() - 1)
-        compare(row.topic, "preview:j_5")
-        verify(row.text.indexOf(twoWide) < 0, row.text)
-        verify(row.text.indexOf("image://lilpreview/j_5/") >= 0, row.text)
+        compare(log.rowCount(), 0)
     }
 }
