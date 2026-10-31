@@ -1157,6 +1157,52 @@ mod tests {
         }
     }
 
+    /// The core this client started has to prove itself like any other: `greet`, on a client's
+    /// own core, sends the proof, and without the event set says nothing more.
+    #[test] // spec: ARCH-027
+    fn a_clients_own_core_is_asked_for_the_proof_too() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = TestEnv::new();
+            let cfg = ClientConfig::for_env(env.env.clone(), CallerKind::Cli).unwrap();
+            let name = env.env.pipe_name();
+            let server = lil_platform::pipe::create_instance(&name, true).expect("fake server");
+            let pipe = open_client(&name).expect("open the fake server");
+            // This process serves the pipe, so it is the core the finder started.
+            let mut finder = Finder::new(&cfg);
+            finder.spawned = Some(lil_platform::process::open(std::process::id()).unwrap());
+            assert!(finder.spawned_pid(server_pid(&pipe).unwrap()));
+            let fake = async {
+                server.connect().await.expect("accept");
+                let (read, mut write) = tokio::io::split(server);
+                let mut lines = BufReader::new(read).lines();
+                let mut got = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let proved = json!({"status": "ok", "proved": true});
+                    let reply = json!({"jsonrpc": "2.0", "id": request["id"], "result": proved});
+                    let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                    let _ = write.flush().await;
+                    got.push(request["method"].clone());
+                }
+                got
+            };
+            let (greeted, got) = tokio::join!(
+                async { greet(&cfg, &mut finder, pipe).await.map(|_| ()) },
+                fake
+            );
+            assert_eq!(got, [method::PROVE]);
+            assert!(
+                matches!(greeted, Err(ClientError::Untrusted { .. })),
+                "{greeted:?}"
+            );
+        });
+    }
+
     /// A server that never answers the proof gets the path's deadline and nothing more.
     #[test] // spec: ARCH-027
     fn a_server_silent_to_the_proof_times_out_and_hears_nothing_more() {
