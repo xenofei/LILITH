@@ -38,6 +38,10 @@
 //! ETAs' words, APP-114, APP-140) and [`live_jobs`] (the running and queued jobs in run order,
 //! with their places, ETAs and times); the bridge's `JobText` and `LiveJobsModel` serve them to
 //! QML.
+//!
+//! The confirm dialog's Qt-free parts (P4a-R10): [`answer_gate`] (when it takes an answer) and
+//! [`pointer_gate`] (whether a click on Approve came from a real pointer); the bridge's
+//! `ConfirmInput` serves them to QML.
 
 #[cfg(feature = "qt")]
 extern crate cxx_qt_lib;
@@ -45,6 +49,7 @@ extern crate cxx_qt_lib;
 #[cfg(feature = "qt")]
 pub mod qt;
 
+pub mod answer_gate;
 pub mod app_state;
 pub mod args;
 pub mod counts;
@@ -54,6 +59,7 @@ pub mod layout_file;
 pub mod live_jobs;
 pub mod money;
 pub mod paging;
+pub mod pointer_gate;
 pub mod preview;
 pub mod requests;
 pub mod retry;
