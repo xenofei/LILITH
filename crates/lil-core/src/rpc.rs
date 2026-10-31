@@ -15,7 +15,8 @@
 //!   `protocol.incompatible` refusal. `core/drain` drains the core only when the client's
 //!   major is greater than the core's (a newer client may replace an older core, ARCH-023);
 //!   otherwise it gets the same frozen refusal and the core keeps running (an older client
-//!   never stops a newer core, ARCH-014). Everything else is -32001.
+//!   never stops a newer core, ARCH-014). A second hello and `core/prove` are -32600; everything
+//!   else is -32001.
 //! - [`ConnState::Ready`]: the session exists. A second hello is -32600. `core/drain` replies
 //!   `{"status":"ok","draining":true}` and begins a requested drain. `tools/list` and
 //!   `tools/call` go to the [`Dispatcher`] (the `tools` module; a draining core answers new

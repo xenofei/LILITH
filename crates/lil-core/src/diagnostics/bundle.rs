@@ -4,7 +4,7 @@
 //!
 //! - `manifest.json`: `{bundle: 1, created, build_id, channel, protocol}`;
 //! - `versions.json`: the core, each app that said hello, ComfyUI, the Qt pair and
-//!   KDDockWidgets (`null`: protocol 1.2 carries no such version) and the driver;
+//!   KDDockWidgets (`null`: the protocol carries no such version) and the driver;
 //! - `suite.toml`, redacted ([`crate::redact::Redactor::toml`]), left out when there is none;
 //! - `errors.json`: `diagnostics.recent` with limit 200;
 //! - `hardware.json`: the telemetry `Snapshot`;
