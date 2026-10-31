@@ -131,7 +131,8 @@ TestCase {
 
         t.core.applyState({connection: "ready", workspace: workspaceOne})
         verify(!banner.visible, "gone at once")
-        for (const a of inBar.filter(a => a !== t.shell.topBar.pauseButton))
+        // The switchers are back at once; each pause control also waits for its fresh read.
+        for (const a of inBar.filter(a => a.text.indexOf("GPU work") < 0 && a.text !== "Pause"))
             verify(a.enabled, "back at once: " + a.text)
         verify(!t.shell.topBar.pauseButton.enabled, "the pause also waits for its fresh read")
         for (let n = 0; n < 20 && open(t.core, named("jobs.list")).length > 0; ++n)

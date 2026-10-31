@@ -18,7 +18,7 @@ Flow {
 
     readonly property bool yourPause: !!queueState && (queueState.reasons || []).indexOf("manual") >= 0
     readonly property int restartHeld: queueState ? queueState.restart_held || 0 : 0
-    readonly property bool free: panel.writable && !panel.busyLanes[lane]
+    readonly property bool free: panel.writable && panel.lanesCurrent && !panel.busyLanes[lane]
 
     spacing: Theme.spacing
 

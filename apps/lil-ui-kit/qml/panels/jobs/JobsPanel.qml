@@ -30,7 +30,10 @@
 // `usage` events and when a job ends, for the retry's cost chip. Writes wait until both lists have
 // loaded, and refusals show in the banner; Pause, Resume and Retry also wait for their own call,
 // so a double-click can't undo itself. A snapshot or a `resync_required` of `jobs` reads everything
-// again; `ready` never does.
+// again. `ready` reloads no model, but a read of the live rows follows it, since a same-core reconnect
+// gets no mark: `lanesCurrent` is false from a loss or a mark until a read made after it has landed,
+// and Pause and Resume wait for it, because a core restart ends a pause and the old state must not
+// decide which of them a press sends.
 //
 // Everything from outside (messages, hints, fix labels, kinds, origins, classes, lanes, statuses,
 // substatuses, phases, reasons) is shown through Core.shownText (P4a-R8), and every Text is plain,
@@ -121,6 +124,10 @@ Rectangle {
 
     // Writes need the core (APP-034): the buttons are marked `requiresCore`, and calls check here.
     readonly property bool writable: jobsModel.loaded && live.loaded && !!core && core.connection === "ready"
+    // See the header.
+    property bool lanesCurrent: true
+    // Connection losses so far: a read that spans one doesn't speak for the new connection.
+    property int _losses: 0
     readonly property var knownLanes: ["gpu-heavy", "cpu"]
     readonly property var headerLanes: {
         const out = knownLanes.slice()
@@ -302,7 +309,12 @@ Rectangle {
         return true
     }
 
-    // Lands on the wanted job if a read has brought its row. The focus goes along only if it is
+    // You chose a row: a job still being looked for must not take the selection from you.
+    function personSelected() {
+        wantedJob = ""
+    }
+
+    // Lands on the wanted job if a read or an event has brought its row. The focus goes along only if it is
     // still in this panel, or nowhere: the person may have gone on while the panel looked.
     function tryWantedJob() {
         if (wantedJob === "")
@@ -387,7 +399,7 @@ Rectangle {
     // core answers at once, so without that a double-click of Pause pauses and then resumes,
     // withdrawing the prompts on the way. The control stays enabled, so it keeps the focus.
     function queueCall(method, params, what) {
-        if (!writable || busyLanes[params.lane])
+        if (!writable || !lanesCurrent || busyLanes[params.lane])
             return
         const answered = _laneAnswered[params.lane]
         if (answered !== undefined && Date.now() - answered < Qt.styleHints.mouseDoubleClickInterval)
@@ -479,6 +491,7 @@ Rectangle {
             return
         }
         applyPendingJobs()
+        const losses = _losses
         _liveReading = true
         _newerLanes = {}
         live.beginRead(!!fresh)
@@ -496,6 +509,8 @@ Rectangle {
             root.overviewChanged()
             const newer = root._newerLanes
             root.applyLanes(JSON.parse(live.lanesJson()).filter(s => !newer[s.lane]))
+            if (losses === root._losses && !root._liveFreshAgain)
+                root.lanesCurrent = true
             if (root.wantedJob !== "")
                 root.fillHistory()
             if (root._liveAgain) {
@@ -514,6 +529,14 @@ Rectangle {
             gone = true
             root._liveReading = false
             root._liveReadFailed = true
+            // One was asked for meanwhile (`ready`, a mark): it needn't wait out the retry.
+            if (root._liveAgain) {
+                const again = root._liveFreshAgain
+                root._liveAgain = false
+                root._liveFreshAgain = false
+                root.readLive(again)
+                return
+            }
             retryLive.start()
         }
         // A listing, each page after the page before.
@@ -578,6 +601,7 @@ Rectangle {
         if (kind !== "event") {
             // A snapshot or a resync: the history reloads itself; the panel reads its own state
             // afresh, and the reload hands back the unknown-status jobs the core still lists.
+            lanesCurrent = false
             readLive(true)
             readEngines()
             readCaps()
@@ -610,6 +634,8 @@ Rectangle {
             overviewChanged()
         if (change === 2)
             requestLiveRead()
+        // An event can bring the row a link asked for, before any read does.
+        tryWantedJob()
     }
 
     function start() {
@@ -646,6 +672,16 @@ Rectangle {
     Connections {
         target: root.core
         ignoreUnknownSignals: true
+        function onConnectionChanged() {
+            if (root.core.connection === "ready") {
+                retryLive.stop()
+                if (!root.lanesCurrent || !live.loaded)
+                    root.readLive()
+            } else {
+                root.lanesCurrent = false
+                root._losses++
+            }
+        }
         function onCallFinished(id, json) {
             const h = root._raw[id]
             if (!h)
@@ -839,6 +875,11 @@ Rectangle {
             activeFocusOnTab: true
             currentIndex: -1
             boundsBehavior: Flickable.StopAtBounds
+            Keys.onPressed: event => {
+                if (event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+                    root.personSelected()
+                event.accepted = false
+            }
 
             Accessible.role: Accessible.List
             Accessible.name: "Running and queued"
@@ -937,6 +978,11 @@ Rectangle {
             activeFocusOnTab: true
             currentIndex: -1
             boundsBehavior: Flickable.StopAtBounds
+            Keys.onPressed: event => {
+                if (event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+                    root.personSelected()
+                event.accepted = false
+            }
 
             Accessible.role: Accessible.List
             Accessible.name: "Finished"

@@ -10,6 +10,7 @@ import QtQuick
 import QtTest
 import Lilith.Shim
 import Lilith.UiKit
+import "CoreShapes.js" as Shapes
 
 TestCase {
     id: tc
@@ -314,6 +315,118 @@ TestCase {
                   t.panel.banner.text)
     }
 
+    // The panel with nothing answered yet: a link can ask for a job before any read is in.
+    function unanswered() {
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        return {window: w, panel: w.panel, core: core}
+    }
+
+    function test_a_wanted_job_lands_when_an_event_brings_it() { // spec: APP-114, P4a-R21
+        const t = unanswered()
+        verify(!t.panel.showJob("j9", false), "it isn't listed yet")
+        compare(t.panel.wantedJob, "j9")
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("j9", "running")})
+        // No read has been answered: the event alone brought the row.
+        compare(answeredReads(t.core), 0)
+        tryCompare(t.panel, "wantedJob", "", 2000, "it landed")
+        const row = t.panel.liveView.currentIndex
+        verify(row >= 0, "its row is selected")
+        compare(t.panel.live.get(row).job_id, "j9")
+    }
+
+    function answeredReads(core) {
+        return core.calls.filter(c => c.name === "jobs.list" && answered[c.id]).length
+    }
+
+    function test_a_late_job_does_not_replace_the_row_you_just_selected() { // spec: APP-114, P4a-R21
+        // A link asks for a job that isn't listed yet; you pick a row while the panel looks.
+        const t = unanswered()
+        const r1 = Shapes.job("r1", "running")
+        const r2 = Shapes.job("r2", "running", {created: "2026-10-30T12:00:05Z"})
+        verify(!t.panel.showJob("j9", false))
+        answerLive(t.core, [r1, r2], [])
+        tryVerify(() => t.panel.live.count === 2 && t.panel.rowFor("r2"), 3000, "the rows")
+        compare(t.panel.wantedJob, "j9", "still looked for")
+        wait(50)
+        const picked = t.panel.rowFor("r2")
+        mouseClick(picked, 5, 5)
+        const chosen = t.panel.live.rowOf("r2")
+        compare(t.panel.liveView.currentIndex, chosen, "your row")
+        compare(t.panel.wantedJob, "", "you chose: the panel stops looking")
+
+        // The wanted job comes after all: the selection stays yours.
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("j9", "running", {created: "2026-10-30T11:00:00Z"})})
+        tryVerify(() => t.panel.live.rowOf("j9") >= 0, 2000, "its row came")
+        wait(50)
+        compare(t.panel.liveView.currentIndex, t.panel.live.rowOf("r2"), "still your row")
+    }
+
+    function test_the_arrow_keys_are_a_selection_too() { // spec: APP-114, APP-156
+        const t = unanswered()
+        verify(!t.panel.showJob("j9", false))
+        answerLive(t.core, [Shapes.job("r1", "running"), Shapes.job("r2", "running")], [])
+        tryVerify(() => t.panel.live.count === 2)
+        t.window.requestActivate()
+        tryVerify(() => t.window.active, 2000, "the window takes the keys")
+        t.panel.liveView.forceActiveFocus(Qt.TabFocusReason)
+        tryVerify(() => t.panel.liveView.activeFocus, 2000)
+        t.panel.liveView.currentIndex = 0
+        compare(t.panel.wantedJob, "j9", "only a person's selection stops it, not a row moving")
+        keyClick(Qt.Key_Down)
+        compare(t.panel.liveView.currentIndex, 1, "the key moved it")
+        compare(t.panel.wantedJob, "")
+    }
+
+    function test_the_pause_waits_for_a_read_after_a_reconnect() { // spec: ARCH-100, CORE-160, APP-114
+        // A restart ends a pause: the state from before the loss must not decide Pause or Resume.
+        const paused = [lane({paused: true, reasons: ["manual"]})]
+        const t = load({lanes: paused})
+        tryVerify(() => t.panel.laneHeader("gpu-heavy") && t.panel.lanes["gpu-heavy"].paused)
+        verify(t.panel.lanesCurrent)
+        const queueCalls = () => t.core.calls.filter(c => c.name.startsWith("app/queue.")).length
+        const reads = () => t.core.calls.filter(isRunningRead).length
+
+        t.core.applyState({connection: "reconnecting"})
+        verify(!t.panel.lanesCurrent, "at once")
+        const before = reads()
+        t.core.applyState({connection: "ready", workspace: null})
+        compare(reads(), before + 1, "`ready` reads: no mark comes on a same-core reconnect")
+        verify(!t.panel.lanesCurrent, "not until that read is in")
+        t.panel.resume("gpu-heavy")
+        compare(queueCalls(), 0, "the old state must not send a resume")
+
+        // A mark during the read: that read no longer speaks for the new core.
+        t.core.emit("jobs", "resync_required", null)
+        answerLive(t.core, [], [], paused)
+        verify(!t.panel.lanesCurrent, "a read from before the mark")
+        t.panel.resume("gpu-heavy")
+        compare(queueCalls(), 0)
+
+        answerLive(t.core, [], [], [lane()])
+        tryVerify(() => t.panel.lanesCurrent, 2000, "the read after it")
+        verify(!t.panel.lanes["gpu-heavy"].paused, "the new core's state")
+        // The mark reloaded the history too, and writes wait for that as well.
+        answer(t.core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}), "the history's reload")
+        tryVerify(() => t.panel.writable, 2000)
+        t.panel.pause("gpu-heavy")
+        compare(t.core.calls.filter(c => c.name === "app/queue.pause").length, 1)
+    }
+
+    function test_a_read_spanning_a_loss_does_not_count() { // spec: ARCH-100, CORE-160
+        const t = load()
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("q1", "queued")})
+        tryVerify(() => openCalls(t.core, isRunningRead).length > 0, 2000, "a read out")
+        t.core.applyState({connection: "reconnecting"})
+        answerLive(t.core, [], [])
+        verify(!t.panel.lanesCurrent, "it began before the loss")
+        t.core.applyState({connection: "ready", workspace: null})
+        tryVerify(() => openCalls(t.core, isRunningRead).length > 0, 2000, "the read for the new connection")
+        answerLive(t.core, [], [])
+        tryVerify(() => t.panel.lanesCurrent, 2000)
+    }
+
     function test_a_lost_connection_disables_the_panels_writes() { // spec: APP-034, APP-114
         const t = load({jobs: [job("r1"), job("q1", {status: "queued", substatus: "waiting"})],
                         running: [job("r1")], queue: [job("q1", {status: "queued", substatus: "waiting"})]})
@@ -348,8 +461,10 @@ TestCase {
 
         t.core.connection = "ready"
         verify(t.panel.writable)
+        answerLive(t.core, [job("r1")], [job("q1", {status: "queued", substatus: "waiting"})])
+        tryVerify(() => t.panel.lanesCurrent, 2000, "the read after `ready`: the pause waits for it")
         for (const b of buttons)
-            verify(b.enabled, "back at once: " + b.text)
+            verify(b.enabled, "back: " + b.text)
     }
 
     function test_an_unknown_reason_is_cut_like_all_outside_text() { // spec: APP-114, P4a-R8

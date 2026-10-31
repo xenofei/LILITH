@@ -251,7 +251,10 @@ Rectangle {
     Accessible.description: timeText
 
     TapHandler {
-        onTapped: root.ListView.view.currentIndex = root.ListView.view.indexAt(root.x + 1, root.y + 1)
+        onTapped: {
+            root.panel.personSelected()
+            root.ListView.view.currentIndex = root.ListView.view.indexAt(root.x + 1, root.y + 1)
+        }
     }
 
     Column {
