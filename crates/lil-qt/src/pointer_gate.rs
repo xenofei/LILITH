@@ -278,10 +278,13 @@ impl PointerGate {
         // A real move ends a rest's small moves near where it was; a warp lands anywhere. If it lands
         // on a button, the rest is the program's, whatever the hand does there next.
         let input = !msg.sent && msg.origin != InputOrigin::Unavailable;
-        if s.kind == PointerKind::Move && !real && input && msg.at != self.last_at {
-            if let Some(t) = s.target.filter(|t| contains(t.rect, msg.at)) {
-                self.reenter = Some(t.serial);
-            }
+        if s.kind == PointerKind::Move
+            && !real
+            && input
+            && msg.at != self.last_at
+            && let Some(t) = s.target.filter(|t| contains(t.rect, msg.at))
+        {
+            self.reenter = Some(t.serial);
         }
         if msg.at.is_some() {
             self.last_at = msg.at;
