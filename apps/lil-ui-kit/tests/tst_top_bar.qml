@@ -864,6 +864,25 @@ TestCase {
         tryVerify(() => !sw.popup.visible, 2000, "and Escape")
     }
 
+    Component {
+        id: otherWindow
+        Window {
+            width: 200
+            height: 100
+            visible: true
+        }
+    }
+
+    function test_a_press_in_another_window_of_the_app_closes_a_list() { // spec: APP-006, APP-001
+        const t = load()
+        const other = createTemporaryObject(otherWindow, tc)
+        tryVerify(() => other.visible)
+        wait(50)
+        const sw = openProjects(t)
+        mouseClick(other.contentItem, 20, 20)
+        tryVerify(() => !sw.popup.visible, 2000, "a floating dock is another window")
+    }
+
     function test_sketchbook_is_the_default_project() { // spec: ARCH-098, APP-015
         const t = load({effective: "sketchbook"})
         compare(t.core.project, "")
