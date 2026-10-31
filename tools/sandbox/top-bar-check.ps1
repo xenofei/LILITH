@@ -361,11 +361,11 @@ try {
     if (-not $floatBtn) {
         Fail '(c) no Float Hardware button, so the floating case did not run'
     } else {
-        $n = @(App-Windows).Count
         Invoke-Element $floatBtn
-        $floating = Wait-For { $w = @(App-Windows) | Where-Object { $_.Current.NativeWindowHandle -ne $script:main.Current.NativeWindowHandle } | Select-Object -First 1; $w } 10 'the floating dock'
+        # UIA shows a floating dock as a Window under the main one ("Floating QWindow with parent").
+        $floating = Wait-For { Find-Window $script:app.Id 'Hardware' } 10 'the floating dock'
         Start-Sleep -Milliseconds 500
-        Pass "(c) Hardware floats in its own window (windows of the app: was $n, now $(@(App-Windows).Count))"
+        Pass "(c) Hardware floats in a window of its own"
         Show-App
         $list = Open-List
         $f = $floating.Current.BoundingRectangle
