@@ -282,16 +282,22 @@ function Invoke-Element($e) {
 function App-Windows {
     @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
 }
+# UI Automation can throw for a whole walk while the tree moves (a reconnect): walk again, a few times.
+function Retry-Walk([scriptblock]$walk) {
+    for ($i = 0; ; ++$i) {
+        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
+    }
+}
 function Find-Named($name) {
     $c = Prop $AE::NameProperty $name
-    foreach ($w in App-Windows) { $e = $w.FindFirst($TS::Descendants, $c); if ($e) { return $e } }
+    foreach ($w in App-Windows) { $e = Retry-Walk { $w.FindFirst($TS::Descendants, $c) }; if ($e) { return $e } }
     return $null
 }
 # The first element whose name starts with `prefix`, in a window of the app. Only the main window
 # and floating docks are searched this way, never a dialog (the check closes those by id).
 function Find-NameStarting([string]$prefix) {
     foreach ($w in App-Windows) {
-        $all = $w.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        $all = Retry-Walk { $w.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) }
         foreach ($e in $all) { try { if ($e.Current.Name.StartsWith($prefix)) { return $e } } catch { } }
     }
     return $null
@@ -370,7 +376,9 @@ try {
     [void](Wait-For { if (-not (Find-Window $script:app.Id 'Create or choose a workspace')) { $true } } 10 'the dialog to close')
     Start-Sleep -Seconds 1
     Check ((Get-DiskState) -eq $before) '(a) cancelled: suite.toml and the folders are as they were'
-    Check ($null -ne (Find-Named 'Create or choose a workspace')) '(a) cancelled: the banner stays'
+    # The window has only just got the front back from the dialog: a few looks, not one.
+    $stays = try { [void](Wait-For { Find-Named 'Create or choose a workspace' } 5 'the banner'); $true } catch { $false }
+    Check $stays '(a) cancelled: the banner stays'
     Close-App
 
     # A workspace, and the app on it.
@@ -538,6 +546,7 @@ try {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
+        if (Test-Path -LiteralPath (Join-Path $DiagDir 'logs')) { Remove-Item -Recurse -Force -LiteralPath (Join-Path $DiagDir 'logs') }
         if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir 'logs') -Recurse -Force }
         Write-Host "diagnostics in $DiagDir"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
