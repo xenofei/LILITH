@@ -19,5 +19,9 @@ fn main() {
         .file("src/qt/boot.rs")
         .cpp_file("src/qt/launch_sink.cpp")
         .file("src/qt/bundle_export.rs")
+        .file("src/qt/confirm_input.rs")
+        .cpp_file("src/qt/pointer_filter.cpp")
+        .qt_module("Gui")
+        .qt_module("Quick")
         .build();
 }
