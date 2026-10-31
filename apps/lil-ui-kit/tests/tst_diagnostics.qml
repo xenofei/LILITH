@@ -625,7 +625,7 @@ TestCase {
         verify(panel.banner.text.indexOf(dir + "/picked.zip") >= 0, panel.banner.text)
         verify(panel.banner.text.indexOf("12,345") >= 0, panel.banner.text)
         verify(panel.banner.text.indexOf("leaves this PC only when you hand it on") >= 0, panel.banner.text)
-        verify(panel.banner.text.indexOf("It still names other programs and network adapters, model files and workspace folders outside your user folder") >= 0, panel.banner.text)
+        verify(panel.banner.text.indexOf("It still names your folders, and any file a log or an error mentions (only the start of a path in your user folder is hidden), ComfyUI's folder and node packs, other programs, network adapters and your hardware, so look through it before you share it.") >= 0, panel.banner.text)
 
         verify(panel.explorerButton.visible)
         compare(panel.explorerButton.text, "Show in Explorer")

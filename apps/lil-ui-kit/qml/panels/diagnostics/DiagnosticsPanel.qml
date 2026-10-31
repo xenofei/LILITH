@@ -164,9 +164,10 @@ Rectangle {
             panelBanner.show("Saved the diagnostics bundle as " + Words.shown(root.core, path, 260) + ": "
                              + MoneyText.count(String((b.files || []).length)) + " files, "
                              + MoneyText.count(String(b.redactions || 0)) + " values redacted. Nothing is sent "
-                             + "anywhere: it leaves this PC only when you hand it on. It still names other "
-                             + "programs and network adapters, model files and workspace folders outside your "
-                             + "user folder, so look through it before you share it.")
+                             + "anywhere: it leaves this PC only when you hand it on. It still names your "
+                             + "folders, and any file a log or an error mentions (only the start of a path in "
+                             + "your user folder is hidden), ComfyUI's folder and node packs, other programs, "
+                             + "network adapters and your hardware, so look through it before you share it.")
         }
         onFailed: (path, why, bundleRead) => {
             const b = root._bundle || {}
