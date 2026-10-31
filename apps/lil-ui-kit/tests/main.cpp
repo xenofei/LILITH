@@ -238,6 +238,9 @@ int main(int argc, char **argv)
         const int code = lil_qt::claim_instance();
         return code >= 0 ? code : 3;
     }
+    // As lil-image does (lil_qt::qt_env_to_clear): QML's local time is Windows', whatever TZ the
+    // shell that started the tests has.
+    qunsetenv("TZ");
     Setup setup;
     return quick_test_main_with_setup(argc, argv, "lil_ui_kit", nullptr, &setup);
 }

@@ -10,7 +10,8 @@
 //   2. The variables that choose where Qt, QML, the scene graph, WebEngine or the Vulkan loader
 //      load code, QML or data from, which exe WebEngine starts, or that open debugging, all names
 //      under their prefixes (lil_qt::qt_env_to_clear), are removed from the process environment,
-//      and checked gone.
+//      and checked gone. So is TZ: QML's local time must be the calendar the core and the bridge
+//      use, Windows' (CORE-012).
 //   3. The names (the caches and the WebEngine profile follow them), AA_ShareOpenGLContexts
 //      (APP-137) and the library path (this exe's folder only) are set; qt.conf beside the exe
 //      pins Qt's other folders to it.
