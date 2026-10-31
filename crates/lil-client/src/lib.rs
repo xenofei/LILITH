@@ -285,10 +285,10 @@ impl fmt::Display for ClientError {
             ClientError::Untrusted { pid, image, reason } if reason == NOT_PROVED => {
                 write!(
                     f,
-                    "The LILITH core pipe names pid {pid} as its server, but whoever holds it did \
-                     not prove that it does, so this client does not trust it. A core from an \
-                     older LILITH build can't answer this: it ends once no LILITH app is open and \
-                     it has been idle, or you can end it in Task Manager."
+                    "The LILITH core pipe names pid {pid} as server, but its holder didn't prove \
+                     that, so it isn't trusted. In another Windows session, use the core's \
+                     session. An older build can't prove it: its lil core stop works, it ends \
+                     once nothing is connected to it and it has been idle, or use Task Manager."
                 )?;
                 if !image.as_os_str().is_empty() {
                     write!(f, " That pid is {}.", image.display())?;
@@ -620,7 +620,8 @@ mod tests {
             reason: NOT_PROVED.to_string(),
         }
         .to_string();
-        let shown: String = text.chars().take(300).collect();
+        // `lil_parse::shown_text` keeps 299 characters and `…` when it cuts.
+        let shown: String = text.chars().take(299).collect();
         assert!(shown.contains("Task Manager."), "{shown}");
         assert!(shown.contains(&u32::MAX.to_string()), "{shown}");
         assert!(text.contains("lil-core.exe"), "{text}");

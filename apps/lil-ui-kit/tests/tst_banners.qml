@@ -208,7 +208,7 @@ TestCase {
         verify(!banner.retryButton.visible)
 
         // A failed proof, in `ClientError::Untrusted`'s words: the cut at 300 only costs the path.
-        t.core.applyState({connection: "unavailable", unavailable: Shapes.otherCause("untrusted", "The LILITH core pipe names pid 4294967295 as its server, but whoever holds it did not prove that it does, so this client does not trust it. A core from an older LILITH build can't answer this: it ends once no LILITH app is open and it has been idle, or you can end it in Task Manager. That pid is C:\\" + "long folder\\".repeat(30) + "lil-core.exe.")})
+        t.core.applyState({connection: "unavailable", unavailable: Shapes.otherCause("untrusted", "The LILITH core pipe names pid 4294967295 as server, but its holder didn't prove that, so it isn't trusted. In another Windows session, use the core's session. An older build can't prove it: its lil core stop works, it ends once nothing is connected to it and it has been idle, or use Task Manager. That pid is C:\\" + "long folder\\".repeat(30) + "lil-core.exe.")})
         verify(banner.text.indexOf("Task Manager.") >= 0, banner.text)
         verify(banner.text.indexOf("lil-core.exe") < 0, banner.text)
     }
