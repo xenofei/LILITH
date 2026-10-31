@@ -16,7 +16,8 @@
        seeded, then Export again over the same file and confirm the replace.
      After each step the disk is checked: the file, its UTF-8 BOM and header, the record's
      provider, no .lil-tmp or .lil-bak beside it, a pre-placed usage.csv.bak of "yours" left as
-     it was; after the cancel the file and the folder are unchanged.
+     it was; after the cancel the file and the folder are unchanged. Real keys go only while the
+     app's window is in front; otherwise the check fails and sends nothing.
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first.
   4. lil-image is closed, the test core stopped, the temporary root removed, and the pop-up told
      it is done. Exit 0 only when every check passed.
@@ -88,10 +89,11 @@ function Self-Test {
 $channel = 'test-usagecheck'
 $root = Join-Path ([IO.Path]::GetTempPath()) ("lil-usagecheck-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 function Enter-TestChannel {
-    New-Item -ItemType Directory $root | Out-Null
-    foreach ($s in 'roaming', 'local', 'profile', 'out') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
+    # First, before anything that can throw: every `lil` from here on is on the test channel.
     $env:LIL_CHANNEL = $channel
     $env:LIL_TEST_ROOT = $root
+    New-Item -ItemType Directory $root | Out-Null
+    foreach ($s in 'roaming', 'local', 'profile', 'out') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
     # The core finds no workspace from this folder: usage is loose.
     Set-Location -LiteralPath $root
 }
@@ -105,6 +107,8 @@ function Seed([string]$provider, [string]$amount) {
     [void](Invoke-Lil @('call', 'test.meter_external', $json))
 }
 function Exit-TestChannel {
+    # Never off the test channel: `lil core stop` would reach the channel this shell defaults to.
+    if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
     try { [void](& $lil core stop 2>&1) } catch { }
     Set-Location -LiteralPath $Repo
     Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
@@ -117,8 +121,39 @@ function Exit-TestChannel {
     if (Test-Path -LiteralPath $root) { Write-Host "note: $root could not be removed yet" }
 }
 
+if (-not ('LilUsageCheck.Win' -as [type])) {
+    Add-Type -Namespace LilUsageCheck -Name Win -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hwnd);
+[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hwnd, out uint processId);
+'@
+}
+# Real input only ever goes to this app: anything else in front, and the check fails and sends nothing.
+function Get-WindowProcessId([System.IntPtr]$hwnd) {
+    [uint32]$owner = 0
+    [void][LilUsageCheck.Win]::GetWindowThreadProcessId($hwnd, [ref]$owner)
+    return [int]$owner
+}
+function Assert-AppInFront {
+    for ($i = 0; $i -lt 5; ++$i) {
+        if ((Get-WindowProcessId ([LilUsageCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw 'no keys sent: another program''s window is in front'
+}
+function Send-Checked([string]$keys) {
+    Assert-AppInFront
+    [System.Windows.Forms.SendKeys]::SendWait($keys)
+}
+
 if ($DryRun) {
     Self-Test
+    # The guard, without any input: a process that owns no window is never in front.
+    $script:app = [pscustomobject]@{ Id = -1 }
+    $refused = $false
+    try { Assert-AppInFront } catch { $refused = "$_" -like 'no keys sent*' }
+    $script:app = $null
+    Check $refused 'self-test: the guard refuses a window that isn''t the app''s'
     Enter-TestChannel
     try {
         Seed 'openrouter' '1.25'
@@ -186,10 +221,7 @@ function Invoke-Element($e) {
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
     try { $e.SetFocus() } catch { Show-App }
-    [System.Windows.Forms.SendKeys]::SendWait(' ')
-}
-if (-not ('LilUsageCheck.Win' -as [type])) {
-    Add-Type -Namespace LilUsageCheck -Name Win -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hwnd);'
+    Send-Checked ' '
 }
 # The app's window in front, through Win32 (UIA's SetFocus is refused on a top-level window).
 function Show-App {
@@ -207,12 +239,12 @@ function Open-UsagePanel {
         elseif ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); $how = 'its dock tab (invoke)' }
     }
     Write-Host ("the Usage & spend tab: {0}" -f $(if ($tab) { "found ($how)" } else { 'not found' }))
-    if (-not $how) { Show-App; [System.Windows.Forms.SendKeys]::SendWait('^5'); $how = 'Ctrl+5' }
+    if (-not $how) { Show-App; Send-Checked '^5'; $how = 'Ctrl+5' }
     try {
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
     } catch {
         if ($how -eq 'Ctrl+5') { throw }
-        Show-App; [System.Windows.Forms.SendKeys]::SendWait('^5'); $how = "Ctrl+5 (after $how did nothing)"
+        Show-App; Send-Checked '^5'; $how = "Ctrl+5 (after $how did nothing)"
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
     }
     Pass "$how opened Usage & spend with the month total"
@@ -310,28 +342,28 @@ function Save-As($dlg, [string]$path) {
         # The file name box has the keyboard focus when the dialog opens.
         Show-Element $dlg
         try { $box.SetFocus() } catch { }
-        [System.Windows.Forms.SendKeys]::SendWait('^a')
-        [System.Windows.Forms.SendKeys]::SendWait((Escape-Keys $path))
+        Send-Checked '^a'
+        Send-Checked (Escape-Keys $path)
         Write-Host 'file name: typed'
         Start-Sleep -Milliseconds 300
-        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        Send-Checked '{ENTER}'
         return
     }
     if (-not (Invoke-DialogId $dlg '1')) {
         Show-Element $dlg; try { $box.SetFocus() } catch { }
-        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        Send-Checked '{ENTER}'
     }
 }
 # Cancel: id 2, else Escape.
 function Cancel-Dialog($dlg) {
-    if (-not (Invoke-DialogId $dlg '2')) { Show-Element $dlg; [System.Windows.Forms.SendKeys]::SendWait('{ESC}') }
+    if (-not (Invoke-DialogId $dlg '2')) { Show-Element $dlg; Send-Checked '{ESC}' }
 }
 # The replace prompt: its Yes, any control type, else Alt+Y.
 function Confirm-Replace($dlg) {
     $yes = $null
     try { $yes = Wait-For { Find-Yes $dlg } 5 'the replace prompt''s Yes' } catch { }
     if ($yes) { Invoke-Element $yes; Write-Host 'replace prompt: Yes'; return }
-    [System.Windows.Forms.SendKeys]::SendWait('%y')
+    Send-Checked '%y'
     Write-Host 'replace prompt: Alt+Y'
 }
 
