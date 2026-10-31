@@ -2,8 +2,9 @@
 //! core.
 //!
 //! - **Properties:** `connection` (`connecting`, `ready`, `reconnecting`, `incompatible` or
-//!   `unavailable`), `coreProtocol`, `workspace` (`{id, path}`, or null), `project` (empty:
-//!   nothing sets the app's project yet; the project switcher's `app/set_context` will),
+//!   `unavailable`), `coreProtocol`, `workspace` (`{id, path}`, or null), `project` (the
+//!   app's project as the last `app/set_context` answered it, empty for none: the project
+//!   switcher tells it through `noteProject`, since the session keeps its project per connection),
 //!   `channelScheme`, `startTimes` (`{firstFrameMs, interactiveMs}` of this start, APP-136, as
 //!   they become known) and `buildId`.
 //! - **Requests:** `call(tool, argsJson)`, `appCall(method, paramsJson)` and
@@ -115,6 +116,10 @@ pub mod qobject {
         /// Switches to workspace `id` with a new hello (P4a-R34).
         #[qinvokable]
         fn set_workspace(self: Pin<&mut Core>, id: &QString) -> QString;
+
+        /// Sets the `project` property: what `app/set_context` answered, empty for none.
+        #[qinvokable]
+        fn note_project(self: Pin<&mut Core>, project: &QString);
 
         /// Tries to reach the core now (the Unavailable banner's "Try again").
         #[qinvokable]
@@ -413,6 +418,13 @@ impl qobject::Core {
     pub fn shown_link_text(&self, text: &QString, max_chars: i32) -> QString {
         let max = usize::try_from(max_chars).unwrap_or(0);
         QString::from(crate::args::shown_outside(&text.to_string(), max).as_str())
+    }
+
+    pub fn note_project(mut self: Pin<&mut Self>, project: &QString) {
+        if self.project != *project {
+            self.as_mut().rust_mut().project = project.clone();
+            self.as_mut().project_changed();
+        }
     }
 
     pub fn retry_now(&self) {
