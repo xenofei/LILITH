@@ -50,9 +50,10 @@ TestCase {
         shell.visible = true
         tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
         const lanes = [Shapes.lane({paused: true, reasons: ["manual"], held: 3}), Shapes.lane({lane: "cpu"})]
-        answerAll("jobs.list", c => Shapes.jobsPage(c.args.status === "running" ? [Shapes.job("r1", "running"), Shapes.job("r2", "running")]
+        const answerJobs = () => answerAll("jobs.list", c => Shapes.jobsPage(c.args.status === "running" ? [Shapes.job("r1", "running"), Shapes.job("r2", "running")]
                                                     : c.args.order === "queue" || c.args.status === "queued" ? [Shapes.job("q1", "queued"), Shapes.job("q2", "queued"), Shapes.job("q3", "queued")]
                                                     : [], lanes))
+        answerJobs()
         answerAll("caps.get", () => Shapes.tool(Shapes.capsView([Shapes.capRow("monthly", 412)])))
         answerAll("app/set_context", () => Shapes.context(tc.workspaceOne, null, "sketchbook"))
         fake.emit("telemetry", "event", Shapes.sample(Shapes.gpu()))
@@ -77,8 +78,18 @@ TestCase {
             "workspace.unsupported", "This core serves only the default workspace, \"D:/art/quay\". To use \"D:/art/harbor\" instead, make it the default with `lil workspace use \"D:/art/harbor\"`.")})
         save(shell, "top-bar-refused.png")
 
+        // Connected, with no workspace at all: a first run. The read after `ready` is in, so the
+        // figures are live, and the banner has read that no default exists.
         fake.applyState({connection: "ready", workspace: null})
         verify(shell.noWorkspaceBanner.visible)
+        tryVerify(() => {
+            answerJobs()
+            answerAll("workspaces.list", () => Shapes.tool({workspaces: []}))
+            return shell.topBar.jobs.current && shell.docks.jobs.content.lanesCurrent
+                   && shell.noWorkspaceBanner.text.indexOf("becomes your default") >= 0
+        }, 5000, "the read after `ready`, and the list")
+        tryCompare(shell.topBar.jobsIndicator, "text", "2 running · 3 queued")
+        verify(shell.topBar.pauseButton.enabled)
         save(shell, "top-bar-no-workspace.png")
     }
 }
