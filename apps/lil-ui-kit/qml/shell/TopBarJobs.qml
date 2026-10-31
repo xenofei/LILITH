@@ -1,11 +1,11 @@
 // What the top bar knows of the jobs (APP-006): how many run and wait, and the lanes' states. It
 // follows the `jobs` topic and shows nothing itself.
 //
-// Counts come from the queue's own source, as the Jobs panel's live list does (Appendix G "Queue
-// position"): `jobs.list {status: "running"}` and every page of `jobs.list {order: "queue"}`, plus
-// every page of `{status: "queued"}`, since a dispatched job (substatus `submitting` or
-// `queued_in_engine`) stays `queued` and is in neither of the others; repeats are dropped by job id.
-// Their JSON goes to a LiveJobsModel of its own as it came, never parsed here. The model is `countsOnly`:
+// Counts come from a read of its own: every page of `jobs.list {status: "running"}` and of
+// `{status: "queued"}`, which lists every queued job, the dispatched ones (substatus `submitting` or
+// `queued_in_engine`) among them. A count needs no place in a queue, so unlike the Jobs panel it reads
+// no `{order: "queue"}`. Their JSON goes to a LiveJobsModel of its own as it came, never parsed here;
+// repeats are dropped by job id. The model is `countsOnly`:
 // no rows, ETAs or sorting, so a job's event is a lookup. A `jobs` event is one job, never a count:
 // one that came, went or changed status asks for a read 150 ms after the last such event (and at
 // most 1 s after the first, so a steady stream still reads); a progress-only one does nothing more.
@@ -120,7 +120,7 @@ Item {
         _reading = true
         _lanesDuringRead = {}
         live.beginRead(fresh)
-        let open = 3
+        let open = 2
         let gone = false
         const done = () => {
             if (gone || --open > 0)
@@ -160,23 +160,17 @@ Item {
                 retry.restart()
             }
         }
-        rawCall({status: "running", limit: 100}, json => {
-            if (!gone) {
-                live.setRunning(json)
-                done()
-            }
-        }, fail)
-        const pages = (args, cursor) => rawCall(Object.assign({limit: 100}, args, cursor ? {cursor: cursor} : {}), json => {
+        const pages = (args, add, cursor) => rawCall(Object.assign({limit: 100}, args, cursor ? {cursor: cursor} : {}), json => {
             if (gone)
                 return
-            const next = live.addQueuePage(json)
+            const next = add(json)
             if (next !== "")
-                pages(args, next)
+                pages(args, add, next)
             else
                 done()
         }, fail)
-        pages({order: "queue"}, "")
-        pages({status: "queued"}, "")
+        pages({status: "running"}, json => live.addRunningPage(json), "")
+        pages({status: "queued"}, json => live.addQueuedPage(json), "")
     }
 
     function onJobsEvent(kind, data) {

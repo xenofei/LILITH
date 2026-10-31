@@ -90,10 +90,6 @@ TestCase {
         return c.name === "jobs.list" && c.args.status === "running"
     }
 
-    function isQueueRead(c) {
-        return c.name === "jobs.list" && c.args.order === "queue"
-    }
-
     function isQueuedRead(c) {
         return c.name === "jobs.list" && c.args.status === "queued"
     }
@@ -108,17 +104,17 @@ TestCase {
         return c.name === "app/set_context" && c.args.project !== undefined
     }
 
-    // One read of the live jobs, as the core answers it: the running jobs; the queue; and every
-    // queued job, which is the queue and the dispatched jobs the queue doesn't list.
+    // One read of the live jobs, as the core answers it: the running jobs, and every queued job, the
+    // dispatched ones included.
     function answerRead(core, running, queued, lanes, dispatched) {
-        answer(core, isRunningRead, Shapes.jobsPage(running, lanes), "the running read")
-        answer(core, isQueueRead, Shapes.jobsPage(queued, lanes), "the queue read")
-        answer(core, isQueuedRead, Shapes.jobsPage((dispatched || []).concat(queued), lanes), "the queued read")
+        const all = running.concat(queued, dispatched || [])
+        const states = lanes || [Shapes.lane(), Shapes.lane({lane: "cpu"})]
+        answer(core, isRunningRead, core.jobsListAnswer({status: "running"}, all, states), "the running read")
+        answer(core, isQueuedRead, core.jobsListAnswer({status: "queued"}, all, states), "the queued read")
     }
 
     function refuseRead(core, code, message) {
         answer(core, isRunningRead, Shapes.refusal(code, message), "the running read")
-        answer(core, isQueueRead, Shapes.refusal(code, message), "the queue read")
         answer(core, isQueuedRead, Shapes.refusal(code, message), "the queued read")
     }
 
@@ -238,9 +234,10 @@ TestCase {
     }
 
     function test_a_dispatched_job_counts_once() { // spec: APP-006, CORE-117
-        // Status `queued`, substatus `submitting` or `queued_in_engine`: in neither `order: "queue"`
-        // nor `status: "running"`, and a queued job is listed by both queued reads.
+        // Status `queued`, substatus `submitting` or `queued_in_engine`: not in `status: "running"`,
+        // and the one listing that holds every queued job is what the bar reads. It reads no queue.
         const t = load()
+        compare(t.core.calls.filter(c => c.name === "jobs.list" && c.args.order === "queue").length, 0)
         t.core.emit("jobs", "resync_required", null)
         answerRead(t.core, [Shapes.job("r1", "running")], [Shapes.job("q1", "queued")], undefined,
                    [Shapes.job("d1", "queued", {substatus: "submitting"}),
@@ -250,9 +247,9 @@ TestCase {
         // Over more than a page, too.
         t.core.emit("jobs", "resync_required", null)
         answer(t.core, isRunningRead, Shapes.jobsPage([]))
-        answer(t.core, isQueueRead, Shapes.jobsPage([Shapes.job("q1", "queued")]))
         const first = answer(t.core, isQueuedRead, Shapes.jobsPage([Shapes.job("d1", "queued", {substatus: "submitting"})], undefined, "c2"))
-        const second = answer(t.core, isQueuedRead, Shapes.jobsPage([Shapes.job("q1", "queued")]))
+        // The same job on a later page counts once.
+        const second = answer(t.core, isQueuedRead, Shapes.jobsPage([Shapes.job("q1", "queued"), Shapes.job("d1", "queued", {substatus: "submitting"})]))
         compare(first.args.cursor, undefined)
         compare(second.args.cursor, "c2", "its next page")
         tryCompare(t.bar.jobsIndicator, "text", "0 running · 2 queued")
