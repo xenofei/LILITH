@@ -2,15 +2,17 @@
 // `active` (the panel is shown). Each time it becomes active it reads again, at most once in 2 s
 // (`showIntervalMs`); while it isn't, it follows nothing and reads nothing.
 //
-// - A `resync_required` or a snapshot of the topic reads again; every other event goes to
-//   `topicEvent`, for the card to apply as full state or to `request()` a read.
+// - A `resync_required` or a snapshot of the topic reads again, and `reloading` tells the card, for a
+//   tool beside this one that has no topic; every other event goes to `topicEvent`, for the card to
+//   apply as full state or to `request()` a read.
 // - `request()` is at most one read a second: the first of a burst at once, the rest as one read
 //   when the second has passed. Reads don't overlap.
 // - An answer can be older than an event: a card that applies an event as full state calls
 //   `eventApplied()`. `answered(structured, current)` then has `current` false for a read that was
 //   open at that moment, the card keeps the event's state, and a fresh read follows.
-// - The connection's own state never reads again, but for a first read that failed (the session
-//   wasn't connected yet), also when it is still open as `ready` comes.
+// - The connection's own state never reads again, but for a read that failed (the session wasn't
+//   connected, or the core was away), also when it is still open as `ready` comes: there is no good
+//   answer in hand for that to overwrite.
 // - `result` is the last good answer's `structured`, and stays through a later failure; `error` is
 //   the last read's ErrorBody, null once a read succeeds.
 import QtQuick
@@ -32,6 +34,7 @@ QtObject {
     readonly property int showIntervalMs: 2000
 
     signal topicEvent(var data)
+    signal reloading()
     signal answered(var structured, bool current)
 
     property bool _complete: false
@@ -97,8 +100,10 @@ QtObject {
             _subscription = CoreCall.subscribe(core, topic, root, (kind, seq, data) => {
                 if (kind === "event")
                     root.topicEvent(data)
-                else
+                else {
                     root.request()
+                    root.reloading()
+                }
             })
         }
         if (_showGate.running) {
@@ -153,7 +158,7 @@ QtObject {
     property Connections _session: Connections {
         target: root.core
         function onConnectionChanged() {
-            if (root.core.connection !== "ready" || !root.active || root.loaded)
+            if (root.core.connection !== "ready" || !root.active || (root.loaded && !root.error))
                 return
             if (root._reading)
                 root._due = true

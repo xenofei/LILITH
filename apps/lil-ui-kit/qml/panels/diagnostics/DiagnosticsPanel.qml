@@ -164,7 +164,9 @@ Rectangle {
             panelBanner.show("Saved the diagnostics bundle as " + Words.shown(root.core, path, 260) + ": "
                              + MoneyText.count(String((b.files || []).length)) + " files, "
                              + MoneyText.count(String(b.redactions || 0)) + " values redacted. Nothing is sent "
-                             + "anywhere: it leaves this PC only when you hand it on.")
+                             + "anywhere: it leaves this PC only when you hand it on. It still names other "
+                             + "programs and network adapters, model files and workspace folders outside your "
+                             + "user folder, so look through it before you share it.")
         }
         onFailed: (path, why, bundleRead) => {
             const b = root._bundle || {}

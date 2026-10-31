@@ -53,10 +53,6 @@ TestCase {
         EventLogModel {}
     }
 
-    Component {
-        id: bundleExportComponent
-        BundleExport {}
-    }
 
     // The panel alone in a window of the shell's size (a TestCase itself isn't visible).
     Component {
@@ -569,9 +565,9 @@ TestCase {
         const core = makeCore()
         const panel = makePanel(core)
         load(core)
-        verify(shows(panel.log, "Telemetry samples, job progress and preview frames aren't kept here"),
+        verify(shows(panel.log, "Telemetry samples, job progress, a job's repeated status and preview frames aren't kept here"),
                texts(panel.log).join(" | "))
-        verify(shows(panel.log, "It keeps the newest 1,000, so a long batch pushes older rows out. Recent errors keep their own list."),
+        verify(shows(panel.log, "It keeps the newest 1,000, about 100 jobs' worth, so a long batch pushes older rows out. Recent errors keep their own list."),
                texts(panel.log).join(" | "))
         core.emit("diagnostics", "event", {kind: "error", code: "store.io", tool: "asset.get", at: "2026-10-30T10:00:00Z"})
         for (let i = 0; i < 1000; ++i)
@@ -629,6 +625,7 @@ TestCase {
         verify(panel.banner.text.indexOf(dir + "/picked.zip") >= 0, panel.banner.text)
         verify(panel.banner.text.indexOf("12,345") >= 0, panel.banner.text)
         verify(panel.banner.text.indexOf("leaves this PC only when you hand it on") >= 0, panel.banner.text)
+        verify(panel.banner.text.indexOf("It still names other programs and network adapters, model files and workspace folders outside your user folder") >= 0, panel.banner.text)
 
         verify(panel.explorerButton.visible)
         compare(panel.explorerButton.text, "Show in Explorer")
@@ -766,17 +763,17 @@ TestCase {
         verify(panel.banner.text.indexOf("two.zip") >= 0, panel.banner.text)
     }
 
-    function test_going_mid_copy_leaves_no_temporary_file() { // spec: ARCH-121
-        const dir = TestFiles.newDir("bundle-going")
-        const source = dir + "/source.zip"
-        verify(TestFiles.write(source, "x".repeat(64 * 1024 * 1024)))
-        const exporter = bundleExportComponent.createObject(tc)
-        verify(exporter.save("file:///" + dir + "/kept.zip", source))
-        exporter.destroy()
-        wait(0)
+    // A whole process, as lil-image is: a copy started through the real shell's panel, then the end of
+    // the event loop with the copy under way. Only the ended process's folder can say what it left.
+    function test_closing_waits_for_an_export_under_way() { // spec: ARCH-121
+        const dir = TestFiles.newDir("bundle-closing")
+        const bytes = 1024 * 1024 * 1024
+        verify(TestFiles.writeSized(dir + "/source.bin", bytes))
+        compare(TestFiles.runQml(Qt.resolvedUrl("export_at_close_child.qml"), dir), 0)
         const names = TestFiles.list(dir)
-        verify(names.indexOf("kept.zip") >= 0, names.join(", "))
-        verify(!names.some(n => n.indexOf("lil-tmp") >= 0), "left: " + names.join(", "))
+        verify(names.indexOf("kept.zip") >= 0, "the file is there: " + names.join(", "))
+        compare(TestFiles.size(dir + "/kept.zip"), bytes, "whole")
+        verify(!names.some(n => n.indexOf("lil-tmp") >= 0), "no temporary file: " + names.join(", "))
     }
 
     function test_explorer_takes_only_an_existing_zip() { // spec: ARCH-121
@@ -1129,6 +1126,25 @@ TestCase {
         const recent = reads("diagnostics.recent")
         core.emit("diagnostics", "resync_required", null)
         compare(reads("diagnostics.recent"), recent + 1)
+        // A reload of a card's first tool reads the tool beside it too: neither keeps the old answer.
+        const open = name => core.calls.filter(c => c.name === name && !answered[c.id])
+        // The reloads above read it already, each as the gate let it: answer those until none is left.
+        for (let turn = 0; turn < 3; ++turn) {
+            wait(1100)
+            for (const c of open("engines.environment")) {
+                answered[c.id] = true
+                core.respond(c.id, ok({captures: [], changes: []}))
+            }
+        }
+        compare(open("engines.environment"), [], "no read open")
+        const environments = reads("engines.environment")
+        core.emit("engines", "resync_required", null)
+        answer(core, isTool("engines.status"), ok({engines: [comfy()]}))
+        tryVerify(() => reads("engines.environment") === environments + 1, 5000, "the environment reads again")
+        const queued = () => core.calls.filter(c => c.name === "jobs.list" && c.args.status === "queued").length
+        const lists = queued()
+        core.emit("jobs", "resync_required", null)
+        tryVerify(() => queued() === lists + 1, 5000, "the queued list reads again")
     }
 
     // The top bar follows `telemetry` at a sample a second: 17 minutes of them, and more, must leave
@@ -1266,6 +1282,34 @@ TestCase {
         verify(button(panel.errors, "Show the job") === show, "the same button")
         verify(show.activeFocus, "the focus stays on it")
         compare(panel.errors.rowsModel.count, 2)
+    }
+
+    function test_cards_recover_when_the_core_comes_back() { // spec: APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        tryVerify(() => shows(panel.queue, "0 running, 0 queued"), 5000)
+        wait(1100)
+        // The reads a reload starts fail: the core has gone.
+        core.connection = "reconnecting"
+        const away = failed({code: "core.unreachable", message: "The core isn't there."})
+        core.emit("jobs", "resync_required", null)
+        answer(core, c => c.name === "jobs.list" && c.args.status === "running", away)
+        answer(core, c => c.name === "jobs.list" && c.args.status === "queued", away)
+        core.emit("engines", "resync_required", null)
+        answer(core, isTool("engines.status"), away)
+        answer(core, isTool("engines.environment"), away)
+        tryVerify(() => shows(panel.queue, "The core isn't there."), 5000, texts(panel.queue).join(" | "))
+        tryVerify(() => shows(panel.engines, "The core isn't there."), 5000, texts(panel.engines).join(" | "))
+        // It is back, with no reload mark of its own (the same core, its cursor kept).
+        core.connection = "ready"
+        answer(core, c => c.name === "jobs.list" && c.args.status === "running", ok({jobs: [{job_id: "j_1", status: "running"}], next_cursor: null, lanes: []}))
+        answer(core, c => c.name === "jobs.list" && c.args.status === "queued", ok({jobs: [], next_cursor: null, lanes: []}))
+        answer(core, isTool("engines.status"), ok({engines: [comfy()]}))
+        answer(core, isTool("engines.environment"), ok({captures: [], changes: []}))
+        tryVerify(() => shows(panel.queue, "1 running, 0 queued"), 5000, texts(panel.queue).join(" | "))
+        verify(!shows(panel.queue, "The core isn't there."), texts(panel.queue).join(" | "))
+        tryVerify(() => !shows(panel.engines, "The core isn't there."), 5000, texts(panel.engines).join(" | "))
     }
 
     function test_a_first_read_that_failed_reads_again_when_ready() { // spec: APP-033

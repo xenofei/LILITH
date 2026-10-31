@@ -61,26 +61,30 @@ TestCase {
         compare(log.rowCount(), 1000)
     }
 
-    // A job's `status` is the same summary as its `jobs` event (the core publishes one value on both):
-    // an ordinary batch of about 100 images must not clear what came before it. Each job here is what
-    // a real one sends: four changes on both topics and a queue event, and its progress.
-    function test_a_batch_of_111_keeps_the_early_error() { // spec: APP-134
+    // What the panel's "about 100 jobs' worth" rests on. On a real test core with the fake ComfyUI, one
+    // tiny job costs 10 rows on `jobs`; its `status` on `job:<id>` (the same summary) and its progress
+    // cost none. So an early row outlasts a batch of 90, and is gone after one of 110.
+    function test_about_100_jobs_fill_the_log() { // spec: APP-134
         const core = createTemporaryObject(fakeComponent, tc)
         const log = createTemporaryObject(logComponent, tc, {core: core})
         core.emit("diagnostics", "event", {kind: "error", code: "store.io", tool: "asset.get", at: "2026-10-30T10:00:00.000Z"})
-        core.emit("engines", "event", {kind: "status", engine: {engine: "comfyui", state: "ready"}})
-        for (let i = 0; i < 111; ++i) {
-            const id = "j_" + i
-            for (const status of ["queued", "running", "running", "succeeded"]) {
-                const job = {job_id: id, status: status}
-                core.emit("jobs", "event", {kind: "job", job: job})
-                core.emit("job:" + id, "event", {kind: "status", job: job})
+        const jobs = (from, to) => {
+            for (let i = from; i < to; ++i) {
+                const id = "j_" + i
+                for (let change = 0; change < 10; ++change) {
+                    const job = {job_id: id, status: "running"}
+                    core.emit("jobs", "event", {kind: "job", job: job})
+                    core.emit("job:" + id, "event", {kind: "status", job: job})
+                    core.emit("job:" + id, "event", {kind: "progress", value: change, max: 10})
+                }
             }
-            core.emit("job:" + id, "event", {kind: "progress", value: 1, max: 2})
-            core.emit("jobs", "event", {kind: "queue", state: {lane: "gpu-heavy", paused: false, reasons: [], held: 0, restart_held: 0, withdrawn: 0}})
         }
-        verify(log.get(0).text.indexOf("store.io") >= 0, "the error is still the first row: " + log.get(0).text)
-        compare(log.rowCount(), 2 + 111 * 5, "each job's four `jobs` events and its queue event")
+        jobs(0, 90)
+        compare(log.rowCount(), 1 + 90 * 10, "10 rows a job")
+        verify(log.get(0).text.indexOf("store.io") >= 0, "after 90 jobs the error is still there")
+        jobs(90, 110)
+        compare(log.rowCount(), 1000)
+        verify(log.get(0).text.indexOf("store.io") < 0, "after 110 it has gone, as the panel says")
     }
 
     // What repeats state at a high rate is left out, whatever follows it; everything else stays.

@@ -58,6 +58,7 @@ LCard {
         args: ({status: "running", limit: root.pageSize})
         topic: "jobs"
         active: root.active
+        onReloading: root.queuedRead.request()
         onAnswered: (structured, current) => {
             if (current && structured)
                 root.applyLanes(structured.lanes)

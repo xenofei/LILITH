@@ -129,6 +129,7 @@ LCard {
         tool: "engines.status"
         topic: "engines"
         active: root.active
+        onReloading: root.environmentRead.request()
         onAnswered: (structured, current) => {
             if (current)
                 root.engines = structured && structured.engines ? structured.engines : []

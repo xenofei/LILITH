@@ -51,13 +51,13 @@ LCard {
         }
         LineText {
             tone: "muted"
-            text: "Telemetry samples, job progress and preview frames aren't kept here: the Telemetry card "
-                  + "and the Jobs panel show them."
+            text: "Telemetry samples, job progress, a job's repeated status and preview frames aren't kept "
+                  + "here: the Telemetry card and the Jobs panel show them."
         }
         LineText {
             tone: "muted"
-            text: "It keeps the newest 1,000, so a long batch pushes older rows out. Recent errors keep their "
-                  + "own list."
+            text: "It keeps the newest 1,000, about 100 jobs' worth, so a long batch pushes older rows out. "
+                  + "Recent errors keep their own list."
         }
 
         ListView {
