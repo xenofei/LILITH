@@ -20,9 +20,9 @@
 //! Everything runs on the GUI thread, and the gate's state lives in that thread's local, out of
 //! reach of anything but this process's own code.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cxx_qt_lib::{QString, QVariant};
 use lil_platform::input_source;
@@ -83,6 +83,14 @@ pub mod qobject {
 
         #[qinvokable]
         fn shown_line(self: &ConfirmInput, text: &QString, max_chars: i32) -> QString;
+
+        #[qinvokable]
+        fn raise_refusal(
+            self: &ConfirmInput,
+            amount: &QString,
+            limit: &QString,
+            currency: &QString,
+        ) -> QString;
 
         #[qinvokable]
         fn seen_messages(self: &ConfirmInput) -> f64;
@@ -158,7 +166,12 @@ pub struct ConfirmInputRust;
 
 thread_local! {
     static GATE: RefCell<PointerGate> = RefCell::new(PointerGate::new());
+    /// The button the last move was on, for the log.
+    static LAST_ON: Cell<u64> = const { Cell::new(0) };
+    static LAST_SENT_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
+
+const SENT_LOG_EVERY: Duration = Duration::from_secs(1);
 
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -177,6 +190,14 @@ fn refusal_words(name: &str, label: &str) -> String {
         ),
         // The amount field (`CapPrompt`).
         "not_a_number" => "Enter the new limit as a number, like 25 or 12.50.".to_string(),
+        "too_many_decimals" => {
+            "That has more decimals than this currency uses. Enter it as the button should say it."
+                .to_string()
+        }
+        "not_higher" => {
+            "That isn't higher than the limit now, so it wouldn't be a raise. Enter a higher one, or use Allow once or Cancel."
+                .to_string()
+        }
         "not_in_front" => AnswerRefusal::NotInFront.message().to_string(),
         "too_soon" => AnswerRefusal::TooSoon.message().to_string(),
         "not_focused" => AnswerRefusal::NotFocused.message().to_string(),
@@ -265,6 +286,15 @@ impl qobject::ConfirmInput {
         QString::from(confirm_text::shown_line(&text.to_string(), max).as_str())
     }
 
+    fn raise_refusal(&self, amount: &QString, limit: &QString, currency: &QString) -> QString {
+        let refusal = confirm_text::raise_refusal(
+            &amount.to_string(),
+            &limit.to_string(),
+            &currency.to_string(),
+        );
+        QString::from(refusal.unwrap_or(""))
+    }
+
     fn seen_messages(&self) -> f64 {
         GATE.with(|g| g.borrow().counts().seen as f64)
     }
@@ -302,10 +332,12 @@ fn pointer_message(
     };
     // The source first, before any other call on this thread (as the Hello window reads it).
     let msg = input_source::pointer_msg(window, lparam);
-    let physically_down = input_source::left_button_physically_down();
+    // Only a press and a release are judged by these, so a move doesn't pay for them.
+    let judged = matches!(kind, PointerKind::Press | PointerKind::Release);
+    let physically_down = judged && input_source::left_button_physically_down();
     // Armed on every move, so leaving always ends the rest and forgets where the cursor was.
     let tracked = kind == PointerKind::Move && input_source::track_leave(window);
-    let exposed = input_source::exposed_at(window, msg.at);
+    let exposed = judged && input_source::exposed_at(window, msg.at);
     let in_front = input_source::in_front(window);
     let seen = Seen {
         kind,
@@ -325,7 +357,25 @@ fn pointer_message(
         gate.message(seen, Instant::now());
         gate.counts()
     });
-    if serial != 0 && matches!(kind, PointerKind::Press | PointerKind::Release) {
+    // One line each time the pointer arrives on a button, whatever brought it (the script's rest).
+    if kind == PointerKind::Move {
+        let arrived = serial != 0 && LAST_ON.replace(serial) != serial;
+        if serial == 0 {
+            LAST_ON.set(0);
+        }
+        if arrived {
+            tracing::info!(
+                origin = ?msg.origin,
+                device = ?msg.device,
+                in_send = msg.sent,
+                seen = counts.seen,
+                real = counts.real,
+                sent = counts.sent,
+                "a move onto a confirmation's button"
+            );
+        }
+    }
+    if serial != 0 && judged {
         tracing::info!(
             kind = ?kind,
             origin = ?msg.origin,
@@ -344,15 +394,25 @@ fn pointer_message(
 }
 
 fn pointer_sent() {
-    let sent = GATE.with(|g| {
+    let counts = GATE.with(|g| {
         let mut gate = g.borrow_mut();
         gate.sent_input();
-        gate.counts().sent
+        gate.counts()
     });
-    tracing::info!(
-        sent,
-        "a mouse button message was sent to a window of the app"
-    );
+    // At most one line a second, so a program can't use up the day's log. The count is in the next.
+    let now = Instant::now();
+    let due = LAST_SENT_LOG
+        .get()
+        .is_none_or(|at| now.duration_since(at) >= SENT_LOG_EVERY);
+    if due {
+        LAST_SENT_LOG.set(Some(now));
+        tracing::info!(
+            seen = counts.seen,
+            real = counts.real,
+            sent = counts.sent,
+            "a mouse button message was sent to a window of the app"
+        );
+    }
 }
 
 fn pointer_guard(ok: bool) {

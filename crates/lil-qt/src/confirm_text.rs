@@ -28,6 +28,9 @@ pub const CONTINUATION: &str = "↳ ";
 /// Blank lines in a row from this many on show as one line.
 const BLANK_RUN: usize = 2;
 
+/// The most arguments shown, each a row to lay out. More is past the bound.
+pub const SHOWN_ROWS_MAX: usize = 1000;
+
 /// Whether `c` shows as a marker: a reader couldn't see it, or it would move the text around.
 pub fn is_marked(c: char) -> bool {
     c.is_control()
@@ -43,6 +46,8 @@ pub fn is_marked(c: char) -> bool {
             | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}'
             // A blank that isn't a space, like the Hangul fillers (default-ignorable, above).
             | '\u{2800}'
+            // Spaces that aren't the plain one: a path can differ by one and read the same.
+            | '\u{a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
         )
 }
 
@@ -170,12 +175,13 @@ pub fn shown_action_within(arguments: &Value, bound: usize) -> ShownAction {
     let mut over = false;
     let mut rows = Vec::new();
     let mut one = |key: String, value: &Value, left: &mut usize| {
-        let key_len = key.chars().count();
-        *left = left.saturating_sub(key_len);
+        let mut shown_key = String::new();
+        let key_whole = take(&mut shown_key, left, &key);
         let (text, whole) = shown_value(&value_text(value), left);
+        let whole = whole && key_whole;
         over |= !whole;
         rows.push(ShownArgument {
-            key,
+            key: shown_key,
             text,
             cut: !whole,
         });
@@ -183,12 +189,19 @@ pub fn shown_action_within(arguments: &Value, bound: usize) -> ShownAction {
     match arguments {
         Value::Null => {}
         Value::Object(map) => {
-            for (key, value) in map {
+            for (key, value) in map.iter().take(SHOWN_ROWS_MAX) {
                 one(marked(key), value, &mut left);
             }
         }
         other => one(String::new(), other, &mut left),
     }
+    let too_many_rows = arguments
+        .as_object()
+        .is_some_and(|map| map.len() > SHOWN_ROWS_MAX);
+    if too_many_rows && let Some(last) = rows.last_mut() {
+        last.cut = true;
+    }
+    let over = over || too_many_rows;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for row in &rows {
         row.key.hash(&mut hasher);
@@ -204,6 +217,58 @@ pub fn shown_action_within(arguments: &Value, bound: usize) -> ShownAction {
 /// The whole action, up to [`SHOWN_BOUND_CHARS`].
 pub fn shown_action(arguments: &Value) -> ShownAction {
     shown_action_within(arguments, SHOWN_BOUND_CHARS)
+}
+
+/// Why a typed amount can't be the new limit of a cap now at `limit` (the core's decimal string), by
+/// name, or `None` when it can. The Raise button shows the amount through `money_text`, which rounds
+/// to the currency's minor unit, and what is sent must be what it says, so more decimals are refused.
+/// A raise that isn't higher is refused too. Text, never a float.
+pub fn raise_refusal(amount: &str, limit: &str, currency: &str) -> Option<&'static str> {
+    let Some(new) = Decimal::parse(amount) else {
+        return Some("not_a_number");
+    };
+    if new.fraction.len() > crate::money::minor_unit(currency) {
+        return Some("too_many_decimals");
+    }
+    // A limit that can't be read refuses nothing here: the core has the say.
+    Decimal::parse(limit)
+        .is_some_and(|now| new.compare(&now) != std::cmp::Ordering::Greater)
+        .then_some("not_higher")
+}
+
+/// A non-negative decimal's digits, with no leading or trailing zeros to compare.
+struct Decimal<'a> {
+    whole: &'a str,
+    fraction: &'a str,
+}
+
+impl<'a> Decimal<'a> {
+    /// Digits, at most 18 before the point, and any after it.
+    fn parse(text: &'a str) -> Option<Decimal<'a>> {
+        let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        let dangling_point = text.contains('.') && fraction.is_empty();
+        if whole.is_empty()
+            || whole.len() > 18
+            || !digits(whole)
+            || !digits(fraction)
+            || dangling_point
+        {
+            return None;
+        }
+        Some(Decimal {
+            whole: whole.trim_start_matches('0'),
+            fraction: fraction.trim_end_matches('0'),
+        })
+    }
+
+    fn compare(&self, other: &Decimal<'_>) -> std::cmp::Ordering {
+        self.whole
+            .len()
+            .cmp(&other.whole.len())
+            .then_with(|| self.whole.cmp(other.whole))
+            .then_with(|| self.fraction.cmp(other.fraction))
+    }
 }
 
 /// From the JSON text of a `confirmations` event, an `app/confirmations.list` result or an
@@ -284,6 +349,72 @@ mod tests {
         // What a reader can see stays as it is.
         for text in ["plain", "café", "日本語", "C:\\art\\a b.png"] {
             assert_eq!(marked(text), text);
+        }
+    }
+
+    #[test] // spec: P4a-R8, APP-115
+    fn spaces_that_arent_the_plain_one_show_as_markers() {
+        for c in [
+            '\u{a0}', '\u{1680}', '\u{2003}', '\u{2009}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ] {
+            let want = format!("a\u{27e8}U+{:04X}\u{27e9}b", u32::from(c));
+            assert_eq!(marked(&format!("a{c}b")), want);
+        }
+        assert_eq!(marked("a b"), "a b", "the plain space stays");
+    }
+
+    #[test] // spec: APP-115
+    fn the_bound_counts_keys_and_rows() {
+        let shown = shown_action(&json!({ "k".repeat(SHOWN_BOUND_CHARS + 1): "" }));
+        assert!(shown.over && shown.rows[0].cut, "a huge key is past it");
+        assert_eq!(shown.rows[0].key.chars().count(), SHOWN_BOUND_CHARS);
+        let mut many = Map::new();
+        for i in 0..=SHOWN_ROWS_MAX {
+            many.insert(format!("k{i}"), Value::Null);
+        }
+        let shown = shown_action(&Value::Object(many));
+        assert!(shown.over, "more rows than it shows");
+        assert_eq!(shown.rows.len(), SHOWN_ROWS_MAX);
+        assert!(shown.rows.last().unwrap().cut, "and the last one says so");
+        let mut enough = Map::new();
+        for i in 0..SHOWN_ROWS_MAX {
+            enough.insert(format!("k{i}"), Value::Null);
+        }
+        assert!(!shown_action(&Value::Object(enough)).over);
+    }
+
+    #[test] // spec: APP-054
+    fn a_raise_is_a_number_in_the_currencys_decimals_and_higher() {
+        for (amount, limit, currency, want) in [
+            ("12", "1", "USD", None),
+            ("12.50", "1", "USD", None),
+            ("12.500", "1", "USD", None),
+            ("1.01", "1", "USD", None),
+            ("25000000", "20", "USD", None),
+            ("121", "120", "JPY", None),
+            ("2", "not a number", "USD", None),
+            ("lots", "1", "USD", Some("not_a_number")),
+            ("", "1", "USD", Some("not_a_number")),
+            ("1.", "1", "USD", Some("not_a_number")),
+            (".5", "0", "USD", Some("not_a_number")),
+            ("-5", "1", "USD", Some("not_a_number")),
+            ("1e3", "1", "USD", Some("not_a_number")),
+            ("1234567890123456789", "1", "USD", Some("not_a_number")),
+            ("25.999", "1", "USD", Some("too_many_decimals")),
+            ("0.001", "0", "USD", Some("too_many_decimals")),
+            ("120.7", "1", "JPY", Some("too_many_decimals")),
+            ("1", "1", "USD", Some("not_higher")),
+            ("1.00", "1", "USD", Some("not_higher")),
+            ("0.5", "1", "USD", Some("not_higher")),
+            ("50", "100", "USD", Some("not_higher")),
+            ("9", "10", "USD", Some("not_higher")),
+            ("1.09", "1.1", "USD", Some("not_higher")),
+        ] {
+            assert_eq!(
+                raise_refusal(amount, limit, currency),
+                want,
+                "{amount} over {limit}"
+            );
         }
     }
 

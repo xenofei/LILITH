@@ -8,9 +8,9 @@
 //! documents nothing about what a posted message reports (`hello::InputOrigin`), so a "hardware"
 //! source means no more than that. [`left_button_physically_down`] is the second factor.
 
-use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Graphics::Gdi::{ClientToScreen, MONITOR_DEFAULTTONULL, MonitorFromPoint};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_LBUTTON,
     VK_RBUTTON,
@@ -20,7 +20,7 @@ use windows::Win32::UI::Input::{
     IMO_HARDWARE, IMO_INJECTED, IMO_SYSTEM, INPUT_MESSAGE_SOURCE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GWL_EXSTYLE, GetAncestor, GetCursorPos, GetForegroundWindow,
+    GA_ROOT, GWL_EXSTYLE, GetAncestor, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetLayeredWindowAttributes, GetSystemMetrics, GetWindowLongPtrW, InSendMessage, IsIconic,
     IsWindowVisible, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY, SM_SWAPBUTTON,
     WS_EX_LAYERED, WS_EX_TRANSPARENT, WindowFromPoint,
@@ -126,6 +126,8 @@ pub struct Exposure {
     /// `WS_EX_LAYERED`, with `GetLayeredWindowAttributes`'s `(alpha, uses alpha, uses a colour key)`,
     /// `None` inside when that call failed (a window drawn with `UpdateLayeredWindow`).
     pub layered: Option<Option<(u8, bool, bool)>>,
+    /// Every corner of its client area is on a monitor.
+    pub on_screen: bool,
 }
 
 impl Exposure {
@@ -133,6 +135,7 @@ impl Exposure {
     /// own attributes; one that can't be read doesn't.
     pub fn is_seen(self) -> bool {
         self.visible
+            && self.on_screen
             && !self.iconic
             && !self.cloaked
             && !self.click_through
@@ -143,6 +146,31 @@ impl Exposure {
                 }
                 Some(None) => false,
             }
+    }
+}
+
+/// Whether every corner of `w`'s client area is on a monitor: a program can place a window partly
+/// off the desktop, or make it taller than the screen, so its top is out of sight with Approve on it.
+/// A maximized window's frame overhangs the monitor, and its client area doesn't.
+fn client_on_screen(w: HWND) -> bool {
+    let mut client = RECT::default();
+    // SAFETY: queries about a window, into local values.
+    unsafe {
+        if GetClientRect(w, &mut client).is_err() {
+            return false;
+        }
+        [
+            (client.left, client.top),
+            (client.right - 1, client.top),
+            (client.left, client.bottom - 1),
+            (client.right - 1, client.bottom - 1),
+        ]
+        .into_iter()
+        .all(|(x, y)| {
+            let mut p = POINT { x, y };
+            ClientToScreen(w, &mut p).as_bool()
+                && !MonitorFromPoint(p, MONITOR_DEFAULTTONULL).is_invalid()
+        })
     }
 }
 
@@ -177,6 +205,7 @@ pub fn exposure(window: isize) -> Exposure {
             iconic: IsIconic(w).as_bool(),
             cloaked: !cloak_read || cloaked != 0,
             click_through: ex_style & WS_EX_TRANSPARENT.0 != 0,
+            on_screen: client_on_screen(w),
             layered,
         }
     }
@@ -338,6 +367,7 @@ mod tests {
             cloaked: false,
             click_through: false,
             layered: None,
+            on_screen: true,
         };
         assert!(seen.is_seen());
         assert!(
@@ -364,6 +394,13 @@ mod tests {
         assert!(
             !Exposure {
                 click_through: true,
+                ..seen
+            }
+            .is_seen()
+        );
+        assert!(
+            !Exposure {
+                on_screen: false,
                 ..seen
             }
             .is_seen()

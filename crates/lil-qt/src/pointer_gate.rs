@@ -155,10 +155,10 @@ impl GateRefusal {
                 "What is shown here changed, or {label} moved. Move the pointer off it, check what it says, then come back and click it."
             )),
             "button_state" => Some(format!(
-                "That click went by before LILITH could check it. Click {label} again, holding the button a moment."
+                "That click was too quick for LILITH to check. Hold the click a moment longer on {label}."
             )),
             "not_exposed" => Some(format!(
-                "This window is covered, see-through or hidden, so a click on {label} doesn't count. Something may have changed it: bring it back and look before you click."
+                "This window is covered, see-through, off the screen or hidden, so a click on {label} doesn't count. Something may have changed it: bring it back and look before you click."
             )),
             "no_guard" => Some(format!(
                 "LILITH couldn't set up its check of where clicks come from, so {label} is off. Deny still works."
@@ -306,9 +306,10 @@ impl PointerGate {
                 }
             }
             PointerKind::Leave => {
+                // It says nothing of `reenter`: any program can post this. A message with the cursor
+                // really off the button clears that, above.
                 self.gate.button_leave();
                 self.current = None;
-                self.reenter = None;
             }
             PointerKind::CaptureChanged => self.gate.capture_changed(),
             PointerKind::CancelMode => self.gate.cancel_mode(),
@@ -702,6 +703,41 @@ mod tests {
         r.seen(PointerKind::Release, hardware((153, 116)), Some(same));
         r.gate.take_press(2, r.now);
         assert_eq!(r.gate.take_click(2, r.now), Err(GateRefusal::Reenter));
+    }
+
+    /// The review's replay: the amount changes under a resting hand, a program posts `WM_MOUSELEAVE`,
+    /// and the hand's small moves on the button rebuild the rest.
+    #[test] // spec: P4a-R10
+    fn refuses_a_posted_leave_as_a_way_round_the_re_entry() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        let new_amount = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let same = Target {
+            changed: false,
+            ..new_amount
+        };
+        r.seen(PointerKind::Move, hardware((151, 116)), Some(new_amount));
+        r.seen(PointerKind::Leave, posted((151, 116)), Some(same));
+        r.seen(PointerKind::Move, hardware((152, 116)), Some(same));
+        r.seen(PointerKind::Move, hardware((153, 116)), Some(same));
+        r.advance(HOVER_BEFORE_PRESS * 4);
+        r.seen(PointerKind::Press, hardware((153, 116)), Some(same));
+        r.seen(PointerKind::Release, hardware((153, 116)), Some(same));
+        r.gate.take_press(2, r.now);
+        assert_eq!(r.gate.take_click(2, r.now), Err(GateRefusal::Reenter));
+        // A real leave, with the cursor off the button, does clear it.
+        r.seen(PointerKind::Leave, hardware(OFF), None);
+        r.seen(PointerKind::Move, hardware((110, 100)), Some(same));
+        r.seen(PointerKind::Move, hardware((111, 101)), Some(same));
+        r.advance(HOVER_BEFORE_PRESS);
+        r.seen(PointerKind::Press, hardware((111, 101)), Some(same));
+        r.seen(PointerKind::Release, hardware((111, 101)), Some(same));
+        r.gate.take_press(2, r.now);
+        assert_eq!(r.gate.take_click(2, r.now), Ok(()));
     }
 
     #[test] // spec: P4a-R10
