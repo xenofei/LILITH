@@ -285,13 +285,13 @@ impl fmt::Display for ClientError {
             ClientError::Untrusted { pid, image, reason } if reason == NOT_PROVED => {
                 write!(
                     f,
-                    "The program serving the LILITH core pipe (pid {pid}) did not prove that it \
-                     holds the pipe, so this client does not trust it. A core from an older \
-                     LILITH build can't answer this: it ends once no LILITH app is open and it \
-                     has been idle, or you can end it in Task Manager."
+                    "The LILITH core pipe names pid {pid} as its server, but whoever holds it did \
+                     not prove that it does, so this client does not trust it. A core from an \
+                     older LILITH build can't answer this: it ends once no LILITH app is open and \
+                     it has been idle, or you can end it in Task Manager."
                 )?;
                 if !image.as_os_str().is_empty() {
-                    write!(f, " The pipe reports {}.", image.display())?;
+                    write!(f, " That pid is {}.", image.display())?;
                 }
                 Ok(())
             }
