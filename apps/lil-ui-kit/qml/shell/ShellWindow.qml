@@ -205,6 +205,8 @@ Window {
             required property var modelData
             sequence: modelData.keys
             context: Qt.ApplicationShortcut
+            // App-wide shortcuts fire under a modal popup: they wait while a confirmation is open.
+            enabled: OpenPrompts.count === 0
             onActivated: root.runAction(modelData.action)
         }
     }

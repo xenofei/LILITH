@@ -15,7 +15,7 @@ const all = [
     {id: "home", title: "Home", source: "PlaceholderPanel.qml", area: "centre", action: "panel.home"},
     {id: "jobs", title: "Jobs", source: "../panels/jobs/JobsPanel.qml", area: "right",
      action: "panel.jobs"},
-    {id: "confirmations", title: "Confirmations", source: "PlaceholderPanel.qml", area: "right",
+    {id: "confirmations", title: "Confirmations", source: "../panels/confirmations/ConfirmationsPanel.qml", area: "right",
      action: "panel.confirmations"},
     {id: "hardware", title: "Hardware", source: "../panels/hardware/HardwarePanel.qml", area: "bottom",
      action: "panel.hardware"},

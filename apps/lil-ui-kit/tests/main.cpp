@@ -17,7 +17,10 @@
 #include <cstring>
 #include <string>
 
+#include <QAccessible>
+#include <QAccessibleActionInterface>
 #include <QCoreApplication>
+#include <QKeyEvent>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QQmlNetworkAccessManagerFactory>
@@ -33,6 +36,16 @@
 #include <QTemporaryDir>
 #include <QtQml/qqmlextensionplugin.h>
 #include <QtQuickTest>
+
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#pragma comment(lib, "user32.lib")
 
 Q_IMPORT_QML_PLUGIN(Lilith_UiKitPlugin)
 Q_IMPORT_QML_PLUGIN(Lilith_ShimPlugin)
@@ -210,6 +223,48 @@ private:
     QTemporaryDir m_root;
 };
 
+// TestInput (a context property): input that reaches a control the way it does in the app, with no
+// window on screen (tst_confirmations, tst_cap_prompt).
+class TestInput : public QObject
+{
+    Q_OBJECT
+
+public:
+    // What UI Automation's Invoke does (QWindowsUiaInvokeProvider::Invoke): false when `item` has
+    // no press action.
+    Q_INVOKABLE bool accessiblePress(QObject *item) const
+    {
+        QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(item);
+        QAccessibleActionInterface *actions = iface ? iface->actionInterface() : nullptr;
+        if (!actions || !actions->actionNames().contains(QAccessibleActionInterface::pressAction()))
+            return false;
+        actions->doAction(QAccessibleActionInterface::pressAction());
+        return true;
+    }
+
+    // A key's auto-repeat press, as a key held down makes.
+    Q_INVOKABLE void keyRepeat(QObject *window, int key) const
+    {
+        QKeyEvent event(QEvent::KeyPress, key, Qt::NoModifier, QString(), true);
+        QCoreApplication::sendEvent(window, &event);
+    }
+
+    // Posts a move, a press and a release to a hidden window of this thread. Nothing shows, and
+    // the event dispatcher takes them as it takes a program's PostMessage to the app's window.
+    Q_INVOKABLE bool postClickToHiddenWindow() const
+    {
+        static const HWND hidden = [] {
+            WNDCLASSW cls{};
+            cls.lpfnWndProc = DefWindowProcW;
+            cls.lpszClassName = L"LILITH-test-hidden";
+            RegisterClassW(&cls);
+            return CreateWindowExW(0, cls.lpszClassName, L"", 0, 0, 0, 10, 10, nullptr, nullptr, nullptr, nullptr);
+        }();
+        return hidden && PostMessageW(hidden, WM_MOUSEMOVE, 0, 0) && PostMessageW(hidden, WM_LBUTTONDOWN, MK_LBUTTON, 0)
+               && PostMessageW(hidden, WM_LBUTTONUP, 0, 0);
+    }
+};
+
 class Setup : public QObject
 {
     Q_OBJECT
@@ -237,6 +292,7 @@ public slots:
         engine->rootContext()->setContextProperty(QStringLiteral("BridgeHook"), new BridgeHook(engine));
         engine->rootContext()->setContextProperty(QStringLiteral("TestFiles"), &m_files);
         engine->rootContext()->setContextProperty(QStringLiteral("TestLaunch"), &m_launch);
+        engine->rootContext()->setContextProperty(QStringLiteral("TestInput"), &m_input);
         // The theme's bundled face as the application font, as lil-image sets it.
         if (QObject *theme = engine->singletonInstance<QObject *>("Lilith.UiKit", "Theme"))
             lilshim::applyThemeFont(theme->property("fontFamily").toString());
@@ -245,6 +301,7 @@ public slots:
 private:
     TestFiles m_files;
     TestLaunch m_launch;
+    TestInput m_input;
     CountingNamFactory m_nam;
 };
 
