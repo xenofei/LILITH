@@ -86,6 +86,7 @@ Rectangle {
     readonly property string assistantReason: "The assistant arrives in a later version"
 
     property var _pauseCall: null
+    property real _pauseAnswered: 0
     property bool _capsReading: false
     property bool _capsDue: false
     property bool _capsFailed: false
@@ -141,8 +142,11 @@ Rectangle {
         }
     }
 
+    // One call at a time, and none for a double-click's length after an answer: the core answers at
+    // once, so without that a double-click pauses and then resumes, withdrawing the prompts on the
+    // way (as the Jobs panel's own control). The button stays enabled, so it keeps the focus.
     function togglePause() {
-        if (_pauseCall)
+        if (_pauseCall || Date.now() - _pauseAnswered < Qt.styleHints.mouseDoubleClickInterval)
             return
         if (!coreReady || !jobs.current) {
             showNotice(coreReady ? "Wait a moment: the state of GPU work is still loading."
@@ -158,6 +162,7 @@ Rectangle {
             owner: root,
             ok: state => {
                 root._pauseCall = null
+                root._pauseAnswered = Date.now()
                 root.jobs.applyLanes([state])
             },
             error: e => {
@@ -167,7 +172,10 @@ Rectangle {
                                 "danger")
                 root._pauseNotice = "refusal"
             },
-            pending: () => { root._pauseCall = null }
+            pending: () => {
+                root._pauseCall = null
+                root._pauseAnswered = Date.now()
+            }
         })
     }
 

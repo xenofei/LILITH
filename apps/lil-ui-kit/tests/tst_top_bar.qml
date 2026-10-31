@@ -562,6 +562,59 @@ TestCase {
         verify(t.bar.yourPause, "the event came after the read's lanes")
     }
 
+    // Past the time a double-click of the pause control is held for.
+    function pastADoubleClick() {
+        wait(Qt.styleHints.mouseDoubleClickInterval + 50)
+    }
+
+    function test_a_double_click_of_pause_is_one_call() { // spec: APP-011, CORE-160
+        const t = load()
+        const b = t.bar.pauseButton
+        const isQueueCall = c => c.name.startsWith("app/queue.")
+        const names = () => t.core.calls.filter(isQueueCall).map(c => c.name)
+        // The core answers at once, before the second click of a double-click.
+        let answerWith = null
+        b.clicked.connect(() => {
+            for (const c of open(t.core, isQueueCall)) {
+                answered[c.id] = true
+                t.core.respond(c.id, answerWith ? answerWith
+                                                : Shapes.app(c.name === "app/queue.pause"
+                                                             ? Shapes.lane({paused: true, reasons: ["manual"]})
+                                                             : Shapes.lane()))
+            }
+        })
+        mouseDoubleClickSequence(b)
+        compare(names(), ["app/queue.pause"], "the second click does nothing")
+        compare(b.text, "Resume GPU work")
+        verify(b.enabled, "it keeps the focus")
+
+        // A person who waits can resume, and pause again.
+        pastADoubleClick()
+        mouseClick(b)
+        compare(names(), ["app/queue.pause", "app/queue.resume"])
+        compare(b.text, "Pause GPU work")
+        pastADoubleClick()
+        mouseClick(b)
+        compare(names().length, 3)
+        compare(b.text, "Resume GPU work")
+
+        // A refusal holds nothing: you try again at once.
+        pastADoubleClick()
+        answerWith = Shapes.refusal("caller.not_allowed", "Not now.")
+        mouseClick(b)
+        compare(names().length, 4)
+        verify(t.bar.notice.visible)
+        mouseClick(b)
+        compare(names().length, 5, "again at once")
+
+        // An answer that asks for a confirmation holds it, as a state does.
+        answerWith = {status: "pending_confirmation", confirmation_id: "c1", retry_token: "r1"}
+        mouseClick(b)
+        compare(names().length, 6)
+        mouseClick(b)
+        compare(names().length, 6, "the second click")
+    }
+
     function test_pause_control_refusal_and_arguments() { // spec: APP-011, CORE-160
         const t = load({unanswered: true})
         t.bar.togglePause()
@@ -580,6 +633,7 @@ TestCase {
         answer(t.core, named("app/queue.pause"), Shapes.app(Shapes.lane({paused: true, reasons: ["manual"]})))
         compare(t.bar.pauseButton.text, "Resume GPU work")
 
+        pastADoubleClick()
         t.bar.togglePause()
         const resume = t.core.calls.filter(named("app/queue.resume"))[0]
         compare(resume.args, {lane: "gpu-heavy"})
@@ -598,6 +652,7 @@ TestCase {
 
         // But only its own: what another part of the bar said stays.
         t.bar.showNotice("Quay is now your default workspace.", "ok")
+        pastADoubleClick()
         t.bar.togglePause()
         verify(t.bar.notice.visible, "not the pause control's to close")
         compare(t.bar.notice.text, "Quay is now your default workspace.")
@@ -1023,6 +1078,37 @@ TestCase {
         compare(t.bar.projectSwitcher.button.text, "sketchbook ▾")
     }
 
+    function test_a_late_project_answer_stays_out_of_another_workspace() { // spec: ARCH-088
+        const t = load()
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        const sw = openProjects(t)
+        mouseClick(row(sw.popup, p => p.project === "harbor"), 5, 5)
+        t.core.applyState({connection: "ready", workspace: quay})
+        answer(t.core, isContextRead, Shapes.context(quay, null, "sketchbook"))
+
+        // The answer comes after the switch.
+        answer(t.core, isProjectSet, Shapes.context(workspaceOne, "harbor", "harbor"))
+        compare(t.core.project, "", "the old workspace's project stays out")
+        compare(sw.effectiveProject, "sketchbook", "and so does its label")
+        tryVerify(() => !sw.popup.visible)
+
+        // So does a refusal: it is about the other workspace.
+        openProjects(t)
+        mouseClick(row(sw.popup, p => p.project === "harbor"), 5, 5)
+        t.core.applyState({connection: "ready", workspace: workspaceOne})
+        answer(t.core, isContextRead, Shapes.context(workspaceOne, null, "sketchbook"))
+        answer(t.core, isProjectSet, Shapes.refusal("project.unknown", "No such project."))
+        compare(sw.popup.message, "", "nothing to say here")
+        tryVerify(() => !sw.popup.visible)
+        compare(open(t.core, isContextRead).length, 0, "and the switch has read already")
+
+        // Neither leaves the switcher stuck.
+        openProjects(t)
+        mouseClick(row(sw.popup, p => p.project === "harbor"), 5, 5)
+        answer(t.core, isProjectSet, Shapes.context(workspaceOne, "harbor", "harbor"))
+        compare(t.core.project, "harbor")
+    }
+
     function test_a_list_stays_inside_the_window() { // spec: APP-156
         const t = load()
         // So narrow that a list opened at the project switcher has to move left to fit.
@@ -1198,6 +1284,7 @@ TestCase {
         shell.gpuPauseToggleRequested()
         compare(core.calls.filter(named("app/queue.pause")).length, 1)
         answer(core, named("app/queue.pause"), Shapes.app(Shapes.lane({paused: true, reasons: ["manual"]})))
+        pastADoubleClick()
         shell.gpuPauseToggleRequested()
         compare(core.calls.filter(named("app/queue.resume")).length, 1)
 

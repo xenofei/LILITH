@@ -141,16 +141,24 @@ Item {
         if (_readCall)
             _readCall.cancel()
         _readCall = null
+        const asked = workspaceId()
         _setCall = CoreCall.appCall(core, "app/set_context", {project: slug}, {
             owner: root,
             ok: r => {
                 root._setCall = null
-                root.core.noteProject(r.project || "")
-                root.effectiveProject = r.effective_project || ""
+                // A late answer from before a switch must not put the old project in the new workspace.
+                if (root.workspaceId() === asked) {
+                    root.core.noteProject(r.project || "")
+                    root.effectiveProject = r.effective_project || ""
+                }
                 popup.close()
             },
             error: e => {
                 root._setCall = null
+                if (root.workspaceId() !== asked) {
+                    popup.close()
+                    return
+                }
                 popup.message = root.refusedText("Couldn't switch the project", e)
                 root.readEffective()
             },
