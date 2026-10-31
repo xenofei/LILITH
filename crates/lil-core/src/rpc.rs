@@ -6,7 +6,7 @@
 //!   wrong caller kind) leaves the connection here, so the client may try again until the hello
 //!   timeout. `core/prove` (Appendix G "Connections") sets the event a client names, whatever
 //!   its version, and leaves the connection here too, with its hello timeout running. After a
-//!   hello, refused or not, it is -32600.
+//!   good hello or a `protocol.incompatible` refusal it is -32600.
 //! - An invalid engine token is terminal (ARCH-050: the connection "is refused", never
 //!   downgraded): the `caller.engine_token_invalid` reply is queued, then the connection is
 //!   closed. The writer still sends that reply (its flush grace); nothing read after that

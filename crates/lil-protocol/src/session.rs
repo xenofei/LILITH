@@ -327,8 +327,9 @@ pub struct CoreInfo {
     pub pipe: String,
 }
 
-/// `core/prove` params (frozen): the name of the event the client has the server set, and
-/// nothing else about the client (Appendix G "Connections"). Unknown fields are refused (-32602).
+/// `core/prove` params (frozen): the name of the event the client has the server set,
+/// `Local\lil-launch-proof-<32 lowercase hex>`, and nothing else about the client (Appendix G
+/// "Connections"). Unknown fields are refused (-32602).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProveParams {
@@ -495,11 +496,11 @@ mod tests {
         assert_eq!(serde_json::from_value::<HelloResult>(wire).unwrap(), result);
     }
 
-    /// Protocol 1.2 (Appendix D): the five capabilities of 1.1, then `queue.v1`, `desktop.v1`
-    /// and `context.v1`, shared in the core's order. Checked by position, so the later plan-4a
+    /// Protocol 1.3 (Appendix D): the five capabilities of 1.1, then `queue.v1`, `desktop.v1`,
+    /// `context.v1` and `proof.v1`, shared in the core's order. Checked by position, so later
     /// capabilities may follow them.
     #[test] // spec: ARCH-029, APP-043
-    fn protocol_is_1_2_and_offers_queue_v1() {
+    fn protocol_is_1_3_with_its_capabilities_in_order() {
         assert_eq!(PROTOCOL.to_string(), "1.3");
         let of_1_1 = [
             "events.v1",
@@ -512,6 +513,7 @@ mod tests {
         assert_eq!(CAPABILITIES.get(5), Some(&"queue.v1"));
         assert_eq!(CAPABILITIES.get(6), Some(&"desktop.v1"));
         assert_eq!(CAPABILITIES.get(7), Some(&"context.v1"));
+        assert_eq!(CAPABILITIES.get(8), Some(&"proof.v1"));
         let unique: std::collections::BTreeSet<_> = CAPABILITIES.iter().collect();
         assert_eq!(unique.len(), CAPABILITIES.len(), "{CAPABILITIES:?}");
         // A client offering them all, in another order and with an unknown one, gets them in
