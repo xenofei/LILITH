@@ -9,9 +9,12 @@
   2. A test channel under a new temporary root (LIL_CHANNEL=test-diagcheck, LIL_TEST_ROOT): the
      deployed lil-image starts on it, with its own test-channel core, and is driven through UI
      Automation. Its dock tab (else Ctrl+6) opens Diagnostics, and then:
-       (a) "Export diagnostics bundle" opens the save dialog: the ZIP filter is there and no file
-           name is filled in; Cancel makes no bundle, checked on disk in the core's folder and in
-           the folder the file would go to;
+       (a) "Export diagnostics bundle" opens the save dialog: the file type box (id 1136 under
+           FileTypeControlHost) reads the ZIP filter, and the file name box (id 1001 under
+           FileNameControlHost; the address bar has another 1001) reads empty, which counts only
+           once a probe typed into it reads back the same way. A box that can't be found or read
+           fails, with its shape (no names or values) in the output and in -DiagDir. Cancel makes
+           no bundle, checked on disk in the core's folder and in the folder the file would go to;
        (b) a save to <temp>\out\bundle.zip: the file is a valid ZIP with the bundle's entries, and
            nothing is left beside it;
        (c) "Show in Explorer": an Explorer window opens on that temporary folder with the file
@@ -53,6 +56,46 @@ function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $wha
 function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+if (-not ('LilDiagCheck.Win' -as [type])) {
+    Add-Type -Namespace LilDiagCheck -Name Win -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hwnd);
+[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern System.IntPtr WindowFromPoint(POINT point);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hwnd, out uint processId);
+[DllImport("user32.dll")] public static extern bool IsWindow(System.IntPtr hwnd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern System.IntPtr FindWindowExW(System.IntPtr parent, System.IntPtr after, string cls, string title);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(System.IntPtr hwnd, System.Text.StringBuilder name, int size);
+[DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")] public static extern System.IntPtr SendText(System.IntPtr hwnd, uint msg, System.IntPtr wParam, System.Text.StringBuilder lParam, uint flags, uint timeoutMs, out System.IntPtr result);
+[DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")] public static extern System.IntPtr SendValue(System.IntPtr hwnd, uint msg, System.IntPtr wParam, System.IntPtr lParam, uint flags, uint timeoutMs, out System.IntPtr result);
+// The first window of class "Edit" under `parent`, at any depth, else zero.
+public static System.IntPtr FindEditUnder(System.IntPtr parent) {
+    System.IntPtr child = System.IntPtr.Zero;
+    while ((child = FindWindowExW(parent, child, null, null)) != System.IntPtr.Zero) {
+        var name = new System.Text.StringBuilder(32);
+        GetClassNameW(child, name, name.Capacity);
+        if (name.ToString() == "Edit") return child;
+        System.IntPtr under = FindEditUnder(child);
+        if (under != System.IntPtr.Zero) return under;
+    }
+    return System.IntPtr.Zero;
+}
+'@
+}
+# What a window of a standard control holds, through WM_GETTEXT, and whether it answered: {ok, text}.
+# An answer of no text is ok; a window that doesn't answer or isn't there is not. It sends no input.
+function Get-NativeText([System.IntPtr]$hwnd) {
+    $none = [pscustomobject]@{ ok = $false; text = '' }
+    if ($hwnd -eq [System.IntPtr]::Zero -or -not [LilDiagCheck.Win]::IsWindow($hwnd)) { return $none }
+    $abortIfHung = [uint32]2
+    $out = [System.IntPtr]::Zero
+    $sent = [LilDiagCheck.Win]::SendValue($hwnd, [uint32]0x000E, [System.IntPtr]::Zero, [System.IntPtr]::Zero, $abortIfHung, [uint32]2000, [ref]$out)
+    if ($sent -eq [System.IntPtr]::Zero) { return $none }
+    $buffer = [System.Text.StringBuilder]::new([Math]::Min(4096, $out.ToInt64() + 1))
+    $sent = [LilDiagCheck.Win]::SendText($hwnd, [uint32]0x000D, [System.IntPtr]::new($buffer.Capacity), $buffer, $abortIfHung, [uint32]2000, [ref]$out)
+    if ($sent -eq [System.IntPtr]::Zero) { return $none }
+    return [pscustomobject]@{ ok = $true; text = $buffer.ToString() }
+}
 
 # --- The disk checks -------------------------------------------------------------------------
 function Get-Listing([string]$dir) {
@@ -115,6 +158,25 @@ function Self-Test {
         Check (Test-SameFolder $folderUrl $d) 'self-test: a window on the folder is told by its URL'
         Check (-not (Test-SameFolder $folderUrl (Join-Path $d 'src'))) 'self-test: a window on another folder is not'
         Check (-not (Test-SameFolder '' $d)) 'self-test: a window with no location is not'
+        # The reader, on controls of this process that are never shown.
+        Add-Type -AssemblyName System.Windows.Forms
+        $box = [System.Windows.Forms.TextBox]::new()
+        $combo = [System.Windows.Forms.ComboBox]::new()
+        try {
+            $box.Text = 'typed'
+            $r = Get-NativeText $box.Handle
+            Check ($r.ok -and $r.text -ceq 'typed') 'self-test: the reader reads a text box'
+            $box.Text = ''
+            $r = Get-NativeText $box.Handle
+            Check ($r.ok -and $r.text -ceq '') 'self-test: the reader tells an empty box from an unread one'
+            $r = Get-NativeText ([System.IntPtr]::Zero)
+            Check (-not $r.ok) 'self-test: no window is not read as empty'
+            $combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+            [void]$combo.Items.Add('ZIP files (*.zip)')
+            $combo.SelectedIndex = 0
+            $r = Get-NativeText $combo.Handle
+            Check ($r.ok -and $r.text -ceq 'ZIP files (*.zip)') 'self-test: the reader reads a drop-down list''s selection'
+        } finally { $box.Dispose(); $combo.Dispose() }
     } finally { Remove-Item -Recurse -Force -LiteralPath $d }
 }
 
@@ -243,15 +305,6 @@ function Find-Window([int]$procId, [string]$name) {
     $e = $AE::RootElement.FindFirst($TS::Children, $c)
     if (-not $e -and $script:main) { $e = $script:main.FindFirst($TS::Descendants, $c) }
     return $e
-}
-if (-not ('LilDiagCheck.Win' -as [type])) {
-    Add-Type -Namespace LilDiagCheck -Name Win -MemberDefinition @'
-[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hwnd);
-[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
-[DllImport("user32.dll")] public static extern System.IntPtr WindowFromPoint(POINT point);
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hwnd, out uint processId);
-'@
 }
 function Get-WindowProcess([System.IntPtr]$hwnd) {
     $owner = [uint32]0
@@ -420,28 +473,92 @@ function Get-NameBox($dlg) {
     if ($box) { return $box }
     return $hostPane
 }
-# What the file name box holds; $null when it can't be read. The name of a file the app filled in,
-# never a name from the dialog's list.
-function Get-NameBoxValue($dlg) {
-    $box = Get-NameBox $dlg
-    $vp = $null
-    if ($box.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { return $vp.Current.Value }
-    return $null
+# The dialog's control with automation id `id` under its host `hostId`, any control type, and never
+# one found outside that host: the address bar has an id 1001 too. {hostPane, control}; either can
+# be $null.
+function Find-HostedControl($dlg, [string]$hostId, [string]$id) {
+    $hostPane = $null
+    try { $hostPane = Wait-For { $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $hostId)) } 10 "the host $hostId" } catch { }
+    $control = if ($hostPane) { $hostPane.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $id)) } else { $null }
+    return [pscustomobject]@{ hostPane = $hostPane; control = $control }
 }
-# The filter the dialog shows: FileTypeControlHost's value, else its selected item; $null when it
-# can't be read. It holds only the app's own filter text.
-function Get-FilterText($dlg) {
-    $combo = Wait-For { $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty 'FileTypeControlHost')) } 10 'the file type box'
+# What a hosted control holds: {found, read, text, how}. UI Automation's patterns where it has them
+# (these controls can show as Panes, with none), else its window. `readEditUnderHost`: an Edit in the
+# host's windows stands in for a control with no window of its own. Only this control is read: never
+# the dialog's file list, navigation pane, address bar or breadcrumb.
+function Read-HostedControl($dlg, [string]$hostId, [string]$id, [bool]$readEditUnderHost) {
+    $found = Find-HostedControl $dlg $hostId $id
+    $out = [pscustomobject]@{ found = [bool]$found.control; read = $false; text = ''; how = '' }
+    if (-not $found.control) { return $out }
+    $c = $found.control
     $p = $null
-    if ($combo.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$p)) {
-        $v = $p.Current.Value
-        if ($v) { return $v }
+    try {
+        if ($c.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$p)) {
+            $out.read = $true; $out.text = [string]$p.Current.Value; $out.how = 'its value pattern'
+            return $out
+        }
+        $p = $null
+        if ($c.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$p)) {
+            $selected = @($p.Current.GetSelection())
+            if ($selected.Count -gt 0) {
+                $out.read = $true; $out.text = [string]$selected[0].Current.Name; $out.how = 'its selection pattern'
+                return $out
+            }
+        }
+        $p = $null
+        if ($c.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$p)) {
+            $out.read = $true; $out.text = [string]$p.DocumentRange.GetText(4096); $out.how = 'its text pattern'
+            return $out
+        }
+        $native = Get-NativeText ([System.IntPtr]$c.Current.NativeWindowHandle)
+        if ($native.ok) {
+            $out.read = $true; $out.text = $native.text; $out.how = 'its window'
+            return $out
+        }
+        if ($readEditUnderHost) {
+            $hostWindow = [System.IntPtr]$found.hostPane.Current.NativeWindowHandle
+            if ($hostWindow -ne [System.IntPtr]::Zero) {
+                $native = Get-NativeText ([LilDiagCheck.Win]::FindEditUnder($hostWindow))
+                if ($native.ok) {
+                    $out.read = $true; $out.text = $native.text; $out.how = 'the Edit under its host'
+                    return $out
+                }
+            }
+        }
+    } catch { Write-Host 'a dialog control went away while it was read' }
+    return $out
+}
+# A dialog control's shape for the fix: control types, ids, classes, whether it has a window, and its
+# patterns, to depth 3. No name and no value: this is safe to keep whatever the control holds.
+function Get-ControlShape($dlg, [string]$hostId) {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $hostPane = $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $hostId))
+    if (-not $hostPane) { $lines.Add("no element with id $hostId"); return $lines }
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $walk = {
+        param($e, [int]$depth)
+        if ($lines.Count -ge 40) { return }
+        try {
+            $c = $e.Current
+            $patterns = @($e.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName -replace 'PatternIdentifiers\.Pattern$', '' }) -join ','
+            $lines.Add(('{0}{1} id={2} class={3} window={4} patterns={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $c.AutomationId, $c.ClassName, ($c.NativeWindowHandle -ne 0), $patterns))
+        } catch { $lines.Add(('{0}(gone)' -f ('  ' * $depth))); return }
+        if ($depth -ge 3) { return }
+        $child = $walker.GetFirstChild($e)
+        while ($child) { & $walk $child ($depth + 1); $child = $walker.GetNextSibling($child) }
     }
-    if ($combo.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$p)) {
-        $s = @($p.Current.GetSelection())
-        if ($s.Count -gt 0) { return $s[0].Current.Name }
-    }
-    return $null
+    & $walk $hostPane 0
+    return $lines
+}
+# A box of the dialog couldn't be read: the shape in the output and, with the app's tree, in -DiagDir.
+function Save-DialogShape($dlg, [string]$hostId) {
+    $shape = @(Get-ControlShape $dlg $hostId)
+    $shape | ForEach-Object { Write-Host "  $_" }
+    try {
+        New-Item -ItemType Directory -Force $DiagDir | Out-Null
+        Add-Content -LiteralPath (Join-Path $DiagDir 'dialog-shape.txt') -Value (@("--- $hostId") + $shape) -Encoding utf8
+        Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt')
+    } catch { Write-Host "the diagnostics weren't saved: $_" }
 }
 # The full path into the file name box (the dialog goes to its folder), then Save (id 1, else Enter).
 function Save-As($dlg, [string]$path) {
@@ -501,13 +618,59 @@ try {
     # (a) The dialog, then Cancel.
     $dlg = Open-SaveDialog
     Pass '(a) "Export diagnostics bundle" opened a window with the dialog''s title'
-    $filter = Get-FilterText $dlg
-    Check ($filter -and $filter -match 'ZIP files' -and $filter -match '\*\.zip') "(a) the ZIP filter is there ($filter)"
-    $name = Get-NameBoxValue $dlg
-    # Its value isn't printed unless it is one the app filled in by mistake.
-    Check ($null -ne $name -and $name -eq '') $(if ($null -eq $name) { "(a) the file name box couldn't be read" } elseif ($name -eq '') { '(a) no file name is filled in' } else { "(a) a file name is filled in: $name" })
+    # The filter: only the app's own text can be there, and it is printed only when it is that.
+    $filter = Read-HostedControl $dlg 'FileTypeControlHost' '1136' $false
+    if (-not $filter.found) {
+        Fail '(a) the file type box (id 1136 under FileTypeControlHost) was not found'
+        Save-DialogShape $dlg 'FileTypeControlHost'
+    } elseif (-not $filter.read) {
+        Fail "(a) the file type box couldn't be read"
+        Save-DialogShape $dlg 'FileTypeControlHost'
+    } elseif ($filter.text -match 'ZIP files' -and $filter.text -match '\*\.zip') {
+        Pass "(a) the file type box reads the ZIP filter, $($filter.text), through $($filter.how)"
+    } else {
+        Fail "(a) the file type box reads something else ($($filter.text.Length) characters, through $($filter.how))"
+    }
+    # The file name: empty passes only if the box was found and read, and if the same read then sees
+    # a probe typed into it, so that "empty" can't be the read of something else. No value is printed.
+    $name = Read-HostedControl $dlg 'FileNameControlHost' '1001' $true
+    if (-not $name.found) {
+        Fail '(a) the file name box (id 1001 under FileNameControlHost) was not found'
+        Save-DialogShape $dlg 'FileNameControlHost'
+    } elseif (-not $name.read) {
+        Fail "(a) the file name box couldn't be read"
+        Save-DialogShape $dlg 'FileNameControlHost'
+    } elseif ($name.text -ne '') {
+        Fail "(a) the file name box holds a name ($($name.text.Length) characters, through $($name.how))"
+    } else {
+        Pass "(a) the file name box reads empty, through $($name.how)"
+        $probe = 'lil-diagcheck-probe'
+        $box = Get-NameBox $dlg
+        Show-Element $dlg
+        try { $box.SetFocus() } catch { }
+        Send-Keys $probe $box $dlg 'the file name box'
+        $seen = $null
+        $end = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $end -and $seen -cne $probe) {
+            Start-Sleep -Milliseconds 200
+            $seen = (Read-HostedControl $dlg 'FileNameControlHost' '1001' $true).text
+        }
+        if ($seen -ceq $probe) {
+            Pass '(a) the same read sees a probe typed into the box, so that empty was the box'
+        } else {
+            Fail "(a) the same read doesn't see a probe typed into the box ($(([string]$seen).Length) characters), so empty proves nothing"
+            Save-DialogShape $dlg 'FileNameControlHost'
+        }
+    }
     Cancel-Dialog $dlg
-    [void](Wait-For { if (-not (Find-Window $script:app.Id $dialogTitle)) { $true } } 10 'the dialog to close')
+    $closed = { if (-not (Find-Window $script:app.Id $dialogTitle)) { $true } }
+    try {
+        [void](Wait-For $closed 3 'the dialog to close')
+    } catch {
+        # A first Escape can only close the box's suggestions.
+        Cancel-Dialog $dlg
+        [void](Wait-For $closed 10 'the dialog to close')
+    }
     Start-Sleep -Seconds 2
     Check ((Get-Listing $coreBundles).Count -eq 0) "(a) cancelled: no file in the core's bundle folder 2 s later"
     Check ((Get-Listing $outDir).Count -eq 0) '(a) cancelled: no file in the folder the file would go to 2 s later'
