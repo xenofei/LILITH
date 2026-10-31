@@ -7,27 +7,32 @@
   1. The hands-off pop-up (tools/sandbox/hands-off.ps1: 10 s of warning, then a countdown).
   2. A test channel under a new temporary root (LIL_CHANNEL=test-topbarcheck, LIL_TEST_ROOT), with
      the deployed lil-image on it, driven through UI Automation. It checks, on disk or through UIA:
-       (a) with no workspace: "Create or choose a workspace" opens the native folder dialog. Cancel
-           it: suite.toml and the root's folders are as they were, and the banner stays.
+       (a) with no workspace: "Create or choose a workspace" opens the native folder dialog (window
+           class #32770). Cancel it: suite.toml and the root's folders are as they were, and the
+           banner stays.
        Then a workspace is made, and lil-image starts again on it:
        (b) a real Ctrl+Shift+P pauses GPU work: the core says so, and the bar's button and badge
            show it; a second press resumes.
-       (c) a switcher's list opens over the docks and takes the focus; Escape closes it; a press on a
-           docked panel closes it; a press on a floating dock window closes it.
+       (c) a switcher's list opens over the docks and takes the focus; a real press on its unavailable
+           row leaves it open, which only the list itself would; Escape closes it; a press on a docked
+           panel closes it; a press on a floating dock window closes it.
        (d) `lil workspace use` while the app stays connected: the banner names it, and "Use the
            default workspace" gets out.
        (e) the test core is killed (by its recorded PID): "Reconnecting…" shows and the pause control
-           is off. The app's session starts a new core: the connection and the counts come back, and
-           the pause control waited for the fresh read (a restart ended the pause, so it must then
-           offer Pause, never the old Resume). A press after that works. A press during the outage
-           isn't tried: the session is back within a second, so it couldn't be aimed (tst_top_bar
-           covers it).
+           is off in each sample. The app's session starts a new core: the connection and the counts
+           come back, and the control then offers Pause, never the old Resume enabled (a restart ended
+           the pause). A press after that works. Sampling can't see the moment between `ready` and the
+           fresh read, and a press can't be aimed at an outage under a second:
+           test_the_lanes_are_not_trusted_from_a_loss_until_the_fresh_read proves the ordering.
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first. The tree holds
-  no names from a dialog's file list, navigation pane, address bar or breadcrumb.
+  no names from a dialog's file list, navigation pane, address bar or breadcrumb. Real keys go only
+  while the app's window is in front, and a real press only where its window is under the point;
+  otherwise the check fails and sends nothing.
   3. lil-image is closed, the test core stopped (only the PIDs recorded here), the test channel's
-     registry keys and temporary root removed, and the pop-up told it is done. Exit 0 only when every
-     check passed.
-  -DryRun does step 2's channel set-up only, with no pop-up and no window.
+     registry keys and temporary root removed, and the pop-up told it is done. Anything left behind
+     fails the run. Exit 0 only when every check passed and the cleanup was complete.
+  -DryRun does step 2's channel set-up and the guards' self-test only, with no pop-up, no window and
+  no input.
 #>
 param(
     # The repository whose build/dev/deploy is checked: by default this script's own.
@@ -54,10 +59,11 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ("lil-topbarcheck-" + [guid]::NewGu
 # Every core PID seen on this test channel: the only core processes this script may stop.
 $corePids = [System.Collections.Generic.HashSet[int]]::new()
 function Enter-TestChannel {
-    New-Item -ItemType Directory $root | Out-Null
-    foreach ($s in 'roaming', 'local', 'profile', 'places') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
+    # First, before anything that can throw: every `lil` from here on is on the test channel.
     $env:LIL_CHANNEL = $channel
     $env:LIL_TEST_ROOT = $root
+    New-Item -ItemType Directory $root | Out-Null
+    foreach ($s in 'roaming', 'local', 'profile', 'places') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
     Set-Location -LiteralPath $root
 }
 function Invoke-Lil([string[]]$a) {
@@ -86,19 +92,36 @@ function Stop-RecordedCores {
     }
 }
 function Exit-TestChannel {
+    # Never off the test channel: `lil core stop` would reach the channel this shell defaults to.
+    if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
     try { [void](Get-CorePid) } catch { }
     try { [void](& $lil core stop 2>&1) } catch { }
     Start-Sleep -Milliseconds 500
-    try { Stop-RecordedCores } catch { Write-Host "note: $_" }
-    Set-Location -LiteralPath $Repo
+    try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
+    try { Set-Location -LiteralPath $Repo } catch { }
     Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
-    foreach ($k in "HKCU:\Software\LILITH-$channel", "HKCU:\Software\Classes\lil-$channel") {
-        if (Test-Path $k) { Write-Host "removing the test channel's $k"; Remove-Item -Recurse -Force $k }
+    # Each exactly the test channel's: its registry root (its classes are under that), and Windows'
+    # notification settings entry, which a toast would make.
+    $capitalised = $channel.Substring(0, 1).ToUpperInvariant() + $channel.Substring(1)
+    $keys = "HKCU:\Software\LILITH-$channel", "HKCU:\Software\Classes\lil-$channel",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\LILITH.Suite.$capitalised"
+    foreach ($k in $keys) {
+        if (Test-Path $k) {
+            Write-Host "removing the test channel's $k"
+            try { Remove-Item -Recurse -Force $k } catch { Write-Host "note: $_" }
+        }
+        if (Test-Path $k) { Fail "cleanup: $k is still there" }
     }
     for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $root); ++$i) {
         try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
     }
-    if (Test-Path -LiteralPath $root) { Write-Host "note: $root could not be removed yet" }
+    if (Test-Path -LiteralPath $root) { Fail "cleanup: $root is still there" }
+    foreach ($id in $corePids) {
+        $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+        if ($p -and $p.ProcessName -eq 'lil-core' -and $p.Path -and $p.Path.StartsWith($Deploy, [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $p.WaitForExit(5000)) { Fail "cleanup: the test core, pid $id, is still running" }
+        }
+    }
 }
 # What the core says of the GPU lane, from another session (the test channel's `lil`).
 function Get-GpuLane {
@@ -114,7 +137,56 @@ function Get-DiskState {
     return "$hash;$names"
 }
 
+if (-not ('LilTopBarCheck.Win' -as [type])) {
+    Add-Type -Namespace LilTopBarCheck -Name Win -MemberDefinition @'
+public struct POINT { public int X; public int Y; }
+[DllImport("user32.dll")] public static extern System.IntPtr WindowFromPoint(POINT point);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hwnd);
+[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hwnd, out uint processId);
+[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, System.UIntPtr extra);
+'@
+}
+# Real input only ever goes to this app: anything else in front, and the check fails and sends nothing.
+function Get-WindowProcessId([System.IntPtr]$hwnd) {
+    [uint32]$owner = 0
+    [void][LilTopBarCheck.Win]::GetWindowThreadProcessId($hwnd, [ref]$owner)
+    return [int]$owner
+}
+function Assert-AppInFront {
+    for ($i = 0; $i -lt 5; ++$i) {
+        if ((Get-WindowProcessId ([LilTopBarCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw 'no keys sent: another program''s window is in front'
+}
+function Send-Checked([string]$keys) {
+    Assert-AppInFront
+    [System.Windows.Forms.SendKeys]::SendWait($keys)
+}
+function Assert-AppAt([int]$x, [int]$y) {
+    $point = [LilTopBarCheck.Win+POINT]::new()
+    $point.X = $x
+    $point.Y = $y
+    if ((Get-WindowProcessId ([LilTopBarCheck.Win]::WindowFromPoint($point))) -ne $script:app.Id) {
+        throw "no press sent: another program's window is at $x,$y"
+    }
+}
+# The guards, without any input: a process that owns no window is never in front or under a point.
+function Self-Test {
+    $script:app = [pscustomobject]@{ Id = -1 }
+    $refused = 0
+    try { Assert-AppInFront } catch { if ("$_" -like 'no keys sent*') { ++$refused } }
+    try { Assert-AppAt 0 0 } catch { if ("$_" -like 'no press sent*') { ++$refused } }
+    $script:app = $null
+    Check ($refused -eq 2) "self-test: the guards refuse a window that isn't the app's ($refused of 2)"
+    $own = Get-WindowProcessId ([LilTopBarCheck.Win]::GetForegroundWindow())
+    Check ($own -ge 0) 'self-test: the foreground window''s owner can be read'
+}
+
 if ($DryRun) {
+    Self-Test
     Enter-TestChannel
     try {
         $ws = Join-Path $root 'places\harbor'
@@ -172,23 +244,17 @@ function Find-Window([int]$procId, [string]$name) {
     if (-not $e -and $script:main) { $e = $script:main.FindFirst($TS::Descendants, $c) }
     return $e
 }
-if (-not ('LilTopBarCheck.Win' -as [type])) {
-    Add-Type -Namespace LilTopBarCheck -Name Win -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hwnd);
-[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-[DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, System.UIntPtr extra);
-'@
-}
 function Show-Element($e) {
     try { [void][LilTopBarCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
     Start-Sleep -Milliseconds 300
 }
 function Show-App { Show-Element $script:main }
-function Send-Keys([string]$keys) { Show-App; [System.Windows.Forms.SendKeys]::SendWait($keys); Start-Sleep -Milliseconds 200 }
-# A real press, at screen coordinates.
+function Send-Keys([string]$keys) { Show-App; Send-Checked $keys; Start-Sleep -Milliseconds 200 }
+# A real press, at screen coordinates, only if the app's window is there.
 function Press-At([double]$x, [double]$y) {
     [void][LilTopBarCheck.Win]::SetCursorPos([int]$x, [int]$y)
     Start-Sleep -Milliseconds 100
+    Assert-AppAt ([int]$x) ([int]$y)
     [LilTopBarCheck.Win]::mouse_event(2, 0, 0, 0, [System.UIntPtr]::Zero)
     Start-Sleep -Milliseconds 50
     [LilTopBarCheck.Win]::mouse_event(4, 0, 0, 0, [System.UIntPtr]::Zero)
@@ -202,7 +268,7 @@ function Invoke-Element($e) {
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
     try { $e.SetFocus() } catch { Show-App }
-    [System.Windows.Forms.SendKeys]::SendWait(' ')
+    Send-Checked ' '
 }
 function App-Windows {
     @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
@@ -289,8 +355,9 @@ try {
     $before = Get-DiskState
     Invoke-Element $create
     $dlg = Wait-For { Find-Window $script:app.Id 'Create or choose a workspace' } 20 'the folder dialog'
-    Pass '(a) "Create or choose a workspace" opened the native folder dialog'
-    if (-not (Invoke-DialogId $dlg '2')) { Show-Element $dlg; [System.Windows.Forms.SendKeys]::SendWait('{ESC}') }
+    Pass '(a) "Create or choose a workspace" opened a folder dialog'
+    Check ($dlg.Current.ClassName -eq '#32770') "(a) it is the native one (window class: $($dlg.Current.ClassName))"
+    if (-not (Invoke-DialogId $dlg '2')) { Show-Element $dlg; Send-Checked '{ESC}' }
     [void](Wait-For { if (-not (Find-Window $script:app.Id 'Create or choose a workspace')) { $true } } 10 'the dialog to close')
     Start-Sleep -Seconds 1
     Check ((Get-DiskState) -eq $before) '(a) cancelled: suite.toml and the folders are as they were'
@@ -334,10 +401,6 @@ try {
     $r = $list.Current.BoundingRectangle
     $h = $home_.Current.BoundingRectangle
     Check ($r.IntersectsWith($h)) "(c) the list lies over a dock (list $r, Home $h)"
-    $top = $AE::FromPoint([System.Windows.Point]::new($r.X + $r.Width / 2, $r.Y + 6))
-    $topName = try { $top.Current.Name } catch { '' }
-    $isOurs = ($topName -eq 'Workspaces') -or ($topName -like 'harbor*') -or ($topName -like 'quay*')
-    Check $isOurs "(c) the list is on top at its own point (UIA there: `"$topName`")"
     $focusName = ''
     $focused = Wait-For {
         $f = $AE::FocusedElement
@@ -345,6 +408,17 @@ try {
         if ($focusName -eq 'Workspaces' -or $focusName -like 'harbor*' -or $focusName -like 'quay*') { $f }
     } 5 'the list to take the focus'
     Pass "(c) the list took the focus ($($focused.Current.Name))"
+    # Only the list keeps itself open: a press that reached anything under it would close it.
+    $row = Wait-For {
+        foreach ($e in $list.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+            try { if ($e.Current.Name -like '*unavailable*') { return $e } } catch { }
+        }
+    } 5 'an unavailable row'
+    $b = $row.Current.BoundingRectangle
+    Press-At ($b.X + 40) ($b.Y + $b.Height / 2)
+    Start-Sleep -Milliseconds 600
+    Check ($null -ne (Find-List 'Workspaces')) '(c) the list is on top over the docks: a real press on its unavailable row left it open'
+    Check ($null -ne (Find-NameStarting 'Workspace: harbor')) '(c) that press chose nothing'
     Send-Keys '{ESC}'
     [void](Wait-For { if (-not (Find-List 'Workspaces')) { $true } } 5 'Escape to close the list')
     Pass '(c) Escape closed the list'
@@ -438,7 +512,7 @@ try {
     $seen | ForEach-Object { Write-Host "(e) saw: $_" }
     Check $sawReconnecting '(e) the connection indicator said Reconnecting'
     Check $sawBanner '(e) the "Reconnecting…" banner showed'
-    Check (-not $earlyEnabled) '(e) the pause control stayed off until the fresh read, and never offered the old Resume'
+    Check (-not $earlyEnabled) '(e) in each sample the pause control was off until the counts came back, and the old Resume never showed enabled'
     Check $done '(e) the connection and the counts came back, and the control offers Pause: the restart ended the pause'
     $newCore = Get-CorePid
     Check ($newCore -gt 0 -and $newCore -ne $victim) "(e) a new core runs, pid $newCore"
@@ -459,9 +533,9 @@ try {
         Write-Host "diagnostics in $DiagDir"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
-    Close-App
-    Exit-TestChannel
-    Set-Content -LiteralPath $state -Value 'done'
+    try { Close-App } catch { Fail "cleanup: closing lil-image: $_" }
+    try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    try { Set-Content -LiteralPath $state -Value 'done' } catch { Write-Host "note: the pop-up wasn't told: $_" }
 }
 
 Write-Host ''
