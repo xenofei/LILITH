@@ -366,7 +366,8 @@ TestCase {
         answered[hello[0].id] = true
         t.core.respond(hello[0].id, Shapes.hello(null))
         verify(banner.visible)
-        compare(banner.text, "Your default workspace still can't be found.")
+        verify(banner.text.endsWith("It still can't be found."), banner.text)
+        verify(banner.text.indexOf("for the command line and agents too") >= 0, "the sentence stays: " + banner.text)
 
         // Its drive back: the same button picks it up, and no default was changed.
         mouseClick(banner.defaultButton)
@@ -379,6 +380,34 @@ TestCase {
         verify(!banner.visible)
         compare(t.core.calls.filter(named("workspace.create")).length, 0)
         compare(t.core.calls.filter(named("workspace.set_default")).length, 0)
+    }
+
+    function test_a_good_default_is_named_and_can_be_used() { // spec: APP-016, P4a-R34
+        // Started on a first run, then `lil workspace init --default` in a terminal.
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: []}))
+        verify(!banner.defaultButton.visible)
+
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        t.core.emit("workspace", "event", Shapes.defaultChanged(quay.id, quay.path))
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: [
+            {id: "ws2", path: "D:/art/quay", name: "Quay", default: true, served: true, missing: false}]}), "read again on the event")
+        verify(banner.text.indexOf("Your default workspace is Quay (D:/art/quay)") >= 0, banner.text)
+        verify(banner.text.indexOf("for the command line and agents too") >= 0, banner.text)
+        verify(banner.text.indexOf("can't be found") < 0, banner.text)
+        verify(banner.defaultButton.visible)
+        compare(walk.report(banner), [])
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.hello(quay))
+        t.core.applyState({connection: "ready", workspace: quay})
+        verify(!banner.visible)
+        compare(t.core.calls.filter(named("workspace.create")).length, 0)
     }
 
     function test_a_failed_list_read_says_it_in_general_words() { // spec: APP-016

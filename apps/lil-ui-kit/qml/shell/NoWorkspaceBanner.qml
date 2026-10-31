@@ -7,11 +7,12 @@
 // `Core.workspace`. A refusal stays on the banner.
 //
 // It says so before the click. `workspaces.list` is read when the banner shows (a session with no
-// workspace may). Where a default exists but can't be found, the banner says what would be replaced,
-// and "Use the default workspace" picks it up again once its drive is back. With no default at all
-// nothing is replaced, and it only says the folder becomes the default. If the read fails, it says
-// the same in general words, naming the command line and agents. There is no confirmation: the
-// folder dialog is already a deliberate step.
+// workspace may), and again on the `workspace` topic's `default_changed`. Where there is a default,
+// the banner names it and says choosing a folder replaces it, and "Use the default workspace" picks
+// it up: once its drive is back, if it can't be found. A refusal is said after that, not instead of
+// it. With no default at all nothing is replaced, and it only says the folder becomes the default.
+// If the read fails, it says the same in general words, naming the command line and agents. There
+// is no confirmation: the folder dialog is already a deliberate step.
 import QtQuick
 import QtQuick.Dialogs
 import Lilith.UiKit
@@ -26,9 +27,10 @@ LBanner {
     property alias defaultButton: defaultButton
     property var _call: null
     property string _refusal
-    // The default row that can't be found, or null; "ok" or "failed" once the list is read.
-    property var _lostDefault: null
+    // The default row, or null; "ok" or "failed" once the list is read.
+    property var _defaultRow: null
     property string _listRead
+    property var _readCall: null
 
     // Something happened that outlives the banner: (text, kind). workspace.create's warnings (a
     // network or cloud-synced folder, a volume without stable ids) are in the text.
@@ -38,15 +40,19 @@ LBanner {
     kind: _refusal !== "" ? "danger" : "warning"
     visible: wanted
     text: {
+        if (_defaultRow) {
+            const row = _defaultRow
+            const named = core.shownText(row.name || folderName(row.path), 60) + " (" + core.shownText(String(row.path), 120) + ")"
+            const said = row.missing || row.problem
+                ? "Your default workspace, " + named + ", can't be found. If its drive is unplugged, plug it in and use"
+                  + " it again. Choosing another folder makes that one the default instead, for the command line and agents too."
+                : "Your default workspace is " + named + ", and this session isn't on it. Use it, or choose another"
+                  + " folder, which becomes the default instead, for the command line and agents too."
+            return _refusal !== "" ? said + " " + _refusal : said
+        }
         if (_refusal !== "")
             return _refusal
         const open = "No workspace is open. You can still generate; that is logged as loose usage."
-        if (_lostDefault) {
-            const name = core.shownText(_lostDefault.name || folderName(_lostDefault.path), 60)
-            return "Your default workspace, " + name + " (" + core.shownText(String(_lostDefault.path), 120)
-                   + "), can't be found. If its drive is unplugged, plug it in and use it again. Choosing another"
-                   + " folder makes that one the default instead, for the command line and agents too."
-        }
         if (_listRead === "ok")
             return open + " The folder you choose becomes your default workspace."
         if (_listRead === "failed")
@@ -56,7 +62,7 @@ LBanner {
 
     onWantedChanged: {
         _refusal = ""
-        _lostDefault = null
+        _defaultRow = null
         _listRead = ""
         if (wanted) {
             announce()
@@ -65,22 +71,31 @@ LBanner {
     }
 
     Component.onCompleted: {
-        if (wanted)
+        CoreCall.subscribe(core, "workspace", root, (kind, seq, data) => {
+            if (kind === "event" && data && data.kind === "default_changed" && root.wanted)
+                root.readDefault()
+        })
+        if (wanted && !_readCall && _listRead === "")
             readDefault()
     }
 
     function readDefault() {
-        CoreCall.call(core, "workspaces.list", {}, {
+        if (_readCall)
+            _readCall.cancel()
+        _readCall = CoreCall.call(core, "workspaces.list", {}, {
             owner: root,
             ok: r => {
+                root._readCall = null
                 const rows = (r.structured || {}).workspaces || []
-                const lost = rows.find(w => w.default && (w.missing || w.problem))
-                root._lostDefault = lost || null
+                root._defaultRow = rows.find(w => w.default) || null
                 root._listRead = "ok"
-                if (lost)
+                if (root._defaultRow)
                     root.announce()
             },
-            error: () => { root._listRead = "failed" }
+            error: () => {
+                root._readCall = null
+                root._listRead = "failed"
+            }
         })
     }
 
@@ -93,7 +108,7 @@ LBanner {
             ok: hello => {
                 root._call = null
                 if (!hello.workspace) {
-                    root._refusal = "Your default workspace still can't be found."
+                    root._refusal = "It still can't be found."
                     root.announce()
                 }
             },
@@ -172,7 +187,7 @@ LBanner {
         LButton {
             id: defaultButton
             requiresCore: true
-            visible: !!root._lostDefault
+            visible: !!root._defaultRow
             text: "Use the default workspace"
             onClicked: root.useDefault()
         }

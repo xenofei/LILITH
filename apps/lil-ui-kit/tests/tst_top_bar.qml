@@ -771,6 +771,36 @@ TestCase {
         }
     }
 
+    function test_a_refused_count_or_caps_read_is_the_same_state() { // spec: ARCH-090, ARCH-100
+        // A hand-edited suite.toml publishes nothing, so a read is the first to hear of it.
+        const t = load({running: [Shapes.job("r1", "running")], caps: [Shapes.capRow("monthly", 412)],
+                        lanes: [Shapes.lane({paused: true, reasons: ["manual"]})]})
+        tryCompare(t.bar.jobsIndicator, "text", "1 running · 0 queued")
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("q1", "queued")})
+        tryVerify(() => open(t.core, isRunningRead).length > 0, 2000, "the read")
+        answer(t.core, isRunningRead, Shapes.notServed("D:/art/quay", "D:/art/harbor"))
+        verify(t.bar.movedReason.indexOf("This core serves only the default workspace") >= 0, t.bar.movedReason)
+        compare(t.bar.connectionIndicator.text, "Workspace refused")
+        compare(t.bar.jobsIndicator.text, "—", "the last counts aren't shown as live")
+        verify(!t.bar.pausedHolder.visible)
+        compare(t.bar.spendIndicator.kind, "muted")
+
+        // A new hello ends it, and caps.get alone can start it.
+        t.core.applyState({connection: "ready", workspace: workspaceOne})
+        compare(t.bar.movedReason, "")
+        t.core.emit("caps", "event", Shapes.capsChanged([]))
+        answer(t.core, named("caps.get"), Shapes.notServed("D:/art/quay", "D:/art/harbor"), "caps.get")
+        verify(t.bar.movedReason !== "")
+
+        // A refusal from before a switch isn't about the new workspace.
+        t.core.applyState({connection: "ready", workspace: workspaceOne})
+        t.core.emit("usage", "event", Shapes.usageRecord())
+        tryVerify(() => open(t.core, named("caps.get")).length > 0, 3000, "caps.get again")
+        t.core.applyState({connection: "ready", workspace: {id: "ws2", path: "D:/art/quay"}})
+        answer(t.core, named("caps.get"), Shapes.notServed("D:/art/quay", "D:/art/harbor"))
+        compare(t.bar.movedReason, "")
+    }
+
     function test_a_refused_list_read_is_the_same_state() { // spec: ARCH-090, ARCH-100
         // The event can be missed; the core's real refusal says the same.
         const t = load()
@@ -895,6 +925,12 @@ TestCase {
         const sw = openProjects(t)
         mouseClick(other.contentItem, 20, 20)
         tryVerify(() => !sw.popup.visible, 2000, "a floating dock is another window")
+
+        // A touch does the same.
+        openProjects(t)
+        touchEvent(other.contentItem).press(0, other.contentItem, 20, 20).commit()
+        tryVerify(() => !sw.popup.visible, 2000, "a touch in another window")
+        touchEvent(other.contentItem).release(0, other.contentItem, 20, 20).commit()
     }
 
     function test_sketchbook_is_the_default_project() { // spec: ARCH-098, APP-015

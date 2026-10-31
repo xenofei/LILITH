@@ -11,6 +11,10 @@
 // find the panel's, floating or not, and the tests' FakeCore works the same. A control in a Popup
 // has no such ancestor (a popup's items are parented to the window's overlay), and sets `core`
 // itself. With no core to ask it stays disabled.
+//
+// Give a marked control a binding or nothing, never a literal `enabled: true`: a literal replaces
+// the default binding, and a gate that engages under a disabled parent then keeps that parent's
+// `false` for good. No control in the kit does this today.
 .pragma library
 
 function ready(control) {

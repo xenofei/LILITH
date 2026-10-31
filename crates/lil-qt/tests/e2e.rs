@@ -789,6 +789,35 @@ fn after_set_default_the_old_session_is_refused_until_a_new_hello() {
     );
 }
 
+/// The no-workspace banner reads the list again on this: a session with no workspace hears of it.
+#[test] // spec: APP-016, ARCH-090
+fn default_changed_reaches_a_session_with_no_workspace() {
+    launch("default_changed_reaches_a_session_with_no_workspace", || {
+        let mut b = PathBuf::new();
+        let mut rig = Rig::start(|env| {
+            b = env.make_workspace("b");
+            env.register_workspace(&b, false);
+        });
+        rig.probe.subscribe("workspace");
+        let fence = rig.probe.call("workspaces.list", json!({}));
+        rig.probe.finished(&fence);
+        let id = rig.probe.call(
+            "workspace.set_default",
+            json!({"path": b.display().to_string()}),
+        );
+        let answer = rig.probe.finished(&id);
+        match rig.probe.wait_for(
+            "default_changed",
+            |s| matches!(s, Seen::Event { topic, .. } if topic == "workspace"),
+        ) {
+            Seen::Event { data, .. } => {
+                assert_eq!(data["id"], answer["structured"]["id"], "{data}");
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+}
+
 /// `lil workspace use` elsewhere, then a lost connection: the hello names the old workspace and is
 /// refused. `Core.unavailable` carries the core's words, and `useDefaultWorkspace` gets out.
 #[test] // spec: ARCH-100, ARCH-090

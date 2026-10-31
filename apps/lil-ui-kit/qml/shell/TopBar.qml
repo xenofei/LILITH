@@ -15,12 +15,13 @@
 //   Core's (APP-027).
 // - **Connection:** `Core.connection` in words. While connected, the core can still refuse this
 //   session: another client moved the default (`lil workspace use`, an agent), and it serves only
-//   the default. `movedReason` says so, from the `workspace` topic's `default_changed`, or from a
-//   switcher's list read refused with `workspace.unsupported`; the connection banner and both
-//   switchers then offer "Use the default workspace". A new hello ends it.
+//   the default. `movedReason` says so, from the `workspace` topic's `default_changed`, or from any
+//   read here refused with `workspace.unsupported` (a hand-edited suite.toml publishes nothing); the
+//   connection banner and both switchers then offer "Use the default workspace". A new hello ends it.
 //
 // Without a connection no figure is live: the GPU and the jobs read "—", the spend is muted, and the
-// badge goes.
+// badge goes. While the core refuses this session the jobs and the spend do the same; the GPU's
+// readings don't depend on the workspace.
 //
 // The app switcher has only this app in M1 (APP-164: the plain name first, the proper name beneath
 // it), so it is a label until there is a second. The assistant toggle shows, off and disabled; a tab
@@ -110,7 +111,7 @@ Rectangle {
     color: Theme.surface
 
     function jobsText() {
-        if (!jobs.current)
+        if (!jobs.current || movedReason !== "")
             return "—"
         const queued = MoneyText.count(jobs.capped >= 0 ? jobs.capped : jobs.queued)
         return MoneyText.count(jobs.running) + " running · " + queued + (jobs.capped >= 0 ? "+" : "") + " queued"
@@ -181,6 +182,12 @@ Rectangle {
         return parts.length > 0 ? parts[parts.length - 1] : String(path || "")
     }
 
+    // A read was refused with `workspace.unsupported`, while this switcher isn't moving the default.
+    function noteRefused(message) {
+        if (!workspaceSwitcher.changingDefault())
+            movedReason = core.shownText(message, 300)
+    }
+
     function onWorkspaceEvent(kind, data) {
         if (kind !== "event" || !data || data.kind !== "default_changed" || !core.workspace)
             return
@@ -201,6 +208,7 @@ Rectangle {
             return
         }
         _capsReading = true
+        const asked = core.workspace ? String(core.workspace.id) : ""
         CoreCall.call(core, "caps.get", {}, {
             owner: root,
             ok: r => {
@@ -209,8 +217,10 @@ Rectangle {
                 root._capsRetryMs = 0
                 root.capsRead()
             },
-            error: () => {
+            error: e => {
                 root._capsFailed = true
+                if (e && e.code === "workspace.unsupported" && asked === (root.core.workspace ? String(root.core.workspace.id) : ""))
+                    root.noteRefused(String(e.message))
                 if (root.coreReady) {
                     root._capsRetryMs = root._capsRetryMs === 0 ? 1000 : Math.min(root._capsRetryMs * 2, 30000)
                     capsRetry.interval = root._capsRetryMs
@@ -288,6 +298,7 @@ Rectangle {
         id: jobs
         core: root.core
         onJobEnded: root.requestCapsRead()
+        onWorkspaceRefused: message => root.noteRefused(message)
     }
 
     Timer {
@@ -340,7 +351,7 @@ Rectangle {
                 ready: root.coreReady
                 movedReason: root.movedReason
                 onNoticed: (text, kind) => root.showNotice(text, kind)
-                onWorkspaceRefused: message => { root.movedReason = root.core.shownText(message, 300) }
+                onWorkspaceRefused: message => root.noteRefused(message)
             }
 
             ProjectSwitcher {
@@ -350,7 +361,7 @@ Rectangle {
                 core: root.core
                 ready: root.coreReady && !!root.core.workspace
                 movedReason: root.movedReason
-                onWorkspaceRefused: message => { root.movedReason = root.core.shownText(message, 300) }
+                onWorkspaceRefused: message => root.noteRefused(message)
             }
 
             Item {
@@ -366,7 +377,7 @@ Rectangle {
 
             Item {
                 id: pausedHolder
-                visible: root.pausedText !== "" && root.jobs.current
+                visible: root.pausedText !== "" && root.jobs.current && root.movedReason === ""
                 width: pausedBadge.width
                 height: 28
 
@@ -393,7 +404,7 @@ Rectangle {
                 text: root.spendText()
                 name: root.capInvalid ? "Spend this month: a cap's value can't be read, so calls are refused"
                                       : "Spend this month: " + text
-                kind: !root.coreReady ? "muted" : root.capInvalid ? "danger" : ""
+                kind: !root.coreReady || root.movedReason !== "" ? "muted" : root.capInvalid ? "danger" : ""
             }
 
             StatusIndicator {

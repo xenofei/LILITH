@@ -66,7 +66,7 @@ public:
 signals:
     // Main window `name` is about to close: its docks are still where they are.
     void mainWindowClosing(const QString &name);
-    // A press reached this window (a floating dock's is another window: a popup's own
+    // A press, a touch or a pen reached this window (a floating dock's is another window: a popup's own
     // close-on-press-outside never hears of it, and it may not change which window is active).
     void windowPressed(QWindow *window);
     // The session is ending or the application quits: save now.

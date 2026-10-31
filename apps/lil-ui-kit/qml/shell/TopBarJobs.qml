@@ -47,6 +47,8 @@ Item {
 
     // A job reached a terminal status.
     signal jobEnded()
+    // The core refused a read with `workspace.unsupported`: it no longer serves this workspace.
+    signal workspaceRefused(string message)
 
     readonly property int _maxWaitMs: 1000
     readonly property bool _connected: !!core && core.connection === "ready"
@@ -109,6 +111,7 @@ Item {
             _again = true
             return
         }
+        const asked = core.workspace ? String(core.workspace.id) : ""
         const fresh = _fresh
         const stale = _stale
         const losses = _losses
@@ -137,10 +140,12 @@ Item {
                     root.requestRead()
             }
         }
-        const fail = () => {
+        const fail = e => {
             if (gone)
                 return
             gone = true
+            if (e && e.code === "workspace.unsupported" && asked === (root.core.workspace ? String(root.core.workspace.id) : ""))
+                root.workspaceRefused(String(e.message))
             root._reading = false
             root._fresh = root._fresh || fresh
             root._stale = root._stale || stale
