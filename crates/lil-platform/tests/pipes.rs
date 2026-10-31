@@ -143,14 +143,21 @@ fn a_proof_event_is_set_only_through_its_own_name() {
     assert!(proof.name().starts_with(r"Local\"), "{}", proof.name());
     // Only a name of the proof's own shape is opened, so a client can't have another event set.
     let hex = proof.name().rsplit('-').next().unwrap().to_string();
+    let prefix = proof.name().strip_suffix(&hex).unwrap();
     for other in [
         String::new(),
         r"Local\other".to_string(),
         format!(r"Global\lil-launch-proof-{hex}"),
         proof.name().to_uppercase(),
-        format!("{}0", proof.name()),
+        // The prefix intact: only what follows it is wrong.
+        format!("{prefix}{}", hex.to_uppercase()),
+        format!("{prefix}{}", &hex[..31]),
+        format!("{prefix}{hex}0"),
+        format!("{prefix}{}g", &hex[..31]),
     ] {
-        assert!(set_proof_event(&other).is_err(), "{other}");
+        // Refused for its shape, not because no event has that name.
+        let refused = set_proof_event(&other).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{other}");
     }
     assert!(!proof.is_set());
     // A proof's shape that names no event.
