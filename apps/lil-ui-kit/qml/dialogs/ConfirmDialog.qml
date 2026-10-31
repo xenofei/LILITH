@@ -35,13 +35,20 @@ Column {
     readonly property bool pending: !!view && view.state === "pending"
     readonly property bool isCap: Words.coversCap(view)
     readonly property string shownKey: Words.fingerprint(view)
-    // All of the action has been on screen.
-    readonly property bool seenAll: !scroller.overflows || scroller.reachedEnd
+    // Every line of the action has been drawn in the view, from the top down with no gap: a jump
+    // past part of it counts for nothing.
+    readonly property bool seenAll: !scroller.overflows || scroller.seenTo >= scroller.contentHeight - 1
+    readonly property int unseenPercent: seenAll ? 0
+        : Math.max(1, Math.round(100 * (scroller.contentHeight - scroller.seenTo) / scroller.contentHeight))
     readonly property bool tooLong: !!view && (!view.shown || view.shown.over)
     readonly property bool approvable: pending && seenAll && !tooLong
     readonly property string blockedWhy: tooLong
         ? "This request is too long to show in full, so it can't be approved here. Deny works."
-        : !seenAll ? "Scroll to the end of the request: this turns on once all of it has been on screen." : ""
+        : seenAll ? ""
+        : scroller.contentY > scroller.seenTo
+          ? "You jumped past part of the request. Scroll back up to where you stopped: " + unseenPercent + "% hasn't been on screen yet."
+          : "Scroll through all of the request: " + unseenPercent + "% hasn't been on screen yet. This turns on once every line has been."
+    readonly property alias header: header
     readonly property alias card: card
     readonly property alias scroller: scroller
     readonly property alias bar: bar
@@ -61,10 +68,7 @@ Column {
             denyButton.forceActiveFocus(Qt.TabFocusReason)
     }
 
-    onShownKeyChanged: {
-        scroller.reachedEnd = false
-        scroller.contentY = 0
-    }
+    onShownKeyChanged: scroller.startAgain()
     // The dialog moved in its column: the buttons with it.
     onYChanged: {
         bar.restartClock()
@@ -72,11 +76,56 @@ Column {
             capPromptLoader.item.bar.restartClock()
     }
 
+    // Who asks and for what stay in sight whatever is scrolled.
+    Column {
+        id: header
+        width: parent.width
+        spacing: Theme.spacing / 2
+        visible: !!root.view
+
+        Text {
+            width: parent.width
+            text: card.actionTitle
+            textFormat: Text.PlainText
+            color: Theme.text
+            font.pixelSize: Theme.fontSize + 1
+            font.bold: true
+            wrapMode: Text.WrapAnywhere
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+
+        Text {
+            width: parent.width
+            text: card.factsText
+            textFormat: Text.PlainText
+            color: Theme.textMuted
+            font.pixelSize: Theme.fontSize
+            wrapMode: Text.Wrap
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+    }
+
     Flickable {
         id: scroller
         readonly property bool overflows: contentHeight > height + 1
         readonly property bool atEnd: contentY + height >= contentHeight - 1
-        property bool reachedEnd: false
+        // How far down every line has been drawn in the view, without a gap.
+        property real seenTo: 0
+        property real _lastHeight: 0
+
+        function note() {
+            if (contentY <= seenTo)
+                seenTo = Math.max(seenTo, contentY + height)
+        }
+
+        // Nothing of what is shown now counts as seen but what the view holds at its top.
+        function startAgain() {
+            contentY = 0
+            seenTo = height
+        }
+
         width: parent.width
         height: Math.min(card.implicitHeight, root.cardMaxHeight)
         contentWidth: width
@@ -84,8 +133,16 @@ Column {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         interactive: overflows
-        // Only a real scroll: while the card is being laid out the sizes pass through every value.
-        onContentYChanged: if (contentY > 0 && contentHeight > height + 1 && contentY + height >= contentHeight - 1) reachedEnd = true
+        onContentYChanged: note()
+        // A shorter view or a new width lays the lines out differently from what was covered.
+        onWidthChanged: startAgain()
+        onHeightChanged: {
+            if (height < _lastHeight)
+                startAgain()
+            else
+                note()
+            _lastHeight = height
+        }
 
         QQC.ScrollBar.vertical: QQC.ScrollBar {
             policy: scroller.overflows ? QQC.ScrollBar.AlwaysOn : QQC.ScrollBar.AlwaysOff
@@ -99,14 +156,18 @@ Column {
             core: root.core
             confirmationId: root.confirmationId
             view: root.view
+            factsOutside: true
         }
     }
 
+    // One line for as long as it scrolls, so the buttons below it stay where they are.
     Text {
         id: moreBelow
         width: parent.width
-        visible: scroller.overflows && !scroller.atEnd
-        text: "More below: scroll to read all of it."
+        visible: scroller.overflows
+        text: scroller.contentY <= 0 ? "More below."
+            : scroller.atEnd ? "More above."
+            : "More above and below."
         textFormat: Text.PlainText
         color: Theme.warning
         font.pixelSize: Theme.fontSize

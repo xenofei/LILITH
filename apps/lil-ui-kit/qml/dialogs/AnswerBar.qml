@@ -139,7 +139,8 @@ Column {
     Text {
         id: reasonLine
         width: parent.width
-        visible: text !== ""
+        // Its room is kept: a popup is centred, so a reason arriving would move the buttons.
+        height: Math.max(implicitHeight, 2 * (font.pixelSize + 4))
         text: root.reason !== "" ? root.reason
             : root.open && !root.connected ? "Not connected to the core: the buttons come back when it is."
             : ""

@@ -32,6 +32,12 @@ function fingerprint(view) {
             JSON.stringify(view.cap || null), view.shown ? view.shown.digest : "unread"].join("|")
 }
 
+// `text` laid out left to right, line by line: right-to-left letters in a value can't then reorder
+// what is around them across the line's start. A first strong mark, which isn't drawn.
+function ltr(text) {
+    return "‎" + String(text).replace(/\n/g, "\n‎")
+}
+
 // "14:02" in local time, from an RFC 3339 time.
 function clock(iso) {
     return Qt.formatTime(new Date(iso), "HH:mm")

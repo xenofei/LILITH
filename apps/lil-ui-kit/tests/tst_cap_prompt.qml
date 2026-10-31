@@ -76,6 +76,12 @@ TestCase {
         tryVerify(() => tc.Window.active, 2000, "the test window is in front")
     }
 
+    // Scrolls down in steps shorter than the view, as a wheel does.
+    function scrollThrough(s) {
+        while (s.contentY + s.height < s.contentHeight - 1)
+            s.contentY = Math.min(s.contentY + s.height * 0.9, s.contentHeight - s.height)
+    }
+
     function makePrompt(component) {
         const prompt = createTemporaryObject(component || promptComponent, tc)
         verify(prompt)
@@ -131,7 +137,22 @@ TestCase {
         compare(row.button.text, "Raise the cap to 12.00 USD and approve")
         row.field.text = "25000000"
         compare(row.button.text, "Raise the cap to 25,000,000.00 USD and approve")
-        verify(row.children[2].text.indexOf("Limit now: 1.00 USD") === 0, row.children[2].text)
+        verify(row.children[2].text.indexOf("Limit when this was asked: 1.00 USD") === 0, row.children[2].text)
+    }
+
+    function test_a_raise_says_what_is_sent_and_is_higher() { // spec: APP-054, P4a-R10
+        const prompt = makePrompt()
+        const row = prompt.raises.itemAt(0)
+        // The limit is 1 USD. Each of these keeps the plain label, and a click says why.
+        for (const [amount, words] of [["25.999", "more decimals"], ["0.5", "isn't higher"], ["1", "isn't higher"],
+                                       ["lots", "as a number"]]) {
+            row.field.text = amount
+            compare(row.button.text, "Raise the cap", amount)
+            wait(550)
+            mouseClick(row.button)
+            verify(prompt.bar.reason.indexOf(words) >= 0, amount + ": " + prompt.bar.reason)
+        }
+        compare(Shapes.answers(fake).length, 0)
     }
 
     // Any change to the field, from a person or a program (posted WM_CHAR, UI Automation's value, which
@@ -291,7 +312,7 @@ TestCase {
         verify(!prompt.allowOnceButton.enabled && !prompt.raises.itemAt(0).button.enabled, "off")
         verify(prompt.cancelButton.enabled, "Cancel works")
         verify(prompt.blockedLine.visible, "it says why")
-        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
+        scrollThrough(dialog.scroller)
         tryVerify(() => prompt.allowOnceButton.enabled, 1000)
         panel.dialogPopup.close()
         tryVerify(() => !panel.dialogPopup.visible)

@@ -114,6 +114,17 @@ TestCase {
         tryVerify(() => !panel.dialogPopup.visible, 2000, "the dialog closes")
     }
 
+    // A label as the reader sees it, without the first strong mark that lays it out left to right.
+    function plain(text) {
+        return text.replace(/‎/g, "")
+    }
+
+    // Scrolls down in steps shorter than the view, as a wheel does.
+    function scrollThrough(s) {
+        while (s.contentY + s.height < s.contentHeight - 1)
+            s.contentY = Math.min(s.contentY + s.height * 0.9, s.contentHeight - s.height)
+    }
+
     readonly property var crane: Shapes.view({
         id: "cf_00000000000000a1", tool: "asset.delete", caller_kind: "mcp", project: "sketchbook",
         arguments: {path: "C:\\art\\crane.png", packages: ["left-pack", "right-pack"], force: true}
@@ -136,8 +147,8 @@ TestCase {
         verify(card.argumentRows[1].text.indexOf("left-pack") >= 0 && card.argumentRows[1].text.indexOf("right-pack") >= 0)
         compare(card.argumentRows[2].text, "true")
         tryCompare(card.rowRepeater, "count", 3)
-        compare(card.rowRepeater.itemAt(0).keyText.text, "path")
-        compare(card.rowRepeater.itemAt(0).valueText.text, "C:\\art\\crane.png")
+        compare(plain(card.rowRepeater.itemAt(0).keyText.text), "path")
+        compare(plain(card.rowRepeater.itemAt(0).valueText.text), "C:\\art\\crane.png")
         verify(!("files" in card), "no list guessed from the names of the arguments")
         compare(walk.report(panel), [])
         verify(walk.interactiveCount(panel) >= 3, "tabs and the card's button")
@@ -166,8 +177,8 @@ TestCase {
                                               arguments: {a: "x\npath: C:\\safe", path: "C:\\evil"}})])
         const card = panel.cardRepeater.itemAt(0)
         tryCompare(card.rowRepeater, "count", 2)
-        compare(card.rowRepeater.itemAt(0).valueText.text, "x\n↳ path: C:\\safe")
-        compare(card.rowRepeater.itemAt(1).keyText.text, "path")
+        compare(plain(card.rowRepeater.itemAt(0).valueText.text), "x\n↳ path: C:\\safe")
+        compare(plain(card.rowRepeater.itemAt(1).keyText.text), "path")
     }
 
     function test_numbers_and_key_order_are_the_cores_not_qmls() { // spec: APP-115
@@ -196,28 +207,95 @@ TestCase {
         verify(dialog.scroller.overflows, "the action needs scrolling")
         verify(!dialog.seenAll)
         verify(!dialog.approvable)
-        verify(dialog.moreBelow.visible, "it says more is below")
+        compare(dialog.moreBelow.text, "More below.")
         verify(dialog.blockedLine.visible)
-        verify(dialog.blockedLine.text.indexOf("Scroll to the end") === 0, dialog.blockedLine.text)
+        verify(dialog.blockedLine.text.indexOf("Scroll through all of the request") === 0, dialog.blockedLine.text)
+        verify(/\d+% hasn't been on screen/.test(dialog.blockedLine.text), dialog.blockedLine.text)
         verify(!dialog.approveButton.enabled, "Approve is off")
         verify(dialog.denyButton.enabled, "Deny works")
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 0)
-        // Part of the way isn't the end.
-        dialog.scroller.contentY = (dialog.scroller.contentHeight - dialog.scroller.height) / 2
-        verify(!dialog.approvable)
-        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
-        tryVerify(() => dialog.approvable, 1000, "at the end it turns on")
-        verify(!dialog.moreBelow.visible)
+        // Who asks and for what stay in sight outside the view.
+        verify(dialog.header.visible)
+        verify(dialog.header.y < dialog.scroller.y, "above the view, not in it")
+        scrollPartWay(dialog)
+        verify(!dialog.approvable, "part of the way isn't all of it")
+        compare(dialog.moreBelow.text, "More above and below.")
+        scrollThrough(dialog.scroller)
+        tryVerify(() => dialog.approvable, 1000, "every line has been drawn")
+        compare(dialog.moreBelow.text, "More above.")
         verify(dialog.approveButton.enabled)
-        verify(!dialog.blockedLine.visible)
+        compare(dialog.blockedLine.text, "")
         // It stays on after scrolling back up: all of it has been on screen.
         dialog.scroller.contentY = 0
         verify(dialog.approvable)
-        verify(dialog.moreBelow.visible)
+        compare(dialog.moreBelow.text, "More below.")
         wait(50)
         mouseClick(dialog.approveButton)
         compare(Shapes.answers(fake).length, 1)
+    }
+
+    function scrollPartWay(dialog) {
+        dialog.scroller.contentY = dialog.scroller.height * 0.9
+    }
+
+    // A jump of the thumb, or a program's: the middle was never drawn.
+    function test_a_jump_to_the_end_doesnt_count_as_reading() { // spec: APP-115, P4a-R10
+        let lines = []
+        for (let i = 0; i < 400; ++i)
+            lines.push("dull line " + i)
+        const hiding = Shapes.view({id: "cf_00000000000000ad",
+                                    arguments: {note: lines.join("\n"), command: "del /s /q C:\\Users", note2: lines.join("\n")}})
+        const panel = makePanel([hiding])
+        openDialog(panel, hiding.id)
+        const dialog = panel.dialog
+        const s = dialog.scroller
+        tryVerify(() => s.overflows, 2000)
+        s.contentY = s.contentHeight - s.height
+        verify(s.atEnd)
+        verify(!dialog.seenAll, "the end was reached, the middle never drawn")
+        verify(!dialog.approvable)
+        verify(!dialog.approveButton.enabled)
+        verify(dialog.blockedLine.text.indexOf("You jumped past part of the request") === 0, dialog.blockedLine.text)
+        verify(/\d+%/.test(dialog.blockedLine.text), "it says how much: " + dialog.blockedLine.text)
+        // A jump in the middle counts for nothing either.
+        s.contentY = s.contentHeight / 2
+        verify(!dialog.seenAll)
+        // Back to where the view left off, then down in steps: now it counts.
+        s.contentY = 0
+        scrollThrough(s)
+        tryVerify(() => dialog.approvable, 1000)
+        // What is shown changes: it starts again.
+        fake.emit("confirmations", "event", Shapes.event("pending", Object.assign({}, hiding, {arguments: {note: lines.join("\n"), other: lines.join("\n")}})))
+        tryVerify(() => !dialog.approvable, 1000, "another action is another reading")
+        compare(s.contentY, 0)
+    }
+
+    function test_a_short_action_needs_no_scrolling() { // spec: APP-115
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        verify(!dialog.scroller.overflows)
+        verify(dialog.seenAll && dialog.approvable)
+        verify(!dialog.moreBelow.visible)
+        compare(dialog.blockedLine.text, "")
+    }
+
+    function test_values_are_laid_out_left_to_right() { // spec: APP-115, P4a-R8
+        const panel = makePanel([Shapes.view({id: "cf_00000000000000ae", arguments: {"\u05D0key": "\u05D0\u05D1 (ok)\nsecond"}})])
+        const card = panel.cardRepeater.itemAt(0)
+        tryCompare(card.rowRepeater, "count", 1)
+        compare(card.rowRepeater.itemAt(0).keyText.text, "\u200E\u05D0key")
+        compare(card.rowRepeater.itemAt(0).valueText.text, "\u200E\u05D0\u05D1 (ok)\n\u200E↳ second")
+    }
+
+    function test_the_queue_has_a_limit() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        for (let i = 0; i < 30; ++i)
+            panel.showConfirmation("cf_00000000000001" + (10 + i))
+        compare(panel.waitingCount, panel.waitingMax)
+        closeDialog(panel)
     }
 
     function test_an_action_too_long_to_show_cant_be_approved() { // spec: APP-115, P4a-R10
@@ -226,7 +304,7 @@ TestCase {
         // The panel's list holds a preview, and says so.
         const card = panel.cardRepeater.itemAt(0)
         tryCompare(card.rowRepeater, "count", 1)
-        verify(card.rowRepeater.itemAt(0).valueText.text.length <= 301)
+        verify(plain(card.rowRepeater.itemAt(0).valueText.text).length <= 301)
         verify(card.rowRepeater.itemAt(0).cutLine.visible)
         openDialog(panel, huge.id)
         const dialog = panel.dialog
@@ -238,7 +316,7 @@ TestCase {
         verify(dialog.card.rowRepeater.itemAt(0).cutLine.visible, "and says so")
         dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
         wait(50)
-        verify(dialog.scroller.reachedEnd || !dialog.scroller.overflows)
+
         verify(!dialog.approvable, "the end of what is shown isn't the end of the action")
         verify(!dialog.approveButton.enabled)
         verify(dialog.blockedLine.text.indexOf("too long to show in full") >= 0, dialog.blockedLine.text)
@@ -257,10 +335,10 @@ TestCase {
         verify(!row.cut && !dialog.tooLong)
         compare(row.text, value)
         tryCompare(dialog.card.rowRepeater, "count", 1)
-        compare(dialog.card.rowRepeater.itemAt(0).valueText.text, value)
+        compare(plain(dialog.card.rowRepeater.itemAt(0).valueText.text), value)
         tryVerify(() => dialog.scroller.overflows, 5000, "it scrolls")
         verify(!dialog.approvable)
-        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
+        scrollThrough(dialog.scroller)
         tryVerify(() => dialog.approvable, 2000)
     }
 
@@ -323,8 +401,8 @@ TestCase {
                                         ["no_real_press", "Press and release"],
                                         ["brought_forward", "brought this window to the front"],
                                         ["reenter", "Move the pointer off it"],
-                                        ["button_state", "went by before LILITH could check it"],
-                                        ["not_exposed", "covered, see-through or hidden"],
+                                        ["button_state", "Hold the click a moment longer"],
+                                        ["not_exposed", "covered, see-through, off the screen or hidden"],
                                         ["no_guard", "is off. Deny still works"]]) {
             hand.verdict = verdict
             mouseClick(dialog.approveButton)

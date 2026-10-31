@@ -76,14 +76,16 @@ Column {
         cancelButton.forceActiveFocus(Qt.TabFocusReason)
     }
 
-    function validAmount(amount) {
-        return /^[0-9]+(\.[0-9]+)?$/.test(amount)
+    // Why `amount` can't be the new limit of `hit`, by name, or "" (lil_qt::confirm_text): what is
+    // sent must be what the button says, and a raise is higher.
+    function raiseRefusal(amount, hit) {
+        return ConfirmInput.raiseRefusal(amount, String(hit.limit), String(hit.currency))
     }
 
-    function raiseLabel(amount, currency) {
-        if (!validAmount(amount))
+    function raiseLabel(amount, hit) {
+        if (raiseRefusal(amount, hit) !== "")
             return "Raise the cap"
-        return "Raise the cap to " + MoneyText.text(amount, String(currency))
+        return "Raise the cap to " + MoneyText.text(amount, String(hit.currency))
                + " and approve" + (alsoApproves !== "" ? " " + alsoApproves : "")
     }
 
@@ -200,18 +202,19 @@ Column {
 
             ApproveButton {
                 id: raiseButton
-                text: root.raiseLabel(raiseRow.amount, raiseRow.modelData.currency)
+                text: root.raiseLabel(raiseRow.amount, raiseRow.modelData)
                 primary: false
                 targetKey: root.confirmationId + "|raise|" + root.shownKey + "|"
                            + String(raiseRow.modelData.cap) + "|" + raiseRow.amount + "|" + text
                 pointerSource: root.pointerSource
                 enabled: bar.live && root.approvable
                 onClicked: {
-                    if (root.validAmount(raiseRow.amount))
+                    const refusal = root.raiseRefusal(raiseRow.amount, raiseRow.modelData)
+                    if (refusal === "")
                         bar.approve(text, {action: "raise",
                                            raise_to: {cap: raiseRow.modelData.cap, amount: raiseRow.amount}})
                     else
-                        bar.refuse("not_a_number", text)
+                        bar.refuse(refusal, text)
                 }
                 onRefused: name => bar.refuse(name, text)
             }
@@ -219,7 +222,7 @@ Column {
             Text {
                 height: raiseButton.height
                 verticalAlignment: Text.AlignVCenter
-                text: "Limit now: " + MoneyText.text(String(raiseRow.modelData.limit), String(raiseRow.modelData.currency))
+                text: "Limit when this was asked: " + MoneyText.text(String(raiseRow.modelData.limit), String(raiseRow.modelData.currency))
                 textFormat: Text.PlainText
                 color: Theme.textMuted
                 font.pixelSize: Theme.fontSize

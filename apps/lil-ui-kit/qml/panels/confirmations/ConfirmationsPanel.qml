@@ -28,6 +28,7 @@ Rectangle {
     property var _waiting: []
     property bool _popupCounted: false
     readonly property int waitingCount: _waiting.length
+    readonly property int waitingMax: 20
     readonly property alias list: list
     readonly property alias banner: banner
     readonly property alias pendingTab: pendingTab
@@ -49,15 +50,12 @@ Rectangle {
     // A `confirm` link, or a card's button: the dialog on it, or in words why not, or a wait.
     function showConfirmation(id) {
         if (dialog.confirmationId !== "") {
-            if (id !== dialog.confirmationId && _waiting.indexOf(id) < 0) {
-                _waiting = _waiting.concat([id])
+            if (id !== dialog.confirmationId && _wait(id))
                 waitingNotice.Accessible.announce(waitingNotice.text)
-            }
             return
         }
         if (!list.loaded) {
-            if (_waiting.indexOf(id) < 0)
-                _waiting = _waiting.concat([id])
+            _wait(id)
             return
         }
         banner.visible = false
@@ -71,6 +69,15 @@ Rectangle {
         } else {
             banner.show("LILITH doesn't know that confirmation: it may have ended long ago, or belong to a workspace that isn't open.")
         }
+    }
+
+    // Queues `id`, at most `waitingMax` of them (each pending one has its card anyway, so a program
+    // can't fill this up); whether it joined.
+    function _wait(id) {
+        if (_waiting.indexOf(id) >= 0 || _waiting.length >= waitingMax)
+            return false
+        _waiting = _waiting.concat([id])
+        return true
     }
 
     function _holdShortcuts(on) {

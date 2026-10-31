@@ -65,6 +65,12 @@ TestCase {
         w.handleLaunchJson(JSON.stringify(Object.assign({intent: "open", focus: true, activate: true}, fields)))
     }
 
+    // Scrolls down in steps shorter than the view, as a wheel does.
+    function scrollThrough(s) {
+        while (s.contentY + s.height < s.contentHeight - 1)
+            s.contentY = Math.min(s.contentY + s.height * 0.9, s.contentHeight - s.height)
+    }
+
     function inFront(w) {
         w.requestActivate()
         tryVerify(() => w.active, 2000)
@@ -292,7 +298,7 @@ TestCase {
         verify(!dialog.approveButton.enabled)
         verify(dialog.moreBelow.visible && dialog.blockedLine.visible)
         verify(dialog.denyButton.enabled)
-        dialog.scroller.contentY = dialog.scroller.contentHeight - dialog.scroller.height
+        scrollThrough(dialog.scroller)
         tryVerify(() => dialog.approveButton.enabled, 1000)
     }
 }

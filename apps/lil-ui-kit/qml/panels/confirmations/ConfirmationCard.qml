@@ -18,6 +18,8 @@ LCard {
     // Above 0: at most this many characters of each value (the panel's list, whose button opens the
     // whole action). The dialog shows it all.
     property int previewChars: 0
+    // The dialog shows the title and the facts line outside its scrolling view.
+    property bool factsOutside: false
     default property alias footer: footerSlot.data
 
     // The arguments as shown: [{key, text, cut}].
@@ -38,7 +40,13 @@ LCard {
         return ConfirmInput.shownLine(String(text), max)
     }
 
-    title: !view ? _shown(confirmationId, 60) : whoText + " asks to run " + actionText
+    readonly property string actionTitle: !view ? _shown(confirmationId, 60)
+                                                : Words.ltr(whoText + " asks to run " + actionText)
+    readonly property string factsText: kindText + (view && view.project ? " · project " + _shown(view.project, 100) : "")
+                                        + (countdownText !== "" ? " · " + countdownText : "")
+
+    title: factsOutside ? "" : actionTitle
+    Accessible.name: actionTitle
 
     Timer {
         interval: 1000
@@ -55,9 +63,8 @@ LCard {
         Text {
             id: factsLine
             width: parent.width
-            visible: !!root.view
-            text: root.kindText + (root.view && root.view.project ? " · project " + root._shown(root.view.project, 100) : "")
-                  + (root.countdownText !== "" ? " · " + root.countdownText : "")
+            visible: !!root.view && !root.factsOutside
+            text: root.factsText
             textFormat: Text.PlainText
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
@@ -68,8 +75,8 @@ LCard {
 
         Text {
             width: parent.width
-            visible: root.argumentRows.length > 0
-            text: "Exact action:"
+            visible: root.argumentRows.length > 0 || (!!root.view && !!root.view.shown && !root.view.shown.over)
+            text: root.argumentRows.length > 0 ? "Exact action:" : "No arguments."
             textFormat: Text.PlainText
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
@@ -104,7 +111,7 @@ LCard {
                         id: keyText
                         width: parent.width
                         visible: text !== ""
-                        text: argument.modelData.key
+                        text: argument.modelData.key !== "" ? Words.ltr(argument.modelData.key) : ""
                         textFormat: Text.PlainText
                         color: Theme.textMuted
                         font.pixelSize: Theme.fontSize
@@ -117,8 +124,8 @@ LCard {
                     Text {
                         id: valueText
                         width: parent.width
-                        text: argument.previewCut ? argument.modelData.text.slice(0, root.previewChars) + "…"
-                                                  : argument.modelData.text
+                        text: Words.ltr(argument.previewCut ? argument.modelData.text.slice(0, root.previewChars) + "…"
+                                                            : argument.modelData.text)
                         textFormat: Text.PlainText
                         color: Theme.text
                         font.pixelSize: Theme.fontSize
