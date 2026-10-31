@@ -653,6 +653,18 @@ pub fn launch_json(plan: &BootPlan, activate: bool) -> Option<String> {
     Some(v.to_string())
 }
 
+/// What the window hears of a toast's Deny that the bridge is sending (P4a-R9, P4a-R11): the
+/// confirmation's id, so the confirm window can say where the deny came from, and never the token.
+/// It takes no focus.
+pub fn deny_notice_json(plan: &BootPlan) -> Option<String> {
+    match &plan.opened {
+        Some(Opened::Deny { id, .. }) => {
+            Some(json!({"kind": "deny", "id": id, "focus": false, "activate": false}).to_string())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1028,20 @@ mod tests {
         );
         let first: Value = serde_json::from_str(&launch_json(&plan(""), false).unwrap()).unwrap();
         assert_eq!(first["activate"], false);
+    }
+
+    #[test] // spec: P4a-R9, P4a-R11
+    fn a_deny_notice_names_the_id_and_never_the_token() {
+        let notice = deny_notice_json(&plan(&format!("lil-dev:deny/{CF}/{TOKEN}"))).unwrap();
+        assert!(!notice.contains(TOKEN), "{notice}");
+        let notice: Value = serde_json::from_str(&notice).unwrap();
+        assert_eq!(notice["kind"], "deny");
+        assert_eq!(notice["id"], CF);
+        assert_eq!(
+            (&notice["focus"], &notice["activate"]),
+            (&json!(false), &json!(false))
+        );
+        assert_eq!(deny_notice_json(&plan(&format!("--confirm {CF}"))), None);
     }
 
     #[test] // spec: APP-020

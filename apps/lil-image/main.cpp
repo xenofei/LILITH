@@ -43,9 +43,10 @@
 // Launches (P4a-R21): this start's own and each forwarded one reach ShellWindow.handleLaunchJson
 // through lil_qt::deliverLaunchesTo once the window is loaded. Once the event loop has ended,
 // lil_qt::release_instance stops taking launches (a new one becomes the instance itself) before
-// the window goes, and starts again any the window never took. Until Task 21's confirm window, a
-// confirm-window start (--confirm, a confirm/ link with no app running) opens the shell without
-// the app's state folder, on its Confirmations panel.
+// the window goes, and starts again any the window never took.
+//
+// The confirm window (APP-048, P4a-R11): a confirm-window start (--confirm, a confirm/ link with no
+// app running) loads ConfirmWindow, not the shell, without the app's state folder: "LILITH — Confirm".
 //
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
@@ -249,16 +250,21 @@ int main(int, char **)
     lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", core != nullptr}});
     // The shell takes the core and the app's state folder, where its layout lives (P4a-R16);
     // under --smoke-exit none, so the deploy check neither reads nor writes the app's state.
-    // A confirm-window start doesn't own the app's state either.
-    const QString stateDir = plan.smoke_exit || plan.confirm_mode ? QString() : fromRust(lil_qt::app_state_dir());
-    engine.setInitialProperties({{QStringLiteral("core"), QVariant::fromValue(core)},
-                                 {QStringLiteral("stateDir"), stateDir}});
-    engine.loadFromModule("Lilith.UiKit", "ShellWindow");
+    // A confirm-window start doesn't own the app's state, and has no shell.
+    if (plan.confirm_mode) {
+        engine.setInitialProperties({{QStringLiteral("core"), QVariant::fromValue(core)}});
+    } else {
+        const QString stateDir = plan.smoke_exit ? QString() : fromRust(lil_qt::app_state_dir());
+        engine.setInitialProperties({{QStringLiteral("core"), QVariant::fromValue(core)},
+                                     {QStringLiteral("stateDir"), stateDir}});
+    }
+    const char *const windowType = plan.confirm_mode ? "ConfirmWindow" : "ShellWindow";
+    engine.loadFromModule("Lilith.UiKit", windowType);
     auto *window = engine.rootObjects().isEmpty()
                        ? nullptr
                        : qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
     if (!window) {
-        lilshim::logEvent(QStringLiteral("error"), {{"what", "ShellWindow failed to load"}});
+        lilshim::logEvent(QStringLiteral("error"), {{"what", QString::fromLatin1(windowType) + " failed to load"}});
         // The instance ends as it would after the event loop: what it took starts again.
         lil_qt::release_instance();
         return 1;
