@@ -8,13 +8,14 @@
 use std::ffi::c_void;
 use std::fmt;
 use std::io;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, HANDLE, HLOCAL, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError,
+    HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -27,6 +28,9 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 use windows::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
+use windows::Win32::System::Threading::{
+    CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
+};
 use windows::core::{HSTRING, PWSTR};
 
 use crate::process::{current_user_sid, io_error};
@@ -179,6 +183,80 @@ pub fn server_pid(client: &NamedPipeClient) -> io::Result<u32> {
     unsafe { GetNamedPipeServerProcessId(HANDLE(client.as_raw_handle()), &mut pid) }
         .map_err(|e| io_error(&e))?;
     Ok(pid)
+}
+
+/// Every proof event's name, then 32 hex digits: the session's `Local\` namespace.
+const PROOF_PREFIX: &str = r"Local\lil-launch-proof-";
+
+/// A pipe server's proof of who it is (Appendix G "Apps"), for when its PID can't vouch for it:
+/// `GetNamedPipeServerProcessId` names the pipe's creator, even after that process has died and
+/// the handle has passed to another. A fresh unsignalled event with a random 128-bit name and
+/// default security, which the server must open with `EVENT_MODIFY_STATE` and set
+/// ([`set_proof_event`]). A process at a lower integrity level can't get that right (no write
+/// up), and an AppContainer can't reach the name.
+#[derive(Debug)]
+pub struct ProofEvent {
+    name: String,
+    event: OwnedHandle,
+}
+
+impl ProofEvent {
+    /// # Errors
+    /// When there's no randomness, the event can't be made, or its name already exists.
+    pub fn new() -> io::Result<ProofEvent> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
+        let mut name = PROOF_PREFIX.to_string();
+        for b in random {
+            name.push_str(&format!("{b:02x}"));
+        }
+        // SAFETY: the name outlives the call, and the handle it returns is owned from here on.
+        let event = unsafe {
+            let handle = CreateEventW(None, true, false, &HSTRING::from(name.as_str()))
+                .map_err(|e| io_error(&e))?;
+            let existed = GetLastError() == ERROR_ALREADY_EXISTS;
+            let event = OwnedHandle::from_raw_handle(handle.0);
+            if existed {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            event
+        };
+        Ok(ProofEvent { name, event })
+    }
+
+    /// The name the server is sent, and all it is sent.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether the server has set it.
+    pub fn is_set(&self) -> bool {
+        // SAFETY: the handle is open while `self` lives.
+        unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 0) == WAIT_OBJECT_0 }
+    }
+}
+
+/// The server's side of a [`ProofEvent`]: opens the event `name` and sets it, for a name of the
+/// proof's own shape only, so a client can't have any other event set.
+///
+/// # Errors
+/// When the name isn't a proof's, or the event can't be opened or set.
+pub fn set_proof_event(name: &str) -> io::Result<()> {
+    let hex = name.strip_prefix(PROOF_PREFIX).unwrap_or_default();
+    if hex.len() != 32 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a proof event's name",
+        ));
+    }
+    // SAFETY: the name outlives the call, and the handle it returns is owned from here on.
+    let event = unsafe {
+        let handle = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name))
+            .map_err(|e| io_error(&e))?;
+        OwnedHandle::from_raw_handle(handle.0)
+    };
+    // SAFETY: the handle is open for the call.
+    unsafe { SetEvent(HANDLE(event.as_raw_handle())) }.map_err(|e| io_error(&e))
 }
 
 /// The SID strings of the access-allowed and access-denied entries in the instance's DACL, in

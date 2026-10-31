@@ -35,8 +35,8 @@ lil-schema = { path = "../lil-schema" }
 serde.workspace = true
 serde_json.workspace = true
 # rt-multi-thread: the background runtime that owns the session (APP-024); macros: `select!`
-# in its event pump.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# in its event pump; net and io-util: the app's single-instance pipe (APP-013).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 tracing.workspace = true
 
 [build-dependencies]
@@ -49,3 +49,20 @@ workspace = true
 # The e2e tests (feature `qt`): a real test-channel core.
 lil-testkit = { path = "../lil-testkit" }
 tempfile.workspace = true
+# desktop_app.rs (the desktop group): the foreground window, the windows of a process and the
+# blocker's synthesized click in physical coordinates (Task 1's S1.4 recipe); instance.rs: a
+# squatter's pipe with a security descriptor of its own, this process's threads, a
+# Low-integrity launch (CreateProcessAsUserW), and a pipe handed from its creator to a holder.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -42,7 +42,8 @@
 //!     applied (events wait in the throttle and the GUI queue): for tests and diagnostics, never
 //!     a model's loaded-at seq.
 //! - **Others:** `retryNow()` (the Unavailable banner's "Try again"), `shownText(text,
-//!   maxChars)` (`lil_parse::shown_text`, P4a-R8).
+//!   maxChars)` (`lil_parse::shown_text`, P4a-R8), `shownLinkText(text, maxChars)`
+//!   (`args::shown_outside`, P4a-R9).
 //!
 //! The session starts only in a process that asked for one ([`super::serve`]): lil-image does,
 //! the QML tests don't, and there every request fails `core.unreachable` and the connection is
@@ -105,6 +106,11 @@ pub mod qobject {
         /// `max_chars` characters (P4a-R8).
         #[qinvokable]
         fn shown_text(self: &Core, text: &QString, max_chars: i32) -> QString;
+
+        /// `text` from a link, a `.lilref`, a target or a title as shown: `shownText`, with what
+        /// may be a deny token cut first, however it is spelled (P4a-R9).
+        #[qinvokable]
+        fn shown_link_text(self: &Core, text: &QString, max_chars: i32) -> QString;
 
         /// Switches to workspace `id` with a new hello (P4a-R34).
         #[qinvokable]
@@ -402,6 +408,11 @@ impl qobject::Core {
     pub fn shown_text(&self, text: &QString, max_chars: i32) -> QString {
         let max = usize::try_from(max_chars).unwrap_or(0);
         QString::from(lil_parse::shown_text(&text.to_string(), max).as_str())
+    }
+
+    pub fn shown_link_text(&self, text: &QString, max_chars: i32) -> QString {
+        let max = usize::try_from(max_chars).unwrap_or(0);
+        QString::from(crate::args::shown_outside(&text.to_string(), max).as_str())
     }
 
     pub fn retry_now(&self) {

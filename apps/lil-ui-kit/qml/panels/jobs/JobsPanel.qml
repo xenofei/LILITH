@@ -36,6 +36,12 @@
 // substatuses, phases, reasons) is shown through Core.shownText (P4a-R8), and every Text is plain,
 // so markup shows as written and an <img> in it loads nothing (AI-222).
 //
+// showJob(id, focus) selects a job's row. A link can ask for it before the first read has returned
+// (P4a-R21), so the panel remembers the job (`wantedJob`) and tries again after each read that loads
+// rows, paging back through the history while it looks, until it lands, a new request replaces it,
+// or the reads have finished without the row: then the banner says the job isn't in the list. The
+// keyboard focus moves to the row only when asked, and not if it has moved on while the panel looked.
+//
 // Ctrl+Shift+P is the top bar's (Task 20): the panel's Pause calls the same `app/queue.*`.
 //
 // For later panels: a delegate's `required property int index` can lag behind a
@@ -105,6 +111,12 @@ Rectangle {
     property var busyLanes: ({})
     property var _laneAnswered: ({})
     property var busyRetries: ({})
+    // The job showJob was asked for that isn't in the lists yet (empty: none), and whether
+    // landing on it may take the keyboard focus.
+    property string wantedJob
+    property bool _wantedFocus: false
+    // The banner is saying a job isn't in the list.
+    property bool _saysNotListed: false
 
     readonly property bool writable: jobsModel.loaded && live.loaded
     readonly property var knownLanes: ["gpu-heavy", "cpu"]
@@ -249,8 +261,26 @@ Rectangle {
         return null
     }
 
-    // Selects the job's row (a fix's "Show the job", show_job).
-    function showJob(jobId) {
+    // Selects the job's row (a fix's "Show the job", show_job; a `task` link, P4a-R21), and moves
+    // the keyboard focus to it unless `focus` is false. A job that isn't listed yet is looked for
+    // (`wantedJob`): the answer is whether it has landed now.
+    function showJob(jobId, focus) {
+        wantedJob = jobId
+        _wantedFocus = focus !== false
+        if (_saysNotListed) {
+            _saysNotListed = false
+            banner.close()
+        }
+        if (landOnJob(jobId, _wantedFocus)) {
+            wantedJob = ""
+            return true
+        }
+        _historyPages = 0
+        fillHistory()
+        return false
+    }
+
+    function landOnJob(jobId, takeFocus) {
         let view = liveList
         let at = live.rowOf(jobId)
         if (at < 0) {
@@ -266,15 +296,42 @@ Rectangle {
         }
         if (at < 0)
             return false
+        const other = view === liveList ? historyList : liveList
+        other.currentIndex = -1
         view.currentIndex = at
         view.positionViewAtIndex(at, ListView.Contain)
-        view.forceActiveFocus(Qt.OtherFocusReason)
+        if (takeFocus)
+            view.forceActiveFocus(Qt.OtherFocusReason)
         return true
+    }
+
+    // Lands on the wanted job if a read has brought its row. The focus goes along only if it is
+    // still in this panel, or nowhere: the person may have gone on while the panel looked.
+    function tryWantedJob() {
+        if (wantedJob === "")
+            return
+        let focused = root.Window.activeFocusItem
+        while (focused && focused !== root)
+            focused = focused.parent
+        const focusStayed = !root.Window.activeFocusItem || focused === root
+        if (landOnJob(wantedJob, _wantedFocus && focusStayed))
+            wantedJob = ""
+    }
+
+    // The reads have finished without the wanted job.
+    function wantedJobNotListed() {
+        const id = shown(wantedJob)
+        wantedJob = ""
+        _saysNotListed = true
+        banner.kind = "warning"
+        banner.show("Job " + id + (_historyCutAt >= 0 ? " isn't in the newest " + grouped(_historyCutAt) + " jobs."
+                                                      : " isn't in the list."))
     }
 
     // --- Calls. ---
 
     function failed(what, error) {
+        _saysNotListed = false
         banner.kind = "danger"
         banner.show(what + ": " + (error && error.message ? shown(error.message, messageChars)
                                                           : "the core didn't answer."))
@@ -442,6 +499,8 @@ Rectangle {
             root.overviewChanged()
             const newer = root._newerLanes
             root.applyLanes(JSON.parse(live.lanesJson()).filter(s => !newer[s.lane]))
+            if (root.wantedJob !== "")
+                root.fillHistory()
             if (root._liveAgain) {
                 const again = root._liveFreshAgain
                 root._liveAgain = false
@@ -658,20 +717,28 @@ Rectangle {
 
     // The history is newest first and holds every status, so its first pages can hold no
     // finished job (a batch queued after them): ask for more while the Finished list is shorter
-    // than a screenful, at most `historyFillPages` pages per load, and say what came of it.
+    // than a screenful, at most `historyFillPages` pages per load, and say what came of it. While
+    // a wanted job isn't in either list, it is looked for the same way, past the screenful: every
+    // read that loads rows comes through here. With no more to look through, it isn't listed.
     function fillHistory() {
+        tryWantedJob()
         if (!jobsModel.loaded || _historyAsked)
             return
+        const seeking = wantedJob !== "" && live.loaded
         const top = jobsModel.index(-1, 0)
-        if (historyList.count >= Math.max(20, Math.ceil(historyList.height / 40))
+        if ((historyList.count >= Math.max(20, Math.ceil(historyList.height / 40)) && !seeking)
                 || !jobsModel.canFetchMore(top)) {
             _historySearching = false
             _historyCutAt = -1
+            if (seeking)
+                wantedJobNotListed()
             return
         }
         if (_historyPages >= historyFillPages) {
             _historySearching = false
             _historyCutAt = jobsModel.rowCount()
+            if (seeking)
+                wantedJobNotListed()
             return
         }
         _historyPages++

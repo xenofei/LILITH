@@ -1,6 +1,6 @@
 // The app's main window: a KDDockWidgets main window (DockingArea) holding one dock per panel of
 // Panels.js (APP-001, ARCH-010). It starts hidden; main.cpp shows it through lilshim::activate,
-// with or without the focus. Later tasks add the top bar and the open requests.
+// with or without the focus. Later tasks add the top bar.
 //
 // Layout (APP-002 to APP-004, P4a-R16, P4a-R33): when it is made it restores the last layout from
 // `stateDir` in APP-003's order (DockLayout: the windows exist, the dock factory is registered,
@@ -13,6 +13,15 @@
 // F6 and Shift+F6 to the next and previous panel, and Ctrl+Shift+P, which emits
 // gpuPauseToggleRequested() for the top bar's pause control (Task 20). Closing a panel announces
 // the key that opens it again (Accessible.announce, a UI Automation notification).
+//
+// Open requests (APP-014, APP-020, APP-065, P4a-R21; the block marked "Open requests" below):
+// a launch (handleLaunchJson, from main.cpp: this start's own, then each one a second launch
+// forwards) and each `open_requests:image` event. A target, raw ref or `.lilref` shows in the
+// Opened card, and a refused link's message there; `task` opens Jobs on that job (`shownJob`, and
+// the panel's showJob(id) when it has one); `confirm` opens Confirmations on that confirmation
+// (`shownConfirmation`, and the panel's showConfirmation(id)). The window comes forward through
+// `shim.activate(window, focus)` (LilShim; the tests pass a fake): an agent's request, or a launch
+// with --no-activate, only flashes the taskbar button.
 import QtQuick
 import com.kdab.dockwidgets 2.0 as KDDW
 import Lilith.Core
@@ -68,6 +77,18 @@ Window {
 
     signal gpuPauseToggleRequested()
 
+    // --- Open requests (Task 19) ---
+    // The shim the window is activated through: LilShim, or a test's fake.
+    property var shim: LilShim
+    property alias openedCard: openedCard
+    property alias instanceBanner: instanceBanner
+    // The job a `task` link last opened Jobs on, and the confirmation a `confirm` link last
+    // opened Confirmations on.
+    property string shownJob
+    property string shownConfirmation
+    property var _openRequests: null
+    // --- end of open requests ---
+
     width: 1280
     height: 800
     visible: false
@@ -80,9 +101,19 @@ Window {
         kind: "warning"
     }
 
+    // --- Open requests (Task 19): while another program holds the launch channel ---
+    LBanner {
+        id: instanceBanner
+        anchors.top: layoutBanner.visible ? layoutBanner.bottom : parent.top
+        width: parent.width
+        kind: "warning"
+    }
+    // --- end of open requests ---
+
     KDDW.DockingArea {
         id: dockingArea
-        anchors.top: layoutBanner.visible ? layoutBanner.bottom : parent.top
+        anchors.top: instanceBanner.visible ? instanceBanner.bottom
+                   : layoutBanner.visible ? layoutBanner.bottom : parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -104,6 +135,18 @@ Window {
         Accessible.role: Accessible.StaticText
         Accessible.name: text
     }
+
+    // --- Open requests (Task 19): the Opened card, until Task 26 moves it into Home ---
+    OpenedCard {
+        id: openedCard
+        anchors.right: dockingArea.right
+        anchors.bottom: dockingArea.bottom
+        anchors.margins: 2 * Theme.spacing
+        width: Math.min(420, dockingArea.width - 4 * Theme.spacing)
+        height: implicitHeight
+        z: 10
+    }
+    // --- end of open requests ---
 
     Component {
         id: dockComponent
@@ -177,12 +220,17 @@ Window {
             createDock(panel.id)
         restoreLayout()
         _settling = false
+        if (core)
+            _openRequests = CoreCall.subscribe(core, "open_requests:image", root, onOpenRequest)
     }
 
     // KDDockWidgets keeps a dock (and its unique name) after its QML item goes, so the shell
     // deletes its docks with it: a later shell in the same process (the QML tests) can reuse the
     // names.
     Component.onDestruction: {
+        // While the core (a test's own FakeCore child among them) is still there.
+        if (_openRequests)
+            _openRequests.unsubscribe()
         for (const id in docks) {
             if (docks[id])
                 docks[id].deleteDockWidgetLater()
@@ -444,4 +492,59 @@ Window {
                 showPanel(panel.id)
         }
     }
+
+    // --- Open requests (Task 19) ---
+    function handleLaunchJson(json) {
+        handleLaunch(JSON.parse(json))
+    }
+
+    // A launch: {kind, intent, focus, activate, ...} (lil_qt::args::launch_json).
+    function handleLaunch(launch) {
+        const focus = launch.focus !== false
+        // This start runs without the app's pipe: the bridge's words for why.
+        if (typeof launch.pipe_notice === "string" && launch.pipe_notice !== "")
+            instanceBanner.show(launch.pipe_notice)
+        if (launch.activate !== false)
+            shim.activate(root, focus)
+        if (launch.kind === "target" || launch.kind === "ref" || launch.kind === "lilref") {
+            openedCard.show(launch)
+        } else if (launch.kind === "refused") {
+            openedCard.showRefused(launch.message || "")
+        } else if (launch.kind === "task") {
+            shownJob = launch.job
+            openPanelOn("jobs", "showJob", launch.job, focus)
+        } else if (launch.kind === "confirm") {
+            shownConfirmation = launch.id
+            openPanelOn("confirmations", "showConfirmation", launch.id, focus)
+        } else if (launch.kind === "confirm_list") {
+            openPanelOn("confirmations", "", "", focus)
+        }
+    }
+
+    // An `open_requests:image` event: {target, intent, focus} (APP-063, APP-065).
+    function onOpenRequest(kind, seq, data) {
+        if (kind !== "event" || !data || typeof data.target !== "string")
+            return
+        handleLaunch({kind: "target", target: data.target, intent: data.intent,
+                      focus: data.focus === true, activate: true})
+    }
+
+    // Opens panel `id`, and calls its `method(arg, focus)` when the panel has one; the keyboard
+    // focus moves into it only with `focus`.
+    function openPanelOn(id, method, arg, focus) {
+        const dock = docks[id]
+        if (!dock)
+            return
+        if (focus) {
+            showPanel(id)
+        } else {
+            if (!dock.isOpen)
+                dock.open()
+            dock.raise()
+        }
+        const content = dock.content
+        if (method && content && typeof content[method] === "function")
+            content[method](arg, focus)
+    }
+    // --- end of open requests ---
 }

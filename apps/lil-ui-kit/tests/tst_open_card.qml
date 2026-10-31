@@ -1,0 +1,372 @@
+// The shell's open requests (APP-014, APP-020, APP-021, APP-065, P4a-R21): a launch the running
+// instance was handed (ShellWindow.handleLaunch, the JSON of lil_qt::args::launch_json) and an
+// `open_requests:image` event each show their target in the Opened card, or say why a link was
+// refused; a `task` link opens Jobs on that job; and the window is brought forward, or only
+// flashes, through the shim's `activate(window, takeFocus)`, which a fake shim records here.
+import QtQuick
+import QtTest
+import Lilith.UiKit
+
+TestCase {
+    id: tc
+    name: "OpenCard"
+    when: windowShown
+    width: 200
+    height: 100
+
+    FakeCore {
+        id: fake
+        project: "sketchbook"
+    }
+
+    // LilShim's activate as a record; the rest of the shim the shell calls is passed through.
+    QtObject {
+        id: fakeShim
+        property var activations: []
+        function activate(window, takeFocus) {
+            activations = activations.concat([{window: window, takeFocus: takeFocus}])
+        }
+    }
+
+    Component {
+        id: shellComponent
+        ShellWindow {
+            core: fake
+            shim: fakeShim
+        }
+    }
+
+    A11yWalk { id: walk }
+
+    readonly property string sealed: "lil://0123456789abcdef/sketchbook/chr_paper_crane@1.0.0#sha256="
+                                     + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+    // The shell of the test before deletes its docks later (KDDockWidgets' names are
+    // process-wide): let that run first.
+    function init() {
+        wait(100)
+        fakeShim.activations = []
+    }
+
+    function makeShell() {
+        const shell = createTemporaryObject(shellComponent, tc)
+        verify(shell, "ShellWindow created")
+        shell.visible = true
+        tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000,
+                  "the docks are laid out")
+        return shell
+    }
+
+    function launch(shell, fields) {
+        shell.handleLaunchJson(JSON.stringify(Object.assign({intent: "open", focus: true, activate: true},
+                                                            fields)))
+    }
+
+    function job(id, over) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z")
+        return Object.assign({job_id: id, kind: "comfy.prompt", lane: "gpu-heavy", priority: "user",
+                              status: "running", substatus: "executing", created: at, updated: at,
+                              started: at, attempt: 1, trace_id: "t_" + id, batch_id: "b_" + id, index: 0,
+                              origin: {surface: "panel", id: "image"},
+                              status_seq: [{status: "running", substatus: "executing", at: at}]}, over || {})
+    }
+
+    function finished(id, created) {
+        return job(id, {status: "succeeded", substatus: null, created: created, finished: created})
+    }
+
+    // The jobs.list calls not answered yet, as the real core answers them over `jobs`.
+    property var answered: ({})
+    function answerJobs(jobs) {
+        for (const c of fake.calls) {
+            if (c.name === "jobs.list" && !answered[c.id]) {
+                answered[c.id] = true
+                fake.respond(c.id, fake.jobsListAnswer(c.args, jobs, []))
+            }
+        }
+    }
+
+    // Answers until `done()`, each read leading to the next, and fails with `what` if it never is.
+    function answerUntil(jobs, done, what) {
+        tryVerify(() => {
+            answerJobs(jobs)
+            return done()
+        }, 5000, what)
+    }
+
+    // Puts the keyboard focus somewhere other than Jobs: the item that holds it.
+    function focusHome(shell) {
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000, "the window is active")
+        shell.docks.home.focusPanel()
+        tryVerify(() => shell.activeFocusItem !== null, 2000, "Home has the focus")
+        return shell.activeFocusItem
+    }
+
+    function selected(view) {
+        return view.currentItem ? view.currentItem.jobId : ""
+    }
+
+    function test_shows_the_target_and_its_actions() {
+        const shell = makeShell()
+        const card = shell.openedCard
+        verify(!card.visible, "no card until something is opened")
+        launch(shell, {kind: "lilref", target: sealed, title: "Paper crane"})
+        tryVerify(() => card.visible, 2000, "the card shows")
+        compare(card.heading, "Paper crane")
+        compare(card.targetText, sealed)
+        compare(card.intentText, "Open")
+        compare(card.message, "")
+        verify(card.copyButton.visible && card.dismissButton.visible, "Copy and Dismiss")
+        compare(card.copyButton.text, "Copy")
+        compare(card.dismissButton.text, "Dismiss")
+        compare(walk.problems(card), [])
+        compare(fakeShim.activations.length, 1)
+        verify(fakeShim.activations[0].window === shell && fakeShim.activations[0].takeFocus,
+               "a launch's window comes forward")
+        // A path, with another intent; the newest replaces the card's target.
+        launch(shell, {kind: "target", target: "C:\\art\\crane.png", intent: "edit"})
+        compare(card.heading, "Opened")
+        compare(card.targetText, "C:\\art\\crane.png")
+        compare(card.intentText, "Edit")
+        card.dismissButton.clicked()
+        verify(!card.visible, "Dismiss hides the card")
+    }
+
+    function test_untrusted_text_is_plain_and_marked() { // spec: AI-222, P4a-R8
+        const shell = makeShell()
+        const card = shell.openedCard
+        const title = '<b>x</b>​<img src="http://127.0.0.1:9/probe.png">'
+        const before = TestFiles.networkRequests()
+        launch(shell, {kind: "lilref", target: sealed + "‮", title: title})
+        compare(card.heading, '<b>x</b>⟨U+200B⟩<img src="http://127.0.0.1:9/probe.png">',
+                "the title is shown as written, its zero-width space marked")
+        compare(card.targetText, sealed + "‮", "the target is kept as received")
+        verify(card.shownTarget.endsWith("⟨U+202E⟩"), "and shown with its bidi mark marked: "
+               + card.shownTarget)
+        launch(shell, {kind: "refused", message: "This link isn't one LILITH opens: a⁦b"})
+        compare(card.message, "This link isn't one LILITH opens: a⟨U+2066⟩b")
+        wait(300)
+        compare(TestFiles.networkRequests(), before, "nothing was loaded")
+    }
+
+    function test_no_token_reaches_the_card_however_it_is_spelled() { // spec: P4a-R9
+        const shell = makeShell()
+        const card = shell.openedCard
+        const id = "cf_0123456789abcdef"
+        const token = "00112233445566778899aabbccddeeff"
+        const clean = text => {
+            const lower = String(text).toLowerCase()
+            return lower.indexOf(token.slice(0, 16)) < 0 && lower.indexOf(token.slice(16)) < 0
+        }
+        for (const spelled of ["lil-dev:deny/" + id + "/" + token,
+                               "lil-dev:DENY/" + id + "/" + token.toUpperCase(),
+                               "C:\\art\\deny\\" + id + "\\" + token + ".png",
+                               "C:\\art\\" + token + ".png",
+                               "x?t=" + token.slice(0, 16) + "%E2%80%8B" + token.slice(16),
+                               "x?t=" + token.slice(0, 16) + "\u00ad" + token.slice(16),
+                               "lil-dev:deny%252F" + id + "%252F" + token]) {
+            // A .lilref's title and a target, a target by a launch, an agent's and a refusal.
+            launch(shell, {kind: "lilref", target: spelled, title: "Crane " + spelled})
+            verify(clean(card.heading), card.heading)
+            verify(clean(card.shownTarget), card.shownTarget)
+            compare(card.targetText, spelled, "Copy keeps the target as it came")
+            launch(shell, {kind: "target", target: spelled})
+            verify(clean(card.shownTarget), card.shownTarget)
+            fake.emit("open_requests:image", "event", {target: spelled, intent: "open", focus: false})
+            verify(clean(card.shownTarget), card.shownTarget)
+            launch(shell, {kind: "refused", message: "This link isn't one LILITH opens: " + spelled})
+            verify(clean(card.message), card.message)
+        }
+        // What holds no token reads as it came.
+        launch(shell, {kind: "target", target: "C:\\art\\100%25 crane.png"})
+        compare(card.shownTarget, "C:\\art\\100%25 crane.png")
+    }
+
+    function test_refused_link_shows_message() {
+        const shell = makeShell()
+        const card = shell.openedCard
+        const message = "This link isn't one LILITH opens: lil-dev:open/@@@"
+        // The docked panels ask the core for their own data; the launch must add nothing.
+        const before = fake.calls.length
+        const panelCalls = new Set(fake.calls.map(c => c.name))
+        launch(shell, {kind: "refused", message: message})
+        compare(fake.calls.slice(before), [], "a refused link asks the core nothing")
+        tryVerify(() => card.visible, 2000, "the card shows")
+        compare(card.message, message)
+        compare(card.targetText, "")
+        verify(!card.copyButton.visible, "nothing to copy")
+        verify(card.dismissButton.visible)
+        compare(fake.calls.slice(before).filter(c => !panelCalls.has(c.name)), [],
+                "nor later, beyond the panels' own re-reads")
+        compare(shell.shownJob, "", "and opens no job")
+        compare(shell.shownConfirmation, "", "nor a confirmation")
+        compare(fakeShim.activations.length, 1, "only the window comes forward")
+        compare(walk.problems(card), [])
+    }
+
+    function test_no_activate_flashes_instead_of_focusing() {
+        const shell = makeShell()
+        launch(shell, {kind: "target", target: "C:\\art\\crane.png", focus: false})
+        compare(fakeShim.activations.length, 1)
+        verify(fakeShim.activations[0].window === shell)
+        compare(fakeShim.activations[0].takeFocus, false)
+        verify(shell.openedCard.visible)
+        // The first launch's window was shown by main.cpp: the card, and no second activation.
+        launch(shell, {kind: "target", target: "C:\\b.png", activate: false})
+        compare(fakeShim.activations.length, 1)
+        compare(shell.openedCard.targetText, "C:\\b.png")
+    }
+
+    function test_task_url_opens_jobs_on_that_job() { // spec: P4a-R21
+        const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        answerUntil([job("j_00000000000000aa"), job(id)], () => panel.live.loaded && panel.live.count === 2,
+                    "the panel has its rows")
+        shell.docks.jobs.forceClose()
+        tryVerify(() => !shell.docks.jobs.isOpen, 2000)
+        launch(shell, {kind: "task", job: id})
+        compare(shell.shownJob, id)
+        tryVerify(() => shell.docks.jobs.isOpen && shell.docks.jobs.content.visible, 2000,
+                  "Jobs opens")
+        tryVerify(() => selected(panel.liveView) === id, 2000, "on that job")
+        verify(panel.rowFor(id).ListView.isCurrentItem, "its row is the selected one")
+        verify(!shell.openedCard.visible, "a task isn't an Opened target")
+        compare(fakeShim.activations.length, 1)
+        verify(fakeShim.activations[0].takeFocus)
+    }
+
+    function test_task_link_lands_on_a_running_job_after_a_cold_start() { // spec: P4a-R21
+        const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        // The launch comes before the panel's first read has returned.
+        verify(!panel.model.loaded && !panel.live.loaded, "no read has returned")
+        launch(shell, {kind: "task", job: id})
+        compare(panel.liveView.currentIndex, -1)
+        answerUntil([job("j_00000000000000aa"), job(id)], () => selected(panel.liveView) === id,
+                    "the row is selected once it is there")
+        verify(panel.rowFor(id).ListView.isCurrentItem)
+        tryVerify(() => panel.liveView.activeFocus, 2000, "and has the keyboard focus, as the link asked")
+        compare(panel.banner.visible, false)
+    }
+
+    function test_task_link_lands_on_a_finished_job_pages_back() { // spec: P4a-R21
+        const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: id})
+        // 250 newer jobs before it: more than a screenful and two pages.
+        const jobs = []
+        for (let i = 0; i < 250; ++i)
+            jobs.push(finished("j_" + String(i).padStart(16, "1"), "2026-10-30T12:00:00Z"))
+        jobs.push(finished(id, "2026-10-01T12:00:00Z"))
+        answerUntil(jobs, () => selected(panel.historyView) === id, "it pages back to the job")
+        compare(panel.liveView.currentIndex, -1)
+        compare(panel.banner.visible, false)
+    }
+
+    function test_task_link_to_a_job_not_in_the_list_says_so() { // spec: P4a-R21
+        const shell = makeShell()
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: "j_00000000000000ff"})
+        answerUntil([job("j_00000000000000aa")], () => panel.banner.visible, "the read ends without the row")
+        verify(panel.banner.text.indexOf("j_00000000000000ff") >= 0
+               && panel.banner.text.indexOf("isn't in the list") >= 0, panel.banner.text)
+        compare(panel.liveView.currentIndex, -1)
+        compare(panel.wantedJob, "", "it has stopped looking")
+        // Once loaded, the same at once; and a request for a job that's there replaces it.
+        launch(shell, {kind: "task", job: "j_00000000000000ee"})
+        verify(panel.banner.text.indexOf("j_00000000000000ee") >= 0, panel.banner.text)
+        launch(shell, {kind: "task", job: "j_00000000000000aa"})
+        verify(!panel.banner.visible, "the words go with the request")
+        compare(selected(panel.liveView), "j_00000000000000aa")
+    }
+
+    function test_a_new_task_link_replaces_the_one_waiting() { // spec: P4a-R21
+        const shell = makeShell()
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: "j_00000000000000aa"})
+        launch(shell, {kind: "task", job: "j_00000000000000bb"})
+        answerUntil([job("j_00000000000000aa"), job("j_00000000000000bb")],
+                    () => selected(panel.liveView) === "j_00000000000000bb", "the last request lands")
+        wait(50)
+        compare(selected(panel.liveView), "j_00000000000000bb", "and the first never does")
+        compare(panel.banner.visible, false)
+    }
+
+    function test_task_link_with_no_focus_leaves_the_keyboard_focus_where_it_is() { // spec: APP-065
+        for (const cold of [true, false]) {
+            wait(100)
+            const shell = makeShell()
+            const id = "j_0123456789abcdef"
+            const panel = shell.docks.jobs.content
+            const jobs = [job(id)]
+            if (!cold)
+                answerUntil(jobs, () => panel.live.loaded, "the panel has its rows")
+            const holder = focusHome(shell)
+            launch(shell, {kind: "task", job: id, focus: false})
+            answerUntil(jobs, () => selected(panel.liveView) === id, "the row is selected, cold: " + cold)
+            verify(!panel.liveView.activeFocus, "the list didn't take the focus, cold: " + cold)
+            verify(shell.activeFocusItem === holder, "it stayed where it was, cold: " + cold)
+            shell.destroy()
+        }
+    }
+
+    function test_a_late_landing_leaves_a_focus_that_has_moved_on() { // spec: P4a-R21
+        const shell = makeShell()
+        const id = "j_0123456789abcdef"
+        const panel = shell.docks.jobs.content
+        launch(shell, {kind: "task", job: id})
+        // The person goes on while the first read is out.
+        const holder = focusHome(shell)
+        answerUntil([job(id)], () => selected(panel.liveView) === id, "the row is selected")
+        verify(shell.activeFocusItem === holder, "the focus stayed where the person put it")
+    }
+
+    function test_agent_open_request_never_takes_focus() {
+        const shell = makeShell()
+        tryVerify(() => fake.subscriberCount("open_requests:image") === 1, 2000,
+                  "the shell follows its open requests")
+        fake.emit("open_requests:image", "event", {target: sealed, intent: "open", focus: false})
+        tryVerify(() => shell.openedCard.visible, 2000, "the card shows")
+        compare(shell.openedCard.targetText, sealed)
+        compare(fakeShim.activations.length, 1)
+        compare(fakeShim.activations[0].takeFocus, false, "APP-065: the window only flashes")
+        // A person's request (from an app or lil) may bring it forward.
+        fake.emit("open_requests:image", "event", {target: "C:\\x.png", intent: "edit", focus: true})
+        compare(fakeShim.activations.length, 2)
+        compare(fakeShim.activations[1].takeFocus, true)
+        compare(shell.openedCard.intentText, "Edit")
+        // A resync carries no request: nothing happens.
+        fake.emit("open_requests:image", "resync_required", {})
+        compare(fakeShim.activations.length, 2)
+    }
+
+    function test_a_held_pipe_shows_a_banner() { // spec: APP-013
+        const shell = makeShell()
+        verify(!shell.instanceBanner.visible)
+        launch(shell, {kind: "activate", activate: false})
+        verify(!shell.instanceBanner.visible, "no banner while the pipe is the app's own")
+        launch(shell, {kind: "activate", activate: false, pipe_notice: null})
+        verify(!shell.instanceBanner.visible)
+        launch(shell, {kind: "activate", activate: false,
+                       pipe_notice: "Another program is holding LILITH's launch channel, so a "
+                                    + "second launch may open a second window."})
+        verify(shell.instanceBanner.visible)
+        compare(shell.instanceBanner.text, "Another program is holding LILITH's launch channel, so a "
+                + "second launch may open a second window.")
+        tryVerify(() => shell.dockingArea.y >= shell.instanceBanner.height, 2000,
+                  "the docks sit below it")
+    }
+
+    function test_confirm_link_opens_confirmations() {
+        const shell = makeShell()
+        shell.docks.confirmations.forceClose()
+        launch(shell, {kind: "confirm", id: "cf_0123456789abcdef"})
+        tryVerify(() => shell.docks.confirmations.isOpen, 2000, "Confirmations opens")
+        compare(shell.shownConfirmation, "cf_0123456789abcdef")
+        verify(!shell.openedCard.visible)
+    }
+}

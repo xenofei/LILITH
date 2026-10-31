@@ -16,5 +16,7 @@ fn main() {
         .file("src/qt/hardware.rs")
         .file("src/qt/job_text.rs")
         .file("src/qt/live_jobs_model.rs")
+        .file("src/qt/boot.rs")
+        .cpp_file("src/qt/launch_sink.cpp")
         .build();
 }

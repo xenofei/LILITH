@@ -4,9 +4,9 @@
 //   0. DLL searches are locked to this exe's folder and System32 (SetDefaultDllDirectories, and
 //      SetDllDirectoryW(L"") takes the current folder out), so a DLL planted on PATH or in the
 //      current folder never loads, whatever name Qt or a driver asks for (opengl32sw.dll, say).
-//   1. lil_qt::boot() reads the raw command line (P4a-R3) and refuses anything but the switches
-//      this build takes. Task 19 adds the forwarded launch, which exits 0 here, and the one
-//      positional argument. It also refuses a start without an absolute exe folder.
+//   1. lil_qt::boot() reads the raw command line (P4a-R3) and refuses anything but its grammar
+//      (lil_qt::args: the switches and one link or file). It also refuses a start without an
+//      absolute exe folder.
 //   2. The variables that choose where Qt, QML, the scene graph, WebEngine or the Vulkan loader
 //      load code, QML or data from, which exe WebEngine starts, or that open debugging, all names
 //      under their prefixes (lil_qt::qt_env_to_clear), are removed from the process environment,
@@ -14,6 +14,10 @@
 //   3. The names (the caches and the WebEngine profile follow them), AA_ShareOpenGLContexts
 //      (APP-137) and the library path (this exe's folder only) are set; qt.conf beside the exe
 //      pins Qt's other folders to it.
+//   3b. lil_qt::claim_instance() (APP-013, APP-014), once the environment is clean and the log
+//      has started: a second launch hands its arguments to the running instance and exits 0
+//      here, and a toast's Deny with no window is sent and exits 0 here (P4a-R9); otherwise this
+//      process serves the app's pipe (or the confirm window's, P4a-R11).
 //   4. QGuiApplication is built from the program name alone: no Qt option reaches it.
 // "Before Qt is initialised", not "before any Qt code": Qt's DLLs run their own static
 // initialisers when the process loads them, before main, and this file's Q_IMPORT_QML_PLUGIN
@@ -35,6 +39,13 @@
 // logs stalls once the window is interactive (lilshim/StallWatchdog.h), and the font database is
 // filled off the GUI thread.
 //
+// Launches (P4a-R21): this start's own and each forwarded one reach ShellWindow.handleLaunchJson
+// through lil_qt::deliverLaunchesTo once the window is loaded. Once the event loop has ended,
+// lil_qt::release_instance stops taking launches (a new one becomes the instance itself) before
+// the window goes, and starts again any the window never took. Until Task 21's confirm window, a
+// confirm-window start (--confirm, a confirm/ link with no app running) opens the shell without
+// the app's state folder, on its Confirmations panel.
+//
 // Switches: --no-activate shows the window without taking the focus (its taskbar button
 // flashes); --smoke-exit quits with 0 once the first frame is shown and the event loop has gone
 // idle (tools/deploy/check-deploy.ps1). The log bridge writes `first_frame` and `interactive` as
@@ -48,6 +59,8 @@
 #include "lilshim/PreviewProvider.h"
 #include "lilshim/StallWatchdog.h"
 
+#include "lil_qt/src/qt/boot.cxxqt.h"
+#include "lil_qt/src/qt/launch_sink.h"
 #include "lil_qt/src/qt/layout.cxxqt.h"
 #include "lil_qt/src/qt/mod.cxxqt.h"
 #include "lil_qt/src/qt/preview_sink.h"
@@ -162,6 +175,11 @@ int main(int, char **)
     if (!logsFailed.empty())
         std::fprintf(stderr, "LILITH's log didn't start: %s\n", std::string(logsFailed).c_str());
 
+    // 3b. One instance: a launch handed to the running one ends here, before Qt.
+    const int handedOver = lil_qt::claim_instance();
+    if (handedOver >= 0)
+        return handedOver;
+
     // 3. Names, attributes and the library path, before the application object exists.
     QCoreApplication::setOrganizationName(fromRust(plan.org));
     QCoreApplication::setApplicationName(fromRust(plan.app));
@@ -230,7 +248,8 @@ int main(int, char **)
     lilshim::logEvent(QStringLiteral("core_object"), {{"loaded", core != nullptr}});
     // The shell takes the core and the app's state folder, where its layout lives (P4a-R16);
     // under --smoke-exit none, so the deploy check neither reads nor writes the app's state.
-    const QString stateDir = plan.smoke_exit ? QString() : fromRust(lil_qt::app_state_dir());
+    // A confirm-window start doesn't own the app's state either.
+    const QString stateDir = plan.smoke_exit || plan.confirm_mode ? QString() : fromRust(lil_qt::app_state_dir());
     engine.setInitialProperties({{QStringLiteral("core"), QVariant::fromValue(core)},
                                  {QStringLiteral("stateDir"), stateDir}});
     engine.loadFromModule("Lilith.UiKit", "ShellWindow");
@@ -239,6 +258,8 @@ int main(int, char **)
                        : qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
     if (!window) {
         lilshim::logEvent(QStringLiteral("error"), {{"what", "ShellWindow failed to load"}});
+        // The instance ends as it would after the event loop: what it took starts again.
+        lil_qt::release_instance();
         return 1;
     }
 
@@ -264,6 +285,10 @@ int main(int, char **)
 
     lilshim::activate(window, !plan.no_activate);
 
+    // Launches: this start's own, then each a second launch hands over (P4a-R21).
+    lil_qt::deliverLaunchesTo(window);
+    lil_qt::launches_ready();
+
     // interactive: the first time the event loop goes idle after the window was shown.
     auto *idleOnce = new QMetaObject::Connection;
     *idleOnce = QObject::connect(QAbstractEventDispatcher::instance(), &QAbstractEventDispatcher::aboutToBlock,
@@ -283,6 +308,9 @@ int main(int, char **)
     });
 
     const int rc = app.exec();
+    // No launch is taken from here on, before the window and the engine go.
+    lil_qt::deliverLaunchesTo(nullptr);
+    lil_qt::release_instance();
     lilshim::logEvent(QStringLiteral("exit"), {{"code", rc}});
     return rc;
 }
