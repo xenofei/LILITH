@@ -148,6 +148,8 @@ pub struct EngineStatus {
     pub suite_job: Option<String>,
     /// A node pack was installed since the engine started.
     pub restart_needed: bool,
+    /// `[engines.comfyui] root` is set: without it `models.report` is `engine.not_configured`.
+    pub models_root_set: bool,
     /// The model inventory refreshed since the engine became ready ([`comfyui::inventory`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory: Option<InventoryStatus>,

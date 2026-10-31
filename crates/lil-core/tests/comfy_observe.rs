@@ -658,18 +658,23 @@ async fn engines_topic_says_when_the_inventory_and_the_capture_are_kept() {
         refreshed,
         &json!(rig.comfy().await.inventory.unwrap().refreshed)
     );
-    // Its capture had been kept, and said so before it, while the hashing still had to run.
     let view = environment::environment(&rig.engines).await.unwrap();
     assert_eq!(view.captures.len(), 1, "the capture is kept");
+    // The capture said so before it, while the hashing still had to run: the one `status` that
+    // repeats the one before it. The catalogue's and the inventory's each change something.
     let ready = seen
         .iter()
         .position(|d| d["engine"]["state"] == "ready")
         .expect("ready");
-    let after_ready = seen.len() - ready - 1;
-    assert!(
-        after_ready >= 2,
-        "a status for the capture and one for the inventory: {seen:?}"
-    );
+    let statuses: Vec<&Value> = seen[ready..]
+        .iter()
+        .filter(|d| d["kind"] == "status")
+        .collect();
+    let repeats = statuses
+        .windows(2)
+        .filter(|w| w[0]["engine"] == w[1]["engine"])
+        .count();
+    assert_eq!(repeats, 1, "one status for the kept capture: {statuses:?}");
     rig.close().await;
 }
 

@@ -637,7 +637,7 @@ impl InventoryHandler {
         // Kept for `engines.environment` and `lil doctor` when the environment changed; one that
         // can't be kept is logged, and the inventory goes on.
         let kept = serde_json::to_value(&environment).unwrap_or(Value::Null);
-        if let Err(e) = environment::store_capture(
+        match environment::store_capture(
             &comfy.suite_state(),
             EngineKind::ComfyUi.wire(),
             &kept,
@@ -645,9 +645,11 @@ impl InventoryHandler {
         )
         .await
         {
-            tracing::warn!(error = %e, "the engine environment capture could not be kept");
-        } else {
-            comfy.capture_kept();
+            Ok(true) => comfy.capture_kept(),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "the engine environment capture could not be kept");
+            }
         }
         let files = match &root {
             Some(root) => {

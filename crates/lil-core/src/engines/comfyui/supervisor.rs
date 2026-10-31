@@ -420,6 +420,7 @@ impl Comfy {
             },
             suite_job: self.prompts.current(),
             restart_needed: self.restart_needed.load(Ordering::SeqCst),
+            models_root_set: self.config.as_ref().is_some_and(|c| c.root.is_some()),
             inventory: self.current_inventory().map(|inv| InventoryStatus {
                 models: u32::try_from(inv.files.len()).unwrap_or(u32::MAX),
                 refreshed: inv.refreshed.clone(),
@@ -586,16 +587,16 @@ impl Comfy {
         crate::workspace::default_of(&self.env).map(|w| w.path)
     }
 
-    /// Keeps the inventory a job refreshed in readiness `epoch`, unless the engine became ready
-    /// again since, and says so on the topic: `status` then carries it, and `models.report` has
-    /// something new.
+    /// Keeps the inventory a job refreshed in readiness `epoch`. Unless the engine became ready
+    /// again since, it says so on the topic: `status` then carries it. An overtaken one is only
+    /// `models.report`'s, and a `status` would carry no inventory to tell it by.
     pub(crate) fn set_inventory(&self, epoch: u64, inventory: Inventory) {
         let inventory = Arc::new(inventory);
         *lock(&self.last_inventory) = Some(inventory.clone());
         if epoch == self.ready_epoch() {
             *lock(&self.inventory) = Some((epoch, inventory));
+            self.publish("status");
         }
-        self.publish("status");
     }
 
     /// The inventory job kept an environment capture: `engines.environment` has something new,
