@@ -66,6 +66,7 @@ Rectangle {
     readonly property alias explorerButton: explorerButton
     readonly property alias fixButton: fixButton
     readonly property alias exporter: bundleExport
+    readonly property alias saveDialog: dialogLoader
     readonly property alias scroller: scroller
 
     color: Theme.surface

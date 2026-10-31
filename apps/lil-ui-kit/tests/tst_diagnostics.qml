@@ -4,6 +4,7 @@
 // the status lines, the bundle's export (into this process's temporary folder only, with a fake
 // shim: no window of Explorer's opens), floating and re-docking, and the accessibility walk.
 import QtQuick
+import QtQuick.Dialogs
 import QtTest
 import Lilith.Core
 import Lilith.Shim
@@ -631,6 +632,23 @@ TestCase {
         compare(panel.explorerButton.text, "Show in Explorer")
         panel.explorerButton.click()
         compare(shim.shown, [dir + "/picked.zip"])
+    }
+
+    // What diagnostics-check.ps1 can't read from the native dialog on every Windows build. The dialog
+    // here is Qt's own, the offscreen platform's.
+    function test_the_save_dialog_asks_for_a_zip() { // spec: ARCH-121
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core)
+        panel.exportButton.click()
+        tryVerify(() => panel.saveDialog.item !== null, 5000, "the dialog is made")
+        const dialog = panel.saveDialog.item
+        compare(dialog.nameFilters, ["ZIP files (*.zip)"])
+        compare(dialog.defaultSuffix, "zip")
+        compare(dialog.fileMode, FileDialog.SaveFile)
+        dialog.reject()
+        wait(50)
+        compare(callsOf(core, "diagnostics.bundle"), [], "a cancel makes no bundle")
     }
 
     function test_a_failed_copy_leaves_the_core_s_bundle_to_show() { // spec: ARCH-121
