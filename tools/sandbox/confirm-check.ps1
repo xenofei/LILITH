@@ -256,7 +256,7 @@ function Save-Evidence([string]$what) {
     if ($DryRun -or -not $script:main) { return }
     try {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
-        $stamp = (Get-Date).ToUniversalTime().ToString('HHmmss')
+        $stamp = (Get-Date).ToUniversalTime().ToString('HHmmssfff')
         $lines = @("failed: $what", "the window said: $(Get-WindowReason)", 'the log since this step:') + @(Get-LogSinceStep)
         Set-Content -LiteralPath (Join-Path $DiagDir "failure-$stamp-evidence.txt") -Value $lines -Encoding utf8
         Save-UiaTree (Join-Path $DiagDir "failure-$stamp-uia.txt")
@@ -843,4 +843,6 @@ try {
 Write-Host ''
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ("{0} checks passed, {1} failed" -f @($results | Where-Object { $_ -like 'PASS*' }).Count, $failures.Count)
+# The pop-up closes when this script does: give it time to turn green and say the PC is free.
+Start-Sleep -Seconds 6
 exit ([int]($failures.Count -gt 0))
