@@ -122,6 +122,68 @@ TestCase {
         verify(w.button.enabled)
     }
 
+    Component {
+        id: disabledParentPage
+        Window {
+            id: under
+            width: 480
+            height: 400
+            visible: true
+            property var core: null
+            property bool parentOn: true
+            property alias button: plainButton
+            property alias iconButton: plainIcon
+            property alias toggle: plainToggle
+            property alias field: plainField
+            Column {
+                enabled: under.parentOn
+                property var core: under.core
+                LButton { id: plainButton; requiresCore: true; text: "Run" }
+                LIconButton { id: plainIcon; requiresCore: true; glyph: "x"; text: "Remove" }
+                LToggle { id: plainToggle; requiresCore: true; text: "Keep" }
+                LTextField { id: plainField; requiresCore: true; label: "Name" }
+            }
+        }
+    }
+
+    // `enabled` reads the effective value, so a gate that engages under a disabled parent must not
+    // keep that `false` as the control's own.
+    function test_a_gate_engaged_under_a_disabled_parent_comes_back() { // spec: APP-034, APP-156
+        const core = createTemporaryObject(fakeComponent, tc)
+        const w = createTemporaryObject(disabledParentPage, tc, {core: core})
+        const marked = [w.button, w.iconButton, w.toggle, w.field]
+        for (const c of marked)
+            verify(c.enabled, "starts live: " + c)
+
+        // Parent off, then the core lost; parent on, then the core back.
+        w.parentOn = false
+        core.connection = "reconnecting"
+        w.parentOn = true
+        for (const c of marked)
+            verify(!c.enabled, "the gate still holds: " + c)
+        core.connection = "ready"
+        for (const c of marked)
+            verify(c.enabled, "back: " + c)
+
+        // The core back first, under the parent.
+        w.parentOn = false
+        core.connection = "reconnecting"
+        core.connection = "ready"
+        for (const c of marked)
+            verify(!c.enabled, "the parent still holds: " + c)
+        w.parentOn = true
+        for (const c of marked)
+            verify(c.enabled, "back: " + c)
+
+        // The other order.
+        core.connection = "reconnecting"
+        w.parentOn = false
+        core.connection = "ready"
+        w.parentOn = true
+        for (const c of marked)
+            verify(c.enabled, "back: " + c)
+    }
+
     function test_requires_core_with_no_core_to_ask_stays_disabled() { // spec: APP-034
         const w = createTemporaryObject(orphanPage, tc)
         verify(!w.orphan.enabled, "fails closed")

@@ -12,6 +12,10 @@ T.Switch {
     // found are in CoreGate.js. Later panels mark their actions with this.
     property bool requiresCore: false
     property var core: null
+    // A binding of its own, not the default `true`. `enabled` reads the effective value, so a gate
+    // that takes over under a disabled parent would otherwise save `false` as this control's own,
+    // and restore it for good. It must read a property: one with no dependency doesn't survive.
+    enabled: control.requiresCore || true
 
     Binding {
         target: control
