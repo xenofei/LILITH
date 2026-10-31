@@ -630,7 +630,7 @@ mod tests {
         // no wire value changed, so no protocol bump. `app/set_context`'s result gained the
         // additive `effective_project`, which plan 4a hasn't released. 1.3 added
         // `core/prove`'s params and result.
-        assert_eq!(h, "57af0c6f07339598");
+        assert_eq!(h, "1c350fa78048e713");
     }
 
     #[test] // spec: ARCH-029
