@@ -11,7 +11,7 @@
 // (core/CoreGate.js), and `live` is both together: the core is ready as well.
 //
 // A refusal is never silent: `reason` shows under the buttons, is announced, and its name goes to
-// the log, with nothing of the input.
+// the log, with nothing of the input, at most one line a second, a hand's refusals included.
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit

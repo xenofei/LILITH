@@ -421,7 +421,7 @@ TestCase {
         for (const [verdict, words] of [["no_rest", "came too soon"], ["no_move", "Move the pointer a little"],
                                         ["no_real_press", "Press and release"],
                                         ["brought_forward", "brought this window to the front"],
-                                        ["reenter", "Approve just came on, or what it stands for changed or moved. Move the pointer off it"],
+                                        ["reenter", "Approve just came on, or what it stands for changed or moved, or the pointer jumped. Move the pointer off it"],
                                         ["button_state", "Hold the click a moment longer"], ["stalled", "too busy"],
                                         ["not_exposed", "covered, see-through, off the screen or hidden"],
                                         ["no_guard", "is off. Deny still works"]]) {

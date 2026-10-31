@@ -6,7 +6,8 @@
 //!
 //! Microsoft documents `IMO_HARDWARE` as covering a UIAccess application's injection as well, and
 //! documents nothing about what a posted message reports (`hello::InputOrigin`), so a "hardware"
-//! source means no more than that. [`left_button_physically_down`] is the second factor.
+//! source means no more than that. [`left_button_physically_down`] is the second factor, against a
+//! posted message.
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};

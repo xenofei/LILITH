@@ -15,11 +15,15 @@
 //! ([`GateRefusal::Reenter`]), and only a real message ends that. What can't be told apart: Windows'
 //! own move (it reports `IMO_SYSTEM`, as for a warp) while the hand happens to be moving, when
 //! something changes the windows under it, reads as a warp; the cost is a move off and back, with
-//! words. And a warp that lands just off a button, with the hand carrying on onto it, reads as the
-//! hand's own arrival: nothing in Windows' input says otherwise.
+//! words. A residual: a warp that lands just off a button, with the hand carrying on onto it, arrives
+//! by the hand's own real moves, and this gate doesn't tell that from an arrival with no warp. And a
+//! warp merged into the hand's next move, if Windows reports that one move as a real one, isn't seen
+//! at all: unmeasured until `tools/sandbox/confirm-check.ps1`'s step (l) reports it.
 //!
 //! **What can't be told.** Microsoft documents `IMO_HARDWARE` as covering a UIAccess application's
-//! injection too, so one (it needs an installed, signed binary) reads as a hand. What a posted
+//! injection too, so one reads as a hand. It documents that such an application must be signed and
+//! installed in a protected folder, unless a local policy turns that off. A public technique may reuse
+//! a signed process's token instead; that is unmeasured here. What a posted
 //! message's source reports isn't documented, so the source isn't the only factor: at a press the
 //! left button must be down, and at a release up (`GetAsyncKeyState`: [`Seen::physically_down`]). That
 //! state follows real and injected input alike, measured: 100 injected presses, none read as up. So it
@@ -162,13 +166,17 @@ impl GateRefusal {
     pub fn words(name: &str, label: &str) -> Option<String> {
         let click = |refusal: Refusal| Some(refusal.message(label));
         match name {
-            "brought_forward" => click(Refusal::NotInFront),
+            // Not the Hello window's words: coming to the front makes a new button here, so a small
+            // move on it isn't enough.
+            "brought_forward" => Some(format!(
+                "That click brought this window to the front. Move the pointer off {label}, then come back and click it."
+            )),
             "not_pointer" => click(Refusal::NotPointer),
             "no_real_press" => click(Refusal::NoRealPress),
             "no_rest" => click(Refusal::NoRest),
             "no_move" => click(Refusal::NoMove),
             "reenter" => Some(format!(
-                "{label} just came on, or what it stands for changed or moved. Move the pointer off it, check what it says, then come back and click it."
+                "{label} just came on, or what it stands for changed or moved, or the pointer jumped. Move the pointer off it, check what it says, then come back and click it."
             )),
             "button_state" => Some(format!(
                 "That click was too quick for LILITH to check. Hold the click a moment longer on {label}."
@@ -286,7 +294,9 @@ impl PointerGate {
         {
             self.reenter = Some(t.serial);
         }
-        if msg.at.is_some() {
+        // Only from input: a posted message leaves the queue before it, and the filter reads the cursor
+        // for each, so a program could otherwise record a warp's place before Windows' own move says so.
+        if input && msg.at.is_some() {
             self.last_at = msg.at;
         }
         if let Some(t) = s.target.filter(|t| t.changed) {
@@ -886,6 +896,102 @@ mod tests {
             r.release(hardware(ON));
             assert_eq!(r.qml_click(), Ok(()), "off and back ends it");
         }
+    }
+
+    /// Posted messages leave the queue before input, and the filter reads the cursor for each: a
+    /// program warps, then posts anything the filter reads, so that Windows' own move isn't new.
+    #[test] // spec: P4a-R10
+    fn a_posted_message_cant_hide_a_warp() {
+        type Warp = fn((i32, i32)) -> PointerMsg;
+        let warps: [Warp; 2] = [system, injected];
+        for warp in warps {
+            for post in [
+                PointerKind::Move,
+                PointerKind::CancelMode,
+                PointerKind::CaptureChanged,
+                PointerKind::Leave,
+            ] {
+                let mut r = Replay::new();
+                r.mv(hardware(OFF));
+                r.mv(hardware((60, 60)));
+                r.seen(post, posted(ON), Replay::target_at(ON));
+                r.mv(warp(ON));
+                r.mv(hardware((151, 115)));
+                r.mv(hardware((152, 115)));
+                r.advance(HOVER_BEFORE_PRESS);
+                r.press(hardware((152, 115)));
+                r.advance(Duration::from_millis(60));
+                r.release(hardware((152, 115)));
+                assert_eq!(r.qml_click(), Err(GateRefusal::Reenter), "{post:?}");
+            }
+        }
+    }
+
+    /// The same behind a new amount: the rule ends at the hand's move off, and a warp back behind a
+    /// post starts it again.
+    #[test] // spec: P4a-R10
+    fn a_warp_back_behind_a_post_starts_the_re_entry_again() {
+        let new_amount = Target {
+            serial: 2,
+            rect: RECT,
+            changed: true,
+        };
+        let same = Target {
+            changed: false,
+            ..new_amount
+        };
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.seen(PointerKind::Move, hardware((151, 116)), Some(new_amount));
+        r.seen(PointerKind::Move, system(OFF), None);
+        r.seen(PointerKind::Move, hardware((51, 50)), None);
+        r.seen(PointerKind::Move, posted((151, 116)), Some(same));
+        r.seen(PointerKind::Move, system((151, 116)), Some(same));
+        r.seen(PointerKind::Move, hardware((152, 116)), Some(same));
+        r.seen(PointerKind::Move, hardware((153, 116)), Some(same));
+        r.advance(HOVER_BEFORE_PRESS);
+        assert_eq!(
+            click_on_two(&mut r, (153, 116), same),
+            Err(GateRefusal::Reenter)
+        );
+    }
+
+    /// The hand on its way back from another window, past what doesn't count as a place.
+    #[test] // spec: P4a-R10
+    fn a_hand_back_from_another_window_isnt_a_warp() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.seen(PointerKind::Leave, posted((199, 129)), None);
+        r.advance(Duration::from_secs(5));
+        r.seen(PointerKind::CaptureChanged, posted((120, 115)), None);
+        r.mv(hardware((101, 101)));
+        r.mv(hardware(ON));
+        r.mv(system(ON));
+        r.mv(hardware((151, 115)));
+        r.advance(HOVER_BEFORE_PRESS);
+        r.press(hardware((151, 115)));
+        r.advance(Duration::from_millis(60));
+        r.release(hardware((151, 115)));
+        assert_eq!(r.qml_click(), Ok(()));
+    }
+
+    /// `ApproveButton` makes a new button as the window comes to the front, so a small move on it
+    /// isn't enough, and the words can't say it is.
+    #[test] // spec: P4a-R10
+    fn the_activating_clicks_words_say_what_works_here() {
+        let words = GateRefusal::words("brought_forward", "Approve").unwrap();
+        assert!(words.contains("front"), "{words}");
+        assert!(
+            words.contains("off Approve"),
+            "what gets it to count: {words}"
+        );
+        assert!(!words.contains("a little"), "{words}");
+    }
+
+    #[test] // spec: P4a-R10
+    fn the_re_entry_words_cover_a_pointer_that_jumped() {
+        let words = GateRefusal::words("reenter", "Approve").unwrap();
+        assert!(words.contains("the pointer jumped"), "{words}");
     }
 
     /// What a hand does, with what Windows and other programs add around it.
