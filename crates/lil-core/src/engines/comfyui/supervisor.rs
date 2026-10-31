@@ -587,13 +587,21 @@ impl Comfy {
     }
 
     /// Keeps the inventory a job refreshed in readiness `epoch`, unless the engine became ready
-    /// again since.
+    /// again since, and says so on the topic: `status` then carries it, and `models.report` has
+    /// something new.
     pub(crate) fn set_inventory(&self, epoch: u64, inventory: Inventory) {
         let inventory = Arc::new(inventory);
         *lock(&self.last_inventory) = Some(inventory.clone());
         if epoch == self.ready_epoch() {
             *lock(&self.inventory) = Some((epoch, inventory));
         }
+        self.publish("status");
+    }
+
+    /// The inventory job kept an environment capture: `engines.environment` has something new,
+    /// after the engine's own `ready` event.
+    pub(crate) fn capture_kept(&self) {
+        self.publish("status");
     }
 
     /// The newest inventory of this core run, even of an engine that has stopped since.

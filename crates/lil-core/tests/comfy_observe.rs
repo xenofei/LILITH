@@ -13,6 +13,7 @@
     reason = "JobFailure holds the wire ErrorBody, as in lil-core itself"
 )]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -74,6 +75,7 @@ impl Drafts {
 /// The jobs and the engines of one in-process "core" over `env`, the GPU scheduler their
 /// admission (no GPU source: no VRAM check).
 struct Rig {
+    events: Arc<EventBus>,
     jobs: Arc<Jobs>,
     engines: Arc<Engines>,
     drafts: Arc<Drafts>,
@@ -138,7 +140,7 @@ impl Rig {
             env.env.clone(),
             jobs.clone(),
             telemetry.clone(),
-            events,
+            events.clone(),
             clock,
             failpoints,
             drafts.clone(),
@@ -146,6 +148,7 @@ impl Rig {
         );
         jobs.set_admission(GpuScheduler::new(telemetry.clone(), engines.clone()));
         Rig {
+            events,
             jobs,
             engines,
             drafts,
@@ -612,6 +615,62 @@ fn registry_naming(env: &TestEnv, sha256: &str) {
         .as_bytes(),
     );
     env.register_workspace(&ws, true);
+}
+
+/// A panel that follows `engines` learns of a new inventory and a kept capture from the topic
+/// alone, without knowing the job that made them: the last `status` event carries the inventory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-130, CORE-164
+async fn engines_topic_says_when_the_inventory_and_the_capture_are_kept() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake, true);
+    lil_testkit::files::write_file(&fake.root().join(r"models\x.safetensors"), b"xxxx");
+    let rig = Rig::new(&env);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    rig.events.attach(1, tx);
+    rig.events
+        .subscribe(1, &["engines".to_string()], &BTreeMap::new())
+        .await;
+    rig.ready().await;
+    let job = rig.observed().await;
+    assert_eq!(job.status, JobStatus::Succeeded);
+
+    // What followed the engine becoming ready: the capture's status, then the inventory's.
+    let mut seen: Vec<Value> = Vec::new();
+    let deadline = Instant::now() + DEADLINE;
+    while !seen.iter().any(|d| !d["engine"]["inventory"].is_null()) {
+        assert!(
+            Instant::now() < deadline,
+            "no status event with the inventory: {seen:?}"
+        );
+        if let Ok(Some(line)) = tokio::time::timeout(POLL, rx.recv()).await {
+            let line: Value = serde_json::from_str(&line).unwrap();
+            if line["params"]["topic"] == "engines" {
+                seen.push(line["params"]["data"].clone());
+            }
+        }
+    }
+    let inventory = seen.last().unwrap();
+    assert_eq!(inventory["kind"], "status", "{inventory}");
+    assert_eq!(inventory["engine"]["inventory"]["models"], 1, "{inventory}");
+    let refreshed = &inventory["engine"]["inventory"]["refreshed"];
+    assert_eq!(
+        refreshed,
+        &json!(rig.comfy().await.inventory.unwrap().refreshed)
+    );
+    // Its capture had been kept, and said so before it, while the hashing still had to run.
+    let view = environment::environment(&rig.engines).await.unwrap();
+    assert_eq!(view.captures.len(), 1, "the capture is kept");
+    let ready = seen
+        .iter()
+        .position(|d| d["engine"]["state"] == "ready")
+        .expect("ready");
+    let after_ready = seen.len() - ready - 1;
+    assert!(
+        after_ready >= 2,
+        "a status for the capture and one for the inventory: {seen:?}"
+    );
+    rig.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-060, CORE-130

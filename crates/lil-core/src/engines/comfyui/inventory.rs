@@ -646,6 +646,8 @@ impl InventoryHandler {
         .await
         {
             tracing::warn!(error = %e, "the engine environment capture could not be kept");
+        } else {
+            comfy.capture_kept();
         }
         let files = match &root {
             Some(root) => {
