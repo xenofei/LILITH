@@ -800,9 +800,10 @@ TestCase {
 
     function test_a_list_stays_inside_the_window() { // spec: APP-156
         const t = load()
-        t.window.width = 640
+        // So narrow that a list opened at the project switcher has to move left to fit.
+        t.window.width = 480
         t.window.height = 240
-        tryVerify(() => t.bar.width === 640)
+        tryVerify(() => t.bar.width === 480)
         wait(50)
         const many = []
         for (let i = 0; i < 30; ++i)

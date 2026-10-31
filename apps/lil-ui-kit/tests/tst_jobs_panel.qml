@@ -331,6 +331,9 @@ TestCase {
         }
         tryVerify(() => marked(t.panel).length >= 3, 3000, "pause, and the rows' Cancel and Run next")
         const buttons = marked(t.panel)
+        // By the property, not only through `writable`: that is what a test of the rule can walk.
+        for (const text of ["Pause", "Run next", "Run last", "Cancel"])
+            verify(buttons.some(b => b.text === text), text + " is marked `requiresCore`")
         for (const b of buttons)
             verify(b.enabled, "live while ready: " + b.text)
         const made = t.core.calls.length
