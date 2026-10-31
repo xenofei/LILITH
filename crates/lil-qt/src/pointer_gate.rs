@@ -1033,7 +1033,8 @@ mod tests {
     /// What isn't a move says nothing of where a hand put the cursor, whatever its origin reads.
     #[test] // spec: P4a-R10
     fn only_a_move_counts_as_a_place() {
-        let cases: [(PointerKind, fn((i32, i32)) -> PointerMsg); 6] = [
+        type Origin = fn((i32, i32)) -> PointerMsg;
+        let cases: [(PointerKind, Origin); 6] = [
             (PointerKind::Leave, system),
             (PointerKind::CaptureChanged, system),
             (PointerKind::CancelMode, system),
