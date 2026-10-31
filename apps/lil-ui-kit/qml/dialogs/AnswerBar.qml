@@ -6,9 +6,9 @@
 // The clock runs from when the bar came up with its window in front, and starts again whenever
 // anything could have put a button under a hand that meant something else: the window leaves the
 // front, moves or is resized (as the Hello window's does), what is shown changes (`shownKey`), rearm(),
-// or the buttons come back on (`live`). `live` is what the buttons' `enabled` binds to: the
-// confirmation is open, no answer is out or sent, and the core is connected (`connection`: Task 20's
-// `requiresCore` isn't in this base).
+// or the buttons come back on (`live`). `buttonsOn` is what the buttons' `enabled` binds to: the
+// confirmation is open and no answer is out or sent. Each button is also marked `requiresCore`
+// (core/CoreGate.js), and `live` is both together: the core is ready as well.
 //
 // A refusal is never silent: `reason` shows under the buttons, is announced, and its name goes to
 // the log, with nothing of the input.
@@ -16,6 +16,7 @@ import QtQuick
 import Lilith.Core
 import Lilith.UiKit
 import "ConfirmText.js" as Words
+import "../core/CoreGate.js" as CoreGate
 
 Column {
     id: root
@@ -33,8 +34,9 @@ Column {
     // The answer went through: nothing more goes out.
     property bool sent: false
     property string reason
-    readonly property bool connected: !!core && core.connection === "ready"
-    readonly property bool live: open && connected && !busy && !sent
+    readonly property bool connected: CoreGate.ready(root)
+    readonly property bool buttonsOn: open && !busy && !sent
+    readonly property bool live: buttonsOn && connected
     readonly property alias reasonLine: reasonLine
     default property alias buttons: row.data
 

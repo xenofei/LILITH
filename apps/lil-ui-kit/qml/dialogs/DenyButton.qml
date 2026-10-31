@@ -4,9 +4,23 @@
 import QtQuick
 import QtQuick.Templates as T
 import Lilith.UiKit
+import "../core/CoreGate.js" as CoreGate
 
 T.Button {
     id: control
+
+    // As on the base controls (core/CoreGate.js).
+    property bool requiresCore: false
+    property var core: null
+    enabled: control.requiresCore || true
+
+    Binding {
+        target: control
+        property: "enabled"
+        when: control.requiresCore && !CoreGate.ready(control)
+        value: false
+        restoreMode: Binding.RestoreBindingOrValue
+    }
 
     signal activated(string kind)
 

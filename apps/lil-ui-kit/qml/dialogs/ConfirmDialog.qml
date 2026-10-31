@@ -203,7 +203,8 @@ Column {
         DenyButton {
             id: denyButton
             text: "Deny"
-            enabled: bar.live
+            requiresCore: true
+            enabled: bar.buttonsOn
             onActivated: kind => bar.deny(kind, denyButton)
         }
 
@@ -212,7 +213,8 @@ Column {
             text: "Approve"
             targetKey: root.shownKey
             pointerSource: root.pointerSource
-            enabled: bar.live && root.approvable
+            requiresCore: true
+            enabled: bar.buttonsOn && root.approvable
             onClicked: bar.approve(text)
             onRefused: name => bar.refuse(name, text)
         }

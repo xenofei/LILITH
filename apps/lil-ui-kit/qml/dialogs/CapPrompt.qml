@@ -162,7 +162,8 @@ Column {
         DenyButton {
             id: cancelButton
             text: "Cancel"
-            enabled: bar.live
+            requiresCore: true
+            enabled: bar.buttonsOn
             Accessible.description: "Denies this call"
             onActivated: kind => bar.deny(kind, cancelButton)
         }
@@ -172,7 +173,8 @@ Column {
             text: root.alsoApproves !== "" ? "Allow once and approve " + root.alsoApproves : "Allow once"
             targetKey: root.confirmationId + "|allow|" + root.shownKey + "|" + text
             pointerSource: root.pointerSource
-            enabled: bar.live && root.approvable
+            requiresCore: true
+            enabled: bar.buttonsOn && root.approvable
             onClicked: bar.approve(text, {action: "allow_once"})
             onRefused: name => bar.refuse(name, text)
         }
@@ -195,7 +197,8 @@ Column {
                 width: 140
                 label: "New limit for " + root.capName(raiseRow.modelData.cap)
                 placeholderText: "New limit"
-                enabled: bar.live
+                requiresCore: true
+                enabled: bar.buttonsOn
                 // Whoever changed it: the gate re-arms.
                 onTextChanged: bar.rearm()
             }
@@ -207,7 +210,8 @@ Column {
                 targetKey: root.confirmationId + "|raise|" + root.shownKey + "|"
                            + String(raiseRow.modelData.cap) + "|" + raiseRow.amount + "|" + text
                 pointerSource: root.pointerSource
-                enabled: bar.live && root.approvable
+                requiresCore: true
+                enabled: bar.buttonsOn && root.approvable
                 onClicked: {
                     const refusal = root.raiseRefusal(raiseRow.amount, raiseRow.modelData)
                     if (refusal === "")

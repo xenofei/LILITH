@@ -10,9 +10,23 @@
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
+import "../core/CoreGate.js" as CoreGate
 
 Item {
     id: root
+
+    // As on the base controls (core/CoreGate.js).
+    property bool requiresCore: false
+    property var core: null
+    enabled: root.requiresCore || true
+
+    Binding {
+        target: root
+        property: "enabled"
+        when: root.requiresCore && !CoreGate.ready(root)
+        value: false
+        restoreMode: Binding.RestoreBindingOrValue
+    }
 
     property string text: "Approve"
     property string targetKey

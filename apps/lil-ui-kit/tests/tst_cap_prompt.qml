@@ -140,6 +140,18 @@ TestCase {
         verify(row.children[2].text.indexOf("Limit when this was asked: 1.00 USD") === 0, row.children[2].text)
     }
 
+    function test_every_control_waits_for_the_core() { // spec: APP-034
+        const prompt = makePrompt()
+        const row = prompt.raises.itemAt(0)
+        const controls = [prompt.cancelButton, prompt.allowOnceButton, row.field, row.button]
+        row.field.text = "25"
+        tryVerify(() => controls.every(c => c.enabled), 1000)
+        fake.connection = "reconnecting"
+        tryVerify(() => controls.every(c => !c.enabled), 1000)
+        fake.connection = "ready"
+        tryVerify(() => controls.every(c => c.enabled), 1000)
+    }
+
     function test_a_raise_says_what_is_sent_and_is_higher() { // spec: APP-054, P4a-R10
         const prompt = makePrompt()
         const row = prompt.raises.itemAt(0)
