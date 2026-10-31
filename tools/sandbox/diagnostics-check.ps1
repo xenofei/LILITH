@@ -30,9 +30,10 @@
   no name from a dialog's file list, navigation pane, address bar or breadcrumb.
   3. lil-image is closed, the test core stopped (`lil core stop`, then by the PID that
      `lil --no-start status` gave on the test channel, and only if it runs from this deploy folder),
-     the test channel's registry keys and the temporary root removed, and the pop-up told it is
-     done. Exit 0 only when no check failed, and the cleanup too; the summary counts what wasn't
-     checked apart from what passed.
+     the test channel's registry keys, temporary root and Qt cache folder
+     (%LOCALAPPDATA%\LILITH-test-diagcheck) removed, and the pop-up told it is done. Exit 0 only when
+     no check failed, and the cleanup too; the summary counts what wasn't checked apart from what
+     passed.
 
   It refuses to start if a core already runs on the test channel, and then stops nothing: that core
   isn't this run's, and the app would attach to it. It never touches the real stable or dev channel
@@ -291,6 +292,16 @@ function Exit-TestChannel {
         try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
     }
     Check (-not (Test-Path -LiteralPath $root)) 'cleanup: the temporary root is gone'
+    # The organisation name is the channel's (apps/lil-image/main.cpp), so Qt's qmlcache goes to the
+    # real local data folder, outside the test root. Exactly this channel's folder: on any other
+    # channel this function has returned above. A core this run didn't start can be using it.
+    if (-not $script:channelTaken) {
+        $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+        for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
+            try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+        }
+        Check (-not (Test-Path -LiteralPath $cache)) "cleanup: the test channel's Qt cache folder is gone"
+    }
 }
 
 if ($DryRun) {
@@ -322,7 +333,7 @@ $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-diagcheck-{0}.state" -f $PID
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
                '-What', 'checks the diagnostics bundle (a window, a save dialog and an Explorer window open)', '-WarnSec', '10', '-RunSec', '60',
-               '-CapSec', '240', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-CapSec', '600', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -349,12 +360,18 @@ function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     }
     throw "timed out after $sec s waiting for $what"
 }
+# UI Automation can throw for a whole walk while the tree moves: walk again, a few times.
+function Retry-Walk([scriptblock]$walk) {
+    for ($i = 0; ; ++$i) {
+        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
+    }
+}
 function Find-Window([int]$procId, [string]$name) {
     $c = Prop $AE::ProcessIdProperty $procId
     if ($name) { $c = And $c (Prop $AE::NameProperty $name) }
     $c = And $c (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Window))
-    $e = $AE::RootElement.FindFirst($TS::Children, $c)
-    if (-not $e -and $script:main) { $e = $script:main.FindFirst($TS::Descendants, $c) }
+    $e = Retry-Walk { $AE::RootElement.FindFirst($TS::Children, $c) }
+    if (-not $e -and $script:main) { $e = Retry-Walk { $script:main.FindFirst($TS::Descendants, $c) } }
     return $e
 }
 function Get-WindowProcess([System.IntPtr]$hwnd) {
@@ -416,33 +433,56 @@ function Invoke-Element($e, [string]$what) {
     try { $e.SetFocus() } catch { }
     Send-Keys ' ' $e $script:main $what
 }
-# The app's window in front, through Win32 (UIA's SetFocus is refused on a top-level window).
-function Show-App {
-    try { [void][LilDiagCheck.Win]::SetForegroundWindow([System.IntPtr]$script:main.Current.NativeWindowHandle) } catch { }
-    Start-Sleep -Milliseconds 300
+# `e`'s window in front, through Win32 (UIA's SetFocus is refused on a top-level window). Windows keeps
+# the front from a program for a few minutes after the person's last input, and no input may be sent
+# to get round that: keep asking, up to 240 s, then fail. Another program is never named.
+function Show-Element($e) {
+    $end = (Get-Date).AddSeconds(240)
+    $waited = $false
+    while ($true) {
+        try { [void][LilDiagCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
+        Start-Sleep -Milliseconds 300
+        if ((Get-WindowProcess ([LilDiagCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
+        if ((Get-Date) -gt $end) { throw "lil-image's window didn't get the front in 240 s" }
+        if (-not $waited) {
+            $waited = $true
+            Write-Host 'Windows keeps the front for now: waiting for it to let go (up to 240 s). Stay off the mouse and keyboard.'
+        }
+        Start-Sleep -Seconds 1
+    }
 }
+function Show-App { Show-Element $script:main }
 # The app's top-level windows (the main window, a floating dock, a dialog).
 function App-Windows {
-    @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
+    @(Retry-Walk { $AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)) })
+}
+# The main window, found afresh: an element found early can stay empty (UI Automation kept an early
+# view). The shell's is titled "LILITH" (or "LILITH — <project>"); else the first one.
+function Find-Main {
+    $wins = App-Windows
+    $found = $wins | Where-Object { $_.Current.Name -like 'LILITH*' } | Select-Object -First 1
+    if ($found) { return $found }
+    if ($wins.Count -gt 0) { return $wins[0] }
+    return $null
 }
 # The first element named `name`, under `in` or else under any window of the app.
 function Find-Named($in, [string]$name) {
     $c = Prop $AE::NameProperty $name
-    $e = $in.FindFirst($TS::Descendants, $c)
+    $e = Retry-Walk { $in.FindFirst($TS::Descendants, $c) }
     if ($e) { return $e }
-    foreach ($w in App-Windows) { $e = $w.FindFirst($TS::Descendants, $c); if ($e) { return $e } }
+    foreach ($w in App-Windows) { $e = Retry-Walk { $w.FindFirst($TS::Descendants, $c) }; if ($e) { return $e } }
     return $null
 }
 # How many elements of the app's windows are named `name`.
 function Count-Named([string]$name) {
     $n = 0
-    foreach ($w in App-Windows) { $n += $w.FindAll($TS::Descendants, (Prop $AE::NameProperty $name)).Count }
+    foreach ($w in App-Windows) { $n += (Retry-Walk { $w.FindAll($TS::Descendants, (Prop $AE::NameProperty $name)) }).Count }
     return $n
 }
 # The first element whose name starts with `prefix`, under any window of the app.
 function Find-NameStarting([string]$prefix) {
     foreach ($root2 in App-Windows) {
-        $all = $root2.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        $all = Retry-Walk { $root2.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) }
         foreach ($e in $all) { try { if ($e.Current.Name.StartsWith($prefix)) { return $e } } catch { } }
     }
     return $null
@@ -451,7 +491,14 @@ function Find-NameStarting([string]$prefix) {
 # reads only once it is shown must be there: its keep-awake line, from `desktop.get`.
 function Open-DiagnosticsPanel {
     $how = ''
-    $tab = $script:main.FindFirst($TS::Descendants, (And (Prop $AE::NameProperty 'Diagnostics') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::TabItem))))
+    $tabName = And (Prop $AE::NameProperty 'Diagnostics') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::TabItem))
+    $tab = $null
+    try {
+        $tab = Wait-For {
+            $script:main = Find-Main
+            if ($script:main) { Retry-Walk { $script:main.FindFirst($TS::Descendants, $tabName) } }
+        } 20 'the Diagnostics tab'
+    } catch { }
     if ($tab) {
         $p = $null
         if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); $how = 'its dock tab (select)' }
@@ -505,11 +552,6 @@ function Open-SaveDialog {
     $btn = Wait-For { $b = Find-Named $script:main 'Export diagnostics bundle'; if ($b -and $b.Current.IsEnabled) { $b } } 30 'an enabled export button'
     Invoke-Element $btn 'the export button'
     return Wait-For { Find-Window $script:app.Id $dialogTitle } 20 'the save dialog'
-}
-# `e`'s window in front (Win32).
-function Show-Element($e) {
-    try { [void][LilDiagCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
-    Start-Sleep -Milliseconds 300
 }
 # SendKeys' own characters, escaped.
 function Escape-Keys([string]$s) { [regex]::Replace($s, '[+^%~(){}\[\]]', '{$0}') }
@@ -681,11 +723,7 @@ try {
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
     [void](Wait-For { if ((Get-CorePid) -ne 0) { $true } } 30 'a core on the test channel')
-    # The shell's window is titled "LILITH" (or "LILITH — <project>"); else the first one.
-    Start-Sleep -Seconds 1
-    $wins = App-Windows
-    $script:main = ($wins | Where-Object { $_.Current.Name -like 'LILITH*' } | Select-Object -First 1)
-    if (-not $script:main) { $script:main = $wins[0] }
+    $script:main = Wait-For { Find-Main } 10 'the main window'
     Pass 'the lil-image started on the test channel has a window'
     Open-DiagnosticsPanel
     $file = Join-Path $outDir 'bundle.zip'
@@ -788,6 +826,8 @@ try {
 
     # (d) Open Backups: the status line's words, and the panel's own beside them.
     $line = 'No backups yet: backups arrive in a later version of LILITH'
+    # Not one look: the Explorer window has just closed, and the tree can be moving.
+    [void](Wait-For { if ((Count-Named $line) -ge 1) { $true } } 15 'the backup status line')
     Check ((Count-Named $line) -eq 1) '(d) the backup status line is in the UIA tree once: the closed panel''s isn''t'
     $windowsBefore = (App-Windows).Count
     $open = Wait-For { Find-Named $script:main 'Open Backups' } 10 'Open Backups'
