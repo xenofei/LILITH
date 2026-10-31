@@ -478,12 +478,18 @@ impl LiveJobs {
 
     /// What the lane headers and the panel's own controls need: `{lanes}` (as
     /// [`LiveJobs::row_lanes`]), `{waiting_for_vram}` (the lanes with a queued job waiting for
-    /// GPU memory), `{mine}` (the live jobs `app`'s panels started) and `{capped}` (as
-    /// [`LiveJobs::capped`], or null).
+    /// GPU memory), `{mine}` (the live jobs `app`'s panels started), `{capped}` (as
+    /// [`LiveJobs::capped`], or null), and `{running}` and `{queued}` (how many rows are running,
+    /// and how many are not: the top bar's counts, a status this build doesn't know among the
+    /// queued, P4a-R40).
     pub fn overview(&self, app: &str) -> Value {
         let mut vram: Vec<String> = Vec::new();
         let mut mine = 0_u32;
+        let mut running = 0_usize;
         for r in &self.rows {
+            if text(&r.job, "status") == "running" {
+                running += 1;
+            }
             if text(&r.job, "substatus") == "waiting_for_vram" {
                 let lane = text(&r.job, "lane");
                 if !vram.iter().any(|l| l == lane) {
@@ -500,7 +506,8 @@ impl LiveJobs {
             }
         }
         serde_json::json!({"lanes": self.row_lanes(), "waiting_for_vram": vram, "mine": mine,
-                           "capped": self.capped})
+                           "capped": self.capped, "running": running,
+                           "queued": self.rows.len() - running})
     }
 
     /// The clock moved on: the rows whose times read differently.
@@ -902,6 +909,12 @@ mod tests {
             overview["mine"],
             json!(0),
             "none of them came from the image app's panels"
+        );
+        assert_eq!(overview["running"], json!(2));
+        assert_eq!(
+            overview["queued"],
+            json!(3),
+            "a job of a status this build doesn't know counts with the queued ones (P4a-R40)"
         );
         // A job that ends leaves.
         let mut done = running("g1", "gpu-heavy", None, 5);
