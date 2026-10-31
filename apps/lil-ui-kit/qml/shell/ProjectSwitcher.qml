@@ -25,8 +25,10 @@ Item {
     required property var core
     // The core is ready and has a workspace: a project is set within one (`workspace.required`).
     required property bool ready
+    // Why the core refuses this session while connected (WorkspaceSwitcher), shown text.
+    property string movedReason
 
-    readonly property bool refused: CoreGate.refusedWorkspace(core)
+    readonly property bool refused: CoreGate.refusedWorkspace(core) || movedReason !== ""
     readonly property bool hasWorkspace: !!core && !!core.workspace && !refused
     // See the header; empty until it is read.
     property string effectiveProject
@@ -48,11 +50,19 @@ Item {
     property var _readCall: null
     property string _workspaceId
 
+    // As the workspace switcher's.
+    signal workspaceRefused(string message)
+
     implicitWidth: Math.min(button.implicitWidth, 200)
     implicitHeight: button.implicitHeight
 
     onReadyChanged: {
         if (!ready && !refused)
+            popup.close()
+    }
+    // A list left open as the refusal ends has nothing in it, and would stay empty.
+    onRefusedChanged: {
+        if (!refused)
             popup.close()
     }
 
@@ -67,7 +77,7 @@ Item {
     function open() {
         popup.message = ""
         if (refused) {
-            popup.message = shown(core.unavailable.reason, 300)
+            popup.message = movedReason !== "" ? movedReason : shown(core.unavailable.reason, 300)
         } else if (ready) {
             read()
             readEffective()
@@ -80,6 +90,7 @@ Item {
     function read() {
         if (_listCall)
             _listCall.cancel()
+        const asked = workspaceId()
         _listCall = CoreCall.call(core, "projects.list", {}, {
             owner: root,
             ok: r => {
@@ -94,6 +105,11 @@ Item {
             },
             error: e => {
                 root._listCall = null
+                if (e && e.code === "workspace.unsupported" && asked === root.workspaceId()) {
+                    root.workspaceRefused(String(e.message))
+                    popup.message = root.movedReason
+                    return
+                }
                 popup.message = root.refusedText("Couldn't list the projects", e)
             }
         })
@@ -115,6 +131,12 @@ Item {
     function choose(slug) {
         if (!ready || _setCall)
             return
+        // The row that is shown already: a plain close, as the workspace switcher's. Sending it
+        // would pin a fallback nobody chose.
+        if (slug === current) {
+            popup.close()
+            return
+        }
         popup.message = ""
         if (_readCall)
             _readCall.cancel()
@@ -147,14 +169,21 @@ Item {
     // A new connection has no project of its own yet.
     function sendAgain() {
         const slug = core.project
+        const asked = workspaceId()
+        // A late answer from before a switch must not put the old project in the new workspace.
+        const same = () => root.workspaceId() === asked && root.core.project === slug
         CoreCall.appCall(core, "app/set_context", {project: slug}, {
             owner: root,
             ok: r => {
+                if (!same())
+                    return
                 root.core.noteProject(r.project || "")
                 root.effectiveProject = r.effective_project || ""
             },
             error: e => {
-                if (e && e.code === "project.unknown" && root.core.project === slug)
+                if (!same())
+                    return
+                if (e && e.code === "project.unknown")
                     root.core.noteProject("")
                 root.readEffective()
             }

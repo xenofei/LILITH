@@ -7,8 +7,10 @@
 //   failed start the session only looks for a core someone else started until then) shows where it
 //   can help. A hello refused over its workspace would only be refused again, so that offers "Use the
 //   default workspace" instead, and a refusal marked `never` offers nothing.
+// - `ready`, with `movedReason` (the top bar's): another client moved the default while the connection
+//   stayed up, so the core refuses every call. The same words and the same way out.
 //
-// `connecting` and `ready` show nothing. It can't be dismissed: it goes when the state does.
+// `connecting` and a plain `ready` show nothing. It can't be dismissed: it goes when the state does.
 import QtQuick
 import Lilith.UiKit
 import "../core/CoreGate.js" as CoreGate
@@ -17,10 +19,13 @@ LBanner {
     id: root
 
     required property var core
+    // Why the core refuses this session while connected, shown text; empty when it doesn't.
+    property string movedReason
 
     readonly property string connection: core ? core.connection : ""
     readonly property var cause: core && connection === "unavailable" ? core.unavailable : null
     readonly property bool refusedWorkspace: CoreGate.refusedWorkspace(core)
+                                             || (connection === "ready" && movedReason !== "")
     property alias retryButton: retryButton
     property alias defaultButton: defaultButton
     property string _useError
@@ -35,13 +40,17 @@ LBanner {
             return "Reconnecting… AI and workspace actions are off until the core is back."
         case "incompatible":
             return "This app can't use the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
-                   + "). Restart the core when it's idle: run lil core stop, then open the app again."
+                   + "). Restart the core when it's idle: run lil core stop, and the app reconnects by itself."
         case "unavailable":
             if (_useError !== "")
                 return _useError
             if (refusedWorkspace)
                 return "The core refused this workspace: " + reason
             return reason !== "" ? "The core isn't available: " + reason : "The core isn't available."
+        case "ready":
+            if (movedReason === "")
+                return ""
+            return _useError !== "" ? _useError : "The core refused this workspace: " + movedReason
         default:
             return ""
         }

@@ -51,7 +51,7 @@ TestCase {
         tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
         const lanes = [Shapes.lane({paused: true, reasons: ["manual"], held: 3}), Shapes.lane({lane: "cpu"})]
         answerAll("jobs.list", c => Shapes.jobsPage(c.args.status === "running" ? [Shapes.job("r1", "running"), Shapes.job("r2", "running")]
-                                                    : c.args.order === "queue" ? [Shapes.job("q1", "queued"), Shapes.job("q2", "queued"), Shapes.job("q3", "queued")]
+                                                    : c.args.order === "queue" || c.args.status === "queued" ? [Shapes.job("q1", "queued"), Shapes.job("q2", "queued"), Shapes.job("q3", "queued")]
                                                     : [], lanes))
         answerAll("caps.get", () => Shapes.tool(Shapes.capsView([Shapes.capRow("monthly", 412)])))
         answerAll("app/set_context", () => Shapes.context(tc.workspaceOne, null, "sketchbook"))

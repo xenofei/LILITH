@@ -125,6 +125,7 @@ Window {
             id: connectionBanner
             width: parent.width
             core: root.core
+            movedReason: topBar.movedReason
         }
 
         NoWorkspaceBanner {

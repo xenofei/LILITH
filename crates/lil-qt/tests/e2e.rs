@@ -738,6 +738,10 @@ fn after_set_default_the_old_session_is_refused_until_a_new_hello() {
                 env.register_workspace(&b, false);
                 env.workspace_id(&a)
             });
+            rig.probe.subscribe("workspace");
+            // The answer to a call made after the subscribe shows that it reached the core.
+            let fence = rig.probe.call("test.echo", json!({"text": "fence"}));
+            rig.probe.finished(&fence);
             let id = rig.probe.call(
                 "workspace.set_default",
                 json!({"path": b.display().to_string()}),
@@ -745,6 +749,18 @@ fn after_set_default_the_old_session_is_refused_until_a_new_hello() {
             let answer = rig.probe.finished(&id);
             let new_id = answer["structured"]["id"].as_str().unwrap().to_string();
             assert_eq!(new_id, rig.env.workspace_id(&b), "{answer}");
+            // The top bar follows this, so another client's move shows without a list read.
+            match rig.probe.wait_for(
+                "default_changed",
+                |s| matches!(s, Seen::Event { topic, .. } if topic == "workspace"),
+            ) {
+                Seen::Event { kind, data, .. } => {
+                    assert_eq!(kind, "event");
+                    assert_eq!(data["kind"], "default_changed", "{data}");
+                    assert_eq!(data["id"], new_id.as_str(), "{data}");
+                }
+                other => panic!("{other:?}"),
+            }
 
             for (tool, args) in [
                 ("test.echo", json!({"text": "old"})),

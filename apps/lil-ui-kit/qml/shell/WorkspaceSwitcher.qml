@@ -13,8 +13,11 @@
 // `Core.setWorkspace`, and `noticed` says what happened. If that hello fails, the rows say what
 // the core now serves, so the new default can be chosen by hand.
 //
-// While the core refuses the session's workspace at the hello (`lil workspace use` elsewhere, a
-// renamed folder) nothing can be listed, but the button stays usable and offers the way out.
+// While the core refuses the session's workspace, nothing can be listed, but the button stays usable
+// and offers the way out. That is a refused hello (`lil workspace use` elsewhere, then a lost
+// connection, a renamed folder), or `movedReason` while connected (the top bar's: another client
+// moved the default, so every call is refused). A list read refused with `workspace.unsupported`
+// tells it through `workspaceRefused`.
 import QtQuick
 import Lilith.UiKit
 import "../core/CoreGate.js" as CoreGate
@@ -25,8 +28,12 @@ Item {
     required property var core
     // The core is ready.
     required property bool ready
+    // Why the core refuses this session while connected, shown text; empty when it doesn't.
+    property string movedReason
 
-    readonly property bool refused: CoreGate.refusedWorkspace(core)
+    readonly property bool refused: CoreGate.refusedWorkspace(core) || movedReason !== ""
+    readonly property string refusedReason: movedReason !== "" ? movedReason
+                                            : refused ? shown(core.unavailable.reason, 300) : ""
     readonly property string currentId: core && core.workspace ? String(core.workspace.id) : ""
     readonly property string currentName: {
         if (!core || !core.workspace)
@@ -44,12 +51,24 @@ Item {
 
     // Something happened that outlives the list: (text, kind).
     signal noticed(string text, string kind)
+    // The core refused this session's workspace while connected, in its words.
+    signal workspaceRefused(string message)
+
+    // Its own click is moving the default, and the hello that follows is on the way.
+    function changingDefault() {
+        return !!_defaultCall || !!_switchCall
+    }
 
     implicitWidth: Math.min(button.implicitWidth, 220)
     implicitHeight: button.implicitHeight
 
     onReadyChanged: {
         if (!ready && !refused)
+            popup.close()
+    }
+    // A list left open as the refusal ends has nothing in it, and would stay empty.
+    onRefusedChanged: {
+        if (!refused)
             popup.close()
     }
 
@@ -89,7 +108,7 @@ Item {
     function open() {
         popup.message = ""
         if (refused)
-            popup.message = shown(core.unavailable.reason, 300)
+            popup.message = refusedReason
         else if (ready)
             read()
         else
@@ -100,6 +119,7 @@ Item {
     function read() {
         if (_listCall)
             _listCall.cancel()
+        const asked = currentId
         _listCall = CoreCall.call(core, "workspaces.list", {}, {
             owner: root,
             ok: r => {
@@ -110,6 +130,11 @@ Item {
             },
             error: e => {
                 root._listCall = null
+                if (e && e.code === "workspace.unsupported" && asked === root.currentId) {
+                    root.workspaceRefused(String(e.message))
+                    popup.message = root.refusedReason
+                    return
+                }
                 popup.message = root.refusedText("Couldn't list the workspaces", e)
             }
         })

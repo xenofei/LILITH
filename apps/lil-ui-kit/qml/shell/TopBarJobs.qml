@@ -2,8 +2,10 @@
 // follows the `jobs` topic and shows nothing itself.
 //
 // Counts come from the queue's own source, as the Jobs panel's live list does (Appendix G "Queue
-// position"): `jobs.list {status: "running"}` and every page of `jobs.list {order: "queue"}`, whose
-// JSON goes to a LiveJobsModel of its own as it came, never parsed here. The model is `countsOnly`:
+// position"): `jobs.list {status: "running"}` and every page of `jobs.list {order: "queue"}`, plus
+// every page of `{status: "queued"}`, since a dispatched job (substatus `submitting` or
+// `queued_in_engine`) stays `queued` and is in neither of the others; repeats are dropped by job id.
+// Their JSON goes to a LiveJobsModel of its own as it came, never parsed here. The model is `countsOnly`:
 // no rows, ETAs or sorting, so a job's event is a lookup. A `jobs` event is one job, never a count:
 // one that came, went or changed status asks for a read 150 ms after the last such event (and at
 // most 1 s after the first, so a steady stream still reads); a progress-only one does nothing more.
@@ -13,7 +15,10 @@
 // `resync_required` until the fresh read made after it has landed, and the pause control waits for
 // it: a core restart ends a pause, so the old state must not decide a toggle. `ready` after a loss
 // is what starts that read. It replaces nothing while it is out, and is no model reload: calls made
-// after `ready` reach the new connection, and a mark that comes after it only reads once more.
+// after `ready` reach the new connection, and a mark that comes after it only reads once more. Only
+// a mark's read carries nothing over; `ready`'s keeps a job of a status this build doesn't know
+// (P4a-R40), which no listing names. After a mark such a job isn't counted until its next event: the
+// panel gets it back from its reloaded history, and the bar has none.
 //
 // A failed read is asked again after 1 s, doubling up to 30 s while connected, as JsonListModel's
 // are; while disconnected nothing is asked, and `ready` reads at once.
@@ -48,8 +53,10 @@ Item {
     property real _dueSince: 0
     property bool _reading: false
     property bool _again: false
-    // The next read must carry nothing over (the first, or after a resync or a loss).
+    // The next read must carry nothing over (the first, or after a resync).
     property bool _fresh: true
+    // The next read is what makes the lanes current again (the first, or after a resync or a loss).
+    property bool _stale: true
     // Connection losses so far: a read that spans one doesn't speak for the new connection.
     property int _losses: 0
     property int _retryMs: 0
@@ -103,12 +110,14 @@ Item {
             return
         }
         const fresh = _fresh
+        const stale = _stale
         const losses = _losses
         _fresh = false
+        _stale = false
         _reading = true
         _lanesDuringRead = {}
         live.beginRead(fresh)
-        let open = 2
+        let open = 3
         let gone = false
         const done = () => {
             if (gone || --open > 0)
@@ -118,11 +127,11 @@ Item {
             root._retryMs = 0
             root.applyLanes(JSON.parse(live.lanesJson()))
             root.applyLanes(Object.keys(root._lanesDuringRead).map(k => root._lanesDuringRead[k]))
-            if (fresh && !root._fresh && losses === root._losses && root._connected)
+            if (stale && !root._stale && losses === root._losses && root._connected)
                 root.current = true
             if (root._again) {
                 root._again = false
-                if (root._fresh)
+                if (root._stale)
                     root.read()
                 else
                     root.requestRead()
@@ -134,6 +143,7 @@ Item {
             gone = true
             root._reading = false
             root._fresh = root._fresh || fresh
+            root._stale = root._stale || stale
             if (root._again) {
                 root._again = false
                 root.read()
@@ -151,22 +161,23 @@ Item {
                 done()
             }
         }, fail)
-        const page = cursor => rawCall(cursor ? {order: "queue", limit: 100, cursor: cursor}
-                                              : {order: "queue", limit: 100}, json => {
+        const pages = (args, cursor) => rawCall(Object.assign({limit: 100}, args, cursor ? {cursor: cursor} : {}), json => {
             if (gone)
                 return
             const next = live.addQueuePage(json)
             if (next !== "")
-                page(next)
+                pages(args, next)
             else
                 done()
         }, fail)
-        page("")
+        pages({order: "queue"}, "")
+        pages({status: "queued"}, "")
     }
 
     function onJobsEvent(kind, data) {
         if (kind !== "event") {
             _fresh = true
+            _stale = true
             current = false
             read()
             return
@@ -210,7 +221,7 @@ Item {
             if (root._connected) {
                 retry.stop()
                 root._retryMs = 0
-                root._fresh = true
+                root._stale = true
                 root.read()
             } else {
                 root.current = false

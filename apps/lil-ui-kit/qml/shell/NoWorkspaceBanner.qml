@@ -5,6 +5,13 @@
 // that is only missing for now (an unplugged drive), so `noticed` says it happened. Its id then goes
 // to `Core.setWorkspace`, a new hello; the banner leaves when that hello's workspace reaches
 // `Core.workspace`. A refusal stays on the banner.
+//
+// It says so before the click. `workspaces.list` is read when the banner shows (a session with no
+// workspace may). Where a default exists but can't be found, the banner says what would be replaced,
+// and "Use the default workspace" picks it up again once its drive is back. With no default at all
+// nothing is replaced, and it only says the folder becomes the default. If the read fails, it says
+// the same in general words, naming the command line and agents. There is no confirmation: the
+// folder dialog is already a deliberate step.
 import QtQuick
 import QtQuick.Dialogs
 import Lilith.UiKit
@@ -16,8 +23,12 @@ LBanner {
 
     readonly property bool wanted: !!core && core.connection === "ready" && !core.workspace
     property alias createButton: createButton
+    property alias defaultButton: defaultButton
     property var _call: null
     property string _refusal
+    // The default row that can't be found, or null; "ok" or "failed" once the list is read.
+    property var _lostDefault: null
+    property string _listRead
 
     // Something happened that outlives the banner: (text, kind). workspace.create's warnings (a
     // network or cloud-synced folder, a volume without stable ids) are in the text.
@@ -26,13 +37,73 @@ LBanner {
     closable: false
     kind: _refusal !== "" ? "danger" : "warning"
     visible: wanted
-    text: _refusal !== "" ? _refusal
-        : "No workspace is open. You can still generate; that is logged as loose usage."
+    text: {
+        if (_refusal !== "")
+            return _refusal
+        const open = "No workspace is open. You can still generate; that is logged as loose usage."
+        if (_lostDefault) {
+            const name = core.shownText(_lostDefault.name || folderName(_lostDefault.path), 60)
+            return "Your default workspace, " + name + " (" + core.shownText(String(_lostDefault.path), 120)
+                   + "), can't be found. If its drive is unplugged, plug it in and use it again. Choosing another"
+                   + " folder makes that one the default instead, for the command line and agents too."
+        }
+        if (_listRead === "ok")
+            return open + " The folder you choose becomes your default workspace."
+        if (_listRead === "failed")
+            return open + " The folder you choose becomes your default workspace, for the command line and agents too."
+        return open
+    }
 
     onWantedChanged: {
         _refusal = ""
-        if (wanted)
+        _lostDefault = null
+        _listRead = ""
+        if (wanted) {
             announce()
+            readDefault()
+        }
+    }
+
+    Component.onCompleted: {
+        if (wanted)
+            readDefault()
+    }
+
+    function readDefault() {
+        CoreCall.call(core, "workspaces.list", {}, {
+            owner: root,
+            ok: r => {
+                const rows = (r.structured || {}).workspaces || []
+                const lost = rows.find(w => w.default && (w.missing || w.problem))
+                root._lostDefault = lost || null
+                root._listRead = "ok"
+                if (lost)
+                    root.announce()
+            },
+            error: () => { root._listRead = "failed" }
+        })
+    }
+
+    function useDefault() {
+        if (_call)
+            return
+        _refusal = ""
+        _call = CoreCall.useDefaultWorkspace(core, {
+            owner: root,
+            ok: hello => {
+                root._call = null
+                if (!hello.workspace) {
+                    root._refusal = "Your default workspace still can't be found."
+                    root.announce()
+                }
+            },
+            error: e => {
+                root._call = null
+                root._refusal = "Couldn't use the default workspace: "
+                                + root.core.shownText(e && e.message ? String(e.message) : "the core didn't answer.", 300)
+                root.announce()
+            }
+        })
     }
 
     function refused(error) {
@@ -97,6 +168,13 @@ LBanner {
             enabled: root.wanted
             text: "Create or choose a workspace"
             onClicked: root.chooseFolder()
+        },
+        LButton {
+            id: defaultButton
+            requiresCore: true
+            visible: !!root._lostDefault
+            text: "Use the default workspace"
+            onClicked: root.useDefault()
         }
     ]
 

@@ -109,6 +109,17 @@ function context(workspace, project, effective) {
     return app({workspace: workspace, project: project, effective_project: effective})
 }
 
+// The `workspace` topic (workspace_tools.rs).
+function defaultChanged(id, path) {
+    return {kind: "default_changed", id: id, path: path}
+}
+
+// The core's own words for a session whose workspace isn't the default any more (workspace.rs).
+function notServed(served, requested) {
+    return refusal("workspace.unsupported", "This core serves only the default workspace, \"" + served
+                   + "\". To use \"" + requested + "\" instead, make it the default with `lil workspace use \"" + requested + "\"`.")
+}
+
 // `projects.list` (Appendix G).
 function projectRows() {
     return [{project: "sketchbook", name: "Sketchbook", status: "active", assets: 3},

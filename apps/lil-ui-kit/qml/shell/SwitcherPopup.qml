@@ -1,8 +1,9 @@
 // The list a top-bar switcher opens: a keyboard-navigable list (one tab stop, the arrow keys and
 // Enter work inside it, A11yWalk's rule), and a line for what went wrong. The list takes the
 // keyboard focus when it opens; Escape or a press outside its switcher closes it (a press on the
-// switcher's own button toggles it there). `activated(index)` is Enter on a row; the rows handle
-// their own clicks. It stays inside the window: its list shrinks to the room below the switcher.
+// switcher's own button toggles it there), and so does its window losing the activation, as a press
+// on a floating dock does. `activated(index)` is Enter on a row; the rows handle their own clicks.
+// It stays inside the window: its list shrinks to the room below the switcher.
 //
 // While the core has refused the session's workspace there is nothing to list: `offerDefault` shows
 // "Use the default workspace" instead, which is `useDefault()`.
@@ -47,6 +48,14 @@ T.Popup {
         const below = parent.mapToItem(null, 0, parent.height).y + 4
         _listRoom = Math.max(60, Math.min(320, window.height - below - margins - topPadding - bottomPadding))
     }
+    Connections {
+        target: root.parent ? root.parent.Window.window : null
+        function onActiveChanged() {
+            if (root.visible && !target.active)
+                root.close()
+        }
+    }
+
     onOpened: {
         if (offerDefault)
             defaultButton.forceActiveFocus(Qt.PopupFocusReason)

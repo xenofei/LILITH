@@ -94,6 +94,10 @@ TestCase {
         return c.name === "jobs.list" && c.args.order === "queue"
     }
 
+    function isQueuedRead(c) {
+        return c.name === "jobs.list" && c.args.status === "queued"
+    }
+
     // `app/set_context {}`, which only reads.
     function isContextRead(c) {
         return c.name === "app/set_context" && c.args.project === undefined
@@ -104,10 +108,18 @@ TestCase {
         return c.name === "app/set_context" && c.args.project !== undefined
     }
 
-    // One read of the live jobs: the running jobs, the queue, and the lanes.
-    function answerRead(core, running, queued, lanes) {
+    // One read of the live jobs, as the core answers it: the running jobs; the queue; and every
+    // queued job, which is the queue and the dispatched jobs the queue doesn't list.
+    function answerRead(core, running, queued, lanes, dispatched) {
         answer(core, isRunningRead, Shapes.jobsPage(running, lanes), "the running read")
         answer(core, isQueueRead, Shapes.jobsPage(queued, lanes), "the queue read")
+        answer(core, isQueuedRead, Shapes.jobsPage((dispatched || []).concat(queued), lanes), "the queued read")
+    }
+
+    function refuseRead(core, code, message) {
+        answer(core, isRunningRead, Shapes.refusal(code, message), "the running read")
+        answer(core, isQueueRead, Shapes.refusal(code, message), "the queue read")
+        answer(core, isQueuedRead, Shapes.refusal(code, message), "the queued read")
     }
 
     // Answers every read still out, in a shell where the Jobs panel reads too.
@@ -179,6 +191,14 @@ TestCase {
         return sw
     }
 
+    function openWorkspacesRefused(t) {
+        const sw = t.bar.workspaceSwitcher
+        mouseClick(sw.button)
+        tryVerify(() => sw.popup.opened)
+        answer(t.core, named("workspaces.list"), Shapes.notServed("D:/art/quay", "D:/art/harbor"), "workspaces.list")
+        return sw
+    }
+
     function openWorkspaces(t, rows) {
         const sw = t.bar.workspaceSwitcher
         const list = rows || Shapes.workspaceRows()
@@ -217,6 +237,27 @@ TestCase {
         compare(t.bar.connectionIndicator.text, "Connected")
     }
 
+    function test_a_dispatched_job_counts_once() { // spec: APP-006, CORE-117
+        // Status `queued`, substatus `submitting` or `queued_in_engine`: in neither `order: "queue"`
+        // nor `status: "running"`, and a queued job is listed by both queued reads.
+        const t = load()
+        t.core.emit("jobs", "resync_required", null)
+        answerRead(t.core, [Shapes.job("r1", "running")], [Shapes.job("q1", "queued")], undefined,
+                   [Shapes.job("d1", "queued", {substatus: "submitting"}),
+                    Shapes.job("d2", "queued", {substatus: "queued_in_engine"})])
+        tryCompare(t.bar.jobsIndicator, "text", "1 running · 3 queued")
+
+        // Over more than a page, too.
+        t.core.emit("jobs", "resync_required", null)
+        answer(t.core, isRunningRead, Shapes.jobsPage([]))
+        answer(t.core, isQueueRead, Shapes.jobsPage([Shapes.job("q1", "queued")]))
+        const first = answer(t.core, isQueuedRead, Shapes.jobsPage([Shapes.job("d1", "queued", {substatus: "submitting"})], undefined, "c2"))
+        const second = answer(t.core, isQueuedRead, Shapes.jobsPage([Shapes.job("q1", "queued")]))
+        compare(first.args.cursor, undefined)
+        compare(second.args.cursor, "c2", "its next page")
+        tryCompare(t.bar.jobsIndicator, "text", "0 running · 2 queued")
+    }
+
     function test_a_cold_start_waits_for_the_core_then_reads_everything() { // spec: APP-006, ARCH-100
         const core = createTemporaryObject(fakeComponent, tc, {connection: "connecting", workspace: null})
         const w = createTemporaryObject(barWindow, tc, {core: core})
@@ -243,8 +284,7 @@ TestCase {
         // Calls made as the bar is made can still fail, when the connection blinks first.
         const t = load({unanswered: true})
         answer(t.core, named("caps.get"), Shapes.refusal("core.unreachable", "No core."))
-        answer(t.core, isRunningRead, Shapes.refusal("core.unreachable", "No core."))
-        answer(t.core, isQueueRead, Shapes.refusal("core.unreachable", "No core."))
+        refuseRead(t.core, "core.unreachable", "No core.")
         compare(t.bar.jobsIndicator.text, "—")
         verify(!t.bar.spendIndicator.visible)
 
@@ -277,8 +317,7 @@ TestCase {
         compare(open(t.core, named("caps.get")).length, 0, "no more once it is in")
 
         // The jobs read likewise.
-        answer(t.core, isRunningRead, Shapes.refusal("core.unreachable", "No core."))
-        answer(t.core, isQueueRead, Shapes.refusal("core.unreachable", "No core."))
+        refuseRead(t.core, "core.unreachable", "No core.")
         compare(t.bar.jobsIndicator.text, "—")
         tryVerify(() => open(t.core, isRunningRead).length > 0, 1500, "read again")
         answerRead(t.core, [Shapes.job("r1", "running")], [])
@@ -396,6 +435,10 @@ TestCase {
 
     function test_a_same_core_reconnect_needs_its_read_too() { // spec: ARCH-100, APP-035
         const t = load()
+        // A status this build doesn't know is in no listing, and a reconnect isn't a new core.
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("odd", "paused_by_director")})
+        answerRead(t.core, [], [])
+        tryCompare(t.bar.jobsIndicator, "text", "0 running · 1 queued")
         const before = t.core.calls.filter(isRunningRead).length
         t.core.applyState({connection: "reconnecting"})
         t.core.applyState({connection: "ready", workspace: workspaceOne})
@@ -403,6 +446,7 @@ TestCase {
         compare(t.core.calls.filter(isRunningRead).length, before + 1, "one read, and no mark is coming")
         answerRead(t.core, [], [])
         tryVerify(() => t.bar.jobs.current)
+        compare(t.bar.jobsIndicator.text, "0 running · 1 queued", "the bar has no history to get it back from (P4a-R40)")
     }
 
     function test_a_lost_connection_shows_no_figure_as_live() { // spec: APP-034, APP-006
@@ -554,6 +598,14 @@ TestCase {
         answer(t.core, named("app/queue.resume"), Shapes.app(Shapes.lane()))
         verify(!t.bar.notice.visible, "and it stays gone on success")
         compare(t.bar.pauseButton.text, "Pause GPU work")
+
+        // But only its own: what another part of the bar said stays.
+        t.bar.showNotice("Quay is now your default workspace.", "ok")
+        t.bar.togglePause()
+        verify(t.bar.notice.visible, "not the pause control's to close")
+        compare(t.bar.notice.text, "Quay is now your default workspace.")
+        answer(t.core, named("app/queue.pause"), Shapes.app(Shapes.lane({paused: true, reasons: ["manual"]})))
+        verify(t.bar.notice.visible)
     }
 
     function test_make_this_the_default_then_a_new_hello() { // spec: APP-006, ARCH-030, ARCH-090
@@ -632,6 +684,113 @@ TestCase {
         compare(sw.popup.message, "Couldn't switch the workspace: This core serves \"Harbor\".")
     }
 
+    function test_a_late_resend_answer_cannot_cross_a_workspace_switch() { // spec: ARCH-088
+        const t = load()
+        t.core.project = "harbor"
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: workspaceOne})
+        tryVerify(() => open(t.core, isProjectSet).length === 1)
+        // The switch overtakes the old session's answer.
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        t.core.applyState({connection: "ready", workspace: quay})
+        compare(t.core.project, "")
+        answer(t.core, isProjectSet, Shapes.context(workspaceOne, "harbor", "harbor"))
+        compare(t.core.project, "", "the old project stays out of the new workspace")
+        answer(t.core, isContextRead, Shapes.context(quay, null, "sketchbook"))
+        compare(t.bar.projectSwitcher.effectiveProject, "sketchbook")
+    }
+
+    function test_the_row_already_shown_only_closes() { // spec: ARCH-088
+        // It would pin a fallback nobody chose, from a stray Enter.
+        const t = load()
+        const sw = openProjects(t)
+        compare(sw.popup.view.currentIndex, 0, "it opens on the current row")
+        // What Enter on that row does.
+        sw.popup.activated(sw.popup.view.currentIndex)
+        tryVerify(() => !sw.popup.visible)
+        openProjects(t)
+        const r = row(sw.popup, p => p.project === "sketchbook")
+        wait(50)
+        mouseClick(r, 5, 5)
+        tryVerify(() => !sw.popup.visible)
+        compare(t.core.calls.filter(isProjectSet).length, 0, "nothing was set")
+        compare(t.core.project, "")
+    }
+
+    function test_another_client_moves_the_default_while_connected() { // spec: ARCH-090, APP-006, ARCH-100
+        // `lil workspace use` in a terminal: the connection stays up, every call is refused.
+        const t = load()
+        const sw = t.bar.workspaceSwitcher
+        compare(t.core.subscriberCount("workspace"), 1, "it follows the topic")
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        t.core.emit("workspace", "event", Shapes.defaultChanged(quay.id, quay.path))
+        verify(t.bar.movedReason.indexOf("quay became the default workspace") >= 0, t.bar.movedReason)
+        compare(t.bar.connectionIndicator.text, "Workspace refused")
+        compare(t.bar.connectionIndicator.kind, "danger")
+        verify(sw.button.enabled)
+        verify(t.bar.projectSwitcher.button.enabled)
+        compare(t.bar.projectSwitcher.button.text, "No project ▾")
+
+        // The list isn't read: the way out is what it offers.
+        const reads = t.core.calls.filter(named("workspaces.list")).length
+        mouseClick(sw.button)
+        tryVerify(() => sw.popup.opened)
+        compare(t.core.calls.filter(named("workspaces.list")).length, reads)
+        compare(sw.popup.message, t.bar.movedReason)
+        verify(sw.popup.defaultButton.visible)
+        wait(50)
+        mouseClick(sw.popup.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        compare(t.core.calls.filter(named("workspace.set_default")).length, 0)
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.hello(quay))
+        t.core.applyState({connection: "ready", workspace: quay})
+        compare(t.bar.movedReason, "", "a new hello ends it")
+        compare(t.bar.connectionIndicator.text, "Connected")
+        tryVerify(() => !sw.popup.visible, 2000, "a list left open has nothing in it now")
+
+        // Back to this one: nothing to say.
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws1", "D:/art/harbor"))
+        verify(t.bar.movedReason !== "")
+        t.core.emit("workspace", "event", Shapes.defaultChanged(quay.id, quay.path))
+        compare(t.bar.movedReason, "", "this session's own workspace is the default again")
+    }
+
+    function test_a_refused_list_read_is_the_same_state() { // spec: ARCH-090, ARCH-100
+        // The event can be missed; the core's real refusal says the same.
+        const t = load()
+        const sw = openWorkspacesRefused(t)
+        verify(t.bar.movedReason.indexOf("This core serves only the default workspace") >= 0, t.bar.movedReason)
+        compare(sw.popup.message, t.bar.movedReason)
+        verify(sw.popup.defaultButton.visible)
+        compare(t.bar.connectionIndicator.text, "Workspace refused")
+        sw.popup.close()
+        tryVerify(() => !sw.popup.visible)
+
+        // Another refusal is only a refusal.
+        t.core.applyState({connection: "ready", workspace: workspaceOne})
+        compare(t.bar.movedReason, "")
+        mouseClick(sw.button)
+        tryVerify(() => sw.popup.opened)
+        answer(t.core, named("workspaces.list"), Shapes.refusal("store.io", "Busy."))
+        compare(t.bar.movedReason, "")
+        compare(sw.popup.message, "Couldn't list the workspaces: Busy.")
+    }
+
+    function test_own_make_default_is_not_another_clients_move() { // spec: ARCH-090
+        const t = load()
+        const sw = openWorkspaces(t)
+        mouseClick(makeDefaultButton(sw.popup, "ws2"))
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        // The event overtakes the answer, and the answer the hello.
+        t.core.emit("workspace", "event", Shapes.defaultChanged(quay.id, quay.path))
+        compare(t.bar.movedReason, "")
+        answer(t.core, named("workspace.set_default"), Shapes.tool(quay))
+        t.core.emit("workspace", "event", Shapes.defaultChanged(quay.id, quay.path))
+        compare(t.bar.movedReason, "")
+    }
+
     function test_unavailable_workspaces_say_why_and_cannot_be_chosen() { // spec: APP-006, ARCH-090
         const t = load()
         const sw = openWorkspaces(t)
@@ -683,13 +842,13 @@ TestCase {
 
         // From the keyboard: the list has the focus, the arrows move and Enter chooses.
         tryVerify(() => sw.popup.view.activeFocus)
-        sw.popup.view.currentIndex = 0
-        keyClick(Qt.Key_Down)
-        compare(sw.popup.view.currentIndex, 1)
+        sw.popup.view.currentIndex = 1
+        keyClick(Qt.Key_Up)
+        compare(sw.popup.view.currentIndex, 0)
         keyClick(Qt.Key_Return)
         const last = t.core.calls.filter(isProjectSet).pop()
-        compare(last.args, {project: "harbor"})
-        answer(t.core, isProjectSet, Shapes.context(workspaceOne, "harbor", "harbor"))
+        compare(last.args, {project: "sketchbook"})
+        answer(t.core, isProjectSet, Shapes.context(workspaceOne, "sketchbook", "sketchbook"))
     }
 
     function test_a_switcher_button_toggles_its_list() { // spec: APP-006
@@ -899,6 +1058,27 @@ TestCase {
         tryVerify(() => t.bar.pausedHolder.visible)
         clean(t.bar.pausedBadge.text, 60)
         plain(t.bar)
+    }
+
+    // The Task 22 audit's probe, on the bar alone: the panel beside it in a shell has its own.
+    function test_an_img_on_the_bar_shows_as_text_and_loads_nothing() { // spec: APP-156, P4a-R8
+        const img = "<img src=\"http://localhost:9/x.png\"><b>bad</b>"
+        const before = TestFiles.networkRequests()
+        const t = load()
+        t.bar.togglePause()
+        answer(t.core, named("app/queue.pause"), Shapes.refusal("caller.not_allowed", img))
+        verify(t.bar.notice.text.indexOf(img) >= 0, t.bar.notice.text)
+        t.core.emit("jobs", "event", {kind: "queue", state: Shapes.lane({paused: true, reasons: [img]})})
+        tryVerify(() => t.bar.pausedHolder.visible)
+        verify(t.bar.pausedBadge.text.indexOf("<img src=") >= 0, t.bar.pausedBadge.text)
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/<img src=x.png><b>bad"))
+        verify(t.bar.movedReason.indexOf("<img src=x.png><b>bad") >= 0, t.bar.movedReason)
+        eachItem(t.bar, i => {
+            if (i.textFormat !== undefined)
+                compare(i.textFormat, Text.PlainText, "plain text: " + i.text)
+        })
+        wait(500)
+        compare(TestFiles.networkRequests(), before, "nothing loaded the <img>")
     }
 
     function test_the_bar_wraps_rather_than_hiding_a_control() { // spec: APP-156

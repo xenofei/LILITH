@@ -90,7 +90,7 @@ TestCase {
     property var answered: ({})
 
     function isLiveRead(c) {
-        return c.name === "jobs.list" && (c.args.status === "running" || c.args.order === "queue")
+        return c.name === "jobs.list" && (c.args.status === "running" || c.args.status === "queued" || c.args.order === "queue")
     }
 
     function page(c, q, run) {

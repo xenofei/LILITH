@@ -147,6 +147,7 @@ TestCase {
         verify(banner.visible)
         verify(banner.text.indexOf("Restart the core when it's idle") >= 0, banner.text)
         verify(banner.text.indexOf("lil core stop") >= 0, "it says how: " + banner.text)
+        verify(banner.text.indexOf("reconnects by itself") >= 0, banner.text)
         verify(banner.text.indexOf("protocol 2.0") >= 0, banner.text)
         compare(banner.kind, "danger")
         verify(!banner.retryButton.visible, "the session goes on trying by itself")
@@ -323,9 +324,152 @@ TestCase {
         t.core.applyState({connection: "ready", workspace: made})
         verify(!banner.visible, "the banner leaves")
         tryVerify(() => t.shell.activeFocusItem && !String(t.shell.activeFocusItem).startsWith("QQuickRootItem"), 2000,
-                  "the focus moves on: " + t.shell.activeFocusItem)
+                  "the focus moves on")
+        const moved = t.shell.activeFocusItem
+        verify(moved.visible && moved.enabled && moved !== banner.createButton, "to a control that can take it: " + moved)
+        verify(walk.tabChain(t.shell.contentItem).indexOf(moved) >= 0, "one Tab reaches: " + moved)
         verify(t.shell.topBar.projectSwitcher.button.enabled, "projects can be chosen now")
         compare(t.core.calls.filter(named("workspace.set_default")).length, 0)
+    }
+
+    function test_a_first_run_says_the_folder_becomes_the_default() { // spec: APP-016
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        verify(!banner.defaultButton.visible)
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: []}), "read when the banner shows")
+        verify(banner.text.indexOf("The folder you choose becomes your default workspace.") >= 0, banner.text)
+        verify(banner.text.indexOf("command line") < 0, "nothing is replaced: " + banner.text)
+        verify(!banner.defaultButton.visible)
+    }
+
+    function test_a_lost_default_says_what_would_be_replaced_before_the_click() { // spec: APP-016, P4a-R34
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: [
+            {id: "ws1", path: "E:/art/harbor", name: "Harbor", default: true, served: false, missing: true},
+            {id: "ws2", path: "D:/art/quay", default: false, served: false, missing: false}]}))
+        verify(banner.text.indexOf("Your default workspace, Harbor (E:/art/harbor), can't be found.") >= 0, banner.text)
+        verify(banner.text.indexOf("plug it in") >= 0, banner.text)
+        verify(banner.text.indexOf("for the command line and agents too") >= 0, banner.text)
+        compare(banner.createButton.text, "Create or choose a workspace", "APP-016's words")
+        verify(banner.defaultButton.visible)
+        compare(banner.defaultButton.text, "Use the default workspace")
+        compare(walk.report(banner), [])
+        compare(t.core.calls.filter(named("workspace.create")).length, 0)
+
+        // Its drive still out: nothing changes, and it says so.
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        let hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.hello(null))
+        verify(banner.visible)
+        compare(banner.text, "Your default workspace still can't be found.")
+
+        // Its drive back: the same button picks it up, and no default was changed.
+        mouseClick(banner.defaultButton)
+        hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        answered[hello[0].id] = true
+        const harbor = {id: "ws1", path: "E:/art/harbor"}
+        t.core.respond(hello[0].id, Shapes.hello(harbor))
+        t.core.applyState({connection: "ready", workspace: harbor})
+        verify(!banner.visible)
+        compare(t.core.calls.filter(named("workspace.create")).length, 0)
+        compare(t.core.calls.filter(named("workspace.set_default")).length, 0)
+    }
+
+    function test_a_failed_list_read_says_it_in_general_words() { // spec: APP-016
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        answer(t.core, named("workspaces.list"), Shapes.refusal("store.io", "suite.toml can't be read."))
+        verify(banner.text.indexOf("for the command line and agents too") >= 0, banner.text)
+        verify(!banner.defaultButton.visible)
+    }
+
+    function test_the_default_moved_while_connected_shows_on_the_banner() { // spec: ARCH-100, ARCH-090
+        const t = load()
+        const banner = t.shell.connectionBanner
+        verify(!banner.visible)
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/quay"))
+        verify(banner.visible, "without waiting for a list to open")
+        verify(banner.text.startsWith("The core refused this workspace: quay became the default workspace"), banner.text)
+        verify(!banner.retryButton.visible)
+        verify(banner.defaultButton.visible)
+        compare(walk.report(banner), [])
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        answered[hello[0].id] = true
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        t.core.respond(hello[0].id, Shapes.hello(quay))
+        t.core.applyState({connection: "ready", workspace: quay})
+        verify(!banner.visible, "a new hello ends it")
+    }
+
+    // The Task 22 audit's probe: an <img> in every message from outside, and no network request.
+    function test_an_img_in_any_outside_message_shows_as_text_and_loads_nothing() { // spec: APP-156, P4a-R8
+        const img = "<img src=\"http://localhost:9/x.png\"><b>bad</b>"
+        const plain = root => {
+            const walkTexts = i => {
+                if (i.textFormat !== undefined)
+                    compare(i.textFormat, Text.PlainText, "plain text: " + i.text)
+                for (let n = 0; n < i.children.length; ++n)
+                    walkTexts(i.children[n])
+            }
+            walkTexts(root)
+        }
+        const before = TestFiles.networkRequests()
+
+        // The connection banner: an unavailable reason, a refused hello, an incompatible protocol.
+        const t = load()
+        const top = t.shell.topBar
+        const banner = t.shell.connectionBanner
+        t.core.applyState({connection: "unavailable", unavailable: Shapes.otherCause("other", img)})
+        verify(banner.text.indexOf(img) >= 0, banner.text)
+        plain(banner)
+        t.core.applyState({connection: "unavailable", unavailable: Shapes.refusedHello("workspace.unknown", img)})
+        verify(banner.text.indexOf(img) >= 0, banner.text)
+        plain(banner)
+        t.core.applyState({connection: "incompatible", coreProtocol: img})
+        plain(banner)
+
+        // A switcher's message and its rows.
+        t.core.applyState({connection: "ready", workspace: workspaceOne})
+        const sw = top.workspaceSwitcher
+        mouseClick(sw.button)
+        tryVerify(() => sw.popup.opened)
+        answer(t.core, named("workspaces.list"), Shapes.refusal("store.io", img))
+        verify(sw.popup.message.indexOf(img) >= 0, sw.popup.message)
+        plain(sw.popup.contentItem)
+        sw.popup.close()
+        tryVerify(() => !sw.popup.visible)
+
+        // The moved default, from a folder's name. (The bar's own notice and badge are in
+        // tst_top_bar: a lane's reason reaches the Jobs panel's headers in a shell too.)
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/" + img))
+        plain(banner)
+
+        // The no-workspace banner: a refusal, and a lost default's name and path. A new core's
+        // request ids start again.
+        answered = {}
+        const u = load(null)
+        const none = u.shell.noWorkspaceBanner
+        answer(u.core, named("workspaces.list"), Shapes.tool({workspaces: [
+            {id: "ws1", path: "E:/" + img, name: img, default: true, served: false, missing: true}]}))
+        verify(none.text.indexOf(img) >= 0, none.text)
+        plain(none)
+        none.folderChosen("file:///D:/art/x")
+        answer(u.core, named("workspace.create"), Shapes.refusal("workspace.path_invalid", img))
+        verify(none.text.indexOf(img) >= 0, none.text)
+        plain(none)
+
+        wait(500)
+        compare(TestFiles.networkRequests(), before, "nothing loaded the <img>")
     }
 
     function test_no_workspace_refusals_stay_on_the_banner() { // spec: APP-016

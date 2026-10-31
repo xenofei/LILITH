@@ -13,7 +13,11 @@
 //   again after 1 s, doubling up to 30 s while connected, and at once on `ready` while it has none.
 // - **GPU** ("GPU 63 % · 9.5/16 GiB · 71 °C"): the `telemetry` topic's samples, whose throttle is
 //   Core's (APP-027).
-// - **Connection:** `Core.connection` in words.
+// - **Connection:** `Core.connection` in words. While connected, the core can still refuse this
+//   session: another client moved the default (`lil workspace use`, an agent), and it serves only
+//   the default. `movedReason` says so, from the `workspace` topic's `default_changed`, or from a
+//   switcher's list read refused with `workspace.unsupported`; the connection banner and both
+//   switchers then offer "Use the default workspace". A new hello ends it.
 //
 // Without a connection no figure is live: the GPU and the jobs read "—", the spend is muted, and the
 // badge goes.
@@ -85,8 +89,11 @@ Rectangle {
     property bool _capsDue: false
     property bool _capsFailed: false
     property int _capsRetryMs: 0
-    // `notice` says a press had to wait: it goes when the wait is over.
-    property bool _waitNotice: false
+    // What `notice` holds from the pause control: "wait" (a press had to wait; it goes when the wait
+    // is over), "refusal" (it goes with the next attempt), else "" (not the pause control's: stays).
+    property string _pauseNotice
+    // See the header. Shown text; empty while the core serves this session.
+    property string movedReason
     // What the bar's items leave of its width: all of it pushes the indicators to the right. When
     // they don't all fit they wrap to a next line instead, so none is out of reach.
     readonly property real _spare: {
@@ -125,7 +132,7 @@ Rectangle {
 
     function connectionText() {
         switch (core ? core.connection : "") {
-        case "ready": return "Connected"
+        case "ready": return movedReason !== "" ? "Workspace refused" : "Connected"
         case "connecting": return "Connecting…"
         case "reconnecting": return "Reconnecting…"
         case "incompatible": return "Core incompatible"
@@ -139,10 +146,12 @@ Rectangle {
         if (!coreReady || !jobs.current) {
             showNotice(coreReady ? "Wait a moment: the state of GPU work is still loading."
                                  : "GPU work can't be paused or resumed until the core is connected.", "warning")
-            _waitNotice = true
+            _pauseNotice = "wait"
             return
         }
-        notice.close()
+        if (_pauseNotice !== "")
+            notice.close()
+        _pauseNotice = ""
         const resume = yourPause
         _pauseCall = CoreCall.appCall(core, resume ? "app/queue.resume" : "app/queue.pause", {lane: "gpu-heavy"}, {
             owner: root,
@@ -155,15 +164,31 @@ Rectangle {
                 root.showNotice((resume ? "Couldn't resume GPU work: " : "Couldn't pause GPU work: ")
                                 + root.core.shownText(e && e.message ? String(e.message) : "the core didn't answer.", 300),
                                 "danger")
+                root._pauseNotice = "refusal"
             },
             pending: () => { root._pauseCall = null }
         })
     }
 
     function showNotice(text, kind) {
-        _waitNotice = false
+        _pauseNotice = ""
         notice.kind = kind
         notice.show(text)
+    }
+
+    function folderName(path) {
+        const parts = String(path || "").split(/[\\/]/).filter(p => p !== "")
+        return parts.length > 0 ? parts[parts.length - 1] : String(path || "")
+    }
+
+    function onWorkspaceEvent(kind, data) {
+        if (kind !== "event" || !data || data.kind !== "default_changed" || !core.workspace)
+            return
+        if (String(data.id) === String(core.workspace.id))
+            movedReason = ""
+        else if (!workspaceSwitcher.changingDefault())
+            movedReason = core.shownText(folderName(data.path), 60)
+                          + " became the default workspace, and this core serves only the default, so it refuses this one's calls."
     }
 
     function readCaps() {
@@ -229,13 +254,18 @@ Rectangle {
         CoreCall.subscribe(core, "telemetry", root, (kind, seq, data) => root.onTelemetry(kind, data))
         CoreCall.subscribe(core, "caps", root, () => root.requestCapsRead())
         CoreCall.subscribe(core, "usage", root, () => root.requestCapsRead())
+        CoreCall.subscribe(core, "workspace", root, (kind, seq, data) => root.onWorkspaceEvent(kind, data))
         readCaps()
     }
 
     Connections {
         target: root.core
         ignoreUnknownSignals: true
+        function onWorkspaceChanged() {
+            root.movedReason = ""
+        }
         function onConnectionChanged() {
+            root.movedReason = ""
             capsRetry.stop()
             if (root.coreReady && (root._capsFailed || !root.capsView)) {
                 root._capsRetryMs = 0
@@ -247,8 +277,8 @@ Rectangle {
     Connections {
         target: jobs
         function onCurrentChanged() {
-            if (jobs.current && root._waitNotice) {
-                root._waitNotice = false
+            if (jobs.current && root._pauseNotice === "wait") {
+                root._pauseNotice = ""
                 notice.close()
             }
         }
@@ -308,7 +338,9 @@ Rectangle {
                 height: 28
                 core: root.core
                 ready: root.coreReady
+                movedReason: root.movedReason
                 onNoticed: (text, kind) => root.showNotice(text, kind)
+                onWorkspaceRefused: message => { root.movedReason = root.core.shownText(message, 300) }
             }
 
             ProjectSwitcher {
@@ -317,6 +349,8 @@ Rectangle {
                 height: 28
                 core: root.core
                 ready: root.coreReady && !!root.core.workspace
+                movedReason: root.movedReason
+                onWorkspaceRefused: message => { root.movedReason = root.core.shownText(message, 300) }
             }
 
             Item {
@@ -372,7 +406,8 @@ Rectangle {
                 readonly property string state_: root.core ? root.core.connection : ""
                 text: root.connectionText()
                 name: "Core connection: " + text
-                kind: state_ === "ready" ? "ok" : state_ === "reconnecting" || state_ === "connecting" ? "warning" : "danger"
+                kind: state_ === "ready" ? (root.movedReason !== "" ? "danger" : "ok")
+                      : state_ === "reconnecting" || state_ === "connecting" ? "warning" : "danger"
             }
 
             Item {
