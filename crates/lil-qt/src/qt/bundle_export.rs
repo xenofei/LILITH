@@ -131,11 +131,7 @@ impl qobject::BundleExport {
     }
 }
 
-fn finish(
-    mut obj: Pin<&mut qobject::BundleExport>,
-    path: &str,
-    outcome: Result<(), CopyFailure>,
-) {
+fn finish(mut obj: Pin<&mut qobject::BundleExport>, path: &str, outcome: Result<(), CopyFailure>) {
     set_busy(obj.as_mut(), false);
     match outcome {
         Ok(()) => obj.saved(QString::from(path)),

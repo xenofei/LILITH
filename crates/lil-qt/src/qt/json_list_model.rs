@@ -871,8 +871,7 @@ impl qobject::EventLogModel {
         seq: f64,
         data_json: &QString,
     ) {
-        let (topic, kind, data_json) =
-            (topic.to_string(), kind.to_string(), data_json.to_string());
+        let (topic, kind, data_json) = (topic.to_string(), kind.to_string(), data_json.to_string());
         if is_heartbeat(&topic, &kind, &data_json) {
             return;
         }
