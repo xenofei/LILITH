@@ -12,7 +12,7 @@ const FILES_MAX = 100
 function who(callerKind, shown) {
     const kind = String(callerKind)
     if (kind.startsWith("ui:"))
-        return "You, in the " + shown(kind.slice(3), 60) + " app"
+        return "The " + shown(kind.slice(3), 60) + " app (you)"
     switch (kind) {
     case "mcp": return "Claude Code"
     case "assistant": return "The assistant"
