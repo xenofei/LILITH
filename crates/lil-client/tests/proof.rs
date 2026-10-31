@@ -495,7 +495,7 @@ fn a_low_holder_of_the_core_pipe_fails_the_proof_and_reads_nothing_more() {
     );
     for request in &requests {
         assert_eq!(request["method"], "core/prove", "{request}");
-        // 0 bytes about the client: no workspace, no app name, no version.
+        // Nothing about the client in what it is sent: no workspace, no app name, no version.
         assert_eq!(request.as_object().unwrap().len(), 4, "{request}");
         assert_eq!(request["params"].as_object().unwrap().len(), 1, "{request}");
     }

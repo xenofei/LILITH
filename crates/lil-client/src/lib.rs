@@ -281,6 +281,20 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientError::NotRunning => f.write_str("The LILITH core is not running."),
+            // The point comes first and the path last: a banner cuts this at 300 characters.
+            ClientError::Untrusted { pid, image, reason } if reason == NOT_PROVED => {
+                write!(
+                    f,
+                    "The program serving the LILITH core pipe (pid {pid}) did not prove that it \
+                     holds the pipe, so this client does not trust it. A core from an older \
+                     LILITH build can't answer this: it ends once no LILITH app is open and it \
+                     has been idle, or you can end it in Task Manager."
+                )?;
+                if !image.as_os_str().is_empty() {
+                    write!(f, " The pipe reports {}.", image.display())?;
+                }
+                Ok(())
+            }
             ClientError::Untrusted { pid, image, reason } => {
                 if image.as_os_str().is_empty() {
                     write!(f, "The LILITH core pipe is served by process {pid}")?;
@@ -295,13 +309,6 @@ impl fmt::Display for ClientError {
                 // Only a same-user core in another folder can be asked to drain.
                 if reason.starts_with(WRONG_FOLDER) {
                     f.write_str(" `lil core stop` can ask it to finish.")?;
-                }
-                // Says what an old core does, and nothing about what this server is.
-                if reason == NOT_PROVED {
-                    f.write_str(
-                        " A core from an older LILITH build can't answer this either: it ends by \
-                         itself when idle, or it can be ended by hand in Task Manager.",
-                    )?;
                 }
                 Ok(())
             }
@@ -602,6 +609,21 @@ mod tests {
         let user = untrusted("it runs as another user".to_string()).to_string();
         assert!(!user.contains("lil core stop"), "{user}");
         assert!(user.contains("77"), "{user}");
+    }
+
+    /// The banner shows the first 300 characters: the way out survives, however long the path.
+    #[test] // spec: ARCH-027
+    fn a_failed_proof_says_what_to_do_within_a_banners_300_characters() {
+        let text = ClientError::Untrusted {
+            pid: u32::MAX,
+            image: PathBuf::from(format!(r"C:\{}\lil-core.exe", "long folder ".repeat(40))),
+            reason: NOT_PROVED.to_string(),
+        }
+        .to_string();
+        let shown: String = text.chars().take(300).collect();
+        assert!(shown.contains("Task Manager."), "{shown}");
+        assert!(shown.contains(&u32::MAX.to_string()), "{shown}");
+        assert!(text.contains("lil-core.exe"), "{text}");
     }
 
     #[test]
