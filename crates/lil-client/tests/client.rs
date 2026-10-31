@@ -199,14 +199,15 @@ fn racing_starts_yield_one_core() {
 fn a_slow_own_core_that_then_serves_is_not_read_as_untrusted() {
     let env = TestEnv::new();
     let mut cfg = config(&env);
-    cfg.start_timeout = Duration::from_millis(500);
+    cfg.start_timeout = Duration::from_millis(200);
     cfg.start_hard_cap = DEADLINE;
     // A real `state.db`, made by a core that then stops, and held so the next core waits for it.
+    // Wall-clock time despite QA-031: a real core's wait on a real lock has no fake clock to turn.
     drop(CoreFixture::start_ready(&env));
     let db = rusqlite::Connection::open(env.env.suite_state_db()).unwrap();
     db.execute_batch("BEGIN EXCLUSIVE").unwrap();
     let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(1));
         db.execute_batch("COMMIT").unwrap();
     });
     let started = std::time::Instant::now();
