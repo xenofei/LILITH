@@ -314,6 +314,47 @@ TestCase {
                   t.panel.banner.text)
     }
 
+    function test_a_lost_connection_disables_the_panels_writes() { // spec: APP-034, APP-114
+        const t = load({jobs: [job("r1"), job("q1", {status: "queued", substatus: "waiting"})],
+                        running: [job("r1")], queue: [job("q1", {status: "queued", substatus: "waiting"})]})
+        verify(t.panel.writable)
+        const marked = root => {
+            const out = []
+            const walk = item => {
+                if (item.requiresCore === true && item.visible)
+                    out.push(item)
+                for (let i = 0; i < item.children.length; ++i)
+                    walk(item.children[i])
+            }
+            walk(root)
+            return out
+        }
+        tryVerify(() => marked(t.panel).length >= 3, 3000, "pause, and the rows' Cancel and Run next")
+        const buttons = marked(t.panel)
+        for (const b of buttons)
+            verify(b.enabled, "live while ready: " + b.text)
+        const made = t.core.calls.length
+
+        t.core.connection = "reconnecting"
+        verify(!t.panel.writable)
+        for (const b of buttons)
+            verify(!b.enabled, "disabled at once: " + b.text)
+        t.panel.pause("gpu-heavy")
+        t.panel.cancelJob("r1")
+        compare(t.core.calls.length, made, "no call goes out")
+
+        t.core.connection = "ready"
+        verify(t.panel.writable)
+        for (const b of buttons)
+            verify(b.enabled, "back at once: " + b.text)
+    }
+
+    function test_an_unknown_reason_is_cut_like_all_outside_text() { // spec: APP-114, P4a-R8
+        const t = load()
+        const label = t.panel.pausedLabel(["x".repeat(200)])
+        verify(label.length <= 60, "cut: " + label.length)
+    }
+
     function test_pause_and_resume_call_app_queue() { // spec: APP-114, CORE-160
         const t = load({jobs: [job("j1")]})
         const header = t.panel.laneHeader("gpu-heavy")

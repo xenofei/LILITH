@@ -24,6 +24,7 @@ Flow {
 
     LButton {
         id: pauseButton
+        requiresCore: true
         text: root.yourPause ? "Resume" : "Pause"
         Accessible.name: text + " " + root.panel.laneLabel(root.lane)
         enabled: root.free
@@ -31,6 +32,7 @@ Flow {
     }
 
     LButton {
+        requiresCore: true
         visible: root.restartHeld > 0
         text: "Resume held jobs (" + root.restartHeld + ")"
         enabled: root.free

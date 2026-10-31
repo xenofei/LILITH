@@ -75,6 +75,8 @@ qt_target_qml_sources(lil-ui-kit
         qml/shell/ProjectSwitcher.qml
         qml/shell/WorkspaceSwitcher.qml
         qml/shell/ConnectionBanner.qml
-        qml/shell/NoWorkspaceBanner.qml)
+        qml/shell/NoWorkspaceBanner.qml
+        qml/core/CoreGate.js
+        qml/panels/jobs/PausedText.js)
 
 add_subdirectory(tests)

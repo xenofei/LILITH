@@ -3,9 +3,23 @@
 import QtQuick
 import QtQuick.Templates as T
 import Lilith.UiKit
+import "../core/CoreGate.js" as CoreGate
 
 T.TextField {
     id: control
+
+    // Disabled unless the core is ready, whatever `enabled` says: the rule and how its core is
+    // found are in CoreGate.js. Later panels mark their actions with this.
+    property bool requiresCore: false
+    property var core: null
+
+    Binding {
+        target: control
+        property: "enabled"
+        when: control.requiresCore && !CoreGate.ready(control)
+        value: false
+        restoreMode: Binding.RestoreBindingOrValue
+    }
 
     // What the field is for, as a screen reader says it.
     property string label

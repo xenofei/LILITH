@@ -50,6 +50,7 @@ import QtQuick
 import QtQml.Models
 import Lilith.Core
 import Lilith.UiKit
+import "PausedText.js" as PausedText
 
 Rectangle {
     id: root
@@ -118,7 +119,8 @@ Rectangle {
     // The banner is saying a job isn't in the list.
     property bool _saysNotListed: false
 
-    readonly property bool writable: jobsModel.loaded && live.loaded
+    // Writes need the core (APP-034): the buttons are marked `requiresCore`, and calls check here.
+    readonly property bool writable: jobsModel.loaded && live.loaded && !!core && core.connection === "ready"
     readonly property var knownLanes: ["gpu-heavy", "cpu"]
     readonly property var headerLanes: {
         const out = knownLanes.slice()
@@ -206,16 +208,11 @@ Rectangle {
     // A lane's pause: "Paused by you", "Paused while fullscreen", "Paused by you and while
     // fullscreen", an unknown reason by its name.
     function pausedLabel(reasons) {
-        const parts = (reasons || []).map(r => r === "manual" ? "by you"
-                                               : r === "fullscreen" ? "while fullscreen" : "by " + shown(r))
-        if (parts.length === 0)
-            return "Paused"
-        const last = parts.pop()
-        return "Paused " + (parts.length ? parts.join(", ") + " and " : "") + last
+        return PausedText.label(reasons, core)
     }
 
     function laneLabel(lane) {
-        return lane === "gpu-heavy" ? "GPU work" : lane === "cpu" ? "CPU work" : shown(lane)
+        return PausedText.laneLabel(lane, core)
     }
 
     function phaseLabel(phase) {
@@ -857,6 +854,7 @@ Rectangle {
                     height: cancelAll.visible ? cancelAll.implicitHeight : 0
                     LButton {
                         id: cancelAll
+                        requiresCore: true
                         anchors { right: parent.right; rightMargin: Theme.spacing }
                         visible: root.mine > 0
                         text: "Cancel all from this app"
