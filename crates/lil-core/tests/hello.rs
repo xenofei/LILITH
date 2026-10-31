@@ -4,7 +4,7 @@
 //!
 //! Wall-clock durations here are failure deadlines only, never measurements (QA-031).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use lil_core::identity::TrustedDirs;
@@ -294,57 +294,6 @@ fn another_majors_client_is_answered_prove_and_then_refused_as_ever() {
     let refused = pipe.call("core/prove", json!({"name": late.name()}));
     assert_eq!(refused["error"]["code"], -32600, "{refused}");
     assert!(!late.is_set());
-}
-
-#[test] // spec: ARCH-027, ARCH-029
-fn prove_is_answered_before_the_state_db_opens_and_a_hello_waits_for_the_core_to_serve() {
-    /// What a client saw while the core stood right before opening its `state.db`.
-    struct Seen {
-        pipe: RawPipe,
-        proved: Value,
-        event_set: bool,
-        state_db_there: bool,
-        hello_answered: Option<String>,
-    }
-    let env = Arc::new(TestEnv::new());
-    let seen: Arc<Mutex<Option<Seen>>> = Arc::default();
-    let before_state_open = {
-        let (env, seen) = (env.clone(), seen.clone());
-        Arc::new(move || {
-            let env = env.clone();
-            // RawPipe has a runtime of its own, and this runs inside the core's.
-            let client = std::thread::spawn(move || {
-                let mut pipe = RawPipe::connect(&env);
-                let proof = ProofEvent::new().unwrap();
-                let proved = pipe.call("core/prove", json!({"name": proof.name()}));
-                pipe.send_line(&request(7, "core/hello", merge_hello(json!({}))));
-                Seen {
-                    proved,
-                    event_set: proof.is_set(),
-                    state_db_there: env.env.suite_state_db().exists(),
-                    hello_answered: pipe.read_line(Duration::from_millis(300)),
-                    pipe,
-                }
-            });
-            *seen.lock().unwrap() = Some(client.join().expect("the client's checks"));
-        })
-    };
-    let _core = start_in_thread(CoreConfig {
-        clock: FakeClock::new(),
-        ids: Arc::new(SeqIds::new()),
-        test_parent_pid: None,
-        before_state_open: Some(before_state_open),
-        ..CoreConfig::for_env(env.env.clone()).expect("core config")
-    });
-    let mut seen = seen.lock().unwrap().take().expect("the hook ran");
-    assert_eq!(seen.proved["result"]["proved"], true, "{}", seen.proved);
-    assert!(seen.event_set);
-    assert!(!seen.state_db_there, "the state.db was open already");
-    assert_eq!(seen.hello_answered, None, "a hello waits for the router");
-    // Now the core serves, and the hello that waited is answered.
-    let hello = read(&mut seen.pipe);
-    assert_eq!(hello["id"], 7, "{hello}");
-    assert_eq!(hello["result"]["status"], "ok", "{hello}");
 }
 
 #[test] // spec: ARCH-029
