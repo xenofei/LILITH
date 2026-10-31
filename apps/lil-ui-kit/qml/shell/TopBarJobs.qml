@@ -3,11 +3,20 @@
 //
 // Counts come from the queue's own source, as the Jobs panel's live list does (Appendix G "Queue
 // position"): `jobs.list {status: "running"}` and every page of `jobs.list {order: "queue"}`, whose
-// JSON goes to a LiveJobsModel of its own as it came, never parsed here. A `jobs` event is one job,
-// never a count: it goes to the model, and one that came, went or changed status asks for a read
-// 150 ms after the last such event (and at most 1 s after the first, so a steady stream still
-// reads). One read is out at a time. A snapshot or a `resync_required` reads afresh; `ready` never
-// does. The model's clock isn't run: nothing here shows a time.
+// JSON goes to a LiveJobsModel of its own as it came, never parsed here. The model is `countsOnly`:
+// no rows, ETAs or sorting, so a job's event is a lookup. A `jobs` event is one job, never a count:
+// one that came, went or changed status asks for a read 150 ms after the last such event (and at
+// most 1 s after the first, so a steady stream still reads); a progress-only one does nothing more.
+// One read is out at a time.
+//
+// `current` says the lanes are the core's as it is now. It is false from a connection loss or a
+// `resync_required` until the fresh read made after it has landed, and the pause control waits for
+// it: a core restart ends a pause, so the old state must not decide a toggle. `ready` after a loss
+// is what starts that read. It replaces nothing while it is out, and is no model reload: calls made
+// after `ready` reach the new connection, and a mark that comes after it only reads once more.
+//
+// A failed read is asked again after 1 s, doubling up to 30 s while connected, as JsonListModel's
+// are; while disconnected nothing is asked, and `ready` reads at once.
 //
 // Lanes come from the read and from `{kind: "queue", state}` events, applied as full states, at
 // most one update per frame. An event that comes during a read is newer than that read's lanes.
@@ -20,11 +29,12 @@ Item {
 
     required property var core
 
-    readonly property alias loaded: live.loaded
-    property int running: 0
-    property int queued: 0
+    // See the header.
+    property bool current: false
+    readonly property alias running: live.runningCount
+    readonly property alias queued: live.queuedCount
     // How many queued jobs the last read listed when it stopped at its page cap, else -1.
-    property int capped: -1
+    readonly property alias capped: live.cappedCount
     // lane -> QueueState.
     property var lanes: ({})
     // The lane updates applied (at most one per frame).
@@ -34,11 +44,15 @@ Item {
     signal jobEnded()
 
     readonly property int _maxWaitMs: 1000
+    readonly property bool _connected: !!core && core.connection === "ready"
     property real _dueSince: 0
     property bool _reading: false
     property bool _again: false
-    // The next read must carry nothing over (a snapshot or a resync came).
-    property bool _fresh: false
+    // The next read must carry nothing over (the first, or after a resync or a loss).
+    property bool _fresh: true
+    // Connection losses so far: a read that spans one doesn't speak for the new connection.
+    property int _losses: 0
+    property int _retryMs: 0
     property var _pendingLanes: ({})
     property var _lanesDuringRead: ({})
     // Request id -> {ok, fail}: the calls whose answer goes to the model as it came.
@@ -66,13 +80,6 @@ Item {
             laneFrame.start()
     }
 
-    function updateCounts() {
-        const o = JSON.parse(live.overview(""))
-        running = o.running
-        queued = o.queued
-        capped = o.capped === null || o.capped === undefined ? -1 : o.capped
-    }
-
     function rawCall(args, ok, fail) {
         const id = core.call("jobs.list", JSON.stringify(args))
         _raw[id] = {ok: ok, fail: fail}
@@ -89,13 +96,14 @@ Item {
     }
 
     function read() {
-        if (!core)
+        if (!_connected)
             return
         if (_reading) {
             _again = true
             return
         }
         const fresh = _fresh
+        const losses = _losses
         _fresh = false
         _reading = true
         _lanesDuringRead = {}
@@ -107,9 +115,11 @@ Item {
                 return
             live.commit(Date.now())
             root._reading = false
-            root.updateCounts()
+            root._retryMs = 0
             root.applyLanes(JSON.parse(live.lanesJson()))
             root.applyLanes(Object.keys(root._lanesDuringRead).map(k => root._lanesDuringRead[k]))
+            if (fresh && !root._fresh && losses === root._losses && root._connected)
+                root.current = true
             if (root._again) {
                 root._again = false
                 if (root._fresh)
@@ -124,8 +134,16 @@ Item {
             gone = true
             root._reading = false
             root._fresh = root._fresh || fresh
-            root._again = false
-            retry.start()
+            if (root._again) {
+                root._again = false
+                root.read()
+                return
+            }
+            if (root._connected) {
+                root._retryMs = root._retryMs === 0 ? 1000 : Math.min(root._retryMs * 2, 30000)
+                retry.interval = root._retryMs
+                retry.restart()
+            }
         }
         rawCall({status: "running", limit: 100}, json => {
             if (!gone) {
@@ -149,6 +167,7 @@ Item {
     function onJobsEvent(kind, data) {
         if (kind !== "event") {
             _fresh = true
+            current = false
             read()
             return
         }
@@ -158,9 +177,7 @@ Item {
             queueEvent(data.state)
         } else if (data.kind === "job" && data.job) {
             const j = data.job
-            const change = live.applyJob(JSON.stringify(j), Date.now())
-            if (change > 0)
-                updateCounts()
+            const change = live.applyJob(JSON.stringify({job_id: j.job_id, status: j.status, updated: j.updated}), 0)
             if (change === 2)
                 requestRead()
             if (j.status === "succeeded" || j.status === "failed" || j.status === "cancelled")
@@ -189,6 +206,18 @@ Item {
     Connections {
         target: root.core
         ignoreUnknownSignals: true
+        function onConnectionChanged() {
+            if (root._connected) {
+                retry.stop()
+                root._retryMs = 0
+                root._fresh = true
+                root.read()
+            } else {
+                root.current = false
+                root._losses++
+                retry.stop()
+            }
+        }
         function onCallFinished(id, json) {
             const h = root._raw[id]
             if (!h)
@@ -207,6 +236,7 @@ Item {
 
     LiveJobsModel {
         id: live
+        countsOnly: true
     }
 
     Timer {
@@ -220,7 +250,6 @@ Item {
 
     Timer {
         id: retry
-        interval: 2000
         onTriggered: root.read()
     }
 

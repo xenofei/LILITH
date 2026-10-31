@@ -2,12 +2,22 @@
 // lists `workspaces.list` each time it opens.
 //
 // Choosing a served row is `Core.setWorkspace(id)`, a new hello, and never `workspace.set_default`:
-// that would change every `cli` and `mcp` caller's workspace. "Make this the default" is its own
-// click, on its own button. A row the core doesn't serve, whose folder is gone or that has a
-// problem is unavailable and says why. A refusal (`workspace.unsupported`) changes nothing shown
-// but the message; `Core.workspace`, which the hello sets, says what is current.
+// that would change every `cli` and `mcp` caller's workspace. A row the core doesn't serve, whose
+// folder is gone or that has a problem is unavailable and says why. A refusal
+// (`workspace.unsupported`) changes nothing shown but the message; `Core.workspace`, which the hello
+// sets, says what is current.
+//
+// "Make this the default" is its own click, on its own button, and it moves the app too: in M1 the
+// core serves only the default, so from that answer on it refuses every call of the old session
+// (the list's re-read included) until a new hello. So the answer's id goes straight to
+// `Core.setWorkspace`, and `noticed` says what happened. If that hello fails, the rows say what
+// the core now serves, so the new default can be chosen by hand.
+//
+// While the core refuses the session's workspace at the hello (`lil workspace use` elsewhere, a
+// renamed folder) nothing can be listed, but the button stays usable and offers the way out.
 import QtQuick
 import Lilith.UiKit
+import "../core/CoreGate.js" as CoreGate
 
 Item {
     id: root
@@ -16,6 +26,7 @@ Item {
     // The core is ready.
     required property bool ready
 
+    readonly property bool refused: CoreGate.refusedWorkspace(core)
     readonly property string currentId: core && core.workspace ? String(core.workspace.id) : ""
     readonly property string currentName: {
         if (!core || !core.workspace)
@@ -31,11 +42,14 @@ Item {
     property var _switchCall: null
     property var _defaultCall: null
 
+    // Something happened that outlives the list: (text, kind).
+    signal noticed(string text, string kind)
+
     implicitWidth: Math.min(button.implicitWidth, 220)
     implicitHeight: button.implicitHeight
 
     onReadyChanged: {
-        if (!ready)
+        if (!ready && !refused)
             popup.close()
     }
 
@@ -68,16 +82,19 @@ Item {
         return !w.default && !w.missing && !w.problem
     }
 
-    function refused(what, error) {
-        popup.message = what + ": " + shown(error && error.message ? error.message : "the core didn't answer.", 300)
+    function refusedText(what, error) {
+        return what + ": " + shown(error && error.message ? error.message : "the core didn't answer.", 300)
     }
 
     function open() {
-        if (!ready)
-            return
         popup.message = ""
+        if (refused)
+            popup.message = shown(core.unavailable.reason, 300)
+        else if (ready)
+            read()
+        else
+            return
         popup.open()
-        read()
     }
 
     function read() {
@@ -93,7 +110,7 @@ Item {
             },
             error: e => {
                 root._listCall = null
-                root.refused("Couldn't list the workspaces", e)
+                popup.message = root.refusedText("Couldn't list the workspaces", e)
             }
         })
     }
@@ -114,34 +131,63 @@ Item {
             },
             error: e => {
                 root._switchCall = null
-                root.refused("Couldn't switch the workspace", e)
+                popup.message = root.refusedText("Couldn't switch the workspace", e)
             }
         })
     }
 
     function makeDefault(w) {
-        if (!ready || _defaultCall)
+        if (!ready || _defaultCall || _switchCall)
             return
         popup.message = ""
+        const name = shown(w.name || folderName(w.path), 60)
         _defaultCall = CoreCall.call(core, "workspace.set_default", {path: w.path}, {
             owner: root,
-            ok: () => {
+            ok: r => {
                 root._defaultCall = null
-                root.read()
+                root.switchToDefault(String((r.structured || {}).id), name)
             },
             error: e => {
                 root._defaultCall = null
-                root.refused("Couldn't make it the default", e)
+                popup.message = root.refusedText("Couldn't make it the default", e)
             }
+        })
+    }
+
+    function switchToDefault(id, name) {
+        // The core serves only this one from now on, whatever the hello below does.
+        workspaces = workspaces.map(w => Object.assign({}, w, {default: w.id === id, served: w.id === id}))
+        _switchCall = CoreCall.setWorkspace(core, id, {
+            owner: root,
+            ok: () => {
+                root._switchCall = null
+                root.noticed(name + " is now your default workspace, and the app has switched to it.", "ok")
+                popup.close()
+            },
+            error: e => {
+                root._switchCall = null
+                const text = name + " is now your default workspace, but the app couldn't switch to it: "
+                             + root.shown(e && e.message ? e.message : "the core didn't answer.", 300)
+                popup.message = text
+                root.noticed(text, "danger")
+            }
+        })
+    }
+
+    function useDefault() {
+        CoreCall.useDefaultWorkspace(core, {
+            owner: root,
+            ok: () => popup.close(),
+            error: e => { popup.message = root.refusedText("Couldn't use the default workspace", e) }
         })
     }
 
     LButton {
         id: button
-        property bool requiresCore: true
+        requiresCore: !root.refused
         width: root.width
         height: 28
-        enabled: root.ready
+        enabled: root.ready || root.refused
         text: root.currentName + " ▾"
         Accessible.name: "Workspace: " + root.currentName
         onClicked: popup.visible ? popup.close() : root.open()
@@ -151,6 +197,8 @@ Item {
         id: popup
         listName: "Workspaces"
         rows: root.workspaces
+        offerDefault: root.refused
+        onUseDefault: root.useDefault()
         onActivated: index => {
             if (index >= 0 && index < root.workspaces.length)
                 root.choose(root.workspaces[index])
@@ -217,12 +265,12 @@ Item {
 
             LButton {
                 id: defaultButton
-                property bool requiresCore: true
+                requiresCore: true
+                core: root.core
                 anchors.right: parent.right
                 anchors.rightMargin: Theme.spacing
                 anchors.verticalCenter: parent.verticalCenter
                 visible: root.canBeDefault(row.modelData)
-                enabled: root.ready
                 text: "Make this the default"
                 Accessible.name: "Make " + row.name + " the default"
                 onClicked: root.makeDefault(row.modelData)

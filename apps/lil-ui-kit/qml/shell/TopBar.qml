@@ -1,27 +1,32 @@
 // The top bar (APP-006): the app's name, the workspace and project switchers, and the indicators.
 //
-// - **Jobs** (TopBarJobs): "2 running · 3 queued", with a badge naming the reasons while a lane is
-//   paused. The pause control is here: its button and Ctrl+Shift+P (togglePause, wired by the
-//   shell) call `app/queue.pause` or `app/queue.resume {lane: "gpu-heavy"}`, as QueueControls does,
-//   and wait for the first read. A refusal shows in `notice`.
+// - **Jobs** (TopBarJobs): "2 running · 3 queued", with a badge naming each paused lane and its
+//   reasons. The pause control is here: its button and Ctrl+Shift+P (togglePause, wired by the shell)
+//   call `app/queue.pause` or `app/queue.resume {lane: "gpu-heavy"}`, as QueueControls does. They act
+//   only on current state (TopBarJobs.current); a press that can't says why in `notice`, as does a
+//   refusal, and a new attempt clears it.
 // - **Spend** ("41 % of cap"): the highest `ratio_permille` of `caps.get` over the rows without
-//   `invalid`, as a whole percent, and nothing at all when there are no caps. The `caps` topic says
-//   nothing about spend between alerts, so `caps.get` is read again on `caps` and `usage` events
-//   and when a job ends, at most once a second.
+//   `invalid`, as a whole percent, and nothing at all when there are no caps. A cap whose value
+//   doesn't parse counts as exceeded and calls are refused, so "Cap invalid" takes over from the
+//   figure. The `caps` topic says nothing about spend between alerts, so `caps.get` is read again on
+//   `caps` and `usage` events and when a job ends, at most once a second. A failed read is asked
+//   again after 1 s, doubling up to 30 s while connected, and at once on `ready` while it has none.
 // - **GPU** ("GPU 63 % · 9.5/16 GiB · 71 °C"): the `telemetry` topic's samples, whose throttle is
-//   Core's (APP-027). "GPU —" while there is no measured reading, or no connection to one.
+//   Core's (APP-027).
 // - **Connection:** `Core.connection` in words.
 //
-// The app switcher has only this app in M1 (APP-164: the plain name first, the proper name beneath
-// it), so it is a label until there is a second. The assistant toggle shows, off and disabled.
+// Without a connection no figure is live: the GPU and the jobs read "—", the spend is muted, and the
+// badge goes.
 //
-// An action marked `requiresCore: true` is enabled only while `Core.connection` is `ready`
-// (APP-034); these are bindings, so that holds within the frame the state changes.
+// The app switcher has only this app in M1 (APP-164: the plain name first, the proper name beneath
+// it), so it is a label until there is a second. The assistant toggle shows, off and disabled; a tab
+// stop around it says why, to the keyboard and to a screen reader.
 import QtQuick
 import QtQuick.Controls.Basic as QQC
 import Lilith.Core
 import Lilith.UiKit
 import "../panels/hardware/HardwareFormat.js" as Format
+import "../panels/jobs/PausedText.js" as PausedText
 
 Rectangle {
     id: root
@@ -42,20 +47,20 @@ Rectangle {
         }
         return top
     }
+    readonly property bool capInvalid: !!capsView && (capsView.caps || []).some(row => row.invalid)
     readonly property var gpuLane: jobs.lanes["gpu-heavy"] || null
     readonly property bool yourPause: !!gpuLane && (gpuLane.reasons || []).indexOf("manual") >= 0
+    // "GPU work paused by you", one for each paused lane.
     readonly property string pausedText: {
-        const paused = Object.keys(jobs.lanes).map(l => jobs.lanes[l]).filter(s => s.paused)
-        if (paused.length === 0)
-            return ""
-        const reasons = []
-        for (const state of paused) {
-            for (const r of state.reasons || []) {
-                if (reasons.indexOf(r) < 0)
-                    reasons.push(r)
+        const out = []
+        for (const lane of Object.keys(jobs.lanes).sort()) {
+            const state = jobs.lanes[lane]
+            if (state.paused) {
+                const words = PausedText.reasonWords(state.reasons, core)
+                out.push(PausedText.laneLabel(lane, core) + " paused" + (words !== "" ? " " + words : ""))
             }
         }
-        return pausedLabel(reasons)
+        return out.join("; ")
     }
 
     property alias jobs: jobs
@@ -70,6 +75,7 @@ Rectangle {
     property alias spendIndicator: spendIndicator
     property alias gpuIndicator: gpuIndicator
     property alias connectionIndicator: connectionIndicator
+    property alias assistantHolder: assistantHolder
     property alias assistantToggle: assistantToggle
     property alias assistantTip: assistantTip
     readonly property string assistantReason: "The assistant arrives in a later version"
@@ -77,6 +83,10 @@ Rectangle {
     property var _pauseCall: null
     property bool _capsReading: false
     property bool _capsDue: false
+    property bool _capsFailed: false
+    property int _capsRetryMs: 0
+    // `notice` says a press had to wait: it goes when the wait is over.
+    property bool _waitNotice: false
     // What the bar's items leave of its width: all of it pushes the indicators to the right. When
     // they don't all fit they wrap to a next line instead, so none is out of reach.
     readonly property real _spare: {
@@ -92,20 +102,17 @@ Rectangle {
     implicitHeight: column.implicitHeight
     color: Theme.surface
 
-    function pausedLabel(reasons) {
-        const parts = reasons.map(r => r === "manual" ? "by you" : r === "fullscreen" ? "while fullscreen"
-                                       : "by " + core.shownText(String(r), 40))
-        if (parts.length === 0)
-            return "Paused"
-        const last = parts.pop()
-        return "Paused " + (parts.length ? parts.join(", ") + " and " : "") + last
-    }
-
     function jobsText() {
-        if (!jobs.loaded)
+        if (!jobs.current)
             return "—"
         const queued = MoneyText.count(jobs.capped >= 0 ? jobs.capped : jobs.queued)
         return MoneyText.count(jobs.running) + " running · " + queued + (jobs.capped >= 0 ? "+" : "") + " queued"
+    }
+
+    function spendText() {
+        if (capInvalid)
+            return "Cap invalid"
+        return capPermille >= 0 ? Math.floor(capPermille / 10) + " % of cap" : ""
     }
 
     function gpuText() {
@@ -127,8 +134,15 @@ Rectangle {
     }
 
     function togglePause() {
-        if (!coreReady || !jobs.loaded || _pauseCall)
+        if (_pauseCall)
             return
+        if (!coreReady || !jobs.current) {
+            showNotice(coreReady ? "Wait a moment: the state of GPU work is still loading."
+                                 : "GPU work can't be paused or resumed until the core is connected.", "warning")
+            _waitNotice = true
+            return
+        }
+        notice.close()
         const resume = yourPause
         _pauseCall = CoreCall.appCall(core, resume ? "app/queue.resume" : "app/queue.pause", {lane: "gpu-heavy"}, {
             owner: root,
@@ -147,11 +161,16 @@ Rectangle {
     }
 
     function showNotice(text, kind) {
+        _waitNotice = false
         notice.kind = kind
         notice.show(text)
     }
 
     function readCaps() {
+        if (!coreReady) {
+            _capsFailed = true
+            return
+        }
         if (_capsReading) {
             _capsDue = true
             return
@@ -161,9 +180,19 @@ Rectangle {
             owner: root,
             ok: r => {
                 root.capsView = r.structured || null
+                root._capsFailed = false
+                root._capsRetryMs = 0
                 root.capsRead()
             },
-            error: () => root.capsRead()
+            error: () => {
+                root._capsFailed = true
+                if (root.coreReady) {
+                    root._capsRetryMs = root._capsRetryMs === 0 ? 1000 : Math.min(root._capsRetryMs * 2, 30000)
+                    capsRetry.interval = root._capsRetryMs
+                    capsRetry.restart()
+                }
+                root.capsRead()
+            }
         })
     }
 
@@ -203,6 +232,28 @@ Rectangle {
         readCaps()
     }
 
+    Connections {
+        target: root.core
+        ignoreUnknownSignals: true
+        function onConnectionChanged() {
+            capsRetry.stop()
+            if (root.coreReady && (root._capsFailed || !root.capsView)) {
+                root._capsRetryMs = 0
+                root.readCaps()
+            }
+        }
+    }
+
+    Connections {
+        target: jobs
+        function onCurrentChanged() {
+            if (jobs.current && root._waitNotice) {
+                root._waitNotice = false
+                notice.close()
+            }
+        }
+    }
+
     TopBarJobs {
         id: jobs
         core: root.core
@@ -212,6 +263,11 @@ Rectangle {
     Timer {
         id: capsThrottle
         interval: 1000
+        onTriggered: root.readCaps()
+    }
+
+    Timer {
+        id: capsRetry
         onTriggered: root.readCaps()
     }
 
@@ -252,6 +308,7 @@ Rectangle {
                 height: 28
                 core: root.core
                 ready: root.coreReady
+                onNoticed: (text, kind) => root.showNotice(text, kind)
             }
 
             ProjectSwitcher {
@@ -275,7 +332,7 @@ Rectangle {
 
             Item {
                 id: pausedHolder
-                visible: root.pausedText !== ""
+                visible: root.pausedText !== "" && root.jobs.current
                 width: pausedBadge.width
                 height: 28
 
@@ -289,18 +346,20 @@ Rectangle {
 
             LButton {
                 id: pauseButton
-                property bool requiresCore: true
+                requiresCore: true
                 height: 28
-                enabled: root.coreReady && root.jobs.loaded
+                enabled: root.jobs.current
                 text: root.yourPause ? "Resume GPU work" : "Pause GPU work"
                 onClicked: root.togglePause()
             }
 
             StatusIndicator {
                 id: spendIndicator
-                visible: root.capPermille >= 0
-                text: Math.floor(root.capPermille / 10) + " % of cap"
-                name: "Spend this month: " + text
+                visible: root.spendText() !== ""
+                text: root.spendText()
+                name: root.capInvalid ? "Spend this month: a cap's value can't be read, so calls are refused"
+                                      : "Spend this month: " + text
+                kind: !root.coreReady ? "muted" : root.capInvalid ? "danger" : ""
             }
 
             StatusIndicator {
@@ -320,6 +379,9 @@ Rectangle {
                 id: assistantHolder
                 width: assistantToggle.width
                 height: 28
+                activeFocusOnTab: true
+                Accessible.role: Accessible.StaticText
+                Accessible.name: "Assistant, off: " + root.assistantReason
 
                 HoverHandler {
                     id: assistantHover
@@ -333,9 +395,18 @@ Rectangle {
                     Accessible.description: root.assistantReason
                 }
 
+                Rectangle {
+                    anchors.fill: parent
+                    visible: assistantHolder.activeFocus
+                    color: "transparent"
+                    radius: Theme.radius
+                    border.color: Theme.focus
+                    border.width: Theme.focusWidth
+                }
+
                 QQC.ToolTip {
                     id: assistantTip
-                    visible: assistantHover.hovered
+                    visible: assistantHover.hovered || assistantHolder.activeFocus
                     text: root.assistantReason
                     font.family: Theme.fontFamily
                     font.pixelSize: Theme.fontSize

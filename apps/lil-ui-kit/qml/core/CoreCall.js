@@ -14,6 +14,8 @@
 //
 //   CoreCall.setWorkspace(Core, id, {owner: root, ok: hello => ..., error: error => ...})
 //                                 // a new hello naming workspace `id` (P4a-R34)
+//   CoreCall.useDefaultWorkspace(Core, {owner: root, ok: hello => ..., error: error => ...})
+//                                 // a new hello on what suite.toml names as the default now
 //
 //   const sub = CoreCall.subscribe(Core, "jobs", root,
 //                                  (kind, seq, data) => ...)  // optional: this topic's events
@@ -81,6 +83,13 @@ function setWorkspace(core, id, handlers) {
     const h = handlers || {}
     const watcher = watch(h.owner)
     return track(core, core.setWorkspace(id), h, true, watcher)
+}
+
+// The same for `Core.useDefaultWorkspace`.
+function useDefaultWorkspace(core, handlers) {
+    const h = handlers || {}
+    const watcher = watch(h.owner)
+    return track(core, core.useDefaultWorkspace(), h, true, watcher)
 }
 
 // Follows `topic` for `owner` until `unsubscribe()` or the owner's destruction, whichever comes

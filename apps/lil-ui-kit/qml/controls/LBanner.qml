@@ -17,6 +17,8 @@ Item {
     property alias actions: actionRow.data
 
     signal closed()
+    // It was announced, as a screen reader hears it.
+    signal announced(string text)
 
     function show(message, announceNow) {
         if (message !== undefined)
@@ -28,6 +30,7 @@ Item {
 
     function announce() {
         Accessible.announce(text)
+        announced(text)
     }
 
     function close() {
@@ -43,6 +46,41 @@ Item {
         }
         visible = false
         closed()
+    }
+
+    // A banner hidden by a binding (not close()) while the focus is in it passes the focus on, as
+    // close() does, rather than dropping it on the window's root.
+    property bool _focusInside: false
+
+    function isInside(item) {
+        for (let p = item; p; p = p.parent) {
+            if (p === root)
+                return true
+        }
+        return false
+    }
+
+    Connections {
+        target: root.Window.window
+        function onActiveFocusItemChanged() {
+            const item = root.Window.window.activeFocusItem
+            if (item && root.isInside(item))
+                root._focusInside = true
+            else if (item && !String(item).startsWith("QQuickRootItem"))
+                root._focusInside = false
+        }
+    }
+
+    onVisibleChanged: {
+        if (visible || !_focusInside)
+            return
+        _focusInside = false
+        const window = Window.window
+        if (!window || !String(window.activeFocusItem).startsWith("QQuickRootItem"))
+            return
+        const next = nextItemInFocusChain(true)
+        if (next && !isInside(next))
+            next.forceActiveFocus(Qt.TabFocusReason)
     }
 
     visible: false

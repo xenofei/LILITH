@@ -1,7 +1,10 @@
 // The no-workspace state (APP-016): connected, with no workspace at all. "Create or choose a
-// workspace" asks for a folder, and `workspace.create {path}` makes it a workspace, or registers
-// one that is already there. Its id then goes to `Core.setWorkspace`, a new hello; the banner leaves
-// when that hello's workspace reaches `Core.workspace`. A refusal stays on the banner.
+// workspace" asks for a folder, and `workspace.create {path, default: true}` makes it a workspace,
+// or registers one that is already there. It becomes the default, since the point of this state is
+// a usable default, though that moves every `cli` and `mcp` caller too and can replace a default
+// that is only missing for now (an unplugged drive), so `noticed` says it happened. Its id then goes
+// to `Core.setWorkspace`, a new hello; the banner leaves when that hello's workspace reaches
+// `Core.workspace`. A refusal stays on the banner.
 import QtQuick
 import QtQuick.Dialogs
 import Lilith.UiKit
@@ -16,8 +19,9 @@ LBanner {
     property var _call: null
     property string _refusal
 
-    // workspace.create's warnings (a network or cloud-synced folder, a volume without stable ids).
-    signal warned(string text)
+    // Something happened that outlives the banner: (text, kind). workspace.create's warnings (a
+    // network or cloud-synced folder, a volume without stable ids) are in the text.
+    signal noticed(string text, string kind)
 
     closable: false
     kind: _refusal !== "" ? "danger" : "warning"
@@ -55,16 +59,26 @@ LBanner {
         return s
     }
 
+    function folderName(path) {
+        const parts = String(path || "").split(/[\\/]/).filter(p => p !== "")
+        return parts.length > 0 ? parts[parts.length - 1] : String(path || "")
+    }
+
     function folderChosen(url) {
-        if (_call)
+        if (_call) {
+            noticed("Still setting up the last folder. Try this one again when that's done.", "warning")
             return
+        }
         _refusal = ""
-        _call = CoreCall.call(core, "workspace.create", {path: localPath(url)}, {
+        _call = CoreCall.call(core, "workspace.create", {path: localPath(url), default: true}, {
             owner: root,
             ok: r => {
                 const made = r.structured || {}
-                for (const w of made.warnings || [])
-                    root.warned(root.core.shownText(String(w), 300))
+                const warnings = (made.warnings || []).map(w => root.core.shownText(String(w), 300))
+                const name = root.core.shownText(root.folderName(made.path), 60)
+                const words = made.default ? [name + " is now your default workspace."] : []
+                if (words.length + warnings.length > 0)
+                    root.noticed(words.concat(warnings).join(" "), warnings.length > 0 ? "warning" : "ok")
                 root._call = CoreCall.setWorkspace(root.core, String(made.id), {
                     owner: root,
                     ok: () => { root._call = null },
@@ -78,7 +92,7 @@ LBanner {
     actions: [
         LButton {
             id: createButton
-            property bool requiresCore: true
+            requiresCore: true
             primary: true
             enabled: root.wanted
             text: "Create or choose a workspace"

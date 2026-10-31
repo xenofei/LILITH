@@ -105,7 +105,10 @@ Window {
     width: 1280
     height: 800
     visible: false
-    title: core && core.project ? "LILITH — " + core.project : "LILITH"
+    // The project calls would really use: the chosen one, else what the core says it falls back to.
+    readonly property string _titleProject: core && core.project ? core.project
+                                            : topBar.projectSwitcher.effectiveProject
+    title: _titleProject !== "" ? "LILITH — " + _titleProject : "LILITH"
     color: Theme.bg
 
     Column {
@@ -128,7 +131,7 @@ Window {
             id: noWorkspaceBanner
             width: parent.width
             core: root.core
-            onWarned: text => topBar.showNotice(text, "warning")
+            onNoticed: (text, kind) => topBar.showNotice(text, kind)
         }
     }
 
