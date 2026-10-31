@@ -7,7 +7,7 @@
 // - **Spend** ("41 % of cap"): the highest `ratio_permille` of `caps.get` over the rows without
 //   `invalid`, as a whole percent, and nothing at all when there are no caps. The `caps` topic says
 //   nothing about spend between alerts, so `caps.get` is read again on `caps` and `usage` events
-//   and when a job ends, at most once a second (Ruling Q-D).
+//   and when a job ends, at most once a second.
 // - **GPU** ("GPU 63 % · 9.5/16 GiB · 71 °C"): the `telemetry` topic's samples, whose throttle is
 //   Core's (APP-027). "GPU —" while there is no measured reading, or no connection to one.
 // - **Connection:** `Core.connection` in words.

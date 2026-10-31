@@ -1,7 +1,8 @@
 // The list a top-bar switcher opens: a keyboard-navigable list (one tab stop, the arrow keys and
 // Enter work inside it, A11yWalk's rule), and a line for what went wrong. The list takes the
-// keyboard focus when it opens; Escape or a press outside closes it. `activated(index)` is Enter on
-// a row; the rows handle their own clicks.
+// keyboard focus when it opens; Escape or a press outside its switcher closes it (a press on the
+// switcher's own button toggles it there). `activated(index)` is Enter on a row; the rows handle
+// their own clicks.
 import QtQuick
 import QtQuick.Templates as T
 import Lilith.UiKit
@@ -24,7 +25,7 @@ T.Popup {
     width: 420
     padding: Theme.spacing
     focus: true
-    closePolicy: T.Popup.CloseOnEscape | T.Popup.CloseOnPressOutside
+    closePolicy: T.Popup.CloseOnEscape | T.Popup.CloseOnPressOutsideParent
     implicitHeight: content.implicitHeight + topPadding + bottomPadding
 
     onOpened: list.forceActiveFocus(Qt.PopupFocusReason)

@@ -15,6 +15,7 @@ TestCase {
     FakeCore {
         id: fake
         project: "sketchbook"
+        workspace: ({id: "ws1", path: "D:/art/harbor"})
     }
 
     Component {

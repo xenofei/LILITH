@@ -382,6 +382,9 @@ TestCase {
         t.core.emit("jobs", "resync_required", null)
         tryCompare(t.bar.jobs, "_reading", true, 2000)
         t.core.emit("jobs", "event", {kind: "queue", state: lane({paused: true, reasons: ["manual"]})})
+        // Its frame passes first, so only the read could undo it.
+        tryCompare(t.bar.pausedBadge, "text", "Paused by you")
+        wait(50)
         answerRead(t.core, [], [], [lane()])
         tryCompare(t.bar.pausedBadge, "text", "Paused by you")
         wait(50)
@@ -515,6 +518,19 @@ TestCase {
         const last = t.core.calls.filter(named("app/set_context")).pop()
         compare(last.args, {project: "harbor"})
         answer(t.core, named("app/set_context"), {status: "ok", workspace: workspaceOne, project: "harbor"})
+    }
+
+    function test_a_switcher_button_toggles_its_list() { // spec: APP-006
+        const t = load()
+        const sw = openProjects(t)
+        mouseClick(sw.button)
+        tryVerify(() => !sw.popup.visible, 2000, "its own button closes it")
+        openProjects(t)
+        mouseClick(t.window.contentItem, 900, 300)
+        tryVerify(() => !sw.popup.visible, 2000, "a press elsewhere closes it")
+        openProjects(t)
+        keyClick(Qt.Key_Escape)
+        tryVerify(() => !sw.popup.visible, 2000, "and Escape")
     }
 
     function test_sketchbook_is_the_default_project() { // spec: ARCH-098, APP-015
