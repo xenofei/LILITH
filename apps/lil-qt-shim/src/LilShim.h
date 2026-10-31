@@ -23,8 +23,8 @@ public:
     // lilshim::isModuleLoaded: whether `dll` is loaded in this process.
     Q_INVOKABLE bool isModuleLoaded(const QString &dll) const;
 
-    // lilshim::showInExplorer.
-    Q_INVOKABLE void showInExplorer(const QString &path) const;
+    // lilshim::showInExplorer: false when it couldn't.
+    Q_INVOKABLE bool showInExplorer(const QString &path) const;
 
     // lilshim::explorerSelectArgument: what showInExplorer would run, for a test that opens no
     // window.
