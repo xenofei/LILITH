@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lil_core::{CoreConfig, start};
-use lil_platform::pipe::{ConnectError, open_client};
+use lil_platform::pipe::{ConnectError, ProofEvent, open_client};
 use lil_testkit::{FakeClock, SeqIds, TestEnv, merge_hello};
 use serde_json::{Value, json};
 use tokio::io::{
@@ -95,19 +95,29 @@ async fn silent_connection_is_closed_after_hello_timeout() {
     let mut no_hello = Client::connect(&pipe).await;
     let early = no_hello.call("tools/list", json!({})).await;
     assert_eq!(early["error"]["code"], -32001, "{early}");
+    // A proof starts nothing, so a client that only proves is no different.
+    let mut prover = Client::connect(&pipe).await;
+    let proof = ProofEvent::new().unwrap();
+    let proved = prover
+        .call("core/prove", json!({"name": proof.name()}))
+        .await;
+    assert_eq!(proved["result"]["status"], "ok", "{proved}");
+    assert!(proof.is_set());
 
     // Just before the timeout: still open.
     tokio::time::advance(Duration::from_secs(29)).await;
     let late = no_hello.call("tools/list", json!({})).await;
     assert_eq!(late["error"]["code"], -32001, "{late}");
     assert!(!no_hello.closed().await, "closed before the hello timeout");
+    assert!(!prover.closed().await, "closed before the hello timeout");
 
-    // Past it: both connections without a hello are closed.
+    // Past it: every connection without a hello is closed.
     tokio::time::advance(Duration::from_secs(2)).await;
     assert!(
         no_hello.closed().await,
         "still open after the hello timeout"
     );
+    assert!(prover.closed().await, "still open after the hello timeout");
     let mut rest = Vec::new();
     let n = silent.read_to_end(&mut rest).await.unwrap_or(0);
     assert_eq!(n, 0, "{}", String::from_utf8_lossy(&rest));

@@ -3,7 +3,8 @@
 //!
 //! [`Client::connect`] finds the channel's core, or starts one on demand as a detached
 //! process (ARCH-004, ARCH-018, ARCH-019). It verifies the process serving the pipe before
-//! saying anything to it (ARCH-027), then says `core/hello` (ARCH-029). A core with an older
+//! saying anything to it (ARCH-027), has whoever holds the pipe prove itself (`core/prove`,
+//! Appendix G "Connections"), then says `core/hello` (ARCH-029). A core with an older
 //! major protocol is drained and replaced (unless the client may not start a core); a newer
 //! one is left running and this client reports itself incompatible (ARCH-023, ARCH-014). The
 //! client then calls tools, minting idempotency keys (ARCH-110), and follows events
@@ -49,6 +50,10 @@ pub use workspace::{
 /// another folder: the one case `lil core stop` can clear (`drain_and_wait` asks only cores of
 /// the current user that it could inspect).
 pub(crate) const WRONG_FOLDER: &str = "its executable is not in the folder this client trusts";
+
+/// The `Untrusted` reason for a server that didn't set the proof's event (`core/prove`, Appendix G
+/// "Connections").
+pub(crate) const NOT_PROVED: &str = "it did not prove that it holds the pipe";
 
 /// The core executable's file name, next to the client's own executable.
 pub const CORE_EXE: &str = "lil-core.exe";
@@ -276,6 +281,20 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientError::NotRunning => f.write_str("The LILITH core is not running."),
+            // The point comes first and the path last: a banner cuts this at 300 characters.
+            ClientError::Untrusted { pid, image, reason } if reason == NOT_PROVED => {
+                write!(
+                    f,
+                    "The LILITH core pipe names pid {pid} as server, but its holder didn't prove \
+                     that, so it isn't trusted. In another Windows session, use the core's \
+                     session. An older build can't prove it: its lil core stop works, it ends \
+                     once nothing is connected to it and it has been idle, or use Task Manager."
+                )?;
+                if !image.as_os_str().is_empty() {
+                    write!(f, " That pid is {}.", image.display())?;
+                }
+                Ok(())
+            }
             ClientError::Untrusted { pid, image, reason } => {
                 if image.as_os_str().is_empty() {
                     write!(f, "The LILITH core pipe is served by process {pid}")?;
@@ -590,6 +609,22 @@ mod tests {
         let user = untrusted("it runs as another user".to_string()).to_string();
         assert!(!user.contains("lil core stop"), "{user}");
         assert!(user.contains("77"), "{user}");
+    }
+
+    /// The banner shows the first 300 characters: the way out survives, however long the path.
+    #[test] // spec: ARCH-027
+    fn a_failed_proof_says_what_to_do_within_a_banners_300_characters() {
+        let text = ClientError::Untrusted {
+            pid: u32::MAX,
+            image: PathBuf::from(format!(r"C:\{}\lil-core.exe", "long folder ".repeat(40))),
+            reason: NOT_PROVED.to_string(),
+        }
+        .to_string();
+        // `lil_parse::shown_text` keeps 299 characters and `…` when it cuts.
+        let shown: String = text.chars().take(299).collect();
+        assert!(shown.contains("Task Manager."), "{shown}");
+        assert!(shown.contains(&u32::MAX.to_string()), "{shown}");
+        assert!(text.contains("lil-core.exe"), "{text}");
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! The production [`Router`] (ARCH-029, ARCH-031, QA-010): per connection a small state
 //! machine around `core/hello`. Infrastructure, not a CORE-014 module.
 //!
-//! - [`ConnState::AwaitingHello`]: only `core/hello` is served; anything else is -32001. A
-//!   hello that fails with an error result (an unknown workspace, a token with the wrong
-//!   caller kind) leaves the connection here, so the client may try again until the hello
-//!   timeout.
+//! - [`ConnState::AwaitingHello`]: only `core/hello` and `core/prove` are served; anything else
+//!   is -32001. A hello that fails with an error result (an unknown workspace, a token with the
+//!   wrong caller kind) leaves the connection here, so the client may try again until the hello
+//!   timeout. `core/prove` (Appendix G "Connections") sets the event a client names, whatever
+//!   its version, and leaves the connection here too, with its hello timeout running. After a
+//!   good hello or a `protocol.incompatible` refusal it is -32600.
 //! - An invalid engine token is terminal (ARCH-050: the connection "is refused", never
 //!   downgraded): the `caller.engine_token_invalid` reply is queued, then the connection is
 //!   closed. The writer still sends that reply (its flush grace); nothing read after that
@@ -13,7 +15,8 @@
 //!   `protocol.incompatible` refusal. `core/drain` drains the core only when the client's
 //!   major is greater than the core's (a newer client may replace an older core, ARCH-023);
 //!   otherwise it gets the same frozen refusal and the core keeps running (an older client
-//!   never stops a newer core, ARCH-014). Everything else is -32001.
+//!   never stops a newer core, ARCH-014). A second hello and `core/prove` are -32600; everything
+//!   else is -32001.
 //! - [`ConnState::Ready`]: the session exists. A second hello is -32600. `core/drain` replies
 //!   `{"status":"ok","draining":true}` and begins a requested drain. `tools/list` and
 //!   `tools/call` go to the [`Dispatcher`] (the `tools` module; a draining core answers new
@@ -90,15 +93,17 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use lil_platform::pipe::set_proof_event;
 use lil_platform::process::{ProcessHandle, ProcessInfo, ProcessInspector};
 use lil_platform::{Env, IdSource};
 use lil_protocol::app;
 use lil_protocol::{
     BUILD_ID, CAPABILITIES, CallerKind, CoreInfo, DrainParams, DrainResult, ErrorBody, HelloParams,
-    HelloResult, Id, Negotiation, Outcome, PROTOCOL, ProtocolVersion, Request, Response, RpcError,
-    SubscribeParams, SubscribeResult, ToolCallParams, ToolOutput, ToolsListParams, ToolsListResult,
-    UnsubscribeParams, UnsubscribeResult, WorkspaceInfo, codes, incompatible_refusal,
-    is_valid_topic, method, negotiate, peek_protocol, rpc_code, schema_hash, shared_capabilities,
+    HelloResult, Id, Negotiation, Outcome, PROTOCOL, ProtocolVersion, ProveParams, ProveResult,
+    Request, Response, RpcError, SubscribeParams, SubscribeResult, ToolCallParams, ToolOutput,
+    ToolsListParams, ToolsListResult, UnsubscribeParams, UnsubscribeResult, WorkspaceInfo, codes,
+    incompatible_refusal, is_valid_topic, method, negotiate, peek_protocol, rpc_code, schema_hash,
+    shared_capabilities,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize as _, Serialize};
@@ -416,10 +421,16 @@ impl RpcRouter {
             (ConnState::AwaitingHello, method::HELLO) => {
                 return self.hello(conn, id, req.params).await;
             }
+            (ConnState::AwaitingHello, method::PROVE) => prove(id, req.params),
             (ConnState::AwaitingHello, _) => fault(
                 id,
                 rpc_code::HANDSHAKE_REQUIRED,
                 "call core/hello first on this connection",
+            ),
+            (_, method::PROVE) => fault(
+                id,
+                rpc_code::INVALID_REQUEST,
+                "core/prove comes before core/hello on a connection",
             ),
             (_, method::HELLO) => fault(
                 id,
@@ -1198,6 +1209,26 @@ fn check_topics(topics: &[String]) -> Result<(), RpcError> {
             format!("{t:?} is not a valid topic name"),
         )),
         None => Ok(()),
+    }
+}
+
+/// `core/prove` (Appendix G "Connections"): sets the proof event the params name, and does nothing
+/// else. A name that isn't of a proof's shape, or that can't be opened and set, is -32602.
+fn prove(id: Id, params: Option<Value>) -> Response {
+    let set = parse_params::<ProveParams>(params).and_then(|p| {
+        set_proof_event(&p.name).map_err(|e| {
+            RpcError::new(
+                rpc_code::INVALID_PARAMS,
+                format!("invalid params: the proof: {e}"),
+            )
+        })
+    });
+    match set {
+        Ok(()) => outcome(id, Outcome::Ok(ProveResult { proved: true })),
+        Err(error) => Response::Error {
+            id: Some(id),
+            error,
+        },
     }
 }
 

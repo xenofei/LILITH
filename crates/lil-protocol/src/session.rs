@@ -1,9 +1,11 @@
-//! The handshake (`core/hello`, ARCH-029), `core/drain`, protocol versions and caller kinds.
+//! The handshake (`core/hello`, ARCH-029), `core/prove` before it, `core/drain`, protocol versions
+//! and caller kinds.
 //!
 //! Frozen across every major version: the `core/hello` method name and its `protocol` field,
 //! which the core reads with [`peek_protocol`] before it checks any other field; the
-//! major-mismatch refusal ([`incompatible_refusal`]); and `core/drain` with no parameters and
-//! the result `{"status":"ok","draining":true}`.
+//! major-mismatch refusal ([`incompatible_refusal`]); `core/drain` with no parameters and the
+//! result `{"status":"ok","draining":true}`; and `core/prove` with the parameter `name` and the
+//! result `{"status":"ok","proved":true}`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -29,16 +31,16 @@ pub struct ProtocolVersion {
     pub minor: u16,
 }
 
-/// The protocol this build speaks: 1.2 (plan 4a, Appendix D). 1.0 and 1.1 clients keep
-/// working.
-pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
+/// The protocol this build speaks: 1.3 (Appendix D). 1.0, 1.1 and 1.2 clients keep working.
+pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 /// The capabilities this build offers. A minor version adds features only as new strings:
 /// 1.0 had `events.v1` and `tools.v1`; 1.1 adds `jobs.v1`, `confirmations.v1` and `caps.v1`
 /// (the `app/*` methods need `confirmations.v1` or `caps.v1` in the shared capabilities); 1.2
 /// adds `queue.v1` (`app/queue.pause` and `app/queue.resume` need it), `desktop.v1`
 /// (`app/desktop.set` needs it) and `context.v1` (`app/set_context` needs it), and plan 4a's
-/// later capabilities follow them.
+/// later capabilities follow them; 1.3 adds `proof.v1`, which says the core answers `core/prove`
+/// (no call needs it: `core/prove` comes before a hello can share anything).
 pub const CAPABILITIES: &[&str] = &[
     "events.v1",
     "tools.v1",
@@ -48,6 +50,7 @@ pub const CAPABILITIES: &[&str] = &[
     "queue.v1",
     "desktop.v1",
     "context.v1",
+    "proof.v1",
 ];
 
 /// `<CARGO_PKG_VERSION>+<LIL_BUILD_ID or "local">`; the suffix is fixed at compile time by
@@ -174,6 +177,9 @@ pub fn schema_hash() -> String {
             schemars::schema_for!(crate::app::DesktopSettings),
             schemars::schema_for!(crate::app::SetContextParams),
             schemars::schema_for!(crate::app::SetContextResult),
+            // Protocol 1.3.
+            schemars::schema_for!(ProveParams),
+            schemars::schema_for!(ProveResult),
         ];
         let all = serde_json::Value::Array(
             schemas
@@ -319,6 +325,22 @@ pub struct CoreInfo {
     pub pid: u32,
     pub channel: String,
     pub pipe: String,
+}
+
+/// `core/prove` params (frozen): the name of the event the client has the server set,
+/// `Local\lil-launch-proof-<32 lowercase hex>`, and nothing else about the client (Appendix G
+/// "Connections"). Unknown fields are refused (-32602).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProveParams {
+    pub name: String,
+}
+
+/// `core/prove` result: `{"status":"ok","proved":true}` inside the `Outcome` (frozen). It counts
+/// for nothing with the client, which looks at the event itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProveResult {
+    pub proved: bool,
 }
 
 /// `core/drain` params: none (frozen).
@@ -474,12 +496,12 @@ mod tests {
         assert_eq!(serde_json::from_value::<HelloResult>(wire).unwrap(), result);
     }
 
-    /// Protocol 1.2 (Appendix D): the five capabilities of 1.1, then `queue.v1`, `desktop.v1`
-    /// and `context.v1`, shared in the core's order. Checked by position, so the later plan-4a
+    /// Protocol 1.3 (Appendix D): the five capabilities of 1.1, then `queue.v1`, `desktop.v1`,
+    /// `context.v1` and `proof.v1`, shared in the core's order. Checked by position, so later
     /// capabilities may follow them.
     #[test] // spec: ARCH-029, APP-043
-    fn protocol_is_1_2_and_offers_queue_v1() {
-        assert_eq!(PROTOCOL.to_string(), "1.2");
+    fn protocol_is_1_3_with_its_capabilities_in_order() {
+        assert_eq!(PROTOCOL.to_string(), "1.3");
         let of_1_1 = [
             "events.v1",
             "tools.v1",
@@ -491,6 +513,7 @@ mod tests {
         assert_eq!(CAPABILITIES.get(5), Some(&"queue.v1"));
         assert_eq!(CAPABILITIES.get(6), Some(&"desktop.v1"));
         assert_eq!(CAPABILITIES.get(7), Some(&"context.v1"));
+        assert_eq!(CAPABILITIES.get(8), Some(&"proof.v1"));
         let unique: std::collections::BTreeSet<_> = CAPABILITIES.iter().collect();
         assert_eq!(unique.len(), CAPABILITIES.len(), "{CAPABILITIES:?}");
         // A client offering them all, in another order and with an unknown one, gets them in
@@ -605,8 +628,9 @@ mod tests {
         // and `app/set_context`'s params and result (Appendix G "Session and listing tools").
         // The `HandlersWire` description changed (the scheme only, plan 4a ruling 2026-10-25):
         // no wire value changed, so no protocol bump. `app/set_context`'s result gained the
-        // additive `effective_project` within 1.2, which plan 4a hasn't released.
-        assert_eq!(h, "cbd599bda7731f66");
+        // additive `effective_project`, which plan 4a hasn't released. 1.3 added
+        // `core/prove`'s params and result.
+        assert_eq!(h, "1c350fa78048e713");
     }
 
     #[test] // spec: ARCH-029

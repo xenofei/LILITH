@@ -1164,7 +1164,8 @@ mod tests {
             fake
         }
 
-        /// Accepts the connection and reads its `core/hello`, which it does not answer.
+        /// Accepts the connection, answers its `core/prove` as a core does, setting the event, and
+        /// reads its `core/hello`, which it does not answer.
         async fn accept_hello(server: NamedPipeServer) -> (FakeCore, Value) {
             server.connect().await.expect("accept");
             let (read, write) = tokio::io::split(server);
@@ -1172,6 +1173,11 @@ mod tests {
                 lines: BufReader::new(read).lines(),
                 write,
             };
+            let prove = fake.request("core/prove").await;
+            let name = prove["params"]["name"].as_str().expect("the event's name");
+            lil_platform::pipe::set_proof_event(name).expect("the proof");
+            let proved = lil_protocol::ProveResult { proved: true };
+            fake.reply(&prove, &Outcome::Ok(proved)).await;
             let hello = fake.request("core/hello").await;
             (fake, hello)
         }

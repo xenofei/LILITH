@@ -29,11 +29,12 @@ use windows::Win32::Security::{
 use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 use windows::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows::Win32::System::Threading::{
-    CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
+    CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent,
+    WaitForSingleObject,
 };
 use windows::core::{HSTRING, PWSTR};
 
-use crate::process::{current_user_sid, io_error};
+use crate::process::{current_user_sid, io_error, own_integrity_rid};
 
 /// `D:P(A;;GA;;;<user_sid>)(A;;GA;;;SY)`: a protected DACL granting all access to the user and
 /// to SYSTEM, and to nobody else (ARCH-026).
@@ -188,12 +189,35 @@ pub fn server_pid(client: &NamedPipeClient) -> io::Result<u32> {
 /// Every proof event's name, then 32 hex digits: the session's `Local\` namespace.
 const PROOF_PREFIX: &str = r"Local\lil-launch-proof-";
 
+/// The integrity level Medium, as a token's RID.
+const MEDIUM_RID: u32 = 0x2000;
+
+/// The security of a proof event a process at the level `own_integrity` makes for the user:
+/// `D:P(A;;<rights>;;;<user_sid>)`, a protected DACL granting what the server's set and the
+/// client's wait need, and nobody else anything. The default DACL won't do: an elevated token's
+/// leaves the user's SID out, and so would shut out a server at Medium.
+///
+/// Above Medium it also has an explicit Medium no-write-up label, `S:(ML;;NW;;;ME)`, so a server
+/// at Medium can always set the event, whatever an elevated process's objects get by default. At
+/// Medium or below it has none: at Medium the event is Medium by default, and below Medium the
+/// kernel gives it the process's own level. No elevated process has run this: only its string, and
+/// that Windows takes that string from a process at Medium, are tested.
+fn proof_sddl(user_sid: &str, own_integrity: u32) -> String {
+    let rights = EVENT_MODIFY_STATE.0 | SYNCHRONIZATION_SYNCHRONIZE.0;
+    let label = if own_integrity > MEDIUM_RID {
+        "S:(ML;;NW;;;ME)"
+    } else {
+        ""
+    };
+    format!("D:P(A;;{rights:#x};;;{user_sid}){label}")
+}
+
 /// A pipe server's proof of who it is (Appendix G "Apps"), for when its PID can't vouch for it:
 /// `GetNamedPipeServerProcessId` names the pipe's creator, even after that process has died and
-/// the handle has passed to another. A fresh unsignalled event with a random 128-bit name and
-/// default security, which the server must open with `EVENT_MODIFY_STATE` and set
-/// ([`set_proof_event`]). A process at a lower integrity level can't get that right (no write
-/// up), and an AppContainer can't reach the name.
+/// the handle has passed to another. A fresh unsignalled event with a random 128-bit name and the
+/// security of [`proof_sddl`], which the server must open with `EVENT_MODIFY_STATE` and set
+/// ([`set_proof_event`]). A process below Medium can't get that right (no write up), and an
+/// AppContainer can't reach the name; a same-user process at Medium or above can.
 #[derive(Debug)]
 pub struct ProofEvent {
     name: String,
@@ -202,18 +226,35 @@ pub struct ProofEvent {
 
 impl ProofEvent {
     /// # Errors
-    /// When there's no randomness, the event can't be made, or its name already exists.
+    /// When there's no randomness, this process's token can't be read, the event can't be made,
+    /// or its name already exists.
     pub fn new() -> io::Result<ProofEvent> {
+        ProofEvent::with_sddl(&proof_sddl(&current_user_sid()?, own_integrity_rid()?))
+    }
+
+    fn with_sddl(sddl: &str) -> io::Result<ProofEvent> {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
         let mut name = PROOF_PREFIX.to_string();
         for b in random {
             name.push_str(&format!("{b:02x}"));
         }
-        // SAFETY: the name outlives the call, and the handle it returns is owned from here on.
+        let descriptor = LocalDescriptor::from_sddl(sddl)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0.0,
+            bInheritHandle: false.into(),
+        };
+        // SAFETY: the name, `attributes` and its descriptor outlive the call, and the handle it
+        // returns is owned from here on.
         let event = unsafe {
-            let handle = CreateEventW(None, true, false, &HSTRING::from(name.as_str()))
-                .map_err(|e| io_error(&e))?;
+            let handle = CreateEventW(
+                Some(&raw const attributes),
+                true,
+                false,
+                &HSTRING::from(name.as_str()),
+            )
+            .map_err(|e| io_error(&e))?;
             let existed = GetLastError() == ERROR_ALREADY_EXISTS;
             let event = OwnedHandle::from_raw_handle(handle.0);
             if existed {
@@ -233,6 +274,11 @@ impl ProofEvent {
     pub fn is_set(&self) -> bool {
         // SAFETY: the handle is open while `self` lives.
         unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 0) == WAIT_OBJECT_0 }
+    }
+
+    /// The access-allowed and access-denied entries of its DACL. Errors as [`instance_dacl`].
+    pub fn dacl(&self) -> io::Result<Vec<DaclEntry>> {
+        handle_dacl(HANDLE(self.event.as_raw_handle()))
     }
 }
 
@@ -280,13 +326,19 @@ pub struct DaclEntry {
 /// The access-allowed and access-denied entries of the instance's DACL, in order, with their
 /// access masks. Errors as [`instance_dacl_sids`].
 pub fn instance_dacl(server: &NamedPipeServer) -> io::Result<Vec<DaclEntry>> {
+    handle_dacl(HANDLE(server.as_raw_handle()))
+}
+
+/// The entries of the DACL of the kernel object `handle`, which was opened with READ_CONTROL.
+fn handle_dacl(handle: HANDLE) -> io::Result<Vec<DaclEntry>> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the handle is the server's open pipe handle (opened with READ_CONTROL as part of
-    // its read access); the out-pointers are valid. `sd` owns the memory `dacl` points into.
+    // SAFETY: the caller's handle is open with READ_CONTROL (a pipe server's as part of its read
+    // access, an event's by making it); the out-pointers are valid. `sd` owns the memory `dacl`
+    // points into.
     unsafe {
         GetSecurityInfo(
-            HANDLE(server.as_raw_handle()),
+            handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             None,
@@ -355,5 +407,38 @@ fn sid_string(sid: PSID) -> io::Result<String> {
         let s = text.to_string();
         let _ = LocalFree(Some(HLOCAL(text.as_ptr().cast())));
         s.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOW: u32 = 0x1000;
+    const HIGH: u32 = 0x3000;
+    const USER: &str = "S-1-5-21-1-2-3-1001";
+
+    #[test] // spec: ARCH-027
+    fn only_a_process_above_medium_labels_its_proof_event() {
+        let plain = format!("D:P(A;;0x100002;;;{USER})");
+        assert_eq!(proof_sddl(USER, LOW), plain);
+        assert_eq!(proof_sddl(USER, MEDIUM_RID), plain);
+        let labelled = format!("{plain}S:(ML;;NW;;;ME)");
+        assert_eq!(
+            proof_sddl(USER, MEDIUM_RID + 0x100),
+            labelled,
+            "Medium Plus"
+        );
+        assert_eq!(proof_sddl(USER, HIGH), labelled);
+    }
+
+    /// Windows takes the labelled form from a process at Medium too, and the event works the same.
+    #[test] // spec: ARCH-027
+    fn a_labelled_proof_event_is_made_and_set() {
+        let sid = current_user_sid().unwrap();
+        let proof = ProofEvent::with_sddl(&proof_sddl(&sid, HIGH)).unwrap();
+        assert!(!proof.is_set());
+        set_proof_event(proof.name()).unwrap();
+        assert!(proof.is_set());
     }
 }

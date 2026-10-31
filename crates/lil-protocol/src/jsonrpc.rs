@@ -49,6 +49,7 @@ pub mod rpc_code {
 /// Method names (ARCH-031).
 pub mod method {
     pub const HELLO: &str = "core/hello";
+    pub const PROVE: &str = "core/prove";
     pub const DRAIN: &str = "core/drain";
     pub const TOOLS_LIST: &str = "tools/list";
     pub const TOOLS_CALL: &str = "tools/call";
