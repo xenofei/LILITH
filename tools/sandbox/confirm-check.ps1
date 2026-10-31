@@ -354,8 +354,8 @@ $what = if ($NoHand) { 'checks the confirm window (a window, synthesized clicks 
         else { 'checks the confirm window (a window, synthesized clicks and keys). When this turns blue it needs you' }
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
-               '-What', $what, '-WarnSec', '10', '-RunSec', '240',
-               '-CapSec', '600', '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-What', $what, '-WarnSec', '10', '-RunSec', '480',
+               '-CapSec', '900', '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -413,9 +413,29 @@ function Get-WindowReason {
     } catch { }
     return ''
 }
+# Windows keeps the front from a program for a few minutes after the person's last input, and no input
+# may be sent to get round that: keep asking until it lets go.
 function Show-App {
-    [void][LilConfirmCheck.Win]::SetForegroundWindow([System.IntPtr]$script:main.Current.NativeWindowHandle)
-    Start-Sleep -Milliseconds 800
+    $hwnd = [System.IntPtr]$script:main.Current.NativeWindowHandle
+    $end = (Get-Date).AddSeconds(240)
+    $waited = $false
+    while ($true) {
+        [void][LilConfirmCheck.Win]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 800
+        $holder = Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())
+        if ($holder -eq $script:app.Id) { break }
+        if ((Get-Date) -gt $end) {
+            $name = (Get-Process -Id $holder -ErrorAction SilentlyContinue).ProcessName
+            throw "the window didn't get the front in 240 s: $name holds it"
+        }
+        if (-not $waited) {
+            $waited = $true
+            Write-Host "Windows keeps the front for now: $((Get-Process -Id $holder -ErrorAction SilentlyContinue).ProcessName) holds it"
+            Set-Cue "Nothing to do. Waiting for Windows to let the test window come to the front.`nStay off the mouse and keyboard: any input makes this wait longer."
+        }
+        Start-Sleep -Seconds 1
+    }
+    if ($waited) { Clear-Cue }
 }
 function Save-UiaTree([string]$path) {
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -438,10 +458,17 @@ function Save-UiaTree([string]$path) {
 function Open-Window([string]$id, [string]$button = 'Approve') {
     Close-App
     $script:app = Start-Process -FilePath $image -ArgumentList @('--confirm', $id) -WorkingDirectory $root -PassThru
-    $script:main = Wait-For {
-        $AE::RootElement.FindFirst($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id))
-    } 40 'the confirm window'
-    $script:approve = Wait-For { Find-Button $button } 30 $button
+    $findMain = { $AE::RootElement.FindFirst($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)) }
+    $script:main = Wait-For $findMain 40 'the confirm window'
+    $first = $script:main
+    # The element is found again each time: one found while the window was being made can stay empty.
+    $script:approve = Wait-For {
+        $script:main = & $findMain
+        if ($script:main) { Find-Button $button }
+    } 30 $button
+    if (-not $first.FindFirst($TS::Descendants, (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Button)))) {
+        Write-Host 'measured: the window element found first has no buttons, a fresh one does: UI Automation kept an early view'
+    }
     $script:deny = Wait-For { $b = Find-Named 'Deny'; if (-not $b) { $b = Find-Named 'Cancel' }; $b } 10 'Deny'
     [void](Wait-For { if ($script:deny.Current.IsEnabled) { $true } } 30 'the buttons to turn on')
     Show-App
@@ -799,6 +826,7 @@ try {
                 $press = $lines | Where-Object { $_.kind -eq 'Press' } | Select-Object -Last 1
                 $release = $lines | Where-Object { $_.kind -eq 'Release' } | Select-Object -Last 1
                 $refused = @(Get-Refusals).Count
+                Get-Refusals | ForEach-Object { Write-Host "(i) measured: a refused click: $((($_ | ConvertFrom-Json).fields) | ConvertTo-Json -Compress)" }
                 Check ($answer -eq 'approved') "(i) a real click on Approve approved it (the core says: $answer; refused clicks before it: $refused; the window: $(Get-WindowReason))"
                 Check ($press -and $press.origin -eq 'Hardware' -and $press.physically_down -eq $true) '(i) the press reads as hardware, the button physically down'
                 Check ($release -and $release.origin -eq 'Hardware' -and $release.physically_down -eq $false) '(i) the release reads as hardware, the button physically up'
