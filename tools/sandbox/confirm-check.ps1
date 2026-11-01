@@ -699,6 +699,19 @@ function Wait-RealClick([string]$cue) {
 }
 # The refusals' names in this step's log.
 function Get-RefusalNames { @(Get-Refusals | ForEach-Object { (($_ | ConvertFrom-Json).fields).refusal }) }
+# What the gate was told of the front, by Windows, in this step: each line with its time and path, and
+# whether each press read as the one that brought the window forward.
+function Get-FrontStory {
+     = foreach ( in Get-LogSinceStep) {
+        if ( -notlike '*of the app*the front*' -and  -notlike "*a press or release on a confirmation's button*") { continue }
+         =  | ConvertFrom-Json
+         = .fields
+         = ([string].timestamp).Substring(11, 12)
+        if (.kind) { " 197609.kind) came_forward=197609.came_forward) in_front=197609.in_front)" }
+        else { " 197609.message) via=197609.via) on_button=197609.on_button) in_front=197609.in_front)" }
+    }
+    return (@() -join '; ')
+}
 # The shell's main window, found afresh: one found while it was being made can stay empty.
 function Find-Shell {
     $all = Retry-Walk { $AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)) }
@@ -1173,7 +1186,7 @@ try {
                         $answer = Wait-RealClick $cue
                         Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve counted. The evidence is saved.' } else { 'Thanks. Stay off the mouse: one more short step comes soon, and this turns blue for it.' })
                         $names = @(Get-RefusalNames)
-                        $measured = "(j) measured: refusals before it counted: [$($names -join ', ')]"
+                        $measured = "(j) measured: refusals before it counted: [$($names -join ', ')]; what the gate was told: [$(Get-FrontStory)]"
                         Write-Host $measured
                         $results.Add($measured)
                         Check ($answer -eq 'approved') "(j) after a title-bar click, a real click on Approve approved it (the core says: $answer)"
@@ -1214,7 +1227,7 @@ try {
                     Start-Sleep -Milliseconds 300
                     $names = @(Get-RefusalNames)
                     $said = Get-WindowReason
-                    $measured = "(q) measured: the first click: the core says $answer; refusals: [$($names -join ', ')]; the window said: $said"
+                    $measured = "(q) measured: the first click: the core says $answer; refusals: [$($names -join ', ')]; the window said: $said; what the gate was told: [$(Get-FrontStory)]"
                     Write-Host $measured
                     $results.Add($measured)
                     if ($names.Count -eq 0) {
