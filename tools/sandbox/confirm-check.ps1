@@ -399,6 +399,23 @@ function Get-Counts {
     return $(if ($o.fields) { $o.fields } else { $o })
 }
 function Get-Refusals { @(Get-LogSinceStep | Where-Object { $_ -like "*an answer to a confirmation didn't count*" }) }
+# What the gate was told of the front, by Windows, in this step: each line with its time and path, and
+# whether each press read as the one that brought the window forward.
+function Get-FrontStory([string[]]$lines = @(Get-LogSinceStep)) {
+    $story = foreach ($line in $lines) {
+        if ($line -notlike '*of the app*the front*' -and $line -notlike "*a press or release on a confirmation's button*") { continue }
+        $o = $line | ConvertFrom-Json
+        $f = $o.fields
+        # PowerShell's ConvertFrom-Json reads the time as a DateTime.
+        $at = ([datetime]$o.timestamp).ToUniversalTime().ToString('HH:mm:ss.fff')
+        if ($f.kind) {
+            "$at $($f.kind) tick=$($f.tick) came_forward=$($f.came_forward) since_front_ms=$($f.since_front_ms) in_front=$($f.in_front)"
+        } else {
+            "$at $($f.message) via=$($f.via) window=$($f.window) tick=$($f.tick) on_button=$($f.on_button) in_front=$($f.in_front)"
+        }
+    }
+    return (@($story) -join '; ')
+}
 
 # Adds the cap the (d) check needs to the test channel's suite.toml, and starts the core again on it.
 function Set-CapAndRestart {
@@ -427,6 +444,10 @@ if ($DryRun) {
     $sample = '{"timestamp":"t","level":"INFO","fields":{"message":"a press or release on a confirmation''s button","kind":"Press","origin":"Hardware","physically_down":true,"sent":3},"target":"lil_qt"}'
     $parsed = ($sample | ConvertFrom-Json).fields
     Check ($parsed.kind -eq 'Press' -and $parsed.origin -eq 'Hardware' -and $parsed.physically_down -eq $true) 'dry run: a log line of that shape parses'
+    $story = Get-FrontStory @(
+        '{"timestamp":"2026-11-01T18:02:04.300000Z","fields":{"message":"a click brought a window of the app to the front","via":"hook","window":"0x1a2b","tick":1000,"on_button":true,"in_front":true}}',
+        '{"timestamp":"2026-11-01T18:02:04.330091Z","fields":{"message":"a press or release on a confirmation''s button","kind":"Press","tick":990,"came_forward":true,"since_front_ms":-10,"in_front":true}}')
+    Check ($story -eq '18:02:04.300 a click brought a window of the app to the front via=hook window=0x1a2b tick=1000 on_button=True in_front=True; 18:02:04.330 Press tick=990 came_forward=True since_front_ms=-10 in_front=True') "dry run: the front's story reads: $story"
     # winuser.h's sizes on x64: what InjectTouchInput and InjectSyntheticPointerInput will read.
     Check ([LilConfirmCheck.Win]::TouchInfoSize() -eq 144 -and [LilConfirmCheck.Win]::PenTypeInfoSize() -eq 152) "dry run: (m)'s structures have Windows' sizes ($([LilConfirmCheck.Win]::TouchInfoSize()), $([LilConfirmCheck.Win]::PenTypeInfoSize()))"
     Enter-TestChannel
@@ -699,19 +720,6 @@ function Wait-RealClick([string]$cue) {
 }
 # The refusals' names in this step's log.
 function Get-RefusalNames { @(Get-Refusals | ForEach-Object { (($_ | ConvertFrom-Json).fields).refusal }) }
-# What the gate was told of the front, by Windows, in this step: each line with its time and path, and
-# whether each press read as the one that brought the window forward.
-function Get-FrontStory {
-     = foreach ( in Get-LogSinceStep) {
-        if ( -notlike '*of the app*the front*' -and  -notlike "*a press or release on a confirmation's button*") { continue }
-         =  | ConvertFrom-Json
-         = .fields
-         = ([string].timestamp).Substring(11, 12)
-        if (.kind) { " 197609.kind) came_forward=197609.came_forward) in_front=197609.in_front)" }
-        else { " 197609.message) via=197609.via) on_button=197609.on_button) in_front=197609.in_front)" }
-    }
-    return (@() -join '; ')
-}
 # The shell's main window, found afresh: one found while it was being made can stay empty.
 function Find-Shell {
     $all = Retry-Walk { $AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)) }
@@ -744,12 +752,19 @@ function Find-FloatingWindow([string]$name) {
     return (Retry-Walk { $script:main.FindFirst($TS::Descendants, $window) })
 }
 # Whether the foreground window is, or isn't, the app's, within the person's time for one stage.
+# Held for 300 ms, so a moment with no foreground window at all, between two others, doesn't count.
 function Wait-Front([bool]$ours) {
     $end = (Get-Date).AddSeconds($HandSec)
+    $since = $null
     while ((Get-Date) -lt $end) {
         $front = Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())
-        if (($front -eq $script:app.Id) -eq $ours) { return $true }
-        Start-Sleep -Milliseconds 100
+        if (($front -eq $script:app.Id) -eq $ours) {
+            if (-not $since) { $since = Get-Date }
+            if (((Get-Date) - $since).TotalMilliseconds -ge 300) { return $true }
+        } else {
+            $since = $null
+        }
+        Start-Sleep -Milliseconds 30
     }
     return $false
 }
@@ -1218,19 +1233,45 @@ try {
                     Try-Beep 880 400
                     Write-Host "NOW: click Approve once. ($HandSec s)"
                     # No UI Automation while waiting: it would keep the app's GUI thread busy for the click.
+                    # The front is watched all the while, on GetTickCount's clock: if the window is back
+                    # in front before the press happened, nothing here tests a click that brings it.
                     $end = (Get-Date).AddSeconds($HandSec)
-                    $answer = 'pending'
-                    while ((Get-Date) -lt $end -and $answer -eq 'pending' -and @(Get-Refusals).Count -eq 0) {
-                        Start-Sleep -Milliseconds 200
-                        $answer = Get-Answer $script:id
+                    $frontBackTick = $null
+                    $press = $null
+                    $nextLook = Get-Date
+                    while ((Get-Date) -lt $end -and -not $press) {
+                        if ($null -eq $frontBackTick -and (Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) {
+                            $frontBackTick = [Environment]::TickCount
+                        }
+                        if ((Get-Date) -ge $nextLook) {
+                            $press = @(Get-PointerLines | Where-Object { $_.kind -eq 'Press' }) | Select-Object -First 1
+                            $nextLook = (Get-Date).AddMilliseconds(300)
+                        }
+                        Start-Sleep -Milliseconds 15
                     }
-                    Start-Sleep -Milliseconds 300
+                    Start-Sleep -Milliseconds 500
+                    $answer = Get-Answer $script:id
                     $names = @(Get-RefusalNames)
                     $said = Get-WindowReason
-                    $measured = "(q) measured: the first click: the core says $answer; refusals: [$($names -join ', ')]; the window said: $said; what the gate was told: [$(Get-FrontStory)]"
+                    # Both on GetTickCount's clock, which wraps: compared as a signed difference. The
+                    # window comes to the front as the activating click happens, so it counts as back
+                    # first only when that was clearly before the press's own time.
+                    $frontFirst = $null
+                    if ($press -and $null -ne $frontBackTick -and $null -ne $press.tick) {
+                        $gap = [int64]$press.tick - ([int64]$frontBackTick -band 0xffffffffL)
+                        if ($gap -gt 2147483647L) { $gap -= 4294967296L } elseif ($gap -lt -2147483648L) { $gap += 4294967296L }
+                        $frontFirst = $gap -gt 50
+                    }
+                    $measured = "(q) measured: the first click: the core says $answer; refusals: [$($names -join ', ')]; the window said: $said; the window was back in front before the press: $frontFirst; what the gate was told: [$(Get-FrontStory)]"
                     Write-Host $measured
                     $results.Add($measured)
-                    if ($names.Count -eq 0) {
+                    if ($frontFirst) {
+                        $note = '(q) NOT TESTED: the window was back in front before the click on Approve, so that click could not bring it forward'
+                        Write-Host $note
+                        $results.Add($note)
+                        Set-Cue 'That one could not be tested: the window was already in front. The check goes on.'
+                        Start-Sleep -Seconds 3
+                    } elseif ($names.Count -eq 0) {
                         Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve came. The evidence is saved.' } else { 'That click answered it, and it should not have. The evidence is saved.' })
                         Fail "(q) the click on Approve in a window not in front wasn't refused (the core says: $answer)"
                         Start-Sleep -Seconds 3
