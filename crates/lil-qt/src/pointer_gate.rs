@@ -72,14 +72,16 @@
 //! the tick its window came to the front: no later than that, it brought the window forward; within
 //! [`FRONT_SETTLE_MS`], too soon. The premise: Windows delivers `WM_ACTIVATE` to this thread before
 //! any input it reads while the window is in front, so the gate knows the front before it judges a
-//! press. A thread stalled before it reads the activation reads the press with its time against an
-//! older front or none: that makes the gate stricter, and its refusals may name the wrong cause.
+//! press. A thread stalled before it reads the activation stamps that front late, after the input
+//! time of a press made in the meantime. That press then reads as having brought the window forward,
+//! or as too soon: stricter, and the refusal may name the wrong cause.
 //! `WA_CLICKACTIVE` and `WM_MOUSEACTIVATE` mark the activating click too. That ends only when the hand
 //! moves somewhere: Windows' own move, or a real one in place, doesn't end it.
 //!
 //! A residual: any program can send this thread `WM_ACTIVATE` or `WM_MOUSEACTIVATE`. A forged one
-//! can only refuse a click (too soon, brought forward, or the pointer off and back) and change the
-//! words it gives: it never makes one count.
+//! can only refuse an answer (a click as too soon, brought forward or needing the pointer off and
+//! back, and a keyboard Deny or Cancel as too soon, through the answer bar's clock) and change the
+//! words it gives: it never approves anything.
 //!
 //! Touch and pen never count. Qt takes them as `WM_POINTER*`, which aren't read here, and a legacy
 //! message that reports either device is refused too, so a tap on Approve says it needs the mouse or
@@ -188,7 +190,8 @@ pub enum GateRefusal {
     /// QML's events came past [`TOKEN_LIFETIME`]: too late to tell.
     Stalled,
     /// The press came within [`FRONT_SETTLE_MS`] of its window coming to the front, by the input's
-    /// own time: the answer gate's half second, immune to Qt's order and to a stalled thread.
+    /// own time: the answer gate's half second, whatever order Qt reads things in. A thread stalled
+    /// before it reads the activation makes this stricter, not laxer (the module docs).
     TooSoon,
     /// The window under the point isn't this one, or this one can't be seen.
     NotExposed,

@@ -16,7 +16,8 @@
 //! - `seenMessages()`, `realMessages()` and `sentMessages()` count what the gate has read. Each press
 //!   or release on a watched button writes one log line saying where Windows says it came from, the
 //!   input's tick and `since_front_ms`, and the counts; each front change one line with the window
-//!   and its tick: `tools/sandbox/confirm-check.ps1` reads them. No position and no text.
+//!   and its tick, at most one a second per kind and path, so a burst logs only some of them:
+//!   `tools/sandbox/confirm-check.ps1` reads them. No position and no text.
 //! - `windowInFront(item)` and `frontGainedMs(item)` are Windows' own front for the item's window,
 //!   which the answer bar decides by on Windows.
 //!
