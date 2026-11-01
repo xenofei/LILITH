@@ -399,6 +399,35 @@ function Get-Counts {
     return $(if ($o.fields) { $o.fields } else { $o })
 }
 function Get-Refusals { @(Get-LogSinceStep | Where-Object { $_ -like "*an answer to a confirmation didn't count*" }) }
+# (q)'s verdict on the first click: 'refused', 'fail: why' or 'not tested: why'. By the gate's own
+# numbers on the press line (`came_forward`, `front_known`, `since_front_ms`) and by the script's own
+# look at the front of the window it clicks (`frontBackTick`, on GetTickCount's clock, or none): if
+# either says the window came forward less than half a second before the press, or with it, the click
+# must have answered nothing and been refused as brought_forward or too_soon. Only when both say it was
+# in front for longer is the step not tested.
+function Get-QVerdict($press, $frontBackTick, [string]$answer, [string[]]$names) {
+    if (-not $press) { return "fail: no press on Approve came (the core says: $answer)" }
+    $gateSays = ($press.came_forward -eq $true) -or ($press.front_known -eq $true -and [int64]$press.since_front_ms -lt 500)
+    $scriptSays = $false
+    $gap = $null
+    if ($null -ne $frontBackTick -and $null -ne $press.tick) {
+        # The clock wraps: a signed difference. Below 0: the script saw the front after the press.
+        $gap = [int64]$press.tick - ([int64]$frontBackTick -band 0xffffffffL)
+        if ($gap -gt 2147483647L) { $gap -= 4294967296L } elseif ($gap -lt -2147483648L) { $gap += 4294967296L }
+        $scriptSays = $gap -lt 500
+    }
+    $numbers = "came_forward=$($press.came_forward), front_known=$($press.front_known), since_front_ms=$($press.since_front_ms), the script saw the front $gap ms before the press"
+    if (-not $gateSays -and -not $scriptSays) {
+        return "not tested: the window was in front for half a second or more before the press ($numbers)"
+    }
+    if ($answer -ne 'pending') {
+        return "fail: a click within half a second of its window coming to the front answered it (the core says: $answer; $numbers)"
+    }
+    if (@($names).Count -eq 0 -or $names[0] -notin 'brought_forward', 'too_soon') {
+        return "fail: it was refused as [$(@($names) -join ', ')], not as brought_forward or too_soon ($numbers)"
+    }
+    return 'refused'
+}
 # What the gate was told of the front, by Windows, in this step: each line with its time and path, and
 # whether each press read as the one that brought the window forward.
 function Get-FrontStory([string[]]$lines = @(Get-LogSinceStep)) {
@@ -448,6 +477,17 @@ if ($DryRun) {
         '{"timestamp":"2026-11-01T18:02:04.300000Z","fields":{"message":"a click brought a window of the app to the front","via":"hook","window":"0x1a2b","tick":1000,"on_button":true,"in_front":true}}',
         '{"timestamp":"2026-11-01T18:02:04.330091Z","fields":{"message":"a press or release on a confirmation''s button","kind":"Press","tick":990,"came_forward":true,"since_front_ms":-10,"in_front":true}}')
     Check ($story -eq '18:02:04.300 a click brought a window of the app to the front via=hook window=0x1a2b tick=1000 on_button=True in_front=True; 18:02:04.330 Press tick=990 came_forward=True since_front_ms=-10 in_front=True') "dry run: the front's story reads: $story"
+    # (q)'s verdict, on the gate's numbers: the window came forward first, 200 ms or 700 ms before.
+    $at200 = [pscustomobject]@{ tick = 1000; came_forward = $false; front_known = $true; since_front_ms = 200 }
+    $at700 = [pscustomobject]@{ tick = 1000; came_forward = $false; front_known = $true; since_front_ms = 700 }
+    $verdict = Get-QVerdict $at200 800 'approved' @()
+    Check ($verdict -like 'fail*') "dry run: (q) fails a click approved 200 ms after its window's front: $verdict"
+    $verdict = Get-QVerdict $at200 800 'pending' @('too_soon')
+    Check ($verdict -eq 'refused') "dry run: (q) passes one refused too_soon 200 ms after: $verdict"
+    $verdict = Get-QVerdict $at700 300 'approved' @()
+    Check ($verdict -like 'not tested*') "dry run: (q) reports one 700 ms after as not tested: $verdict"
+    $verdict = Get-QVerdict $at700 900 'approved' @()
+    Check ($verdict -like 'fail*') "dry run: (q) fails it when its own look saw the window come forward with the press: $verdict"
     # winuser.h's sizes on x64: what InjectTouchInput and InjectSyntheticPointerInput will read.
     Check ([LilConfirmCheck.Win]::TouchInfoSize() -eq 144 -and [LilConfirmCheck.Win]::PenTypeInfoSize() -eq 152) "dry run: (m)'s structures have Windows' sizes ($([LilConfirmCheck.Win]::TouchInfoSize()), $([LilConfirmCheck.Win]::PenTypeInfoSize()))"
     Enter-TestChannel
@@ -1239,8 +1279,10 @@ try {
                     $frontBackTick = $null
                     $press = $null
                     $nextLook = Get-Date
+                    # Only the window it clicks: another of the app's coming forward says nothing here.
+                    $clicked = [System.IntPtr]$script:main.Current.NativeWindowHandle
                     while ((Get-Date) -lt $end -and -not $press) {
-                        if ($null -eq $frontBackTick -and (Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) {
+                        if ($null -eq $frontBackTick -and [LilConfirmCheck.Win]::GetForegroundWindow() -eq $clicked) {
                             $frontBackTick = [Environment]::TickCount
                         }
                         if ((Get-Date) -ge $nextLook) {
@@ -1253,32 +1295,25 @@ try {
                     $answer = Get-Answer $script:id
                     $names = @(Get-RefusalNames)
                     $said = Get-WindowReason
-                    # Both on GetTickCount's clock, which wraps: compared as a signed difference. The
-                    # window comes to the front as the activating click happens, so it counts as back
-                    # first only when that was clearly before the press's own time.
-                    $frontFirst = $null
-                    if ($press -and $null -ne $frontBackTick -and $null -ne $press.tick) {
-                        $gap = [int64]$press.tick - ([int64]$frontBackTick -band 0xffffffffL)
-                        if ($gap -gt 2147483647L) { $gap -= 4294967296L } elseif ($gap -lt -2147483648L) { $gap += 4294967296L }
-                        $frontFirst = $gap -gt 50
-                    }
-                    $measured = "(q) measured: the first click: the core says $answer; refusals: [$($names -join ', ')]; the window said: $said; the window was back in front before the press: $frontFirst; what the gate was told: [$(Get-FrontStory)]"
+                    $verdict = Get-QVerdict $press $frontBackTick $answer $names
+                    $measured = "(q) measured: the first click: the core says $answer; refusals: [$($names -join ', ')]; the window said: $said; verdict: $verdict; what the gate was told: [$(Get-FrontStory)]"
                     Write-Host $measured
                     $results.Add($measured)
-                    if ($frontFirst) {
-                        $note = '(q) NOT TESTED: the window was back in front before the click on Approve, so that click could not bring it forward'
+                    if ($verdict -like 'not tested*') {
+                        $note = "(q) NOT TESTED: $($verdict.Substring(12))"
                         Write-Host $note
                         $results.Add($note)
                         Set-Cue 'That one could not be tested: the window was already in front. The check goes on.'
                         Start-Sleep -Seconds 3
-                    } elseif ($names.Count -eq 0) {
-                        Set-Cue $(if ($answer -eq 'pending') { 'Timed out: no click on Approve came. The evidence is saved.' } else { 'That click answered it, and it should not have. The evidence is saved.' })
-                        Fail "(q) the click on Approve in a window not in front wasn't refused (the core says: $answer)"
+                    } elseif ($verdict -like 'fail*') {
+                        Set-Cue $(if ($answer -eq 'pending') { 'That click wasn''t refused as it should have been. The evidence is saved.' } else { 'That click answered it, and it should not have. The evidence is saved.' })
+                        Fail "(q) $($verdict.Substring(6))"
                         Start-Sleep -Seconds 3
                     } else {
-                        Check ($names[0] -eq 'brought_forward') "(q) it was refused as brought_forward: $($names[0])"
-                        Check ($answer -eq 'pending') '(q) and it answered nothing'
-                        Check ($said -eq $expected) "(q) and the window says what works: $said"
+                        Pass "(q) the click that brought the window forward answered nothing, refused as $($names[0])"
+                        if ($names[0] -eq 'brought_forward') {
+                            Check ($said -eq $expected) "(q) and the window says what works: $said"
+                        }
                         Start-Step
                         Try-Beep 659 250
                         $answer = Wait-RealClick 'Now: move the pointer off Approve, then come back and click it'
