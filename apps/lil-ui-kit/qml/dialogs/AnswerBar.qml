@@ -27,7 +27,11 @@ Column {
     property string shownKey
     // Still waiting for an answer, as far as the dialog knows.
     property bool open: true
+    // Qt's view, for what the bar shows. What it decides reads Windows where there is a Windows (the
+    // front source: ConfirmInput, or a test's fake with windowInFront and frontGainedMs).
     property bool inFront: Window.active
+    property var frontSource: ConfirmInput
+    property bool useNativeFront: Qt.platform.pluginName === "windows"
 
     property real visibleSinceMs: -1
     property bool busy: false
@@ -87,7 +91,7 @@ Column {
     }
 
     function restartClock() {
-        visibleSinceMs = inFront && visible ? ConfirmInput.nowMs() : -1
+        visibleSinceMs = (inFront || useNativeFront) && visible ? ConfirmInput.nowMs() : -1
     }
 
     // What these buttons answer has changed: a click needs the half second again, and any words
@@ -103,12 +107,15 @@ Column {
         Accessible.announce(reason)
     }
 
-    // Qt's `Window.active` is a step behind Windows: its activation reaches QML after the click that
-    // caused it. So in front means by Windows too, and the half second runs from the later of this
-    // bar's own clock and when Windows last brought a window of the app to the front.
+    // Qt's `Window.active` is a step behind Windows, its activation reaching QML after the click that
+    // caused it, and it goes stale between a window and its floating panels: its activeChanged comes
+    // only to the old and the new focus window, while isActive counts the family. So on Windows, in
+    // front means the foreground window is this one, and the half second runs from the later of this
+    // bar's own clock and when Windows last brought this window to the front.
     function _passes(kind, focused, label) {
-        const front = inFront && ConfirmInput.windowInFront(root)
-        const since = visibleSinceMs < 0 ? -1 : Math.max(visibleSinceMs, ConfirmInput.frontGainedMs())
+        const front = useNativeFront ? frontSource.windowInFront(root) : inFront
+        const since = visibleSinceMs < 0 ? -1
+            : Math.max(visibleSinceMs, useNativeFront ? frontSource.frontGainedMs(root) : -1)
         const name = ConfirmInput.gateRefusal(kind, focused, since, front, ConfirmInput.nowMs())
         if (name === "")
             return true

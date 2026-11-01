@@ -21,4 +21,7 @@ std::uint64_t pointerSerial(const QVariant &item);
 // Whether the item's window is the foreground window, by Windows itself (always on other platforms).
 bool pointerWindowInFront(const QVariant &item);
 
+// The item's top-level window (GA_ROOT), or 0.
+std::intptr_t pointerWindowRoot(const QVariant &item);
+
 } // namespace lil_qt

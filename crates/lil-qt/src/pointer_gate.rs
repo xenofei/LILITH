@@ -66,9 +66,13 @@
 //! sent messages, reach the gate through both the thread hook and the filter (Qt runs its dispatcher's
 //! filters for sent messages that aren't input), before the click that caused them is read. Qt's own
 //! activation reaches QML after that click, so nothing here waits on `Window.active`. On coming to the
-//! front the rest starts again, nothing half-done stands, and a button under the cursor needs the
-//! pointer to leave it and come back ([`PointerKind::FrontGained`]). An activation ends only when the
-//! hand moves somewhere: Windows' own move, or a real one in place, doesn't end it.
+//! front, per top-level window, the rest starts again, nothing half-done stands, and a button under
+//! the cursor needs the pointer to leave it and come back ([`PointerKind::FrontGained`]). The press is
+//! then judged by its own time (`MSG.time`, which a program posting a message can't choose) against
+//! the tick its window came to the front: no later than that, it brought the window forward; within
+//! [`FRONT_SETTLE_MS`], too soon. Neither depends on the order messages are read in, nor on a stalled
+//! thread. `WA_CLICKACTIVE` and `WM_MOUSEACTIVATE` mark the activating click too. That ends only when
+//! the hand moves somewhere: Windows' own move, or a real one in place, doesn't end it.
 //!
 //! Touch and pen never count. Qt takes them as `WM_POINTER*`, which aren't read here, and a legacy
 //! message that reports either device is refused too, so a tap on Approve says it needs the mouse or
@@ -101,8 +105,10 @@ pub enum PointerKind {
     CancelMode,
     /// `WM_MOUSEACTIVATE` for a left press.
     MouseActivate,
-    /// `WM_ACTIVATE`: the window came to the front.
+    /// `WM_ACTIVATE` with `WA_ACTIVE`: the window came to the front, not by a click.
     FrontGained,
+    /// `WM_ACTIVATE` with `WA_CLICKACTIVE`: a click brought it to the front.
+    FrontClicked,
     /// `WM_ACTIVATE` with `WA_INACTIVE`: it left the front.
     FrontLost,
 }
@@ -134,7 +140,20 @@ pub struct Seen {
     /// `TME_LEAVE` is armed on the message's window (moves only).
     pub tracked: bool,
     pub target: Option<Target>,
+    /// The message's top-level window (`GA_ROOT`).
+    pub window: isize,
+    /// When the input happened, on `GetTickCount`'s clock: `MSG.time` for what left the queue, which
+    /// a program posting a message can't choose; the tick when a sent message (activation) arrived.
+    pub time: u32,
 }
+
+/// How long after its window comes to the front a press is too soon, by the input's own time: the
+/// answer gate's half second.
+pub const FRONT_SETTLE_MS: i32 = 500;
+
+/// `GetTickCount` moves in steps of about 16 ms, and an activating click's own time comes a little
+/// before its activation's tick: a press up to this long after the tick still brought it forward.
+pub const TICK_SLACK_MS: i32 = 20;
 
 /// How many messages it has read, how many of them Windows reported as real, and how many mouse
 /// button messages were sent past the filter: what a test and the app's log can check. No position,
@@ -157,6 +176,9 @@ pub enum GateRefusal {
     ButtonState,
     /// QML's events came past [`TOKEN_LIFETIME`]: too late to tell.
     Stalled,
+    /// The press came within [`FRONT_SETTLE_MS`] of its window coming to the front, by the input's
+    /// own time: the answer gate's half second, immune to Qt's order and to a stalled thread.
+    TooSoon,
     /// The window under the point isn't this one, or this one can't be seen.
     NotExposed,
     /// The hook that sees sent messages couldn't be set.
@@ -173,6 +195,7 @@ impl GateRefusal {
             GateRefusal::Reenter => "reenter",
             GateRefusal::ButtonState => "button_state",
             GateRefusal::Stalled => "stalled",
+            GateRefusal::TooSoon => "too_soon",
             GateRefusal::NotExposed => "not_exposed",
             GateRefusal::NoGuard => "no_guard",
         }
@@ -196,6 +219,10 @@ impl GateRefusal {
             )),
             "button_state" => Some(format!(
                 "That click was too quick for LILITH to check. Hold the click a moment longer on {label}."
+            )),
+            // The answer gate's name too: one set of words for both.
+            "too_soon" => Some(format!(
+                "Wait a moment: {label} works half a second after this window comes to the front."
             )),
             "stalled" => Some(format!(
                 "LILITH was too busy to check that click in time, so it didn't count. Click {label} again."
@@ -243,6 +270,8 @@ pub struct PointerGate {
     current: Option<u64>,
     /// `WM_MOUSEACTIVATE` came: the next press brought the window to the front.
     activated: bool,
+    /// When each top-level window last came to the front, on the input's clock.
+    fronts: Vec<(isize, u32)>,
     /// The pointer must really leave this button before it counts again.
     reenter: Option<u64>,
     /// Where the cursor was at the last message.
@@ -301,7 +330,10 @@ impl PointerGate {
         // Whether a front change or an activation: they say nothing of where a hand put the cursor.
         let front = matches!(
             s.kind,
-            PointerKind::FrontGained | PointerKind::FrontLost | PointerKind::MouseActivate
+            PointerKind::FrontGained
+                | PointerKind::FrontClicked
+                | PointerKind::FrontLost
+                | PointerKind::MouseActivate
         );
         // The hand put the cursor somewhere it wasn't.
         let moved_on = s.kind == PointerKind::Move && real && on_time && msg.at != self.last_at;
@@ -366,10 +398,17 @@ impl PointerGate {
                 self.qml_pressed = None;
                 self.qml_press_late = None;
                 let activated = std::mem::take(&mut self.activated);
-                self.press_refused = if activated || !s.in_front {
+                // By the input's own time against its window's last coming to the front: the click
+                // that caused the activation came no later than it.
+                let since_front = self.ms_since_front(s.window, s.time);
+                let brought_forward = since_front.is_some_and(|ms| ms <= TICK_SLACK_MS);
+                let too_soon = since_front.is_some_and(|ms| ms < FRONT_SETTLE_MS);
+                self.press_refused = if activated || brought_forward || !s.in_front {
                     Some(GateRefusal::Click(Refusal::NotInFront))
                 } else if must_reenter {
                     Some(GateRefusal::Reenter)
+                } else if too_soon {
+                    Some(GateRefusal::TooSoon)
                 } else if !s.exposed {
                     Some(GateRefusal::NotExposed)
                 } else if !s.physically_down {
@@ -429,19 +468,33 @@ impl PointerGate {
             // rest starts again, nothing half-done stands, and with the cursor on a button the
             // pointer must leave it and come back. A click meant for the window underneath, or a
             // window raised under a moving hand, is refused that way.
-            PointerKind::FrontGained | PointerKind::FrontLost => {
+            PointerKind::FrontGained | PointerKind::FrontClicked | PointerKind::FrontLost => {
                 self.gate.restart(msg.at);
                 self.press_refused = None;
                 self.press_serial = None;
                 self.token = None;
                 self.press_token = None;
-                if s.kind == PointerKind::FrontGained
-                    && let Some(t) = s.target.filter(|t| contains(t.rect, msg.at))
-                {
-                    self.reenter = Some(t.serial);
+                if s.kind != PointerKind::FrontLost {
+                    self.fronts.retain(|&(w, _)| w != s.window);
+                    self.fronts.push((s.window, s.time));
+                    if let Some(t) = s.target.filter(|t| contains(t.rect, msg.at)) {
+                        self.reenter = Some(t.serial);
+                    }
+                }
+                if s.kind == PointerKind::FrontClicked {
+                    self.activated = true;
                 }
             }
         }
+    }
+
+    /// Milliseconds from `window` last coming to the front to `time`, both on the input's clock, or
+    /// none if it never did while watched.
+    pub fn ms_since_front(&self, window: isize, time: u32) -> Option<i32> {
+        self.fronts
+            .iter()
+            .find(|&&(w, _)| w == window)
+            .map(|&(_, at)| time.wrapping_sub(at) as i32)
     }
 
     /// A press or release was sent to one of this thread's windows, past the filter: everything
@@ -553,18 +606,31 @@ mod tests {
     struct Replay {
         gate: PointerGate,
         now: Instant,
+        start: Instant,
     }
+
+    /// The replays' top-level window.
+    const WINDOW: isize = 0x1234;
+    /// `GetTickCount` when a replay starts: near its wrap, so a comparison that forgot it fails.
+    const TICK_START: u32 = u32::MAX - 2_000;
 
     impl Replay {
         fn new() -> Replay {
+            let now = Instant::now();
             Replay {
                 gate: PointerGate::new(),
-                now: Instant::now(),
+                now,
+                start: now,
             }
         }
 
         fn advance(&mut self, by: Duration) {
             self.now += by;
+        }
+
+        /// `GetTickCount` now.
+        fn tick(&self) -> u32 {
+            TICK_START.wrapping_add((self.now - self.start).as_millis() as u32)
         }
 
         /// As a real hand's message reads: in front, exposed, the button down at a press only.
@@ -577,11 +643,22 @@ mod tests {
                 physically_down: kind == PointerKind::Press,
                 tracked: true,
                 target,
+                window: WINDOW,
+                time: TICK_START,
             }
         }
 
         fn seen(&mut self, kind: PointerKind, m: PointerMsg, target: Option<Target>) {
-            let s = Self::seen_as(kind, m, target);
+            let time = self.tick();
+            self.seen_at(kind, m, target, time);
+        }
+
+        /// A message whose input happened at `time`, read now.
+        fn seen_at(&mut self, kind: PointerKind, m: PointerMsg, target: Option<Target>, time: u32) {
+            let s = Seen {
+                time,
+                ..Self::seen_as(kind, m, target)
+            };
             self.gate.message(s, self.now);
         }
 
@@ -1143,7 +1220,8 @@ mod tests {
         r.advance(Duration::from_millis(60));
         r.release(hardware(ON));
         assert_eq!(r.qml_click(), Err(GateRefusal::Click(Refusal::NotInFront)));
-        // Off and back, rest, click: that counts.
+        // Off and back, rest, click: that counts, half a second on.
+        r.advance(Duration::from_millis(500));
         r.rest_on_the_button();
         r.press(hardware(ON));
         r.advance(Duration::from_millis(60));
@@ -1166,6 +1244,7 @@ mod tests {
         r.mv(hardware((151, 115)));
         r.mv(hardware((152, 115)));
         assert_eq!(click_on_one(&mut r, (152, 115)), Err(GateRefusal::Reenter));
+        r.advance(Duration::from_millis(500));
         r.rest_on_the_button();
         assert_eq!(click_on_one(&mut r, ON), Ok(()));
     }
@@ -1177,11 +1256,90 @@ mod tests {
         let mut r = Replay::new();
         r.seen(PointerKind::FrontLost, hardware(OFF), None);
         r.seen(PointerKind::MouseActivate, hardware((60, 10)), None);
-        r.seen(PointerKind::FrontGained, hardware((60, 10)), None);
+        r.seen(PointerKind::FrontClicked, hardware((60, 10)), None);
+        // A hand takes a moment from the title bar to Approve.
+        r.advance(Duration::from_millis(400));
         r.mv(hardware((70, 40)));
         r.mv(hardware((101, 101)));
         r.mv(hardware(ON));
         assert_eq!(click_on_one(&mut r, ON), Ok(()));
+    }
+
+    /// A press that happened before its window came to the front, by the input's own time, brought
+    /// it forward, whatever the gate was told in between and whatever order Qt reads things in: no
+    /// `WM_MOUSEACTIVATE` and no `WA_CLICKACTIVE` here, only the times.
+    #[test] // spec: P4a-R10
+    fn a_press_from_before_its_window_came_forward_brought_it_forward() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        let pressed_at = r.tick();
+        r.advance(Duration::from_millis(30));
+        r.seen(
+            PointerKind::FrontGained,
+            hardware(ON),
+            Replay::target_at(ON),
+        );
+        // The press is read now, its input 30 ms before the activation.
+        r.seen_at(
+            PointerKind::Press,
+            hardware(ON),
+            Replay::target_at(ON),
+            pressed_at,
+        );
+        r.advance(Duration::from_millis(60));
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Click(Refusal::NotInFront)));
+    }
+
+    /// Within half a second of its window coming to the front, by the input's own time: too soon,
+    /// however late the thread read it. After that: it counts, however soon it is read.
+    #[test] // spec: P4a-R10
+    fn a_press_within_half_a_second_of_the_front_is_too_soon_by_its_own_time() {
+        let mut r = Replay::new();
+        r.seen(PointerKind::FrontGained, hardware(OFF), None);
+        let came = r.tick();
+        r.mv(hardware((101, 101)));
+        r.mv(hardware(ON));
+        r.advance(HOVER_BEFORE_PRESS + Duration::from_millis(100));
+        // Pressed 250 ms after, read 2 s after: a stalled thread doesn't stretch the half second.
+        r.advance(Duration::from_secs(2));
+        r.seen_at(
+            PointerKind::Press,
+            hardware(ON),
+            Replay::target_at(ON),
+            came.wrapping_add(250),
+        );
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Err(GateRefusal::TooSoon));
+        // Pressed 600 ms after the front: it counts.
+        r.seen_at(
+            PointerKind::Press,
+            hardware(ON),
+            Replay::target_at(ON),
+            came.wrapping_add(600),
+        );
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Ok(()));
+    }
+
+    /// Another window of the app coming to the front (a floating panel) is that window's: a click in
+    /// this one isn't too soon for it.
+    #[test] // spec: P4a-R10
+    fn another_windows_front_is_its_own() {
+        let mut r = Replay::new();
+        let other = Seen {
+            window: WINDOW + 1,
+            time: r.tick(),
+            ..Replay::seen_as(PointerKind::FrontGained, hardware(OFF), None)
+        };
+        r.gate.message(other, r.now);
+        assert_eq!(r.gate.ms_since_front(WINDOW, r.tick()), None);
+        // The hand rests again, within half a second of the other window's front.
+        r.rest_on_the_button();
+        r.press(hardware(ON));
+        r.advance(Duration::from_millis(60));
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Ok(()));
     }
 
     /// Only a hand that moves somewhere ends the activation: a real move where the cursor already
@@ -1651,6 +1809,7 @@ mod tests {
             GateRefusal::Reenter,
             GateRefusal::ButtonState,
             GateRefusal::Stalled,
+            GateRefusal::TooSoon,
             GateRefusal::NotExposed,
             GateRefusal::NoGuard,
         ] {

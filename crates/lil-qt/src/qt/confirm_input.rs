@@ -107,10 +107,10 @@ pub mod qobject {
         #[qinvokable]
         fn window_in_front(self: &ConfirmInput, item: &QVariant) -> bool;
 
-        /// When a window of the app last came to the front, by Windows itself, on now_ms()'s
-        /// clock; -1 before that.
+        /// When the item's top-level window last came to the front, by Windows itself, on
+        /// now_ms()'s clock; -1 before that.
         #[qinvokable]
-        fn front_gained_ms(self: &ConfirmInput) -> f64;
+        fn front_gained_ms(self: &ConfirmInput, item: &QVariant) -> f64;
     }
 
     /// Which pointer message the filter read.
@@ -124,6 +124,7 @@ pub mod qobject {
         CancelMode,
         MouseActivate,
         FrontGained,
+        FrontClicked,
         FrontLost,
     }
 
@@ -145,6 +146,10 @@ pub mod qobject {
         /// Whether the item's window is the foreground window (always, off Windows).
         #[cxx_name = "pointerWindowInFront"]
         fn pointer_window_in_front(item: &QVariant) -> bool;
+
+        /// The item's top-level window (`GA_ROOT`), or 0.
+        #[cxx_name = "pointerWindowRoot"]
+        fn pointer_window_root(item: &QVariant) -> isize;
     }
 
     #[namespace = "lil_qt"]
@@ -163,6 +168,8 @@ pub mod qobject {
             bottom: i32,
             changed: bool,
             via_hook: bool,
+            root: isize,
+            time: u32,
         );
 
         /// A mouse button message was sent to a window of this thread, past the filter.
@@ -178,6 +185,7 @@ pub mod qobject {
 
 use qobject::{
     PointerMessage, pointer_serial, pointer_unwatch, pointer_watch, pointer_window_in_front,
+    pointer_window_root,
 };
 
 /// `ConfirmInput`'s Rust side: it holds nothing of its own.
@@ -194,9 +202,9 @@ thread_local! {
     static ARRIVAL_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
     static REFUSAL_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
     /// Front lines, by kind and by which path saw the message (filter, hook).
-    static FRONT_LINES: Cell<[LogLimit; 6]> = const { Cell::new([LogLimit::new(); 6]) };
-    /// When a window of the app last came to the front, in now_ms()'s milliseconds.
-    static FRONT_GAINED_AT: Cell<f64> = const { Cell::new(-1.0) };
+    static FRONT_LINES: Cell<[LogLimit; 8]> = const { Cell::new([LogLimit::new(); 8]) };
+    /// When each top-level window of the app last came to the front, in now_ms()'s milliseconds.
+    static FRONT_GAINED_AT: RefCell<Vec<(isize, f64)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn log_due(limit: &'static LocalKey<Cell<LogLimit>>) -> bool {
@@ -353,8 +361,15 @@ impl qobject::ConfirmInput {
         pointer_window_in_front(item)
     }
 
-    fn front_gained_ms(&self) -> f64 {
-        FRONT_GAINED_AT.get()
+    fn front_gained_ms(&self, item: &QVariant) -> f64 {
+        let root = pointer_window_root(item);
+        FRONT_GAINED_AT.with(|fronts| {
+            fronts
+                .borrow()
+                .iter()
+                .find(|&&(w, _)| w == root)
+                .map_or(-1.0, |&(_, at)| at)
+        })
     }
 }
 
@@ -370,6 +385,8 @@ fn pointer_message(
     bottom: i32,
     changed: bool,
     via_hook: bool,
+    root: isize,
+    time: u32,
 ) {
     let kind = match kind {
         PointerMessage::Move => PointerKind::Move,
@@ -380,6 +397,7 @@ fn pointer_message(
         PointerMessage::CancelMode => PointerKind::CancelMode,
         PointerMessage::MouseActivate => PointerKind::MouseActivate,
         PointerMessage::FrontGained => PointerKind::FrontGained,
+        PointerMessage::FrontClicked => PointerKind::FrontClicked,
         PointerMessage::FrontLost => PointerKind::FrontLost,
         _ => return,
     };
@@ -406,28 +424,37 @@ fn pointer_message(
             rect: (left, top, right, bottom),
             changed,
         }),
+        window: root,
+        time,
     };
-    let (counts, came_forward) = GATE.with(|g| {
+    let (counts, came_forward, since_front) = GATE.with(|g| {
         let mut gate = g.borrow_mut();
-        // Whether this press is the one that brought the window forward, before it is judged.
+        // Before it is judged: whether this press would be the one that brought the window forward
+        // by what came before it, and how long after its window last came to the front it happened.
         let came_forward = gate.came_forward();
+        let since_front = gate.ms_since_front(root, time);
         gate.message(seen, Instant::now());
-        (gate.counts(), came_forward)
+        (gate.counts(), came_forward, since_front)
     });
-    // Coming to the front, by Windows itself: the answer gate's clock starts again from here, and
-    // each change gets a line, so a real run shows what the gate was told and by which path.
-    if matches!(
-        kind,
-        PointerKind::FrontGained | PointerKind::FrontLost | PointerKind::MouseActivate
-    ) {
-        if kind == PointerKind::FrontGained {
-            FRONT_GAINED_AT.set(ms_since_start());
+    // Coming to the front, by Windows itself: the answer gate's clock starts again from here for
+    // that window, and each change gets a line, so a real run shows what the gate was told, when,
+    // and by which path.
+    let gained = matches!(kind, PointerKind::FrontGained | PointerKind::FrontClicked);
+    if gained || matches!(kind, PointerKind::FrontLost | PointerKind::MouseActivate) {
+        if gained {
+            let at = ms_since_start();
+            FRONT_GAINED_AT.with(|fronts| {
+                let mut fronts = fronts.borrow_mut();
+                fronts.retain(|&(w, _)| w != root);
+                fronts.push((root, at));
+            });
         }
         let index = match kind {
             PointerKind::FrontGained => 0,
-            PointerKind::FrontLost => 1,
-            _ => 2,
-        } + if via_hook { 3 } else { 0 };
+            PointerKind::FrontClicked => 1,
+            PointerKind::FrontLost => 2,
+            _ => 3,
+        } + if via_hook { 4 } else { 0 };
         let due = FRONT_LINES.with(|cell| {
             let mut limits = cell.get();
             let due = limits[index].due(Instant::now());
@@ -437,11 +464,15 @@ fn pointer_message(
         if due {
             let what = match kind {
                 PointerKind::FrontGained => "a window of the app came to the front",
+                PointerKind::FrontClicked => "a click brought a window of the app to the front",
                 PointerKind::FrontLost => "a window of the app left the front",
                 _ => "a click is bringing a window of the app to the front",
             };
             tracing::info!(
                 via = if via_hook { "hook" } else { "filter" },
+                // Which top-level window, as Windows numbers it for this session: nothing personal.
+                window = format!("{root:#x}"),
+                tick = time,
                 on_button = serial != 0,
                 in_front,
                 in_send = msg.sent,
@@ -491,6 +522,10 @@ fn pointer_message(
             in_front,
             exposed,
             came_forward,
+            // By the input's own time; -1: its window hasn't come to the front while watched.
+            since_front_ms = since_front.map_or(-1, i64::from),
+            // When the input happened, on GetTickCount's clock: what a script compares with its own.
+            tick = time,
             seen = counts.seen,
             real = counts.real,
             sent = counts.sent,

@@ -61,7 +61,11 @@ std::optional<PointerMessage> kindOf(const MSG &m)
         return std::nullopt;
     // Coming to the front and leaving it, from Windows itself, whatever Qt's own focus does next.
     case WM_ACTIVATE:
-        return LOWORD(m.wParam) == WA_INACTIVE ? PointerMessage::FrontLost : PointerMessage::FrontGained;
+        switch (LOWORD(m.wParam)) {
+        case WA_INACTIVE: return PointerMessage::FrontLost;
+        case WA_CLICKACTIVE: return PointerMessage::FrontClicked;
+        default: return PointerMessage::FrontGained;
+        }
     default: return std::nullopt;
     }
 }
@@ -94,6 +98,11 @@ std::optional<RECT> placeOn(HWND hwnd, const POINT &origin, const QQuickItem &it
 void deliver(PointerMessage kind, const MSG &m, bool viaHook)
 {
     {
+        // Activation is sent, never queued, so it has no MSG.time of its own (what Qt puts there is
+        // the last queued message's): when it arrived, on the same clock.
+        const bool sent = kind == PointerMessage::FrontGained || kind == PointerMessage::FrontClicked
+            || kind == PointerMessage::FrontLost || kind == PointerMessage::MouseActivate;
+        const std::uint32_t time = sent ? std::uint32_t(GetTickCount()) : std::uint32_t(m.time);
         POINT cursor{};
         const bool haveCursor = GetCursorPos(&cursor) != FALSE;
         POINT origin{0, 0};
@@ -118,7 +127,8 @@ void deliver(PointerMessage kind, const MSG &m, bool viaHook)
             }
         }
         pointer_message(kind, reinterpret_cast<std::intptr_t>(m.hwnd), std::intptr_t(m.lParam), serial,
-                        target.left, target.top, target.right, target.bottom, changed, viaHook);
+                        target.left, target.top, target.right, target.bottom, changed, viaHook,
+                        reinterpret_cast<std::intptr_t>(GetAncestor(m.hwnd, GA_ROOT)), time);
     }
 }
 
@@ -205,6 +215,15 @@ std::uint64_t pointerSerial(const QVariant &item)
     return 0;
 }
 
+
+std::intptr_t pointerWindowRoot(const QVariant &item)
+{
+    QQuickItem *quick = itemOf(item);
+    QQuickWindow *window = quick ? quick->window() : nullptr;
+    if (!window || !window->handle())
+        return 0;
+    return reinterpret_cast<std::intptr_t>(GetAncestor(reinterpret_cast<HWND>(window->winId()), GA_ROOT));
+}
 
 bool pointerWindowInFront(const QVariant &item)
 {

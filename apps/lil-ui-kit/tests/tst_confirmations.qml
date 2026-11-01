@@ -85,6 +85,35 @@ TestCase {
         }
     }
 
+    // A floating panel: a window of its own, transient for the test's.
+    Component {
+        id: floatWindow
+        Window {
+            width: 100
+            height: 100
+            visible: true
+        }
+    }
+
+    // What Qt's `Window.active` says in the test's window, as a binding.
+    Component {
+        id: activeProbe
+        Item {
+            property bool seen: Window.active
+        }
+    }
+
+    // Windows' front, as the bar reads it on Windows: what a test sets.
+    Component {
+        id: windowsFront
+        QtObject {
+            property bool front: true
+            property real gained: -1
+            function windowInFront(item) { return front }
+            function frontGainedMs(item) { return gained }
+        }
+    }
+
     A11yWalk { id: walk }
 
     function init() {
@@ -885,6 +914,49 @@ TestCase {
 
     // Coming to the front is the native gate's (pointer_gate's FrontGained replays). Qt delivers its
     // activation after the click that caused it, so a new button here would cost that click its words.
+    // Measured, offscreen: focus goes to a floating window, then out of the app from there. Qt sends
+    // activeChanged only to the old and the new focus window, so a binding in the main window keeps
+    // saying it is active. That's why the bar decides by Windows' front on Windows.
+    function test_window_active_goes_stale_through_a_floating_window() { // spec: P4a-R10
+        const probe = createTemporaryObject(activeProbe, tc)
+        verify(probe.seen)
+        const float = createTemporaryObject(floatWindow, null, {transientParent: tc.Window.window})
+        float.requestActivate()
+        tryVerify(() => float.active, 2000, "the float has the focus")
+        const other = createTemporaryObject(otherWindow, null)
+        other.requestActivate()
+        tryVerify(() => other.active, 2000, "another window has the focus")
+        verify(!tc.Window.window.active, "the test's window isn't active")
+        verify(probe.seen, "but a binding to Window.active still says it is")
+    }
+
+    // On Windows the bar asks Windows: in front, and half a second from its window's last coming
+    // to the front, whatever `Window.active` says.
+    function test_on_windows_the_bar_decides_by_windows_front() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const dialog = panel.dialog
+        const bar = dialog.bar
+        const windows = createTemporaryObject(windowsFront, tc)
+        bar.frontSource = windows
+        bar.useNativeFront = true
+        verify(bar.inFront, "Qt says in front")
+        windows.front = false
+        mouseClick(dialog.denyButton)
+        compare(Shapes.answers(fake).length, 0, "Windows says another window is in front")
+        verify(bar.reason.indexOf("Bring this window") === 0, bar.reason)
+        windows.front = true
+        windows.gained = ConfirmInput.nowMs()
+        mouseClick(dialog.denyButton)
+        compare(Shapes.answers(fake).length, 0, "it just came to the front, by Windows")
+        verify(bar.reason.indexOf("Wait a moment") === 0, bar.reason)
+        wait(550)
+        mouseClick(dialog.denyButton)
+        compare(Shapes.answers(fake).length, 1, "half a second on, it answers")
+        compare(Shapes.answers(fake)[0].args.answer, "deny")
+        closeDialog(panel)
+    }
+
     function test_coming_to_the_front_leaves_the_button_as_it_is() { // spec: P4a-R10
         const panel = makePanel([crane])
         openDialog(panel, crane.id)
