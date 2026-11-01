@@ -1112,6 +1112,48 @@ TestCase {
         closeDialog(panel)
     }
 
+    // The dialog is where the panel is: a floated panel's dialog opens in its float, whose front is
+    // the one Windows reports, with the cap prompt and the waiting notice in it.
+    function test_a_floated_panels_dialog_opens_in_its_float() { // spec: P4a-R10
+        wait(100)
+        const shell = createTemporaryObject(shellComponent, tc)
+        verify(shell)
+        shell.visible = true
+        tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000)
+        tryVerify(() => shell.layoutSettled, 5000)
+        const dock = shell.docks.confirmations
+        tryVerify(() => dock.content, 5000)
+        wait(50)
+        dock.setAsCurrentTab()
+        const panel = dock.content
+        panel.pointerSource = hand
+        const capped = Shapes.view({id: "cf_00000000000000e4", covers: ["cap"], cap: [Shapes.capHit()]})
+        Shapes.answerLists(fake, [crane, capped], [])
+        tryVerify(() => panel.list.loaded, 2000)
+        dock.isFloating = true
+        tryVerify(() => dock.isFloating && panel.Window.window && panel.Window.window !== shell, 5000,
+                  "the panel floats in its own window")
+        panel.showConfirmation(capped.id)
+        tryVerify(() => panel.dialogPopup.opened, 2000)
+        compare(panel.dialog.Window.window, panel.Window.window, "the dialog is in the float")
+        compare(panel.dialog.capPrompt.Window.window, panel.Window.window, "and its cap prompt")
+        panel.showConfirmation(crane.id)
+        verify(panel.waitingNotice.visible)
+        compare(panel.waitingNotice.Window.window, panel.Window.window, "and the waiting notice")
+        panel.dialogPopup.close()
+        tryVerify(() => panel.dialogPopup.opened, 2000, "the next one opens")
+        panel.dialogPopup.close()
+        tryVerify(() => !panel.dialogPopup.visible, 2000)
+        // Docked again: back in the main window.
+        dock.isFloating = false
+        tryVerify(() => !dock.isFloating && panel.Window.window === shell, 5000, "docked again")
+        panel.showConfirmation(crane.id)
+        tryVerify(() => panel.dialogPopup.opened, 2000)
+        compare(panel.dialog.Window.window, shell, "the dialog is in the main window")
+        panel.dialogPopup.close()
+        tryVerify(() => !panel.dialogPopup.visible, 2000)
+    }
+
     function test_app_wide_shortcuts_stay_quiet_under_the_dialog() { // spec: P4a-R10, APP-011
         wait(100)
         const shell = createTemporaryObject(shellComponent, tc)

@@ -206,7 +206,9 @@ Rectangle {
 
     T.Popup {
         id: popup
-        parent: T.Overlay.overlay
+        // The panel's own window, docked or floated: the dialog opens where the panel is, and its
+        // front is the one Windows reports for that window. It follows when the panel moves.
+        parent: root.Window.contentItem
         modal: true
         focus: true
         closePolicy: T.Popup.CloseOnEscape
