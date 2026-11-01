@@ -14,8 +14,11 @@
 //!   `logRefusal(name)` the one log line, with nothing of the input.
 //! - `shownActions(json)` and `shownLine(text, max)` are [`crate::confirm_text`]'s.
 //! - `seenMessages()`, `realMessages()` and `sentMessages()` count what the gate has read. Each press
-//!   or release on a watched button writes one log line saying where Windows says it came from, and
-//!   the counts: `tools/sandbox/confirm-check.ps1` reads them. No position, no timing, no text.
+//!   or release on a watched button writes one log line saying where Windows says it came from, the
+//!   input's tick and `since_front_ms`, and the counts; each front change one line with the window
+//!   and its tick: `tools/sandbox/confirm-check.ps1` reads them. No position and no text.
+//! - `windowInFront(item)` and `frontGainedMs(item)` are Windows' own front for the item's window,
+//!   which the answer bar decides by on Windows.
 //!
 //! Everything runs on the GUI thread, and the gate's state lives in that thread's local, out of
 //! reach of anything but this process's own code.
@@ -432,7 +435,7 @@ fn pointer_message(
         // Before it is judged: whether this press would be the one that brought the window forward
         // by what came before it, and how long after its window last came to the front it happened.
         let came_forward = gate.came_forward();
-        let since_front = gate.ms_since_front(root, time);
+        let since_front = gate.ms_since_front(root, time, Instant::now());
         gate.message(seen, Instant::now());
         (gate.counts(), came_forward, since_front)
     });
@@ -522,8 +525,10 @@ fn pointer_message(
             in_front,
             exposed,
             came_forward,
-            // By the input's own time; -1: its window hasn't come to the front while watched.
-            since_front_ms = since_front.map_or(-1, i64::from),
+            // By the input's own time, below 0 when the press came before the front. `front_known`
+            // false: its window hasn't come to the front while watched, in the last minute.
+            front_known = since_front.is_some(),
+            since_front_ms = since_front.map_or(0, i64::from),
             // When the input happened, on GetTickCount's clock: what a script compares with its own.
             tick = time,
             seen = counts.seen,
@@ -559,4 +564,6 @@ fn pointer_guard(ok: bool) {
 
 fn pointer_gate_reset() {
     GATE.with(|g| g.borrow_mut().reset());
+    // What the windows' fronts were before anything was watched is old too.
+    FRONT_GAINED_AT.with(|fronts| fronts.borrow_mut().clear());
 }
