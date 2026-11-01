@@ -418,6 +418,10 @@ function Get-QVerdict($press, $frontBackTick, [string]$answer, [string[]]$names)
     }
     $numbers = "came_forward=$($press.came_forward), front_known=$($press.front_known), since_front_ms=$($press.since_front_ms), the script saw the front $gap ms before the press"
     if (-not $gateSays -and -not $scriptSays) {
+        # Neither saw a front at all: nothing says when the window came forward.
+        if ($press.front_known -ne $true -and $null -eq $gap) {
+            return "not tested: no front was seen by the gate or the script ($numbers)"
+        }
         return "not tested: the window was in front for half a second or more before the press ($numbers)"
     }
     if ($answer -ne 'pending') {
@@ -438,7 +442,7 @@ function Get-FrontStory([string[]]$lines = @(Get-LogSinceStep)) {
         # PowerShell's ConvertFrom-Json reads the time as a DateTime.
         $at = ([datetime]$o.timestamp).ToUniversalTime().ToString('HH:mm:ss.fff')
         if ($f.kind) {
-            "$at $($f.kind) tick=$($f.tick) came_forward=$($f.came_forward) since_front_ms=$($f.since_front_ms) in_front=$($f.in_front)"
+            "$at $($f.kind) tick=$($f.tick) came_forward=$($f.came_forward) front_known=$($f.front_known) since_front_ms=$($f.since_front_ms) in_front=$($f.in_front)"
         } else {
             "$at $($f.message) via=$($f.via) window=$($f.window) tick=$($f.tick) on_button=$($f.on_button) in_front=$($f.in_front)"
         }
@@ -475,8 +479,8 @@ if ($DryRun) {
     Check ($parsed.kind -eq 'Press' -and $parsed.origin -eq 'Hardware' -and $parsed.physically_down -eq $true) 'dry run: a log line of that shape parses'
     $story = Get-FrontStory @(
         '{"timestamp":"2026-11-01T18:02:04.300000Z","fields":{"message":"a click brought a window of the app to the front","via":"hook","window":"0x1a2b","tick":1000,"on_button":true,"in_front":true}}',
-        '{"timestamp":"2026-11-01T18:02:04.330091Z","fields":{"message":"a press or release on a confirmation''s button","kind":"Press","tick":990,"came_forward":true,"since_front_ms":-10,"in_front":true}}')
-    Check ($story -eq '18:02:04.300 a click brought a window of the app to the front via=hook window=0x1a2b tick=1000 on_button=True in_front=True; 18:02:04.330 Press tick=990 came_forward=True since_front_ms=-10 in_front=True') "dry run: the front's story reads: $story"
+        '{"timestamp":"2026-11-01T18:02:04.330091Z","fields":{"message":"a press or release on a confirmation''s button","kind":"Press","tick":990,"came_forward":true,"front_known":true,"since_front_ms":-10,"in_front":true}}')
+    Check ($story -eq '18:02:04.300 a click brought a window of the app to the front via=hook window=0x1a2b tick=1000 on_button=True in_front=True; 18:02:04.330 Press tick=990 came_forward=True front_known=True since_front_ms=-10 in_front=True') "dry run: the front's story reads: $story"
     # (q)'s verdict, on the gate's numbers: the window came forward first, 200 ms or 700 ms before.
     $at200 = [pscustomobject]@{ tick = 1000; came_forward = $false; front_known = $true; since_front_ms = 200 }
     $at700 = [pscustomobject]@{ tick = 1000; came_forward = $false; front_known = $true; since_front_ms = 700 }
@@ -485,7 +489,10 @@ if ($DryRun) {
     $verdict = Get-QVerdict $at200 800 'pending' @('too_soon')
     Check ($verdict -eq 'refused') "dry run: (q) passes one refused too_soon 200 ms after: $verdict"
     $verdict = Get-QVerdict $at700 300 'approved' @()
-    Check ($verdict -like 'not tested*') "dry run: (q) reports one 700 ms after as not tested: $verdict"
+    Check ($verdict -like 'not tested: the window was in front*') "dry run: (q) reports one 700 ms after as not tested: $verdict"
+    $unseen = [pscustomobject]@{ tick = 1000; came_forward = $false; front_known = $false; since_front_ms = 0 }
+    $verdict = Get-QVerdict $unseen $null 'approved' @()
+    Check ($verdict -like 'not tested: no front was seen by the gate or the script*') "dry run: (q) says when no front was seen at all: $verdict"
     $verdict = Get-QVerdict $at700 900 'approved' @()
     Check ($verdict -like 'fail*') "dry run: (q) fails it when its own look saw the window come forward with the press: $verdict"
     # winuser.h's sizes on x64: what InjectTouchInput and InjectSyntheticPointerInput will read.
