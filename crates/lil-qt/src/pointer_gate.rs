@@ -62,6 +62,14 @@
 //! is refused, and so is one where the window under the point isn't this one, or this one is
 //! see-through, cloaked or minimized ([`GateRefusal::NotExposed`]).
 //!
+//! **Coming to the front is read from Windows**, never from Qt: `WM_ACTIVATE` and `WM_MOUSEACTIVATE`,
+//! sent messages, reach the gate through both the thread hook and the filter (Qt runs its dispatcher's
+//! filters for sent messages that aren't input), before the click that caused them is read. Qt's own
+//! activation reaches QML after that click, so nothing here waits on `Window.active`. On coming to the
+//! front the rest starts again, nothing half-done stands, and a button under the cursor needs the
+//! pointer to leave it and come back ([`PointerKind::FrontGained`]). An activation ends only when the
+//! hand moves somewhere: Windows' own move, or a real one in place, doesn't end it.
+//!
 //! Touch and pen never count. Qt takes them as `WM_POINTER*`, which aren't read here, and a legacy
 //! message that reports either device is refused too, so a tap on Approve says it needs the mouse or
 //! touchpad.
@@ -93,6 +101,10 @@ pub enum PointerKind {
     CancelMode,
     /// `WM_MOUSEACTIVATE` for a left press.
     MouseActivate,
+    /// `WM_ACTIVATE`: the window came to the front.
+    FrontGained,
+    /// `WM_ACTIVATE` with `WA_INACTIVE`: it left the front.
+    FrontLost,
 }
 
 /// The button under the cursor, as Qt places it now.
@@ -286,8 +298,15 @@ impl PointerGate {
         // Where the message says the cursor was is where it is now. A hand's move still in the queue
         // when a warp lands reads as real, from the old place, with the cursor at the new one.
         let on_time = msg.message_at == msg.at;
+        // Whether a front change or an activation: they say nothing of where a hand put the cursor.
+        let front = matches!(
+            s.kind,
+            PointerKind::FrontGained | PointerKind::FrontLost | PointerKind::MouseActivate
+        );
+        // The hand put the cursor somewhere it wasn't.
+        let moved_on = s.kind == PointerKind::Move && real && on_time && msg.at != self.last_at;
         // Only a real message, on time: a program can warp the cursor off and back, or post a move.
-        if real && on_time && self.reenter.is_some() && serial != self.reenter {
+        if real && on_time && !front && self.reenter.is_some() && serial != self.reenter {
             self.reenter = None;
         }
         // A real move ends a rest's small moves near where it was; a warp lands anywhere. If it lands
@@ -327,9 +346,10 @@ impl PointerGate {
         let must_reenter = serial.is_some() && serial == self.reenter;
         match s.kind {
             PointerKind::Move => {
-                // A hand moving: an activation with no press after it (a title bar) is over. Windows'
-                // own move can come between an activation and its press, and doesn't count.
-                if real {
+                // A hand moving somewhere: an activation with no press after it (a title bar) is
+                // over. Windows' own move, or a real one in place, can come between an activation and
+                // its press, and doesn't count.
+                if moved_on {
                     self.activated = false;
                 }
                 // From one button straight to another: the rest was on the first.
@@ -405,6 +425,22 @@ impl PointerGate {
             PointerKind::CaptureChanged => self.gate.capture_changed(),
             PointerKind::CancelMode => self.gate.cancel_mode(),
             PointerKind::MouseActivate => self.activated = true,
+            // The window came to the front, or left it, whatever QML's `Window.active` says: the
+            // rest starts again, nothing half-done stands, and with the cursor on a button the
+            // pointer must leave it and come back. A click meant for the window underneath, or a
+            // window raised under a moving hand, is refused that way.
+            PointerKind::FrontGained | PointerKind::FrontLost => {
+                self.gate.restart(msg.at);
+                self.press_refused = None;
+                self.press_serial = None;
+                self.token = None;
+                self.press_token = None;
+                if s.kind == PointerKind::FrontGained
+                    && let Some(t) = s.target.filter(|t| contains(t.rect, msg.at))
+                {
+                    self.reenter = Some(t.serial);
+                }
+            }
         }
     }
 
@@ -462,6 +498,11 @@ impl PointerGate {
             no_guard: self.no_guard,
             ..PointerGate::default()
         };
+    }
+
+    /// A press now would be the one that brought the window forward.
+    pub fn came_forward(&self) -> bool {
+        self.activated
     }
 
     pub fn counts(&self) -> Counts {
@@ -1078,6 +1119,87 @@ mod tests {
         r.mv(hardware(ON));
         r.mv(hardware((151, 115)));
         assert_eq!(click_on_one(&mut r, (151, 115)), Ok(()));
+    }
+
+    /// The real run at 95e260f: a click straight on Approve in a window not in front counted. Coming
+    /// to the front is now the gate's own: `WM_ACTIVATE` through the hook and the filter, whatever
+    /// QML's `Window.active` does. Here the hand rested on Approve while the window was behind.
+    #[test] // spec: P4a-R10
+    fn refuses_a_click_that_brought_the_window_forward_after_a_rest_behind() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        // The click: Windows sends WM_MOUSEACTIVATE and WM_ACTIVATE, then gives the press.
+        r.seen(
+            PointerKind::MouseActivate,
+            hardware(ON),
+            Replay::target_at(ON),
+        );
+        r.seen(
+            PointerKind::FrontGained,
+            hardware(ON),
+            Replay::target_at(ON),
+        );
+        r.press(hardware(ON));
+        r.advance(Duration::from_millis(60));
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Click(Refusal::NotInFront)));
+        // Off and back, rest, click: that counts.
+        r.rest_on_the_button();
+        r.press(hardware(ON));
+        r.advance(Duration::from_millis(60));
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Ok(()));
+    }
+
+    /// The same if only `WM_ACTIVATE` reaches the gate: the window came forward under the cursor.
+    #[test] // spec: P4a-R10
+    fn refuses_a_click_on_a_window_that_came_forward_under_the_cursor() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.seen(PointerKind::FrontLost, hardware(OFF), None);
+        r.advance(Duration::from_secs(5));
+        r.seen(
+            PointerKind::FrontGained,
+            hardware(ON),
+            Replay::target_at(ON),
+        );
+        r.mv(hardware((151, 115)));
+        r.mv(hardware((152, 115)));
+        assert_eq!(click_on_one(&mut r, (152, 115)), Err(GateRefusal::Reenter));
+        r.rest_on_the_button();
+        assert_eq!(click_on_one(&mut r, ON), Ok(()));
+    }
+
+    /// The title bar, (j): the window comes forward with the cursor off every button, and the hand
+    /// comes to Approve by moving. Its first click counts.
+    #[test] // spec: P4a-R10
+    fn accepts_the_first_click_after_the_title_bar_brought_the_window_forward() {
+        let mut r = Replay::new();
+        r.seen(PointerKind::FrontLost, hardware(OFF), None);
+        r.seen(PointerKind::MouseActivate, hardware((60, 10)), None);
+        r.seen(PointerKind::FrontGained, hardware((60, 10)), None);
+        r.mv(hardware((70, 40)));
+        r.mv(hardware((101, 101)));
+        r.mv(hardware(ON));
+        assert_eq!(click_on_one(&mut r, ON), Ok(()));
+    }
+
+    /// Only a hand that moves somewhere ends the activation: a real move where the cursor already
+    /// was isn't one.
+    #[test] // spec: P4a-R10
+    fn a_move_in_place_doesnt_end_the_activation() {
+        let mut r = Replay::new();
+        r.rest_on_the_button();
+        r.seen(
+            PointerKind::MouseActivate,
+            hardware(ON),
+            Replay::target_at(ON),
+        );
+        r.mv(hardware(ON));
+        r.press(hardware(ON));
+        r.advance(Duration::from_millis(60));
+        r.release(hardware(ON));
+        assert_eq!(r.qml_click(), Err(GateRefusal::Click(Refusal::NotInFront)));
     }
 
     /// The window comes to the front between the activating click's press and its release, so the

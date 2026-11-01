@@ -35,7 +35,6 @@ Item {
     property bool primary: true
     property bool _completed: false
     property bool _watching: false
-    readonly property bool _front: Window.active
     property string _pressKey
 
     // The click is the hand's as far as Windows can tell; the caller still asks the answer gate.
@@ -78,9 +77,9 @@ Item {
     // Back on after being off (the core away, an answer out, what's shown not read): a new button to
     // the gate too. A hand that rested before it went off moves off and back, and is told so.
     onEnabledChanged: if (_watching && enabled) pointerSource.watch(root)
-    // Its window came to the front under whatever the hand was doing: the same. A hand on the title bar
-    // comes to the button by moving, so that person's first click counts.
-    on_FrontChanged: if (_watching && _front) pointerSource.watch(root)
+    // Coming to the front is the native gate's own (WM_ACTIVATE, crate::pointer_gate), not a new
+    // button here: Qt delivers its activation after the click that caused it has been read, and a
+    // new serial then would turn that click's true words into false ones.
     Component.onCompleted: {
         _completed = true
         _syncWatch()

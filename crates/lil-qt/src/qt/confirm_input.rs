@@ -102,6 +102,15 @@ pub mod qobject {
 
         #[qinvokable]
         fn sent_messages(self: &ConfirmInput) -> f64;
+
+        /// Whether the item's window is the foreground window, by Windows itself.
+        #[qinvokable]
+        fn window_in_front(self: &ConfirmInput, item: &QVariant) -> bool;
+
+        /// When a window of the app last came to the front, by Windows itself, on now_ms()'s
+        /// clock; -1 before that.
+        #[qinvokable]
+        fn front_gained_ms(self: &ConfirmInput) -> f64;
     }
 
     /// Which pointer message the filter read.
@@ -114,6 +123,8 @@ pub mod qobject {
         CaptureChanged,
         CancelMode,
         MouseActivate,
+        FrontGained,
+        FrontLost,
     }
 
     #[namespace = "lil_qt"]
@@ -130,6 +141,10 @@ pub mod qobject {
         /// The item's serial, or 0 when it isn't watched.
         #[cxx_name = "pointerSerial"]
         fn pointer_serial(item: &QVariant) -> u64;
+
+        /// Whether the item's window is the foreground window (always, off Windows).
+        #[cxx_name = "pointerWindowInFront"]
+        fn pointer_window_in_front(item: &QVariant) -> bool;
     }
 
     #[namespace = "lil_qt"]
@@ -147,6 +162,7 @@ pub mod qobject {
             right: i32,
             bottom: i32,
             changed: bool,
+            via_hook: bool,
         );
 
         /// A mouse button message was sent to a window of this thread, past the filter.
@@ -160,7 +176,9 @@ pub mod qobject {
     }
 }
 
-use qobject::{PointerMessage, pointer_serial, pointer_unwatch, pointer_watch};
+use qobject::{
+    PointerMessage, pointer_serial, pointer_unwatch, pointer_watch, pointer_window_in_front,
+};
 
 /// `ConfirmInput`'s Rust side: it holds nothing of its own.
 #[derive(Default)]
@@ -175,6 +193,10 @@ thread_local! {
     static RELEASE_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
     static ARRIVAL_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
     static REFUSAL_LINES: Cell<LogLimit> = const { Cell::new(LogLimit::new()) };
+    /// Front lines, by kind and by which path saw the message (filter, hook).
+    static FRONT_LINES: Cell<[LogLimit; 6]> = const { Cell::new([LogLimit::new(); 6]) };
+    /// When a window of the app last came to the front, in now_ms()'s milliseconds.
+    static FRONT_GAINED_AT: Cell<f64> = const { Cell::new(-1.0) };
 }
 
 fn log_due(limit: &'static LocalKey<Cell<LogLimit>>) -> bool {
@@ -187,6 +209,10 @@ fn log_due(limit: &'static LocalKey<Cell<LogLimit>>) -> bool {
 }
 
 static START: OnceLock<Instant> = OnceLock::new();
+
+fn ms_since_start() -> f64 {
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
 
 fn refusal_words(name: &str, label: &str) -> String {
     if let Some(words) = GateRefusal::words(name, label) {
@@ -228,7 +254,7 @@ fn input_kind(kind: &str) -> InputKind {
 
 impl qobject::ConfirmInput {
     fn now_ms(&self) -> f64 {
-        START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+        ms_since_start()
     }
 
     fn gate_refusal(
@@ -322,6 +348,14 @@ impl qobject::ConfirmInput {
     fn sent_messages(&self) -> f64 {
         GATE.with(|g| g.borrow().counts().sent as f64)
     }
+
+    fn window_in_front(&self, item: &QVariant) -> bool {
+        pointer_window_in_front(item)
+    }
+
+    fn front_gained_ms(&self) -> f64 {
+        FRONT_GAINED_AT.get()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -335,6 +369,7 @@ fn pointer_message(
     right: i32,
     bottom: i32,
     changed: bool,
+    via_hook: bool,
 ) {
     let kind = match kind {
         PointerMessage::Move => PointerKind::Move,
@@ -344,6 +379,8 @@ fn pointer_message(
         PointerMessage::CaptureChanged => PointerKind::CaptureChanged,
         PointerMessage::CancelMode => PointerKind::CancelMode,
         PointerMessage::MouseActivate => PointerKind::MouseActivate,
+        PointerMessage::FrontGained => PointerKind::FrontGained,
+        PointerMessage::FrontLost => PointerKind::FrontLost,
         _ => return,
     };
     // The source first of what is read here. The filter has already read the cursor and where the
@@ -370,11 +407,49 @@ fn pointer_message(
             changed,
         }),
     };
-    let counts = GATE.with(|g| {
+    let (counts, came_forward) = GATE.with(|g| {
         let mut gate = g.borrow_mut();
+        // Whether this press is the one that brought the window forward, before it is judged.
+        let came_forward = gate.came_forward();
         gate.message(seen, Instant::now());
-        gate.counts()
+        (gate.counts(), came_forward)
     });
+    // Coming to the front, by Windows itself: the answer gate's clock starts again from here, and
+    // each change gets a line, so a real run shows what the gate was told and by which path.
+    if matches!(
+        kind,
+        PointerKind::FrontGained | PointerKind::FrontLost | PointerKind::MouseActivate
+    ) {
+        if kind == PointerKind::FrontGained {
+            FRONT_GAINED_AT.set(ms_since_start());
+        }
+        let index = match kind {
+            PointerKind::FrontGained => 0,
+            PointerKind::FrontLost => 1,
+            _ => 2,
+        } + if via_hook { 3 } else { 0 };
+        let due = FRONT_LINES.with(|cell| {
+            let mut limits = cell.get();
+            let due = limits[index].due(Instant::now());
+            cell.set(limits);
+            due
+        });
+        if due {
+            let what = match kind {
+                PointerKind::FrontGained => "a window of the app came to the front",
+                PointerKind::FrontLost => "a window of the app left the front",
+                _ => "a click is bringing a window of the app to the front",
+            };
+            tracing::info!(
+                via = if via_hook { "hook" } else { "filter" },
+                on_button = serial != 0,
+                in_front,
+                in_send = msg.sent,
+                seen = counts.seen,
+                "{what}"
+            );
+        }
+    }
     // One line each time the pointer arrives on a button, whatever brought it (the script's rest).
     if kind == PointerKind::Move {
         let arrived = serial != 0 && LAST_ON.replace(serial) != serial;
@@ -415,6 +490,7 @@ fn pointer_message(
             by_messages_down = input_source::left_button_down_by_messages(),
             in_front,
             exposed,
+            came_forward,
             seen = counts.seen,
             real = counts.real,
             sent = counts.sent,

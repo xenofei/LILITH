@@ -103,8 +103,13 @@ Column {
         Accessible.announce(reason)
     }
 
+    // Qt's `Window.active` is a step behind Windows: its activation reaches QML after the click that
+    // caused it. So in front means by Windows too, and the half second runs from the later of this
+    // bar's own clock and when Windows last brought a window of the app to the front.
     function _passes(kind, focused, label) {
-        const name = ConfirmInput.gateRefusal(kind, focused, visibleSinceMs, inFront, ConfirmInput.nowMs())
+        const front = inFront && ConfirmInput.windowInFront(root)
+        const since = visibleSinceMs < 0 ? -1 : Math.max(visibleSinceMs, ConfirmInput.frontGainedMs())
+        const name = ConfirmInput.gateRefusal(kind, focused, since, front, ConfirmInput.nowMs())
         if (name === "")
             return true
         refuse(name, label)

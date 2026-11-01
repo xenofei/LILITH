@@ -10,6 +10,7 @@
 
 #include <QtCore/QAbstractNativeEventFilter>
 #include <QtCore/QCoreApplication>
+#include <QtGui/QGuiApplication>
 #include <QtCore/QList>
 #include <QtCore/QPointer>
 #include <QtQuick/QQuickItem>
@@ -58,6 +59,9 @@ std::optional<PointerMessage> kindOf(const MSG &m)
         if (HIWORD(m.lParam) == WM_LBUTTONDOWN)
             return PointerMessage::MouseActivate;
         return std::nullopt;
+    // Coming to the front and leaving it, from Windows itself, whatever Qt's own focus does next.
+    case WM_ACTIVATE:
+        return LOWORD(m.wParam) == WA_INACTIVE ? PointerMessage::FrontLost : PointerMessage::FrontGained;
     default: return std::nullopt;
     }
 }
@@ -86,26 +90,10 @@ std::optional<RECT> placeOn(HWND hwnd, const POINT &origin, const QQuickItem &it
     return rect;
 }
 
-// Sees every message sent to a window of this thread, from any thread, before its window procedure.
-LRESULT CALLBACK sentHook(int code, WPARAM wparam, LPARAM lparam)
+// Gives one message to the gate, with the watched button under the cursor as Qt places it now.
+void deliver(PointerMessage kind, const MSG &m, bool viaHook)
 {
-    if (code == HC_ACTION) {
-        const UINT message = reinterpret_cast<const CWPSTRUCT *>(lparam)->message;
-        if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK || message == WM_LBUTTONUP)
-            pointer_sent();
-    }
-    return CallNextHookEx(nullptr, code, wparam, lparam);
-}
-
-class PointerFilter : public QAbstractNativeEventFilter
-{
-public:
-    bool nativeEventFilter(const QByteArray &, void *message, qintptr *) override
     {
-        const MSG &m = *static_cast<const MSG *>(message);
-        const std::optional<PointerMessage> kind = kindOf(m);
-        if (!kind || s_watched.isEmpty())
-            return false;
         POINT cursor{};
         const bool haveCursor = GetCursorPos(&cursor) != FALSE;
         POINT origin{0, 0};
@@ -129,8 +117,44 @@ public:
                 changed = moved;
             }
         }
-        pointer_message(*kind, reinterpret_cast<std::intptr_t>(m.hwnd), std::intptr_t(m.lParam), serial,
-                        target.left, target.top, target.right, target.bottom, changed);
+        pointer_message(kind, reinterpret_cast<std::intptr_t>(m.hwnd), std::intptr_t(m.lParam), serial,
+                        target.left, target.top, target.right, target.bottom, changed, viaHook);
+    }
+}
+
+// Sees every message sent to a window of this thread, from any thread, before its window procedure.
+// Activation is sent, never posted, so this sees it whatever Qt's own path does with it; the filter
+// sees it too, in the window procedure, and the gate takes it twice without harm.
+LRESULT CALLBACK sentHook(int code, WPARAM wparam, LPARAM lparam)
+{
+    if (code == HC_ACTION) {
+        const CWPSTRUCT &sent = *reinterpret_cast<const CWPSTRUCT *>(lparam);
+        const UINT message = sent.message;
+        if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK || message == WM_LBUTTONUP) {
+            pointer_sent();
+        } else if ((message == WM_ACTIVATE || message == WM_MOUSEACTIVATE) && !s_watched.isEmpty()) {
+            MSG m{};
+            m.hwnd = sent.hwnd;
+            m.message = message;
+            m.wParam = sent.wParam;
+            m.lParam = sent.lParam;
+            if (const std::optional<PointerMessage> kind = kindOf(m))
+                deliver(*kind, m, true);
+        }
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+class PointerFilter : public QAbstractNativeEventFilter
+{
+public:
+    bool nativeEventFilter(const QByteArray &, void *message, qintptr *) override
+    {
+        const MSG &m = *static_cast<const MSG *>(message);
+        const std::optional<PointerMessage> kind = kindOf(m);
+        if (!kind || s_watched.isEmpty())
+            return false;
+        deliver(*kind, m, false);
         return false;
     }
 };
@@ -179,6 +203,19 @@ std::uint64_t pointerSerial(const QVariant &item)
             return watched.serial;
     }
     return 0;
+}
+
+
+bool pointerWindowInFront(const QVariant &item)
+{
+    // Only Windows has a front to read; elsewhere (the offscreen tests) Qt's own word stands.
+    if (QGuiApplication::platformName() != QLatin1String("windows"))
+        return true;
+    QQuickItem *quick = itemOf(item);
+    QQuickWindow *window = quick ? quick->window() : nullptr;
+    if (!window || !window->handle())
+        return false;
+    return GetForegroundWindow() == reinterpret_cast<HWND>(window->winId());
 }
 
 } // namespace lil_qt

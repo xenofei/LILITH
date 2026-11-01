@@ -883,8 +883,9 @@ TestCase {
         closeDialog(panel)
     }
 
-    // A window raised under a moving hand: "a click meant for the window underneath".
-    function test_coming_to_the_front_is_a_new_button_to_the_gate() { // spec: P4a-R10
+    // Coming to the front is the native gate's (pointer_gate's FrontGained replays). Qt delivers its
+    // activation after the click that caused it, so a new button here would cost that click its words.
+    function test_coming_to_the_front_leaves_the_button_as_it_is() { // spec: P4a-R10
         const panel = makePanel([crane])
         openDialog(panel, crane.id)
         const other = createTemporaryObject(otherWindow, null)
@@ -893,7 +894,7 @@ TestCase {
         const before = hand.watches
         tc.Window.window.requestActivate()
         tryVerify(() => panel.dialog.bar.inFront, 2000)
-        verify(hand.watches > before, "the gate starts again")
+        compare(hand.watches, before, "the native gate starts again, not QML")
         closeDialog(panel)
     }
 
