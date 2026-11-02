@@ -16,11 +16,18 @@
            counts from the kept time, so it lists those two and not the first.
        (c) a floating Home: the same lines, the time not moved by the float; a job finishing while it
            floats is listed there, and the time moves. Docked again: the same lines.
-       (d) Home behind a tab: a real drag of its title bar puts it in the Jobs tabs, and the Jobs tab
-           is chosen. A job finishes: the time stays. Home's tab chosen: the job is listed, and the
-           time moves 3 s or more later.
+       (d) Home behind a tab: a real drag of its title bar onto the drop indicator at the centre of
+           the Jobs group puts it in the Jobs tabs, and the Jobs tab is chosen. A job finishes: the
+           time stays. Home's tab chosen: the job is listed, and the time moves 3 s or more later. If
+           the drag doesn't take, this fails by name and prints what it aimed at. The tab's effect on
+           Home is QML's own whatever the platform, and tst_home's
+           test_last_seen_waits_until_really_on_screen covers it offscreen.
        (e) a real second launch, with Home closed: it hands over and exits 0, Home opens, and the
            Opened card shows the target; a refused link says so there.
+  Each step that expects lines prints the count, each line as the app's UI tree names it, the kept
+  time, each job's end time and which jobs the core's `since` still lists at that time. A time check
+  only passes beside the line count it depends on. When the lines are missing, the check is instead
+  that the time hasn't moved past those jobs, which is what would lose them for good.
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first. The tree holds no
   names from a dialog's file list, navigation pane, address bar or breadcrumb. A real press goes only
   while the app's window is in front and under the point; otherwise the check fails and sends nothing.
@@ -152,12 +159,30 @@ function Assert-ChannelFree {
         throw "refused: the test channel is taken: $taken"
     }
 }
-# A job that finishes, from another session: its id once it has.
+# A job that finishes, from another session: its id once it has. Its end time is kept to be printed.
+$jobEnds = [ordered]@{}
 function Invoke-FinishedJob {
-    $id = (Invoke-Lil @('call', 'test.job', '{"lane":"cpu"}') | ConvertFrom-Json).structured.job.job_id
-    $done = Invoke-Lil @('call', 'job.wait', ('{"job_id":"' + $id + '","timeout_s":30}')) | ConvertFrom-Json
+    $id = (Invoke-Lil @('call', 'test.job', '{"lane":"cpu"}') | ConvertFrom-Json -DateKind String).structured.job.job_id
+    $done = Invoke-Lil @('call', 'job.wait', ('{"job_id":"' + $id + '","timeout_s":30}')) | ConvertFrom-Json -DateKind String
     if ($done.structured.job.status -ne 'succeeded') { throw "the test job ended $($done.structured.job.status)" }
+    $jobEnds[$id] = "$($done.structured.job.updated)"
     return $id
+}
+# The ids the core's `jobs.list {since}` gives at time `at`: a job not among them is lost to the card.
+function Get-SinceIds([string]$at) {
+    $json = Invoke-Lil @('call', 'jobs.list', ('{"since":"' + $at + '","limit":500}')) | ConvertFrom-Json -DateKind String
+    return @($json.structured.jobs | ForEach-Object { $_.job_id })
+}
+# Asks `count` until it gives `want`, for at most `sec` seconds: the last count, -1 if it threw. The
+# asking is in this function, so its answer can't be left behind in a script block's own scope.
+function Wait-Count([scriptblock]$count, [int]$want, [int]$sec) {
+    $end = (Get-Date).AddSeconds($sec)
+    while ($true) {
+        $n = -1
+        try { $n = [int](& $count) } catch { Write-Host "the count threw: $_" }
+        if ($n -eq $want -or (Get-Date) -ge $end) { return $n }
+        Start-Sleep -Milliseconds 200
+    }
 }
 # The app's kept time as written: the text itself, since ConvertFrom-Json would turn it into a date.
 function Get-Kept {
@@ -170,6 +195,12 @@ function Set-Kept([string]$workspace, [string]$at) {
     $text = '{"state": 1, "workspaces": {"' + $workspace + '": {"last_seen_at": "' + $at + '"}}}'
     [IO.File]::WriteAllText($stateFile, $text)
 }
+# The count's rules, with no app: what it asks reaches the caller, and a throw isn't a count.
+function Test-WaitCount {
+    Check ((Wait-Count { 2 } 2 1) -eq 2) 'self-test: a count reached is returned'
+    Check ((Wait-Count { 0 } 2 1) -eq 0) 'self-test: a count not reached is returned as it stands'
+    Check ((Wait-Count { throw 'no' } 2 1) -eq -1) 'self-test: a count that throws reads as unknown, not as none'
+}
 
 if (-not ('LilHomeCheck.Win' -as [type])) {
     Add-Type -Namespace LilHomeCheck -Name Win -MemberDefinition @'
@@ -179,6 +210,8 @@ public struct POINT { public int X; public int Y; }
 [DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hwnd, out uint processId);
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
+[DllImport("user32.dll")] public static extern uint GetDpiForSystem();
 [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, System.UIntPtr extra);
 '@
 }
@@ -218,6 +251,7 @@ function Self-Test {
 
 if ($DryRun) {
     Self-Test
+    Test-WaitCount
     try {
         Enter-TestChannel
         Assert-ChannelFree
@@ -230,6 +264,9 @@ if ($DryRun) {
         Check ([bool]$wsId) 'dry run: the default workspace has an id'
         $job = Invoke-FinishedJob
         Check ([bool]$job) 'dry run: a test job finishes from the command line'
+        Check ($jobEnds[$job] -match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d') "dry run: its end time reads as the core wrote it ($($jobEnds[$job]))"
+        Check ((Get-SinceIds '2026-01-01T00:00:00Z') -contains $job) 'dry run: the core lists it from a time before it'
+        Check ((Get-SinceIds '2099-01-01T00:00:00Z') -notcontains $job) 'dry run: and not from a time after it'
         Check (Test-Path -LiteralPath (Join-Path $root "local\LILITH-$channel")) 'dry run: the local data folder is where the kept time goes'
         Set-Kept $wsId '2026-01-01T00:00:00Z'
         Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads back'
@@ -300,14 +337,56 @@ function Find-NameStarting([string]$prefix) {
     }
     return $null
 }
-# The card's lines of finished jobs now, a line once (a window under another can list it twice).
-function Count-FinishedLines {
-    $names = [System.Collections.Generic.List[string]]::new()
+# The card's lines of finished jobs now, a line once (a window under another can list it twice), as
+# the app's UI tree has them: `name`, its `rect`, and whether UI Automation calls it off screen.
+function Get-FinishedLines {
+    $seen = @{}
     foreach ($w in App-Windows) {
         $all = Retry-Walk { $w.FindAll($TS::Descendants, (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Text))) }
-        foreach ($e in $all) { try { if ($e.Current.Name.StartsWith('Finished · ')) { $names.Add($e.Current.Name + $e.Current.BoundingRectangle) } } catch { } }
+        foreach ($e in $all) {
+            try {
+                $c = $e.Current
+                if ($c.Name.StartsWith('Finished · ')) {
+                    $seen["$($c.Name)$($c.BoundingRectangle)"] = "$($c.Name) | at $($c.BoundingRectangle) | offscreen=$($c.IsOffscreen)"
+                }
+            } catch { }
+        }
     }
-    return @($names | Select-Object -Unique).Count
+    return @($seen.Values)
+}
+# What one run needs in order to decide: the count, the lines, the kept time, the job's end times, and
+# which of them the core still lists at the kept time. Only the app's own names and ids.
+function Write-LinesReport([string]$step, [int]$count) {
+    Write-Host "$step line count: $count"
+    try { Get-FinishedLines | ForEach-Object { Write-Host "$step line: $_" } } catch { Write-Host "$step the lines couldn't be read: $_" }
+    $kept = Get-Kept
+    Write-Host "$step kept time: $kept"
+    foreach ($id in $jobEnds.Keys) { Write-Host "$step job $id ended $($jobEnds[$id])" }
+    try { Write-Host "$step the core lists from the kept time: $((Get-SinceIds $kept) -join ', ')" } catch { Write-Host "$step the core's list couldn't be read: $_" }
+}
+# The pair that must never come apart: the card shows `want` lines and the time then moves past the
+# `jobs` on them; or, if the lines aren't there, the time has not moved past those jobs, so they are
+# only late, not lost. `shownAt`, when given, is when Home came back: the move must be 3 s or more on.
+function Check-LinesThenTime([string]$step, [int]$want, [string[]]$jobs, [string]$keptBefore, $shownAt) {
+    $n = Wait-Count { @(Get-FinishedLines).Count } $want 15
+    Write-LinesReport $step $n
+    if ($n -eq $want) {
+        Pass "$step the card lists $want line(s)"
+        $took = Wait-KeptMoved $keptBefore $(if ($shownAt) { $shownAt } else { Get-Date }) 'the kept time to move'
+        if ($shownAt) { Check ($took -ge 2.5) "$step the time moved 3 s or more after Home showed ($took s)" } else { Pass "$step the time moves" }
+        $at = Get-Kept
+        $still = @(Get-SinceIds $at | Where-Object { $jobs -contains $_ })
+        Check ($still.Count -eq 0) "$step the time ($at) moved past the jobs shown, so they don't come back (still listed: $($still -join ', '))"
+    } else {
+        Fail "$step the card shows $n line(s), not $want (-1: the tree couldn't be read); whether the time may move isn't judged"
+        # Long enough for a write that shouldn't happen.
+        Start-Sleep -Seconds 5
+        Write-LinesReport $step $n
+        $at = Get-Kept
+        $listed = @(Get-SinceIds $at)
+        $lost = @($jobs | Where-Object { $listed -notcontains $_ })
+        Check ($lost.Count -eq 0) "$step with the lines missing, the time ($at) hasn't moved past those jobs (past it: $($lost -join ', '))"
+    }
 }
 function Find-TabItem([string]$name) {
     $c = And (Prop $AE::NameProperty $name) (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::TabItem))
@@ -345,7 +424,8 @@ function Show-App {
     }
 }
 # A real drag, with the window in front and under both ends. The cursor moves in steps, as the docking
-# code needs to see it move.
+# code needs to see it move, and the end is gone over again: the drop indicators are made as it hovers,
+# and need a move over them. It says where the cursor really got to, as a scaled desktop would differ.
 function Drag-From([double]$fromX, [double]$fromY, [double]$toX, [double]$toY) {
     Assert-AppInFront
     Assert-AppAt ([int]$fromX) ([int]$fromY)
@@ -355,15 +435,36 @@ function Drag-From([double]$fromX, [double]$fromY, [double]$toX, [double]$toY) {
     Assert-AppAt ([int]$fromX) ([int]$fromY)
     [LilHomeCheck.Win]::mouse_event(2, 0, 0, 0, [System.UIntPtr]::Zero)
     try {
-        foreach ($i in 1..20) {
-            [void][LilHomeCheck.Win]::SetCursorPos([int]($fromX + ($toX - $fromX) * $i / 20), [int]($fromY + ($toY - $fromY) * $i / 20))
+        foreach ($i in 1..30) {
+            [void][LilHomeCheck.Win]::SetCursorPos([int]($fromX + ($toX - $fromX) * $i / 30), [int]($fromY + ($toY - $fromY) * $i / 30))
             Start-Sleep -Milliseconds 40
         }
         Start-Sleep -Milliseconds 500
+        foreach ($d in 6, 3, 0) {
+            [void][LilHomeCheck.Win]::SetCursorPos([int]$toX + $d, [int]$toY)
+            Start-Sleep -Milliseconds 150
+        }
+        Start-Sleep -Milliseconds 300
+        $at = [LilHomeCheck.Win+POINT]::new()
+        [void][LilHomeCheck.Win]::GetCursorPos([ref]$at)
+        Write-Host "(d) dropping at $($at.X),$($at.Y), aimed at $([int]$toX),$([int]$toY); system DPI $([LilHomeCheck.Win]::GetDpiForSystem())"
     } finally {
         [LilHomeCheck.Win]::mouse_event(4, 0, 0, 0, [System.UIntPtr]::Zero)
     }
     Start-Sleep -Milliseconds 500
+}
+function Find-Pane([string]$name) {
+    $c = And (Prop $AE::NameProperty $name) (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Pane))
+    foreach ($w in App-Windows) { $e = Retry-Walk { $w.FindFirst($TS::Descendants, $c) }; if ($e) { return $e } }
+    return $null
+}
+# The tabs the app's windows have, by name.
+function Get-TabNames {
+    $names = foreach ($w in App-Windows) {
+        $all = Retry-Walk { $w.FindAll($TS::Descendants, (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::TabItem))) }
+        foreach ($e in $all) { try { $e.Current.Name } catch { } }
+    }
+    return ($names -join ', ')
 }
 
 # On a failure: every window of the app as UIA shows it, at most 4000 elements. Names only for the
@@ -415,7 +516,7 @@ try {
     [void](Invoke-Lil @('workspace', 'init', $harbor, '--default'))
     [void](Get-CorePid)
     $wsId = Get-WorkspaceId
-    [void](Invoke-FinishedJob)
+    $first = Invoke-FinishedJob
     $seed = '2026-01-01T00:00:00Z'
     Set-Kept $wsId $seed
 
@@ -430,27 +531,20 @@ try {
     Set-WindowState ([System.Windows.Automation.WindowVisualState]::Normal)
     $restored = Get-Date
     [void](Wait-For { Find-NameStarting 'Core connection: Connected' } 40 'the connection')
-    [void](Wait-For { Find-NameStarting 'Finished · ' } 30 'the card''s line')
-    Pass '(a) restored: the card lists the job'
-    $took = Wait-KeptMoved $seed $restored 'the kept time to move'
-    Check ($took -ge 2.5) "(a) the time moved 3 s or more after the restore ($took s)"
-    Check ($null -ne (Find-NameStarting 'Finished · ')) '(a) the line stays as the time moves'
+    Check-LinesThenTime '(a)' 1 @($first) $seed $restored
+    Check ((@(Get-FinishedLines).Count) -eq 1) '(a) the line stays as the time moves'
 
     # (b) Minimized for longer, with two more jobs finishing.
     Set-WindowState ([System.Windows.Automation.WindowVisualState]::Minimized)
     Start-Sleep -Seconds 1
     $kept = Get-Kept
-    [void](Invoke-FinishedJob)
-    [void](Invoke-FinishedJob)
+    $jobB = @((Invoke-FinishedJob), (Invoke-FinishedJob))
     Start-Sleep -Seconds 4
     Check ((Get-Kept) -eq $kept) '(b) minimized, with jobs finishing: the kept time stays'
     Set-WindowState ([System.Windows.Automation.WindowVisualState]::Normal)
     $restored = Get-Date
-    $n = 0
-    try { [void](Wait-For { $n = Count-FinishedLines; if ($n -eq 2) { $true } } 15 'two lines') } catch { }
-    Check ($n -eq 2) "(b) restored: the card lists the two jobs since, not the first ($n lines)"
-    $took = Wait-KeptMoved $kept $restored 'the kept time to move'
-    Check ($took -ge 2.5) "(b) the time moved 3 s or more after the restore ($took s)"
+    # The two since, not the first: the card now counts from the kept time.
+    Check-LinesThenTime '(b)' 2 $jobB $kept $restored
 
     # (c) A floating Home.
     $kept = Get-Kept
@@ -458,51 +552,53 @@ try {
     $floating = Wait-For { Find-Window 'Home' } 10 'the floating Home'
     Pass '(c) Home floats in a window of its own'
     Start-Sleep -Seconds 1
-    Check ((Count-FinishedLines) -eq 2) '(c) a floating Home keeps its lines'
+    $n = @(Get-FinishedLines).Count
+    Check ($n -eq 2) "(c) a floating Home keeps its lines ($n)"
     Check ((Get-Kept) -eq $kept) '(c) the float doesn''t move the kept time'
-    [void](Invoke-FinishedJob)
-    $n = 0
-    try { [void](Wait-For { $n = Count-FinishedLines; if ($n -eq 3) { $true } } 15 'three lines') } catch { }
-    Check ($n -eq 3) "(c) a job finishing while it floats is listed ($n lines)"
-    [void](Wait-KeptMoved $kept (Get-Date) 'the kept time to move')
-    Pass '(c) floating, it counts as on screen: the time moves'
+    $jobC = Invoke-FinishedJob
+    # Floating, it counts as on screen: the job is listed there, and the time moves past it.
+    Check-LinesThenTime '(c)' 3 @($jobC) $kept $null
     Invoke-Element (Wait-For { Find-Named 'Float Home' } 10 'Float Home, to dock it')
     [void](Wait-For { if (-not (Find-Window 'Home')) { $true } } 10 'Home to dock back')
     Start-Sleep -Seconds 1
-    Check ((Count-FinishedLines) -eq 3) '(c) docked again: the same lines'
+    $n = @(Get-FinishedLines).Count
+    Check ($n -eq 3) "(c) docked again: the same lines ($n)"
 
-    # (d) Behind a tab: a real drag of Home's title bar onto the Jobs group.
+    # (d) Behind a tab: a real drag of Home's title bar onto the Jobs group's centre, where KDDockWidgets
+    # puts the indicator that makes a tab (ClassicIndicatorsOverlay: the hovered group's centre). The
+    # group runs from its title bar to the bottom of its panel. Home's title bar is pressed left of its
+    # Float button: the rest of the bar is the drag area.
     Show-App
-    $bar = Wait-For { Find-Named 'Home' } 10 'Home''s title bar'
-    $barCondition = And (Prop $AE::NameProperty 'Home') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::TitleBar))
-    $found = Retry-Walk { $script:main.FindFirst($TS::Descendants, $barCondition) }
-    if ($found) { $bar = $found }
-    $b = $bar.Current.BoundingRectangle
-    $jobsTab = Wait-For { Find-TabItem 'Jobs' } 10 'the Jobs tab'
-    $t = $jobsTab.Current.BoundingRectangle
-    Drag-From ($b.X + 60) ($b.Y + $b.Height / 2) ($t.X + 100) ($t.Y + 300)
+    $floatHome = (Wait-For { Find-Named 'Float Home' } 10 'Float Home').Current.BoundingRectangle
+    $closeJobs = (Wait-For { Find-Named 'Close Jobs' } 10 'Close Jobs').Current.BoundingRectangle
+    $jobsPane = (Wait-For { Find-Pane 'Jobs' } 10 'the Jobs panel').Current.BoundingRectangle
+    $fromX = $floatHome.X - 60
+    $fromY = $floatHome.Y + $floatHome.Height / 2
+    $groupTop = $closeJobs.Y - 4
+    $toX = $jobsPane.X + $jobsPane.Width / 2
+    $toY = ($groupTop + $jobsPane.Bottom) / 2
+    Write-Host "(d) Float Home at $floatHome, Close Jobs at $closeJobs, the Jobs panel at $jobsPane; tabs before: $(Get-TabNames)"
+    Write-Host "(d) dragging from $([int]$fromX),$([int]$fromY) to $([int]$toX),$([int]$toY)"
+    Drag-From $fromX $fromY $toX $toY
     $homeTab = $null
     try { $homeTab = Wait-For { Find-TabItem 'Home' } 10 'the Home tab' } catch { }
+    Write-Host "(d) tabs after: $(Get-TabNames); a window of Home's own: $([bool](Find-Window 'Home'))"
     if (-not $homeTab) {
-        Fail '(d) the drag didn''t put Home in the Jobs tabs, so the tab case did not run'
+        Fail '(d) the drag didn''t put Home in the Jobs tabs, so the tab case did not run here (tst_home''s test_last_seen_waits_until_really_on_screen covers it offscreen)'
     } else {
         Pass '(d) Home is in the Jobs tabs'
         Invoke-Element (Wait-For { Find-TabItem 'Jobs' } 10 'the Jobs tab')
         Start-Sleep -Seconds 4
         $kept = Get-Kept
-        [void](Invoke-FinishedJob)
+        $jobD = Invoke-FinishedJob
         Start-Sleep -Seconds 5
         Check ((Get-Kept) -eq $kept) '(d) behind a tab, with a job finishing: the kept time stays'
         Invoke-Element (Wait-For { Find-TabItem 'Home' } 10 'the Home tab')
         $shown = Get-Date
-        $n = 0
-        try { [void](Wait-For { $n = Count-FinishedLines; if ($n -eq 1) { $true } } 15 'one line') } catch { }
         # One line: Home was behind the tab long enough for the card to count from the kept time, and
         # that is past the second of the jobs it listed before, since it was written from a read made
         # 3 s after they showed.
-        Check ($n -eq 1) "(d) Home's tab chosen: the card lists that job, counting from the kept time ($n lines)"
-        $took = Wait-KeptMoved $kept $shown 'the kept time to move'
-        Check ($took -ge 2.5) "(d) the time moved 3 s or more after Home showed ($took s)"
+        Check-LinesThenTime '(d)' 1 @($jobD) $kept $shown
     }
 
     # (e) A real second launch, with Home closed.
