@@ -137,4 +137,32 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/settings/NotificationSetup.qml
         qml/shell/FirstStartCard.qml)
 
+# Task 29: the owner's budgets (test-params.toml's [budgets], protected) for the benches, as
+# LIL_BUDGET_<NAME>=<value> environment entries: each `name = number` line of that table, its name
+# upper-cased (gui_stall_p99_ms is LIL_BUDGET_GUI_STALL_P99_MS). LIL_BUDGET_ENV is the list, for
+# the tests' ENVIRONMENT here, in tests/ and in apps/lil-image (bench_cold_start). A change to the
+# file reconfigures.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/test-params.toml)
+file(STRINGS ${CMAKE_SOURCE_DIR}/test-params.toml lil_params_lines)
+set(LIL_BUDGET_ENV "")
+set(lil_in_budgets FALSE)
+foreach(line IN LISTS lil_params_lines)
+    if(line MATCHES "^[ \t]*\\[([A-Za-z0-9_.]+)\\]")
+        if(CMAKE_MATCH_1 STREQUAL "budgets")
+            set(lil_in_budgets TRUE)
+        else()
+            set(lil_in_budgets FALSE)
+        endif()
+    elseif(lil_in_budgets AND line MATCHES "^[ \t]*([a-z0-9_]+)[ \t]*=[ \t]*([0-9.]+)")
+        string(TOUPPER "${CMAKE_MATCH_1}" lil_budget_name)
+        list(APPEND LIL_BUDGET_ENV "LIL_BUDGET_${lil_budget_name}=${CMAKE_MATCH_2}")
+    endif()
+endforeach()
+foreach(needed GUI_STALL_P99_MS EVENT_TO_UI_MS COLD_START_MS DEPLOY_FOLDER_MIB)
+    if(NOT LIL_BUDGET_ENV MATCHES "LIL_BUDGET_${needed}=")
+        message(FATAL_ERROR "test-params.toml's [budgets] has no ${needed} (lower case there)")
+    endif()
+endforeach()
+set(LIL_BUDGET_ENV "${LIL_BUDGET_ENV}" PARENT_SCOPE)
+
 add_subdirectory(tests)

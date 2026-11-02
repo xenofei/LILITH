@@ -31,3 +31,15 @@ index_rebuild_2000_assets_s = 30
 # Windows runner's figure (printed in the PR's CI log) and adjusts it, if needed, when
 # approving the PR.
 index_warm_reconcile_10000_assets_s = 6
+# Plan 4a's app budgets (APP-135, APP-136, APP-139), which apps/lil-ui-kit/CMakeLists.txt passes to
+# the benches (CTest label bench) as LIL_BUDGET_<NAME>.
+# bench_gui_stalls: the p99 of the GUI thread's 4 ms heartbeat lateness, and of the frame interval,
+# in ms.
+gui_stall_p99_ms = 16
+# bench_event_to_ui: the p99 from an event's receipt to the UI showing it, in ms.
+event_to_ui_ms = 100
+# bench_cold_start: `interactive` of each warm start of the deploy folder, in ms.
+cold_start_ms = 2000
+# deploy_runs_off_path (tools/deploy/check-deploy.ps1): the deploy folder's size in MiB, the folder
+# measured at plan 4a Task 29's head (371.9 MiB, every file of build/dev/deploy) plus 10 %, rounded up.
+deploy_folder_mib = 409.1
