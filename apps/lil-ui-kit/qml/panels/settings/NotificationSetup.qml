@@ -24,6 +24,10 @@ LCard {
 
     signal setUpPressed()
     signal checkAgain()
+    // Set up had the keyboard and has gone, its work done: the panel takes the keyboard.
+    signal focusLeft()
+
+    property bool _hadFocus: false
 
     readonly property bool appMissing: !!setup && setup.appMissing === true
     readonly property var problems: NotificationText.problems(path, appMissing)
@@ -74,7 +78,7 @@ LCard {
         LineText {
             visible: root.appMissing && NotificationText.setupOffered(root.path)
             tone: "muted"
-            text: "It would open " + Words.shown(root.core, root.setup ? root.setup.appPath : "", 260) + "."
+            text: "lil-image.exe should be at " + Words.shown(root.core, root.setup ? root.setup.appPath : "", 260) + "."
         }
 
         Flow {
@@ -86,9 +90,18 @@ LCard {
                 visible: NotificationText.setupOffered(root.path) && !root.appMissing
                 primary: true
                 requiresCore: true
-                enabled: !root.setup.busy
+                // Stays enabled while it runs, so the keyboard stays here: the bridge runs one at a time.
                 text: root.setup.busy ? "Setting up…" : "Set up"
-                onClicked: root.setUpPressed()
+                onClicked: {
+                    root._hadFocus = activeFocus
+                    root.setUpPressed()
+                }
+                onVisibleChanged: {
+                    if (!visible && root._hadFocus) {
+                        root._hadFocus = false
+                        root.focusLeft()
+                    }
+                }
             }
 
             LButton {
@@ -105,7 +118,6 @@ LCard {
                 id: checkButton
                 visible: root.problems.length > 0
                 requiresCore: true
-                enabled: !root.setup.busy
                 text: "Check again"
                 onClicked: root.checkAgain()
             }

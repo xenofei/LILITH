@@ -207,7 +207,7 @@ TestCase {
         for (const label of sixLabels) {
             const toggle = toggleNamed(panel, label)
             verify(toggle && reallyVisible(toggle), label)
-            compare(toggle.checked, label !== "Spending alerts", label)
+            compare(toggle.checked, label !== "Spending alerts" && label !== "Director-task decisions", label)
         }
         compare(toggleNamed(panel, "Quiet while fullscreen").checked, true)
         compare(toggleNamed(panel, "Pause GPU work while a game or video is fullscreen").checked, false)
@@ -269,6 +269,7 @@ TestCase {
         const host = loaded(core)
         const toggle = toggleNamed(host.panel, "Director-task decisions")
         compare(toggle.enabled, false)
+        compare(toggle.checked, false, "the core has it on, but a held switch doesn't look it")
         toggle.click()
         compare(sets(core), [])
         verify(shows(host.panel, "Director tasks arrive in a later version of LILITH"))
@@ -326,7 +327,8 @@ TestCase {
     function test_a_refused_set_restores_the_toggle_and_says_why() { // spec: APP-146, APP-039
         for (const [code, message] of [
             ["caller.not_allowed", "Only the LILITH app changes these settings."],
-            ["params.invalid", "\"job_failed\" is not a notification category."]]) {
+            // A -32602 as it really reaches the app (the e2e test checks it); the core is still there.
+            ["core.unreachable", "The LILITH core answered with a protocol error (-32602): invalid params: \"job_failed\" is not a notification category"]]) {
             answered = {}
             const core = makeCore()
             const host = loaded(core)
@@ -340,7 +342,16 @@ TestCase {
             verify(panel.banner.text.indexOf(message) >= 0, panel.banner.text)
             verify(panel.banner.text.indexOf("Job failed") >= 0, panel.banner.text)
             verify(!shows(panel, "Saving…"))
+            if (code === "core.unreachable") {
+                // It reads again, to be sure, and the message stays: the core never went away.
+                verify(panel.banner.text.indexOf("may not have changed") >= 0, panel.banner.text)
+                verify(panel.banner.text.indexOf("went away") < 0, panel.banner.text)
+                answer(core, isRead, readOk())
+                wait(50)
+                verify(panel.banner.visible, "still says why")
+            }
             // The next set that works takes the message away, and the switch still sets.
+            wait(Qt.styleHints.mouseDoubleClickInterval + 50)
             toggle.click()
             const now = Shapes.desktopSettings()
             now.notifications.job_failed = false
@@ -366,6 +377,257 @@ TestCase {
         wait(50)
         compare(toggle.checked, false, "a double-click doesn't undo itself")
         compare(sets(core).length, 1)
+    }
+
+    // Real answers take a few ms, so the first can land before a double-click's second click.
+    function test_a_double_click_answered_at_once_sends_one_set() { // spec: APP-146
+        const core = makeCore()
+        const host = loaded(core)
+        const toggle = toggleNamed(host.panel, "Job failed")
+        toggle.click()
+        const now = Shapes.desktopSettings()
+        now.notifications.job_failed = false
+        answer(core, isSet, setOk(now))
+        tryCompare(toggle, "checked", false)
+        toggle.click()
+        compare(sets(core).length, 1, "the second click is the same double-click")
+        compare(toggle.checked, false)
+        // A flip after that is a flip.
+        wait(Qt.styleHints.mouseDoubleClickInterval + 50)
+        toggle.click()
+        compare(sets(core).length, 2)
+        compare(sets(core)[1].args, {notifications: {job_failed: true}})
+    }
+
+    function test_a_read_open_when_a_set_answers_doesnt_undo_it() { // spec: APP-146
+        const core = makeCore()
+        const host = loaded(core)
+        const panel = host.panel
+        const toggle = toggleNamed(panel, "Job failed")
+        wait(1100)
+        panel.desktopRead.request()
+        tryVerify(() => reads(core) === 2, 5000)
+        toggle.click()
+        const now = Shapes.desktopSettings()
+        now.notifications.job_failed = false
+        answer(core, isSet, setOk(now))
+        tryCompare(toggle, "checked", false)
+        // The read was made before the set: what it says is older.
+        answer(core, isRead, readOk())
+        wait(50)
+        compare(toggle.checked, false, "an older read doesn't undo the answer")
+        tryVerify(() => reads(core) === 3, 5000, "and a read that knows follows")
+    }
+
+    function test_a_read_open_when_an_event_comes_doesnt_undo_it() { // spec: APP-146
+        const core = makeCore()
+        const host = loaded(core)
+        const panel = host.panel
+        const toggle = toggleNamed(panel, "Job finished")
+        tryVerify(() => core.subscriberCount("desktop") > 0, 5000)
+        wait(1100)
+        panel.desktopRead.request()
+        tryVerify(() => reads(core) === 2, 5000)
+        const now = Shapes.desktopSettings()
+        now.notifications.job_finished = false
+        core.emit("desktop", "event", Shapes.settingsChanged(now))
+        tryCompare(toggle, "checked", false)
+        answer(core, isRead, readOk())
+        wait(50)
+        compare(toggle.checked, false, "an older read doesn't undo the event")
+        tryVerify(() => reads(core) === 3, 5000, "and a read that knows follows")
+    }
+
+    function test_a_read_open_when_set_up_answers_doesnt_undo_it() { // spec: APP-022
+        const core = makeCore()
+        const setup = makeSetup()
+        const missing = {toasts: "ready", shortcut: "missing", handlers: "ok"}
+        const host = loaded(core, Shapes.desktopSettings({notification_path: missing}), setup)
+        const panel = host.panel
+        wait(1100)
+        panel.desktopRead.request()
+        tryVerify(() => reads(core) === 2, 5000)
+        setup.finish(Shapes.setupReport())
+        tryVerify(() => !panel.pathCard.setUpButton.visible, 5000)
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: missing})))
+        wait(50)
+        verify(!panel.pathCard.setUpButton.visible, "the setup's re-read is newer than the read that was open")
+        compare(panel.path.shortcut, "ok")
+    }
+
+    function test_set_up_after_a_failed_read_reads_again() { // spec: APP-022
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, undefined, setup)
+        const panel = host.panel
+        wait(1100)
+        panel.desktopRead.request()
+        answer(core, isRead, Shapes.refusal("store.io", "No."))
+        tryVerify(() => !panel.fresh, 5000)
+        wait(1100)
+        const before = reads(core)
+        setup.finish(Shapes.setupReport())
+        tryVerify(() => reads(core) === before + 1, 5000, "the report's path alone doesn't end the failed read")
+        answer(core, isRead, readOk())
+        tryVerify(() => panel.fresh, 5000)
+    }
+
+    function hideAndShow(panel) {
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        panel.visible = true
+        tryVerify(() => panel.shown, 5000)
+    }
+
+    function test_a_report_ends_when_the_panel_is_left() { // spec: APP-022
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        tryVerify(() => panel.shown && card.setUpButton.enabled, 5000)
+        setup.finish(Shapes.setupReport({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}))
+        tryVerify(() => shows(card, "are set up"), 5000, texts(card).join(" | "))
+        hideAndShow(panel)
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}})))
+        tryVerify(() => panel.fresh, 5000)
+        verify(!shows(card, "are set up"), "not a stale line: " + texts(card).join(" | "))
+
+        setup.refuses = true
+        card.setUpButton.click()
+        verify(shows(card, "Set up didn't start"))
+        hideAndShow(panel)
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}})))
+        tryVerify(() => panel.fresh, 5000)
+        verify(!shows(card, "Set up didn't start"), texts(card).join(" | "))
+    }
+
+    // A run from the first-start card, say, put away there: why it failed is here.
+    function test_a_report_that_came_behind_a_tab_still_shows() { // spec: APP-022
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        tryVerify(() => panel.shown, 5000)
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        setup.finish(Shapes.setupReport({shortcut: {state: "failed", why: "Access is denied."}, scheme: {state: "ok"},
+                                         notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}))
+        panel.visible = true
+        tryVerify(() => panel.shown, 5000)
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}})))
+        tryVerify(() => panel.fresh, 5000)
+        verify(shows(card, "couldn't be written: Access is denied."), texts(card).join(" | "))
+        hideAndShow(panel)
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}})))
+        tryVerify(() => panel.fresh, 5000)
+        verify(!shows(card, "Access is denied"), "seen, and then left: " + texts(card).join(" | "))
+    }
+
+    // Behind a tab it follows nothing, so the connection is what tells it.
+    function test_a_loss_behind_a_tab_holds_until_a_read_after_it() { // spec: APP-146, ARCH-100
+        const core = makeCore()
+        const host = loaded(core)
+        const panel = host.panel
+        const toggle = toggleNamed(panel, "Job failed")
+        tryVerify(() => toggle.enabled && panel.shown, 5000)
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        core.applyState({connection: "reconnecting"})
+        core.applyState({connection: "ready"})
+        wait(2100)
+        const before = reads(core)
+        panel.visible = true
+        tryVerify(() => panel.shown, 5000)
+        verify(!panel.fresh, "old until a read made after the loss")
+        compare(toggle.enabled, false)
+        toggle.click()
+        compare(sets(core), [], "no write from what may be old")
+        tryVerify(() => reads(core) === before + 1, 5000)
+        answer(core, isRead, readOk())
+        tryVerify(() => panel.fresh, 5000)
+        tryVerify(() => toggle.enabled, 5000)
+    }
+
+    function test_a_read_open_at_a_loss_doesnt_count_as_after_it() { // spec: APP-146, ARCH-100
+        const core = makeCore()
+        const host = loaded(core)
+        const panel = host.panel
+        wait(1100)
+        panel.desktopRead.request()
+        tryVerify(() => reads(core) === 2, 5000)
+        core.applyState({connection: "reconnecting"})
+        core.applyState({connection: "ready"})
+        answer(core, isRead, readOk())
+        wait(50)
+        verify(!panel.fresh, "that read was made before the loss")
+        tryVerify(() => reads(core) === 3, 5000, "the read after the loss")
+        answer(core, isRead, readOk())
+        tryVerify(() => panel.fresh, 5000)
+    }
+
+    // A same-core reconnect gets no mark; a new core's `ready` comes before its `resync_required`.
+    function test_ready_reads_and_a_new_core_s_mark_reads_again() { // spec: APP-146, ARCH-100
+        const core = makeCore()
+        const host = loaded(core)
+        const panel = host.panel
+        tryVerify(() => core.subscriberCount("desktop") > 0, 5000)
+        wait(1100)
+        const before = reads(core)
+        core.applyState({connection: "reconnecting"})
+        verify(!panel.fresh)
+        core.applyState({connection: "ready"})
+        verify(!panel.fresh, "ready alone says nothing of what the switches show")
+        tryVerify(() => reads(core) === before + 1, 5000, "ready reads")
+        // The new core's mark, with that read open: only a read made after it counts.
+        core.emit("desktop", "resync_required", null)
+        answer(core, isRead, readOk())
+        wait(50)
+        verify(!panel.fresh, "that read was made before the mark")
+        tryVerify(() => reads(core) === before + 2, 5000, "the read after the mark")
+        answer(core, isRead, readOk())
+        tryVerify(() => panel.fresh, 5000)
+    }
+
+    function test_read_again_hides_while_the_core_is_away() { // spec: APP-034
+        const core = makeCore()
+        const host = makeHost(core)
+        const panel = host.panel
+        answer(core, isRead, Shapes.refusal("store.io", "No."))
+        tryVerify(() => panel.readAgainButton.visible, 5000)
+        core.applyState({connection: "reconnecting"})
+        verify(!panel.readAgainButton.visible, "it couldn't be pressed")
+        verify(panel.statusLine.text.indexOf("read when it's back") >= 0, panel.statusLine.text)
+        core.applyState({connection: "ready"})
+        answer(core, isRead, readOk())
+        tryVerify(() => panel.fresh, 5000)
+    }
+
+    function test_the_path_card_goes_first_while_something_needs_you() { // spec: APP-146, APP-156
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        // Wide: at the top of its column; narrow, as the Default layout's dock is, at the top.
+        tryVerify(() => panel.scroller.wide && card.y === 0 && panel.desktopToggles.y > 0, 5000, "wide: " + card.y)
+        host.width = 620
+        tryVerify(() => !panel.scroller.wide && card.y === 0 && panel.notifications.y > 0, 5000, "narrow")
+        verify(panel.desktopToggles.y >= panel.notifications.y + panel.notifications.height, "the rest below")
+        compare(panel.scroller.nextItemInFocusChain(true), card.setUpButton, "the keyboard's order is the same")
+        setup.finish(Shapes.setupReport())
+        tryVerify(() => card.y >= panel.desktopToggles.y + panel.desktopToggles.height, 5000, "back at the end")
+        verify(panel.notifications.y === 0)
+        verify(panel.scroller.nextItemInFocusChain(true) !== card.setUpButton)
+    }
+
+    function test_the_switch_notes_are_their_descriptions() { // spec: APP-156
+        const core = makeCore()
+        const host = loaded(core)
+        verify(toggleNamed(host.panel, "Job failed").Accessible.description.indexOf("Jobs held after a restart") >= 0)
+        verify(toggleNamed(host.panel, "Quiet while fullscreen").Accessible.description.indexOf("notification centre") >= 0)
+        compare(toggleNamed(host.panel, "Job finished").Accessible.description, "")
     }
 
     function test_two_sets_racing_end_on_what_the_core_last_said() { // spec: APP-146
@@ -498,7 +760,7 @@ TestCase {
         // The set's answer is lost with the connection: maybe written.
         answer(core, c => c.id === call.id, Shapes.refusal("core.unreachable", "The core went away."))
         tryVerify(() => panel.banner.visible, 5000)
-        verify(panel.banner.text.indexOf("may have changed") >= 0, panel.banner.text)
+        verify(panel.banner.text.indexOf("may not have changed") >= 0, panel.banner.text)
         compare(toggle.checked, true, "what the core last said")
         wait(1100)
         const before = reads(core)
@@ -584,7 +846,7 @@ TestCase {
         verify(!card.setUpButton.visible)
         verify(shows(card, "lil-image.exe isn't where the core looks for it"), texts(card).join(" | "))
         verify(!texts(card).some(t => t.indexOf("\"Set up\"") >= 0), "no sentence names the button")
-        verify(shows(card, "C:\\gone\\lil-image.exe"))
+        verify(shows(card, "lil-image.exe should be at C:\\gone\\lil-image.exe."), texts(card).join(" | "))
     }
 
     function test_set_up_button_writes_then_rereads() { // spec: APP-022, P4a-R26
@@ -599,7 +861,7 @@ TestCase {
         card.setUpButton.click()
         compare(setup.runs, 1)
         compare(card.setUpButton.text, "Setting up…")
-        compare(card.setUpButton.enabled, false)
+        verify(card.setUpButton.enabled, "the keyboard stays on it")
         // Two presses, one run.
         card.setUpButton.click()
         compare(setup.runs, 1)
@@ -609,6 +871,43 @@ TestCase {
         verify(shows(card, NotificationText.reachable))
         verify(shows(card, "The Start-menu shortcut and this LILITH's lil: links are set up."), texts(card).join(" | "))
         compare(core.calls.length, calls, "the bridge read it")
+    }
+
+    function test_the_keyboard_stays_through_set_up() { // spec: APP-156
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        host.requestActivate()
+        tryVerify(() => host.active, 5000)
+        tryVerify(() => card.setUpButton.enabled, 5000)
+        card.setUpButton.forceActiveFocus()
+        verify(card.setUpButton.activeFocus)
+        keyClick(Qt.Key_Space)
+        compare(setup.runs, 1)
+        verify(card.setUpButton.activeFocus, "held while it runs")
+        keyClick(Qt.Key_Space)
+        compare(setup.runs, 1, "a second press runs nothing")
+        setup.finish(Shapes.setupReport())
+        tryVerify(() => !card.setUpButton.visible, 5000)
+        tryVerify(() => panel.scroller.activeFocus, 5000, "the keyboard goes on to the list, not to nothing")
+    }
+
+    function test_set_up_s_outcome_is_announced() { // spec: APP-156
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const said = []
+        host.panel.announced.connect(t => said.push(t))
+        tryVerify(() => host.panel.pathCard.setUpButton.enabled, 5000)
+        // A run pressed elsewhere is said elsewhere.
+        setup.finish(Shapes.setupReport({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}))
+        compare(said, [])
+        setup.busy = false
+        host.panel.pathCard.setUpButton.click()
+        setup.finish(Shapes.setupReport())
+        compare(said, ["The Start-menu shortcut and this LILITH's lil: links are set up."])
     }
 
     function test_set_up_says_which_part_failed() { // spec: APP-022
@@ -664,10 +963,12 @@ TestCase {
         const card = host.panel.pathCard
         tryVerify(() => card.setUpButton.enabled, 5000)
         core.applyState({connection: "reconnecting"})
-        // What may be old isn't offered.
+        // What may be old isn't offered, until a read after the loss.
         verify(!card.setUpButton.visible)
         core.applyState({connection: "ready"})
-        verify(card.setUpButton.visible)
+        verify(!card.setUpButton.visible)
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}})))
+        tryVerify(() => card.setUpButton.visible, 5000)
     }
 
     // The bridge's answer can land after the panel is gone.

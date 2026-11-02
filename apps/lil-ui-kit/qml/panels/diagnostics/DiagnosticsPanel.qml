@@ -150,6 +150,14 @@ Rectangle {
         }
     }
 
+    // Set up publishes no event, and its result is what the notification card says.
+    Connections {
+        target: root.setup
+        function onFinished(reportJson) {
+            root.desktopRead.request()
+        }
+    }
+
     // Only while the shell gives none.
     EventLogModel {
         id: ownEventLog

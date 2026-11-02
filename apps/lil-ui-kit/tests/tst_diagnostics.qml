@@ -104,6 +104,14 @@ TestCase {
         ShellWindow {}
     }
 
+    Component {
+        id: fakeSetupComponent
+        QtObject {
+            property bool appMissing: false
+            signal finished(string reportJson)
+        }
+    }
+
     A11yWalk { id: walk }
 
     property var answered: ({})
@@ -1372,6 +1380,22 @@ TestCase {
     }
 
     // --- Floating, and the gate -----------------------------------------------------------------
+
+    // Set up publishes no event, so a card beside a floating Settings would go on saying "use Set up".
+    function test_a_set_up_makes_the_card_read_again() { // spec: APP-146, APP-022
+        const core = makeCore()
+        const panel = makePanel(core)
+        const setup = fakeSetupComponent.createObject(tc)
+        panel.setup = setup
+        load(core, {"desktop.get": ok(desktop({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}))})
+        tryVerify(() => shows(panel.notifications, "The Start-menu shortcut is missing"), 5000)
+        wait(1100)
+        const reads = callsOf(core, "desktop.get").length
+        setup.finished("{}")
+        tryVerify(() => callsOf(core, "desktop.get").length === reads + 1, 5000, "it reads again")
+        answer(core, isTool("desktop.get"), ok(desktop()))
+        tryVerify(() => shows(panel.notifications, "Nothing stands in the way"), 5000)
+    }
 
     function test_float_and_redock_keeps_diagnostics_state() { // spec: ARCH-116
         const core = makeCore()

@@ -13,16 +13,20 @@
 // It reads when it is shown (never the core's 10 s cache, so what you fixed elsewhere shows), follows
 // the `desktop` topic while shown, and reads again on a `resync_required` or a snapshot (ToolRead). A
 // read that fails says so; a failed read is retried when `ready` comes. No switch takes a write before
-// the first answer, or while what it shows may be old (`fresh`): then they are dimmed and held.
+// the first answer, or while what it shows may be old (`fresh`): then they are dimmed and held. A lost
+// connection counts as old, shown or not, until a read made after it has landed: a same-core reconnect
+// gets no mark, and a new core's `ready` comes before its `resync_required`, so `ready` reads too.
 //
 // "Set up" runs on the setup bridge, which the first-start card shares (`setup`, filled in by the shell
 // when it makes the dock): whichever pressed it, each hears the report, and its re-read is the path
-// shown here. A report with no path (the core didn't answer) reads again through the session.
+// shown here. A report with no path (the core didn't answer) reads again through the session. A report
+// stays until it has been shown and the panel left, so one that came behind a tab is still read here.
 pragma ComponentBehavior: Bound
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
 import "../diagnostics/DiagnosticsText.js" as Words
+import "../diagnostics/NotificationText.js" as NotificationText
 
 Rectangle {
     id: root
@@ -41,16 +45,29 @@ Rectangle {
     property var path: null
     // Setting id ("notifications.<key>", or the field's name) -> true, while a set of it is out.
     property var setsOut: ({})
-    // A topic's resync or snapshot: until a read answers, the switches may be old.
+    // A lost connection, a topic's resync or snapshot: until a read made after it answers, the switches
+    // may be old.
     property bool reloading: false
     // What the last setup did, or null.
     property var report: null
     property string setupProblem
+    // Whether something on the path card needs you: it goes first. Told from the last reading, old or
+    // not, so the cards don't jump about while the core is away.
+    readonly property bool pathFirst: NotificationText.problems(path).length > 0
+
+    // It was said, as a screen reader hears it.
+    signal announced(string text)
 
     property bool _raced: false
     // A set whose answer was lost: read again as soon as the core can answer.
     property bool _lostAnswer: false
+    // The banner is about such a set; it goes with the first read after the connection really went.
+    property bool _lossBanner: false
     property bool _closeOnRead: false
+    // The report or problem shown has been on screen, so leaving the panel ends it.
+    property bool _reportSeen: false
+    // Set up was pressed here: its outcome is said here.
+    property bool _pressed: false
 
     // Whether the panel is live. A flicker (floating and re-docking moves the item) isn't a hide.
     property bool shown: false
@@ -67,8 +84,8 @@ Rectangle {
             return ""
         const known = settings !== null
         if (!core || core.connection !== "ready")
-            return known ? "The core isn't connected, so these show what it last said and can't be changed now."
-                         : "The core isn't connected, so the settings can't be read yet."
+            return known ? "The core isn't connected, so these show what it last said and can't be changed now. They are read again when it's back."
+                         : "The core isn't connected, so the settings can't be read yet. They are read when it's back."
         if (desktopRead.error)
             return "The settings couldn't be read: " + Words.errorText(core, desktopRead.error)
                    + (known ? " The switches show what the core last said." : "")
@@ -96,10 +113,15 @@ Rectangle {
         id: settle
         interval: root.isOnScreen ? 50 : 500
         onTriggered: {
-            // What the last setup did is news only until the panel is left.
+            // What the last setup did is news until it has been shown and the panel left.
             if (root.isOnScreen && !root.shown) {
-                root.report = null
-                root.setupProblem = ""
+                if (root._reportSeen) {
+                    root.report = null
+                    root.setupProblem = ""
+                    root._reportSeen = false
+                } else if (root.report) {
+                    root._reportSeen = true
+                }
             }
             root.shown = root.isOnScreen
         }
@@ -173,32 +195,45 @@ Rectangle {
         }
     }
 
+    // `core.unreachable` is what the bridge makes of anything but a refusal: the connection lost with
+    // the set on it, nothing sent, or a protocol error from a core that is still there. So the words say
+    // only what holds of all three, with the bridge's own for which it was.
     function refused(label, error) {
         const shownLabel = Words.shown(core, label, 80)
         panelBanner.kind = "danger"
         if (error.code === "core.unreachable") {
             _lostAnswer = true
-            panelBanner.show("\"" + shownLabel + "\": the core went away before it answered, so this may have "
-                             + "changed. The switch shows what the core last said, until it can be read again.")
-            readAfterLoss()
+            _lossBanner = true
+            _closeOnRead = !core || core.connection !== "ready"
+            panelBanner.show("\"" + shownLabel + "\" may not have changed: " + Words.errorText(core, error)
+                             + " The switch shows what the core last said, until it can be read again.")
+            readIfOwed()
         } else {
             panelBanner.show("\"" + shownLabel + "\" wasn't changed: " + Words.errorText(core, error))
         }
     }
 
-    function readAfterLoss() {
-        if (!_lostAnswer || !core || core.connection !== "ready")
+    // On `ready`, or at once while it is: the read a lost connection or a lost answer is owed. A read
+    // that failed or never landed goes again by itself (ToolRead).
+    function readIfOwed() {
+        if (!core || core.connection !== "ready")
             return
+        const owed = reloading || _lostAnswer
         _lostAnswer = false
-        _closeOnRead = true
-        desktopRead.request()
+        if (owed && desktopRead.loaded && !desktopRead.error)
+            desktopRead.request()
     }
 
     function pressSetUp() {
         setupProblem = ""
-        if (!setup.run() && !setup.busy)
+        if (setup.run()) {
+            _pressed = true
+        } else if (!setup.busy) {
             setupProblem = "Set up didn't start. Run lil doctor instead."
+            _reportSeen = shown
+        }
     }
+
 
     readonly property ToolRead desktopRead: ToolRead {
         core: root.core
@@ -215,7 +250,12 @@ Rectangle {
                 root.applySettings(data.settings, "")
             }
         }
-        onReloading: root.reloading = true
+        onReloading: {
+            root.reloading = true
+            // A read already open when the mark came was made before it; the one due follows.
+            if (root.desktopRead._reading && root.desktopRead._due)
+                root.desktopRead.eventApplied()
+        }
         onAnswered: (structured, current) => {
             if (structured && (current || root.path === null))
                 root.path = structured.notification_path
@@ -223,10 +263,8 @@ Rectangle {
                 return
             root.applySettings(structured, "")
             root.reloading = false
-            if (root._closeOnRead) {
-                root._closeOnRead = false
+            if (root._closeOnRead)
                 panelBanner.close()
-            }
             // The path speaks now: an old "couldn't say" doesn't stay beside it.
             if (root.report && root.report.reread_error)
                 root.report = Object.assign({}, root.report, {reread_error: null})
@@ -236,7 +274,15 @@ Rectangle {
     Connections {
         target: root.core
         function onConnectionChanged() {
-            root.readAfterLoss()
+            if (root.core.connection === "ready") {
+                root.readIfOwed()
+            } else {
+                root.reloading = true
+                // A read open now was made before the loss.
+                root.desktopRead.eventApplied()
+                if (root._lossBanner)
+                    root._closeOnRead = true
+            }
         }
     }
 
@@ -245,6 +291,13 @@ Rectangle {
         function onFinished(reportJson) {
             const report = JSON.parse(reportJson)
             root.report = report
+            root._reportSeen = root.shown
+            if (root._pressed) {
+                const said = NotificationText.setupOutcome(report, (t, max) => Words.shown(root.core, t, max))
+                root.Accessible.announce(said)
+                root.announced(said)
+            }
+            root._pressed = false
             if (report.notification_path) {
                 root.desktopRead.eventApplied()
                 root.path = report.notification_path
@@ -257,6 +310,10 @@ Rectangle {
     LBanner {
         id: panelBanner
         width: parent.width
+        onClosed: {
+            root._lossBanner = false
+            root._closeOnRead = false
+        }
     }
 
     Row {
@@ -278,7 +335,8 @@ Rectangle {
 
         LButton {
             id: readAgainButton
-            visible: !!root.desktopRead.error
+            // While the core is away it comes by itself, and the line says so.
+            visible: !!root.desktopRead.error && !!root.core && root.core.connection === "ready"
             requiresCore: true
             text: "Read again"
             onClicked: root.desktopRead.request()
@@ -349,16 +407,42 @@ Rectangle {
             }
         }
 
-        Grid {
+        // Placed by hand, with the path card first while something on it needs you, so Set up isn't
+        // below nine rows in a small dock. It comes first for the keyboard too: it has a tab stop
+        // only then.
+        Item {
             id: content
-            width: scroller.width
-            columns: scroller.wide ? 2 : 1
-            spacing: 2 * Theme.spacing
 
-            readonly property real columnWidth: scroller.wide ? Math.floor((width - spacing) / 2) : width
+            readonly property real gap: 2 * Theme.spacing
+            readonly property real columnWidth: scroller.wide ? Math.floor((width - gap) / 2) : width
+            readonly property real togglesHeight: notificationToggles.visible ? notificationToggles.height + gap : 0
+            readonly property real desktopHeight: desktopToggles.visible ? desktopToggles.height + gap : 0
+            readonly property real pathHeight: pathCard.height + gap
+            readonly property real rightX: scroller.wide && notificationToggles.visible ? columnWidth + gap : 0
+
+            width: scroller.width
+            height: scroller.wide ? Math.max(togglesHeight, desktopHeight + pathHeight)
+                                  : togglesHeight + desktopHeight + pathHeight
+
+            NotificationSetup {
+                id: pathCard
+                x: content.rightX
+                y: root.pathFirst ? 0 : content.desktopHeight + (scroller.wide ? 0 : content.togglesHeight)
+                width: content.columnWidth
+                core: root.core
+                setup: root.setup
+                path: root.fresh ? root.path : null
+                report: root.report
+                setupProblem: root.setupProblem
+                openExternally: root.openExternally
+                onSetUpPressed: root.pressSetUp()
+                onCheckAgain: root.desktopRead.request()
+                onFocusLeft: scroller.forceActiveFocus(Qt.TabFocusReason)
+            }
 
             NotificationToggles {
                 id: notificationToggles
+                y: !scroller.wide && root.pathFirst ? content.pathHeight : 0
                 width: content.columnWidth
                 visible: root.settings !== null
                 opacity: root.fresh ? 1 : 0.5
@@ -369,33 +453,17 @@ Rectangle {
                 onFlip: (id, on, label) => root.flip(id, on, label)
             }
 
-            Column {
+            DesktopToggles {
+                id: desktopToggles
+                x: content.rightX
+                y: (root.pathFirst ? content.pathHeight : 0) + (scroller.wide ? 0 : content.togglesHeight)
                 width: content.columnWidth
-                spacing: 2 * Theme.spacing
-
-                DesktopToggles {
-                    id: desktopToggles
-                    width: parent.width
-                    visible: root.settings !== null
-                    opacity: root.fresh ? 1 : 0.5
-                    settings: root.settings
-                    setsOut: root.setsOut
-                    live: root.fresh
-                    onFlip: (id, on, label) => root.flip(id, on, label)
-                }
-
-                NotificationSetup {
-                    id: pathCard
-                    width: parent.width
-                    core: root.core
-                    setup: root.setup
-                    path: root.fresh ? root.path : null
-                    report: root.report
-                    setupProblem: root.setupProblem
-                    openExternally: root.openExternally
-                    onSetUpPressed: root.pressSetUp()
-                    onCheckAgain: root.desktopRead.request()
-                }
+                visible: root.settings !== null
+                opacity: root.fresh ? 1 : 0.5
+                settings: root.settings
+                setsOut: root.setsOut
+                live: root.fresh
+                onFlip: (id, on, label) => root.flip(id, on, label)
             }
         }
     }

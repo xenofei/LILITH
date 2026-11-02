@@ -1,9 +1,9 @@
 // grab_settings: the Settings panel and the first-start card offscreen, saved as
 // <grab dir>/settings-<state>.png (LIL_GRAB_DIR, else CMake's build/<preset>/grabs) for the reviewer, on
 // FakeCore's scripted answers: the panel alone at the shell's 1280 x 800 with everything in order, with
-// the notification path unreachable, with its read failed, the shell's first start, and the panel
-// docked in the shell's Default layout. Each grab must have the window's size and not be one flat
-// colour.
+// the notification path unreachable, with its read failed, the shell's first start, the panel docked in
+// the shell's Default layout with everything in order and with Set up to offer. Each grab must have the
+// window's size and not be one flat colour.
 import QtQuick
 import QtTest
 import Lilith.Shim
@@ -163,5 +163,18 @@ TestCase {
         answerRead(core, Shapes.tool(Shapes.desktopSettings()))
         tryVerify(() => shell.docks.settings.content.fresh, 5000)
         save(shell, "docked")
+    }
+
+    function test_grab_docked_with_set_up() { // spec: APP-146, APP-022
+        const core = fakeComponent.createObject(tc)
+        const shell = createTemporaryObject(shellComponent, tc, {core: core, setup: fakeSetupComponent.createObject(tc)})
+        shell.visible = true
+        tryVerify(() => shell.layoutSettled, 5000)
+        shell.docks.settings.setAsCurrentTab()
+        tryVerify(() => shell.docks.settings.content.shown, 5000)
+        answerRead(core, Shapes.tool(Shapes.desktopSettings({notification_path: {
+            toasts: "ready", shortcut: "missing", handlers: "ok"}})))
+        tryVerify(() => shell.docks.settings.content.fresh, 5000)
+        save(shell, "docked-set-up")
     }
 }
