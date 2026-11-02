@@ -169,21 +169,37 @@ Rectangle {
     }
 
     // --- Live progress, at most 10 times a second. ---
+    // A burst faster than that is held back to the newest, shown 100 ms after the last one shown. An
+    // event that comes 100 ms or more after the one before it is shown at once: the core already sends
+    // at most 10 a second, and holding those back by a Timer, which fires late, kept each one waiting
+    // a whole period (bench_event_to_ui: p99 126 ms against APP-139's 100).
 
     property var _waiting: null
     property var _subscription: null
+    property real _appliedAt: 0
+    property real _arrivedAt: 0
 
     function applyProgress(p) {
         liveProgress = p
         progressApplied++
+        _appliedAt = Date.now()
     }
 
     function offerProgress(p) {
-        if (gate.running) {
-            _waiting = p
-        } else {
+        const now = Date.now()
+        const sinceShown = now - _appliedAt
+        const sinceLast = now - _arrivedAt
+        _arrivedAt = now
+        if (sinceShown >= 100 || sinceLast >= 100) {
+            gate.stop()
+            _waiting = null
             applyProgress(p)
-            gate.start()
+        } else {
+            _waiting = p
+            if (!gate.running) {
+                gate.interval = Math.max(1, 100 - sinceShown)
+                gate.start()
+            }
         }
     }
 
@@ -209,9 +225,15 @@ Rectangle {
         })
     }
 
-    onRunningChanged: follow()
-    onJobIdChanged: follow()
-    Component.onCompleted: follow()
+    // Only once the row is made (PreviewImage's rule): a follow() while the row was being made left a
+    // subscription the next follow() didn't end, so each event reached the row twice (bench_event_to_ui).
+    property bool _complete: false
+    onRunningChanged: if (_complete) follow()
+    onJobIdChanged: if (_complete) follow()
+    Component.onCompleted: {
+        _complete = true
+        follow()
+    }
     // A newer summary of the job carries its progress; one made before the newest progress
     // event (a lower value of the same steps) doesn't take it back.
     readonly property var modelProgress: model.progress
@@ -236,7 +258,6 @@ Rectangle {
             if (root._waiting) {
                 root.applyProgress(root._waiting)
                 root._waiting = null
-                gate.start()
             }
         }
     }
@@ -307,7 +328,13 @@ Rectangle {
             width: parent.width
             height: item && item.visible ? 96 : 0
             sourceComponent: PreviewImage {
-                visible: status === Image.Ready
+                // Shown from its first frame on: while the next frame loads it keeps the one it has
+                // (retainWhileLoading), so its place stays, and the rows below don't jump at each frame.
+                // A finished job's preview has no source, and goes.
+                property bool hadFrame: false
+                onStatusChanged: if (status === Image.Ready) hadFrame = true
+                onSourceChanged: if (String(source) === "") hadFrame = false
+                visible: status === Image.Ready || (hadFrame && status === Image.Loading)
                 core: root.panel.core
                 jobId: root.jobId
                 horizontalAlignment: Image.AlignLeft

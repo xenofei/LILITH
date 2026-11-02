@@ -1625,4 +1625,69 @@ TestCase {
         compare(core.calls.length, pages, "nothing was loaded again")
         compare(core.subscriberCount("jobs"), subscribers, "the model's and the panel's subscriptions stay")
     }
+
+    // Task 29 (bench_event_to_ui): progress at the core's own most, 10 a second, is shown as each event
+    // arrives. The 10 Hz limit holds back only a faster burst; a limit timed by its own Timer, which
+    // fires late, held nearly every one of these back for up to a period (p99 126 ms against 100). The
+    // row is new, so the first event comes within 100 ms of the first progress shown.
+    function test_progress_100_ms_apart_shows_as_it_arrives() { // spec: APP-139, APP-114
+        const t = load({jobs: [job("j1", {progress: {value: 0, max: 50}})]})
+        const r = row(t.panel, "j1")
+        let held = 0
+        let last = 0
+        for (let i = 1; i <= 20; ++i) {
+            while (Date.now() - last < 101)
+                wait(1)
+            last = Date.now()
+            t.core.emit("job:j1", "event", {kind: "progress", value: i, max: 50})
+            if (r.progressValue !== i)
+                ++held
+        }
+        compare(held, 0, "events 100 ms apart that the limit held back: " + held)
+        tryCompare(r, "progressValue", 20, 1000)
+    }
+
+    // Task 29 (bench_event_to_ui): a running row keeps its preview's place while the next frame loads.
+    // It collapsed to nothing at each new frame's Loading, so at 10 Hz the rows below jumped, and a row
+    // at the list's end was made and destroyed with every frame.
+    function test_the_preview_keeps_its_place_while_the_next_frame_loads() { // spec: APP-114, APP-031
+        const t = load({jobs: [job("j1")]})
+        const r = row(t.panel, "j1")
+        t.core.emitFromCore("preview:j1", "event", {format: "png", data_b64: twoWide})
+        tryVerify(() => r.preview && r.preview.visible && r.preview.status === Image.Ready, 2000, "the first frame shows")
+        const height = r.height
+        let hidden = 0
+        let shrunk = 0
+        const onVisible = () => { if (!r.preview.visible) ++hidden }
+        const onHeight = () => { if (r.height < height) ++shrunk }
+        r.preview.visibleChanged.connect(onVisible)
+        r.heightChanged.connect(onHeight)
+        for (let i = 0; i < 10; ++i) {
+            const before = r.preview.source.toString()
+            t.core.emitFromCore("preview:j1", "event", {format: "png", data_b64: i % 2 ? twoWide : threeWide})
+            tryVerify(() => r.preview.source.toString() !== before && r.preview.status === Image.Ready, 2000)
+            wait(20)
+        }
+        r.preview.visibleChanged.disconnect(onVisible)
+        r.heightChanged.disconnect(onHeight)
+        compare(hidden, 0, "the preview was hidden while a frame loaded")
+        compare(shrunk, 0, "the row shrank while a frame loaded")
+        // A finished job's preview still goes.
+        t.core.emit("job:j1", "event", {kind: "status", job: job("j1", {status: "succeeded"})})
+        tryVerify(() => !r.preview || !r.preview.visible, 2000, "a finished job shows no preview")
+    }
+
+    // Task 29 (bench_event_to_ui): a row follows its job once. The subscription it made while it was
+    // being made outlived the next follow(), so each progress event was offered twice, and the second
+    // offer held the next real one back by up to a period.
+    function test_a_row_follows_its_job_once() { // spec: APP-139, APP-028
+        const t = load({jobs: [job("j1", {progress: {value: 0, max: 50}})]})
+        const r = row(t.panel, "j1")
+        wait(150)
+        const applied = r.progressApplied
+        t.core.emit("job:j1", "event", {kind: "progress", value: 7, max: 50})
+        compare(r.progressValue, 7, "shown at once")
+        wait(300)
+        compare(r.progressApplied - applied, 1, "one event, applied once")
+    }
 }
