@@ -43,7 +43,9 @@
   app; Ctrl+C and errors still clean up explicitly, and closing the job's handle at the end ends
   whatever is left of them. Each of them is created suspended, put in the job, and only then
   resumed, so its own children are in the job from their start too. The script's own pwsh is not
-  in the job.
+  in the job. One exception: a packaged (MSIX) program's out-of-package children start outside
+  every job (see Start-ProcessInJob), so with -BenchCommand pwsh, where pwsh is the Store build,
+  ctest and the bench it starts are outside the job (below).
 
   -SamplersOnly -ProcessId <pid> runs just the two samplers against another process for
   -SamplerSeconds and reports their coverage (no ComfyUI, no app); it checks the sampling.
@@ -56,9 +58,13 @@
   results/s06-bench.json. The spike's deploy folder isn't needed. <program> is a path or a name
   on PATH: it is resolved with Get-Command before anything starts, and the script stops at once
   if it isn't found (the job starts a full path only). An offscreen bench uses Qt Quick's software
-  renderer, so the load reaches it only as CPU contention, not as a GPU stall. For bench_gui_stalls:
+  renderer, so the load reaches it only as CPU contention, not as a GPU stall. When <program> is
+  the Store (MSIX) pwsh, its children (ctest, then the bench) start outside the kill-on-close job:
+  closing this console doesn't end them; the timeout, Ctrl+C and an error still do (the script
+  kills the command's process with its tree). For bench_gui_stalls, from a pwsh prompt (the call operator: under
+  `pwsh -File`, a comma list binds as one string, and the run fails):
     $env:LIL_BENCH_MEASURE_S = 60
-    pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1 -BenchCommand pwsh, -NoProfile, -File,
+    & <repo>\spikes\app-shell\comfy-load.ps1 -BenchCommand pwsh, -NoProfile, -File,
       <repo>\tools\dev-shell.ps1, ctest, --test-dir, <repo>\build\dev, -R, '^bench_gui_stalls$', -V
 
 .EXAMPLE
@@ -167,7 +173,7 @@ if (Test-Comfy) { throw "something already answers on $Url; this script only mea
 if (-not (Test-Path $ComfyPython) -or -not (Test-Path $ComfyMain)) { throw "ComfyUI not found at $ComfyMain" }
 
 $res = [ordered]@{ check = 'S0.6'; started = (Get-Date).ToString('o'); rate_hz = $RateHz; charts_batched = [bool]$ChartsBatched; runs = $Runs }
-$comfy = $null; $load = $null; $app = $null; $gpuProc = $null; $vramProc = $null; $handsOffDone = $null
+$comfy = $null; $load = $null; $app = $null; $bench = $null; $gpuProc = $null; $vramProc = $null; $handsOffDone = $null
 try {
     # Checked again right before the start (run-owner.ps1 checked minutes ago): no ComfyUI or spike
     # process by path. An elevated ComfyUI on another port can't be seen this way (Windows hides
@@ -343,6 +349,8 @@ try {
     if ($handsOffDone) { Set-Content -Path $handsOffDone -Value 'done' -ErrorAction SilentlyContinue }   # the notice says the PC is free
     if ($stopFile -and -not (Test-Path $stopFile)) { Set-Content -Path $stopFile -Value 'stop' -ErrorAction SilentlyContinue }
     if ($app -and -not $app.HasExited) { try { $app.Kill($true) } catch {} }
+    # -BenchCommand's process with its tree: a Store pwsh's children are outside the job.
+    if ($bench -and -not $bench.HasExited) { try { $bench.Kill($true) } catch {} }
     if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue }
     if ($vramProc -and -not $vramProc.HasExited) { try { $vramProc.Kill() } catch {} }
     # .NET's tree kill takes a child only if it started after its parent, so a reused parent pid
