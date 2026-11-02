@@ -1692,7 +1692,8 @@ TestCase {
     }
 
     // A clock set back (the time of day stepped back by a minute) never holds progress back: a
-    // negative time since counts as long ago, and the gate never waits more than 100 ms.
+    // negative time since counts as long ago, so it shows at once. An event 10 ms after that one is
+    // held, and the gate shows it within half a second (its wait is 90 ms here, never the minute).
     function test_progress_after_the_clock_steps_back_shows_at_once() { // spec: APP-139, APP-114
         const t = load({jobs: [job("j1", {progress: {value: 0, max: 50}})]})
         const r = row(t.panel, "j1")
@@ -1702,7 +1703,7 @@ TestCase {
         r.offerProgress({value: 2, max: 50}, at - 60000)
         compare(r.progressValue, 2, "shown at once a minute back")
         r.offerProgress({value: 3, max: 50}, at - 59990)
-        verify(r.progressValue === 3 || r.progressValue === 2, String(r.progressValue))
-        tryCompare(r, "progressValue", 3, 500, "a held one waits at most 100 ms")
+        compare(r.progressValue, 2, "held: 10 ms after the last one shown")
+        tryCompare(r, "progressValue", 3, 500, "the gate shows the held one within 500 ms")
     }
 }

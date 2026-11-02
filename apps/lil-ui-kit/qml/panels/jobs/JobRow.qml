@@ -169,7 +169,7 @@ Rectangle {
         }
     }
 
-    // --- Live progress, at most 10 times a second. ---
+    // --- Live progress, about 10 times a second. ---
     // A burst faster than that is held back to the newest, shown 100 ms after the last one shown. An
     // event that comes 100 ms or more after the one before it is shown at once: the core already sends
     // at most 10 a second, and holding those back by a Timer, which fires late, kept each one waiting
