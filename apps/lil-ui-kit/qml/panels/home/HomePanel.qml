@@ -87,8 +87,8 @@ Rectangle {
     readonly property bool hasWorkspace: workspaceId !== ""
     // The session is up and has no workspace at all (APP-016).
     readonly property bool noWorkspace: connected && !hasWorkspace
-    // On screen, as far as Qt can tell: a window under another program or on a locked screen is too,
-    // which is why the time also asks for the active window.
+    // On screen, as far as Qt can tell: a window under another program is too, which is why the time
+    // also asks for the active window. A locked screen is meant to count as not active; untested.
     readonly property bool onScreen: visible && width > 0 && height > 0 && Window.visibility !== Window.Hidden
                                      && Window.visibility !== Window.Minimized
     // The card has a time to count from.

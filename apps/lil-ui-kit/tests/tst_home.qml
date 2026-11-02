@@ -1793,7 +1793,7 @@ TestCase {
         const panel = makeHome(core, dir)
         const host = panel.Window.window
         const s = awayScene()
-        // Covered by another program, or a locked screen: it shows, and nobody is looking.
+        // Covered by another program: it shows, and nobody is looking.
         const other = otherProgram()
         activate(other)
         tryVerify(() => !host.active, 3000)
