@@ -10,27 +10,34 @@
      the deployed lil-image on it, driven through UI Automation. Its core's desktop is FakeDesktop,
      which test.desktop sets, so what the core says is the test's; what Set up writes is real, under
      the test channel's own registry root and the temporary root's Programs folder, which the shell
-     never reads. It checks, on disk, in the registry or through UIA:
+     never reads. A channel already taken (a core on it, or its registry root left by a crashed run)
+     is refused: nothing is started, and neither is touched. Buttons and switches are pressed through
+     UI Automation's Invoke or Toggle, Qt's accessible press and not mouse or key input; only the
+     panel keys (Ctrl+, and Ctrl+4) are real input. It checks, on disk, in the registry or through UIA:
        (a) the first start: the card offers Set up and Not now; state.json is on disk; Not now puts it
            away, and the next start doesn't show it;
-       (b) state.json removed, so a first start again: a real press of the card's Set up writes the
-           shortcut, exactly to the deployed lil-image.exe with the channel's AUMID and CLSID, and the
-           own scheme's command, exactly `"<lil-image.exe>" "%1"`. No `.lilref` key, under the test
-           channel's classes root or the real one, and nothing under the real classes root at all;
+       (b) state.json removed, so a first start again: the card's Set up, pressed through Invoke, writes
+           the shortcut, exactly to the deployed lil-image.exe with the channel's AUMID and CLSID, and
+           the own scheme's command, exactly `"<lil-image.exe>" "%1"`, and no `.lilref` under the test
+           channel's classes root. Under the real classes root, read only, before and after: `.lilref`'s
+           value, the real channels' schemes, their AUMID registrations and the CLSIDs those name are
+           unchanged, and neither the test channel's scheme, AUMID nor CLSID is there;
        (c) the core then told it is set up: Settings says nothing stands in the way and has no Set up;
-       (d) a real press of a switch in Settings reaches the core and suite.toml;
-       (e) Windows' reason: "Open Windows notification settings" opens Windows' Settings. Only when
-           no Settings process is running, so the one it starts is the one this check closes; if one
-           is, this part counts as NOT CHECKED, neither a pass nor a failure.
+       (d) a switch in Settings, pressed through Toggle or Invoke, reaches the core and suite.toml;
+       (e) Windows' reason: "Open Windows notification settings", pressed through Invoke, opens Windows'
+           Settings. Only when no Settings process is running, so the one it starts is the one this
+           check closes; if one is, this part counts as NOT CHECKED, neither a pass nor a failure.
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first. The tree holds
   no names from a dialog's file list, navigation pane, address bar or breadcrumb. Real keys go only
   while the app's window is in front; otherwise the check fails and sends nothing.
-  3. lil-image is closed, the test core stopped (only the PIDs recorded here), the test channel's
-     registry keys, temporary root and Qt cache folder (%LOCALAPPDATA%\LILITH-test-settingscheck)
-     removed, and the pop-up told it is done. Anything left behind fails the run. Exit 0 only when
-     every check passed and the cleanup was complete.
-  -DryRun does step 2's channel set-up and the guards' self-test only, with no pop-up, no window and
-  no input.
+  3. lil-image is closed, the test core stopped (only the PIDs recorded here), and what the run wrote
+     removed: the test channel's registry root (all that Set up writes is under it), temporary root
+     and Qt cache folder (%LOCALAPPDATA%\LILITH-test-settingscheck). A key of the channel's name
+     outside its root is a failure of the check, removed only if it wasn't there when the run began.
+     The pop-up is told it is done. Anything left behind fails the run. Exit 0 only when every check
+     passed and the cleanup was complete.
+  -DryRun does step 2's channel set-up, the real registrations' read and the guards' self-test only,
+  with no pop-up, no window and no input.
 #>
 param(
     # The repository whose build/dev/deploy is checked: by default this script's own.
@@ -58,15 +65,56 @@ $capitalised = $channel.Substring(0, 1).ToUpperInvariant() + $channel.Substring(
 $root = Join-Path ([IO.Path]::GetTempPath()) ("lil-settingscheck-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $classes = "HKCU:\Software\LILITH-$channel\Classes"
 $realClasses = 'HKCU:\Software\Classes'
+# Keys of the channel's name outside its registry root: nothing should make them.
+$strayKeys = "$realClasses\$scheme", "$realClasses\AppUserModelId\LILITH.Suite.$capitalised",
+             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\LILITH.Suite.$capitalised"
 # Every core PID seen on this test channel: the only core processes this script may stop.
 $corePids = [System.Collections.Generic.HashSet[int]]::new()
+$script:channelTaken = $false
+$script:strayAtStart = @()
 function Enter-TestChannel {
     # First, before anything that can throw: every `lil` from here on is on the test channel.
     $env:LIL_CHANNEL = $channel
     $env:LIL_TEST_ROOT = $root
     New-Item -ItemType Directory $root | Out-Null
     foreach ($s in 'roaming', 'local', 'profile') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
+    # The pipe's name comes from the channel alone, so a core left by a crashed run would serve this
+    # run from its old root; and its registry root would pass for what this run wrote.
+    $o = & $lil --no-start status 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $script:channelTaken = $true
+        throw "a core already runs on $channel. It isn't this run's, so nothing was started and it wasn't stopped: run ``lil core stop`` with LIL_CHANNEL=$channel and LIL_TEST_ROOT set, or end it, then run this again"
+    }
+    if (Test-Path "HKCU:\Software\LILITH-$channel") {
+        $script:channelTaken = $true
+        throw "HKCU:\Software\LILITH-$channel is there already, so it isn't this run's and it wasn't touched: a crashed run left it. Remove it, then run this again"
+    }
+    $script:strayAtStart = @($strayKeys | Where-Object { Test-Path $_ })
     Set-Location -LiteralPath $root
+}
+# What the real channels have registered, read only. `name = value` lines, so a run can compare before
+# and after; printed by name alone, since a value holds a path.
+function Get-RealRegistrations {
+    $default = { param($key) try { (Get-ItemProperty -LiteralPath $key -ErrorAction Stop).'(default)' } catch { $null } }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add(".lilref = $(& $default "$realClasses\.lilref")")
+    foreach ($s in 'lil', 'lil-dev') { $lines.Add("$s = $(& $default "$realClasses\$s\shell\open\command")") }
+    foreach ($type in 'stable', 'dev') {
+        $lines.Add("LILITH.lilref.$type = $(& $default "$realClasses\LILITH.lilref.$type\shell\open\command")")
+    }
+    foreach ($aumid in @(Get-ChildItem -LiteralPath "$realClasses\AppUserModelId" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.PSChildName -like 'LILITH.Suite.*' } | Sort-Object PSChildName)) {
+        $p = Get-ItemProperty -LiteralPath $aumid.PSPath
+        $lines.Add("$($aumid.PSChildName) = $($p.DisplayName) | $($p.CustomActivator)")
+        if ($p.CustomActivator) {
+            $lines.Add("CLSID $($p.CustomActivator) = $(& $default "$realClasses\CLSID\$($p.CustomActivator)\LocalServer32")")
+        }
+    }
+    return @($lines)
+}
+function Compare-RealRegistrations([string[]]$before, [string[]]$after) {
+    $changed = @(Compare-Object $before $after | ForEach-Object { ($_.InputObject -split ' = ', 2)[0] } | Sort-Object -Unique)
+    Check ($changed.Count -eq 0) "(b) the real registrations are as they were, $($before.Count) read before and after$(if ($changed.Count) { ': changed: ' + ($changed -join ', ') })"
 }
 function Invoke-Lil([string[]]$a) {
     $o = & $lil @a 2>&1
@@ -78,7 +126,7 @@ function Get-CorePid {
     $o = & $lil --no-start status 2>&1
     if ($LASTEXITCODE -ne 0) { return 0 }
     $m = [regex]::Match(($o -join "`n"), 'pid (\d+), channel (\S+?)\)')
-    if (-not $m.Success -or $m.Groups[2].Value -notlike '*settingscheck*') { return 0 }
+    if (-not $m.Success -or $m.Groups[2].Value -cne $channel) { return 0 }
     $id = [int]$m.Groups[1].Value
     [void]$corePids.Add($id)
     return $id
@@ -96,17 +144,31 @@ function Stop-RecordedCores {
 function Exit-TestChannel {
     # Never off the test channel: `lil core stop` would reach the channel this shell defaults to.
     if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
+    if ($script:channelTaken) {
+        Write-Host 'the test channel is not this run''s: its core, its keys and its cache stay'
+        try { Set-Location -LiteralPath $Repo } catch { }
+        Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
+        for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $root); ++$i) {
+            try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
+        }
+        return
+    }
     try { [void](Get-CorePid) } catch { }
     try { [void](& $lil core stop 2>&1) } catch { }
     Start-Sleep -Milliseconds 500
     try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     try { Set-Location -LiteralPath $Repo } catch { }
     Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
-    # Each exactly the test channel's: its registry root (what Set up wrote is under that), the name
-    # it would have under the real classes root (a failure of the check above, if it is there), and
-    # Windows' notification settings entry, which a toast would make.
-    $keys = "HKCU:\Software\LILITH-$channel", "$realClasses\$scheme",
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\LILITH.Suite.$capitalised"
+    # What this run wrote: its registry root, with all that Set up wrote under it. A key of the
+    # channel's name elsewhere is this run's only if it wasn't there when the run began, and then it
+    # is a failure as well: FakeDesktop posts no toast, and Set up writes under the root.
+    $keys = @("HKCU:\Software\LILITH-$channel")
+    foreach ($k in $strayKeys) {
+        if ((Test-Path $k) -and $script:strayAtStart -notcontains $k) {
+            Fail "cleanup: $k was written by this run, outside the channel's root"
+            $keys += $k
+        }
+    }
     foreach ($k in $keys) {
         if (Test-Path $k) {
             Write-Host "removing the test channel's $k"
@@ -186,6 +248,8 @@ if ($DryRun) {
         [void](Invoke-Lil @('status'))
         $id = Get-CorePid
         Check ($id -gt 0) "dry run: the test core runs, pid $id"
+        $real = Get-RealRegistrations
+        Check ($real.Count -ge 5) "dry run: the real registrations read, $($real.Count) lines, read only"
         Set-FakeDesktop '{"handlers":false,"shortcut":false}'
         $d = Get-DesktopGet
         Check ($d.notification_path.handlers -eq 'missing' -and $d.notification_path.shortcut -eq 'missing') 'dry run: test.desktop sets what the core says'
@@ -346,12 +410,12 @@ try {
     Check ($null -eq (Find-Named 'Not now')) '(a) the next start doesn''t show it'
     Close-App
 
-    # (b) A first start again, and a real Set up.
+    # (b) A first start again, and Set up, pressed through Invoke: what it writes is real.
     Remove-Item -LiteralPath $stateFile.FullName
     foreach ($f in Get-ChildItem -LiteralPath $stateFile.DirectoryName -Force -Filter 'state.json*') { Remove-Item -LiteralPath $f.FullName }
     Start-App
     $setUp = Wait-Enabled 'Set up' 20
-    $beforeReal = @(Get-ChildItem -LiteralPath $realClasses -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "*$channel*" })
+    $realBefore = Get-RealRegistrations
     Invoke-Element $setUp
     $said = Wait-For { Find-NameStarting 'The Start-menu shortcut and this LILITH' } 20 'the card to say what it wrote'
     Pass "(b) the card says: $($said.Current.Name)"
@@ -367,8 +431,12 @@ try {
     Check ($clsids.Count -eq 1) '(b) the CLSID is registered'
     Check (-not (Test-Path -LiteralPath "$classes\.lilref")) '(b) no .lilref association'
     Check (@(Get-ChildItem -LiteralPath $classes -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'LILITH.lilref.*' }).Count -eq 0) '(b) no .lilref file type'
-    $afterReal = @(Get-ChildItem -LiteralPath $realClasses -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "*$channel*" })
-    Check ($beforeReal.Count -eq 0 -and $afterReal.Count -eq 0) '(b) nothing under the real classes root'
+    Compare-RealRegistrations $realBefore (Get-RealRegistrations)
+    Check (-not (Test-Path -LiteralPath "$realClasses\$scheme")) '(b) the test channel''s scheme isn''t under the real classes root'
+    Check (-not (Test-Path -LiteralPath "$realClasses\AppUserModelId\LILITH.Suite.$capitalised")) '(b) nor its AUMID'
+    if ($clsids.Count -eq 1) {
+        Check (-not (Test-Path -LiteralPath "$realClasses\CLSID\$($clsids[0].PSChildName)")) '(b) nor its CLSID'
+    }
 
     # (c) The core told so: Settings has no Set up.
     Invoke-Element (Wait-Enabled 'Not now' 5)
@@ -378,12 +446,12 @@ try {
     Pass '(c) Settings says nothing stands in the way'
     Check ($null -eq (Find-Named 'Set up')) '(c) and has no Set up'
 
-    # (d) A switch.
+    # (d) A switch, pressed through Toggle or Invoke.
     $switch = Wait-Enabled 'Job failed' 15
     $was = Is-Toggled $switch
     Invoke-Element $switch
     $core = Wait-For { $d = Get-DesktopGet; if ($d.notifications.job_failed -eq $false) { $d } } 10 'the core to say Job failed is off'
-    Pass '(d) a press on Job failed reached the core'
+    Pass '(d) Job failed, pressed through UI Automation, reached the core'
     $toml = Get-SuiteToml
     Check ($toml -and ((Get-Content -Raw -LiteralPath $toml.FullName) -match 'job_failed\s*=\s*false')) '(d) and suite.toml'
     $now = Wait-For { $s = Find-Named 'Job failed'; if ($s -and (Is-Toggled $s) -ne $was) { $s } } 10 'the switch to show the answer'
@@ -402,7 +470,7 @@ try {
         Invoke-Element $link
         try {
             $opened = Wait-For { Get-Process -Name SystemSettings -ErrorAction SilentlyContinue | Select-Object -First 1 } 15 'Windows'' Settings'
-            Pass "(e) the link opened Windows' Settings"
+            Pass "(e) the button, pressed through Invoke, opened Windows' Settings"
             Stop-Process -Id $opened.Id -Force
         } catch { Fail "(e) $_" }
     }
