@@ -3,7 +3,8 @@
 //! app and per machine, never in the core.
 //!
 //! A file that doesn't parse is set aside as `state.json.bad-<YYYYMMDDTHHMMSSZ>` and the app
-//! starts with no state; writes go through `replace_file` (P4a-R16).
+//! starts with no state; writes go through `replace_file` (P4a-R16), but for the first start's
+//! record, which is made only if there is no file and never replaces one.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write as _};
