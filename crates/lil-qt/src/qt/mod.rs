@@ -41,7 +41,7 @@ pub mod ffi {
         /// the app's log: a Qt message with its `qt_category`.
         fn log_line(line: &str);
 
-        /// The event loop has ended: waits for the exports under way, at most
+        /// The event loop has ended: waits for the exports and the setup under way, at most
         /// `csv::CLOSE_WAIT`, then tells them to stop (`csv::Writes::wait`), and logs what became
         /// of them. No panel's destruction can do this: the shell's docks outlive the event loop.
         fn wait_for_exports();
@@ -146,15 +146,17 @@ fn wait_for_exports() {
     if ended.stopped {
         tracing::warn!(
             still_running = ended.running,
-            "closing told an export that took too long to stop: one still writing leaves the \
-             file you picked as it was, and one past its last chunk replaces it"
+            "closing told a write that took too long to stop: an export still writing leaves the \
+             file you picked as it was and one past its last chunk replaces it, and a notification \
+             setup goes on to the end of the step it is in"
         );
     }
     if ended.running > 0 {
         tracing::error!(
             still_running = ended.running,
-            "an export didn't stop as the app closed: a .lil-tmp file may stay beside the file \
-             you picked"
+            "a write didn't stop as the app closed: an export may leave a .lil-tmp file beside the \
+             file you picked, and a notification setup may be left part-way, which Set up or lil \
+             doctor writes again"
         );
     }
 }
