@@ -302,11 +302,17 @@ if ($DryRun) {
         Check (Test-Path -LiteralPath (Join-Path $root "local\LILITH-$channel")) 'dry run: the local data folder is where the kept time goes'
         Set-Kept $wsId '2026-01-01T00:00:00Z'
         Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads back'
-        # The read shares deletion: a holder that wants to delete or replace the file, as the app's swap
-        # does, goes on beside it.
+        # The read shares deletion: while the file is open as Read-Shared opens it, it can be renamed away
+        # and back, as the app's swap (ReplaceFileW) needs. Get-Content's open, which shares no deletion,
+        # makes the rename fail: that half shows the check can tell them apart.
+        $moved = "$stateFile.renamed"
+        $renames = { param($stream) try { [IO.File]::Move($stateFile, $moved); [IO.File]::Move($moved, $stateFile); $true } catch { $false } finally { $stream.Dispose() } }
         $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-        $swap = [IO.FileStream]::new($stateFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-        try { Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads beside a holder that shares deletion' } finally { $swap.Dispose() }
+        $asRead = & $renames ([IO.FileStream]::new($stateFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share))
+        $asGetContent = & $renames ([IO.FileStream]::new($stateFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite))
+        if (Test-Path -LiteralPath $moved) { [IO.File]::Move($moved, $stateFile) }
+        Check ($asRead -and -not $asGetContent) "dry run: the file renames away and back while held as Read-Shared holds it, and not as Get-Content does ($asRead, $asGetContent)"
+        Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads back after the renames'
         Check (Test-Path -LiteralPath $image) "dry run: $image is deployed"
     } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
     Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
