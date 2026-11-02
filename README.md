@@ -23,6 +23,20 @@ cargo deny check                     # needs cargo-deny
 cargo run -q -p lil-cli -- dev spec-report
 ```
 
+## Build and run the app
+
+The Image app (`lil-image`) also needs Visual Studio or its Build Tools with the MSVC 14.44 x64 toolset, CMake 3.24 or later, Ninja, and Qt 6.12.0 with Qt WebEngine 6.140.0 for MSVC 2022 x64, in `C:\Qt\6.12.0\msvc2022_64` or the folder `LIL_QT_DIR` names. Run every CMake and CTest command through `tools/dev-shell.ps1`: it finds Visual Studio with vswhere, pins the MSVC 14.44 toolset (and stops if `cl` isn't 19.44) and puts the Qt folder first on `PATH`.
+
+```powershell
+pwsh -NoProfile -File tools/dev-shell.ps1 cmake --preset dev
+pwsh -NoProfile -File tools/dev-shell.ps1 cmake --build --preset dev   # the app, the tests and the deploy folder
+pwsh -NoProfile -File tools/dev-shell.ps1 ctest --preset qml           # the Qt Quick tests, offscreen
+```
+
+The `dev` build preset also builds the `deploy` target: `build\dev\deploy` holds `lil-image.exe` with the Qt files it needs, the core (`lil-core.exe`), `lil.exe` and `lil-mcp.exe`, and runs without Qt or Visual Studio on `PATH`. Start `build\dev\deploy\lil-image.exe`; it starts the core when none is running. The first CMake build takes a while (about 25 minutes).
+
+Notifications need a Start-menu shortcut and a link handler. The app offers to set them up on its first start; after that, use **Set up** in the Settings panel, or run `lil doctor`, which offers the same.
+
 ## Merging into main
 
 Changes reach `main` only through pull requests merged with `lil dev merge <PR>`, which checks CI, the protected-file approvals and the pinned head commit first. The merge guard is described in the spec (§6.2); the maintainer's guide, with the one-time setup and everyday use, is [docs/dev/merge-guard.md](docs/dev/merge-guard.md).
