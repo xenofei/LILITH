@@ -28,9 +28,10 @@ TestCase {
             property bool appMissing: false
             property string appPath
             property int runs: 0
+            property bool refuses: false
             signal finished(string reportJson)
             function run() {
-                if (busy)
+                if (busy || refuses)
                     return false
                 runs++
                 busy = true
@@ -385,6 +386,20 @@ TestCase {
         answerRead(core, {toasts: "ready", shortcut: "ok", handlers: "missing"})
         tryVerify(() => card.text.indexOf("couldn't say") < 0, 5000, card.text)
         verify(card.visible)
+    }
+
+    function test_set_up_that_cant_start_is_said() { // spec: APP-156
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc, {refuses: true})
+        const shell = makeShell(core, TestFiles.newDir("nostart"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, missing)
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        const said = []
+        card.announced.connect(t => said.push(t))
+        card.setUpButton.click()
+        compare(said, ["Set up didn't start. Run lil doctor instead."])
+        compare(card.text, "Set up didn't start. Run lil doctor instead.")
     }
 
     function test_a_later_start_takes_nothing_from_a_settings_run() { // spec: APP-022

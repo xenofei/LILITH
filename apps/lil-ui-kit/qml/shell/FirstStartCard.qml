@@ -86,8 +86,10 @@ LBanner {
                 root._problem = ""
                 if (root.setup.run())
                     root._pressed = true
-                else if (!root.setup.busy)
+                else if (!root.setup.busy) {
                     root._problem = "Set up didn't start. Run lil doctor instead."
+                    root.announce()
+                }
             }
         },
         LButton {

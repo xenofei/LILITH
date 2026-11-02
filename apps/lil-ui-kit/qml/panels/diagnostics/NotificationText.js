@@ -118,7 +118,7 @@ const categories = [
     {key: "confirmation_waiting", label: "Confirmation waiting"},
     {key: "cap_alert", label: "Spending alerts"},
     {key: "director_decision", label: "Director-task decisions", held: true,
-     note: "Director tasks arrive in a later version of LILITH."},
+     note: "Director tasks arrive in a later version of LILITH, so this isn't used yet."},
     {key: "agent_activity", label: "Claude Code and agent activity"}
 ]
 

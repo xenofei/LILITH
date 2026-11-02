@@ -24,7 +24,7 @@ LCard {
 
     signal setUpPressed()
     signal checkAgain()
-    // Set up had the keyboard and has gone, its work done: the panel takes the keyboard.
+    // Set up had the keyboard, and going left it with nothing: the panel takes the keyboard.
     signal focusLeft()
 
     property bool _hadFocus: false
@@ -34,6 +34,17 @@ LCard {
     readonly property alias setUpButton: setUpButton
     readonly property alias windowsButton: windowsButton
     readonly property alias checkButton: checkButton
+
+    // A run has ended, its report applied. Only if the button it was pressed on has gone and the
+    // keyboard is nowhere of use, still on that hidden button or fallen to the window's root as LBanner
+    // tells it, is there anything to pick up: else it has moved on, and stays there.
+    function runEnded() {
+        const focused = Window.window ? Window.window.activeFocusItem : null
+        if (_hadFocus && !setUpButton.visible
+                && (focused === setUpButton || String(focused).startsWith("QQuickRootItem")))
+            focusLeft()
+        _hadFocus = false
+    }
 
     title: "Notifications on this PC"
 
@@ -93,14 +104,8 @@ LCard {
                 // Stays enabled while it runs, so the keyboard stays here: the bridge runs one at a time.
                 text: root.setup.busy ? "Setting up…" : "Set up"
                 onClicked: {
-                    root._hadFocus = activeFocus
                     root.setUpPressed()
-                }
-                onVisibleChanged: {
-                    if (!visible && root._hadFocus) {
-                        root._hadFocus = false
-                        root.focusLeft()
-                    }
+                    root._hadFocus = activeFocus && root.setup.busy
                 }
             }
 

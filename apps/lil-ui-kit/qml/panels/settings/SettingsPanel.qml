@@ -51,9 +51,10 @@ Rectangle {
     // What the last setup did, or null.
     property var report: null
     property string setupProblem
-    // Whether something on the path card needs you: it goes first. Told from the last reading, old or
-    // not, so the cards don't jump about while the core is away.
-    readonly property bool pathFirst: NotificationText.problems(path).length > 0
+    // Whether the path card has something for you: what needs you, or what the last setup did, whose
+    // words mustn't go out of sight as the button goes. It goes first. Told from the last reading, old
+    // or not, so the cards don't jump about while the core is away.
+    readonly property bool pathFirst: NotificationText.problems(path).length > 0 || report !== null
 
     // It was said, as a screen reader hears it.
     signal announced(string text)
@@ -205,7 +206,8 @@ Rectangle {
             _lostAnswer = true
             _lossBanner = true
             _closeOnRead = !core || core.connection !== "ready"
-            panelBanner.show("\"" + shownLabel + "\" may not have changed: " + Words.errorText(core, error)
+            const why = Words.errorText(core, error)
+            panelBanner.show("\"" + shownLabel + "\" may not have changed: " + why + (/[.!?]$/.test(why) ? "" : ".")
                              + " The switch shows what the core last said, until it can be read again.")
             readIfOwed()
         } else {
@@ -231,7 +233,13 @@ Rectangle {
         } else if (!setup.busy) {
             setupProblem = "Set up didn't start. Run lil doctor instead."
             _reportSeen = shown
+            say(setupProblem)
         }
+    }
+
+    function say(text) {
+        Accessible.announce(text)
+        announced(text)
     }
 
 
@@ -293,9 +301,7 @@ Rectangle {
             root.report = report
             root._reportSeen = root.shown
             if (root._pressed) {
-                const said = NotificationText.setupOutcome(report, (t, max) => Words.shown(root.core, t, max))
-                root.Accessible.announce(said)
-                root.announced(said)
+                root.say(NotificationText.setupOutcome(report, (t, max) => Words.shown(root.core, t, max)))
             }
             root._pressed = false
             if (report.notification_path) {
@@ -304,6 +310,7 @@ Rectangle {
             }
             if (!report.notification_path || root.desktopRead.error)
                 root.desktopRead.request()
+            pathCard.runEnded()
         }
     }
 

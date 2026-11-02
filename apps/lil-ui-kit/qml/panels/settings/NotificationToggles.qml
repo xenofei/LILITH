@@ -39,11 +39,11 @@ LCard {
                 // A key this build doesn't know comes from the core: shown as text.
                 text: modelData.label === modelData.key ? Words.shown(root.core, modelData.key, 80) : modelData.label
                 note: modelData.note || ""
-                // A held category shows off: nothing of it is on until it can be used.
-                value: !modelData.held && !!root.settings && !!root.settings.notifications
+                value: !!root.settings && !!root.settings.notifications
                        && root.settings.notifications[modelData.key] === true
                 busy: root.setsOut[settingId] === true
-                live: root.live && !modelData.held
+                live: root.live
+                held: !!modelData.held
                 onFlipped: on => root.flip(settingId, on, modelData.label)
             }
         }

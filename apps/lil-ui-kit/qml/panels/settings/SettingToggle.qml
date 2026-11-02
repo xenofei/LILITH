@@ -3,7 +3,7 @@
 // core says so. While `busy` (a set of this one is out) it says so and a flip does nothing, and so
 // does a flip within the double-click interval of the last one sent, since the core's answer can come
 // before a double-click's second click: a double-click sends one set either way. `live` false holds it:
-// the core is away, or the value may be old.
+// the core is away, or the value may be old. `held`: nothing of it is in use yet, so it is muted too.
 import QtQuick
 import Lilith.UiKit
 
@@ -14,6 +14,7 @@ Column {
     property bool value
     property bool busy: false
     property bool live: true
+    property bool held: false
     // A line under it, also its accessible description; "" for none.
     property string note
 
@@ -32,7 +33,8 @@ Column {
         LToggle {
             id: toggle
             requiresCore: true
-            enabled: root.live
+            enabled: root.live && !root.held
+            opacity: root.held ? 0.5 : 1
             checked: root.value
             Accessible.description: root.note
             onToggled: {
@@ -40,7 +42,8 @@ Column {
                 // A press leaves the binding in place but the switch moved: back to the core's word.
                 checked = Qt.binding(() => root.value)
                 const now = Date.now()
-                if (root.busy || now - root._lastSent < Qt.styleHints.mouseDoubleClickInterval)
+                // Math.abs: a clock stepped back mustn't stop a switch.
+                if (root.busy || Math.abs(now - root._lastSent) < Qt.styleHints.mouseDoubleClickInterval)
                     return
                 root._lastSent = now
                 root.flipped(on)

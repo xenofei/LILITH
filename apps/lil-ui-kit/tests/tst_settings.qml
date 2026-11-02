@@ -207,7 +207,7 @@ TestCase {
         for (const label of sixLabels) {
             const toggle = toggleNamed(panel, label)
             verify(toggle && reallyVisible(toggle), label)
-            compare(toggle.checked, label !== "Spending alerts" && label !== "Director-task decisions", label)
+            compare(toggle.checked, label !== "Spending alerts", label)
         }
         compare(toggleNamed(panel, "Quiet while fullscreen").checked, true)
         compare(toggleNamed(panel, "Pause GPU work while a game or video is fullscreen").checked, false)
@@ -269,10 +269,12 @@ TestCase {
         const host = loaded(core)
         const toggle = toggleNamed(host.panel, "Director-task decisions")
         compare(toggle.enabled, false)
-        compare(toggle.checked, false, "the core has it on, but a held switch doesn't look it")
+        compare(toggle.checked, true, "the core's word, though it can't be changed yet")
+        verify(toggle.opacity < 1, "and it looks off the controls")
+        verify(toggle.Accessible.description.indexOf("isn't used yet") >= 0, toggle.Accessible.description)
         toggle.click()
         compare(sets(core), [])
-        verify(shows(host.panel, "Director tasks arrive in a later version of LILITH"))
+        verify(shows(host.panel, "Director tasks arrive in a later version of LILITH, so this isn't used yet."))
     }
 
     function test_keep_awake_toggle_hidden_when_unavailable() { // spec: ARCH-127
@@ -346,6 +348,7 @@ TestCase {
                 // It reads again, to be sure, and the message stays: the core never went away.
                 verify(panel.banner.text.indexOf("may not have changed") >= 0, panel.banner.text)
                 verify(panel.banner.text.indexOf("went away") < 0, panel.banner.text)
+                verify(panel.banner.text.indexOf("category. The switch") >= 0, panel.banner.text)
                 answer(core, isRead, readOk())
                 wait(50)
                 verify(panel.banner.visible, "still says why")
@@ -617,9 +620,17 @@ TestCase {
         verify(panel.desktopToggles.y >= panel.notifications.y + panel.notifications.height, "the rest below")
         compare(panel.scroller.nextItemInFocusChain(true), card.setUpButton, "the keyboard's order is the same")
         setup.finish(Shapes.setupReport())
+        tryVerify(() => !card.setUpButton.visible, 5000)
+        wait(50)
+        compare(card.y, 0, "a success's words stay in sight")
+        tryVerify(() => card.y + card.height <= panel.scroller.height || card.height > panel.scroller.height, 5000)
+        verify(shows(card, "are set up"), texts(card).join(" | "))
+        verify(panel.scroller.nextItemInFocusChain(true) !== card.setUpButton)
+        // Seen and left: back at the end.
+        hideAndShow(panel)
+        answer(core, isRead, readOk())
         tryVerify(() => card.y >= panel.desktopToggles.y + panel.desktopToggles.height, 5000, "back at the end")
         verify(panel.notifications.y === 0)
-        verify(panel.scroller.nextItemInFocusChain(true) !== card.setUpButton)
     }
 
     function test_the_switch_notes_are_their_descriptions() { // spec: APP-156
@@ -892,6 +903,83 @@ TestCase {
         setup.finish(Shapes.setupReport())
         tryVerify(() => !card.setUpButton.visible, 5000)
         tryVerify(() => panel.scroller.activeFocus, 5000, "the keyboard goes on to the list, not to nothing")
+    }
+
+    Component {
+        id: outsideComponent
+        Item {
+            width: 10
+            height: 10
+            focus: true
+            activeFocusOnTab: true
+        }
+    }
+
+    // The keyboard moved on while it ran: it stays where it went.
+    function test_set_up_takes_no_keyboard_from_where_it_went() { // spec: APP-156
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        host.requestActivate()
+        tryVerify(() => host.active, 5000)
+        tryVerify(() => card.setUpButton.enabled, 5000)
+        card.setUpButton.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        compare(setup.runs, 1)
+        const toggle = toggleNamed(panel, "Job failed")
+        toggle.forceActiveFocus()
+        tryVerify(() => toggle.activeFocus, 5000)
+        setup.finish(Shapes.setupReport())
+        tryVerify(() => !card.setUpButton.visible, 5000)
+        wait(50)
+        verify(toggle.activeFocus, "the switch keeps it")
+    }
+
+    // A run that failed leaves nothing behind for a later hide to act on.
+    function test_a_failed_run_takes_no_keyboard_later() { // spec: APP-156
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        const outside = createTemporaryObject(outsideComponent, host.contentItem)
+        host.requestActivate()
+        tryVerify(() => host.active, 5000)
+        tryVerify(() => card.setUpButton.enabled, 5000)
+        card.setUpButton.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        setup.finish(Shapes.setupReport({shortcut: {state: "failed", why: "Access is denied."}, scheme: {state: "ok"},
+                                         notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}))
+        wait(50)
+        verify(card.setUpButton.visible)
+        outside.forceActiveFocus()
+        tryVerify(() => outside.activeFocus, 5000)
+        panel.visible = false
+        wait(50)
+        verify(outside.activeFocus, "a field elsewhere keeps it")
+    }
+
+    function test_a_clock_stepped_back_doesnt_stop_a_switch() { // spec: APP-146
+        const core = makeCore()
+        const host = loaded(core)
+        const toggle = toggleNamed(host.panel, "Job failed")
+        // The switch's row: as if the last set went out before the clock moved back an hour.
+        toggle.parent.parent._lastSent = Date.now() + 3600000
+        toggle.click()
+        compare(sets(core).length, 1, "a press still sends")
+    }
+
+    function test_set_up_that_cant_start_is_said() { // spec: APP-156
+        const core = makeCore()
+        const setup = makeSetup({refuses: true})
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}), setup)
+        const said = []
+        host.panel.announced.connect(t => said.push(t))
+        tryVerify(() => host.panel.pathCard.setUpButton.enabled, 5000)
+        host.panel.pathCard.setUpButton.click()
+        compare(said, ["Set up didn't start. Run lil doctor instead."])
     }
 
     function test_set_up_s_outcome_is_announced() { // spec: APP-156
