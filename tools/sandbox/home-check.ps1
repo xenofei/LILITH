@@ -15,13 +15,20 @@
        (b) minimized for longer, with two more jobs finishing: the time stays. Restored: the card
            counts from the kept time, so it lists those two and not the first.
        (c) a floating Home: the same lines, the time not moved by the float; a job finishing while it
-           floats is listed there, and the time moves. Docked again: the same lines.
+           floats is listed there, and the time moves with the app in front (Qt calls a floating window
+           active while any of the app's windows has the focus). The main window minimized with Home
+           floating: Windows hides the floating window with its owner; the step prints what UI
+           Automation says of it, a job finishes, and the time stays, as no window of the app is
+           active, whatever Qt's visibility says. Docked again: the same lines.
        (d) Home behind a tab: a real drag of its title bar onto the drop indicator at the centre of
            the Jobs group puts it in the Jobs tabs, and the Jobs tab is chosen. A job finishes: the
            time stays. Home's tab chosen: the job is listed, and the time moves 3 s or more later. If
            the drag doesn't take, this fails by name and prints what it aimed at. The tab's effect on
            Home is QML's own whatever the platform, and tst_home's
            test_last_seen_waits_until_really_on_screen covers it offscreen.
+       (f) another program's window in front (a small window of this script's), with Home on screen
+           behind it: a job finishes, the line shows, and the time stays. The app back in front: the
+           time moves.
        (e) a real second launch, with Home closed: it hands over and exits 0, Home opens, and the
            Opened card shows the target; a refused link says so there.
   Each step that expects lines prints the count, each line as the app's UI tree names it, the kept
@@ -280,7 +287,7 @@ if ($DryRun) {
 $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-homecheck-{0}.state" -f $PID)
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
-               '-What', 'checks Home (windows that minimize and float, and a real drag)', '-WarnSec', '10', '-RunSec', '120',
+               '-What', 'checks Home (windows that minimize and float, and a real drag)', '-WarnSec', '10', '-RunSec', '150',
                '-CapSec', '600', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
@@ -294,7 +301,7 @@ while (-not (Test-Path -LiteralPath "$state.shown")) {
 Start-Sleep -Seconds 10
 
 # --- 2. The check --------------------------------------------------------------------------------
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 $AE = [System.Windows.Automation.AutomationElement]
 $TS = [System.Windows.Automation.TreeScope]
 $WP = [System.Windows.Automation.WindowPattern]
@@ -423,6 +430,35 @@ function Show-App {
         Start-Sleep -Seconds 1
     }
 }
+# A window of this script's, in front: what another program would be. It waits for the front as
+# Show-App does. Its messages are pumped only as far as it needs to stay a window.
+function Show-Cover {
+    $form = [System.Windows.Forms.Form]::new()
+    $form.Text = 'home-check: another program'
+    $form.Width = 320
+    $form.Height = 120
+    $form.ShowInTaskbar = $true
+    $form.Show()
+    $end = (Get-Date).AddSeconds(240)
+    while ($true) {
+        [System.Windows.Forms.Application]::DoEvents()
+        $form.Activate()
+        [void][LilHomeCheck.Win]::SetForegroundWindow($form.Handle)
+        Start-Sleep -Milliseconds 500
+        [System.Windows.Forms.Application]::DoEvents()
+        if ([LilHomeCheck.Win]::GetForegroundWindow() -eq $form.Handle) { return $form }
+        if ((Get-Date) -gt $end) { $form.Close(); throw 'the check''s own window didn''t get the front in 240 s' }
+    }
+}
+# What UI Automation says of a window of the app: only its state.
+function Write-WindowState([string]$step, $window) {
+    try {
+        $c = $window.Current
+        $p = $null
+        $visual = if ($window.TryGetCurrentPattern($WP::Pattern, [ref]$p)) { $p.Current.WindowVisualState } else { 'no WindowPattern' }
+        Write-Host "$step the floating window: state $visual, offscreen=$($c.IsOffscreen), at $($c.BoundingRectangle)"
+    } catch { Write-Host "$step the floating window can't be read: $_" }
+}
 # A real drag, with the window in front and under both ends. The cursor moves in steps, as the docking
 # code needs to see it move, and the end is gone over again: the drop indicators are made as it hovers,
 # and need a move over them. It says where the cursor really got to, as a scaled desktop would differ.
@@ -530,6 +566,8 @@ try {
     Check ((Get-Kept) -eq $seed) '(a) minimized for 6 s: the kept time stays'
     Set-WindowState ([System.Windows.Automation.WindowVisualState]::Normal)
     $restored = Get-Date
+    # The time moves only in the active window.
+    Show-App
     [void](Wait-For { Find-NameStarting 'Core connection: Connected' } 40 'the connection')
     Check-LinesThenTime '(a)' 1 @($first) $seed $restored
     Check ((@(Get-FinishedLines).Count) -eq 1) '(a) the line stays as the time moves'
@@ -543,6 +581,7 @@ try {
     Check ((Get-Kept) -eq $kept) '(b) minimized, with jobs finishing: the kept time stays'
     Set-WindowState ([System.Windows.Automation.WindowVisualState]::Normal)
     $restored = Get-Date
+    Show-App
     # The two since, not the first: the card now counts from the kept time.
     Check-LinesThenTime '(b)' 2 $jobB $kept $restored
 
@@ -555,14 +594,32 @@ try {
     $n = @(Get-FinishedLines).Count
     Check ($n -eq 2) "(c) a floating Home keeps its lines ($n)"
     Check ((Get-Kept) -eq $kept) '(c) the float doesn''t move the kept time'
+    # The main window minimized: Windows hides the floating window with its owner. Whatever Qt's
+    # visibility says, no window of the app is active, so the time stays. It is read before the job, so
+    # that a job can't be the reason.
+    $keptC = Get-Kept
+    Set-WindowState ([System.Windows.Automation.WindowVisualState]::Minimized)
+    Start-Sleep -Seconds 1
+    Write-WindowState '(c) main minimized:' $floating
     $jobC = Invoke-FinishedJob
-    # Floating, it counts as on screen: the job is listed there, and the time moves past it.
-    Check-LinesThenTime '(c)' 3 @($jobC) $kept $null
+    Start-Sleep -Seconds 5
+    Check ((Get-Kept) -eq $keptC) '(c) the main window minimized, Home floating, with a job finishing: the kept time stays'
+    Set-WindowState ([System.Windows.Automation.WindowVisualState]::Normal)
+    Show-App
+    Write-WindowState '(c) main restored:' $floating
+    # Floating, with the app in front: the job is listed there, and the time moves past it. How many
+    # lines says what Qt made of the owner's minimizing: 3 if the floating window stayed "visible" to
+    # it, so the card kept its time; 1 if it went hidden for 3 s or more, so the card moved to the kept
+    # time, as after any time away. Either is right; the job's line is the point.
+    $wantC = Wait-Count { @(Get-FinishedLines).Count } 3 8
+    if ($wantC -ne 3) { $wantC = 1 }
+    Write-Host "(c) with the main window minimized, Qt's visibility of the floating window $(if ($wantC -eq 3) { 'didn''t change (3 lines expected)' } else { 'went hidden (1 line expected)' })"
+    Check-LinesThenTime '(c)' $wantC @($jobC) $kept $null
     Invoke-Element (Wait-For { Find-Named 'Float Home' } 10 'Float Home, to dock it')
     [void](Wait-For { if (-not (Find-Window 'Home')) { $true } } 10 'Home to dock back')
     Start-Sleep -Seconds 1
     $n = @(Get-FinishedLines).Count
-    Check ($n -eq 3) "(c) docked again: the same lines ($n)"
+    Check ($n -eq $wantC) "(c) docked again: the same lines ($n)"
 
     # (d) Behind a tab: a real drag of Home's title bar onto the Jobs group's centre, where KDDockWidgets
     # puts the indicator that makes a tab (ClassicIndicatorsOverlay: the hovered group's centre). The
@@ -600,6 +657,31 @@ try {
         # 3 s after they showed.
         Check-LinesThenTime '(d)' 1 @($jobD) $kept $shown
     }
+
+    # (f) Another program in front, with Home on screen behind it. The main window, and Home in it if
+    # (d) took, or else its own window, stays open.
+    if (Find-TabItem 'Home') { Invoke-Element (Find-TabItem 'Home') }
+    Start-Sleep -Seconds 4
+    $kept = Get-Kept
+    $wantF = @(Get-FinishedLines).Count + 1
+    $cover = Show-Cover
+    try {
+        $jobF = Invoke-FinishedJob
+        $n = Wait-Count { [System.Windows.Forms.Application]::DoEvents(); @(Get-FinishedLines).Count } $wantF 15
+        Write-LinesReport '(f)' $n
+        Check ($n -eq $wantF) "(f) another program in front: the line still shows ($n)"
+        $until = (Get-Date).AddSeconds(5)
+        while ((Get-Date) -lt $until) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200 }
+        Check ((Get-Kept) -eq $kept) '(f) another program in front, with a job finishing: the kept time stays'
+    } finally {
+        $cover.Close()
+        $cover.Dispose()
+    }
+    Show-App
+    $took = Wait-KeptMoved $kept (Get-Date) 'the kept time to move'
+    Check ($took -ge 2.5) "(f) the app back in front: the time moves 3 s or more later ($took s)"
+    $still = @(Get-SinceIds (Get-Kept) | Where-Object { $_ -eq $jobF })
+    Check ($still.Count -eq 0) '(f) and past that job'
 
     # (e) A real second launch, with Home closed.
     Invoke-Element (Wait-For { Find-Named 'Close Home' } 10 'Close Home')
