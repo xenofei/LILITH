@@ -25,7 +25,8 @@
 //! - `isFirstStart(dir)`: whether this is the app's first start in `dir`, read only
 //!   ([`crate::app_state::is_first_start`]); false with no `dir`.
 //! - `recordFirstStart(dir)`: from now on it isn't ([`crate::app_state::record_first_start`]): never
-//!   replaces a file. A record that can't be written is logged, and the next start offers again.
+//!   replaces a file. A record that can't be created is logged, and the next start offers again; one
+//!   created but cut short leaves a `state.json`, so it counts as a start that has happened.
 
 use core::pin::Pin;
 use std::path::{Path, PathBuf};
