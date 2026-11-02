@@ -1232,7 +1232,7 @@ TestCase {
         panel.visible = true
         const call = answer(core, isTool("desktop.get"), ok(desktop()))
         compare(call.args.fresh, true)
-        tryVerify(() => shows(panel.notifications, "Nothing stands in the way"), 5000, texts(panel.notifications).join(" | "))
+        tryVerify(() => shows(panel.notifications, NotificationText.reachable), 5000, texts(panel.notifications).join(" | "))
         for (const name of ["models.report", "engines.environment", "engines.status", "diagnostics.recent", "telemetry.snapshot"])
             answer(core, isTool(name), ok(name === "models.report" ? report() : name === "engines.environment" ? {captures: [], changes: []}
                                           : name === "engines.status" ? {engines: [comfy()]} : name === "diagnostics.recent" ? {errors: []} : snapshot()))
@@ -1394,7 +1394,7 @@ TestCase {
         setup.finished("{}")
         tryVerify(() => callsOf(core, "desktop.get").length === reads + 1, 5000, "it reads again")
         answer(core, isTool("desktop.get"), ok(desktop()))
-        tryVerify(() => shows(panel.notifications, "Nothing stands in the way"), 5000)
+        tryVerify(() => shows(panel.notifications, NotificationText.reachable), 5000)
     }
 
     function test_float_and_redock_keeps_diagnostics_state() { // spec: ARCH-116

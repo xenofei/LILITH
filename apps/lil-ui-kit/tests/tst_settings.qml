@@ -982,6 +982,74 @@ TestCase {
         compare(said, ["Set up didn't start. Run lil doctor instead."])
     }
 
+    // The failure was fixed elsewhere, `lil doctor`, say: what the core reads now takes its words away.
+    function test_a_fresh_read_takes_away_the_failure_of_what_is_fine() { // spec: APP-022, APP-146
+        const core = makeCore()
+        const setup = makeSetup()
+        const missing = {toasts: "ready", shortcut: "missing", handlers: "missing"}
+        const host = loaded(core, Shapes.desktopSettings({notification_path: missing}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        tryVerify(() => card.setUpButton.enabled, 5000)
+        card.setUpButton.click()
+        setup.finish(Shapes.setupReport({shortcut: {state: "failed", why: "Access is denied."},
+                                         scheme: {state: "failed", why: "Access is denied."},
+                                         notification_path: missing}))
+        tryVerify(() => shows(card, "The Start-menu shortcut couldn't be written"), 5000, texts(card).join(" | "))
+        verify(shows(card, "lil: links couldn't be registered"))
+        // One part fixed: its words go, the other's stay.
+        card.checkButton.click()
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "ok", handlers: "missing"}})))
+        tryVerify(() => !shows(card, "The Start-menu shortcut couldn't be written"), 5000, texts(card).join(" | "))
+        verify(shows(card, "lil: links couldn't be registered"), texts(card).join(" | "))
+        // Both: nothing left over beside the good words.
+        card.checkButton.click()
+        answer(core, isRead, readOk())
+        tryVerify(() => shows(card, NotificationText.reachable), 5000, texts(card).join(" | "))
+        verify(!shows(card, "couldn't"), texts(card).join(" | "))
+        verify(!shows(card, "Nothing needed writing"), texts(card).join(" | "))
+    }
+
+    // A run that stopped with an error never asked the core, and what it wrote isn't known.
+    function test_a_run_that_stopped_says_what_isnt_known() { // spec: APP-022
+        const core = makeCore()
+        const setup = makeSetup()
+        const host = loaded(core, Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "missing"}}), setup)
+        const panel = host.panel
+        const card = panel.pathCard
+        tryVerify(() => card.setUpButton.enabled, 5000)
+        card.setUpButton.click()
+        wait(1100)
+        setup.finish(Shapes.setupReport({stopped: true, shortcut: {state: "not_tried"}, scheme: {state: "not_tried"},
+                                         notification_path: null}))
+        tryVerify(() => shows(card, "Set up stopped with an error, so what it wrote isn't known."), 5000, texts(card).join(" | "))
+        verify(!shows(card, "The core couldn't say"), texts(card).join(" | "))
+        // The panel asks the core itself. Still missing: the words stay. All fine: they go.
+        answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: {toasts: "ready", shortcut: "missing", handlers: "missing"}})))
+        wait(50)
+        verify(shows(card, "what it wrote isn't known"), texts(card).join(" | "))
+        card.checkButton.click()
+        answer(core, isRead, readOk())
+        tryVerify(() => !shows(card, "what it wrote isn't known"), 5000, texts(card).join(" | "))
+    }
+
+    function test_the_words_promise_only_what_is_checked_and_fit_the_button() { // spec: APP-146
+        const core = makeCore()
+        const off = reason => ({toasts: "unavailable", toasts_reason: reason, shortcut: "ok", handlers: "ok"})
+        const host = loaded(core, Shapes.desktopSettings())
+        const card = host.panel.pathCard
+        verify(shows(card, "Nothing LILITH can check stands in the way of its notifications."), texts(card).join(" | "))
+        tryVerify(() => core.subscriberCount("desktop") > 0, 5000)
+        for (const reason of ["disabled_for_app", "disabled_for_user", "disabled_by_policy", "elevated"]) {
+            core.emit("desktop", "resync_required", null)
+            answer(core, isRead, readOk(Shapes.desktopSettings({notification_path: off(reason)})))
+            tryVerify(() => host.panel.fresh && card.checkButton.visible && shows(card, "then press Check again."), 5000, reason + ": " + texts(card).join(" | "))
+            verify(!shows(card, "then run lil doctor"), reason)
+        }
+        // Where there is no such button, the doctor is still the way.
+        verify(NotificationText.problems(off("disabled_for_app"))[0].indexOf("then run lil doctor to check the rest.") >= 0)
+    }
+
     function test_set_up_s_outcome_is_announced() { // spec: APP-156
         const core = makeCore()
         const setup = makeSetup()

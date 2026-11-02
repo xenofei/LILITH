@@ -402,6 +402,24 @@ TestCase {
         compare(card.text, "Set up didn't start. Run lil doctor instead.")
     }
 
+    function test_a_fresh_read_takes_away_the_failure_of_what_is_fine() { // spec: APP-022
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("fine"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, missing)
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        card.setUpButton.click()
+        setup.finish(Shapes.setupReport({shortcut: {state: "failed", why: "Access is denied."}, scheme: {state: "written"},
+                                         notification_path: missing}))
+        tryVerify(() => card.text.indexOf("couldn't be written") >= 0, 5000, card.text)
+        wait(1100)
+        core.emit("desktop", "resync_required", null)
+        answerRead(core, {toasts: "ready", shortcut: "ok", handlers: "missing"})
+        tryVerify(() => card.text.indexOf("couldn't be written") < 0, 5000, card.text)
+        verify(card.visible)
+    }
+
     function test_a_later_start_takes_nothing_from_a_settings_run() { // spec: APP-022
         const dir = TestFiles.newDir("later")
         verify(TestFiles.write(dir + "/state.json", JSON.stringify({state: 1, workspaces: {}})))

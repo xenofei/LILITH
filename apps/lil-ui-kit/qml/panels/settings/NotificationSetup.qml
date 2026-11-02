@@ -30,7 +30,7 @@ LCard {
     property bool _hadFocus: false
 
     readonly property bool appMissing: !!setup && setup.appMissing === true
-    readonly property var problems: NotificationText.problems(path, appMissing)
+    readonly property var problems: NotificationText.problems(path, appMissing, true)
     readonly property alias setUpButton: setUpButton
     readonly property alias windowsButton: windowsButton
     readonly property alias checkButton: checkButton

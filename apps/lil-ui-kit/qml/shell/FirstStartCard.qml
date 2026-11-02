@@ -136,8 +136,8 @@ LBanner {
         onAnswered: (structured, current) => {
             if (structured && (current || root.path === null))
                 root.tookPath(structured.notification_path)
-            if (current && root.report && root.report.reread_error)
-                root.report = Object.assign({}, root.report, {reread_error: null})
+            if (current)
+                root.report = NotificationText.reportAfterRead(root.report, structured && structured.notification_path)
         }
     }
 

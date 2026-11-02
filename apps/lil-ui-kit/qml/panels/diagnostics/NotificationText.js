@@ -7,39 +7,46 @@
 // while the app isn't where the core looks for it (`appMissing`, the bridge's), when neither can.
 .pragma library
 
-// What the card says when nothing is in the way. `not_yet_shown` counts as reachable.
-const reachable = "Nothing stands in the way of LILITH's notifications."
+// What the card says when nothing is in the way, as far as the path goes: the notifier's setting, the
+// shortcut and the handlers. Windows' Do Not Disturb isn't among them. `not_yet_shown` counts as reachable.
+const reachable = "Nothing LILITH can check stands in the way of its notifications."
 
-const doctorChecks = "then run lil doctor to check the rest."
 const doctorFixes = "Run lil doctor to fix, or use \"Set up\" in the Settings panel."
 const appMissingFix = "It can't be set up while lil-image.exe isn't where the core looks for it: build or "
                       + "install the app, then run lil doctor."
 
-const toastSentences = {
-    disabled_for_app: "Notifications are off for LILITH in Windows Settings. Turn them on there, " + doctorChecks,
-    disabled_for_user: "Notifications are off in Windows Settings. Turn them on there, " + doctorChecks,
-    disabled_by_policy: "A policy blocks notifications. Change the policy on this PC, " + doctorChecks,
-    elevated: "The core runs as administrator, so Windows won't show its notifications. Start LILITH "
-              + "without administrator rights, " + doctorChecks,
-    no_platform: "Windows isn't showing LILITH's notifications on this PC. Run lil doctor to check the "
-                 + "shortcut and the link handlers."
+// What Windows decides, and what to do after: `then` ends the sentence, by what the card has beside it.
+function toastSentence(reason, then) {
+    switch (reason) {
+    case "disabled_for_app":
+        return "Notifications are off for LILITH in Windows Settings. Turn them on there, " + then
+    case "disabled_for_user":
+        return "Notifications are off in Windows Settings. Turn them on there, " + then
+    case "disabled_by_policy":
+        return "A policy blocks notifications. Change the policy on this PC, " + then
+    case "elevated":
+        return "The core runs as administrator, so Windows won't show its notifications. Start LILITH "
+               + "without administrator rights, " + then
+    case "no_platform":
+        return "Windows isn't showing LILITH's notifications on this PC. Run lil doctor to check the "
+               + "shortcut and the link handlers."
+    }
+    return "Windows won't show LILITH's notifications (" + reason + "). Run lil doctor to check the "
+           + "shortcut and the link handlers."
 }
 
 // One sentence for each part of `path` ({toasts, toasts_reason?, shortcut, handlers}) that keeps a
 // notification from you; empty when none does. A reason this build doesn't know is shown by its
 // name, so pass the result through Core.shownText. `appMissing`: the setup is withheld, so no
-// sentence names it.
-function problems(path, appMissing) {
+// sentence names it. `checkHere`: the card has a "Check again" button beside these words.
+function problems(path, appMissing, checkHere) {
     const out = []
     if (!path)
         return out
     const fix = appMissing ? appMissingFix : doctorFixes
-    if (path.toasts === "unavailable") {
-        const reason = path.toasts_reason
-        out.push(toastSentences[reason]
-                 || "Windows won't show LILITH's notifications (" + reason + "). Run lil doctor to check the "
-                    + "shortcut and the link handlers.")
-    }
+    if (path.toasts === "unavailable")
+        out.push(toastSentence(path.toasts_reason,
+                               checkHere ? "then press Check again." : "then run lil doctor to check the rest."))
     if (path.shortcut === "missing")
         out.push("The Start-menu shortcut is missing. " + fix)
     else if (path.shortcut === "wrong")
@@ -81,6 +88,8 @@ function windowsCanFix(path) {
 function setupOutcome(report, shown) {
     if (!report)
         return ""
+    if (report.stopped)
+        return "Set up stopped with an error, so what it wrote isn't known. Run lil doctor to check."
     if (report.app_missing)
         return "Nothing was written: lil-image.exe isn't at " + shown(report.app_missing, 260)
                + ". Build or install the app, then run lil doctor."
@@ -106,8 +115,26 @@ function setupOutcome(report, shown) {
 
 // Whether that report has something that went wrong.
 function setupFailed(report) {
-    return !!report && (!!report.app_missing || !!report.reread_error || report.shortcut.state === "failed"
-                        || report.scheme.state === "failed")
+    return !!report && (!!report.stopped || !!report.app_missing || !!report.reread_error
+                        || report.shortcut.state === "failed" || report.scheme.state === "failed")
+}
+
+// `report` once the core has read `path` afresh: "couldn't say" is over, and so is the failure of a part
+// the core now reads as fine, however it got fixed. Null when that leaves nothing to say.
+function reportAfterRead(report, path) {
+    if (!report || !path)
+        return report
+    const fine = part => part.state === "failed" ? {state: "ok"} : part
+    const after = Object.assign({}, report, {reread_error: null})
+    if (path.shortcut === "ok")
+        after.shortcut = fine(report.shortcut)
+    if (path.handlers === "ok")
+        after.scheme = fine(report.scheme)
+    if (path.shortcut === "ok" && path.handlers === "ok")
+        after.stopped = false
+    const wasFailed = setupFailed(report)
+    const said = after.shortcut.state === "written" || after.scheme.state === "written"
+    return wasFailed && !setupFailed(after) && !said ? null : after
 }
 
 // The notification categories this build knows, in the order they show, with what each is called

@@ -195,7 +195,7 @@ function settingsChanged(settings) {
 
 // lil_qt::setup::SetupReport, as the bridge's `finished` carries it.
 function setupReport(over) {
-    return Object.assign({app_missing: null, shortcut: {state: "written"}, scheme: {state: "written"},
+    return Object.assign({app_missing: null, stopped: false, shortcut: {state: "written"}, scheme: {state: "written"},
                           notification_path: {toasts: "ready", shortcut: "ok", handlers: "ok"},
                           reread_error: null}, over || {})
 }

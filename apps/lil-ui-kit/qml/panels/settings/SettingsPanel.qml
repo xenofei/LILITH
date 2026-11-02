@@ -273,9 +273,9 @@ Rectangle {
             root.reloading = false
             if (root._closeOnRead)
                 panelBanner.close()
-            // The path speaks now: an old "couldn't say" doesn't stay beside it.
-            if (root.report && root.report.reread_error)
-                root.report = Object.assign({}, root.report, {reread_error: null})
+            // The path speaks now: an old "couldn't say", or the failure of a part that is fine by now,
+            // doesn't stay beside it.
+            root.report = NotificationText.reportAfterRead(root.report, structured && structured.notification_path)
         }
     }
 
