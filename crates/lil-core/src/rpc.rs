@@ -56,7 +56,11 @@
 //! one when the connection closes, or says hello in another workspace afterwards. Either way,
 //! once no app that can answer is connected, the toasts held back while it was in front go out.
 //! A process is assumed to keep one session at a time: a second live one of the same pid and
-//! caller in another workspace counts as a switch. The waits live in one core instance: after
+//! caller in another workspace counts as a switch, but one with no workspace doesn't, since a
+//! toast's Deny from the app connects so. So a real move to no workspace leaves the prompts
+//! answerable until they expire, the process exits, or it opens another workspace; the app's call
+//! that asked has already ended on such a move, so answering runs nothing, though a raise still
+//! changes the cap. The waits live in one core instance: after
 //! a core restart, prompts reloaded from `state.db` end at their expiry (Appendix G).
 //!
 //! **Lifecycle** (ARCH-020, ruling P23). [`Router::opened`] and [`Router::closed`] feed the
@@ -269,7 +273,7 @@ impl RpcRouter {
     /// answerable (APP-051) from now until [`Router::closed`], and the observers are told of the
     /// session: all under the map lock, so a connection that closes meanwhile is never counted.
     /// An app's session in another workspace than one it left ends that one's cap prompts (a
-    /// switch; module docs).
+    /// switch; module docs). A session with no workspace isn't a switch.
     fn settle_ready(
         &self,
         conn_id: u64,
@@ -288,7 +292,9 @@ impl RpcRouter {
                 observer.ready(conn_id, &session);
                 observer.said_hello(conn_id, &session, build_id);
             }
-            if matches!(session.caller, CallerKind::Ui(_)) {
+            if matches!(session.caller, CallerKind::Ui(_))
+                && session.workspace_id() != lil_protocol::NO_WORKSPACE
+            {
                 let switched: Vec<(String, String)> =
                     match lock(&self.left).get_mut(&session.client_pid) {
                         Some(left) => {
@@ -329,7 +335,7 @@ impl RpcRouter {
             {
                 if other.workspace_id() == session.workspace_id() {
                     here = true;
-                } else {
+                } else if other.workspace_id() != lil_protocol::NO_WORKSPACE {
                     elsewhere = true;
                 }
             }

@@ -104,6 +104,14 @@ TestCase {
         ShellWindow {}
     }
 
+    Component {
+        id: fakeSetupComponent
+        QtObject {
+            property bool appMissing: false
+            signal finished(string reportJson)
+        }
+    }
+
     A11yWalk { id: walk }
 
     property var answered: ({})
@@ -999,9 +1007,9 @@ TestCase {
             [off("no_platform"), "Windows isn't showing LILITH's notifications on this PC"],
             [off("a_new_reason"), "Windows won't show LILITH's notifications (a_new_reason)"],
             [path({shortcut: "missing"}), "The Start-menu shortcut is missing"],
-            [path({shortcut: "wrong"}), "The Start-menu shortcut opens another program or build"],
+            [path({shortcut: "wrong"}), "The Start-menu shortcut isn't right for this LILITH"],
             [path({handlers: "missing"}), "This LILITH's lil: links aren't registered"],
-            [path({handlers: "other_channel"}), "Another LILITH build handles lil: links"]
+            [path({handlers: "other_channel"}), "Another LILITH build or another program handles lil: links"]
         ]
         for (const [p, sentence] of cases) {
             const problems = NotificationText.problems(p)
@@ -1029,7 +1037,7 @@ TestCase {
         core.emit("desktop", "event", {kind: "settings", settings: desktop()})
         answer(core, isTool("desktop.get"), ok(desktop({notification_path: path({toasts: "unavailable", toasts_reason: "disabled_for_user", shortcut: "wrong"})})))
         tryVerify(() => shows(panel.notifications, "Notifications are off in Windows Settings"), 5000)
-        verify(shows(panel.notifications, "The Start-menu shortcut opens another program or build"))
+        verify(shows(panel.notifications, "The Start-menu shortcut isn't right for this LILITH"))
         verify(!shows(panel.notifications, NotificationText.reachable))
     }
 
@@ -1224,7 +1232,7 @@ TestCase {
         panel.visible = true
         const call = answer(core, isTool("desktop.get"), ok(desktop()))
         compare(call.args.fresh, true)
-        tryVerify(() => shows(panel.notifications, "Nothing stands in the way"), 5000, texts(panel.notifications).join(" | "))
+        tryVerify(() => shows(panel.notifications, NotificationText.reachable), 5000, texts(panel.notifications).join(" | "))
         for (const name of ["models.report", "engines.environment", "engines.status", "diagnostics.recent", "telemetry.snapshot"])
             answer(core, isTool(name), ok(name === "models.report" ? report() : name === "engines.environment" ? {captures: [], changes: []}
                                           : name === "engines.status" ? {engines: [comfy()]} : name === "diagnostics.recent" ? {errors: []} : snapshot()))
@@ -1372,6 +1380,22 @@ TestCase {
     }
 
     // --- Floating, and the gate -----------------------------------------------------------------
+
+    // Set up publishes no event, so a card beside a floating Settings would go on saying "use Set up".
+    function test_a_set_up_makes_the_card_read_again() { // spec: APP-146, APP-022
+        const core = makeCore()
+        const panel = makePanel(core)
+        const setup = fakeSetupComponent.createObject(tc)
+        panel.setup = setup
+        load(core, {"desktop.get": ok(desktop({notification_path: {toasts: "ready", shortcut: "missing", handlers: "ok"}}))})
+        tryVerify(() => shows(panel.notifications, "The Start-menu shortcut is missing"), 5000)
+        wait(1100)
+        const reads = callsOf(core, "desktop.get").length
+        setup.finished("{}")
+        tryVerify(() => callsOf(core, "desktop.get").length === reads + 1, 5000, "it reads again")
+        answer(core, isTool("desktop.get"), ok(desktop()))
+        tryVerify(() => shows(panel.notifications, NotificationText.reachable), 5000)
+    }
 
     function test_float_and_redock_keeps_diagnostics_state() { // spec: ARCH-116
         const core = makeCore()

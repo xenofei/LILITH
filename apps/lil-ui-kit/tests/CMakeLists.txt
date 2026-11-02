@@ -214,3 +214,16 @@ set_tests_properties(grab_home PROPERTIES
     TIMEOUT 300
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 27: the Settings panel and the first-start card, whose shells run on the 1280 x 800 offscreen
+# screen.
+lil_qml_test(tst_settings tst_settings.qml)
+lil_qml_test(tst_first_start tst_first_start.qml)
+set_property(TEST tst_settings tst_first_start APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+add_test(NAME grab_settings COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/grab_settings.qml)
+set_tests_properties(grab_settings PROPERTIES
+    LABELS grabs
+    TIMEOUT 300
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")

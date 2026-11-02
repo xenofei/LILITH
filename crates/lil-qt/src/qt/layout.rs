@@ -22,6 +22,11 @@
 //! - `awayItems(pagesJson, pendingJson, lastSeen)`: [`crate::away::away_items_json`] as JSON;
 //!   `nextCursor(resultJson)`: a `jobs.list` result's `next_cursor`, empty on the last page, so
 //!   QML needn't parse the page.
+//! - `isFirstStart(dir)`: whether this is the app's first start in `dir`, read only
+//!   ([`crate::app_state::is_first_start`]); false with no `dir`.
+//! - `recordFirstStart(dir)`: from now on it isn't ([`crate::app_state::record_first_start`]): never
+//!   replaces a file. A record that can't be created is logged, and the next start offers again; one
+//!   created but cut short leaves a `state.json`, so it counts as a start that has happened.
 
 use core::pin::Pin;
 use std::path::{Path, PathBuf};
@@ -95,6 +100,12 @@ pub mod qobject {
             pending_json: &QString,
             last_seen: &QString,
         ) -> QString;
+
+        #[qinvokable]
+        fn is_first_start(self: &ShellState, dir: &QString) -> bool;
+
+        #[qinvokable]
+        fn record_first_start(self: &ShellState, dir: &QString);
     }
 
     #[namespace = "lil_qt"]
@@ -262,6 +273,21 @@ impl qobject::ShellState {
             &pending_json.to_string(),
             &last_seen.to_string(),
         ))
+    }
+
+    fn is_first_start(&self, dir: &QString) -> bool {
+        let dir = dir.to_string();
+        !dir.is_empty() && crate::app_state::is_first_start(Path::new(&dir))
+    }
+
+    fn record_first_start(&self, dir: &QString) {
+        let dir = dir.to_string();
+        if dir.is_empty() {
+            return;
+        }
+        if let Err(e) = crate::app_state::record_first_start(Path::new(&dir)) {
+            tracing::warn!(kind = ?e.kind(), "the app's first start couldn't be recorded");
+        }
     }
 }
 

@@ -3,16 +3,17 @@
 //! app and per machine, never in the core.
 //!
 //! A file that doesn't parse is set aside as `state.json.bad-<YYYYMMDDTHHMMSSZ>` and the app
-//! starts with no state; writes go through `replace_file` (P4a-R16).
+//! starts with no state; writes go through `replace_file` (P4a-R16), but for the first start's
+//! record, which is made only if there is no file and never replaces one.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use lil_platform::Env;
 use serde::{Deserialize, Serialize};
 
-use crate::layout_file::{set_aside, write_replacing};
+use crate::layout_file::{retry_shared, set_aside, write_replacing};
 
 /// The `state` version this build reads and writes.
 pub const STATE_VERSION: u64 = 1;
@@ -51,7 +52,14 @@ impl AppState {
 
     fn load_from(path: &Path) -> AppState {
         let mut unread = false;
-        let workspaces = match std::fs::read_to_string(path) {
+        // A program holding the file for a moment is waited for (SHARE_WAIT), so a brief hold doesn't
+        // make it unread, which refuses Home's write.
+        // Text that isn't UTF-8 is a file that doesn't parse, as LayoutFile::load takes it.
+        let read = match retry_shared(|| std::fs::read_to_string(path)) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Ok(String::new()),
+            other => other,
+        };
+        let workspaces = match read {
             Ok(text) => match serde_json::from_str::<StateFile>(&text) {
                 Ok(file) if file.state == STATE_VERSION => file.workspaces,
                 Ok(_) | Err(_) => {
@@ -104,6 +112,43 @@ impl AppState {
         };
         let text = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
         write_replacing(&self.path, &text)
+    }
+}
+
+/// Whether this start is the app's first on its channel, `dir` being its state folder
+/// (`Env::app_state_dir`): it only reads. A `state.json` that was set aside, or a folder that can't be
+/// read, isn't a first start (Appendix G, app state).
+pub fn is_first_start(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => !entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("state.json")
+        }),
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+/// The record that the first start's offer has been made or wasn't needed: `state.json` with no
+/// workspaces, unless there is one by now. It never replaces a file: the app's other writer (Home's
+/// last seen time) may have got there first.
+pub fn record_first_start(dir: &Path) -> io::Result<()> {
+    let file = StateFile {
+        state: STATE_VERSION,
+        workspaces: BTreeMap::new(),
+    };
+    let text = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
+    std::fs::create_dir_all(dir)?;
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join("state.json"));
+    match created {
+        Ok(mut new) => new.write_all(&text),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -201,6 +246,159 @@ mod tests {
             again.last_seen("ws_b").as_deref(),
             Some("2026-10-26T09:00:00Z")
         );
+    }
+
+    /// Holds `path` open from another thread, with `share` (FILE_SHARE_* bits), for `ms`, as a person's
+    /// tool, a backup program or an antivirus can; returns once it is held.
+    fn hold(path: &Path, share: u32, ms: u64) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (held, path) = (std::sync::mpsc::channel(), path.to_path_buf());
+        let worker = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(share)
+                .open(&path)
+                .unwrap();
+            held.0.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            drop(file);
+        });
+        held.1.recv().unwrap();
+        worker
+    }
+
+    /// A reader that doesn't share deletion (PowerShell's Get-Content) holds the file for a moment:
+    /// the write waits for it rather than failing (P4a-R16).
+    #[test] // spec: P4a-R16
+    fn a_brief_hold_doesnt_fail_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = AppState::load(&env, "image");
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        let path = env.app_state_dir("image").join("state.json");
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
+        let holder = hold(&path, 0x1 | 0x2, 5);
+        let mut again = AppState::load(&env, "image");
+        again.set_last_seen("ws_a", "2026-10-28T10:00:00Z").unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            AppState::load(&env, "image").last_seen("ws_a").as_deref(),
+            Some("2026-10-28T10:00:00Z")
+        );
+    }
+
+    /// A hold that lasts isn't waited out: the read and the write each give up within about 100 ms,
+    /// since they run on the GUI thread, and Home's next mark tries again.
+    #[test] // spec: P4a-R16
+    fn a_lasting_hold_fails_without_holding_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = AppState::load(&env, "image");
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        let path = env.app_state_dir("image").join("state.json");
+        let holder = hold(&path, 0x1 | 0x2, 2000);
+        let mut again = AppState::load(&env, "image");
+        let started = std::time::Instant::now();
+        assert!(again.set_last_seen("ws_a", "2026-10-28T10:00:00Z").is_err());
+        let write = started.elapsed();
+        holder.join().unwrap();
+        let holder = hold(&path, 0, 2000);
+        let started = std::time::Instant::now();
+        let mut unread = AppState::load(&env, "image");
+        let read = started.elapsed();
+        assert!(
+            unread
+                .set_last_seen("ws_a", "2026-10-28T10:00:00Z")
+                .is_err(),
+            "unread"
+        );
+        holder.join().unwrap();
+        let bound = std::time::Duration::from_millis(150);
+        assert!(write < bound, "the write held the thread {write:?}");
+        assert!(read < bound, "the read held the thread {read:?}");
+    }
+
+    /// A state.json that isn't UTF-8 is set aside like one that doesn't parse, so Home's writes go on.
+    #[test] // spec: P4a-R16
+    fn a_state_that_isnt_utf8_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let app_dir = env.app_state_dir("image");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("state.json"), [b'{', 0xFF, b'}']).unwrap();
+        let mut state = AppState::load(&env, "image");
+        let names: Vec<String> = std::fs::read_dir(&app_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.len() == 1 && names[0].starts_with("state.json.bad-"),
+            "{names:?}"
+        );
+        state.set_last_seen("ws_a", "2026-10-28T10:00:00Z").unwrap();
+        assert_eq!(
+            AppState::load(&env, "image").last_seen("ws_a").as_deref(),
+            Some("2026-10-28T10:00:00Z")
+        );
+    }
+
+    /// One that shares nothing, for a moment: the read waits for it, so the state isn't taken for
+    /// unreadable and Home's time isn't refused.
+    #[test] // spec: P4a-R16
+    fn a_brief_exclusive_hold_doesnt_fail_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = AppState::load(&env, "image");
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        let path = env.app_state_dir("image").join("state.json");
+        let holder = hold(&path, 0, 5);
+        let mut read = AppState::load(&env, "image");
+        holder.join().unwrap();
+        assert_eq!(
+            read.last_seen("ws_a").as_deref(),
+            Some("2026-10-27T10:00:00Z")
+        );
+        read.set_last_seen("ws_b", "2026-10-28T10:00:00Z").unwrap();
+    }
+
+    #[test] // spec: APP-022
+    fn only_a_start_with_no_state_is_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let app_dir = env.app_state_dir("image");
+        assert!(is_first_start(&app_dir), "no folder yet");
+        assert!(!app_dir.exists(), "asking writes nothing");
+        record_first_start(&app_dir).unwrap();
+        assert!(!is_first_start(&app_dir), "recorded");
+        // The record is a state like any other, and takes what comes later.
+        let mut state = AppState::load(&env, "image");
+        assert_eq!(state.last_seen("ws_a"), None);
+        assert_eq!(
+            std::fs::read_dir(&app_dir).unwrap().count(),
+            1,
+            "nothing was set aside"
+        );
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        record_first_start(&app_dir).unwrap();
+        assert_eq!(
+            AppState::load(&env, "image").last_seen("ws_a").as_deref(),
+            Some("2026-10-27T10:00:00Z"),
+            "a record never writes over a state"
+        );
+
+        // A state set aside is an app that has run before.
+        let other = env.app_state_dir("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("state.json"), "{nope").unwrap();
+        let _ = AppState::load(&env, "other");
+        assert!(!other.join("state.json").exists());
+        assert!(!is_first_start(&other), "set aside, not new");
+
+        // Another file in the folder (the layout) says nothing of it.
+        let third = env.app_state_dir("third");
+        std::fs::create_dir_all(&third).unwrap();
+        std::fs::write(third.join("layout.json"), "{}").unwrap();
+        assert!(is_first_start(&third));
     }
 
     #[test] // spec: APP-111

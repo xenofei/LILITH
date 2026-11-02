@@ -1001,6 +1001,371 @@ fn topic_subscriptions_are_counted_and_kept_in_order() {
     });
 }
 
+/// What the Settings panel reads and sends, from the real core: `desktop.get`'s fields, the one-key
+/// `app/desktop.set` answered with the whole settings, the `desktop` topic's `{kind: "settings"}`,
+/// and a category the core doesn't list refused, with nothing written.
+#[test] // spec: APP-146, APP-039
+fn desktop_settings_answer_as_the_settings_panel_reads_them() {
+    launch(
+        "desktop_settings_answer_as_the_settings_panel_reads_them",
+        || {
+            let mut rig = Rig::start(|_| {});
+            rig.probe.subscribe("desktop");
+            poll("the subscription", || {
+                (rig.probe.last_seq("desktop") >= 0.0).then_some(())
+            });
+
+            let id = rig.probe.call("desktop.get", json!({"fresh": true}));
+            let first = rig.probe.finished(&id)["structured"].clone();
+            let categories = [
+                "job_finished",
+                "job_failed",
+                "confirmation_waiting",
+                "cap_alert",
+                "director_decision",
+                "agent_activity",
+            ];
+            let mut listed: Vec<&str> = first["notifications"]
+                .as_object()
+                .expect("notifications")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            listed.sort_unstable();
+            let mut known = categories;
+            known.sort_unstable();
+            assert_eq!(listed, known, "exactly the panel's six");
+            for category in categories {
+                assert_eq!(first["notifications"][category], true, "{category}");
+            }
+            assert_eq!(first["quiet_while_fullscreen"], true);
+            assert_eq!(first["fullscreen_autopause"], false);
+            assert_eq!(first["keep_awake_gpu"], true);
+            assert!(first["keep_awake_available"].is_boolean());
+            // A test core starts with its handlers missing, as the first-start card's fixtures do.
+            assert_eq!(first["notification_path"]["handlers"], "missing");
+            assert_eq!(first["notification_path"]["shortcut"], "ok");
+            assert_eq!(first["notification_path"]["toasts"], "ready");
+
+            // One key: the answer is the whole settings, directly (an `app/*` result).
+            let id = rig.probe.app_call(
+                "app/desktop.set",
+                json!({"notifications": {"job_failed": false}}),
+            );
+            let answer = rig.probe.finished(&id);
+            assert_eq!(answer["notifications"]["job_failed"], false);
+            assert_eq!(answer["notifications"]["job_finished"], true);
+            assert_eq!(answer["quiet_while_fullscreen"], true);
+            assert!(answer["notification_path"].is_object());
+            let event = rig.probe.wait_for("the settings event", |s| {
+                matches!(s, Seen::Event { topic, data, .. }
+                if topic == "desktop" && data["kind"] == "settings")
+            });
+            let Seen::Event { kind, data, .. } = event else {
+                unreachable!()
+            };
+            assert_eq!(kind, "event");
+            assert_eq!(data["settings"]["notifications"]["job_failed"], false);
+
+            // Each switch's own field.
+            let id = rig
+                .probe
+                .app_call("app/desktop.set", json!({"fullscreen_autopause": true}));
+            assert_eq!(rig.probe.finished(&id)["fullscreen_autopause"], true);
+
+            // A category it doesn't list: refused, and nothing changes.
+            let id = rig.probe.app_call(
+                "app/desktop.set",
+                json!({"notifications": {"job_progress": true, "job_failed": true}}),
+            );
+            let Seen::Failed(_, error) = rig.probe.outcome(&id) else {
+                panic!("job_progress wasn't refused")
+            };
+            // A -32602 reaches the app as this, the core still there: tst_settings' fixture is this.
+            assert_eq!(error["code"], "core.unreachable", "{error}");
+            assert_eq!(error["retry"], "same_idempotency_key", "{error}");
+            let message = error["message"].as_str().expect("a message");
+            assert!(message.contains("protocol error (-32602)"), "{message}");
+            assert!(message.contains("job_progress"), "{message}");
+            let id = rig.probe.call("desktop.get", json!({"fresh": true}));
+            let after = rig.probe.finished(&id)["structured"].clone();
+            assert_eq!(after["notifications"]["job_failed"], false);
+            assert!(after["notifications"].get("job_progress").is_none());
+
+            // The notification path a test sets is what a fresh read says, and an unavailable one has
+            // its reason beside it.
+            let id = rig.probe.call(
+                "test.desktop",
+                json!({"handlers": true, "toasts": "disabled_for_app"}),
+            );
+            rig.probe.finished(&id);
+            let id = rig.probe.call("desktop.get", json!({"fresh": true}));
+            let path = rig.probe.finished(&id)["structured"]["notification_path"].clone();
+            assert_eq!(
+                path,
+                json!({"toasts": "unavailable", "toasts_reason": "disabled_for_app",
+                   "shortcut": "ok", "handlers": "ok"})
+            );
+        },
+    );
+}
+
+/// Set up's read never touches the app's cap prompts (Appendix G "Connections"). The app's session
+/// asks; it reconnects, which leaves the old session on the core's list of those left; the read as
+/// the bridge makes it comes, and the prompt stays pending. So it does when the app's connection
+/// closes while a read is open. A Core object isn't used: its own session would hide the second case.
+#[test] // spec: APP-022, APP-051
+fn setup_s_read_leaves_a_pending_prompt_alone() {
+    launch("setup_s_read_leaves_a_pending_prompt_alone", || {
+        let env = TestEnv::new();
+        env.suite_toml_set(MONTHLY_1);
+        let ws = env.make_workspace("served");
+        env.register_workspace(&ws, true);
+        let _core = CoreFixture::start_exe(&env, &own_folder().join("lil-core.exe"));
+        let mut cfg = ClientConfig::for_env(env.env.clone(), "ui:test".parse().unwrap())
+            .expect("a client configuration");
+        cfg.start = StartPolicy::NoStart;
+        cfg.workspace = env.workspace_id(&ws);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let connect = |cfg: &ClientConfig| {
+            rt.block_on(lil_client::Client::connect(cfg))
+                .expect("connect")
+        };
+        let state_of = |c: &lil_client::Client, id: &str| -> String {
+            for which in ["pending", "history"] {
+                let got = rt
+                    .block_on(c.app_call("app/confirmations.list", json!({"state": which})))
+                    .expect("the list");
+                let got = serde_json::to_value(&got).unwrap();
+                let rows = got["confirmations"].as_array().cloned().unwrap_or_default();
+                if let Some(row) = rows.iter().find(|r| r["id"] == id) {
+                    return row["state"].as_str().unwrap_or_default().to_string();
+                }
+            }
+            "not listed".to_string()
+        };
+        let ask_cap = |c: &lil_client::Client, key: &str| -> String {
+            let mut args = serde_json::Map::new();
+            args.insert("cost".to_string(), json!("5"));
+            let got = rt
+                .block_on(c.call_tool("test.destructive", args, Some(key.to_string())))
+                .expect("the tool");
+            let got = serde_json::to_value(&got).unwrap();
+            got["confirmation_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{got}"))
+                .to_string()
+        };
+        let settle = || std::thread::sleep(Duration::from_millis(500));
+
+        // A reconnect in the same workspace, then the read.
+        let first = connect(&cfg);
+        let prompt = ask_cap(&first, "ik_00000000000000b1");
+        assert_eq!(state_of(&first, &prompt), "pending");
+        drop(first);
+        settle();
+        let again = connect(&cfg);
+        settle();
+        assert_eq!(state_of(&again, &prompt), "pending", "a reconnect keeps it");
+        let mut fresh = serde_json::Map::new();
+        fresh.insert("fresh".to_string(), json!(true));
+        let answer = lil_qt::setup::ask_core(&cfg, "desktop.get", fresh).expect("the read");
+        assert!(matches!(answer, lil_protocol::Outcome::Ok(_)), "{answer:?}");
+        settle();
+        assert_eq!(state_of(&again, &prompt), "pending", "after Set up's read");
+
+        // The app's connection closes while a read's is open.
+        let read = connect(&lil_qt::setup::read_config(&cfg));
+        drop(again);
+        settle();
+        let back = connect(&cfg);
+        settle();
+        assert_eq!(
+            state_of(&back, &prompt),
+            "pending",
+            "after the app's connection closed beside a read"
+        );
+        drop(read);
+        settle();
+        assert_eq!(state_of(&back, &prompt), "pending", "and the read's closed");
+    });
+}
+
+/// A toast's Deny, sent from the app's own process as `ui:*` with no workspace
+/// (`single_instance::send_deny`, on `boot.rs`'s `deny_cfg`), ends only what it denies: the app's
+/// unrelated cap prompt stays pending (Appendix G "Connections"). On the first connection, after a
+/// same-core reconnect in the same workspace, when the app's connection closes while a Deny's is open,
+/// and for an app with no workspace. A Core object isn't used: its own session would hide the third.
+#[test] // spec: APP-029, APP-051
+fn a_toast_s_deny_leaves_the_app_s_cap_prompts_alone() {
+    launch("a_toast_s_deny_leaves_the_app_s_cap_prompts_alone", || {
+        let env = TestEnv::new();
+        env.suite_toml_set(MONTHLY_1);
+        let ws = env.make_workspace("served");
+        env.register_workspace(&ws, true);
+        let _core = CoreFixture::start_exe(&env, &own_folder().join("lil-core.exe"));
+        let mut app = ClientConfig::for_env(env.env.clone(), "ui:test".parse().unwrap())
+            .expect("a client configuration");
+        app.start = StartPolicy::NoStart;
+        // As `deny_cfg`: the app's caller, no workspace named.
+        let deny = app.clone();
+        assert_eq!(deny.workspace, lil_protocol::NO_WORKSPACE);
+        app.workspace = env.workspace_id(&ws);
+        let mut script = app.clone();
+        script.caller_kind = "cli".parse().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let connect = |cfg: &ClientConfig| {
+            rt.block_on(lil_client::Client::connect(cfg))
+                .expect("connect")
+        };
+        let map = |v: Value| -> serde_json::Map<String, Value> {
+            let Value::Object(m) = v else { unreachable!() };
+            m
+        };
+        let state_of = |c: &lil_client::Client, id: &str| -> String {
+            for which in ["pending", "history"] {
+                let got = rt
+                    .block_on(c.app_call("app/confirmations.list", json!({"state": which})))
+                    .expect("the list");
+                let got = serde_json::to_value(&got).unwrap();
+                let rows = got["confirmations"].as_array().cloned().unwrap_or_default();
+                if let Some(row) = rows.iter().find(|r| r["id"] == id) {
+                    return row["state"].as_str().unwrap_or_default().to_string();
+                }
+            }
+            "not listed".to_string()
+        };
+        let ask_cap = |c: &lil_client::Client, key: &str| -> String {
+            let got = rt
+                .block_on(c.call_tool(
+                    "test.destructive",
+                    map(json!({"cost": "5"})),
+                    Some(key.to_string()),
+                ))
+                .expect("the tool");
+            let got = serde_json::to_value(&got).unwrap();
+            got["confirmation_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{got}"))
+                .to_string()
+        };
+        let cli = connect(&script);
+        let told = rt
+            .block_on(cli.call_tool("test.desktop", map(json!({"handlers": true})), None))
+            .expect("test.desktop");
+        assert!(matches!(told, lil_protocol::Outcome::Ok(_)), "{told:?}");
+        // A script's confirmation, with its toast: the id and its real Deny token.
+        let scripts_toast = |key: &str| -> (String, String) {
+            let got = rt
+                .block_on(cli.call_tool("test.destructive", map(json!({})), Some(key.to_string())))
+                .expect("the tool");
+            let got = serde_json::to_value(&got).unwrap();
+            let id = got["confirmation_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{got}"))
+                .to_string();
+            let head = format!(":deny/{id}/");
+            let token = poll("the toast's Deny", || {
+                let seen = rt
+                    .block_on(cli.call_tool("test.desktop", map(json!({})), None))
+                    .expect("test.desktop");
+                let seen = serde_json::to_value(&seen).unwrap();
+                let toasts = seen["structured"]["toasts"].as_array().cloned()?;
+                toasts.iter().rev().find_map(|t| {
+                    let xml = t["xml"].as_str()?;
+                    let at = xml.find(&head)?;
+                    Some(
+                        xml[at + head.len()..]
+                            .chars()
+                            .take_while(char::is_ascii_hexdigit)
+                            .collect::<String>(),
+                    )
+                })
+            });
+            (id, token)
+        };
+        let settle = || std::thread::sleep(Duration::from_millis(600));
+        let do_deny = |id: &str, token: &str, c: &lil_client::Client, deny: &ClientConfig| {
+            let outcome = lil_qt::single_instance::send_deny(deny, id, token);
+            assert!(
+                matches!(outcome, lil_qt::single_instance::DenyOutcome::Denied),
+                "{outcome:?}"
+            );
+            settle();
+            assert_eq!(state_of(c, id), "denied");
+        };
+
+        // The app's first connection, with its prompt.
+        let first = connect(&app);
+        let unrelated = ask_cap(&first, "ik_00000000000000c1");
+        assert_eq!(state_of(&first, &unrelated), "pending");
+        let (id, token) = scripts_toast("ik_00000000000000c2");
+        do_deny(&id, &token, &first, &deny);
+        assert_eq!(
+            state_of(&first, &unrelated),
+            "pending",
+            "on a first connection"
+        );
+
+        // A same-core reconnect in the same workspace, then a Deny.
+        drop(first);
+        settle();
+        let second = connect(&app);
+        settle();
+        assert_eq!(
+            state_of(&second, &unrelated),
+            "pending",
+            "a reconnect keeps it"
+        );
+        let (id, token) = scripts_toast("ik_00000000000000c3");
+        do_deny(&id, &token, &second, &deny);
+        assert_eq!(
+            state_of(&second, &unrelated),
+            "pending",
+            "after a reconnect, then a Deny of something else"
+        );
+
+        // The app's connection closes while a Deny's is open.
+        let another = ask_cap(&second, "ik_00000000000000c4");
+        let held = connect(&deny);
+        drop(second);
+        settle();
+        let third = connect(&app);
+        settle();
+        assert_eq!(
+            state_of(&third, &another),
+            "pending",
+            "after the app's connection closed beside a Deny's"
+        );
+        drop(held);
+        drop(third);
+        settle();
+
+        // An app with no workspace.
+        let mut none = app.clone();
+        none.workspace = lil_protocol::NO_WORKSPACE.to_string();
+        let c = connect(&none);
+        let its_own = ask_cap(&c, "ik_00000000000000c5");
+        drop(c);
+        settle();
+        let c = connect(&none);
+        settle();
+        let (id, token) = scripts_toast("ik_00000000000000c6");
+        do_deny(&id, &token, &c, &deny);
+        assert_eq!(
+            state_of(&c, &its_own),
+            "pending",
+            "an app with no workspace"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------------------------
