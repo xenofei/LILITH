@@ -243,3 +243,14 @@ foreach(bench bench_gui_stalls bench_event_to_ui)
         ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json;${LIL_BUDGET_ENV}"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
 endforeach()
+# Task 29 (ledger TC-01): the shell's workspace paths against a real test-channel core, Task 20's C1
+# and I3 through the UI. Cargo runs the launcher (crates/lil-qt/tests/qml_real_core.rs), which runs
+# this runner as lil-image.exe beside the core; label qml, so the qml presets run it.
+add_test(NAME tst_real_core
+    COMMAND cargo test --locked -p lil_qt --test qml_real_core -- --ignored --nocapture
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(tst_real_core PROPERTIES
+    LABELS qml
+    TIMEOUT 900
+    ENVIRONMENT "LIL_QML_RUNNER=$<TARGET_FILE:tst_lil_ui_kit>;LIL_QML_REAL_CORE_TEST=${CMAKE_CURRENT_SOURCE_DIR}/tst_real_core.qml"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
