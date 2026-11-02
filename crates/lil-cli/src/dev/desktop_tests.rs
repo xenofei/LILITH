@@ -1616,7 +1616,10 @@ fn command(cmd: &Cmd) -> Command {
 }
 
 /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` (Windows PowerShell 5.1, for
-/// WinForms and the ACL check).
+/// WinForms and the ACL check). Its callers start it without `PSModulePath`: run from pwsh 7
+/// (`tools/dev-shell.ps1`, then cargo), that variable names pwsh 7's module folders, and 5.1 then
+/// autoloads 7's modules, which fail to load there (`Microsoft.PowerShell.Security`'s type data
+/// collides). Unset, 5.1 uses its own default.
 fn windows_powershell() -> PathBuf {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
     PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
@@ -1624,23 +1627,33 @@ fn windows_powershell() -> PathBuf {
 
 /// Prints each folder SYSTEM (`S-1-5-18`) has no allow entry for with the rights it needs:
 /// read and execute, or modify for a `w|` folder. The folders come in `LIL_ACL_FOLDERS`, one per
-/// line, each `r|<path>` or `w|<path>`.
+/// line, each `r|<path>` or `w|<path>`. The ACL comes from .NET (`GetAccessControl`), not
+/// `Get-Acl`, so no module loads. A folder whose ACL can't be read is said on stderr, and the
+/// check then exits 3, which the runner reports as a failed check, never as a folder SYSTEM can't
+/// use.
 const ACL_CHECK: &str = r#"
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$failed = $false
 foreach ($line in ($env:LIL_ACL_FOLDERS -split "`n")) {
     if (-not $line) { continue }
     $write = $line.StartsWith('w|'); $path = $line.Substring(2)
     $need = if ($write) { [Security.AccessControl.FileSystemRights]::Modify } else { [Security.AccessControl.FileSystemRights]::ReadAndExecute }
     $ok = $false
     try {
-        foreach ($rule in (Get-Acl -LiteralPath $path).Access) {
+        foreach ($rule in ([IO.DirectoryInfo]$path).GetAccessControl().Access) {
             if ($rule.AccessControlType -ne 'Allow') { continue }
             try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
             if ($sid -eq 'S-1-5-18' -and (($rule.FileSystemRights -band $need) -eq $need)) { $ok = $true }
         }
-    } catch { }
+    } catch {
+        [Console]::Error.WriteLine("${path}: $($_.Exception.Message)")
+        $failed = $true
+        continue
+    }
     if (-not $ok) { [Console]::Out.WriteLine($path) }
 }
+if ($failed) { exit 3 }
 "#;
 
 /// `powershell -EncodedCommand`'s argument: the script as base64 of UTF-16LE.
@@ -1776,6 +1789,7 @@ impl HostOps for RealHost {
                 &encoded_command(ACL_CHECK),
             ])
             .env("LIL_ACL_FOLDERS", folders.join("\n"))
+            .env_remove("PSModulePath")
             .stdin(Stdio::null())
             .output()?;
         if !out.status.success() {
@@ -1845,6 +1859,7 @@ impl HostOps for RealHost {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             Command::new(windows_powershell())
                 .args(&args)
+                .env_remove("PSModulePath")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -3572,6 +3587,42 @@ mod tests {
         assert!(
             RUN_INSIDE.contains(&format!("$Filter = '{filter}'")),
             "run-inside.ps1's filter isn't {filter}"
+        );
+    }
+
+    /// The ACL check reads the ACL through .NET, never `Get-Acl` (whose module, autoloaded from
+    /// pwsh 7's `PSModulePath`, fails in Windows PowerShell 5.1 and read every folder as refused),
+    /// and a folder it can't read fails the check instead of reading as one SYSTEM can't use.
+    #[test] // spec: QA-042
+    fn the_acl_check_needs_no_module_and_says_why_it_failed() {
+        assert!(!ACL_CHECK.contains("Get-Acl"), "{ACL_CHECK}");
+        assert!(
+            ACL_CHECK.contains(".GetAccessControl().Access"),
+            "{ACL_CHECK}"
+        );
+        assert!(
+            ACL_CHECK.contains("[Console]::Error.WriteLine("),
+            "{ACL_CHECK}"
+        );
+        assert!(ACL_CHECK.contains("exit 3"), "{ACL_CHECK}");
+        // The real check, in Windows PowerShell 5.1 started as the runner starts it (no Sandbox,
+        // no window): an existing folder is read, a missing one is a failed check that names it.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let host = RealHost::new(dir.path());
+        let mapped = |p: &Path| Mapped {
+            host: p.to_path_buf(),
+            sandbox: r"C:\lil\in".to_string(),
+            read_only: true,
+        };
+        host.system_cannot_use(&[mapped(dir.path())])
+            .expect("an existing folder's ACL is read");
+        let err = host
+            .system_cannot_use(&[mapped(&missing)])
+            .expect_err("a folder whose ACL can't be read fails the check");
+        assert!(
+            err.to_string().contains(&missing.display().to_string()),
+            "{err}"
         );
     }
 }
