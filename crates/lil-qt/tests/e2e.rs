@@ -1001,6 +1001,110 @@ fn topic_subscriptions_are_counted_and_kept_in_order() {
     });
 }
 
+/// What the Settings panel reads and sends, from the real core: `desktop.get`'s fields, the one-key
+/// `app/desktop.set` answered with the whole settings, the `desktop` topic's `{kind: "settings"}`,
+/// and a category the core doesn't list refused, with nothing written.
+#[test] // spec: APP-146, APP-039
+fn desktop_settings_answer_as_the_settings_panel_reads_them() {
+    launch(
+        "desktop_settings_answer_as_the_settings_panel_reads_them",
+        || {
+            let mut rig = Rig::start(|_| {});
+            rig.probe.subscribe("desktop");
+            poll("the subscription", || {
+                (rig.probe.last_seq("desktop") >= 0.0).then_some(())
+            });
+
+            let id = rig.probe.call("desktop.get", json!({"fresh": true}));
+            let first = rig.probe.finished(&id)["structured"].clone();
+            let categories = [
+                "job_finished",
+                "job_failed",
+                "confirmation_waiting",
+                "cap_alert",
+                "director_decision",
+                "agent_activity",
+            ];
+            let mut listed: Vec<&str> = first["notifications"]
+                .as_object()
+                .expect("notifications")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            listed.sort_unstable();
+            let mut known = categories;
+            known.sort_unstable();
+            assert_eq!(listed, known, "exactly the panel's six");
+            for category in categories {
+                assert_eq!(first["notifications"][category], true, "{category}");
+            }
+            assert_eq!(first["quiet_while_fullscreen"], true);
+            assert_eq!(first["fullscreen_autopause"], false);
+            assert_eq!(first["keep_awake_gpu"], true);
+            assert!(first["keep_awake_available"].is_boolean());
+            // A test core starts with its handlers missing, as the first-start card's fixtures do.
+            assert_eq!(first["notification_path"]["handlers"], "missing");
+            assert_eq!(first["notification_path"]["shortcut"], "ok");
+            assert_eq!(first["notification_path"]["toasts"], "ready");
+
+            // One key: the answer is the whole settings, directly (an `app/*` result).
+            let id = rig.probe.app_call(
+                "app/desktop.set",
+                json!({"notifications": {"job_failed": false}}),
+            );
+            let answer = rig.probe.finished(&id);
+            assert_eq!(answer["notifications"]["job_failed"], false);
+            assert_eq!(answer["notifications"]["job_finished"], true);
+            assert_eq!(answer["quiet_while_fullscreen"], true);
+            assert!(answer["notification_path"].is_object());
+            let event = rig.probe.wait_for("the settings event", |s| {
+                matches!(s, Seen::Event { topic, data, .. }
+                if topic == "desktop" && data["kind"] == "settings")
+            });
+            let Seen::Event { kind, data, .. } = event else {
+                unreachable!()
+            };
+            assert_eq!(kind, "event");
+            assert_eq!(data["settings"]["notifications"]["job_failed"], false);
+
+            // Each switch's own field.
+            let id = rig
+                .probe
+                .app_call("app/desktop.set", json!({"fullscreen_autopause": true}));
+            assert_eq!(rig.probe.finished(&id)["fullscreen_autopause"], true);
+
+            // A category it doesn't list: refused, and nothing changes.
+            let id = rig.probe.app_call(
+                "app/desktop.set",
+                json!({"notifications": {"job_progress": true, "job_failed": true}}),
+            );
+            let Seen::Failed(_, error) = rig.probe.outcome(&id) else {
+                panic!("job_progress wasn't refused")
+            };
+            assert!(error["message"].is_string(), "{error}");
+            let id = rig.probe.call("desktop.get", json!({"fresh": true}));
+            let after = rig.probe.finished(&id)["structured"].clone();
+            assert_eq!(after["notifications"]["job_failed"], false);
+            assert!(after["notifications"].get("job_progress").is_none());
+
+            // The notification path a test sets is what a fresh read says, and an unavailable one has
+            // its reason beside it.
+            let id = rig.probe.call(
+                "test.desktop",
+                json!({"handlers": true, "toasts": "disabled_for_app"}),
+            );
+            rig.probe.finished(&id);
+            let id = rig.probe.call("desktop.get", json!({"fresh": true}));
+            let path = rig.probe.finished(&id)["structured"]["notification_path"].clone();
+            assert_eq!(
+                path,
+                json!({"toasts": "unavailable", "toasts_reason": "disabled_for_app",
+                   "shortcut": "ok", "handlers": "ok"})
+            );
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------------------------
