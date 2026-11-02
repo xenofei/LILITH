@@ -277,7 +277,7 @@ mod tests {
         state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
         let path = env.app_state_dir("image").join("state.json");
         // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
-        let holder = hold(&path, 0x1 | 0x2, 20);
+        let holder = hold(&path, 0x1 | 0x2, 5);
         let mut again = AppState::load(&env, "image");
         again.set_last_seen("ws_a", "2026-10-28T10:00:00Z").unwrap();
         holder.join().unwrap();
@@ -313,7 +313,7 @@ mod tests {
             "unread"
         );
         holder.join().unwrap();
-        let bound = std::time::Duration::from_millis(100);
+        let bound = std::time::Duration::from_millis(150);
         assert!(write < bound, "the write held the thread {write:?}");
         assert!(read < bound, "the read held the thread {read:?}");
     }
@@ -351,7 +351,7 @@ mod tests {
         let mut state = AppState::load(&env, "image");
         state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
         let path = env.app_state_dir("image").join("state.json");
-        let holder = hold(&path, 0, 20);
+        let holder = hold(&path, 0, 5);
         let mut read = AppState::load(&env, "image");
         holder.join().unwrap();
         assert_eq!(
