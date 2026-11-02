@@ -33,10 +33,12 @@ index_rebuild_2000_assets_s = 30
 index_warm_reconcile_10000_assets_s = 6
 # Plan 4a's app budgets (APP-135, APP-136, APP-139), which apps/lil-ui-kit/CMakeLists.txt passes to
 # the benches (CTest label bench) as LIL_BUDGET_<NAME>.
-# bench_gui_stalls: the p99 of the GUI thread's 4 ms heartbeat lateness, and of the frame interval,
-# in ms.
+# bench_gui_stalls: the p99 of the GUI thread's 4 ms heartbeat lateness, in ms. Its frame interval's
+# p99 is held to max(this, its idle p99 + half of this), since offscreen frames follow a timer, not a
+# display (plan 4a ruling, 2026-11-01).
 gui_stall_p99_ms = 16
-# bench_event_to_ui: the p99 from an event's receipt to the UI showing it, in ms.
+# bench_event_to_ui: the p99 of job progress from Core's signal (after the session pump's 10 Hz
+# limit) to the first frame that shows it, in ms (APP-139 as ruled 2026-11-01).
 event_to_ui_ms = 100
 # bench_cold_start: `interactive` of each warm start of the deploy folder, in ms.
 cold_start_ms = 2000
