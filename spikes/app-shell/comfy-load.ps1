@@ -53,7 +53,10 @@
   notice) and waits for it, at most -MeasureSeconds + 600 s. The command's own exit code is its
   verdict, and the GPU's coverage over its run says whether the load held (INVALID if not, as above).
   Its output goes to the run's folder (bench.out.log, bench.err.log) and the result to
-  results/s06-bench.json. The spike's deploy folder isn't needed. For bench_gui_stalls:
+  results/s06-bench.json. The spike's deploy folder isn't needed. <program> is a path or a name
+  on PATH: it is resolved with Get-Command before anything starts, and the script stops at once
+  if it isn't found (the job starts a full path only). An offscreen bench uses Qt Quick's software
+  renderer, so the load reaches it only as CPU contention, not as a GPU stall. For bench_gui_stalls:
     $env:LIL_BENCH_MEASURE_S = 60
     pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1 -BenchCommand pwsh, -NoProfile, -File,
       <repo>\tools\dev-shell.ps1, ctest, --test-dir, <repo>\build\dev, -R, '^bench_gui_stalls$', -V
@@ -76,6 +79,13 @@ param(
     [string[]]$BenchCommand = @()
 )
 $ErrorActionPreference = 'Stop'
+# -BenchCommand's program, as a full path, before anything starts: Start-ProcessInJob passes it to
+# CreateProcessW, which doesn't search PATH.
+if ($BenchCommand.Count) {
+    $found = Get-Command -CommandType Application -Name $BenchCommand[0] -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { throw "-BenchCommand: '$($BenchCommand[0])' isn't a program on PATH or a path to one; nothing was started" }
+    $BenchCommand[0] = $found.Source
+}
 $Root    = $PSScriptRoot
 $Repo    = (Resolve-Path (Join-Path $Root '..\..')).Path
 $Deploy  = Join-Path $Root 'build\deploy'
