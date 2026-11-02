@@ -587,6 +587,13 @@ fn host_env(dir: &Path) -> Env {
 /// so a killed run's leftovers are swept like any other.
 const HOST_TOAST_TEST_ID: &str = "desktop-00000000000000f1";
 
+/// `LIL_DESKTOP_TOAST_HOLD_MS`: the owner's look at a real toast (plan 4a Task 29 Step 5's yes/no
+/// question, ruling 2026-11-01). Set, `desktop_toast_posts_under_the_shortcut_aumid`'s toast pops
+/// (no `SuppressPopup`, `duration="long"`) and stays that long before the test removes it; unset,
+/// it is quiet and removed as soon as History shows it, as in every host run. Nothing else changes:
+/// the same channel, registrations and `Cleanup`.
+const ENV_TOAST_HOLD_MS: &str = "LIL_DESKTOP_TOAST_HOLD_MS";
+
 #[test] // spec: APP-022, QA-042
 #[ignore = "desktop"]
 fn desktop_toast_posts_under_the_shortcut_aumid() {
@@ -605,19 +612,29 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         || format!("toasts_state {:?}", desktop.toasts_state()),
     );
 
+    let hold = std::env::var(ENV_TOAST_HOLD_MS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis);
     let tag = "j_00000000000000a5";
     let xml = format!(
         concat!(
-            r#"<toast launch="{}:task/{}" activationType="protocol"><visual>"#,
+            r#"<toast launch="{}:task/{}" activationType="protocol"{}><visual>"#,
             r#"<binding template="ToastGeneric"><text>Job finished</text>"#,
             r#"<text>desktop test · no project · 0 s</text></binding></visual></toast>"#
         ),
         env.activation_scheme(),
-        tag
+        tag,
+        if hold.is_some() {
+            r#" duration="long""#
+        } else {
+            ""
+        }
     );
     // The toast's own events say why a dropped toast never reached History (P4a-R39).
-    let watched =
-        post_watched(&env, &toast(tag, "job_finished", &xml, true)).expect("the toast posts");
+    let watched = post_watched(&env, &toast(tag, "job_finished", &xml, hold.is_none()))
+        .expect("the toast posts");
     let context = || {
         format!(
             "toasts_state {:?}, the toast's events {:?}, History {:?}",
@@ -642,6 +659,10 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         || desktop.toasts_state() == ToastsState::Ready,
         context,
     );
+    if let Some(hold) = hold {
+        eprintln!("{ENV_TOAST_HOLD_MS}: the toast stays {hold:?}, then goes");
+        std::thread::sleep(hold);
+    }
     desktop.remove(tag, "job_finished");
     eventually(
         "the toast gone from History",
