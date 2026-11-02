@@ -3615,8 +3615,12 @@ mod tests {
             sandbox: r"C:\lil\in".to_string(),
             read_only: true,
         };
-        host.system_cannot_use(&[mapped(dir.path())])
-            .expect("an existing folder's ACL is read");
+        // A temporary folder inherits the profile's ACL, which gives SYSTEM full control.
+        assert_eq!(
+            host.system_cannot_use(&[mapped(dir.path())]).unwrap(),
+            Vec::<PathBuf>::new(),
+            "an existing folder's ACL is read, and SYSTEM may use it"
+        );
         let err = host
             .system_cannot_use(&[mapped(&missing)])
             .expect_err("a folder whose ACL can't be read fails the check");
