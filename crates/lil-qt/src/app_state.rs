@@ -6,7 +6,7 @@
 //! starts with no state; writes go through `replace_file` (P4a-R16).
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use lil_platform::Env;
@@ -108,35 +108,40 @@ impl AppState {
 }
 
 /// Whether this start is the app's first on its channel, `dir` being its state folder
-/// (`Env::app_state_dir`), and if it is, the record that it was: `state.json` with no workspaces, so
-/// a later start isn't one, whatever this one did (Appendix G, app state). A `state.json` that was set
-/// aside, or a folder that can't be read, isn't a first start. A record that can't be written is
-/// logged: this start still is the first, and so is the next.
-pub fn claim_first_start(dir: &Path) -> bool {
-    let seen = match std::fs::read_dir(dir) {
-        Ok(entries) => entries.flatten().any(|entry| {
+/// (`Env::app_state_dir`): it only reads. A `state.json` that was set aside, or a folder that can't be
+/// read, isn't a first start (Appendix G, app state).
+pub fn is_first_start(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => !entries.flatten().any(|entry| {
             entry
                 .file_name()
                 .to_string_lossy()
                 .to_ascii_lowercase()
                 .starts_with("state.json")
         }),
-        Err(e) => e.kind() != io::ErrorKind::NotFound,
-    };
-    if seen {
-        return false;
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
     }
+}
+
+/// The record that the first start's offer has been made or wasn't needed: `state.json` with no
+/// workspaces, unless there is one by now. It never replaces a file: the app's other writer (Home's
+/// last seen time) may have got there first.
+pub fn record_first_start(dir: &Path) -> io::Result<()> {
     let file = StateFile {
         state: STATE_VERSION,
         workspaces: BTreeMap::new(),
     };
-    let written = serde_json::to_vec_pretty(&file)
-        .map_err(io::Error::other)
-        .and_then(|text| write_replacing(&dir.join("state.json"), &text));
-    if let Err(e) = written {
-        tracing::warn!(kind = ?e.kind(), "the app's first start couldn't be recorded");
+    let text = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
+    std::fs::create_dir_all(dir)?;
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join("state.json"));
+    match created {
+        Ok(mut new) => new.write_all(&text),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
     }
-    true
 }
 
 /// Now, as `YYYYMMDDTHHMMSSZ`.
@@ -240,8 +245,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env = env(dir.path());
         let app_dir = env.app_state_dir("image");
-        assert!(claim_first_start(&app_dir), "no folder yet");
-        assert!(!claim_first_start(&app_dir), "recorded");
+        assert!(is_first_start(&app_dir), "no folder yet");
+        assert!(!app_dir.exists(), "asking writes nothing");
+        record_first_start(&app_dir).unwrap();
+        assert!(!is_first_start(&app_dir), "recorded");
         // The record is a state like any other, and takes what comes later.
         let mut state = AppState::load(&env, "image");
         assert_eq!(state.last_seen("ws_a"), None);
@@ -251,11 +258,11 @@ mod tests {
             "nothing was set aside"
         );
         state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
-        assert!(!claim_first_start(&app_dir));
+        record_first_start(&app_dir).unwrap();
         assert_eq!(
             AppState::load(&env, "image").last_seen("ws_a").as_deref(),
             Some("2026-10-27T10:00:00Z"),
-            "a claim never writes over a state"
+            "a record never writes over a state"
         );
 
         // A state set aside is an app that has run before.
@@ -264,13 +271,13 @@ mod tests {
         std::fs::write(other.join("state.json"), "{nope").unwrap();
         let _ = AppState::load(&env, "other");
         assert!(!other.join("state.json").exists());
-        assert!(!claim_first_start(&other), "set aside, not new");
+        assert!(!is_first_start(&other), "set aside, not new");
 
         // Another file in the folder (the layout) says nothing of it.
         let third = env.app_state_dir("third");
         std::fs::create_dir_all(&third).unwrap();
         std::fs::write(third.join("layout.json"), "{}").unwrap();
-        assert!(claim_first_start(&third));
+        assert!(is_first_start(&third));
     }
 
     #[test] // spec: APP-111

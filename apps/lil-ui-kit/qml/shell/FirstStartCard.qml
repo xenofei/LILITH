@@ -1,13 +1,18 @@
 // The notification setup offered on the app's first start (APP-022; owner decision 2026-10-22): the
 // same "Set up" as the Settings panel's, on the shared bridge, shown only while it has something to
-// write. "Not now" puts it away. `state.json` was written as the shell started
-// (ShellState.claimFirstStart), so a later start never shows it, whatever was pressed here; Settings
+// write. "Not now" puts it away.
+//
+// As the shell starts it only reads whether this is a first start (no `state.json*`). The core's first
+// answer decides, once: `state.json` is recorded unless one is there by now (Home's own write may be
+// first on a slow answer), and the card shows if something is missing. So a session the core never
+// answers uses nothing up, and the next start is still a first. From then on the offer can only end:
+// put away, set up, or told by the core there is nothing left to write. Then it stops reading, so a
+// later resync can't bring the card back days into the session. A later start never shows it; Settings
 // still has the button.
 //
 // It lies in the shell's top column, under the banners and above the docks, so it can't cover a
 // banner's way out, and it asks nothing of the workspace: a first start with no workspace has both,
-// one above the other. It stays away until the core has said what is missing: with no answer there
-// is nothing to offer.
+// one above the other.
 pragma ComponentBehavior: Bound
 import QtQuick
 import Lilith.Core
@@ -24,20 +29,36 @@ LBanner {
     // The app's state folder (ShellWindow's `stateDir`).
     required property string stateDir
 
-    // Taken once, as the shell starts.
+    // Read once, as the shell starts.
     property bool firstStart: false
-    property bool dismissed: false
+    // The offer is over, for good.
+    property bool done: false
     // The core's reading, from its own read or the setup's.
     property var path: null
     // What the last setup did, or null.
     property var report: null
     property string _problem
+    // The core has answered, and the record is made.
+    property bool _decided: false
+    // Set up was pressed here: its outcome is said here.
+    property bool _pressed: false
 
-    readonly property bool wanted: firstStart && !dismissed && !!setup && !setup.appMissing
+    readonly property bool wanted: firstStart && !done && !!setup && !setup.appMissing
                                    && NotificationText.setupOffered(path)
 
     readonly property alias setUpButton: setUpButton
     readonly property alias notNowButton: notNowButton
+
+    // The core's reading came. The first one decides; after that it can only end the offer.
+    function tookPath(reading) {
+        const first = !_decided
+        _decided = true
+        path = reading
+        if (first)
+            ShellState.recordFirstStart(stateDir)
+        if (!wanted)
+            done = true
+    }
 
     closable: false
     text: {
@@ -59,18 +80,20 @@ LBanner {
             primary: true
             requiresCore: true
             core: root.core
-            enabled: !root.setup.busy
+            // Stays enabled while it runs, so the keyboard stays here: the bridge runs one at a time.
             text: root.setup.busy ? "Setting up…" : "Set up"
             onClicked: {
                 root._problem = ""
-                if (!root.setup.run() && !root.setup.busy)
+                if (root.setup.run())
+                    root._pressed = true
+                else if (!root.setup.busy)
                     root._problem = "Set up didn't start. Run lil doctor instead."
             }
         },
         LButton {
             id: notNowButton
             text: "Not now"
-            onClicked: root.dismissed = true
+            onClicked: root.done = true
         }
     ]
 
@@ -84,18 +107,20 @@ LBanner {
     Connections {
         target: root.setup
         function onFinished(reportJson) {
-            if (!root.firstStart || root.dismissed)
+            if (!root.firstStart)
                 return
             const report = JSON.parse(reportJson)
             root.report = report
+            // Said while it still shows: a set-up that works takes the card away.
+            if (root._pressed && root.visible)
+                root.announce()
+            root._pressed = false
             if (report.notification_path) {
                 pathRead.eventApplied()
-                root.path = report.notification_path
+                root.tookPath(report.notification_path)
             } else {
                 pathRead.request()
             }
-            if (root.visible && root.wanted)
-                root.announce()
         }
     }
 
@@ -105,14 +130,14 @@ LBanner {
         tool: "desktop.get"
         args: ({fresh: true})
         topic: "desktop"
-        active: root.firstStart && !root.dismissed
+        active: root.firstStart && !root.done
         onAnswered: (structured, current) => {
             if (structured && (current || root.path === null))
-                root.path = structured.notification_path
+                root.tookPath(structured.notification_path)
             if (current && root.report && root.report.reread_error)
                 root.report = Object.assign({}, root.report, {reread_error: null})
         }
     }
 
-    Component.onCompleted: firstStart = ShellState.claimFirstStart(stateDir)
+    Component.onCompleted: firstStart = ShellState.isFirstStart(stateDir)
 }

@@ -277,6 +277,185 @@ TestCase {
         verify(card.notNowButton.visible, "and the way out is there")
     }
 
+    function stateFile(dir) {
+        return TestFiles.list(dir).indexOf("state.json") >= 0
+    }
+
+    // No answer uses nothing up: the promise is an offer you actually saw.
+    function test_a_start_with_no_answer_stays_a_first_start() { // spec: APP-022
+        const dir = TestFiles.newDir("noanswer2")
+        const core = fakeComponent.createObject(tc)
+        const shell = makeShell(core, dir, fakeSetupComponent.createObject(tc))
+        tryVerify(() => reads(core) === 1, 5000)
+        verify(!stateFile(dir), "nothing written until the core answers")
+        let call = core.calls.find(c => c.name === "desktop.get")
+        answered[call.id] = true
+        core.respond(call.id, Shapes.refusal("core.unreachable", "No core."))
+        wait(50)
+        verify(!stateFile(dir), "nor when it fails")
+        dropShell(shell)
+
+        answered = {}
+        const again = fakeComponent.createObject(tc)
+        const later = makeShell(again, dir, fakeSetupComponent.createObject(tc))
+        answerRead(again, missing)
+        tryVerify(() => later.firstStartCard.visible, 5000, "still offered")
+        verify(stateFile(dir), "and recorded now")
+    }
+
+    function test_an_answer_with_nothing_missing_is_recorded_and_ends_the_offer() { // spec: APP-022
+        const dir = TestFiles.newDir("recorded")
+        const core = fakeComponent.createObject(tc)
+        const shell = makeShell(core, dir, fakeSetupComponent.createObject(tc))
+        answerRead(core, {toasts: "ready", shortcut: "ok", handlers: "ok"})
+        tryVerify(() => stateFile(dir), 5000)
+        compare(JSON.parse(TestFiles.read(dir + "/state.json")), {state: 1, workspaces: {}})
+        // Days later, a resync finds something missing: too late to be a first start's offer.
+        const before = reads(core)
+        wait(1100)
+        core.emit("desktop", "resync_required", null)
+        wait(1100)
+        compare(reads(core), before, "it has stopped reading")
+        verify(!shell.firstStartCard.visible)
+    }
+
+    function test_a_card_that_left_stays_gone() { // spec: APP-022
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("gone2"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, missing)
+        tryVerify(() => card.visible, 5000)
+        // Fixed elsewhere: a resync says so, and the card goes.
+        wait(1100)
+        core.emit("desktop", "resync_required", null)
+        answerRead(core, {toasts: "ready", shortcut: "ok", handlers: "ok"})
+        tryVerify(() => !card.visible, 5000)
+        const before = reads(core)
+        wait(1100)
+        core.emit("desktop", "resync_required", null)
+        wait(1100)
+        compare(reads(core), before, "it has stopped reading")
+        verify(!card.visible)
+    }
+
+    // Home's own write can get there first on a slow answer.
+    function test_the_record_never_replaces_a_file() { // spec: APP-022, APP-111
+        const dir = TestFiles.newDir("home")
+        const core = fakeComponent.createObject(tc)
+        const shell = makeShell(core, dir, fakeSetupComponent.createObject(tc))
+        tryVerify(() => reads(core) === 1, 5000)
+        const home = JSON.stringify({state: 1, workspaces: {ws1: {last_seen_at: "2026-10-31T10:00:00Z"}}})
+        verify(TestFiles.write(dir + "/state.json", home))
+        answerRead(core, missing)
+        tryVerify(() => shell.firstStartCard.visible, 5000, "this start began as a first")
+        compare(TestFiles.read(dir + "/state.json"), home)
+    }
+
+    function test_a_read_open_when_set_up_answers_doesnt_undo_it() { // spec: APP-022
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("late"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, missing)
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        wait(1100)
+        const before = reads(core)
+        core.emit("desktop", "resync_required", null)
+        tryVerify(() => reads(core) === before + 1, 5000)
+        card.setUpButton.click()
+        const after = {toasts: "ready", shortcut: "ok", handlers: "missing"}
+        setup.finish(Shapes.setupReport({scheme: {state: "failed", why: "Access is denied."}, notification_path: after}))
+        answerRead(core, missing)
+        wait(50)
+        compare(card.path.shortcut, "ok", "the read was made before the setup's")
+        tryVerify(() => reads(core) === before + 2, 5000, "a read that knows follows")
+    }
+
+    function test_a_failed_reread_doesnt_stay_once_a_read_answers() { // spec: APP-022
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("stuck"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, missing)
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        card.setUpButton.click()
+        setup.finish(Shapes.setupReport({notification_path: null, reread_error: "no answer within 5 s"}))
+        tryVerify(() => card.text.indexOf("couldn't say") >= 0, 5000, card.text)
+        answerRead(core, {toasts: "ready", shortcut: "ok", handlers: "missing"})
+        tryVerify(() => card.text.indexOf("couldn't say") < 0, 5000, card.text)
+        verify(card.visible)
+    }
+
+    function test_a_later_start_takes_nothing_from_a_settings_run() { // spec: APP-022
+        const dir = TestFiles.newDir("later")
+        verify(TestFiles.write(dir + "/state.json", JSON.stringify({state: 1, workspaces: {}})))
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(fakeComponent.createObject(tc), dir, setup)
+        wait(50)
+        setup.finish(Shapes.setupReport({notification_path: missing}))
+        wait(50)
+        compare(shell.firstStartCard.report, null)
+        compare(shell.firstStartCard.path, null)
+        verify(!shell.firstStartCard.visible)
+    }
+
+    function test_set_up_s_outcome_is_said_and_the_keyboard_goes_on() { // spec: APP-156
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("said"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, missing)
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        const said = []
+        card.announced.connect(t => said.push(t))
+        shell.requestActivate()
+        tryVerify(() => shell.active, 5000)
+        card.setUpButton.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        compare(setup.runs, 1)
+        verify(card.setUpButton.enabled && card.setUpButton.activeFocus, "held while it runs")
+        setup.finish(Shapes.setupReport())
+        tryVerify(() => !card.visible, 5000)
+        compare(said, ["The Start-menu shortcut and this LILITH's lil: links are set up."])
+        tryVerify(() => !!shell.activeFocusItem && !String(shell.activeFocusItem).startsWith("QQuickRootItem"), 5000,
+                  "the keyboard isn't dropped: " + shell.activeFocusItem)
+    }
+
+    // Put away during a run, the card says nothing more: Settings says why it failed.
+    function test_not_now_during_a_run_leaves_the_failure_to_settings() { // spec: APP-022
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("during"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, missing)
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        card.setUpButton.click()
+        card.notNowButton.click()
+        verify(!card.visible)
+        setup.finish(Shapes.setupReport({shortcut: {state: "failed", why: "Access is denied."}, scheme: {state: "failed", why: "Access is denied."},
+                                         notification_path: missing}))
+        verify(!card.visible, "it doesn't come back for it")
+        tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000, "the docks are laid out")
+        wait(100)
+        const dock = shell.docks.settings
+        dock.setAsCurrentTab()
+        const panel = dock.content
+        tryVerify(() => panel.shown, 5000, "Settings in front")
+        answerRead(core, missing)
+        tryVerify(() => panel.fresh, 5000)
+        let found = false
+        const visit = i => {
+            if (i.visible && typeof i.text === "string" && typeof i.lineCount === "number"
+                    && i.text.indexOf("couldn't be written: Access is denied.") >= 0)
+                found = true
+            for (let n = 0; n < i.children.length; ++n)
+                visit(i.children[n])
+        }
+        visit(panel.pathCard)
+        verify(found, "Settings shows why the last run failed")
+    }
+
     function test_a_set_up_with_no_answer_from_the_core_reads_again() { // spec: APP-022
         const core = fakeComponent.createObject(tc)
         const setup = fakeSetupComponent.createObject(tc)

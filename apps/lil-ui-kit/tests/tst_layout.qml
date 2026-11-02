@@ -149,8 +149,7 @@ TestCase {
         checkDefaultLayout(shell)
         verify(!shell.layoutBanner.visible, "no banner")
         compare(shell.saveLayout(), "", "the 60 s save")
-        // The first start's own record (state.json) isn't the layout.
-        compare(TestFiles.list(dir).filter(f => f !== "state.json"), [], "nothing is written until the layout changes")
+        compare(TestFiles.list(dir), [], "nothing is written until the layout changes")
     }
 
     function test_restore_runs_in_order() { // spec: APP-003
@@ -236,7 +235,7 @@ TestCase {
         const shell = makeShell(dir)
         ignoreWarning(/layout_save_skipped/)
         DockLayout.saveRequested()   // a logoff before the window ever showed
-        compare(TestFiles.list(dir).filter(f => f !== "state.json"), [], "nothing is written")
+        compare(TestFiles.list(dir), [], "nothing is written")
         dropShell(shell)
     }
 
