@@ -127,4 +127,14 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/home/OpenJobs.qml
         qml/panels/home/AwayCard.qml)
 
+# Task 27: the Settings panel and the first-start card.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/panels/settings/SettingsPanel.qml
+        qml/panels/settings/SettingToggle.qml
+        qml/panels/settings/NotificationToggles.qml
+        qml/panels/settings/DesktopToggles.qml
+        qml/panels/settings/NotificationSetup.qml
+        qml/shell/FirstStartCard.qml)
+
 add_subdirectory(tests)

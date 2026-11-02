@@ -87,6 +87,9 @@ Window {
     property alias topBar: topBar
     property alias connectionBanner: connectionBanner
     property alias noWorkspaceBanner: noWorkspaceBanner
+    property alias firstStartCard: firstStartCard
+    // The setup bridge the first-start card and the panels share: SetupBridge, or a test's fake.
+    property var setup: SetupBridge
     property EventLogModel eventLog: EventLogModel {
         core: root.core
     }
@@ -195,6 +198,15 @@ Window {
             width: parent.width
             core: root.core
             onNoticed: (text, kind) => topBar.showNotice(text, kind)
+        }
+
+        // The first start's notification setup (Task 27), under the banners and above the docks.
+        FirstStartCard {
+            id: firstStartCard
+            width: parent.width
+            core: root.core
+            setup: root.setup
+            stateDir: root.stateDir
         }
     }
 
@@ -352,6 +364,8 @@ Window {
             content.shell = root
         if (content && content.eventLog !== undefined && root.eventLog)
             content.eventLog = root.eventLog
+        if (content && content.setup !== undefined)
+            content.setup = root.setup
         dock.isOpenChanged.connect(() => root.panelOpenChanged(dock))
         return dock
     }

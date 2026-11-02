@@ -25,7 +25,7 @@ const all = [
      action: "panel.usage"},
     {id: "diagnostics", title: "Diagnostics", source: "../panels/diagnostics/DiagnosticsPanel.qml", area: "bottom",
      action: "panel.diagnostics"},
-    {id: "settings", title: "Settings", source: "PlaceholderPanel.qml", area: "bottom",
+    {id: "settings", title: "Settings", source: "../panels/settings/SettingsPanel.qml", area: "bottom",
      action: "panel.settings"},
     // Opened from Diagnostics' backup status line (APP-008, APP-133): the Default layout leaves it
     // closed, and it has no shortcut.

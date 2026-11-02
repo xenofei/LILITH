@@ -22,6 +22,7 @@ const codes = {
     "core.unreachable": ["transient", "same_idempotency_key"],
     "store.io": ["transient", "same_idempotency_key"],
     "caller.not_allowed": ["declined", "never"],
+    "params.invalid": ["user_fixable", "after_resolve"],
 }
 
 function errorBody(code, message) {
@@ -175,4 +176,26 @@ function confirmations(rows) {
 // The `confirmations` topic (confirm/mod.rs).
 function confirmationEvent(kind, row) {
     return {kind: kind, confirmation: row}
+}
+
+// lil_protocol::app::DesktopSettings: what `desktop.get` and `app/desktop.set` answer, and the
+// defaults of lil_schema::suite (every category on, quiet on, auto-pause off, keep-awake on).
+function desktopSettings(over) {
+    return Object.assign({notifications: {job_finished: true, job_failed: true, confirmation_waiting: true,
+                                          cap_alert: true, director_decision: true, agent_activity: true},
+                          quiet_while_fullscreen: true, fullscreen_autopause: false, keep_awake_gpu: true,
+                          keep_awake_available: true,
+                          notification_path: {toasts: "ready", shortcut: "ok", handlers: "ok"}}, over || {})
+}
+
+// The `desktop` topic's `{kind: "settings", settings}` (lil_core::desktop).
+function settingsChanged(settings) {
+    return {kind: "settings", settings: settings}
+}
+
+// lil_qt::setup::SetupReport, as the bridge's `finished` carries it.
+function setupReport(over) {
+    return Object.assign({app_missing: null, shortcut: {state: "written"}, scheme: {state: "written"},
+                          notification_path: {toasts: "ready", shortcut: "ok", handlers: "ok"},
+                          reread_error: null}, over || {})
 }
