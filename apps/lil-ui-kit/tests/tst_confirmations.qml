@@ -1154,6 +1154,179 @@ TestCase {
         tryVerify(() => !panel.dialogPopup.visible, 2000)
     }
 
+    // Two links before the layout has settled: a target that asks for the focus (Home's, once laid
+    // out) and a confirmation (held until then). The confirmation's dialog ends with the focus.
+    function test_a_held_confirm_link_keeps_the_focus_over_home_at_settle() { // spec: P4a-R10, P4a-R21
+        wait(100)
+        const shell = createTemporaryObject(shellComponent, tc)
+        verify(shell)
+        verify(!shell.layoutSettled)
+        shell.handleLaunchJson(JSON.stringify({kind: "target", target: "C:\art\crane.png", intent: "open",
+                                               focus: true, activate: true}))
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: true, activate: true}))
+        shell.visible = true
+        shell.requestActivate()
+        const panel = shell.docks.confirmations.content
+        panel.pointerSource = hand
+        Shapes.answerLists(fake, [crane], [])
+        tryVerify(() => shell.layoutSettled, 5000, "the layout settles")
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the held link opens the dialog")
+        tryVerify(() => shell.active, 2000)
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the focus")
+        wait(200)
+        verify(panel.dialog.denyButton.activeFocus, "and keeps it")
+        verify(!shell.docks.home.panelHasFocus, "Home didn't take it")
+        verify(shell.openedCard.visible, "the target is on Home's card all the same")
+        closeDialog(panel)
+        shell.destroy()
+    }
+
+    // The shell laid out and in front, with the panel's lists in.
+    function settledShell() {
+        wait(100)
+        const shell = createTemporaryObject(shellComponent, tc)
+        verify(shell)
+        shell.visible = true
+        tryVerify(() => shell.layoutSettled, 5000, "the layout settles")
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        const panel = shell.docks.confirmations.content
+        panel.pointerSource = hand
+        Shapes.answerLists(fake, [crane], [])
+        tryVerify(() => panel.list.loaded, 2000)
+        return shell
+    }
+
+    // A confirm link with no focus to a closed panel, with the keyboard elsewhere: the dialog takes the
+    // keyboard whatever the link asked (P4a-R10), so the panel opens and Deny has it.
+    function test_a_no_focus_confirm_link_opens_a_closed_panel_with_deny_focused() { // spec: P4a-R10, APP-065
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.forceClose()
+        tryVerify(() => !dock.isOpen, 2000)
+        shell.docks.hardware.focusPanel()
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000, "the keyboard is in Hardware")
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: false, activate: false}))
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        verify(dock.isOpen, "the panel opened")
+        compare(OpenPrompts.count, 1)
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        closeDialog(panel)
+        shell.destroy()
+    }
+
+    // A no-focus confirm link to a floated panel that is already open: its dialog takes the keyboard,
+    // so its window is made active (P4a-R10).
+    function test_a_no_focus_confirm_link_activates_an_open_floated_panel() { // spec: P4a-R10
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.isFloating = true
+        tryVerify(() => dock.isFloating && panel.Window.window && panel.Window.window !== shell && panel.visible, 5000,
+                  "the panel floats, open")
+        const float = panel.Window.window
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        shell.docks.hardware.focusPanel()
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000, "the keyboard is in Hardware")
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: false, activate: false}))
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        // Qt calls the float active with the main window (a window's transient family), so the proof
+        // is the keyboard: Deny has it only once the float is the focus window.
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        verify(float.activeFocusItem === panel.dialog.denyButton, "in the float")
+        closeDialog(panel)
+        dock.isFloating = false
+        tryVerify(() => panel.Window.window === shell, 5000)
+        shell.destroy()
+    }
+
+    // A no-focus link that opens no dialog (an id the core doesn't know) leaves a closed panel closed
+    // and the keyboard where it was (APP-065).
+    function test_a_no_focus_link_to_an_unknown_id_leaves_the_panel_closed() { // spec: APP-065
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        dock.forceClose()
+        tryVerify(() => !dock.isOpen, 2000)
+        shell.docks.jobs.setAsCurrentTab()
+        shell.docks.jobs.focusPanel()
+        tryVerify(() => shell.docks.jobs.panelHasFocus, 2000, "the keyboard is in Jobs")
+        const holder = shell.activeFocusItem
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: "cf_00000000000000ff", focus: false, activate: false}))
+        wait(300)
+        verify(!dock.isOpen, "Confirmations stays closed")
+        verify(shell.docks.jobs.panelHasFocus && shell.activeFocusItem === holder, "Jobs keeps the keyboard")
+        compare(OpenPrompts.count, 0)
+        shell.destroy()
+    }
+
+    // The core away, the list loaded but old, and a no-focus link for an id it doesn't have yet: the
+    // panel waits for the core, so it opens, and the dialog shows there once the core is back.
+    function test_a_no_focus_link_while_the_core_is_away_opens_the_panel() { // spec: P4a-R10
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.forceClose()
+        tryVerify(() => !dock.isOpen, 2000)
+        shell.docks.jobs.setAsCurrentTab()
+        shell.docks.jobs.focusPanel()
+        tryVerify(() => shell.docks.jobs.panelHasFocus, 2000)
+        fake.connection = "reconnecting"
+        const later = Shapes.view({id: "cf_00000000000000e7"})
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: later.id, focus: false, activate: false}))
+        fake.emit("confirmations", "event", Shapes.event("pending", later))
+        fake.connection = "ready"
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens once the core is back")
+        verify(dock.isOpen, "in the panel, which opened")
+        compare(panel.dialog.confirmationId, later.id)
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        closeDialog(panel)
+        shell.destroy()
+    }
+
+    // A floated panel whose list is being read again: the link's dialog comes later, and its window is
+    // made active then.
+    function test_a_late_dialog_in_a_floated_panel_gets_the_keyboard() { // spec: P4a-R10
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.isFloating = true
+        tryVerify(() => dock.isFloating && panel.Window.window && panel.Window.window !== shell && panel.visible, 5000,
+                  "the panel floats, open")
+        const float = panel.Window.window
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        shell.docks.hardware.focusPanel()
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000)
+        fake.emit("confirmations", "resync_required", {})
+        tryVerify(() => !panel.list.loaded, 2000, "the list is read again")
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: false, activate: false}))
+        verify(!panel.dialogPopup.visible, "no dialog yet")
+        Shapes.answerLists(fake, [crane], [])
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        verify(float.activeFocusItem === panel.dialog.denyButton, "in the float")
+        closeDialog(panel)
+        dock.isFloating = false
+        tryVerify(() => panel.Window.window === shell, 5000)
+        shell.destroy()
+    }
+
+    // Opening the panel while its dialog is open leaves the keyboard on the dialog.
+    function test_showing_the_panel_under_its_dialog_keeps_deny_focused() { // spec: P4a-R10
+        const shell = settledShell()
+        const panel = shell.docks.confirmations.content
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: true, activate: true}))
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        shell.showPanel("confirmations")
+        wait(100)
+        verify(panel.dialog.denyButton.activeFocus, "Deny keeps it: " + shell.activeFocusItem)
+        closeDialog(panel)
+        shell.destroy()
+    }
+
     function test_app_wide_shortcuts_stay_quiet_under_the_dialog() { // spec: P4a-R10, APP-011
         wait(100)
         const shell = createTemporaryObject(shellComponent, tc)

@@ -13,6 +13,8 @@ KDDW.DockWidget {
     // A Panels.js entry.
     required property var panel
     required property var core
+    // The shell's state folder, for a panel that asks for it (Panels.js `wantsStateDir`).
+    property string stateDir
 
     // The panel's own item, once loaded.
     readonly property Item content: loader.item
@@ -21,6 +23,12 @@ KDDW.DockWidget {
 
     uniqueName: panel.id
     title: panel.title
+
+    // The item that holds this dock's tabs: two docks with the same one are tabs of one group. Null
+    // while it is closed, when no one can say where it would come back.
+    function tabHolder() {
+        return loader.parent ? loader.parent.parent : null
+    }
 
     // Gives the keyboard focus to the panel's first focusable item, else to the panel.
     function focusPanel() {
@@ -45,6 +53,11 @@ KDDW.DockWidget {
         id: loader
         anchors.fill: parent
         focus: true
-        Component.onCompleted: setSource(Panels.url(root.panel), {core: root.core, title: root.panel.title})
+        Component.onCompleted: {
+            const props = {core: root.core, title: root.panel.title}
+            if (root.panel.wantsStateDir)
+                props.stateDir = root.stateDir
+            setSource(Panels.url(root.panel), props)
+        }
     }
 }

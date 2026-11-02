@@ -183,11 +183,25 @@ pub fn cap_share_permille(e: &Estimate, caps: &CapsView) -> Option<u32> {
     (permille.is_finite() && permille >= 0.0).then(|| permille.min(f64::from(u32::MAX)) as u32)
 }
 
+/// A job kind's words, or `None` for a kind this build doesn't name: that one shows as it is
+/// (P4a-R40).
+pub fn kind_word(kind: &str) -> Option<&'static str> {
+    match kind {
+        "comfy.prompt" => Some("ComfyUI prompt"),
+        "comfy.inventory" => Some("ComfyUI inventory"),
+        "comfy.install_node" => Some("Node pack install"),
+        "test.job" => Some("Test job"),
+        "assistant_task" => Some("Director task"),
+        _ => None,
+    }
+}
+
 /// An RFC 3339 time (`YYYY-MM-DDTHH:MM:SS`, an optional fraction, then `Z` or `±HH:MM`) as
-/// Unix milliseconds; `None` when it doesn't read.
+/// Unix milliseconds; `None` when it doesn't read. It takes exactly what the core's `since` takes
+/// (`Jobs::list`): a real calendar date, seconds to 59, upper-case `T` and `Z`.
 pub fn parse_utc_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't') {
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
     }
     if b[13] != b':' || b[16] != b':' {
@@ -201,7 +215,15 @@ pub fn parse_utc_ms(s: &str) -> Option<i64> {
     };
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in).contains(&d) || h > 23 || mi > 59 || sec > 59 {
         return None;
     }
     let mut rest = &s[19..];
@@ -220,7 +242,7 @@ pub fn parse_utc_ms(s: &str) -> Option<i64> {
         rest = &frac[digits..];
     }
     let offset_min = match rest {
-        "Z" | "z" => 0,
+        "Z" => 0,
         _ => {
             let sign = match rest.as_bytes().first()? {
                 b'+' => 1,
@@ -228,10 +250,14 @@ pub fn parse_utc_ms(s: &str) -> Option<i64> {
                 _ => return None,
             };
             let o = rest.get(1..)?;
-            if o.len() != 5 || o.as_bytes()[2] != b':' {
+            let digit = |i: usize| o.as_bytes().get(i).is_some_and(u8::is_ascii_digit);
+            if o.len() != 5 || o.as_bytes()[2] != b':' || ![0, 1, 3, 4].into_iter().all(digit) {
                 return None;
             }
             let (oh, om): (i64, i64) = (o[..2].parse().ok()?, o[3..].parse().ok()?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
             sign * (oh * 60 + om)
         }
     };
@@ -603,6 +629,36 @@ mod tests {
         ] {
             assert_eq!(parse_utc_ms(bad), None, "{bad}");
         }
+    }
+
+    #[test] // spec: APP-111
+    fn parse_utc_ms_takes_only_what_the_core_takes() {
+        // `jobs.list`'s `since` refuses each of these (Jobs::list, telemetry::parse_ts), so a kept
+        // time like one must never be sent, and a shown time like one reads as none.
+        for bad in [
+            "2026-02-31T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-00-10T00:00:00Z",
+            "2026-10-00T00:00:00Z",
+            "2026-10-30T12:00:60Z",
+            "2026-10-30T24:00:00Z",
+            "2026-10-30T12:60:00Z",
+            "2026-10-30t12:00:00Z",
+            "2026-10-30T12:00:00z",
+            "2026-10-30T12:00:00.Z",
+            "2026-10-30T12:00:00+24:00",
+            "2026-10-30T12:00:00+02:60",
+            "2026-10-30T12:00:00++2:00",
+            "2026",
+            "yesterday",
+        ] {
+            assert_eq!(parse_utc_ms(bad), None, "{bad}");
+        }
+        assert_eq!(
+            parse_utc_ms("2028-02-29T23:59:59.5-01:30"),
+            Some(1_835_481_599_500 + 90 * 60_000)
+        );
     }
 
     #[test] // spec: APP-114

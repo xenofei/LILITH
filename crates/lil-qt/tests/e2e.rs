@@ -1005,6 +1005,290 @@ fn topic_subscriptions_are_counted_and_kept_in_order() {
 // Helpers.
 // ---------------------------------------------------------------------------------------------
 
+/// Home's reads leave the session's project and the workspace's hint alone (ARCH-088): a call that
+/// names a project makes it the active one and writes the hint, so Home names none. The hint is
+/// `harbor`; every read Home makes, with its arguments, leaves it so, and `project.status {}` answers
+/// for `harbor`. Reading `{project: "lantern"}` moves it, which is why Home mustn't.
+#[test] // spec: APP-111, ARCH-088
+fn home_s_reads_leave_the_hint_alone() {
+    launch("home_s_reads_leave_the_hint_alone", || {
+        let mut served = PathBuf::new();
+        let mut rig = Rig::start(|env| {
+            served = env.make_workspace("home");
+            env.register_workspace(&served, true);
+        });
+        let ws = QString::from(rig.env.workspace_id(&served).as_str());
+        let id = rig
+            .probe
+            .on_gui(move |core| core.set_workspace(&ws).to_string());
+        rig.probe.finished(&id);
+        for project in ["lantern", "harbor"] {
+            let id = rig.probe.call(
+                "project.create",
+                json!({"project": project, "name": project}),
+            );
+            rig.probe.finished(&id);
+        }
+        let state = served.join(".lilith").join("state.json");
+        let hint = || std::fs::read_to_string(&state).unwrap_or_default();
+        let before = hint();
+        assert!(before.contains("harbor"), "{before}");
+        for (tool, args) in [
+            ("projects.list", json!({})),
+            ("project.status", json!({})),
+            (
+                "assets.query",
+                json!({"sort": {"field": "updated", "dir": "desc"}, "limit": 12}),
+            ),
+            ("jobs.list", json!({"limit": 100, "status": "running"})),
+            ("jobs.list", json!({"limit": 100, "order": "queue"})),
+            ("jobs.list", json!({"limit": 100, "status": "queued"})),
+            (
+                "jobs.list",
+                json!({"limit": 100, "since": "2026-01-01T00:00:00.500Z"}),
+            ),
+        ] {
+            let id = rig.probe.call(tool, args.clone());
+            let answer = rig.probe.finished(&id);
+            if tool == "project.status" {
+                assert_eq!(answer["structured"]["project"], "harbor", "{answer}");
+            }
+            assert_eq!(hint(), before, "{tool} {args} moved the hint");
+        }
+        let id = rig
+            .probe
+            .app_call("app/confirmations.list", json!({"state": "pending"}));
+        rig.probe.finished(&id);
+        assert_eq!(hint(), before);
+        let id = rig
+            .probe
+            .call("project.status", json!({"project": "lantern"}));
+        rig.probe.finished(&id);
+        assert!(
+            hint().contains("lantern"),
+            "naming one moves it: {}",
+            hint()
+        );
+    });
+}
+
+/// What the card lists on a real core (APP-111), as `home-check.ps1` steps through it: a job that
+/// finished before the kept time, two that finished after it, each read through `jobs.list {since}`
+/// and `away_items`. A kept time a second or more after a job's end doesn't list it again.
+#[test] // spec: APP-111
+fn the_card_lists_what_finished_after_the_kept_time() {
+    launch("the_card_lists_what_finished_after_the_kept_time", || {
+        let mut served = PathBuf::new();
+        let mut rig = Rig::start(|env| {
+            served = env.make_workspace("home");
+            env.register_workspace(&served, true);
+        });
+        let ws = QString::from(rig.env.workspace_id(&served).as_str());
+        let id = rig
+            .probe
+            .on_gui(move |core| core.set_workspace(&ws).to_string());
+        rig.probe.finished(&id);
+        let finish = |rig: &mut Rig| {
+            let id = rig.probe.call("test.job", json!({"lane": "cpu"}));
+            let job = rig.probe.finished(&id)["structured"]["job"]["job_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no job id"))
+                .to_string();
+            let id = rig
+                .probe
+                .call("job.wait", json!({"job_id": job, "timeout_s": 30}));
+            let waited = rig.probe.finished(&id);
+            assert_eq!(
+                waited["structured"]["job"]["status"], "succeeded",
+                "{waited}"
+            );
+            job
+        };
+        // Now with a fraction, as Home keeps it.
+        let kept_now = || {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+            lil_schema::time::rfc3339(secs).replace('Z', ".250Z")
+        };
+        let lines = |rig: &mut Rig, kept: &str| -> Vec<String> {
+            let id = rig
+                .probe
+                .call("jobs.list", json!({"since": kept, "limit": 100}));
+            let page = rig.probe.finished(&id);
+            let items = lil_qt::away::away_items_json(&json!([page]).to_string(), "[]", kept);
+            items
+                .as_array()
+                .unwrap_or_else(|| panic!("{items}"))
+                .iter()
+                .map(|l| l["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let first = finish(&mut rig);
+        std::thread::sleep(Duration::from_millis(2100));
+        let kept = kept_now();
+        assert_eq!(
+            lines(&mut rig, &kept),
+            Vec::<String>::new(),
+            "before: {first} is past"
+        );
+        let (second, third) = (finish(&mut rig), finish(&mut rig));
+        let mut listed = lines(&mut rig, &kept);
+        listed.sort();
+        let mut want = vec![second.clone(), third.clone()];
+        want.sort();
+        assert_eq!(listed, want, "the two since, not {first}");
+        // A time at least two seconds on, as the one more read's start would be, lists neither.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(lines(&mut rig, &kept_now()), Vec::<String>::new());
+        // The old time still lists them: they aren't lost until the time moves.
+        assert_eq!(lines(&mut rig, &kept).len(), 2);
+    });
+}
+
+/// A session's project is set when `app/set_context` has answered: `project.status {}` asked after
+/// that answers for it, and Home reads the counts again then (the switcher's `contextSet`).
+#[test] // spec: APP-111, ARCH-088
+fn counts_read_after_set_context_answer_for_its_project() {
+    launch(
+        "counts_read_after_set_context_answer_for_its_project",
+        || {
+            let mut served = PathBuf::new();
+            let mut rig = Rig::start(|env| {
+                served = env.make_workspace("home");
+                env.register_workspace(&served, true);
+            });
+            let ws = QString::from(rig.env.workspace_id(&served).as_str());
+            let id = rig
+                .probe
+                .on_gui(move |core| core.set_workspace(&ws).to_string());
+            rig.probe.finished(&id);
+            for project in ["lantern", "harbor"] {
+                let id = rig.probe.call(
+                    "project.create",
+                    json!({"project": project, "name": project}),
+                );
+                rig.probe.finished(&id);
+            }
+            for i in 0..20 {
+                let want = if i % 2 == 0 { "lantern" } else { "harbor" };
+                let id = rig
+                    .probe
+                    .app_call("app/set_context", json!({"project": want}));
+                rig.probe.finished(&id);
+                let id = rig.probe.call("project.status", json!({}));
+                let status = rig.probe.finished(&id);
+                assert_eq!(status["structured"]["project"], want, "{status}");
+            }
+        },
+    );
+}
+
+/// Home's reads against a real core (APP-111): each answers in the shape the panel reads, a time
+/// with a fraction is taken as `since`, and the finished job it lists comes out of `away_items`.
+#[test] // spec: APP-111
+fn home_s_reads_have_the_shapes_home_reads() {
+    launch("home_s_reads_have_the_shapes_home_reads", || {
+        let mut served = PathBuf::new();
+        let mut rig = Rig::start(|env| {
+            served = env.make_workspace("home");
+            env.register_workspace(&served, true);
+        });
+        let ws = QString::from(rig.env.workspace_id(&served).as_str());
+        let id = rig
+            .probe
+            .on_gui(move |core| core.set_workspace(&ws).to_string());
+        rig.probe.finished(&id);
+
+        let id = rig.probe.call(
+            "project.create",
+            json!({"project": "lantern", "name": "Lantern"}),
+        );
+        rig.probe.finished(&id);
+        let id = rig.probe.call("projects.list", json!({}));
+        let list = rig.probe.finished(&id);
+        let lantern = list["structured"]["projects"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|p| p["project"] == "lantern"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{list}"));
+        assert_eq!(lantern["name"], "Lantern", "{lantern}");
+        assert_eq!(lantern["status"], "active", "{lantern}");
+        assert_eq!(lantern["assets"], 0, "{lantern}");
+
+        let id = rig
+            .probe
+            .call("project.status", json!({"project": "lantern"}));
+        let status = rig.probe.finished(&id);
+        assert_eq!(status["structured"]["project"], "lantern", "{status}");
+        assert!(
+            status["structured"]["assets_by_status"].is_object(),
+            "{status}"
+        );
+        let id = rig
+            .probe
+            .call("project.status", json!({"project": "no-such-project"}));
+        match rig.probe.outcome(&id) {
+            Seen::Failed(_, error) => assert_eq!(error["code"], "project.unknown", "{error}"),
+            other => panic!("expected project.unknown, got {other:?}"),
+        }
+
+        let id = rig.probe.call(
+            "assets.query",
+            json!({"sort": {"field": "updated", "dir": "desc"}, "limit": 12}),
+        );
+        let assets = rig.probe.finished(&id);
+        assert!(assets["structured"]["assets"].is_array(), "{assets}");
+
+        let id = rig.probe.call("test.job", json!({"lane": "cpu"}));
+        let job = rig.probe.finished(&id)["structured"]["job"]["job_id"].clone();
+        let job = job.as_str().unwrap_or_else(|| panic!("{job}")).to_string();
+        let id = rig
+            .probe
+            .call("job.wait", json!({"job_id": job, "timeout_s": 30}));
+        let waited = rig.probe.finished(&id);
+        assert_eq!(
+            waited["structured"]["job"]["status"], "succeeded",
+            "{waited}"
+        );
+
+        let since = "2026-01-01T00:00:00.500Z";
+        let id = rig
+            .probe
+            .call("jobs.list", json!({"since": since, "limit": 100}));
+        let page = rig.probe.finished(&id);
+        assert!(page["structured"]["next_cursor"].is_null(), "{page}");
+        let id = rig
+            .probe
+            .app_call("app/confirmations.list", json!({"state": "pending"}));
+        let pending = rig.probe.finished(&id);
+        let rows = pending["confirmations"].to_string();
+        assert!(pending["confirmations"].is_array(), "{pending}");
+
+        let items = lil_qt::away::away_items_json(&json!([page]).to_string(), &rows, since);
+        let line = items
+            .as_array()
+            .and_then(|lines| lines.iter().find(|l| l["id"] == job.as_str()))
+            .cloned()
+            .unwrap_or_else(|| panic!("{items}"));
+        assert_eq!(line["kind"], "finished", "{line}");
+        assert!(
+            line["title"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("Test job · ")),
+            "{line}"
+        );
+        // Counted from after it, it isn't listed: by the core, nor by the card.
+        let later = "2099-01-01T00:00:00Z";
+        let id = rig
+            .probe
+            .call("jobs.list", json!({"since": later, "limit": 100}));
+        let page = rig.probe.finished(&id);
+        assert_eq!(page["structured"]["jobs"], json!([]), "{page}");
+    });
+}
+
 /// Polls `f` every 20 ms until it gives a value, for at most [`DEADLINE`].
 fn poll<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + DEADLINE;

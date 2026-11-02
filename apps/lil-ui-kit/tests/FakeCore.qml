@@ -121,7 +121,12 @@ QtObject {
                                 && (j.substatus === "submitting" || j.substatus === "queued_in_engine")
         const placeless = j => j.queue_position === undefined || j.queue_position === null
         const laneRank = j => j.lane === "gpu-heavy" ? 0 : j.lane === "cpu" ? 1 : 2
-        const sorted = jobs.map(j => dispatched(j) ? Object.assign({}, j, {queue_position: undefined}) : j)
+        // `since`: `updated` is in whole seconds, and a time with a fraction counts from the second
+        // before it (Jobs::list).
+        const sinceMs = args.since ? Date.parse(args.since) : NaN
+        const sinceS = Math.floor(sinceMs / 1000) - (sinceMs % 1000 !== 0 ? 1 : 0)
+        const later = j => isNaN(sinceMs) || Math.floor(Date.parse(j.updated) / 1000) > sinceS
+        const sorted = jobs.filter(later).map(j => dispatched(j) ? Object.assign({}, j, {queue_position: undefined}) : j)
         let listed
         if (args.order === "queue") {
             listed = sorted.filter(j => j.status === "queued" && !dispatched(j)).sort((a, b) =>

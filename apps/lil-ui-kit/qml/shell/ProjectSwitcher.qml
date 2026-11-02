@@ -52,6 +52,10 @@ Item {
 
     // As the workspace switcher's.
     signal workspaceRefused(string message)
+    // The session's project has been set, by a choice or again on a new connection, and calls made
+    // from now on use it: a call naming no project made before this answered for whatever the hint
+    // says. `Core.project` alone can't say so: choosing the project it still holds doesn't change it.
+    signal contextSet()
 
     implicitWidth: Math.min(button.implicitWidth, 200)
     implicitHeight: button.implicitHeight
@@ -150,6 +154,7 @@ Item {
                 if (root.workspaceId() === asked) {
                     root.core.noteProject(r.project || "")
                     root.effectiveProject = r.effective_project || ""
+                    root.contextSet()
                 }
                 popup.close()
             },
@@ -187,6 +192,7 @@ Item {
                     return
                 root.core.noteProject(r.project || "")
                 root.effectiveProject = r.effective_project || ""
+                root.contextSet()
             },
             error: e => {
                 if (!same())

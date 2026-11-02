@@ -1,7 +1,8 @@
 // Home's "Opened" card (P4a-R21): what an open request showed last, a `lil:open/` link, a raw
 // `lil://` ref, a `.lilref` file, a file path, an agent's `ui.show` or `open_in`, with its intent,
 // or why a link was refused ("This link isn't one LILITH opens: …", APP-020). Plan 4b routes the
-// target to the Inspector instead; until Task 26 builds Home, the shell holds the card.
+// target to the Inspector instead. It sits at the top of Home; the shell hands it each request and
+// opens Home.
 //
 // It shows a target as text only: nothing is fetched, loaded or run from it (AI-222). Every
 // string from outside (the target, a `.lilref` title, a refusal) goes through shownLinkText
@@ -28,6 +29,11 @@ LCard {
     readonly property alias copyButton: copyButton
     readonly property alias dismissButton: dismissButton
 
+    // A request came: the panel brings the card into view.
+    signal opened()
+    // Dismiss hid the card; `hadFocus`: its button had the keyboard focus, which needs somewhere to go.
+    signal dismissed(bool hadFocus)
+
     // A launch or open request of kind target, ref or lilref: {target, title?, intent}.
     function show(launch) {
         message = ""
@@ -36,6 +42,7 @@ LCard {
         intentText = launch.intent === "edit" ? "Edit"
                    : launch.intent === "use_as_input" ? "Use as input" : "Open"
         visible = true
+        opened()
     }
 
     function showRefused(text) {
@@ -44,6 +51,7 @@ LCard {
         heading = "Link refused"
         message = shown(text, 300)
         visible = true
+        opened()
     }
 
     // lil_qt::args::shown_outside, from the bridge itself (whatever core the shell was given).
@@ -114,7 +122,11 @@ LCard {
             LButton {
                 id: dismissButton
                 text: "Dismiss"
-                onClicked: root.visible = false
+                onClicked: {
+                    const hadFocus = activeFocus
+                    root.visible = false
+                    root.dismissed(hadFocus)
+                }
             }
         }
     }

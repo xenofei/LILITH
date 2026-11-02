@@ -188,10 +188,7 @@ Rectangle {
     }
 
     function kindLabel(kind) {
-        const known = {"comfy.prompt": "ComfyUI prompt", "comfy.inventory": "ComfyUI inventory",
-                       "comfy.install_node": "Node pack install", "test.job": "Test job",
-                       "assistant_task": "Director task"}
-        return kind ? word(known, kind) : "Job"
+        return kind ? JobText.kindWord(kind) || shown(kind) : "Job"
     }
 
     function originLabel(origin) {
@@ -239,14 +236,7 @@ Rectangle {
 
     // A running job's substatus: nothing for `executing`, else its words or its name.
     function runningLabel(substatus) {
-        if (!substatus || substatus === "executing")
-            return ""
-        const retrying = /^retrying_(\d+)_of_(\d+)$/.exec(substatus)
-        if (retrying)
-            return "Retrying (" + retrying[1] + " of " + retrying[2] + ")"
-        const known = {cancelling: "Cancelling", interrupted_unknown: "Outcome unknown",
-                       ingesting: "Bringing in the outputs"}
-        return word(known, substatus)
+        return PausedText.runningWords(substatus, core)
     }
 
     // --- Rows. ---

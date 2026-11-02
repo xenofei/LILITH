@@ -22,8 +22,9 @@
 //
 // Open requests (APP-014, APP-020, APP-065, P4a-R21; the block marked "Open requests" below):
 // a launch (handleLaunchJson, from main.cpp: this start's own, then each one a second launch
-// forwards) and each `open_requests:image` event. A target, raw ref or `.lilref` shows in the
-// Opened card, and a refused link's message there; `task` opens Jobs on that job (`shownJob`, and
+// forwards) and each `open_requests:image` event. A target, raw ref or `.lilref` shows in Home's
+// Opened card, and a refused link's message there, with Home opened and brought to the front, or
+// with no `focus` only where that covers no panel holding the keyboard (showWithoutFocus); `task` opens Jobs on that job (`shownJob`, and
 // the panel's showJob(id) when it has one); `confirm` opens Confirmations on that confirmation
 // (`shownConfirmation`, and the panel's showConfirmation(id)). The window comes forward through
 // `shim.activate(window, focus)` (LilShim; the tests pass a fake): an agent's request, or a launch
@@ -94,10 +95,21 @@ Window {
 
     onGpuPauseToggleRequested: topBar.togglePause()
 
+    // Home reads the counts of the session's project, which a new connection has only once the switcher
+    // has set it again.
+    Connections {
+        target: topBar.projectSwitcher
+        function onContextSet() {
+            if (root.docks.home && root.docks.home.content)
+                root.docks.home.content.contextSet()
+        }
+    }
+
     // --- Open requests (Task 19) ---
     // The shim the window is activated through: LilShim, or a test's fake.
     property var shim: LilShim
-    property alias openedCard: openedCard
+    // Home's Opened card: Home is loaded with the shell, open or not.
+    property Item openedCard: null
     property alias instanceBanner: instanceBanner
     // The job a `task` link last opened Jobs on, and the confirmation a `confirm` link last
     // opened Confirmations on.
@@ -114,7 +126,35 @@ Window {
         _heldLaunches = []
         held.forEach(handleLaunch)
     }
-    onLayoutSettledChanged: _runHeldLaunches()
+    // A launch that asked for the focus came before the Default layout was laid out.
+    property bool _focusHomeOnSettle: false
+    // The confirmation a no-focus link asked for: its dialog's opening makes a floated panel's window
+    // active. The Confirmations panel, once made.
+    property string _activateConfirm
+    property Item _confirmPanel: null
+
+    Connections {
+        target: root._confirmPanel ? root._confirmPanel.dialogPopup : null
+        function onOpened() {
+            const panel = root._confirmPanel
+            if (root._activateConfirm === "" || panel.dialog.confirmationId !== root._activateConfirm)
+                return
+            root._activateConfirm = ""
+            const win = panel.Window.window
+            if (win && win !== root)
+                win.requestActivate()
+        }
+    }
+    // Once laid out: Home takes the focus such a launch asked for, unless a confirmation is open
+    // (P4a-R10), and then the held links run, so a confirmation dialog one opens ends with the focus.
+    onLayoutSettledChanged: {
+        if (layoutSettled && _focusHomeOnSettle) {
+            _focusHomeOnSettle = false
+            if (OpenPrompts.count === 0)
+                docks.home.focusPanel()
+        }
+        _runHeldLaunches()
+    }
 
     Connections {
         target: OpenPrompts
@@ -200,18 +240,6 @@ Window {
         Accessible.name: text
     }
 
-    // --- Open requests (Task 19): the Opened card, until Task 26 moves it into Home ---
-    OpenedCard {
-        id: openedCard
-        anchors.right: dockingArea.right
-        anchors.bottom: dockingArea.bottom
-        anchors.margins: 2 * Theme.spacing
-        width: Math.min(420, dockingArea.width - 4 * Theme.spacing)
-        height: implicitHeight
-        z: 10
-    }
-    // --- end of open requests ---
-
     Component {
         id: dockComponent
         DockedPanel {}
@@ -284,6 +312,8 @@ Window {
         LilShim.applyPalette(Theme.palette)
         for (const panel of Panels.all)
             createDock(panel.id)
+        openedCard = docks.home.content.openedCard
+        _confirmPanel = docks.confirmations ? docks.confirmations.content : null
         restoreLayout()
         _settling = false
         if (core)
@@ -313,7 +343,7 @@ Window {
         const panel = Panels.byId(id)
         if (!panel)
             return null
-        const dock = dockComponent.createObject(root, {panel: panel, core: root.core})
+        const dock = dockComponent.createObject(root, {panel: panel, core: root.core, stateDir: root.stateDir})
         docks[id] = dock
         // Diagnostics reaches the shell (it opens Backups and Jobs), and takes the shell's event
         // log when it keeps one.
@@ -526,7 +556,10 @@ Window {
         if (!dock.isOpen)
             dock.open()
         dock.raise()
-        dock.focusPanel()
+        // A dialog the panel holds keeps the keyboard (P4a-R10).
+        const content = dock.content
+        if (!(content && content.dialogPopup && content.dialogPopup.visible))
+            dock.focusPanel()
         // A panel in a floating window: that window takes the keys.
         const win = dock.content ? dock.content.Window.window : null
         if (win && win !== root)
@@ -608,17 +641,40 @@ Window {
             shim.activate(root, focus)
         if (launch.kind === "target" || launch.kind === "ref" || launch.kind === "lilref") {
             openedCard.show(launch)
+            showOpenedCard(focus)
         } else if (launch.kind === "refused") {
             openedCard.showRefused(launch.message || "")
+            showOpenedCard(focus)
         } else if (launch.kind === "task") {
             shownJob = launch.job
             openPanelOn("jobs", "showJob", launch.job, focus)
         } else if (launch.kind === "confirm") {
             shownConfirmation = launch.id
+            // Its dialog takes the keyboard whatever the link asked (P4a-R10), and opens only in an open
+            // panel: so with no focus a closed panel opens when a dialog may follow, and a floated
+            // panel's window is made active when this link's dialog opens, now or once the panel has
+            // what it waits for (`_activateConfirm`); no other dialog activates it. A link no dialog
+            // follows (an id the core doesn't know, or one already answered) leaves a closed panel
+            // closed (APP-065).
+            const dock = docks.confirmations
+            if (!focus && dock && !dock.isOpen && confirmDialogMayOpen(launch.id))
+                dock.open()
+            _activateConfirm = focus ? "" : launch.id
             openPanelOn("confirmations", "showConfirmation", launch.id, focus)
         } else if (launch.kind === "confirm_list") {
             openPanelOn("confirmations", "", "", focus)
         }
+    }
+
+    // Whether the Confirmations panel would open its dialog on `id`: yes while its list isn't in or
+    // the core is away (it waits, and the dialog may follow), else only for a pending confirmation it
+    // lists.
+    function confirmDialogMayOpen(id) {
+        const panel = docks.confirmations ? docks.confirmations.content : null
+        if (!panel || !panel.list || !panel.list.loaded || !panel.coreReady)
+            return true
+        const view = panel.list.view(id)
+        return !!view && view.state === "pending"
     }
 
     // An `open_requests:image` event: {target, intent, focus} (APP-063, APP-065).
@@ -629,19 +685,41 @@ Window {
                       focus: data.focus === true, activate: true})
     }
 
+    // Brings Home, and so the Opened card, to the front. The Default layout that is still waiting
+    // for its size opens Home in front anyway, and the focus goes in once it has settled.
+    function showOpenedCard(focus) {
+        if (!_defaultPending)
+            openPanelOn("home", "", "", focus)
+        else
+            _focusHomeOnSettle = _focusHomeOnSettle || focus
+    }
+
+    // A panel shown with no keyboard focus (APP-065): never over a panel that holds the focus, and a
+    // floating one's window isn't activated (a dock's raise does that). The person's way to it is the
+    // taskbar flash or the agent's toast, then its shortcut. A closed panel may come back in the tabs
+    // of the one with the focus, and nothing says where before it does, so then it stays closed.
+    function showWithoutFocus(dock) {
+        if (dock.content && dock.content.visible)
+            return
+        const holder = openPanels().find(d => d !== dock && d.panelHasFocus)
+        if (!dock.isOpen) {
+            if (!holder)
+                dock.open()
+        } else if (!holder || holder.tabHolder() !== dock.tabHolder()) {
+            dock.setAsCurrentTab()
+        }
+    }
+
     // Opens panel `id`, and calls its `method(arg, focus)` when the panel has one; the keyboard
     // focus moves into it only with `focus`.
     function openPanelOn(id, method, arg, focus) {
         const dock = docks[id]
         if (!dock)
             return
-        if (focus) {
+        if (focus)
             showPanel(id)
-        } else {
-            if (!dock.isOpen)
-                dock.open()
-            dock.raise()
-        }
+        else
+            showWithoutFocus(dock)
         const content = dock.content
         if (method && content && typeof content[method] === "function")
             content[method](arg, focus)

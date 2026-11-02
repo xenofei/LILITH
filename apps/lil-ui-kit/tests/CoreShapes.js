@@ -145,3 +145,34 @@ function refusedHello(code, message) {
 function otherCause(cause, reason) {
     return {reason: reason, cause: cause}
 }
+
+// `project.status` (projects/mod.rs ProjectStatus): only the statuses that have assets are listed.
+function projectStatus(project, byStatus) {
+    return tool({project: project, status: "active", assets_by_status: byStatus, orphans: [], needs_repair: [],
+                 missing: []})
+}
+
+// pipeline/detail.rs AssetSummary, in `assets.query`'s page (asset_read_tools.rs).
+function asset(project, id, status, updated) {
+    return {ref: "lil://0123456789abcdef/" + project + "/" + id, project: project, asset_id: id, type: "image",
+            status: status, version: null, approved_version: null, updated: updated, needs_repair: false}
+}
+
+function assetsPage(rows) {
+    return tool({assets: rows, next_cursor: null, total: rows.length})
+}
+
+// lil_protocol::app::ConfirmationView, and `app/confirmations.list`'s answer.
+function confirmation(id, tool, created, over) {
+    return Object.assign({id: id, tool: tool, arguments: {}, caller_kind: "mcp", covers: ["confirm"], state: "pending",
+                          created: created, expires_at: "2026-12-31T00:00:00Z"}, over || {})
+}
+
+function confirmations(rows) {
+    return app({confirmations: rows})
+}
+
+// The `confirmations` topic (confirm/mod.rs).
+function confirmationEvent(kind, row) {
+    return {kind: kind, confirmation: row}
+}

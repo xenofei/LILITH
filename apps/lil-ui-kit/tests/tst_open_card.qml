@@ -52,7 +52,7 @@ TestCase {
         const shell = createTemporaryObject(shellComponent, tc)
         verify(shell, "ShellWindow created")
         shell.visible = true
-        tryVerify(() => shell.docks.home.content && shell.docks.home.content.width > 0, 5000,
+        tryVerify(() => shell.docks.home.content && shell.docks.home.content.onScreen, 5000,
                   "the docks are laid out")
         return shell
     }
