@@ -18,12 +18,13 @@
        (a) the first start: the card offers Set up and Not now; state.json is on disk; Not now puts it
            away, and the next start doesn't show it;
        (b) state.json removed, so a first start again: the card's Set up, pressed through Invoke, writes
-           the shortcut, exactly to the deployed lil-image.exe with the channel's AUMID and CLSID, and
-           the own scheme's command, exactly `"<lil-image.exe>" "%1"`, and no `.lilref` under the test
+           the shortcut, exactly to the deployed lil-image.exe, the channel's AUMID and CLSID registrations
+           (what the shortcut itself carries of them is desktop_set_up_writes_the_shortcut_and_handlers'
+           to check), and the own scheme's command, exactly `"<lil-image.exe>" "%1"`, and no `.lilref` under the test
            channel's classes root. Under the real classes root, read only, before and after: `.lilref`'s
            value, the real channels' schemes, their AUMID registrations and the CLSIDs those name are
            unchanged, and neither the test channel's scheme, AUMID nor CLSID is there;
-       (c) the core then told it is set up: Settings says nothing stands in the way and has no Set up;
+       (c) the core then told it is set up: Settings says nothing it can check stands in the way and has no Set up;
        (d) a switch in Settings, pressed through Toggle or Invoke, reaches the core and suite.toml;
        (e) Windows' reason: "Open Windows notification settings", pressed through Invoke, opens Windows'
            Settings. Only when no Settings process is running, so the one it starts is the one this
@@ -445,8 +446,8 @@ try {
     Invoke-Element (Wait-Enabled 'Not now' 5)
     Set-FakeDesktop '{"handlers":true,"shortcut":true,"toasts":"ready"}'
     Send-Keys '^,'
-    [void](Wait-For { Find-NameStarting 'Nothing stands in the way' } 15 'Settings to say so')
-    Pass '(c) Settings says nothing stands in the way'
+    [void](Wait-For { Find-NameStarting 'Nothing LILITH can check stands in the way' } 15 'Settings to say so')
+    Pass '(c) Settings says nothing it can check stands in the way'
     Check ($null -eq (Find-Named 'Set up')) '(c) and has no Set up'
 
     # (d) A switch, pressed through Toggle or Invoke.
