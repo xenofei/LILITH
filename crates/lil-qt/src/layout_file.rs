@@ -217,14 +217,18 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_replacing_with(path, bytes, |name| format!("{name}.bak"))
 }
 
-/// How long a read or a swap waits for another program that holds the file for a moment (a person's
-/// tool, a backup program, an antivirus, a script reading it without sharing deletion), in all.
-/// These run on the GUI thread too, so it stays short: a longer hold fails, and the caller's next
-/// attempt tries again.
-pub const SHARE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long one read or one swap may sleep, in all, waiting for another program that holds the file
+/// for a moment (a person's tool, a backup program, an antivirus, a script reading it without sharing
+/// deletion). It is per call: Home's `setLastSeen` is a read and a swap, so two of these. They run on
+/// the GUI thread (Home's time, the layout save) and on the exports' worker threads, so it stays short:
+/// a longer hold fails as before, and the caller's next attempt tries again (Home at its next mark,
+/// the layout at its next save).
+pub const SHARE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// `op`, again while it fails with a sharing violation (or a replace Windows couldn't finish for one),
-/// from 10 ms doubling, for [`SHARE_WAIT`] in all; then its last error.
+/// sleeping 10 ms, doubling up to 100 ms, while the sleeps stay within [`SHARE_WAIT`]; then its last
+/// error. With 50 ms that is 10 and 20 ms, so at most 30 ms of sleep. Every `write_replacing` writer
+/// has it: state.json, layout.json and the CSV and bundle exports.
 pub(crate) fn retry_shared<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let start = std::time::Instant::now();
     let mut pause = std::time::Duration::from_millis(10);
