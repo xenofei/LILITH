@@ -227,3 +227,8 @@ set_tests_properties(grab_settings PROPERTIES
     TIMEOUT 300
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 29: the whole shell's layout (it makes shells, so on the 1280 x 800 offscreen screen).
+lil_qml_test(tst_layout_full tst_layout_full.qml)
+set_property(TEST tst_layout_full APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
