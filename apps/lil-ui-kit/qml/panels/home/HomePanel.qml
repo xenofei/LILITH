@@ -34,10 +34,11 @@
 // without a `stateDir` keeps none, and so has no card. A person must never lose a line they weren't
 // shown, and a line they watched arrive shouldn't come back. So after Home has been on screen in the
 // active window for `seenAfterMs` in a row with no read of the card's out (not behind a tab, in a
-// closed dock, on a minimized window, under another program, on a locked screen, or with the core
-// away), it does one more jobs read, and the time written is when that read began (`seenStamp`, never
-// `now`). That is a second or more after the read that showed the last line, which matters because the
-// core's `since` lists again the second a fractional time falls in. If that read brings a new line,
+// closed dock, on a minimized window, under another program, or with the core away; a locked screen
+// is meant to count as not active, but no test or real run has shown it), it does one more jobs
+// read, and the time written is when that read began (`seenStamp`, never `now`). That is a second or
+// more after the read that showed the last line, which matters because the core's `since` lists
+// again the second a fractional time falls in. If that read brings a new line,
 // fails, or lands with Home off screen or inactive, nothing is written, and the wait starts again. A
 // new line on the card starts it again too, and a steady stream of reads puts the write off, never the
 // other way. Active is Qt's: a floating Home counts while any of the app's windows has the focus. A
