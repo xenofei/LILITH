@@ -1621,6 +1621,66 @@ TestCase {
         compare(panel.awayCard.moreLabel.text, "and 6 more. Jobs and Confirmations list them.")
     }
 
+    function test_a_line_that_hides_rows_names_only_what_it_hides() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const jobs = []
+        for (let i = 0; i < 19; ++i)
+            jobs.push(Shapes.job("j_00000000000" + String(10000 + i), "succeeded", {updated: "2026-10-30T13:00:05Z"}))
+        // Older than the jobs: one shows on the 20th line, and two are hidden.
+        const pending = ["cf_00000000000000b1", "cf_00000000000000b2", "cf_00000000000000b3"].map(
+            id => Shapes.confirmation(id, "comfy.run", "2026-10-30T12:30:00Z"))
+        settle(core, panel, scene({jobs: jobs, pending: pending}))
+        compare(panel.awayCard.moreLabel.text, "and 2 more. Confirmations lists them.")
+    }
+
+    function test_open_jobs_past_the_cap_says_only_that_there_is_more() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        settle(core, panel, scene())
+        // The Jobs panel stops at the same cap, so it doesn't list them either.
+        panel.jobsCapped = 10000
+        compare(panel.openJobs.moreLabel.text, "and more.")
+        const jobs = []
+        for (let i = 0; i < 11; ++i)
+            jobs.push(Shapes.job("j_000000000000001" + i.toString(16), "queued", {queue_position: i}))
+        core.emit("jobs", "event", {kind: "job", job: jobs[0]})
+        tryVerify(() => {
+            answerAll(core, scene({jobs: jobs}))
+            return panel.openJobs.count === 11 && panel._open === 0
+        }, 5000)
+        panel.jobsCapped = 10000
+        compare(panel.openJobs.moreLabel.text, "and 3 or more.")
+    }
+
+    function test_choosing_the_project_core_already_holds_reads_its_counts() { // spec: APP-111
+        const core = makeCore()
+        core.project = "lantern"
+        const shell = makeShell(core)
+        const panel = shell.docks.home.content
+        const switcher = shell.topBar.projectSwitcher
+        // A resend failed: the bar shows the hint, and Core.project still says lantern.
+        const open = () => core.calls.filter(c => c.name === "app/set_context" && !answered[c.id])
+        const harbor = scene({status: Shapes.projectStatus("harbor", {stale: 1})})
+        settle(core, panel, harbor)
+        switcher.effectiveProject = "harbor"
+        for (const c of open())
+            answered[c.id] = true
+        compare(panel.statusCounts.title, "Assets in harbor")
+        const before = callsOf(core, "project.status").length
+        switcher.choose("lantern")
+        const set = open().pop()
+        verify(set && set.args.project === "lantern", "it asks for lantern")
+        answered[set.id] = true
+        verify(core.respond(set.id, Shapes.context("ws1", "lantern", "lantern")))
+        compare(core.project, "lantern", "no change for noteProject to signal")
+        tryVerify(() => callsOf(core, "project.status").length === before + 1, 3000, "the counts are read again")
+        settle(core, panel, scene({status: Shapes.projectStatus("lantern", {stale: 3})}))
+        compare(panel.statusCounts.title, "Assets in lantern")
+        shell.destroy()
+    }
+
     function test_a11y_walk_passes() { // spec: APP-156
         const dir = stateWith("ws1", seen)
         const core = makeCore()

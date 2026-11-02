@@ -8,9 +8,9 @@
 // `{kind: "queue"}`) reads the jobs, one that ended the cards too, and a confirmation's event the
 // confirmations. They wait 150 ms after the last such event, at most 1 s after the first, so a burst
 // is one read. The counts walk the project's folder, so job ends read them at most once in
-// `statusGapMs`, with a last read so that they settle. Choosing a project reads them at once, and so
-// does the top bar's switcher having set the project again on a new session (`contextSet`): a read
-// made before that answered for whatever the hint says. A
+// `statusGapMs`, with a last read so that they settle. The top bar's switcher having set the project,
+// by a choice or again on a new session (`contextSet`), reads them at once: a read made before that
+// answered for whatever the hint says. A
 // snapshot, a `resync_required` or `ready` reads everything, and until each read lands what it covers
 // is grey and says it is being read again. A failed read keeps what the card shows, greyed, says so,
 // and is asked again after 1 s, doubling up to 30 s, or with the next read of anything, except the
@@ -655,8 +655,8 @@ Rectangle {
         _dismissed = {}
     }
 
-    // The top bar's switcher has set the session's project again: the counts asked before that answered
-    // for whatever the hint says.
+    // The top bar's switcher has set the session's project: the counts asked before that answered for
+    // whatever the hint says.
     function contextSet() {
         due({status: true})
         requestRead()

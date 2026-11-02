@@ -24,9 +24,14 @@ LCard {
             return panel.noteFor("jobs", "the jobs")
         return panel.isStale("confirmations") ? panel.noteFor("confirmations", "the confirmations") : ""
     }
-    // Where the rows it doesn't show are.
-    readonly property string whereHidden: panel.awayItems.slice(maxLines).some(item => item.kind === "confirmation")
-                                          ? "Jobs and Confirmations list them." : "Jobs lists them."
+    // Where the rows it doesn't show are, by what they are. Pages its read didn't take in are jobs.
+    readonly property string whereHidden: {
+        const hidden = panel.awayItems.slice(maxLines)
+        const confirmations = hidden.some(item => item.kind === "confirmation")
+        const jobs = panel.awayCut || hidden.some(item => item.kind !== "confirmation")
+        return jobs && confirmations ? "Jobs and Confirmations list them."
+                                     : confirmations ? "Confirmations lists them." : "Jobs lists them."
+    }
     readonly property string moreText: {
         if (moreLines <= 0 && !panel.awayCut)
             return ""

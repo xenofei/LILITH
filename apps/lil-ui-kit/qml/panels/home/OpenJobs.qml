@@ -95,9 +95,10 @@ LCard {
             text: {
                 const capped = root.panel.jobsCapped
                 if (root.count > root.maxRows)
-                    return "and " + MoneyText.count(String(root.count - root.maxRows)) + (capped >= 0 ? " or more. " : " more. ")
-                           + "Jobs lists them."
-                return capped >= 0 ? "and more. Jobs lists them." : ""
+                    return "and " + MoneyText.count(String(root.count - root.maxRows))
+                           + (capped >= 0 ? " or more." : " more. Jobs lists them.")
+                // Past the cap Jobs stops too ("Showing the first N queued jobs").
+                return capped >= 0 ? "and more." : ""
             }
             textFormat: Text.PlainText
             color: Theme.textMuted
