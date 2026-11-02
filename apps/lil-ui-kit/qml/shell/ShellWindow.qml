@@ -538,7 +538,10 @@ Window {
         if (!dock.isOpen)
             dock.open()
         dock.raise()
-        dock.focusPanel()
+        // A dialog the panel holds keeps the keyboard (P4a-R10).
+        const content = dock.content
+        if (!(content && content.dialogPopup && content.dialogPopup.visible))
+            dock.focusPanel()
         // A panel in a floating window: that window takes the keys.
         const win = dock.content ? dock.content.Window.window : null
         if (win && win !== root)
@@ -629,6 +632,10 @@ Window {
             openPanelOn("jobs", "showJob", launch.job, focus)
         } else if (launch.kind === "confirm") {
             shownConfirmation = launch.id
+            // Its dialog takes the keyboard whatever the link asked (P4a-R10), and opens only in an open
+            // panel: so the panel opens even with no focus.
+            if (!focus && docks.confirmations && !docks.confirmations.isOpen)
+                docks.confirmations.open()
             openPanelOn("confirmations", "showConfirmation", launch.id, focus)
         } else if (launch.kind === "confirm_list") {
             openPanelOn("confirmations", "", "", focus)

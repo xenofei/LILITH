@@ -1181,6 +1181,55 @@ TestCase {
         shell.destroy()
     }
 
+    // The shell laid out and in front, with the panel's lists in.
+    function settledShell() {
+        wait(100)
+        const shell = createTemporaryObject(shellComponent, tc)
+        verify(shell)
+        shell.visible = true
+        tryVerify(() => shell.layoutSettled, 5000, "the layout settles")
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        const panel = shell.docks.confirmations.content
+        panel.pointerSource = hand
+        Shapes.answerLists(fake, [crane], [])
+        tryVerify(() => panel.list.loaded, 2000)
+        return shell
+    }
+
+    // A confirm link with no focus to a closed panel, with the keyboard elsewhere: the dialog takes the
+    // keyboard whatever the link asked (P4a-R10), so the panel opens and Deny has it.
+    function test_a_no_focus_confirm_link_opens_a_closed_panel_with_deny_focused() { // spec: P4a-R10, APP-065
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.forceClose()
+        tryVerify(() => !dock.isOpen, 2000)
+        shell.docks.hardware.focusPanel()
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000, "the keyboard is in Hardware")
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: false, activate: false}))
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        verify(dock.isOpen, "the panel opened")
+        compare(OpenPrompts.count, 1)
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        closeDialog(panel)
+        shell.destroy()
+    }
+
+    // Opening the panel while its dialog is open leaves the keyboard on the dialog.
+    function test_showing_the_panel_under_its_dialog_keeps_deny_focused() { // spec: P4a-R10
+        const shell = settledShell()
+        const panel = shell.docks.confirmations.content
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: true, activate: true}))
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        shell.showPanel("confirmations")
+        wait(100)
+        verify(panel.dialog.denyButton.activeFocus, "Deny keeps it: " + shell.activeFocusItem)
+        closeDialog(panel)
+        shell.destroy()
+    }
+
     function test_app_wide_shortcuts_stay_quiet_under_the_dialog() { // spec: P4a-R10, APP-011
         wait(100)
         const shell = createTemporaryObject(shellComponent, tc)
