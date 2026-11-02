@@ -61,10 +61,12 @@ pub fn away_items_json(pages_json: &str, pending_json: &str, last_seen: &str) ->
 }
 
 /// The core's own `since` (`jobs.list`, Appendix G): `updated` is kept in whole seconds, so a time
-/// with a fraction counts from the second before it, and also lists the jobs of its own second.
+/// with a fraction counts from the second before it, and also lists the jobs of its own second. A
+/// fraction of `.000` counts as one here, so no job later in that second is lost. The core takes
+/// `.000` as a whole second, so Home never keeps such a time (`HomePanel.seenStamp`).
 fn since_secs(last_seen: &str) -> Option<i64> {
     let ms = parse_utc_ms(last_seen)?;
-    Some(ms.div_euclid(1000) - i64::from(ms.rem_euclid(1000) != 0))
+    Some(ms.div_euclid(1000) - i64::from(last_seen.contains('.')))
 }
 
 fn text<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
@@ -229,6 +231,12 @@ mod tests {
         ];
         let items = away_items(&jobs, &[], Some("2026-10-30T12:00:05.200Z"));
         assert_eq!(ids(&items), ["j_same_second"]);
+        // A fraction of exactly .000 is one too: the job later in that second isn't lost.
+        let items = away_items(&jobs, &[], Some("2026-10-30T12:00:05.000Z"));
+        assert_eq!(ids(&items), ["j_same_second"]);
+        // With no fraction, as the core's whole-second `since`: only later seconds.
+        let items = away_items(&jobs, &[], Some("2026-10-30T12:00:05Z"));
+        assert_eq!(ids(&items), [] as [&str; 0]);
         // The same time with an offset reads the same.
         let items = away_items(&jobs, &[], Some("2026-10-30T14:00:05.200+02:00"));
         assert_eq!(ids(&items), ["j_same_second"]);
