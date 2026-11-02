@@ -1690,4 +1690,19 @@ TestCase {
         wait(300)
         compare(r.progressApplied - applied, 1, "one event, applied once")
     }
+
+    // A clock set back (the time of day stepped back by a minute) never holds progress back: a
+    // negative time since counts as long ago, and the gate never waits more than 100 ms.
+    function test_progress_after_the_clock_steps_back_shows_at_once() { // spec: APP-139, APP-114
+        const t = load({jobs: [job("j1", {progress: {value: 0, max: 50}})]})
+        const r = row(t.panel, "j1")
+        const at = Date.now()
+        r.offerProgress({value: 1, max: 50}, at)
+        compare(r.progressValue, 1, "shown at t")
+        r.offerProgress({value: 2, max: 50}, at - 60000)
+        compare(r.progressValue, 2, "shown at once a minute back")
+        r.offerProgress({value: 3, max: 50}, at - 59990)
+        verify(r.progressValue === 3 || r.progressValue === 2, String(r.progressValue))
+        tryCompare(r, "progressValue", 3, 500, "a held one waits at most 100 ms")
+    }
 }

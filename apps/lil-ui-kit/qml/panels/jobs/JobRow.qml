@@ -2,14 +2,15 @@
 // who started it, its class and its lane when they aren't the usual (`user`, `gpu-heavy`), its
 // status in words, and its controls. The same row shows a live job (LiveJobsModel, whose `place`,
 // `eta_text`, `elapsed_text` and `batch_size` Rust works out) and a finished one (the panel's
-// JsonListModel); nothing in it reads the clock.
+// JsonListModel); only its progress limit reads the clock (`Date.now`).
 //
 // - **Running:** its substatus ("Retrying (1 of 3)", "Cancelling", "Outcome unknown" with its
 //   error and no clock, any other by its name), its phase, its progress, how long it has run and
 //   its time left, the "unresponsive" and slow flags, its live preview (PreviewImage), and
 //   Cancel. Progress comes only on `job:<id>`, which the row follows while the job runs, and is
-//   applied at most 10 times a second (leading edge: the first at once, then the newest waiting
-//   one every 100 ms); a status event of the job drops the waiting one.
+//   applied about 10 times a second: an event 100 ms or more after the one before shows at once,
+//   so it can follow a held one within a few ms; a faster burst waits, and its newest is shown
+//   100 ms after the last one shown. A status event of the job drops the waiting one.
 // - **Queued:** why it waits (a held job names its reasons, "Held after a restart" among them;
 //   "Waiting for GPU memory"; a job the core has dispatched, which has no place: "Submitting", "In
 //   ComfyUI's queue", or a retry waiting on the earlier ComfyUI prompt it inherited, as the core
@@ -179,25 +180,27 @@ Rectangle {
     property real _appliedAt: 0
     property real _arrivedAt: 0
 
-    function applyProgress(p) {
+    function applyProgress(p, at) {
         liveProgress = p
         progressApplied++
-        _appliedAt = Date.now()
+        _appliedAt = at === undefined ? Date.now() : at
     }
 
-    function offerProgress(p) {
-        const now = Date.now()
-        const sinceShown = now - _appliedAt
-        const sinceLast = now - _arrivedAt
-        _arrivedAt = now
-        if (sinceShown >= 100 || sinceLast >= 100) {
+    // `now` (a test's) defaults to the clock. A clock set back makes a time since negative, which
+    // counts as long ago: the event shows at once, never waits a whole step back.
+    function offerProgress(p, now) {
+        const at = now === undefined ? Date.now() : now
+        const sinceShown = at - _appliedAt
+        const sinceLast = at - _arrivedAt
+        _arrivedAt = at
+        if (sinceShown >= 100 || sinceLast >= 100 || sinceShown < 0 || sinceLast < 0) {
             gate.stop()
             _waiting = null
-            applyProgress(p)
+            applyProgress(p, at)
         } else {
             _waiting = p
             if (!gate.running) {
-                gate.interval = Math.max(1, 100 - sinceShown)
+                gate.interval = Math.min(100, Math.max(1, 100 - sinceShown))
                 gate.start()
             }
         }
@@ -225,11 +228,11 @@ Rectangle {
         })
     }
 
-    // Only once the row is made (PreviewImage's rule). While the list makes the row, `jobId` and
-    // `running` change as their bindings first take the model's values, before the row's own
-    // initializers have run; `_subscription: null` then overwrote the subscription that follow() had
-    // just made. Nothing ended that one, and its handler lives as long as the row, so each event
-    // reached the row twice (bench_event_to_ui).
+    // Only once the row is made (PreviewImage's rule). While the list makes the row, follow() ran
+    // re-entrantly: reading `jobId` inside it evaluated that binding for the first time, whose
+    // onJobIdChanged ran a nested follow() that subscribed, and the outer follow() then assigned its
+    // own subscription over that one. Nothing ended the nested one, and its handler lives as long as
+    // the row, so each event reached the row twice (bench_event_to_ui).
     property bool _complete: false
     onRunningChanged: if (_complete) follow()
     onJobIdChanged: if (_complete) follow()
