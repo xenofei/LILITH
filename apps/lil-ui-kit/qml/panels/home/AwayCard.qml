@@ -1,0 +1,105 @@
+// Home's "While you were away" card (APP-111, P4a-R41): the lines the panel holds, newest first, as
+// plain text with their times in the person's local calendar. It shows while it has a line, or
+// while its read has failed and so it can't say there are none. Dismiss clears it (HomePanel).
+import QtQuick
+import Lilith.Core
+import Lilith.UiKit
+
+LCard {
+    id: root
+
+    required property var panel
+
+    // The lines the card shows; the rest are counted.
+    readonly property int maxLines: 20
+    readonly property var lines: panel.awayItems.slice(0, maxLines)
+    readonly property int moreLines: panel.awayItems.length - lines.length
+    readonly property bool failed: panel.readState.jobs === "failed" || panel.readState.confirmations === "failed"
+    readonly property bool stale: !panel.connected || failed
+    readonly property string note: {
+        if (!panel.connected)
+            return panel.noteFor("jobs", "")
+        if (panel.readState.jobs === "failed")
+            return panel.noteFor("jobs", "the jobs")
+        return panel.readState.confirmations === "failed" ? panel.noteFor("confirmations", "the confirmations") : ""
+    }
+    readonly property string moreText: {
+        if (moreLines <= 0 && !panel.awayCut)
+            return ""
+        return moreLines > 0 ? "and " + MoneyText.count(String(moreLines)) + (panel.awayCut ? " or more" : " more") : "and more"
+    }
+    readonly property alias dismissButton: dismissButton
+    readonly property alias noteText: noteText
+    readonly property alias moreLabel: moreLabel
+    readonly property alias lineRepeater: lineRepeater
+
+    function word(kind) {
+        return kind === "finished" ? "Finished" : kind === "failed" ? "Failed" : kind === "needs_you" ? "Needs you"
+             : "Confirmation waiting"
+    }
+
+    function lineColor(kind) {
+        if (stale)
+            return Theme.textMuted
+        return kind === "failed" ? Theme.danger : kind === "finished" ? Theme.text : Theme.warning
+    }
+
+    title: "While you were away"
+    visible: panel.awayOn && (panel.awayItems.length > 0 || failed)
+
+    Column {
+        width: parent.width
+        spacing: 4
+
+        Repeater {
+            id: lineRepeater
+            model: root.lines
+            delegate: Text {
+                required property var modelData
+                width: parent.width
+                text: [root.word(modelData.kind), root.panel.shown(modelData.title, 200),
+                       root.panel.localStamp(modelData.at)].filter(p => p !== "").join(" · ")
+                textFormat: Text.PlainText
+                color: root.lineColor(modelData.kind)
+                font.pixelSize: Theme.fontSize
+                wrapMode: Text.Wrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+        }
+
+        Text {
+            id: moreLabel
+            width: parent.width
+            visible: root.moreText !== ""
+            text: root.moreText
+            textFormat: Text.PlainText
+            color: Theme.textMuted
+            font.pixelSize: Theme.fontSize
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+
+        Text {
+            id: noteText
+            width: parent.width
+            visible: root.note !== ""
+            text: root.note
+            textFormat: Text.PlainText
+            color: Theme.warning
+            font.pixelSize: Theme.fontSize
+            wrapMode: Text.Wrap
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+
+        LButton {
+            id: dismissButton
+            requiresCore: true
+            visible: root.panel.awayItems.length > 0
+            text: "Dismiss"
+            Accessible.description: "Clears this list, and counts from now"
+            onClicked: root.panel.dismissAway()
+        }
+    }
+}

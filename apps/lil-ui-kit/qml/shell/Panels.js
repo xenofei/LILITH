@@ -7,12 +7,14 @@
 //           others there, the first one in front), or "" for a panel the Default layout leaves
 //           closed
 //   action  its shortcut's action in the shortcut map (lil_qt::shortcuts), or "" for none
+//   wantsStateDir  (optional) true: the panel takes the shell's `stateDir`
 // Shared: later tasks replace their own entry's `source` and may add entries; never reorder or
 // drop one.
 .pragma library
 
 const all = [
-    {id: "home", title: "Home", source: "PlaceholderPanel.qml", area: "centre", action: "panel.home"},
+    {id: "home", title: "Home", source: "../panels/home/HomePanel.qml", area: "centre", action: "panel.home",
+     wantsStateDir: true},
     {id: "jobs", title: "Jobs", source: "../panels/jobs/JobsPanel.qml", area: "right",
      action: "panel.jobs"},
     {id: "confirmations", title: "Confirmations", source: "../panels/confirmations/ConfirmationsPanel.qml", area: "right",

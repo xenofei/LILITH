@@ -31,7 +31,7 @@ qt_target_qml_sources(lil-ui-kit
         qml/shell/Panels.js
         qml/shell/PlaceholderPanel.qml
         qml/a11y/A11yWalk.qml)
-# Task 19: the Opened card (P4a-R21), held by the shell until Task 26 moves it into Home.
+# Task 19: the Opened card (P4a-R21), which sits in Home.
 qt_target_qml_sources(lil-ui-kit
     QML_FILES
         qml/panels/home/OpenedCard.qml)
@@ -116,5 +116,15 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/confirmations/ConfirmationCard.qml
         qml/panels/confirmations/HistoryList.qml
         qml/shell/ConfirmWindow.qml)
+
+# Task 26: Home.
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/panels/home/HomePanel.qml
+        qml/panels/home/ProjectsCard.qml
+        qml/panels/home/RecentAssets.qml
+        qml/panels/home/StatusCounts.qml
+        qml/panels/home/OpenJobs.qml
+        qml/panels/home/AwayCard.qml)
 
 add_subdirectory(tests)

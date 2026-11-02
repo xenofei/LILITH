@@ -1006,6 +1006,110 @@ fn topic_subscriptions_are_counted_and_kept_in_order() {
 // ---------------------------------------------------------------------------------------------
 
 /// Polls `f` every 20 ms until it gives a value, for at most [`DEADLINE`].
+/// Home's reads against a real core (APP-111): each answers in the shape the panel reads, a time
+/// with a fraction is taken as `since`, and the finished job it lists comes out of `away_items`.
+#[test] // spec: APP-111
+fn home_s_reads_have_the_shapes_home_reads() {
+    launch("home_s_reads_have_the_shapes_home_reads", || {
+        let mut served = PathBuf::new();
+        let mut rig = Rig::start(|env| {
+            served = env.make_workspace("home");
+            env.register_workspace(&served, true);
+        });
+        let ws = QString::from(rig.env.workspace_id(&served).as_str());
+        let id = rig
+            .probe
+            .on_gui(move |core| core.set_workspace(&ws).to_string());
+        rig.probe.finished(&id);
+
+        let id = rig.probe.call(
+            "project.create",
+            json!({"project": "lantern", "name": "Lantern"}),
+        );
+        rig.probe.finished(&id);
+        let id = rig.probe.call("projects.list", json!({}));
+        let list = rig.probe.finished(&id);
+        let lantern = list["structured"]["projects"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|p| p["project"] == "lantern"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{list}"));
+        assert_eq!(lantern["name"], "Lantern", "{lantern}");
+        assert_eq!(lantern["status"], "active", "{lantern}");
+        assert_eq!(lantern["assets"], 0, "{lantern}");
+
+        let id = rig
+            .probe
+            .call("project.status", json!({"project": "lantern"}));
+        let status = rig.probe.finished(&id);
+        assert_eq!(status["structured"]["project"], "lantern", "{status}");
+        assert!(
+            status["structured"]["assets_by_status"].is_object(),
+            "{status}"
+        );
+        let id = rig
+            .probe
+            .call("project.status", json!({"project": "no-such-project"}));
+        match rig.probe.outcome(&id) {
+            Seen::Failed(_, error) => assert_eq!(error["code"], "project.unknown", "{error}"),
+            other => panic!("expected project.unknown, got {other:?}"),
+        }
+
+        let id = rig.probe.call(
+            "assets.query",
+            json!({"sort": {"field": "updated", "dir": "desc"}, "limit": 12}),
+        );
+        let assets = rig.probe.finished(&id);
+        assert!(assets["structured"]["assets"].is_array(), "{assets}");
+
+        let id = rig.probe.call("test.job", json!({"lane": "cpu"}));
+        let job = rig.probe.finished(&id)["structured"]["job"]["job_id"].clone();
+        let job = job.as_str().unwrap_or_else(|| panic!("{job}")).to_string();
+        let id = rig
+            .probe
+            .call("job.wait", json!({"job_id": job, "timeout_s": 30}));
+        let waited = rig.probe.finished(&id);
+        assert_eq!(
+            waited["structured"]["job"]["status"], "succeeded",
+            "{waited}"
+        );
+
+        let since = "2026-01-01T00:00:00.500Z";
+        let id = rig
+            .probe
+            .call("jobs.list", json!({"since": since, "limit": 100}));
+        let page = rig.probe.finished(&id);
+        assert!(page["structured"]["next_cursor"].is_null(), "{page}");
+        let id = rig
+            .probe
+            .app_call("app/confirmations.list", json!({"state": "pending"}));
+        let pending = rig.probe.finished(&id);
+        let rows = pending["confirmations"].to_string();
+        assert!(pending["confirmations"].is_array(), "{pending}");
+
+        let items = lil_qt::away::away_items_json(&json!([page]).to_string(), &rows, since);
+        let line = items
+            .as_array()
+            .and_then(|lines| lines.iter().find(|l| l["id"] == job.as_str()))
+            .cloned()
+            .unwrap_or_else(|| panic!("{items}"));
+        assert_eq!(line["kind"], "finished", "{line}");
+        assert!(
+            line["title"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("Test job · ")),
+            "{line}"
+        );
+        // Counted from after it, it isn't listed: by the core, nor by the card.
+        let later = "2099-01-01T00:00:00Z";
+        let id = rig
+            .probe
+            .call("jobs.list", json!({"since": later, "limit": 100}));
+        let page = rig.probe.finished(&id);
+        assert_eq!(page["structured"]["jobs"], json!([]), "{page}");
+    });
+}
+
 fn poll<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + DEADLINE;
     loop {

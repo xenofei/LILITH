@@ -22,8 +22,9 @@
 //
 // Open requests (APP-014, APP-020, APP-065, P4a-R21; the block marked "Open requests" below):
 // a launch (handleLaunchJson, from main.cpp: this start's own, then each one a second launch
-// forwards) and each `open_requests:image` event. A target, raw ref or `.lilref` shows in the
-// Opened card, and a refused link's message there; `task` opens Jobs on that job (`shownJob`, and
+// forwards) and each `open_requests:image` event. A target, raw ref or `.lilref` shows in Home's
+// Opened card, and a refused link's message there, with Home opened and brought to the front (the
+// keyboard focus moves into it only with `focus`); `task` opens Jobs on that job (`shownJob`, and
 // the panel's showJob(id) when it has one); `confirm` opens Confirmations on that confirmation
 // (`shownConfirmation`, and the panel's showConfirmation(id)). The window comes forward through
 // `shim.activate(window, focus)` (LilShim; the tests pass a fake): an agent's request, or a launch
@@ -97,7 +98,8 @@ Window {
     // --- Open requests (Task 19) ---
     // The shim the window is activated through: LilShim, or a test's fake.
     property var shim: LilShim
-    property alias openedCard: openedCard
+    // Home's Opened card: Home is loaded with the shell, open or not.
+    property Item openedCard: null
     property alias instanceBanner: instanceBanner
     // The job a `task` link last opened Jobs on, and the confirmation a `confirm` link last
     // opened Confirmations on.
@@ -200,18 +202,6 @@ Window {
         Accessible.name: text
     }
 
-    // --- Open requests (Task 19): the Opened card, until Task 26 moves it into Home ---
-    OpenedCard {
-        id: openedCard
-        anchors.right: dockingArea.right
-        anchors.bottom: dockingArea.bottom
-        anchors.margins: 2 * Theme.spacing
-        width: Math.min(420, dockingArea.width - 4 * Theme.spacing)
-        height: implicitHeight
-        z: 10
-    }
-    // --- end of open requests ---
-
     Component {
         id: dockComponent
         DockedPanel {}
@@ -284,6 +274,7 @@ Window {
         LilShim.applyPalette(Theme.palette)
         for (const panel of Panels.all)
             createDock(panel.id)
+        openedCard = docks.home.content.openedCard
         restoreLayout()
         _settling = false
         if (core)
@@ -313,7 +304,7 @@ Window {
         const panel = Panels.byId(id)
         if (!panel)
             return null
-        const dock = dockComponent.createObject(root, {panel: panel, core: root.core})
+        const dock = dockComponent.createObject(root, {panel: panel, core: root.core, stateDir: root.stateDir})
         docks[id] = dock
         // Diagnostics reaches the shell (it opens Backups and Jobs), and takes the shell's event
         // log when it keeps one.
@@ -608,8 +599,10 @@ Window {
             shim.activate(root, focus)
         if (launch.kind === "target" || launch.kind === "ref" || launch.kind === "lilref") {
             openedCard.show(launch)
+            showOpenedCard(focus)
         } else if (launch.kind === "refused") {
             openedCard.showRefused(launch.message || "")
+            showOpenedCard(focus)
         } else if (launch.kind === "task") {
             shownJob = launch.job
             openPanelOn("jobs", "showJob", launch.job, focus)
@@ -627,6 +620,13 @@ Window {
             return
         handleLaunch({kind: "target", target: data.target, intent: data.intent,
                       focus: data.focus === true, activate: true})
+    }
+
+    // Brings Home, and so the Opened card, to the front. The Default layout that is still waiting
+    // for its size opens Home in front anyway.
+    function showOpenedCard(focus) {
+        if (!_defaultPending)
+            openPanelOn("home", "", "", focus)
     }
 
     // Opens panel `id`, and calls its `method(arg, focus)` when the panel has one; the keyboard
