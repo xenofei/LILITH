@@ -1072,6 +1072,81 @@ fn home_s_reads_leave_the_hint_alone() {
     });
 }
 
+/// What the card lists on a real core (APP-111), as `home-check.ps1` steps through it: a job that
+/// finished before the kept time, two that finished after it, each read through `jobs.list {since}`
+/// and `away_items`. A kept time a second or more after a job's end doesn't list it again.
+#[test] // spec: APP-111
+fn the_card_lists_what_finished_after_the_kept_time() {
+    launch("the_card_lists_what_finished_after_the_kept_time", || {
+        let mut served = PathBuf::new();
+        let mut rig = Rig::start(|env| {
+            served = env.make_workspace("home");
+            env.register_workspace(&served, true);
+        });
+        let ws = QString::from(rig.env.workspace_id(&served).as_str());
+        let id = rig
+            .probe
+            .on_gui(move |core| core.set_workspace(&ws).to_string());
+        rig.probe.finished(&id);
+        let finish = |rig: &mut Rig| {
+            let id = rig.probe.call("test.job", json!({"lane": "cpu"}));
+            let job = rig.probe.finished(&id)["structured"]["job"]["job_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no job id"))
+                .to_string();
+            let id = rig
+                .probe
+                .call("job.wait", json!({"job_id": job, "timeout_s": 30}));
+            let waited = rig.probe.finished(&id);
+            assert_eq!(
+                waited["structured"]["job"]["status"], "succeeded",
+                "{waited}"
+            );
+            job
+        };
+        // Now with a fraction, as Home keeps it.
+        let kept_now = || {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+            lil_schema::time::rfc3339(secs).replace('Z', ".250Z")
+        };
+        let lines = |rig: &mut Rig, kept: &str| -> Vec<String> {
+            let id = rig
+                .probe
+                .call("jobs.list", json!({"since": kept, "limit": 100}));
+            let page = rig.probe.finished(&id);
+            let items = lil_qt::away::away_items_json(&json!([page]).to_string(), "[]", kept);
+            items
+                .as_array()
+                .unwrap_or_else(|| panic!("{items}"))
+                .iter()
+                .map(|l| l["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let first = finish(&mut rig);
+        std::thread::sleep(Duration::from_millis(2100));
+        let kept = kept_now();
+        assert_eq!(
+            lines(&mut rig, &kept),
+            Vec::<String>::new(),
+            "before: {first} is past"
+        );
+        let (second, third) = (finish(&mut rig), finish(&mut rig));
+        let mut listed = lines(&mut rig, &kept);
+        listed.sort();
+        let mut want = vec![second.clone(), third.clone()];
+        want.sort();
+        assert_eq!(listed, want, "the two since, not {first}");
+        // A time at least two seconds on, as the one more read's start would be, lists neither.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(lines(&mut rig, &kept_now()), Vec::<String>::new());
+        // The old time still lists them: they aren't lost until the time moves.
+        assert_eq!(lines(&mut rig, &kept).len(), 2);
+    });
+}
+
 /// A session's project is set when `app/set_context` has answered: `project.status {}` asked after
 /// that answers for it, and Home reads the counts again then (the switcher's `contextSet`).
 #[test] // spec: APP-111, ARCH-088
