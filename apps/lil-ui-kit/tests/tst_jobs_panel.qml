@@ -1456,6 +1456,7 @@ TestCase {
         verify(row(t.panel, "j1").statusText.indexOf("Retrying (1 of 3)") >= 0, row(t.panel, "j1").statusText)
         verify(row(t.panel, "j2").statusText.indexOf("Cancelling") >= 0, row(t.panel, "j2").statusText)
         const u = row(t.panel, "j3")
+        verify(u.statusText.indexOf("Running") < 0, "nothing is running it: " + u.statusText)
         verify(u.statusText.indexOf("Outcome unknown") >= 0 && u.statusText.indexOf("Whether it ran is unknown.") >= 0,
                u.statusText)
         compare(u.timeText, "", "no ETA and no clock")

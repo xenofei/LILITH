@@ -87,7 +87,9 @@ Rectangle {
     readonly property string stateText: {
         const parts = []
         if (running) {
-            parts.push("Running")
+            // `interrupted_unknown`: nothing is running it any more, whatever its status says.
+            if (!outcomeUnknown)
+                parts.push("Running")
             parts.push(panel.runningLabel(substatus))
             if (outcomeUnknown && error && error.message)
                 parts.push(panel.shown(error.message, panel.messageChars))
