@@ -1081,7 +1081,12 @@ fn desktop_settings_answer_as_the_settings_panel_reads_them() {
             let Seen::Failed(_, error) = rig.probe.outcome(&id) else {
                 panic!("job_progress wasn't refused")
             };
-            assert!(error["message"].is_string(), "{error}");
+            // A -32602 reaches the app as this, the core still there: tst_settings' fixture is this.
+            assert_eq!(error["code"], "core.unreachable", "{error}");
+            assert_eq!(error["retry"], "same_idempotency_key", "{error}");
+            let message = error["message"].as_str().expect("a message");
+            assert!(message.contains("protocol error (-32602)"), "{message}");
+            assert!(message.contains("job_progress"), "{message}");
             let id = rig.probe.call("desktop.get", json!({"fresh": true}));
             let after = rig.probe.finished(&id)["structured"].clone();
             assert_eq!(after["notifications"]["job_failed"], false);
@@ -1103,6 +1108,90 @@ fn desktop_settings_answer_as_the_settings_panel_reads_them() {
             );
         },
     );
+}
+
+/// Set up's read never touches the app's cap prompts (Appendix G "Connections"). The app's session
+/// asks; it reconnects, which leaves the old session on the core's list of those left; the read as
+/// the bridge makes it comes, and the prompt stays pending. So it does when the app's connection
+/// closes while a read is open. A Core object isn't used: its own session would hide the second case.
+#[test] // spec: APP-022, APP-051
+fn setup_s_read_leaves_a_pending_prompt_alone() {
+    launch("setup_s_read_leaves_a_pending_prompt_alone", || {
+        let env = TestEnv::new();
+        env.suite_toml_set(MONTHLY_1);
+        let ws = env.make_workspace("served");
+        env.register_workspace(&ws, true);
+        let _core = CoreFixture::start_exe(&env, &own_folder().join("lil-core.exe"));
+        let mut cfg = ClientConfig::for_env(env.env.clone(), "ui:test".parse().unwrap())
+            .expect("a client configuration");
+        cfg.start = StartPolicy::NoStart;
+        cfg.workspace = env.workspace_id(&ws);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let connect = |cfg: &ClientConfig| {
+            rt.block_on(lil_client::Client::connect(cfg))
+                .expect("connect")
+        };
+        let state_of = |c: &lil_client::Client, id: &str| -> String {
+            for which in ["pending", "history"] {
+                let got = rt
+                    .block_on(c.app_call("app/confirmations.list", json!({"state": which})))
+                    .expect("the list");
+                let got = serde_json::to_value(&got).unwrap();
+                let rows = got["confirmations"].as_array().cloned().unwrap_or_default();
+                if let Some(row) = rows.iter().find(|r| r["id"] == id) {
+                    return row["state"].as_str().unwrap_or_default().to_string();
+                }
+            }
+            "not listed".to_string()
+        };
+        let ask_cap = |c: &lil_client::Client, key: &str| -> String {
+            let mut args = serde_json::Map::new();
+            args.insert("cost".to_string(), json!("5"));
+            let got = rt
+                .block_on(c.call_tool("test.destructive", args, Some(key.to_string())))
+                .expect("the tool");
+            let got = serde_json::to_value(&got).unwrap();
+            got["confirmation_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{got}"))
+                .to_string()
+        };
+        let settle = || std::thread::sleep(Duration::from_millis(500));
+
+        // A reconnect in the same workspace, then the read.
+        let first = connect(&cfg);
+        let prompt = ask_cap(&first, "ik_00000000000000b1");
+        assert_eq!(state_of(&first, &prompt), "pending");
+        drop(first);
+        settle();
+        let again = connect(&cfg);
+        settle();
+        assert_eq!(state_of(&again, &prompt), "pending", "a reconnect keeps it");
+        let mut fresh = serde_json::Map::new();
+        fresh.insert("fresh".to_string(), json!(true));
+        let answer = lil_qt::setup::ask_core(&cfg, "desktop.get", fresh).expect("the read");
+        assert!(matches!(answer, lil_protocol::Outcome::Ok(_)), "{answer:?}");
+        settle();
+        assert_eq!(state_of(&again, &prompt), "pending", "after Set up's read");
+
+        // The app's connection closes while a read's is open.
+        let read = connect(&lil_qt::setup::read_config(&cfg));
+        drop(again);
+        settle();
+        let back = connect(&cfg);
+        settle();
+        assert_eq!(
+            state_of(&back, &prompt),
+            "pending",
+            "after the app's connection closed beside a read"
+        );
+        drop(read);
+        settle();
+        assert_eq!(state_of(&back, &prompt), "pending", "and the read's closed");
+    });
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -15,7 +15,8 @@ use lil_platform::{Channel, Env, Roots};
 use lil_protocol::Outcome;
 use lil_protocol::app::{HandlersWire, NotificationPath, ShortcutWire, ToastsWire};
 use lil_qt::setup::{
-    RealRegistrar, Registrar, SetupReport, Step, app_exe, app_missing, ask_core, set_up_with,
+    RealRegistrar, Registrar, SetupReport, Step, app_exe, app_missing, ask_core, read_config,
+    set_up_with,
 };
 use lil_testkit::{CoreFixture, TestEnv, ensure_built};
 use serde_json::{Map, Value, json};
@@ -189,6 +190,12 @@ fn the_read_starts_no_core_and_names_no_workspace() {
     cfg.start = StartPolicy::StartIfNeeded;
     // A default that went away must not stand between the app and its notification path.
     cfg.workspace = "ws_gone".to_string();
+    // As the app makes it: the core takes a second `ui:*` session of a process for a workspace switch.
+    cfg.caller_kind = "ui:image".parse().unwrap();
+    let read = read_config(&cfg);
+    assert_eq!(read.caller_kind, lil_protocol::CallerKind::Cli);
+    assert_eq!(read.workspace, lil_protocol::NO_WORKSPACE);
+    assert!(matches!(read.start, StartPolicy::NoStart));
     let fresh = || {
         let mut args = Map::new();
         args.insert("fresh".to_string(), Value::Bool(true));

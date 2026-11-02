@@ -9,7 +9,10 @@
 //! the report says which is which. Outside a test channel nothing is written while the channel's
 //! `lil-image.exe` isn't there ([`app_missing`], `lil doctor`'s rule). Then `desktop.get {fresh:
 //! true}` asks the core, over a connection of its own that never starts one, what it now reads:
-//! the core's own answer is what the app shows.
+//! the core's own answer is what the app shows. That connection is a `cli` caller's
+//! ([`read_config`]): the core takes a second `ui:*` session of one process, in another workspace,
+//! for a workspace switch, and cancels the cap prompts of the session it thinks was left
+//! (Appendix G "Connections").
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,7 +22,7 @@ use lil_client::{Client, ClientConfig, StartPolicy};
 use lil_platform::desktop::{HandlerPart, ShortcutState};
 use lil_platform::{Channel, Env};
 use lil_protocol::app::NotificationPath;
-use lil_protocol::{NO_WORKSPACE, Outcome, ToolOutput};
+use lil_protocol::{CallerKind, NO_WORKSPACE, Outcome, ToolOutput};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -187,17 +190,25 @@ fn read_path(outcome: Outcome<ToolOutput>) -> Result<NotificationPath, String> {
     }
 }
 
-/// One tool call over a connection of its own, on a runtime of its own, never starting a core,
-/// with no workspace, in at most [`REREAD_BOUND`].
+/// The connection [`ask_core`] makes from the app's `cfg`: a `cli` caller's, so that the core never
+/// takes it for the app's session (module docs), with no workspace, never starting a core.
+pub fn read_config(cfg: &ClientConfig) -> ClientConfig {
+    let mut cfg = cfg.clone();
+    cfg.caller_kind = CallerKind::Cli;
+    cfg.start = StartPolicy::NoStart;
+    cfg.workspace = NO_WORKSPACE.to_string();
+    cfg.workspace_origin = None;
+    cfg
+}
+
+/// One tool call over a connection of its own ([`read_config`]), on a runtime of its own, in at most
+/// [`REREAD_BOUND`].
 pub fn ask_core(
     cfg: &ClientConfig,
     tool: &str,
     args: Map<String, Value>,
 ) -> Result<Outcome<ToolOutput>, String> {
-    let mut cfg = cfg.clone();
-    cfg.start = StartPolicy::NoStart;
-    cfg.workspace = NO_WORKSPACE.to_string();
-    cfg.workspace_origin = None;
+    let cfg = read_config(cfg);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
