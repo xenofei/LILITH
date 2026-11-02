@@ -33,6 +33,8 @@ struct StateFile {
 pub struct AppState {
     path: PathBuf,
     workspaces: BTreeMap<String, Seen>,
+    /// The file is there and couldn't be read: writing now would drop what it holds.
+    unread: bool,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
     }
 
     fn load_from(path: &Path) -> AppState {
+        let mut unread = false;
         let workspaces = match std::fs::read_to_string(path) {
             Ok(text) => match serde_json::from_str::<StateFile>(&text) {
                 Ok(file) if file.state == STATE_VERSION => file.workspaces,
@@ -61,6 +64,7 @@ impl AppState {
             Err(e) => {
                 if e.kind() != io::ErrorKind::NotFound {
                     tracing::warn!(error = %e, "the app state can't be read");
+                    unread = true;
                 }
                 BTreeMap::new()
             }
@@ -68,6 +72,7 @@ impl AppState {
         AppState {
             path: path.to_path_buf(),
             workspaces,
+            unread,
         }
     }
 
@@ -77,7 +82,16 @@ impl AppState {
     }
 
     /// Records `at` (RFC 3339) as when `ws` was last seen, and writes the file.
+    ///
+    /// # Errors
+    /// Why it wasn't written, among them that the file couldn't be read when this was loaded: the
+    /// write would replace the other workspaces' times with nothing.
     pub fn set_last_seen(&mut self, ws: &str, at: &str) -> io::Result<()> {
+        if self.unread {
+            return Err(io::Error::other(
+                "the app state couldn't be read, so it isn't written over",
+            ));
+        }
         self.workspaces.insert(
             ws.to_string(),
             Seen {
@@ -152,6 +166,41 @@ mod tests {
         assert_eq!(again, state);
         // Each app keeps its own.
         assert_eq!(AppState::load(&env, "other").last_seen("ws_a"), None);
+    }
+
+    #[test] // spec: P4a-R16
+    fn a_read_error_never_writes_over_the_other_workspaces() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = AppState::load(&env, "image");
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        state.set_last_seen("ws_b", "2026-10-26T09:00:00Z").unwrap();
+        let path = env.app_state_dir("image").join("state.json");
+        // Another program holds the file for a moment: no sharing, so a read fails.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let mut unread = AppState::load(&env, "image");
+        drop(held);
+        assert_eq!(unread.last_seen("ws_b"), None);
+        // The write is refused, not made with only this workspace in it.
+        assert!(
+            unread
+                .set_last_seen("ws_a", "2026-10-28T10:00:00Z")
+                .is_err()
+        );
+        let again = AppState::load(&env, "image");
+        assert_eq!(
+            again.last_seen("ws_a").as_deref(),
+            Some("2026-10-27T10:00:00Z")
+        );
+        assert_eq!(
+            again.last_seen("ws_b").as_deref(),
+            Some("2026-10-26T09:00:00Z")
+        );
     }
 
     #[test] // spec: APP-111
