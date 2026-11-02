@@ -674,11 +674,13 @@ try {
         while ((Get-Date) -lt $until) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200 }
         Check ((Get-Kept) -eq $kept) '(f) another program in front, with a job finishing: the kept time stays'
     } finally {
+        # Closing it hands the front back at once, before Show-App's own wait: the time counts from here.
+        $backAt = Get-Date
         $cover.Close()
         $cover.Dispose()
     }
     Show-App
-    $took = Wait-KeptMoved $kept (Get-Date) 'the kept time to move'
+    $took = Wait-KeptMoved $kept $backAt 'the kept time to move'
     Check ($took -ge 2.5) "(f) the app back in front: the time moves 3 s or more later ($took s)"
     $still = @(Get-SinceIds (Get-Kept) | Where-Object { $_ -eq $jobF })
     Check ($still.Count -eq 0) '(f) and past that job'
