@@ -507,6 +507,45 @@ fn an_apps_cap_prompt_outlives_its_reconnect_and_ends_with_its_process() {
     wait_cancelled(&mut other, &id, "the prompt outlived its app");
 }
 
+/// A later session of the app with no workspace isn't a switch: a toast's Deny, say, connects so, and
+/// a person who denied one thing must not lose another (Appendix G "Connections"). The prompt stays
+/// answerable, and still ends with the app's process.
+#[test] // spec: APP-029, ARCH-030
+fn a_session_with_no_workspace_leaves_the_cap_prompts_until_the_process_ends() {
+    let env = TestEnv::new();
+    env.suite_toml_set(MONTHLY_1);
+    let served = env.make_workspace("served");
+    env.register_workspace(&served, true);
+    let _core = core_trusting_testbins(&env, true);
+    let mut app = TestApp::start(&env, None, &[]);
+    let id_served = env.workspace_id(&served);
+    let hello = app.reconnect(&id_served);
+    assert_eq!(hello["workspace"]["id"], id_served.as_str(), "{hello}");
+    let asked = app.tool(
+        "test.destructive",
+        json!({"cost": "5"}),
+        Some("ik_00000000000000a3"),
+    );
+    assert_eq!(asked["status"], "pending_confirmation", "{asked}");
+    let id = asked["confirmation_id"].as_str().unwrap().to_string();
+
+    let hello = app.reconnect("none");
+    assert_eq!(hello["caller_kind"], "ui:test", "{hello}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(history_state(&mut app, &id), None, "not ended");
+    let pending = app.call("app/confirmations.list", json!({"state": "pending"}));
+    assert!(
+        pending["result"]["confirmations"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|c| c["id"] == id.as_str())),
+        "still answerable: {pending}"
+    );
+
+    drop(app);
+    let mut other = TestApp::start(&env, None, &[]);
+    wait_cancelled(&mut other, &id, "the prompt outlived its app");
+}
+
 /// A switch ends the app's cap prompts of the workspace it left at once, while the app runs:
 /// its next connection names another workspace.
 #[test] // spec: APP-029, ARCH-030

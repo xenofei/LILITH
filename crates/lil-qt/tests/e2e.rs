@@ -1194,6 +1194,178 @@ fn setup_s_read_leaves_a_pending_prompt_alone() {
     });
 }
 
+/// A toast's Deny, sent from the app's own process as `ui:*` with no workspace
+/// (`single_instance::send_deny`, on `boot.rs`'s `deny_cfg`), ends only what it denies: the app's
+/// unrelated cap prompt stays pending (Appendix G "Connections"). On the first connection, after a
+/// same-core reconnect in the same workspace, when the app's connection closes while a Deny's is open,
+/// and for an app with no workspace. A Core object isn't used: its own session would hide the third.
+#[test] // spec: APP-029, APP-051
+fn a_toast_s_deny_leaves_the_app_s_cap_prompts_alone() {
+    launch("a_toast_s_deny_leaves_the_app_s_cap_prompts_alone", || {
+        let env = TestEnv::new();
+        env.suite_toml_set(MONTHLY_1);
+        let ws = env.make_workspace("served");
+        env.register_workspace(&ws, true);
+        let _core = CoreFixture::start_exe(&env, &own_folder().join("lil-core.exe"));
+        let mut app = ClientConfig::for_env(env.env.clone(), "ui:test".parse().unwrap())
+            .expect("a client configuration");
+        app.start = StartPolicy::NoStart;
+        // As `deny_cfg`: the app's caller, no workspace named.
+        let deny = app.clone();
+        assert_eq!(deny.workspace, lil_protocol::NO_WORKSPACE);
+        app.workspace = env.workspace_id(&ws);
+        let mut script = app.clone();
+        script.caller_kind = "cli".parse().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let connect = |cfg: &ClientConfig| {
+            rt.block_on(lil_client::Client::connect(cfg))
+                .expect("connect")
+        };
+        let map = |v: Value| -> serde_json::Map<String, Value> {
+            let Value::Object(m) = v else { unreachable!() };
+            m
+        };
+        let state_of = |c: &lil_client::Client, id: &str| -> String {
+            for which in ["pending", "history"] {
+                let got = rt
+                    .block_on(c.app_call("app/confirmations.list", json!({"state": which})))
+                    .expect("the list");
+                let got = serde_json::to_value(&got).unwrap();
+                let rows = got["confirmations"].as_array().cloned().unwrap_or_default();
+                if let Some(row) = rows.iter().find(|r| r["id"] == id) {
+                    return row["state"].as_str().unwrap_or_default().to_string();
+                }
+            }
+            "not listed".to_string()
+        };
+        let ask_cap = |c: &lil_client::Client, key: &str| -> String {
+            let got = rt
+                .block_on(c.call_tool(
+                    "test.destructive",
+                    map(json!({"cost": "5"})),
+                    Some(key.to_string()),
+                ))
+                .expect("the tool");
+            let got = serde_json::to_value(&got).unwrap();
+            got["confirmation_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{got}"))
+                .to_string()
+        };
+        let cli = connect(&script);
+        let told = rt
+            .block_on(cli.call_tool("test.desktop", map(json!({"handlers": true})), None))
+            .expect("test.desktop");
+        assert!(matches!(told, lil_protocol::Outcome::Ok(_)), "{told:?}");
+        // A script's confirmation, with its toast: the id and its real Deny token.
+        let scripts_toast = |key: &str| -> (String, String) {
+            let got = rt
+                .block_on(cli.call_tool("test.destructive", map(json!({})), Some(key.to_string())))
+                .expect("the tool");
+            let got = serde_json::to_value(&got).unwrap();
+            let id = got["confirmation_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{got}"))
+                .to_string();
+            let head = format!(":deny/{id}/");
+            let token = poll("the toast's Deny", || {
+                let seen = rt
+                    .block_on(cli.call_tool("test.desktop", map(json!({})), None))
+                    .expect("test.desktop");
+                let seen = serde_json::to_value(&seen).unwrap();
+                let toasts = seen["structured"]["toasts"].as_array().cloned()?;
+                toasts.iter().rev().find_map(|t| {
+                    let xml = t["xml"].as_str()?;
+                    let at = xml.find(&head)?;
+                    Some(
+                        xml[at + head.len()..]
+                            .chars()
+                            .take_while(char::is_ascii_hexdigit)
+                            .collect::<String>(),
+                    )
+                })
+            });
+            (id, token)
+        };
+        let settle = || std::thread::sleep(Duration::from_millis(600));
+        let do_deny = |id: &str, token: &str, c: &lil_client::Client, deny: &ClientConfig| {
+            let outcome = lil_qt::single_instance::send_deny(deny, id, token);
+            assert!(
+                matches!(outcome, lil_qt::single_instance::DenyOutcome::Denied),
+                "{outcome:?}"
+            );
+            settle();
+            assert_eq!(state_of(c, id), "denied");
+        };
+
+        // The app's first connection, with its prompt.
+        let first = connect(&app);
+        let unrelated = ask_cap(&first, "ik_00000000000000c1");
+        assert_eq!(state_of(&first, &unrelated), "pending");
+        let (id, token) = scripts_toast("ik_00000000000000c2");
+        do_deny(&id, &token, &first, &deny);
+        assert_eq!(
+            state_of(&first, &unrelated),
+            "pending",
+            "on a first connection"
+        );
+
+        // A same-core reconnect in the same workspace, then a Deny.
+        drop(first);
+        settle();
+        let second = connect(&app);
+        settle();
+        assert_eq!(
+            state_of(&second, &unrelated),
+            "pending",
+            "a reconnect keeps it"
+        );
+        let (id, token) = scripts_toast("ik_00000000000000c3");
+        do_deny(&id, &token, &second, &deny);
+        assert_eq!(
+            state_of(&second, &unrelated),
+            "pending",
+            "after a reconnect, then a Deny of something else"
+        );
+
+        // The app's connection closes while a Deny's is open.
+        let another = ask_cap(&second, "ik_00000000000000c4");
+        let held = connect(&deny);
+        drop(second);
+        settle();
+        let third = connect(&app);
+        settle();
+        assert_eq!(
+            state_of(&third, &another),
+            "pending",
+            "after the app's connection closed beside a Deny's"
+        );
+        drop(held);
+        drop(third);
+        settle();
+
+        // An app with no workspace.
+        let mut none = app.clone();
+        none.workspace = lil_protocol::NO_WORKSPACE.to_string();
+        let c = connect(&none);
+        let its_own = ask_cap(&c, "ik_00000000000000c5");
+        drop(c);
+        settle();
+        let c = connect(&none);
+        settle();
+        let (id, token) = scripts_toast("ik_00000000000000c6");
+        do_deny(&id, &token, &c, &deny);
+        assert_eq!(
+            state_of(&c, &its_own),
+            "pending",
+            "an app with no workspace"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------------------------
