@@ -23,6 +23,7 @@ pub mod live_jobs_model;
 pub mod money_text;
 pub mod preview_feed;
 pub mod runtime;
+pub mod setup_bridge;
 
 #[cxx_qt::bridge]
 pub mod ffi {

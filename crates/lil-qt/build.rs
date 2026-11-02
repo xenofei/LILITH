@@ -23,5 +23,6 @@ fn main() {
         .cpp_file("src/qt/pointer_filter.cpp")
         .qt_module("Gui")
         .qt_module("Quick")
+        .file("src/qt/setup_bridge.rs")
         .build();
 }

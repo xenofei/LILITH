@@ -22,6 +22,8 @@
 //! - `awayItems(pagesJson, pendingJson, lastSeen)`: [`crate::away::away_items_json`] as JSON;
 //!   `nextCursor(resultJson)`: a `jobs.list` result's `next_cursor`, empty on the last page, so
 //!   QML needn't parse the page.
+//! - `claimFirstStart(dir)`: whether this is the app's first start in `dir`, and from now on it
+//!   isn't ([`crate::app_state::claim_first_start`]); false with no `dir`.
 
 use core::pin::Pin;
 use std::path::{Path, PathBuf};
@@ -95,6 +97,9 @@ pub mod qobject {
             pending_json: &QString,
             last_seen: &QString,
         ) -> QString;
+
+        #[qinvokable]
+        fn claim_first_start(self: &ShellState, dir: &QString) -> bool;
     }
 
     #[namespace = "lil_qt"]
@@ -262,6 +267,11 @@ impl qobject::ShellState {
             &pending_json.to_string(),
             &last_seen.to_string(),
         ))
+    }
+
+    fn claim_first_start(&self, dir: &QString) -> bool {
+        let dir = dir.to_string();
+        !dir.is_empty() && crate::app_state::claim_first_start(Path::new(&dir))
     }
 }
 
