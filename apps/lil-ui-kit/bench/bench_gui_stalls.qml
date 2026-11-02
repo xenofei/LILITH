@@ -11,11 +11,13 @@
 // what it does in the app, and the decode's own cost is printed beside it (the Task 17 and 23 carry).
 //
 // Pass: heartbeat lateness p99 under LIL_BUDGET_GUI_STALL_P99_MS (test-params.toml's
-// gui_stall_p99_ms), and the frame interval's p99 under the same budget over the platform's own pace.
-// The offscreen platform paces its frames with a timer, not a display (its idle frame interval has a
-// p99 near 25 ms here with nothing to do), so the frame check is the spike's rule made relative: the
-// feed may add less than the budget to the idle p99 (bound: max(budget, idle p99 + budget / 2)). The
-// idle figures are measured first, with the same small animation running.
+// gui_stall_p99_ms), and frame interval p99 under max(the budget, the idle p99 + half the budget,
+// 8 ms at 16) (plan 4a ruling, 2026-11-01). The reason: offscreen there is no display, so the frame
+// interval is the platform's own timer pace, not a vsync, and its idle p99 is already near 25 ms here
+// with nothing to do; a flat 16 ms would fail whatever the app did. So the feed may add at most half
+// the budget to the platform's own idle p99. The idle figures are measured first, with the same small
+// animation running. The 4 ms heartbeat runs at about 100 Hz on this platform (Windows' timers), and
+// its idle lateness, printed first, is the timer's own floor.
 //
 // Set LIL_BENCH_MEASURE_S to measure for longer (the run under ComfyUI's load, Task 29 Step 4).
 import QtQuick

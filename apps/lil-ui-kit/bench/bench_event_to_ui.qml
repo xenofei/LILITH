@@ -6,10 +6,14 @@
 // 100 ms), and then signals each on the GUI thread, in order, as Core.coreEvent.
 // - Job progress: 8 running jobs, each with a progress event and a 512 x 512 JPEG preview every
 //   100 ms, for MeasureS seconds. Each event is stamped as the app receives it (Core's signal, after the
-//   pump), and counts as shown at the first frame (`frameSwapped`) whose row has reached its value.
-//   Pass: p99 under LIL_BUDGET_EVENT_TO_UI_MS (test-params.toml's event_to_ui_ms). The pump's own
-//   stage, from the event's arrival to its signal (the decode queue and the throttle's wait, which
-//   APP-139's "leading-edge throttle" allows), is printed beside it, with the whole way.
+//   pump: APP-139 as ruled 2026-11-01), and counts as shown at the first frame (`frameSwapped`) whose
+//   row has reached its value. Pass: p99 under LIL_BUDGET_EVENT_TO_UI_MS (test-params.toml's
+//   event_to_ui_ms). The pump's own stage, from the event's arrival to its signal (the decode queue and
+//   the 10 Hz limit's wait, up to 100 ms by design, APP-027), is printed beside it, with the whole way.
+//   All 8 jobs are fed, but only the rows in view are timed (2 at 1280 x 800: the Jobs dock is the
+//   window's height and a row with its preview is tall), which the ruling accepts: a row out of view
+//   has nothing on screen to time. They are chosen after 2 s of the feed and must be the same rows
+//   at the end.
 // - A confirmation (never throttled): it is in the Confirmations panel's scene once its event is
 //   handled, so it shows in the frame after it arrives; each of 20, with the feed running, reaches a
 //   frame under the budget and within two of the platform's frame intervals.
