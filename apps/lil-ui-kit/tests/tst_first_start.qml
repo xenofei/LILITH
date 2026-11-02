@@ -478,6 +478,29 @@ TestCase {
                   "the keyboard isn't dropped: " + shell.activeFocusItem)
     }
 
+    // Windows has LILITH's notifications off (an elevated first start, say): Set up adds only LILITH's
+    // part, and the card says so before and after.
+    function test_with_windows_off_the_card_promises_only_lilith_s_part() { // spec: APP-022, APP-146
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("winoff"), setup)
+        const card = shell.firstStartCard
+        const off = {toasts: "unavailable", toasts_reason: "elevated", shortcut: "missing", handlers: "ok"}
+        answerRead(core, off)
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        verify(card.text.indexOf("adds what Windows needs") < 0, card.text)
+        verify(card.text.indexOf("LILITH's part") >= 0, card.text)
+        verify(card.text.indexOf("Windows still keeps LILITH's notifications from you: Settings says why and what to do.") >= 0, card.text)
+        const said = []
+        card.announced.connect(t => said.push(t))
+        card.setUpButton.click()
+        setup.finish(Shapes.setupReport({scheme: {state: "ok"},
+                                         notification_path: {toasts: "unavailable", toasts_reason: "elevated", shortcut: "ok", handlers: "ok"}}))
+        tryVerify(() => !card.visible, 5000)
+        compare(said, ["The Start-menu shortcut is set up. Windows still keeps LILITH's notifications from you: "
+                       + "Settings says why and what to do."])
+    }
+
     // Put away during a run, the card says nothing more: Settings says why it failed.
     function test_not_now_during_a_run_leaves_the_failure_to_settings() { // spec: APP-022
         const core = fakeComponent.createObject(tc)

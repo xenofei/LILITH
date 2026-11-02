@@ -60,18 +60,28 @@ LBanner {
             done = true
     }
 
+    // Windows keeps the notifications from you whatever Set up writes (an elevated start, say), as the
+    // newest reading has it: the setup's own, else the card's.
+    readonly property bool windowsOff: {
+        const now = report && report.notification_path ? report.notification_path : path
+        return !!now && now.toasts === "unavailable"
+    }
+    readonly property string windowsNote: windowsOff
+        ? " Windows still keeps LILITH's notifications from you: Settings says why and what to do." : ""
+
     closable: false
     text: {
         if (_problem !== "")
             return _problem
         const outcome = NotificationText.setupOutcome(report, (t, max) => Words.shown(core, t, max))
         if (outcome !== "")
-            return outcome
+            return outcome + windowsNote
         const other = path && path.handlers === "other_channel"
             ? " Another LILITH build or another program handles lil: links: run lil doctor to see which one." : ""
-        return "Set up adds what Windows needs to show LILITH's notifications and open their links: "
-               + NotificationText.setupWrites(path) + ", for your user account. You can also do this later "
-               + "in Settings." + other
+        const adds = windowsOff ? "Set up adds LILITH's part of what's needed to show its notifications and open their links: "
+                                : "Set up adds what Windows needs to show LILITH's notifications and open their links: "
+        return adds + NotificationText.setupWrites(path) + ", for your user account. You can also do this later "
+               + "in Settings." + other + windowsNote
     }
 
     actions: [
