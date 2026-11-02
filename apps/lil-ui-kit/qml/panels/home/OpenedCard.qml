@@ -31,6 +31,8 @@ LCard {
 
     // A request came: the panel brings the card into view.
     signal opened()
+    // Dismiss hid the card; `hadFocus`: its button had the keyboard focus, which needs somewhere to go.
+    signal dismissed(bool hadFocus)
 
     // A launch or open request of kind target, ref or lilref: {target, title?, intent}.
     function show(launch) {
@@ -120,7 +122,11 @@ LCard {
             LButton {
                 id: dismissButton
                 text: "Dismiss"
-                onClicked: root.visible = false
+                onClicked: {
+                    const hadFocus = activeFocus
+                    root.visible = false
+                    root.dismissed(hadFocus)
+                }
             }
         }
     }

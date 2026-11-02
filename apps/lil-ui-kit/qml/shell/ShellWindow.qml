@@ -116,7 +116,18 @@ Window {
         _heldLaunches = []
         held.forEach(handleLaunch)
     }
-    onLayoutSettledChanged: _runHeldLaunches()
+    // A launch that asked for the focus came before the Default layout was laid out.
+    property bool _focusHomeOnSettle: false
+    // Once laid out: Home takes the focus such a launch asked for, unless a confirmation is open
+    // (P4a-R10), and then the held links run, so a confirmation dialog one opens ends with the focus.
+    onLayoutSettledChanged: {
+        if (layoutSettled && _focusHomeOnSettle) {
+            _focusHomeOnSettle = false
+            if (OpenPrompts.count === 0)
+                docks.home.focusPanel()
+        }
+        _runHeldLaunches()
+    }
 
     Connections {
         target: OpenPrompts
@@ -623,10 +634,12 @@ Window {
     }
 
     // Brings Home, and so the Opened card, to the front. The Default layout that is still waiting
-    // for its size opens Home in front anyway.
+    // for its size opens Home in front anyway, and the focus goes in once it has settled.
     function showOpenedCard(focus) {
         if (!_defaultPending)
             openPanelOn("home", "", "", focus)
+        else
+            _focusHomeOnSettle = _focusHomeOnSettle || focus
     }
 
     // Opens panel `id`, and calls its `method(arg, focus)` when the panel has one; the keyboard

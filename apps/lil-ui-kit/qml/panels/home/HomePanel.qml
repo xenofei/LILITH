@@ -1,32 +1,48 @@
 // Home (minimal; APP-111, APP-016, P4a-R16, P4a-R21, P4a-R41): the Opened card, "While you were
 // away", the workspace and its projects, the assets by status, the open jobs and the recent assets.
 //
-// Reads. Home reads its cards when it first shows and after a `jobs` or `confirmations` event that
-// changes what it shows: a job that came, went or changed status (never its progress, nor
-// `{kind: "queue"}`) reads the jobs, one that ended the workspace's cards too, and a confirmation's
-// event the confirmations. They wait 150 ms after the last such event, at most 1 s after the first,
-// and one read is out at a time, so a burst is one read. A snapshot, a `resync_required` or `ready`
-// reads everything. A failed read keeps what the card shows, greyed, says so, and is asked again
-// after 1 s, doubling up to 30 s. While Home isn't on screen nothing is read, and what came meanwhile
-// is read when it shows. A workspace switch cancels what is out and clears the cards. Everything
-// needing a workspace waits for one (APP-016): without one only the open jobs are read, and the
-// recent assets become the recent loose files (empty until plan 5). `NoWorkspaceBanner` holds the
-// way out.
+// Reads. There are four kinds, each with at most one read out, so a slow one holds up no other: the
+// jobs, the confirmations, the cards (`projects.list` and `assets.query`) and the counts
+// (`project.status`). Home reads them all when it first shows, and after a `jobs` or `confirmations`
+// event that changes what it shows: a job that came, went or changed status (never its progress, nor
+// `{kind: "queue"}`) reads the jobs, one that ended the cards too, and a confirmation's event the
+// confirmations. They wait 150 ms after the last such event, at most 1 s after the first, so a burst
+// is one read. The counts walk the project's folder, so job ends read them at most once in
+// `statusGapMs`, with a last read so that they settle; choosing a project reads them at once. A
+// snapshot, a `resync_required` or `ready` reads everything, and until each read lands what it covers
+// is grey and says it is being read again. A failed read keeps what the card shows, greyed, says so,
+// and is asked again after 1 s, doubling up to 30 s, or with the next read of anything. While Home
+// isn't on screen nothing is read: what came meanwhile is read when it shows, and after a second or
+// more off screen everything is (a float's moment off screen isn't that). A workspace switch cancels
+// what is out and clears the cards. Everything needing a workspace waits for one (APP-016): without
+// one only the open jobs are read, and the recent assets become the recent loose files (empty until
+// plan 5). `NoWorkspaceBanner` holds the way out.
+//
+// Home never names a project (`project.status {}`): a call that names one makes it the session's
+// active project and rewrites the workspace's hint (ARCH-088), and a read must do neither.
 //
 // Jobs. The open jobs are a LiveJobsModel of Home's own over every page of `jobs.list {status:
 // "running"}`, `{order: "queue"}` and `{status: "queued"}`, the JSON handed over as it came. The
 // card's jobs are every page of `{since: <the card's time>}`, up to `awayPages`, and the queued jobs,
-// where the ones a restart holds are, whatever their age. `ShellState.awayItems` picks from them.
+// where the ones a restart holds are, whatever their age. `ShellState.awayItems` picks from them, as
+// soon as the jobs and the confirmations have landed.
 //
 // Last seen. The time is kept per workspace in the app's state (`stateDir`, AppState); a shell
-// without a `stateDir` keeps none, and so has no card. It becomes now after Home has been really on
-// screen for `seenAfterMs` in a row, the card's reads in: not behind a tab, in a closed dock, on a
-// minimized window, or with the core away. A new line on the card starts that wait again. The card
-// goes on counting from the time it opened with, so its lines don't vanish as you read them: it moves
-// to the kept time when Home has been off screen for `seenAfterMs` (a float, which hides it for a
-// moment, doesn't), or at once on Dismiss, which also forgets the lines it dismissed, the jobs a
-// restart holds and the pending confirmations among them, until they change or the app starts again.
-// There is no card on the first run.
+// without a `stateDir` keeps none, and so has no card. A person must never lose a line they weren't
+// shown, so the time written is when the last jobs read that landed began (`seenStamp`, never `now`),
+// after Home has been really on screen for `seenAfterMs` in a row with no read of the card's out: not
+// behind a tab, in a closed dock, on a minimized window, or with the core away. A new line on the card
+// starts that wait again, and a steady stream of reads puts the write off, never the other way. A
+// `{since}` read cut at `awayPages` writes nothing: the card says there is more, until Dismiss. The
+// card goes on counting from the time it opened with, so its lines don't vanish as you read them: it
+// moves to the kept time when Home has been off screen for `seenAfterMs` (a float, which hides it for
+// a moment, doesn't). Dismiss forgets the lines it dismissed, the jobs a restart holds and the pending
+// confirmations among them, until they change, the workspace changes or the app starts again, and
+// moves both times to that same read's start; with a jobs read due, out or failing it moves neither,
+// and the usual write follows once a read has landed. There is no card on the first run. A kept time
+// ahead of now (the clock was ahead) can't say when you last looked: the card counts from
+// `aheadLookBackMs` before now, so lines may show twice but none is lost, and the usual write mends
+// the kept time. A kept time the core's `since` wouldn't take counts as none (`ShellState.lastSeen`).
 //
 // Everything from outside is plain text through `core.shownText` (P4a-R8), and every count goes
 // through MoneyText.count.
@@ -49,6 +65,8 @@ Rectangle {
     readonly property alias openJobs: openJobs
     readonly property alias recentAssets: recentAssets
     readonly property alias scroller: scroller
+    readonly property alias scrollBar: scrollBar
+    readonly property alias focusRing: focusRing
     readonly property alias live: live
 
     readonly property string workspaceId: core && core.workspace ? String(core.workspace.id) : ""
@@ -66,6 +84,10 @@ Rectangle {
     readonly property int seenAfterMs: 3000
     // The most pages of `{since}` one read follows; past them the card says there is more.
     readonly property int awayPages: 20
+    // The least time between two reads of the counts after job ends.
+    property int statusGapMs: 30000
+    // How far back the card counts when the kept time is ahead of now: a week.
+    readonly property real aheadLookBackMs: 7 * 24 * 3600 * 1000
 
     // projects.list's rows, assets.query's rows, and project.status's counts and project.
     property var projects: []
@@ -80,23 +102,34 @@ Rectangle {
     // The time the card counts from: empty before the first time Home was seen here.
     property string lastSeen
 
-    // Each part's last read: "" (none yet), "ok", "none" (status: no such project) or "failed".
+    // Each part's last read: "" (none yet), "ok", "none" (status: no such project), "failed", or "old"
+    // (a reload is due or out).
     property var readState: ({})
     property var readError: ({})
 
-    property int _open: 0
-    property bool _again: false
-    // What is due: {jobs, confirmations, cards}.
-    property var _due: ({jobs: true, confirmations: true, cards: true})
+    // The kinds of read out: jobs, confirmations, cards, status.
+    property var _out: ({})
+    readonly property int _open: Object.keys(_out).length
+    // What is due, by kind.
+    property var _due: ({jobs: true, confirmations: true, cards: true, status: true})
+    // The kinds a reload has marked: what lands from a read asked before it is still old.
+    property var _oldDue: ({})
     // The next jobs read carries nothing over (a snapshot or a resync came).
     property bool _fresh: false
-    property var _calls: []
+    // Kind -> its read's calls, to cancel them.
+    property var _calls: ({})
     // Request id -> {ok, fail}: the calls whose answer goes on as it came.
     property var _raw: ({})
     property var _pendingJobs: []
     property real _dueSince: 0
     property int _retryMs: 0
     property var _toRetry: ({})
+    // When the counts were last read, ms.
+    property real _statusAt: 0
+    // Home has been off screen long enough for everything to be read when it shows.
+    property bool _readOnShow: false
+    // When the last jobs read that landed began (seenStamp): what the time may move to.
+    property string _seenUpTo
     // The last pages holding the card's jobs, the pending confirmations, and the lines known so far.
     property string _awayPages: "[]"
     property var _pending: []
@@ -132,8 +165,14 @@ Rectangle {
 
     // A time from the core in the person's local calendar, "" when it doesn't read.
     function localStamp(at) {
-        const ms = Date.parse(at)
+        const ms = typeof at === "string" ? ShellState.timeMs(at) : NaN
         return isNaN(ms) ? "" : Qt.formatDateTime(new Date(ms), "yyyy-MM-dd HH:mm")
+    }
+
+    // `ms` as a kept time. The core takes a fraction of .000 as a whole second, which would lose a job
+    // later in that second, so that one reads a millisecond earlier.
+    function seenStamp(ms) {
+        return new Date(ms % 1000 === 0 ? ms - 1 : ms).toISOString()
     }
 
     // What a card says about its read, "" when it has nothing to say. `what` names what it reads.
@@ -143,19 +182,28 @@ Rectangle {
             return state === "" ? "Not connected to the core." : "Not connected to the core, so this may be out of date."
         if (state === "failed")
             return "Couldn't read " + what + ": " + readError[part] + " Trying again…"
+        if (state === "old")
+            return "Reading again, so this may be out of date."
         return state === "" ? "Reading…" : ""
     }
 
     // What the card shows may be old.
     function isStale(part) {
-        return !connected || readState[part] === "failed"
+        return !connected || readState[part] === "failed" || readState[part] === "old"
+    }
+
+    function kindOf(part) {
+        return part === "projects" || part === "assets" ? "cards" : part
     }
 
     function setRead(part, state, error) {
+        // Asked before a reload: it doesn't speak for now.
+        if (state !== "failed" && _oldDue[kindOf(part)])
+            state = "old"
         readState = Object.assign({}, readState, {[part]: state})
         if (state === "failed") {
             readError = Object.assign({}, readError, {[part]: shown(error && error.message ? error.message : "the core didn't answer.", 300)})
-            _toRetry[part === "jobs" || part === "confirmations" ? part : "cards"] = true
+            _toRetry[kindOf(part)] = true
         }
     }
 
@@ -166,7 +214,34 @@ Rectangle {
     }
 
     function dueEverything() {
-        due({jobs: true, confirmations: true, cards: true})
+        due({jobs: true, confirmations: true, cards: true, status: true})
+    }
+
+    // A snapshot, a mark or `ready`: everything is read again, and until then it reads as old.
+    function reload() {
+        const state = Object.assign({}, readState)
+        for (const part in state) {
+            if (state[part] === "ok" || state[part] === "none")
+                state[part] = "old"
+        }
+        readState = state
+        _oldDue = {jobs: true, confirmations: true, cards: true, status: true}
+        dueEverything()
+    }
+
+    // After job ends: the counts now, or at the end of their gap, once.
+    function dueStatusSoon() {
+        const left = statusGapMs - (Date.now() - _statusAt)
+        if (left <= 0) {
+            due({status: true})
+        } else if (!statusGate.running) {
+            statusGate.interval = left
+            statusGate.start()
+        }
+    }
+
+    function anyDue() {
+        return !!(_due.jobs || _due.confirmations || _due.cards || _due.status)
     }
 
     // 150 ms after the last event, at most 1 s after the first.
@@ -185,60 +260,78 @@ Rectangle {
         _raw[id] = {ok: ok, fail: fail}
     }
 
+    // Starts what is due and isn't out. What is out stays due, and is read when that one lands.
     function read() {
         if (!connectedNow() || !onScreen)
             return
-        if (_open > 0) {
-            _again = true
-            return
-        }
-        const jobs = !!_due.jobs
+        // A part that failed is asked again with this read, whatever brought it on.
+        due(_toRetry)
+        _toRetry = {}
+        retry.stop()
         const here = workspaceNow() !== ""
-        const confirmations = !!_due.confirmations && here && lastSeen !== ""
-        const cards = !!_due.cards && here
-        _due = {}
-        if (!jobs && !confirmations && !cards)
-            return
-        _again = false
+        const wanted = {
+            jobs: !!_due.jobs,
+            confirmations: !!_due.confirmations && here && lastSeen !== "",
+            cards: !!_due.cards && here,
+            status: !!_due.status && here
+        }
+        const left = {}
+        const start = {}
+        const out = Object.assign({}, _out)
+        for (const kind in wanted) {
+            if (wanted[kind] && _out[kind])
+                left[kind] = true
+            else if (wanted[kind])
+                start[kind] = out[kind] = true
+        }
+        _due = left
         _dueSince = 0
         coalesce.stop()
-        retry.stop()
-        _toRetry = {}
-        _calls = []
-        _open = (jobs ? 1 : 0) + (confirmations ? 1 : 0) + (cards ? 3 : 0)
-        if (jobs)
+        if (Object.keys(start).length === 0)
+            return
+        _out = out
+        const old = Object.assign({}, _oldDue)
+        for (const kind in start)
+            delete old[kind]
+        _oldDue = old
+        if (start.jobs || start.confirmations)
+            _awayLoaded = false
+        for (const kind in start)
+            _calls[kind] = []
+        if (start.jobs)
             readJobs()
-        if (confirmations)
+        if (start.confirmations)
             readConfirmations()
-        if (cards) {
-            readProjects()
+        if (start.cards)
+            readCards()
+        if (start.status)
             readStatus()
-            readAssets()
-        }
     }
 
-    // One of the reads is in.
-    function landed() {
-        if (--_open > 0)
-            return
-        updateAway()
-        const failed = Object.keys(_toRetry)
-        if (failed.length > 0) {
-            _retryMs = _retryMs === 0 ? 1000 : Math.min(_retryMs * 2, 30000)
-            retry.interval = _retryMs
-            retry.start()
-        } else {
+    // A read of this kind is in.
+    function landed(kind) {
+        const out = Object.assign({}, _out)
+        delete out[kind]
+        _out = out
+        if (kind === "jobs" || kind === "confirmations")
+            updateAway()
+        if (Object.keys(_toRetry).length > 0) {
+            if (!retry.running) {
+                _retryMs = _retryMs === 0 ? 1000 : Math.min(_retryMs * 2, 30000)
+                retry.interval = _retryMs
+                retry.start()
+            }
+        } else if (_open === 0) {
             _retryMs = 0
         }
-        if (_again || _due.jobs || _due.confirmations || _due.cards) {
-            _again = false
+        if (anyDue())
             requestRead()
-        }
     }
 
     function readJobs() {
         const since = workspaceNow() !== "" ? lastSeen : ""
         const fresh = _fresh
+        const startedAt = seenStamp(Date.now())
         _fresh = false
         applyPendingJobs()
         live.beginRead(fresh)
@@ -246,6 +339,7 @@ Rectangle {
         let gone = false
         const sincePages = []
         const queuedPages = []
+        let cut = false
         const done = () => {
             if (gone || --open > 0)
                 return
@@ -254,8 +348,10 @@ Rectangle {
             const capped = JSON.parse(live.overview("image")).capped
             root.jobsCapped = capped === null || capped === undefined ? -1 : capped
             root._awayPages = "[" + sincePages.concat(queuedPages).join(",") + "]"
+            root.awayCut = cut
+            root._seenUpTo = startedAt
             root.setRead("jobs", "ok")
-            root.landed()
+            root.landed("jobs")
         }
         const fail = e => {
             if (gone)
@@ -263,7 +359,7 @@ Rectangle {
             gone = true
             root._fresh = root._fresh || fresh
             root.setRead("jobs", "failed", e)
-            root.landed()
+            root.landed("jobs")
         }
         const list = (args, add) => {
             const page = cursor => root.rawCall("jobs.list", Object.assign({limit: 100}, args, cursor ? {cursor: cursor} : {}), json => {
@@ -285,61 +381,80 @@ Rectangle {
         })
         if (since === "")
             return
-        awayCut = false
         list({since: since}, json => {
             sincePages.push(json)
             const next = ShellState.nextCursor(json)
             if (next !== "" && sincePages.length >= root.awayPages) {
-                root.awayCut = true
+                cut = true
                 return ""
             }
             return next
         })
     }
 
-    function track(call) {
-        _calls.push(call)
+    function track(kind, call) {
+        _calls[kind].push(call)
     }
 
     function readConfirmations() {
-        track(CoreCall.appCall(core, "app/confirmations.list", {state: "pending"}, {
+        track("confirmations", CoreCall.appCall(core, "app/confirmations.list", {state: "pending"}, {
             owner: root,
             ok: r => {
                 root._pending = r.confirmations || []
                 root.setRead("confirmations", "ok")
-                root.landed()
+                root.landed("confirmations")
             },
             error: e => {
                 root.setRead("confirmations", "failed", e)
-                root.landed()
+                root.landed("confirmations")
             }
         }))
     }
 
-    function readProjects() {
-        track(CoreCall.call(core, "projects.list", {}, {
+    // `projects.list` and `assets.query`.
+    function readCards() {
+        let open = 2
+        const done = () => {
+            if (--open === 0)
+                root.landed("cards")
+        }
+        track("cards", CoreCall.call(core, "projects.list", {}, {
             owner: root,
             ok: r => {
                 root.projects = (r.structured || {}).projects || []
                 root.setRead("projects", "ok")
-                root.landed()
+                done()
             },
             error: e => {
                 root.setRead("projects", "failed", e)
-                root.landed()
+                done()
+            }
+        }))
+        track("cards", CoreCall.call(core, "assets.query", {sort: {field: "updated", dir: "desc"}, limit: 12}, {
+            owner: root,
+            ok: r => {
+                root.assets = (r.structured || {}).assets || []
+                root.setRead("assets", "ok")
+                done()
+            },
+            error: e => {
+                root.setRead("assets", "failed", e)
+                done()
             }
         }))
     }
 
+    // The session's project, never named: naming one would move it and the workspace's hint.
     function readStatus() {
-        track(CoreCall.call(core, "project.status", core.project ? {project: core.project} : {}, {
+        _statusAt = Date.now()
+        track("status", CoreCall.call(core, "project.status", {}, {
             owner: root,
             ok: r => {
                 const s = r.structured || {}
                 root.byStatus = s.assets_by_status || {}
                 root.statusProject = s.project || ""
                 root.setRead("status", "ok")
-                root.landed()
+                root.landed("status")
             },
             error: e => {
                 // The project the core falls back on isn't there: nothing to count, no fault.
@@ -350,30 +465,17 @@ Rectangle {
                 } else {
                     root.setRead("status", "failed", e)
                 }
-                root.landed()
-            }
-        }))
-    }
-
-    function readAssets() {
-        track(CoreCall.call(core, "assets.query", {sort: {field: "updated", dir: "desc"}, limit: 12}, {
-            owner: root,
-            ok: r => {
-                root.assets = (r.structured || {}).assets || []
-                root.setRead("assets", "ok")
-                root.landed()
-            },
-            error: e => {
-                root.setRead("assets", "failed", e)
-                root.landed()
+                root.landed("status")
             }
         }))
     }
 
     function cancelReads() {
-        for (const call of _calls)
-            call.cancel()
-        _calls = []
+        for (const kind in _calls) {
+            for (const call of _calls[kind])
+                call.cancel()
+        }
+        _calls = {}
         for (const id in _raw) {
             try {
                 core.cancel(id)
@@ -382,11 +484,11 @@ Rectangle {
             }
         }
         _raw = {}
-        _open = 0
-        _again = false
+        _out = {}
         _dueSince = 0
         coalesce.stop()
         retry.stop()
+        statusGate.stop()
     }
 
     // --- Events. ---
@@ -394,7 +496,7 @@ Rectangle {
     function onJobsEvent(kind, data) {
         if (kind !== "event") {
             _fresh = true
-            dueEverything()
+            reload()
             read()
         } else if (data && data.kind === "job" && data.job) {
             _pendingJobs.push(data.job)
@@ -405,7 +507,7 @@ Rectangle {
 
     function onConfirmationsEvent(kind) {
         if (kind !== "event") {
-            dueEverything()
+            reload()
             read()
         } else {
             due({confirmations: true})
@@ -427,6 +529,8 @@ Rectangle {
         if (change !== 2 && !ended && !unknown)
             return
         due(ended ? {jobs: true, cards: true} : {jobs: true})
+        if (ended)
+            dueStatusSoon()
         requestRead()
     }
 
@@ -456,7 +560,8 @@ Rectangle {
                     seenTimer.restart()
             }
         }
-        _awayLoaded = readState.jobs === "ok" && (!awayOn || readState.confirmations === "ok")
+        _awayLoaded = readState.jobs === "ok" && !_out.jobs && !_out.confirmations
+                      && (!awayOn || readState.confirmations === "ok")
     }
 
     function writeSeen(at) {
@@ -466,23 +571,35 @@ Rectangle {
         _wroteSeen = true
     }
 
-    // Dismiss: these lines are done with, and the card counts from now.
+    // Dismiss: these lines are done with. Both times move to when the read they came from began, unless
+    // a jobs read is due, out or failing: then nothing has shown what came since, and they stay.
     function dismissAway() {
         const dismissed = Object.assign({}, _dismissed)
         for (const item of awayItems)
             dismissed[lineKey(item)] = true
         _dismissed = dismissed
-        const at = new Date().toISOString()
-        writeSeen(at)
-        lastSeen = at
+        const clear = readState.jobs === "ok" && !_out.jobs && !_due.jobs && !_toRetry.jobs && _pendingJobs.length === 0
+        if (clear && _seenUpTo !== "") {
+            writeSeen(_seenUpTo)
+            lastSeen = _seenUpTo
+            awayCut = false
+        } else {
+            _unseen = true
+        }
         updateAway()
+    }
+
+    // The time to count from in this workspace: see the header for one ahead of now.
+    function keptSince(workspace) {
+        const kept = ShellState.lastSeen(stateDir, workspace)
+        return kept !== "" && ShellState.timeMs(kept) > Date.now() ? seenStamp(Date.now() - aheadLookBackMs) : kept
     }
 
     // Home has been away long enough: the card now counts from the kept time.
     function moveCardTime() {
         _moveTime = false
         _wroteSeen = false
-        lastSeen = ShellState.lastSeen(stateDir, workspaceNow())
+        lastSeen = keptSince(workspaceNow())
         _unseen = true
         _awayLoaded = false
         due({jobs: true, confirmations: true})
@@ -490,7 +607,9 @@ Rectangle {
 
     function startWorkspace() {
         _workspaceAt = workspaceNow()
-        lastSeen = _workspaceAt !== "" ? ShellState.lastSeen(stateDir, _workspaceAt) : ""
+        lastSeen = _workspaceAt !== "" ? keptSince(_workspaceAt) : ""
+        _seenUpTo = ""
+        _statusAt = 0
         _unseen = true
         _wroteSeen = false
         _moveTime = false
@@ -504,7 +623,16 @@ Rectangle {
             return
         if (_moveTime)
             moveCardTime()
-        read()
+        const waiting = anyDue() || Object.keys(_toRetry).length > 0
+        if (_readOnShow) {
+            _readOnShow = false
+            due({jobs: true, confirmations: true, cards: true})
+            dueStatusSoon()
+        }
+        if (waiting)
+            read()
+        else if (anyDue())
+            requestRead()
     }
 
     Component.onCompleted: {
@@ -533,7 +661,7 @@ Rectangle {
         function onConnectionChanged() {
             if (root.connectedNow()) {
                 root._retryMs = 0
-                root.dueEverything()
+                root.reload()
                 root.read()
             } else {
                 // A read that spans a loss doesn't speak for the new connection.
@@ -555,6 +683,8 @@ Rectangle {
             root._pendingJobs = []
             root.readState = {}
             root.readError = {}
+            root._oldDue = {}
+            root._toRetry = {}
             live.beginRead(true)
             live.commit(Date.now())
             root.startWorkspace()
@@ -562,7 +692,7 @@ Rectangle {
             root.read()
         }
         function onProjectChanged() {
-            root.due({cards: true})
+            root.due({status: true})
             root.requestRead()
         }
         function onCallFinished(id, json) {
@@ -596,10 +726,14 @@ Rectangle {
 
     Timer {
         id: retry
+        onTriggered: root.read()
+    }
+
+    // The last read of the counts after job ends.
+    Timer {
+        id: statusGate
         onTriggered: {
-            const again = root._toRetry
-            root._toRetry = {}
-            root.due(again)
+            root.due({status: true})
             root.read()
         }
     }
@@ -616,8 +750,8 @@ Rectangle {
         id: seenTimer
         interval: root.seenAfterMs
         running: root.onScreen && root.connected && root.hasWorkspace && root.stateDir !== "" && root._awayLoaded
-                 && root._unseen
-        onTriggered: root.writeSeen(new Date().toISOString())
+                 && root._unseen && !root.awayCut
+        onTriggered: root.writeSeen(root._seenUpTo)
     }
 
     // A float hides Home for a moment; this long off screen is really away.
@@ -625,6 +759,32 @@ Rectangle {
         interval: root.seenAfterMs
         running: !root.onScreen && root._wroteSeen
         onTriggered: root._moveTime = true
+    }
+
+    // Off screen for longer than a float's moment: everything is read when it shows.
+    Timer {
+        interval: 1000
+        running: !root.onScreen
+        onTriggered: root._readOnShow = true
+    }
+
+    // Keeps the item with the keyboard focus in view.
+    Connections {
+        target: root.Window.window
+        function onActiveFocusItemChanged() {
+            const item = root.Window.window ? root.Window.window.activeFocusItem : null
+            for (let p = item; p; p = p.parent) {
+                if (p === scroller.contentItem) {
+                    const y = item.mapToItem(scroller.contentItem, 0, 0).y
+                    if (y < scroller.contentY)
+                        scroller.contentY = Math.max(0, y - Theme.spacing)
+                    else if (y + item.height > scroller.contentY + scroller.height)
+                        scroller.contentY = Math.min(scroller.contentHeight - scroller.height,
+                                                     y + item.height - scroller.height + Theme.spacing)
+                    return
+                }
+            }
+        }
     }
 
     Flickable {
@@ -674,6 +834,10 @@ Rectangle {
                 id: openedCard
                 width: parent.width
                 onOpened: scroller.contentY = 0
+                onDismissed: hadFocus => {
+                    if (hadFocus)
+                        scroller.forceActiveFocus(Qt.OtherFocusReason)
+                }
             }
 
             AwayCard {
@@ -724,5 +888,27 @@ Rectangle {
                 }
             }
         }
+    }
+
+    // Where the cards are scrolled to, and that there is more.
+    Rectangle {
+        id: scrollBar
+        visible: scroller.visibleArea.heightRatio < 1
+        x: scroller.x + scroller.width - width
+        y: scroller.y + scroller.visibleArea.yPosition * scroller.height
+        width: 3
+        height: Math.max(16, scroller.visibleArea.heightRatio * scroller.height)
+        radius: 1
+        color: Theme.textMuted
+    }
+
+    // The keyboard focus on the cards.
+    Rectangle {
+        id: focusRing
+        visible: scroller.activeFocus
+        anchors.fill: scroller
+        color: "transparent"
+        border.color: Theme.focus
+        border.width: Theme.focusWidth
     }
 }

@@ -1,6 +1,7 @@
 // Home's "While you were away" card (APP-111, P4a-R41): the lines the panel holds, newest first, as
-// plain text with their times in the person's local calendar. It shows while it has a line, or
-// while its read has failed and so it can't say there are none. Dismiss clears it (HomePanel).
+// plain text with their times in the person's local calendar. It shows while it has a line, while
+// its read has failed and so it can't say there are none, or while there is more than its read took
+// in. Dismiss clears it (HomePanel).
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
@@ -15,18 +16,21 @@ LCard {
     readonly property var lines: panel.awayItems.slice(0, maxLines)
     readonly property int moreLines: panel.awayItems.length - lines.length
     readonly property bool failed: panel.readState.jobs === "failed" || panel.readState.confirmations === "failed"
-    readonly property bool stale: !panel.connected || failed
+    readonly property bool stale: panel.isStale("jobs") || panel.isStale("confirmations")
     readonly property string note: {
         if (!panel.connected)
             return panel.noteFor("jobs", "")
-        if (panel.readState.jobs === "failed")
+        if (panel.isStale("jobs"))
             return panel.noteFor("jobs", "the jobs")
-        return panel.readState.confirmations === "failed" ? panel.noteFor("confirmations", "the confirmations") : ""
+        return panel.isStale("confirmations") ? panel.noteFor("confirmations", "the confirmations") : ""
     }
     readonly property string moreText: {
         if (moreLines <= 0 && !panel.awayCut)
             return ""
-        return moreLines > 0 ? "and " + MoneyText.count(String(moreLines)) + (panel.awayCut ? " or more" : " more") : "and more"
+        if (moreLines > 0)
+            return "and " + MoneyText.count(String(moreLines)) + (panel.awayCut ? " or more" : " more")
+        return lines.length > 0 ? "and more"
+                                : "More jobs changed while you were away than this card reads. Jobs lists them."
     }
     readonly property alias dismissButton: dismissButton
     readonly property alias noteText: noteText
@@ -45,7 +49,7 @@ LCard {
     }
 
     title: "While you were away"
-    visible: panel.awayOn && (panel.awayItems.length > 0 || failed)
+    visible: panel.awayOn && (panel.awayItems.length > 0 || failed || panel.awayCut)
 
     Column {
         width: parent.width
@@ -76,6 +80,7 @@ LCard {
             textFormat: Text.PlainText
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
+            wrapMode: Text.Wrap
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
@@ -96,10 +101,16 @@ LCard {
         LButton {
             id: dismissButton
             requiresCore: true
-            visible: root.panel.awayItems.length > 0
+            visible: root.panel.awayItems.length > 0 || root.panel.awayCut
             text: "Dismiss"
-            Accessible.description: "Clears this list, and counts from now"
-            onClicked: root.panel.dismissAway()
+            Accessible.description: "Clears this list"
+            onClicked: {
+                const hadFocus = activeFocus
+                root.panel.dismissAway()
+                // It may hide under the focus.
+                if (hadFocus)
+                    root.panel.scroller.forceActiveFocus(Qt.OtherFocusReason)
+            }
         }
     }
 }

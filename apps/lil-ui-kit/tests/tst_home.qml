@@ -146,7 +146,28 @@ TestCase {
     }
 
     function coalesceDue(panel) {
-        return !!(panel._due.jobs || panel._due.confirmations || panel._due.cards)
+        return !!(panel._due.jobs || panel._due.confirmations || panel._due.cards || panel._due.status)
+    }
+
+    function isoAgo(ms) {
+        return new Date(Date.now() - ms).toISOString().replace(/\.\d+Z$/, "Z")
+    }
+
+    // Keeps answering from `s` for `ms`.
+    function answerFor(core, s, ms) {
+        const from = Date.now()
+        while (Date.now() - from < ms) {
+            answerAll(core, s)
+            wait(50)
+        }
+    }
+
+    function isInside(item, ancestor) {
+        for (let p = item; p; p = p.parent) {
+            if (p === ancestor)
+                return true
+        }
+        return false
     }
 
     function callsOf(core, name) {
@@ -193,7 +214,7 @@ TestCase {
         compare(rowTexts(panel.projectsCard.rows), ["sketchbook · 12 assets", "lantern · 3 assets"])
         compare(panel.statusCounts.countsLabel.text, "Takes waiting 4 · In review 2 · Stale 1 · Blocked 0")
         compare(panel.statusCounts.title, "Assets in sketchbook")
-        compare(callsOf(core, "project.status")[0].args, {project: "sketchbook"})
+        compare(callsOf(core, "project.status")[0].args, {}, "naming one would move the session's project and the hint")
         compare(panel.projectsCard.workspaceText, "Workspace: harbor")
         const query = callsOf(core, "assets.query")[0].args
         compare(query, {sort: {field: "updated", dir: "desc"}, limit: 12})
@@ -334,10 +355,9 @@ TestCase {
         compare(walk.problems(panel.awayCard), [])
         wait(Math.max(0, 2000 - (Date.now() - shownAt)))
         compare(keptTime(dir, "ws1"), seen, "not yet")
-        const before = Date.now()
         tryVerify(() => keptTime(dir, "ws1") !== seen, 2500, "written after 3 s")
         const at = Date.parse(keptTime(dir, "ws1"))
-        verify(at >= before - 1000 && at <= Date.now(), "it is now: " + keptTime(dir, "ws1"))
+        verify(at >= shownAt - 2000 && at <= shownAt + 500, "it is when the read that was shown began: " + keptTime(dir, "ws1"))
         verify(Date.now() - shownAt >= 2900, "and not before 3 s")
         // The lines stay: they don't vanish as you read them, nor on the next read.
         verify(panel.awayCard.visible)
@@ -804,7 +824,7 @@ TestCase {
         core.emit("jobs", "event", {kind: "job", job: Shapes.job("j_0000000000000031", "succeeded")})
         tryVerify(() => core.calls.length > before, 3000)
         const names = core.calls.slice(before).map(c => c.name)
-        verify(names.indexOf("assets.query") >= 0 && names.indexOf("project.status") >= 0, names)
+        verify(names.indexOf("assets.query") >= 0 && names.indexOf("projects.list") >= 0, names)
         settle(core, panel, without)
     }
 
@@ -828,8 +848,12 @@ TestCase {
         const core = makeCore()
         const panel = makeHome(core)
         settle(core, panel, scene())
+        const before = callsOf(core, "project.status").length
+        const others = callsOf(core, "projects.list").length
         core.noteProject("lantern")
-        tryVerify(() => callsOf(core, "project.status").some(c => c.args.project === "lantern"), 3000)
+        tryVerify(() => callsOf(core, "project.status").length === before + 1, 3000)
+        compare(callsOf(core, "project.status")[before].args, {}, "the session's project, never named")
+        compare(callsOf(core, "projects.list").length, others, "only the counts depend on it")
         settle(core, panel, scene({status: Shapes.projectStatus("lantern", {stale: 3})}))
         compare(panel.statusCounts.title, "Assets in lantern")
         compare(panel.statusCounts.countsLabel.text, "Takes waiting 0 · In review 0 · Stale 3 · Blocked 0")
@@ -1001,6 +1025,400 @@ TestCase {
         compare(panel.lastSeen, seen, "the card's time hasn't moved")
         compare([count("projects.list"), count("assets.query"), count("project.status")], reads, "nothing is read again")
         shell.destroy()
+    }
+
+    // --- Fix round 1. ---
+
+    function test_a_retry_survives_a_read_that_does_not_cover_it() { // spec: APP-111
+        for (const [name, refusedName] of [["cards", "projects.list"], ["jobs", "jobs.list"], ["counts", "assets.query"]]) {
+            const core = makeCore()
+            answered = {}
+            const panel = makeHome(core, stateWith("ws1", seen))
+            const refused = Shapes.refusal("store.io", "The index is busy.")
+            settle(core, panel, scene({fail: {[refusedName]: refused}}))
+            const card = refusedName === "jobs.list" ? panel.openJobs : refusedName === "assets.query" ? panel.recentAssets : panel.projectsCard
+            verify(card.note.indexOf("Trying again") >= 0, card.note)
+            // Well inside the retry's wait, an event reads something else.
+            core.emit("confirmations", "event", Shapes.confirmationEvent("pending", Shapes.confirmation("cf_00000000000000b1", "comfy.run", "2026-10-30T13:00:01Z")))
+            tryVerify(() => {
+                answerAll(core, scene())
+                return card.note.indexOf("Trying again") < 0 && card.note !== "Reading…"
+            }, 5000, name + ": it is asked again, and the words go")
+            panel.Window.window.destroy()
+        }
+    }
+
+    function test_the_time_does_not_pass_a_job_being_read() { // spec: APP-111, P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const host = panel.Window.window
+        settle(core, panel, scene())
+        wait(2300)
+        // A job ends now, and its read is slow.
+        const job = Shapes.job("j_00000000000000e1", "failed", {updated: isoAgo(0), project: "sketchbook"})
+        core.emit("jobs", "event", {kind: "job", job: job})
+        tryVerify(() => panel._open > 0, 3000, "the read goes out")
+        wait(1500)
+        compare(keptTime(dir, "ws1"), seen, "the time waits for the read")
+        host.visibility = Window.Minimized
+        tryVerify(() => !panel.onScreen, 5000)
+        answerAll(core, scene({jobs: [job]}))
+        wait(3400)
+        host.visibility = Window.Windowed
+        tryVerify(() => panel.onScreen, 5000)
+        settle(core, panel, scene({jobs: [job]}))
+        verify(panel.awayCard.visible, "the job nobody saw is on the card")
+        verify(lineTexts(panel.awayCard)[0].startsWith("Failed"), lineTexts(panel.awayCard))
+    }
+
+    function test_the_time_is_never_past_the_read_that_was_shown() { // spec: P4a-R16
+        // A reload that hasn't landed holds it, whatever the wait.
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        settle(core, panel, scene())
+        core.emit("jobs", "resync_required", {})
+        compare(panel._awayLoaded, false, "cleared as the read starts")
+        wait(3400)
+        compare(keptTime(dir, "ws1"), seen)
+        // Once it lands, it is that read's start, not the time of the write.
+        const landing = Date.now()
+        settle(core, panel, scene())
+        tryVerify(() => keptTime(dir, "ws1") !== seen, 4000)
+        verify(Date.parse(keptTime(dir, "ws1")) <= landing, keptTime(dir, "ws1"))
+    }
+
+    function test_a_kept_time_never_has_a_fraction_of_exactly_000() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        // The core takes .000 as a whole second, and would lose a job later in that second.
+        const ms = Date.parse("2026-10-30T12:00:05.000Z")
+        compare(panel.seenStamp(ms), "2026-10-30T12:00:04.999Z")
+        compare(panel.seenStamp(ms + 250), "2026-10-30T12:00:05.250Z")
+    }
+
+    function test_dismiss_while_the_jobs_read_is_failing_keeps_the_time() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const oldJob = Shapes.job("j_00000000000000e2", "succeeded", {updated: "2026-10-30T13:00:05Z"})
+        settle(core, panel, scene({jobs: [oldJob]}))
+        core.emit("jobs", "resync_required", {})
+        settle(core, panel, scene({jobs: [oldJob], fail: {"jobs.list": Shapes.refusal("store.io", "busy")}}))
+        const later = Shapes.job("j_00000000000000e3", "failed", {updated: isoAgo(5000)})
+        verify(panel.awayCard.dismissButton.visible)
+        panel.awayCard.dismissButton.clicked()
+        compare(keptTime(dir, "ws1"), seen, "the time holds while the read fails")
+        compare(lineTexts(panel.awayCard), [], "the line shown goes")
+        tryVerify(() => {
+            answerAll(core, scene({jobs: [oldJob, later]}))
+            return panel.readState.jobs === "ok"
+        }, 5000, "the read recovers")
+        compare(lineTexts(panel.awayCard).length, 1, "only the job it never showed")
+        verify(lineTexts(panel.awayCard)[0].startsWith("Failed"), lineTexts(panel.awayCard))
+    }
+
+    function test_dismiss_with_a_job_end_waiting_keeps_the_job() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const oldJob = Shapes.job("j_00000000000000e2", "succeeded", {updated: "2026-10-30T13:00:05Z"})
+        settle(core, panel, scene({jobs: [oldJob]}))
+        const later = Shapes.job("j_00000000000000e3", "failed", {updated: isoAgo(2000)})
+        core.emit("jobs", "event", {kind: "job", job: later})
+        panel.awayCard.dismissButton.clicked()
+        tryVerify(() => {
+            answerAll(core, scene({jobs: [oldJob, later]}))
+            return panel.awayCard.lineRepeater.count === 1
+        }, 3000, "the job it never showed comes")
+        verify(lineTexts(panel.awayCard)[0].startsWith("Failed"), lineTexts(panel.awayCard))
+    }
+
+    function test_coming_back_reads_the_cards() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        settle(core, panel, scene())
+        const host = panel.Window.window
+        // A moment off screen, as a float: nothing.
+        host.visibility = Window.Minimized
+        tryVerify(() => !panel.onScreen, 5000)
+        wait(100)
+        let before = core.calls.length
+        host.visibility = Window.Windowed
+        tryVerify(() => panel.onScreen, 5000)
+        wait(400)
+        compare(core.calls.slice(before), [], "a brief hide reads nothing")
+        // Longer: the cards are read, a moment later, the new ones shown.
+        host.visibility = Window.Minimized
+        tryVerify(() => !panel.onScreen, 5000)
+        wait(1300)
+        before = core.calls.length
+        host.visibility = Window.Windowed
+        tryVerify(() => panel.onScreen, 5000)
+        compare(core.calls.slice(before), [], "coalesced, not at once")
+        tryVerify(() => core.calls.slice(before).some(c => c.name === "projects.list"), 3000, "the cards are read")
+        settle(core, panel, scene({projects: [{project: "new", name: "New", status: "active", assets: 1}]}))
+        compare(panel.projectsCard.rows.count, 1)
+        verify(core.calls.slice(before).some(c => c.name === "jobs.list" && c.args.status === "running"), "the jobs too")
+    }
+
+    function test_figures_read_as_old_until_a_reload_lands() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        const s = scene()
+        settle(core, panel, s)
+        const check = what => {
+            verify(panel.isStale("projects"), what)
+            verify(Qt.colorEqual(panel.projectsCard.rows.itemAt(0).color, Theme.textMuted), what)
+            verify(Qt.colorEqual(panel.statusCounts.countsLabel.color, Theme.textMuted), what)
+            verify(Qt.colorEqual(panel.recentAssets.rows.itemAt(0).color, Theme.textMuted), what)
+            compare(panel.projectsCard.note, "Reading again, so this may be out of date.", what)
+            compare(panel.openJobs.note, "Reading again, so this may be out of date.", what)
+        }
+        // Back from a loss, before anything has landed.
+        core.applyState({connection: "reconnecting"})
+        core.applyState({connection: "ready", workspace: wsOne})
+        check("back on ready")
+        settle(core, panel, s)
+        verify(!panel.isStale("projects"))
+        verify(Qt.colorEqual(panel.projectsCard.rows.itemAt(0).color, Theme.text))
+        compare(panel.projectsCard.note, "")
+        // A mark, the same.
+        core.emit("jobs", "resync_required", {})
+        check("on a resync")
+        settle(core, panel, s)
+        compare(panel.statusCounts.note, "")
+        compare(panel.openJobs.note, "Nothing is running or queued.")
+    }
+
+    function test_a_read_from_before_a_mark_does_not_clear_it() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        const s = scene()
+        settle(core, panel, s)
+        core.emit("jobs", "event", {kind: "job", job: Shapes.job("j_0000000000000031", "succeeded")})
+        tryVerify(() => callsOf(core, "projects.list").length === 2, 3000, "a read is out")
+        core.emit("jobs", "resync_required", {})
+        answerAll(core, s)
+        verify(panel.isStale("projects"), "what landed was asked before the mark")
+        settle(core, panel, s)
+        verify(!panel.isStale("projects"))
+    }
+
+    function test_project_status_is_limited_after_job_ends() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        panel.statusGapMs = 1000
+        const s = scene()
+        settle(core, panel, s)
+        wait(1100)
+        const count = () => callsOf(core, "project.status").length
+        const before = count()
+        // The gap has passed: the first end reads the counts.
+        core.emit("jobs", "event", {kind: "job", job: Shapes.job("j_0000000000000031", "succeeded")})
+        tryVerify(() => count() === before + 1, 2000, "the first end reads them")
+        settle(core, panel, s)
+        // More ends within the gap: not one read each.
+        const from = Date.now()
+        for (let i = 0; i < 4; ++i) {
+            core.emit("jobs", "event", {kind: "job", job: Shapes.job("j_000000000000004" + i, "succeeded")})
+            answerFor(core, s, 100)
+        }
+        verify(Date.now() - from < 1000, "the test stayed within the gap")
+        compare(count(), before + 1, "limited")
+        // And a last one, so the counts settle.
+        tryVerify(() => {
+            answerAll(core, s)
+            return count() === before + 2
+        }, 3000, "the final read")
+        answerFor(core, s, 1300)
+        compare(count(), before + 2, "then nothing more")
+    }
+
+    function test_the_default_gap_is_30_s() { // spec: APP-111
+        const panel = makeHome(makeCore())
+        compare(panel.statusGapMs, 30000)
+    }
+
+    function test_away_lines_do_not_wait_for_the_cards() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const s = awayScene()
+        // Only the jobs and the confirmations answer: the index is still being built.
+        tryVerify(() => {
+            for (const c of core.calls) {
+                if (answered[c.id])
+                    continue
+                if (c.name === "jobs.list" || c.name === "app/confirmations.list") {
+                    answered[c.id] = true
+                    core.respond(c.id, c.name === "jobs.list" ? core.jobsListAnswer(c.args, s.jobs, [])
+                                                              : Shapes.confirmations(s.pending))
+                }
+            }
+            return panel.awayCard.visible
+        }, 5000, "the card shows with the cards' reads out")
+        compare(panel.awayCard.lineRepeater.count, 4)
+        compare(panel.projectsCard.note, "Reading…")
+        // And a job's end is read meanwhile.
+        const fresh = Shapes.job("j_00000000000000c1", "failed", {updated: isoAgo(0)})
+        core.emit("jobs", "event", {kind: "job", job: fresh})
+        tryVerify(() => {
+            for (const c of core.calls) {
+                if (!answered[c.id] && c.name === "jobs.list") {
+                    answered[c.id] = true
+                    core.respond(c.id, core.jobsListAnswer(c.args, s.jobs.concat([fresh]), []))
+                }
+            }
+            return panel.awayCard.lineRepeater.count === 5
+        }, 3000, "the slow cards hold nothing up")
+    }
+
+    function test_tab_brings_a_control_into_view_with_a_ring_and_a_bar() { // spec: APP-156
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const host = panel.Window.window
+        host.height = 200
+        const jobs = []
+        for (let i = 0; i < 25; ++i)
+            jobs.push(Shapes.job("j_00000000000" + String(10000 + i), "succeeded", {updated: "2026-10-30T13:00:05Z"}))
+        settle(core, panel, scene({jobs: jobs}))
+        host.requestActivate()
+        tryVerify(() => host.active, 3000)
+        wait(100)
+        verify(panel.scrollBar.visible, "the bar says there is more")
+        panel.scroller.forceActiveFocus()
+        verify(panel.focusRing.visible, "the ring shows the scroll area has the focus")
+        keyClick(Qt.Key_Tab)
+        const b = panel.awayCard.dismissButton
+        tryVerify(() => b.activeFocus, 2000, "Tab reaches Dismiss")
+        verify(!panel.focusRing.visible, "the ring goes with the focus")
+        tryVerify(() => {
+            const at = b.mapToItem(panel.scroller, 0, 0)
+            return at.y >= 0 && at.y + b.height <= panel.scroller.height
+        }, 2000, "the button is in view")
+        // Back up: the card's top control comes into view again.
+        panel.scroller.contentY = panel.scroller.contentHeight - panel.scroller.height
+        panel.scroller.forceActiveFocus()
+        compare(walk.problems(panel), [])
+    }
+
+    function test_a_kept_time_ahead_of_now_loses_no_line() { // spec: APP-111
+        const future = "2099-01-01T00:00:00Z"
+        const dir = stateWith("ws1", future)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const job = Shapes.job("j_00000000000000e4", "failed", {updated: isoAgo(60000)})
+        const old = Shapes.job("j_00000000000000e5", "failed", {updated: isoAgo(8 * 24 * 3600 * 1000)})
+        settle(core, panel, scene({jobs: [job, old]}))
+        verify(panel.lastSeen !== future, "never sent")
+        verify(callsOf(core, "jobs.list").every(c => c.args.since !== future))
+        verify(panel.awayCard.visible, "a job from a minute ago is listed")
+        compare(panel.awayCard.lineRepeater.count, 1, "a week back, no further")
+        tryVerify(() => keptTime(dir, "ws1") !== future, 4000, "the kept time comes back to now")
+        verify(Date.parse(keptTime(dir, "ws1")) <= Date.now())
+        compare(panel.awayCard.lineRepeater.count, 1, "and the line stays")
+    }
+
+    function test_a_since_read_past_its_limit_says_so_and_holds_the_time() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const jobs = []
+        // Nothing the card lists in the pages it reads.
+        for (let i = 0; i < panel.awayPages * 100 + 1; ++i)
+            jobs.push(Shapes.job("j_0000000000" + String(100000 + i), "cancelled", {created: "2026-10-30T14:00:00Z", updated: "2026-10-30T14:00:05Z"}))
+        jobs.push(Shapes.job("j_00000000000000f1", "failed", {created: "2026-10-30T12:30:00Z", updated: "2026-10-30T13:00:05Z"}))
+        settle(core, panel, scene({jobs: jobs}))
+        verify(panel.awayCut)
+        compare(panel.awayItems, [])
+        verify(panel.awayCard.visible, "the card says there is more")
+        verify(panel.awayCard.moreLabel.visible && panel.awayCard.moreText.indexOf("than this card reads") >= 0, panel.awayCard.moreText)
+        wait(3400)
+        compare(keptTime(dir, "ws1"), seen, "the time doesn't pass pages it didn't read")
+        verify(panel.awayCard.dismissButton.visible, "you can say you've seen that")
+        panel.dismissAway()
+        verify(!panel.awayCard.visible)
+        verify(keptTime(dir, "ws1") !== seen)
+    }
+
+    function test_status_words_are_true_when_the_projects_read_failed() { // spec: APP-111
+        const core = makeCore()
+        core.project = ""
+        const panel = makeHome(core)
+        const unknown = Shapes.refusal("project.unknown", "There is no project.")
+        settle(core, panel, scene({status: unknown, fail: {"projects.list": Shapes.refusal("store.io", "busy")}}))
+        verify(panel.projectsCard.note.indexOf("Couldn't read") === 0, panel.projectsCard.note)
+        compare(panel.statusCounts.note, "This workspace has no current project to count.")
+    }
+
+    function test_times_that_do_not_read_show_no_time() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        settle(core, panel, scene())
+        for (const v of ["", "garbage", "12", "1", "2026", "2026-13-45T00:00:00Z", "2026-02-31T00:00:00Z", "2026-10-30",
+                         "2026-10-30T13:00:05", "10/30/2026", "Sat Oct 31 2026", null, undefined, 5])
+            compare(panel.localStamp(v), "", "no time for " + v)
+        compare(panel.localStamp("2026-10-30T13:00:05.250Z"), stamp("2026-10-30T13:00:05Z"))
+        compare(panel.localStamp("2026-10-30T15:00:05+02:00"), stamp("2026-10-30T13:00:05Z"))
+        core.emit("jobs", "resync_required", {})
+        settle(core, panel, scene({assets: [Shapes.asset("sketchbook", "a", "approved", null), Shapes.asset("sketchbook", "b", "approved", "12")]}))
+        compare(rowTexts(panel.recentAssets.rows), ["a · sketchbook · Approved", "b · sketchbook · Approved"])
+    }
+
+    function test_a_kept_time_the_core_would_refuse_is_never_sent() { // spec: P4a-R16
+        for (const bad of ["2026-02-31T00:00:00Z", "2026-10-30T12:00:60Z", "2026-10-30T12:00:00z"]) {
+            const dir = stateWith("ws1", bad)
+            const core = makeCore()
+            answered = {}
+            const panel = makeHome(core, dir)
+            settle(core, panel, awayScene())
+            compare(panel.lastSeen, "", bad)
+            verify(callsOf(core, "jobs.list").every(c => c.args.since === undefined), bad)
+            panel.Window.window.destroy()
+        }
+    }
+
+    function test_focus_after_dismiss_stays_in_home() { // spec: APP-156
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const host = panel.Window.window
+        settle(core, panel, awayScene())
+        host.requestActivate()
+        tryVerify(() => host.active, 3000)
+        panel.openedCard.show({target: "C:\\art\\x.png", intent: "open"})
+        wait(100)
+        panel.awayCard.dismissButton.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        verify(!panel.awayCard.visible)
+        tryVerify(() => panel.scroller.activeFocus, 2000, "the focus goes to the scroll area: " + host.activeFocusItem)
+        panel.openedCard.dismissButton.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        verify(!panel.openedCard.visible)
+        tryVerify(() => panel.scroller.activeFocus, 2000, "and from the Opened card: " + host.activeFocusItem)
+    }
+
+    function test_a_focus_launch_while_the_default_layout_waits_gets_the_focus() { // spec: P4a-R21
+        const core = makeCore()
+        const shell = createTemporaryObject(shellComponent, tc, {core: core})
+        shell.handleLaunchJson(JSON.stringify({kind: "target", target: "C:\\art\\x.png", intent: "open", focus: true, activate: false}))
+        shell.visible = true
+        tryVerify(() => shell.docks.home.content && shell.docks.home.content.onScreen, 5000)
+        shell.requestActivate()
+        tryVerify(() => shell.docks.home.panelHasFocus, 5000, "Home takes the focus the launch asked for")
+        shell.destroy()
+    }
+
+    function test_a_job_with_an_unknown_outcome_does_not_say_running() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        settle(core, panel, scene({jobs: [Shapes.job("j_0000000000000001", "running", {substatus: "interrupted_unknown", project: "sketchbook"})]}))
+        const view = panel.openJobs.view
+        tryVerify(() => !!view.itemAtIndex(0), 5000)
+        compare(view.itemAtIndex(0).text, "ComfyUI prompt · sketchbook · Outcome unknown")
     }
 
     function test_a11y_walk_passes() { // spec: APP-156

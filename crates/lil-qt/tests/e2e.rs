@@ -1005,7 +1005,73 @@ fn topic_subscriptions_are_counted_and_kept_in_order() {
 // Helpers.
 // ---------------------------------------------------------------------------------------------
 
-/// Polls `f` every 20 ms until it gives a value, for at most [`DEADLINE`].
+/// Home's reads leave the session's project and the workspace's hint alone (ARCH-088): a call that
+/// names a project makes it the active one and writes the hint, so Home names none. The hint is
+/// `harbor`; every read Home makes, with its arguments, leaves it so, and `project.status {}` answers
+/// for `harbor`. Reading `{project: "lantern"}` moves it, which is why Home mustn't.
+#[test] // spec: APP-111, ARCH-088
+fn home_s_reads_leave_the_hint_alone() {
+    launch("home_s_reads_leave_the_hint_alone", || {
+        let mut served = PathBuf::new();
+        let mut rig = Rig::start(|env| {
+            served = env.make_workspace("home");
+            env.register_workspace(&served, true);
+        });
+        let ws = QString::from(rig.env.workspace_id(&served).as_str());
+        let id = rig
+            .probe
+            .on_gui(move |core| core.set_workspace(&ws).to_string());
+        rig.probe.finished(&id);
+        for project in ["lantern", "harbor"] {
+            let id = rig.probe.call(
+                "project.create",
+                json!({"project": project, "name": project}),
+            );
+            rig.probe.finished(&id);
+        }
+        let state = served.join(".lilith").join("state.json");
+        let hint = || std::fs::read_to_string(&state).unwrap_or_default();
+        let before = hint();
+        assert!(before.contains("harbor"), "{before}");
+        for (tool, args) in [
+            ("projects.list", json!({})),
+            ("project.status", json!({})),
+            (
+                "assets.query",
+                json!({"sort": {"field": "updated", "dir": "desc"}, "limit": 12}),
+            ),
+            ("jobs.list", json!({"limit": 100, "status": "running"})),
+            ("jobs.list", json!({"limit": 100, "order": "queue"})),
+            ("jobs.list", json!({"limit": 100, "status": "queued"})),
+            (
+                "jobs.list",
+                json!({"limit": 100, "since": "2026-01-01T00:00:00.500Z"}),
+            ),
+        ] {
+            let id = rig.probe.call(tool, args.clone());
+            let answer = rig.probe.finished(&id);
+            if tool == "project.status" {
+                assert_eq!(answer["structured"]["project"], "harbor", "{answer}");
+            }
+            assert_eq!(hint(), before, "{tool} {args} moved the hint");
+        }
+        let id = rig
+            .probe
+            .app_call("app/confirmations.list", json!({"state": "pending"}));
+        rig.probe.finished(&id);
+        assert_eq!(hint(), before);
+        let id = rig
+            .probe
+            .call("project.status", json!({"project": "lantern"}));
+        rig.probe.finished(&id);
+        assert!(
+            hint().contains("lantern"),
+            "naming one moves it: {}",
+            hint()
+        );
+    });
+}
+
 /// Home's reads against a real core (APP-111): each answers in the shape the panel reads, a time
 /// with a fraction is taken as `since`, and the finished job it lists comes out of `away_items`.
 #[test] // spec: APP-111
@@ -1110,6 +1176,7 @@ fn home_s_reads_have_the_shapes_home_reads() {
     });
 }
 
+/// Polls `f` every 20 ms until it gives a value, for at most [`DEADLINE`].
 fn poll<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + DEADLINE;
     loop {

@@ -30,8 +30,10 @@ LCard {
     // What a job's row says about its state.
     function stateWords(status, substatus, reasons) {
         if (status === "running") {
-            const known = {executing: "", cancelling: "Cancelling", interrupted_unknown: "Outcome unknown",
-                           ingesting: "Bringing in the outputs"}
+            // Nothing is running it any more, whatever its status says: it waits for you.
+            if (substatus === "interrupted_unknown")
+                return "Outcome unknown"
+            const known = {executing: "", cancelling: "Cancelling", ingesting: "Bringing in the outputs"}
             const word = Object.prototype.hasOwnProperty.call(known, substatus) ? known[substatus] : panel.shown(substatus)
             return word !== "" ? "Running · " + word : "Running"
         }

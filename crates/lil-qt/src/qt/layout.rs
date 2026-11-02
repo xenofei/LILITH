@@ -18,6 +18,7 @@
 //! - `lastSeen(dir, workspace)`: when Home was last seen in that workspace (RFC 3339), empty when
 //!   never or when what is kept doesn't read; `setLastSeen(dir, workspace, at)`: writes it through
 //!   `AppState`; empty, or why it couldn't (P4a-R16).
+//! - `timeMs(text)`: [`crate::format::parse_utc_ms`], NaN when it doesn't read.
 //! - `awayItems(pagesJson, pendingJson, lastSeen)`: [`crate::away::away_items_json`] as JSON;
 //!   `nextCursor(resultJson)`: a `jobs.list` result's `next_cursor`, empty on the last page, so
 //!   QML needn't parse the page.
@@ -80,6 +81,9 @@ pub mod qobject {
             workspace: &QString,
             at: &QString,
         ) -> QString;
+
+        #[qinvokable]
+        fn time_ms(self: &ShellState, text: &QString) -> f64;
 
         #[qinvokable]
         fn next_cursor(self: &ShellState, result_json: &QString) -> QString;
@@ -233,6 +237,10 @@ impl qobject::ShellState {
                 QString::from(&e.to_string())
             }
         }
+    }
+
+    fn time_ms(&self, text: &QString) -> f64 {
+        parse_utc_ms(&text.to_string()).map_or(f64::NAN, |ms| ms as f64)
     }
 
     fn next_cursor(&self, result_json: &QString) -> QString {

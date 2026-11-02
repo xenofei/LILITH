@@ -21,8 +21,11 @@ LCard {
     readonly property string note: {
         if (!panel.connected)
             return panel.noteFor("status", "")
-        if (panel.readState.status === "none")
+        if (panel.readState.status === "none") {
+            if (panel.readState.projects !== "ok")
+                return "This workspace has no current project to count."
             return panel.projects.length > 0 ? "Choose a project in the top bar to see its counts." : "No project to count yet."
+        }
         return panel.noteFor("status", "the counts")
     }
     readonly property alias countsLabel: countsLabel

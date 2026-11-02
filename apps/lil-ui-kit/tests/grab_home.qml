@@ -86,7 +86,7 @@ TestCase {
         const answered = {}
         tryVerify(() => {
             answerAll(core, s, answered)
-            return panel._open === 0 && !panel._due.jobs && !panel._due.cards && !panel._due.confirmations
+            return panel._open === 0 && !panel.anyDue()
         }, 5000, "the reads are in")
         if (before)
             before(shell, core)
@@ -137,6 +137,27 @@ TestCase {
                 answerAll(core, bad, answered)
                 return shell.docks.home.content.readState.projects === "failed"
             }, 5000)
+        })
+    }
+
+    function test_grab_home_keyboard() { // spec: APP-156
+        const jobs = []
+        for (let i = 0; i < 25; ++i)
+            jobs.push(Shapes.job("j_00000000000" + String(10000 + i), "succeeded", {updated: "2026-10-30T13:00:05Z", project: "sketchbook"}))
+        grab("home-keyboard.png", ws, "2026-10-30T12:00:00Z", Object.assign({}, fullScene, {jobs: jobs}), shell => {
+            // The scroll bar, the focus ring, and Tab bringing the card's button into view.
+            const panel = shell.docks.home.content
+            shell.requestActivate()
+            tryVerify(() => shell.active, 3000)
+            panel.scroller.forceActiveFocus()
+            tryVerify(() => panel.scrollBar.visible && panel.focusRing.visible, 3000, "the bar and the ring")
+            wait(100)
+            const ring = grabImage(shell.contentItem)
+            const out = TestFiles.env("LIL_GRAB_DIR") || TestFiles.env("LIL_GRAB_DEFAULT_DIR")
+            verify(TestFiles.mkpath(out))
+            ring.save(out + "/home-keyboard-ring.png")
+            keyClick(Qt.Key_Tab)
+            tryVerify(() => panel.awayCard.dismissButton.activeFocus, 2000)
         })
     }
 
