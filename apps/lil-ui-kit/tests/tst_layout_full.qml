@@ -3,7 +3,8 @@
 // panel and none a placeholder, and Backups opens from Diagnostics' button. Then, in one shell with
 // every panel holding state of its own (and the first-start card offered, and Home's kept time
 // written), each panel floats and docks back in turn: after every move every panel still has its
-// state, the card and the kept time are untouched, and nothing is read again. Every read is answered
+// state, the card and the kept time are untouched, and the move reads none of 11 read tools again
+// (the list in `steady`; other reads and the subscriptions aren't counted). Every read is answered
 // as the real core answers it (ShellScene.js, over CoreShapes.js); the app state is a temporary folder.
 import QtQuick
 import QtTest

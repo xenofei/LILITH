@@ -2,14 +2,16 @@
 // shell under the fake feed. The events reach the shell as Core's do: through BenchPump, the runner's
 // stand-in for the session's event pump, which runs the bridge's own event step on a thread of its own
 // (a preview's base64 and JPEG decode inline, so the events behind a preview wait for it: the Task 17
-// and 23 carry), then the pump's leading-edge throttle for a job's progress (APP-027: at most one every
-// 100 ms), and then signals each on the GUI thread, in order, as Core.coreEvent.
+// and 23 carry), then the pump's leading-edge throttle for a job's events (APP-027: at most one every
+// 100 ms), and then signals each on the GUI thread, in order, as Core.coreEvent. The confirmations
+// below don't go through BenchPump: they are emitted straight into FakeCore.
 // - Job progress: 8 running jobs, each with a progress event and a 512 x 512 JPEG preview every
 //   100 ms, for MeasureS seconds. Each event is stamped as the app receives it (Core's signal, after the
 //   pump: APP-139 as ruled 2026-11-01), and counts as shown at the first frame (`frameSwapped`) whose
 //   row has reached its value. Pass: p99 under LIL_BUDGET_EVENT_TO_UI_MS (test-params.toml's
-//   event_to_ui_ms). The pump's own stage, from the event's arrival to its signal (the decode queue and
-//   the 10 Hz limit's wait, up to 100 ms by design, APP-027), is printed beside it, with the whole way.
+//   event_to_ui_ms). The pump's own stage, from the event's arrival to its signal (the decode queue,
+//   the 10 Hz limit's wait, up to 100 ms by design, APP-027, and the wait in the GUI thread's queue
+//   before the signal), is printed beside it, with the whole way.
 //   All 8 jobs are fed, but only the rows in view are timed (2 at 1280 x 800: the Jobs dock is the
 //   window's height and a row with its preview is tall), which the ruling accepts: a row out of view
 //   has nothing on screen to time. They are chosen after 2 s of the feed and must be the same rows
@@ -273,7 +275,7 @@ TestCase {
                     + " events on " + measured.length + " rows in view, p50 " + ms(percentile(latencies, 0.5)) + " ms, p99 "
                     + ms(p99) + " ms, max " + ms(percentile(latencies, 1)) + " ms (budget " + budgetMs + " ms); "
                     + left + " never shown")
-        console.log("bench: event to UI, job progress, the pump's stage (decode queue and the 10 Hz throttle's wait): p50 "
+        console.log("bench: event to UI, job progress, the pump's stage (decode queue, the 10 Hz throttle's wait and the GUI queue): p50 "
                     + ms(percentile(pumpStage, 0.5)) + " ms, p99 " + ms(percentile(pumpStage, 0.99)) + " ms; the whole way, p50 "
                     + ms(percentile(whole, 0.5)) + " ms, p99 " + ms(percentile(whole, 0.99)) + " ms")
         verify(latencies.length >= measureS * measured.length * 9, "the events were measured: " + latencies.length)

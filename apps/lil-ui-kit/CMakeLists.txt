@@ -141,7 +141,7 @@ qt_target_qml_sources(lil-ui-kit
 # LIL_BUDGET_<NAME>=<value> environment entries: each `name = number` line of that table, its name
 # upper-cased (gui_stall_p99_ms is LIL_BUDGET_GUI_STALL_P99_MS). LIL_BUDGET_ENV is the list, for
 # the tests' ENVIRONMENT here, in tests/ and in apps/lil-image (bench_cold_start). A change to the
-# file reconfigures.
+# file reconfigures at the next build.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/test-params.toml)
 file(STRINGS ${CMAKE_SOURCE_DIR}/test-params.toml lil_params_lines)
 set(LIL_BUDGET_ENV "")

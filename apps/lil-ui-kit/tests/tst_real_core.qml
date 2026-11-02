@@ -11,7 +11,8 @@
 // - I3: `lil workspace use` elsewhere, then a lost connection (`lil core stop`; the session starts a
 //   new core): the hello names the old workspace and is refused. The banner says so in the core's words
 //   and offers "Use the default workspace", which gets the app back.
-// Each test works from whichever workspace is current, so their order doesn't matter.
+// Each test works from whichever workspace is current, so their order doesn't matter while both pass;
+// once one fails it can leave the app unavailable, and the other then fails too.
 import QtQuick
 import QtTest
 import Lilith.Core

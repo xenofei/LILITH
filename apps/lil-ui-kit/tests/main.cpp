@@ -101,6 +101,9 @@ static double benchNowMs()
 // signalled on the GUI thread as `delivered(topic, kind, dataJson, postedMs)`, `postedMs` being the
 // benches' clock when it was posted (its receipt). So a progress event waits behind the previews posted
 // before it, as in the app (the Task 17 and 23 carry), and the GUI thread does only what it does there.
+// It is a re-implementation, not lil_qt::throttle::Coalescer, and simpler: it throttles every `job:`
+// event, not only progress, and has neither the drop of a waiting update on a `status` or `retrying`
+// event nor the 1 Hz limit on telemetry samples.
 class BenchPump : public QObject
 {
     Q_OBJECT

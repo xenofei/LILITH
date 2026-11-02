@@ -1,14 +1,23 @@
-// bench_gui_stalls (label bench; APP-135, APP-139): the whole shell under the fake feed, as spike 10's
-// S0.6 measured its own: Jobs with 8 running jobs, each with a 512 x 512 JPEG preview and a progress
-// event at 10 Hz, Hardware live with a telemetry sample a second, Home in front, and Diagnostics and
-// Settings loaded behind their tabs (a docked panel's Loader never unloads). For MeasureS seconds it
-// measures the GUI thread's 4 ms heartbeat lateness and the shell window's frame interval
-// (BenchProbe, the runner's: a precise timer and `frameSwapped`, as the spike's shim measured them).
+// bench_gui_stalls (label bench; APP-135): the whole shell under the fake feed: Jobs with 8 running
+// jobs, each with a 512 x 512 JPEG preview and a progress event at 10 Hz (2 of the 8 previews are on
+// screen at 1280 x 800; the others are fed and decoded), Hardware live with a telemetry sample a
+// second, Home in front, and Diagnostics and Settings loaded behind their tabs (a docked panel's
+// Loader never unloads). For MeasureS seconds it measures the GUI thread's 4 ms heartbeat lateness
+// and the shell window's frame interval (BenchProbe, the runner's: a precise timer and
+// `frameSwapped`).
 //
 // The events reach the shell as Core's do: through BenchPump, the runner's stand-in for the session's
 // event pump, which runs the bridge's own event step (a preview's base64 and JPEG decode, inline) on a
 // thread of its own and then signals each event on the GUI thread, in order. So the GUI thread does
 // what it does in the app, and the decode's own cost is printed beside it (the Task 17 and 23 carry).
+//
+// What it can show: offscreen, Qt Quick renders with its software backend (the scene graph logs
+// "Loading backend software", graphics API 1), not on the GPU. So this bench measures the CPU and the
+// GUI thread only; under ComfyUI's load (Task 29 Step 4) the load reaches it only as CPU contention,
+// never as a GPU stall, and there the idle reference below is measured under the load too, so the
+// relative frame bound hides the load's effect on frames. Of its figures, the heartbeat p99 is the
+// useful CPU and GUI-thread one. APP-135 (GUI-thread stalls under ComfyUI on a display) rests on spike
+// 10's S0.6 for plan 4a, not on this bench.
 //
 // Pass: heartbeat lateness p99 under LIL_BUDGET_GUI_STALL_P99_MS (test-params.toml's
 // gui_stall_p99_ms), and frame interval p99 under max(the budget, the idle p99 + half the budget,
@@ -16,8 +25,8 @@
 // interval is the platform's own timer pace, not a vsync, and its idle p99 is already near 25 ms here
 // with nothing to do; a flat 16 ms would fail whatever the app did. So the feed may add at most half
 // the budget to the platform's own idle p99. The idle figures are measured first, with the same small
-// animation running. The 4 ms heartbeat runs at about 100 Hz on this platform (Windows' timers), and
-// its idle lateness, printed first, is the timer's own floor.
+// animation running. The 4 ms heartbeat runs at about 100 Hz under the offscreen platform, and its
+// idle lateness, printed first, is the timer's own floor.
 //
 // Set LIL_BENCH_MEASURE_S to measure for longer (the run under ComfyUI's load, Task 29 Step 4).
 import QtQuick
