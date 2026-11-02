@@ -288,7 +288,7 @@ pub const KEEP_SET_ASIDE: usize = 5;
 
 /// Renames `path` to `<name>.bad-<utc>` in its folder (`utc` as `YYYYMMDDTHHMMSSZ`) and returns
 /// the new path. A name already taken gets `-2`, `-3`, ... after it; nothing is replaced. The
-/// oldest copies beyond [`KEEP_SET_ASIDE`] are then removed.
+/// oldest copies beyond [`KEEP_SET_ASIDE`] are then removed, never the one just made.
 pub fn set_aside(path: &Path, utc: &str) -> io::Result<PathBuf> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::new(
@@ -308,7 +308,7 @@ pub fn set_aside(path: &Path, utc: &str) -> io::Result<PathBuf> {
             continue;
         }
         lil_platform::fs::move_new(path, &to)?;
-        prune_set_aside(dir, &name);
+        prune_set_aside(dir, &name, &to);
         return Ok(to);
     }
     Err(io::Error::new(
@@ -317,25 +317,45 @@ pub fn set_aside(path: &Path, utc: &str) -> io::Result<PathBuf> {
     ))
 }
 
-/// Removes `<name>`'s set-aside copies beyond the newest [`KEEP_SET_ASIDE`]. A copy that can't be
-/// removed stays, and the log says so.
-fn prune_set_aside(dir: &Path, name: &str) {
+/// The order of a set-aside copy by what follows `<name>.bad-`: its time, then the `-2`, `-3` of
+/// copies made in the same second. `None` for any other name: that isn't one of ours.
+fn set_aside_order(rest: &str) -> Option<(&str, u32)> {
+    let (utc, n) = match rest.split_once('-') {
+        Some((utc, n)) => {
+            let digits = !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit());
+            if !digits || n.starts_with('0') {
+                return None;
+            }
+            (utc, n.parse().ok()?)
+        }
+        None => (rest, 1),
+    };
+    let b = utc.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    let is_utc = b.len() == 16 && digits(0..8) && b[8] == b'T' && digits(9..15) && b[15] == b'Z';
+    is_utc.then_some((utc, n))
+}
+
+/// Removes `<name>`'s set-aside copies beyond the newest [`KEEP_SET_ASIDE`], counting `made`, which
+/// stays whatever its time says (the clock can have been set back). Only files named exactly as
+/// [`set_aside`] names them count or go. A copy that can't be removed stays, and the log says so.
+fn prune_set_aside(dir: &Path, name: &str, made: &Path) {
     let prefix = format!("{name}.bad-");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    // By time, then by the `-2`, `-3` of copies made in the same second.
     let mut copies: Vec<(String, u32, PathBuf)> = entries
         .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|entry| entry.path() != made)
         .filter_map(|entry| {
             let file = entry.file_name().into_string().ok()?;
-            let rest = file.strip_prefix(&prefix)?;
-            let (utc, n) = rest.split_once('-').unwrap_or((rest, "1"));
-            Some((utc.to_string(), n.parse().unwrap_or(1), entry.path()))
+            let (utc, n) = set_aside_order(file.strip_prefix(&prefix)?)?;
+            Some((utc.to_string(), n, entry.path()))
         })
         .collect();
     copies.sort();
-    let old = copies.len().saturating_sub(KEEP_SET_ASIDE);
+    let old = copies.len().saturating_sub(KEEP_SET_ASIDE - 1);
     for (_, _, path) in copies.drain(..old) {
         if let Err(e) = std::fs::remove_file(&path) {
             tracing::warn!(error = %e, "an old set-aside copy couldn't be removed");
@@ -568,6 +588,94 @@ mod tests {
             LayoutFile::load(&dir.path().join("layout.json")),
             Err(LayoutError::Io(e)) if e.kind() == io::ErrorKind::NotFound
         ));
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test] // spec: APP-002
+    fn set_aside_counts_and_removes_only_its_own_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // Names that only start alike: a person's files, and a folder.
+        let others = [
+            "layout.json.bad-",
+            "layout.json.bad-0",
+            "layout.json.bad-20261001T000000Z.keep",
+            "layout.json.bad-20261001T000000Z-",
+            "layout.json.bad-20261001T000000Z-x",
+            "layout.json.bad-20261001T000000Z-0",
+            "layout.json.bad-2026100T000000Z",
+            "layout.json.bad-20261001X000000Z",
+            "layout.json.bad-my-notes.txt",
+            "layout.json.bad-z1",
+            "layout.json.bad-z2",
+            "layout.json.bad-z3",
+            "layout.json.bad-z4",
+            "layout.json.bad-z5",
+        ];
+        for name in others {
+            std::fs::write(dir.path().join(name), "mine").unwrap();
+        }
+        let folder = "layout.json.bad-20260101T000000Z";
+        std::fs::create_dir(dir.path().join(folder)).unwrap();
+        let mut made = Vec::new();
+        for utc in [
+            "20261101T000000Z",
+            "20261102T000000Z",
+            "20261103T000000Z",
+            "20261104T000000Z",
+            "20261105T000000Z",
+        ] {
+            std::fs::write(&path, utc).unwrap();
+            let moved = set_aside(&path, utc).unwrap();
+            assert!(moved.exists(), "{moved:?}");
+            made.push(format!("layout.json.bad-{utc}"));
+        }
+        // Five real copies: neither the folder nor the others count, and all of them stay.
+        let mut want: Vec<String> = others.iter().map(|s| (*s).to_string()).collect();
+        want.push(folder.to_string());
+        want.extend(made);
+        want.sort();
+        assert_eq!(names_in(dir.path()), want);
+        assert!(dir.path().join(folder).is_dir());
+    }
+
+    #[test] // spec: APP-002
+    fn set_aside_never_removes_the_copy_it_just_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        for utc in [
+            "20270101T000000Z",
+            "20270102T000000Z",
+            "20270103T000000Z",
+            "20270104T000000Z",
+            "20270105T000000Z",
+        ] {
+            std::fs::write(&path, utc).unwrap();
+            set_aside(&path, utc).unwrap();
+        }
+        // The clock was set back: the new copy has the oldest name, and the banner names it.
+        std::fs::write(&path, "now").unwrap();
+        let moved = set_aside(&path, "20261031T000000Z").unwrap();
+        assert!(moved.exists(), "{moved:?}");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "now");
+        assert_eq!(
+            names_in(dir.path()),
+            [
+                "layout.json.bad-20261031T000000Z",
+                "layout.json.bad-20270102T000000Z",
+                "layout.json.bad-20270103T000000Z",
+                "layout.json.bad-20270104T000000Z",
+                "layout.json.bad-20270105T000000Z",
+            ]
+        );
     }
 
     #[test] // spec: APP-002
