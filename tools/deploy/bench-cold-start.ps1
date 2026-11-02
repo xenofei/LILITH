@@ -16,6 +16,10 @@
   Before each start it waits, at most 60 s, for the machine's CPU load to fall under 35 % (the
   spike's measurement condition, recorded beside each start; it never changes the verdict).
 
+  -First times the first start alone, with no untimed start before it: Task 29 Step 4's first start
+  of a fresh copy of the deploy folder after a Defender scan of it (APP-136, spike 10's S0.5 (c)). The
+  test channel is new each run, so Qt's caches for it start empty.
+
   The budget is -BudgetMs, else LIL_BUDGET_COLD_START_MS (test-params.toml's [budgets]
   cold_start_ms, which CMake passes), else it fails.
 
@@ -28,6 +32,7 @@ param(
     [double]$BudgetMs = 0,
     [int]$Starts = 10,
     [int]$TimeoutSec = 60,
+    [switch]$First,
     [switch]$NoHandsOff
 )
 $ErrorActionPreference = 'Stop'
@@ -43,6 +48,7 @@ if ($BudgetMs -le 0) {
     exit 1
 }
 $failures = [System.Collections.Generic.List[string]]::new()
+if ($First) { $Starts = 1 }
 
 # The test channel: its own root, removed at the end with Qt's cache folder of that channel only.
 $channel = 'test-coldstart'
@@ -132,8 +138,10 @@ if (-not $NoHandsOff -and $env:GITHUB_ACTIONS -ne 'true') {
 
 $runs = @()
 try {
-    $warm = Start-Once
-    Write-Host ("untimed start: exit {0}, interactive {1} ms" -f $warm.code, $warm.interactive)
+    if (-not $First) {
+        $warm = Start-Once
+        Write-Host ("untimed start: exit {0}, interactive {1} ms" -f $warm.code, $warm.interactive)
+    }
     for ($i = 1; $i -le $Starts; ++$i) {
         $r = Start-Once
         $runs += $r
@@ -160,8 +168,8 @@ try {
 
 $times = @($runs | Where-Object { $null -ne $_.interactive } | ForEach-Object { [double]$_.interactive } | Sort-Object)
 if ($times.Count) {
-    Write-Host ("bench: cold start, {0} warm starts: interactive p50 {1} ms, max {2} ms (budget {3} ms)" -f `
-        $times.Count, $times[[math]::Floor(($times.Count - 1) / 2)], $times[-1], $BudgetMs)
+    Write-Host ("bench: cold start, {0} {1}: interactive p50 {2} ms, max {3} ms (budget {4} ms)" -f `
+        $times.Count, $(if ($First) { 'first start' } else { 'warm starts' }), $times[[math]::Floor(($times.Count - 1) / 2)], $times[-1], $BudgetMs)
 }
 if ($failures.Count) {
     Write-Host 'bench_cold_start: FAIL'
