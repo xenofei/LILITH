@@ -139,7 +139,7 @@ TestCase {
                                                                     started: new Date(Date.now() - 5000).toISOString()})
     }
 
-    function test_the_shell_under_the_fake_feed_holds_the_gui_thread_to_a_frame() { // spec: APP-135, APP-139
+    function test_the_shell_under_the_fake_feed_holds_the_gui_thread_to_a_frame() { // spec: APP-135
         verify(budgetMs > 0, "LIL_BUDGET_GUI_STALL_P99_MS is set (CMake passes test-params.toml's budgets)")
         const frames = framesB64()
         // Each frame's event text made once: in the app the bytes never reach JavaScript, so the
@@ -243,7 +243,7 @@ TestCase {
                     + " ms, the fake's answers " + ms(cost.answers) + " ms, of " + (measureS * 1000)
                     + " ms; on the pump's thread, the bridge's decode of a preview: " + ms(decodeEach) + " ms each ("
                     + ms(decodeEach * sent / (measureS * 10)) + " % of that thread)")
-        // The 4 ms timer runs at about 100 Hz on this platform (Windows' timers), which sets the
+        // The 4 ms timer runs at about 100 Hz under the offscreen platform, which sets the
         // heartbeat's floor: its idle lateness is printed first.
         verify(load.lateness.n > measureS * 50, "the heartbeat ran: " + load.lateness.n + " beats")
         verify(load.frames.n > measureS * 10, "frames were drawn: " + load.frames.n)
