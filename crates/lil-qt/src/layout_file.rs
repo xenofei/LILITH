@@ -283,8 +283,12 @@ pub(crate) fn write_replacing_stoppable(
     swapped
 }
 
+/// How many set-aside copies of a file are kept: the newest ones.
+pub const KEEP_SET_ASIDE: usize = 5;
+
 /// Renames `path` to `<name>.bad-<utc>` in its folder (`utc` as `YYYYMMDDTHHMMSSZ`) and returns
-/// the new path. A name already taken gets `-2`, `-3`, ... after it; nothing is replaced.
+/// the new path. A name already taken gets `-2`, `-3`, ... after it; nothing is replaced. The
+/// oldest copies beyond [`KEEP_SET_ASIDE`] are then removed.
 pub fn set_aside(path: &Path, utc: &str) -> io::Result<PathBuf> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::new(
@@ -304,12 +308,39 @@ pub fn set_aside(path: &Path, utc: &str) -> io::Result<PathBuf> {
             continue;
         }
         lil_platform::fs::move_new(path, &to)?;
+        prune_set_aside(dir, &name);
         return Ok(to);
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "too many set-aside copies with this time",
     ))
+}
+
+/// Removes `<name>`'s set-aside copies beyond the newest [`KEEP_SET_ASIDE`]. A copy that can't be
+/// removed stays, and the log says so.
+fn prune_set_aside(dir: &Path, name: &str) {
+    let prefix = format!("{name}.bad-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // By time, then by the `-2`, `-3` of copies made in the same second.
+    let mut copies: Vec<(String, u32, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file = entry.file_name().into_string().ok()?;
+            let rest = file.strip_prefix(&prefix)?;
+            let (utc, n) = rest.split_once('-').unwrap_or((rest, "1"));
+            Some((utc.to_string(), n.parse().unwrap_or(1), entry.path()))
+        })
+        .collect();
+    copies.sort();
+    let old = copies.len().saturating_sub(KEEP_SET_ASIDE);
+    for (_, _, path) in copies.drain(..old) {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(error = %e, "an old set-aside copy couldn't be removed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -537,5 +568,47 @@ mod tests {
             LayoutFile::load(&dir.path().join("layout.json")),
             Err(LayoutError::Io(e)) if e.kind() == io::ErrorKind::NotFound
         ));
+    }
+
+    #[test] // spec: APP-002
+    fn set_aside_keeps_only_the_newest_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // Another file's copies, and files that only look alike, are left alone.
+        std::fs::write(dir.path().join("state.json.bad-20260101T000000Z"), "s").unwrap();
+        std::fs::write(dir.path().join("layout.json.bak"), "b").unwrap();
+        // Three in one second (the -10 sorts after the -2 by its number), then later ones.
+        for utc in [
+            "20261001T000000Z",
+            "20261001T000000Z",
+            "20261002T000000Z",
+            "20261003T000000Z",
+            "20261004T000000Z",
+            "20261005T000000Z",
+            "20261006T000000Z",
+        ] {
+            std::fs::write(&path, utc).unwrap();
+            set_aside(&path, utc).unwrap();
+        }
+        std::fs::write(dir.path().join("layout.json.bad-20261001T000000Z-10"), "x").unwrap();
+        std::fs::write(&path, "last").unwrap();
+        set_aside(&path, "20261007T000000Z").unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "layout.json.bad-20261003T000000Z",
+                "layout.json.bad-20261004T000000Z",
+                "layout.json.bad-20261005T000000Z",
+                "layout.json.bad-20261006T000000Z",
+                "layout.json.bad-20261007T000000Z",
+                "layout.json.bak",
+                "state.json.bad-20260101T000000Z",
+            ]
+        );
     }
 }
