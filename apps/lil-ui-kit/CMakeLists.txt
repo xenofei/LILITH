@@ -99,4 +99,22 @@ qt_target_qml_sources(lil-ui-kit
         qml/panels/diagnostics/NotificationText.js
         qml/panels/backups/BackupsPanel.qml)
 
+# Task 21: the Confirmations panel, the shared dialog, the cap prompt and the confirm window.
+set_source_files_properties(qml/dialogs/OpenPrompts.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+qt_target_qml_sources(lil-ui-kit
+    QML_FILES
+        qml/dialogs/OpenPrompts.qml
+        qml/dialogs/ConfirmText.js
+        qml/dialogs/ApproveButton.qml
+        qml/dialogs/DenyButton.qml
+        qml/dialogs/AnswerBar.qml
+        qml/dialogs/CardColumn.qml
+        qml/dialogs/ConfirmationList.qml
+        qml/dialogs/CapPrompt.qml
+        qml/dialogs/ConfirmDialog.qml
+        qml/panels/confirmations/ConfirmationsPanel.qml
+        qml/panels/confirmations/ConfirmationCard.qml
+        qml/panels/confirmations/HistoryList.qml
+        qml/shell/ConfirmWindow.qml)
+
 add_subdirectory(tests)

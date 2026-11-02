@@ -98,7 +98,7 @@ cxx_qt_import_crate(
     CRATES lil_qt
     LOCKED
     FEATURES qt
-    QT_MODULES Qt6::Core Qt6::Qml)
+    QT_MODULES Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick)
 cxx_qt_import_qml_module(lil_qt_qml
     URI "Lilith.Core"
     SOURCE_CRATE lil_qt)

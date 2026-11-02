@@ -25,6 +25,7 @@ pub mod hw_fake;
 mod hw_nvml;
 mod hw_pdh;
 pub mod ids;
+pub mod input_source;
 pub mod interrupt;
 pub mod job_object;
 pub mod known_folders;

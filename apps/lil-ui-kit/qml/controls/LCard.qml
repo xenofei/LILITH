@@ -10,7 +10,7 @@ Rectangle {
     default property alias content: body.data
 
     implicitWidth: Math.max(heading.implicitWidth, body.childrenRect.width) + 2 * Theme.spacing
-    implicitHeight: heading.implicitHeight + body.childrenRect.height + 3 * Theme.spacing
+    implicitHeight: (title !== "" ? heading.implicitHeight + Theme.spacing : 0) + body.childrenRect.height + 2 * Theme.spacing
     radius: Theme.radius
     color: Theme.surface
     border.color: Theme.surfaceRaised
@@ -24,6 +24,7 @@ Rectangle {
         x: Theme.spacing
         y: Theme.spacing
         width: parent.width - 2 * Theme.spacing
+        visible: root.title !== ""
         text: root.title
         textFormat: Text.PlainText
         color: Theme.text
@@ -35,7 +36,7 @@ Rectangle {
     Item {
         id: body
         x: Theme.spacing
-        y: heading.y + heading.height + Theme.spacing
+        y: root.title !== "" ? heading.y + heading.height + Theme.spacing : Theme.spacing
         width: parent.width - 2 * Theme.spacing
         height: parent.height - y - Theme.spacing
     }

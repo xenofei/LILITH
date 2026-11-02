@@ -12,7 +12,8 @@
 //!    thread (`single_instance`), and the forwarded launches are routed on one more,
 //!    `lil-launches`, so a `.lilref` read never holds up the pipe (review M-8).
 //! 3. Each launch the window must show (this start's own first, then each forwarded one; a
-//!    forwarded deny is sent on a thread of its own, and the window never hears of it) waits
+//!    forwarded deny is sent on a thread of its own, and the window hears only its id, once the
+//!    core has taken it) waits
 //!    here until `main.cpp` has named its window (`lil_qt::deliverLaunchesTo`,
 //!    `src/qt/launch_sink.h`) and called `launches_ready()`; from then on each goes to the
 //!    window as it comes, and the window says when it has taken one (`launch_handled`).
@@ -31,9 +32,9 @@ use std::time::Duration;
 use lil_client::ClientConfig;
 use lil_platform::Env;
 
-use crate::args::{BootPlan, Mode, launch_json};
+use crate::args::{BootPlan, Mode, deny_notice_json, launch_json};
 use crate::single_instance::{
-    Forwarded, InstanceServer, Routed, Start, restart_untaken, route, start,
+    Forwarded, InstanceServer, Routed, Start, restart_untaken, route_then, start,
 };
 
 #[cxx_qt::bridge]
@@ -247,7 +248,10 @@ fn claim_instance() -> i32 {
 /// One forwarded launch: shown by the window, or a deny sent without it.
 fn take(forwarded: &Forwarded, env: &Env) {
     let deny_env = env.clone();
-    match route(forwarded, env, move || deny_cfg(&deny_env)) {
+    // Once the core has taken a deny, the confirm window says where it came from; the shell ignores
+    // this.
+    let denied = |id: &str| deliver(deny_notice_json(id), None);
+    match route_then(forwarded, env, move || deny_cfg(&deny_env), denied) {
         Routed::Show(plan) => {
             if let Some(json) = launch_json(&plan, true) {
                 deliver(json, Some(forwarded.args.clone()));

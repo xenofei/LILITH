@@ -1205,6 +1205,34 @@ async fn race_after_stage_5_asks_for_the_cap_only() {
     assert_eq!(rig.monthly().await, ("2".into(), "9".into()));
 }
 
+/// A raise on a confirmation whose time is up is refused before it changes the cap.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-091, CORE-008
+async fn a_raise_on_an_expired_confirmation_keeps_the_cap() {
+    let rig = Rig::new(MONTHLY_1);
+    rig.confirm.presence().opened();
+    let args = json!({"provider": "fakeprov", "amount": "2"});
+    let p = pending(
+        &rig.call(&cli(), "test.meter_external", args, &next_key())
+            .await,
+    );
+    let limit = rig.row("monthly").await.limit;
+    rig.clock.advance(LIFETIME);
+    let raise = Some(CapAnswer {
+        action: CapAction::Raise,
+        raise_to: Some(RaiseTo {
+            cap: "monthly".into(),
+            amount: "20".into(),
+        }),
+    });
+    let refused = rig
+        .confirm
+        .answer(&app(), answer(&p.confirmation_id, Answer::Approve, raise))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "confirm.expired", "{refused:?}");
+    assert_eq!(rig.row("monthly").await.limit, limit, "the cap stays");
+}
+
 #[tokio::test(flavor = "multi_thread")] // spec: CORE-091, CORE-008
 async fn allow_once_and_raise_answers() {
     let rig = Rig::new(MONTHLY_1);

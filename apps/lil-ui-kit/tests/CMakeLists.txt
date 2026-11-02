@@ -190,3 +190,17 @@ set_tests_properties(grab_diagnostics PROPERTIES
     TIMEOUT 300
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 21: the Confirmations panel, the cap prompt and the confirm window; the panel's test makes a
+# shell, so they run on the 1280 x 800 offscreen screen.
+lil_qml_test(tst_confirmations tst_confirmations.qml)
+lil_qml_test(tst_cap_prompt tst_cap_prompt.qml)
+lil_qml_test(tst_confirm_window tst_confirm_window.qml)
+set_property(TEST tst_confirmations tst_cap_prompt tst_confirm_window APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+add_test(NAME grab_confirmations COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/grab_confirmations.qml)
+set_tests_properties(grab_confirmations PROPERTIES
+    LABELS grabs
+    TIMEOUT 300
+    ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")

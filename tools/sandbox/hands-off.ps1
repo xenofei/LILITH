@@ -10,6 +10,9 @@ bottom right):
      keyboard", and what is coming;
   2. then a countdown of -RunSec seconds until the PC may be used again ("almost done" after);
   3. once -StateFile exists: "Done: you can use the PC again", for 5 s, then it closes.
+With -CueFile, while that file is there, it shows its text instead, large, on blue, and taller, whatever
+else is going on: what a check needs a person to do now (tools/sandbox/confirm-check.ps1). It says no
+"hands off" then. It goes back when the file is gone.
 It writes <StateFile>.shown once it is on screen; the runner starts the tests only -WarnSec
 seconds after that. It never takes the focus (WS_EX_NOACTIVATE and ShowWithoutActivation; made
 topmost with SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE |
@@ -26,7 +29,8 @@ param(
     # worst-case run (every test running until nextest ends it).
     [int]$CapSec = 1200,
     [string]$StateFile = '',
-    [int]$ParentPid = 0
+    [int]$ParentPid = 0,
+    [string]$CueFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +75,7 @@ if ($ParentPid -gt 0) {
 }
 $script:shownAt = $null
 $script:doneAt = $null
+$script:cue = ''
 
 $form = New-Object LilHandsOff
 $form.FormBorderStyle = 'None'
@@ -84,12 +89,15 @@ $form.Top = $area.Top + 24
 $label = New-Object System.Windows.Forms.Label
 $label.Dock = 'Fill'
 $label.ForeColor = [System.Drawing.Color]::White
-$label.Font = New-Object System.Drawing.Font('Segoe UI', 15)
+$plainFont = New-Object System.Drawing.Font('Segoe UI', 15)
+$largeFont = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
+$label.Font = $plainFont
 $label.TextAlign = 'MiddleCenter'
 $form.Controls.Add($label)
 $amber = [System.Drawing.Color]::FromArgb(150, 90, 0)
 $red = [System.Drawing.Color]::FromArgb(140, 30, 30)
 $green = [System.Drawing.Color]::FromArgb(20, 110, 40)
+$blue = [System.Drawing.Color]::FromArgb(20, 70, 170)
 # What it shows from its first frame, before the timer's first tick.
 $form.BackColor = $amber
 $label.Text = ("In {0} s: HANDS OFF the mouse and keyboard.`nLILITH {1}." -f $WarnSec, $What)
@@ -117,6 +125,23 @@ $timer.Add_Tick({
         if ($nowMs - $script:doneAt -gt 5000) { Remove-StateFiles; $form.Close() }
         return
     }
+    if ($CueFile) {
+        if (Test-Path -LiteralPath $CueFile) {
+            # A read that fails, while the file is being replaced, keeps what it says now.
+            try { $script:cue = (Get-Content -LiteralPath $CueFile -Raw -Encoding UTF8 -ErrorAction Stop).Trim() } catch { }
+        } else {
+            $script:cue = ''
+        }
+    }
+    if ($script:cue) {
+        $form.BackColor = $blue
+        $form.Height = 260
+        $label.Font = $largeFont
+        $label.Text = $script:cue
+        return
+    }
+    $form.Height = 130
+    $label.Font = $plainFont
     if ($nowMs -lt $startAt) {
         $form.BackColor = $amber
         $label.Text = ("In {0} s: HANDS OFF the mouse and keyboard.`nLILITH {1}." -f [math]::Ceiling(($startAt - $nowMs) / 1000), $What)

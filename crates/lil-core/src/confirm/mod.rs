@@ -876,6 +876,11 @@ impl Confirm {
         if row.state != ConfState::Pending {
             return Err(ended(&row));
         }
+        // Before anything changes: a raise must not land on a confirmation whose time is up.
+        if row.expires_utc <= self.now() {
+            self.expire(&db, &id).await.map_err(|e| state_error(&e))?;
+            return Err(expired());
+        }
         if p.answer == Answer::Approve && row.covers.contains(&Cover::Cap) {
             let Some(cap) = &p.cap else {
                 return Err(fail(

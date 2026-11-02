@@ -259,6 +259,110 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// A window's title.
+fn title_of(hwnd: HWND) -> String {
+    let mut text = [0u16; 128];
+    // SAFETY: a local buffer of the size given.
+    let n = unsafe { GetWindowTextW(hwnd, &mut text) };
+    String::from_utf16_lossy(&text[..usize::try_from(n).unwrap_or(0)])
+}
+
+/// Waits until `pid` is in front, with what stood there if it never comes.
+fn wait_front_is(env: &TestEnv, pid: u32, what: &str) {
+    let until = Instant::now() + DEADLINE;
+    while foreground_pid() != pid {
+        if Instant::now() >= until {
+            panic!(
+                "{what} in front within {DEADLINE:?}: {}",
+                front_report(env, pid)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A toast's Open is a `confirm/` link started by the process in front. With no app running it
+/// starts the confirm window, in front; a second link goes to that window, and brings it back. With
+/// the app running, the link goes to the app (P4a-R11).
+#[test] // spec: APP-048, P4a-R11, QA-042
+#[ignore = "desktop"]
+fn desktop_toast_url_brings_the_confirm_window_to_front() {
+    require_desktop_group(true);
+    // SAFETY: a plain call, before this process makes any window.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let env = TestEnv::new();
+    let deploy = deployed_app().parent().unwrap().to_path_buf();
+    let _core = CoreFixture::start_exe(&env, &deploy.join("lil-core.exe"));
+    let scheme = env.env.activation_scheme();
+    let link = format!("{scheme}:confirm/cf_0123456789abcdef");
+    let other_link = format!("{scheme}:confirm/cf_0123456789abcde0");
+
+    let blocker = OwnerWindow::open(
+        "LILITH desktop test",
+        "A link to a confirmation must bring LILITH's window in front of this one.",
+    )
+    .expect("the blocker window");
+    let hold_the_front = |blocker: &OwnerWindow| {
+        let raised = blocker.bring_to_front();
+        if raised == Raise::NotInFront && !blocker.wait_front(Duration::from_millis(500)) {
+            // SAFETY: a plain call on a live window of this process.
+            unsafe { SwitchToThisWindow(HWND(blocker.hwnd() as *mut c_void), true) };
+            if !blocker.wait_front(Duration::from_millis(500)) {
+                click(blocker.hwnd());
+            }
+        }
+        assert!(
+            blocker.wait_front(Duration::from_secs(5)),
+            "the blocker holds the front ({}; the front is pid {})",
+            raised.name(),
+            foreground_pid()
+        );
+    };
+    let hand_over = |args: &[&str]| {
+        let mut launch = start_app(&env, args);
+        let started = Instant::now();
+        loop {
+            if let Some(status) = launch.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(0), "the launch hands over and exits 0");
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the launch didn't exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // No app running: the confirm window, in front.
+    hold_the_front(&blocker);
+    let window = Running(start_app(&env, &[link.as_str()]));
+    let pid = window.0.id();
+    wait_until("the confirm window", || app_window(pid).is_some());
+    wait_front_is(&env, pid, "the confirm window");
+    assert_eq!(title_of(app_window(pid).unwrap()), "LILITH — Confirm");
+    // A second link goes to it, and brings it back in front.
+    hold_the_front(&blocker);
+    hand_over(&[other_link.as_str()]);
+    wait_front_is(&env, pid, "the confirm window, for a second link");
+    drop(window);
+
+    // The app running: the link goes to it.
+    let app = Running(start_app(&env, &["--no-activate"]));
+    let pid = app.0.id();
+    wait_until("the app's window", || app_window(pid).is_some());
+    std::thread::sleep(Duration::from_millis(500));
+    hold_the_front(&blocker);
+    hand_over(&[link.as_str()]);
+    wait_front_is(&env, pid, "the app");
+    let title = title_of(app_window(pid).unwrap());
+    assert!(
+        title.starts_with("LILITH") && !title.contains("Confirm"),
+        "{title}"
+    );
+    drop(blocker);
+}
+
 #[test] // spec: APP-013, APP-014, QA-042
 #[ignore = "desktop"]
 fn desktop_second_launch_comes_to_front() {

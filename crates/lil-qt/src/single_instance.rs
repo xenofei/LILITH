@@ -1008,6 +1008,17 @@ pub fn route(
     env: &Env,
     deny_cfg: impl FnOnce() -> Option<ClientConfig> + Send + 'static,
 ) -> Routed {
+    route_then(forwarded, env, deny_cfg, |_| {})
+}
+
+/// [`route`], and `on_denied(id)` once the core has taken a deny (on the deny's own thread): a token
+/// it refuses tells nobody anything.
+pub fn route_then(
+    forwarded: &Forwarded,
+    env: &Env,
+    deny_cfg: impl FnOnce() -> Option<ClientConfig> + Send + 'static,
+    on_denied: impl FnOnce(&str) + Send + 'static,
+) -> Routed {
     let plan = crate::args::plan_args(&forwarded.args, env);
     if plan.refused.is_some() {
         tracing::warn!("a launch's command line was refused by the running instance");
@@ -1021,7 +1032,9 @@ pub fn route(
             .name("lil-deny".into())
             .spawn(move || match deny_cfg() {
                 Some(cfg) => {
-                    send_deny(&cfg, &id, &token);
+                    if send_deny(&cfg, &id, &token) == DenyOutcome::Denied {
+                        on_denied(&id);
+                    }
                 }
                 None => tracing::warn!(
                     link = cut_deny(&id),
