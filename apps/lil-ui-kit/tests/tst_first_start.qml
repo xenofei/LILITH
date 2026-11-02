@@ -117,6 +117,9 @@ TestCase {
         verify(card.notNowButton.visible)
         verify(card.text.indexOf("a Start-menu shortcut and a link handler") >= 0, card.text)
         verify(card.text.indexOf(".lilref") < 0, card.text)
+        // Windows lets them through: the whole promise, and no note.
+        verify(card.text.indexOf("adds what Windows needs") >= 0, card.text)
+        verify(card.text.indexOf("Windows still keeps") < 0, card.text)
         // Above the docks, not over them.
         tryVerify(() => card.mapToItem(null, 0, 0).y > 0 && shell.dockingArea.mapToItem(null, 0, 0).y >= card.mapToItem(null, 0, card.height).y,
                   5000, "the card lies between the bar and the docks")
@@ -499,6 +502,28 @@ TestCase {
         tryVerify(() => !card.visible, 5000)
         compare(said, ["The Start-menu shortcut is set up. Windows still keeps LILITH's notifications from you: "
                        + "Settings says why and what to do."])
+    }
+
+    // The note follows the newest reading: a Set up that partly failed while Windows had them off, then
+    // Windows lets them through and a resync reads it.
+    function test_the_windows_note_follows_the_newest_reading() { // spec: APP-022, APP-146
+        const core = fakeComponent.createObject(tc)
+        const setup = fakeSetupComponent.createObject(tc)
+        const shell = makeShell(core, TestFiles.newDir("winlater"), setup)
+        const card = shell.firstStartCard
+        answerRead(core, {toasts: "unavailable", toasts_reason: "disabled_for_app", shortcut: "missing", handlers: "missing"})
+        tryVerify(() => card.visible && card.setUpButton.enabled, 5000)
+        card.setUpButton.click()
+        setup.finish(Shapes.setupReport({scheme: {state: "failed", why: "Access is denied."},
+                                         notification_path: {toasts: "unavailable", toasts_reason: "disabled_for_app",
+                                                             shortcut: "ok", handlers: "missing"}}))
+        tryVerify(() => card.text.indexOf("Windows still keeps") >= 0, 5000, card.text)
+        wait(1100)
+        core.emit("desktop", "resync_required", null)
+        answerRead(core, {toasts: "ready", shortcut: "ok", handlers: "missing"})
+        tryVerify(() => card.text.indexOf("Windows still keeps") < 0, 5000, card.text)
+        verify(card.visible, "the scheme is still missing")
+        verify(card.text.indexOf("couldn't be registered") >= 0, card.text)
     }
 
     // Put away during a run, the card says nothing more: Settings says why it failed.

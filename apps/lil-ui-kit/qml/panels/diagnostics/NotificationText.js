@@ -103,14 +103,19 @@ function setupOutcome(report, shown) {
     else if (wroteScheme)
         parts.push("This LILITH's lil: links are set up.")
     if (report.shortcut.state === "failed")
-        parts.push("The Start-menu shortcut couldn't be written: " + shown(report.shortcut.why, 300) + ".")
+        parts.push(sentence("The Start-menu shortcut couldn't be written: " + shown(report.shortcut.why, 300)))
     if (report.scheme.state === "failed")
-        parts.push("This LILITH's lil: links couldn't be registered: " + shown(report.scheme.why, 300) + ".")
+        parts.push(sentence("This LILITH's lil: links couldn't be registered: " + shown(report.scheme.why, 300)))
     if (report.reread_error)
-        parts.push("The core couldn't say how things stand now: " + shown(report.reread_error, 300) + ".")
+        parts.push(sentence("The core couldn't say how things stand now: " + shown(report.reread_error, 300)))
     if (parts.length === 0)
         parts.push("Nothing needed writing from here. Run lil doctor to check the rest.")
     return parts.join(" ")
+}
+
+// `text` and a full stop, unless it ends a sentence already.
+function sentence(text) {
+    return /[.!?]$/.test(text) ? text : text + "."
 }
 
 // Whether that report has something that went wrong.
@@ -120,12 +125,13 @@ function setupFailed(report) {
 }
 
 // `report` once the core has read `path` afresh: "couldn't say" is over, and so is the failure of a part
-// the core now reads as fine, however it got fixed. Null when that leaves nothing to say.
+// the core now reads as fine, however it got fixed; its `notification_path` is that reading, the newest.
+// Null when that leaves nothing to say.
 function reportAfterRead(report, path) {
     if (!report || !path)
         return report
     const fine = part => part.state === "failed" ? {state: "ok"} : part
-    const after = Object.assign({}, report, {reread_error: null})
+    const after = Object.assign({}, report, {reread_error: null, notification_path: path})
     if (path.shortcut === "ok")
         after.shortcut = fine(report.shortcut)
     if (path.handlers === "ok")
