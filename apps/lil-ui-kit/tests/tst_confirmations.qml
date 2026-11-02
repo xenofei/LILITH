@@ -1261,6 +1261,58 @@ TestCase {
         shell.destroy()
     }
 
+    // The core away, the list loaded but old, and a no-focus link for an id it doesn't have yet: the
+    // panel waits for the core, so it opens, and the dialog shows there once the core is back.
+    function test_a_no_focus_link_while_the_core_is_away_opens_the_panel() { // spec: P4a-R10
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.forceClose()
+        tryVerify(() => !dock.isOpen, 2000)
+        shell.docks.jobs.setAsCurrentTab()
+        shell.docks.jobs.focusPanel()
+        tryVerify(() => shell.docks.jobs.panelHasFocus, 2000)
+        fake.connection = "reconnecting"
+        const later = Shapes.view({id: "cf_00000000000000e7"})
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: later.id, focus: false, activate: false}))
+        fake.emit("confirmations", "event", Shapes.event("pending", later))
+        fake.connection = "ready"
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens once the core is back")
+        verify(dock.isOpen, "in the panel, which opened")
+        compare(panel.dialog.confirmationId, later.id)
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        closeDialog(panel)
+        shell.destroy()
+    }
+
+    // A floated panel whose list is being read again: the link's dialog comes later, and its window is
+    // made active then.
+    function test_a_late_dialog_in_a_floated_panel_gets_the_keyboard() { // spec: P4a-R10
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.isFloating = true
+        tryVerify(() => dock.isFloating && panel.Window.window && panel.Window.window !== shell && panel.visible, 5000,
+                  "the panel floats, open")
+        const float = panel.Window.window
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        shell.docks.hardware.focusPanel()
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000)
+        fake.emit("confirmations", "resync_required", {})
+        tryVerify(() => !panel.list.loaded, 2000, "the list is read again")
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: false, activate: false}))
+        verify(!panel.dialogPopup.visible, "no dialog yet")
+        Shapes.answerLists(fake, [crane], [])
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        verify(float.activeFocusItem === panel.dialog.denyButton, "in the float")
+        closeDialog(panel)
+        dock.isFloating = false
+        tryVerify(() => panel.Window.window === shell, 5000)
+        shell.destroy()
+    }
+
     // Opening the panel while its dialog is open leaves the keyboard on the dialog.
     function test_showing_the_panel_under_its_dialog_keeps_deny_focused() { // spec: P4a-R10
         const shell = settledShell()

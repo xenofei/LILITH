@@ -128,6 +128,23 @@ Window {
     }
     // A launch that asked for the focus came before the Default layout was laid out.
     property bool _focusHomeOnSettle: false
+    // The confirmation a no-focus link asked for: its dialog's opening makes a floated panel's window
+    // active. The Confirmations panel, once made.
+    property string _activateConfirm
+    property Item _confirmPanel: null
+
+    Connections {
+        target: root._confirmPanel ? root._confirmPanel.dialogPopup : null
+        function onOpened() {
+            const panel = root._confirmPanel
+            if (root._activateConfirm === "" || panel.dialog.confirmationId !== root._activateConfirm)
+                return
+            root._activateConfirm = ""
+            const win = panel.Window.window
+            if (win && win !== root)
+                win.requestActivate()
+        }
+    }
     // Once laid out: Home takes the focus such a launch asked for, unless a confirmation is open
     // (P4a-R10), and then the held links run, so a confirmation dialog one opens ends with the focus.
     onLayoutSettledChanged: {
@@ -296,6 +313,7 @@ Window {
         for (const panel of Panels.all)
             createDock(panel.id)
         openedCard = docks.home.content.openedCard
+        _confirmPanel = docks.confirmations ? docks.confirmations.content : null
         restoreLayout()
         _settling = false
         if (core)
@@ -634,26 +652,26 @@ Window {
             shownConfirmation = launch.id
             // Its dialog takes the keyboard whatever the link asked (P4a-R10), and opens only in an open
             // panel: so with no focus a closed panel opens when a dialog may follow, and a floated
-            // panel's window is made active once it shows one. A link no dialog follows (an id the core
-            // doesn't know, or one already answered) leaves a closed panel closed (APP-065).
+            // panel's window is made active when this link's dialog opens, now or once the panel has
+            // what it waits for (`_activateConfirm`); no other dialog activates it. A link no dialog
+            // follows (an id the core doesn't know, or one already answered) leaves a closed panel
+            // closed (APP-065).
             const dock = docks.confirmations
             if (!focus && dock && !dock.isOpen && confirmDialogMayOpen(launch.id))
                 dock.open()
+            _activateConfirm = focus ? "" : launch.id
             openPanelOn("confirmations", "showConfirmation", launch.id, focus)
-            const panel = dock ? dock.content : null
-            const win = panel ? panel.Window.window : null
-            if (!focus && win && win !== root && panel.dialogPopup && panel.dialogPopup.visible)
-                win.requestActivate()
         } else if (launch.kind === "confirm_list") {
             openPanelOn("confirmations", "", "", focus)
         }
     }
 
-    // Whether the Confirmations panel would open its dialog on `id`: yes while its list isn't in
-    // (the dialog may follow), else only for a pending confirmation it lists.
+    // Whether the Confirmations panel would open its dialog on `id`: yes while its list isn't in or
+    // the core is away (it waits, and the dialog may follow), else only for a pending confirmation it
+    // lists.
     function confirmDialogMayOpen(id) {
         const panel = docks.confirmations ? docks.confirmations.content : null
-        if (!panel || !panel.list || !panel.list.loaded)
+        if (!panel || !panel.list || !panel.list.loaded || !panel.coreReady)
             return true
         const view = panel.list.view(id)
         return !!view && view.state === "pending"
