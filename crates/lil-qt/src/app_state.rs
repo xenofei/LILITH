@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use lil_platform::Env;
 use serde::{Deserialize, Serialize};
 
-use crate::layout_file::{set_aside, write_replacing};
+use crate::layout_file::{retry_shared, set_aside, write_replacing};
 
 /// The `state` version this build reads and writes.
 pub const STATE_VERSION: u64 = 1;
@@ -52,7 +52,9 @@ impl AppState {
 
     fn load_from(path: &Path) -> AppState {
         let mut unread = false;
-        let workspaces = match std::fs::read_to_string(path) {
+        // A program holding the file for a moment is waited for (SHARE_WAIT), so a brief hold doesn't
+        // make it unread, which refuses Home's write.
+        let workspaces = match retry_shared(|| std::fs::read_to_string(path)) {
             Ok(text) => match serde_json::from_str::<StateFile>(&text) {
                 Ok(file) if file.state == STATE_VERSION => file.workspaces,
                 Ok(_) | Err(_) => {
@@ -239,6 +241,64 @@ mod tests {
             again.last_seen("ws_b").as_deref(),
             Some("2026-10-26T09:00:00Z")
         );
+    }
+
+    /// Holds `path` open from another thread, with `share` (FILE_SHARE_* bits), for `ms`, as a person's
+    /// tool, a backup program or an antivirus can; returns once it is held.
+    fn hold(path: &Path, share: u32, ms: u64) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (held, path) = (std::sync::mpsc::channel(), path.to_path_buf());
+        let worker = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(share)
+                .open(&path)
+                .unwrap();
+            held.0.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            drop(file);
+        });
+        held.1.recv().unwrap();
+        worker
+    }
+
+    /// A reader that doesn't share deletion (PowerShell's Get-Content) holds the file for a moment:
+    /// the write waits for it rather than failing (P4a-R16).
+    #[test] // spec: P4a-R16
+    fn a_brief_hold_doesnt_fail_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = AppState::load(&env, "image");
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        let path = env.app_state_dir("image").join("state.json");
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
+        let holder = hold(&path, 0x1 | 0x2, 200);
+        let mut again = AppState::load(&env, "image");
+        again.set_last_seen("ws_a", "2026-10-28T10:00:00Z").unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            AppState::load(&env, "image").last_seen("ws_a").as_deref(),
+            Some("2026-10-28T10:00:00Z")
+        );
+    }
+
+    /// One that shares nothing, for a moment: the read waits for it, so the state isn't taken for
+    /// unreadable and Home's time isn't refused.
+    #[test] // spec: P4a-R16
+    fn a_brief_exclusive_hold_doesnt_fail_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = AppState::load(&env, "image");
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        let path = env.app_state_dir("image").join("state.json");
+        let holder = hold(&path, 0, 200);
+        let mut read = AppState::load(&env, "image");
+        holder.join().unwrap();
+        assert_eq!(
+            read.last_seen("ws_a").as_deref(),
+            Some("2026-10-27T10:00:00Z")
+        );
+        read.set_last_seen("ws_b", "2026-10-28T10:00:00Z").unwrap();
     }
 
     #[test] // spec: APP-022

@@ -217,6 +217,33 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_replacing_with(path, bytes, |name| format!("{name}.bak"))
 }
 
+/// How long a read or a swap waits for another program that holds the file for a moment (a person's
+/// tool, a backup program, an antivirus, a script reading it without sharing deletion), in all.
+/// These run on the GUI thread too, so it stays short: a longer hold fails, and the caller's next
+/// attempt tries again.
+pub const SHARE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `op`, again while it fails with a sharing violation (or a replace Windows couldn't finish for one),
+/// from 10 ms doubling, for [`SHARE_WAIT`] in all; then its last error.
+pub(crate) fn retry_shared<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let start = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(10);
+    loop {
+        match op() {
+            Err(e)
+                if matches!(
+                    lil_platform::fs::classify(&e),
+                    RetryClass::SharingViolation | RetryClass::ReplaceRetry
+                ) && start.elapsed() + pause <= SHARE_WAIT =>
+            {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// How much [`write_replacing_stoppable`] writes between asking whether to stop.
 const WRITE_CHUNK: usize = 1024 * 1024;
 
@@ -265,7 +292,7 @@ pub(crate) fn write_replacing_stoppable(
         return Err(e);
     }
     let swapped = if path.try_exists()? {
-        match lil_platform::fs::replace_file(path, &temp, &backup) {
+        match retry_shared(|| lil_platform::fs::replace_file(path, &temp, &backup)) {
             // Error 1177: the old file is already under the backup name and the target name is
             // free, but the new file is still under its temp name: move it in (as lil-core's
             // ReplacementNotMoved step does) rather than lose it.
