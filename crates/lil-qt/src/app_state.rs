@@ -54,7 +54,12 @@ impl AppState {
         let mut unread = false;
         // A program holding the file for a moment is waited for (SHARE_WAIT), so a brief hold doesn't
         // make it unread, which refuses Home's write.
-        let workspaces = match retry_shared(|| std::fs::read_to_string(path)) {
+        // Text that isn't UTF-8 is a file that doesn't parse, as LayoutFile::load takes it.
+        let read = match retry_shared(|| std::fs::read_to_string(path)) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Ok(String::new()),
+            other => other,
+        };
+        let workspaces = match read {
             Ok(text) => match serde_json::from_str::<StateFile>(&text) {
                 Ok(file) if file.state == STATE_VERSION => file.workspaces,
                 Ok(_) | Err(_) => {
@@ -272,10 +277,65 @@ mod tests {
         state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
         let path = env.app_state_dir("image").join("state.json");
         // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
-        let holder = hold(&path, 0x1 | 0x2, 200);
+        let holder = hold(&path, 0x1 | 0x2, 20);
         let mut again = AppState::load(&env, "image");
         again.set_last_seen("ws_a", "2026-10-28T10:00:00Z").unwrap();
         holder.join().unwrap();
+        assert_eq!(
+            AppState::load(&env, "image").last_seen("ws_a").as_deref(),
+            Some("2026-10-28T10:00:00Z")
+        );
+    }
+
+    /// A hold that lasts isn't waited out: the read and the write each give up within about 100 ms,
+    /// since they run on the GUI thread, and Home's next mark tries again.
+    #[test] // spec: P4a-R16
+    fn a_lasting_hold_fails_without_holding_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = AppState::load(&env, "image");
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        let path = env.app_state_dir("image").join("state.json");
+        let holder = hold(&path, 0x1 | 0x2, 2000);
+        let mut again = AppState::load(&env, "image");
+        let started = std::time::Instant::now();
+        assert!(again.set_last_seen("ws_a", "2026-10-28T10:00:00Z").is_err());
+        let write = started.elapsed();
+        holder.join().unwrap();
+        let holder = hold(&path, 0, 2000);
+        let started = std::time::Instant::now();
+        let mut unread = AppState::load(&env, "image");
+        let read = started.elapsed();
+        assert!(
+            unread
+                .set_last_seen("ws_a", "2026-10-28T10:00:00Z")
+                .is_err(),
+            "unread"
+        );
+        holder.join().unwrap();
+        let bound = std::time::Duration::from_millis(100);
+        assert!(write < bound, "the write held the thread {write:?}");
+        assert!(read < bound, "the read held the thread {read:?}");
+    }
+
+    /// A state.json that isn't UTF-8 is set aside like one that doesn't parse, so Home's writes go on.
+    #[test] // spec: P4a-R16
+    fn a_state_that_isnt_utf8_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let app_dir = env.app_state_dir("image");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("state.json"), [b'{', 0xFF, b'}']).unwrap();
+        let mut state = AppState::load(&env, "image");
+        let names: Vec<String> = std::fs::read_dir(&app_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.len() == 1 && names[0].starts_with("state.json.bad-"),
+            "{names:?}"
+        );
+        state.set_last_seen("ws_a", "2026-10-28T10:00:00Z").unwrap();
         assert_eq!(
             AppState::load(&env, "image").last_seen("ws_a").as_deref(),
             Some("2026-10-28T10:00:00Z")
@@ -291,7 +351,7 @@ mod tests {
         let mut state = AppState::load(&env, "image");
         state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
         let path = env.app_state_dir("image").join("state.json");
-        let holder = hold(&path, 0, 200);
+        let holder = hold(&path, 0, 20);
         let mut read = AppState::load(&env, "image");
         holder.join().unwrap();
         assert_eq!(
