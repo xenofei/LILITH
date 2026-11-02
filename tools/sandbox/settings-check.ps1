@@ -10,8 +10,9 @@
      the deployed lil-image on it, driven through UI Automation. Its core's desktop is FakeDesktop,
      which test.desktop sets, so what the core says is the test's; what Set up writes is real, under
      the test channel's own registry root and the temporary root's Programs folder, which the shell
-     never reads. A channel already taken (a core on it, or its registry root left by a crashed run)
-     is refused: nothing is started, and neither is touched. Buttons and switches are pressed through
+     never reads. A channel already taken (a pipe of that channel, whichever deploy's core or app
+     serves it, or its registry root left by a crashed run) is refused: nothing is started, and
+     neither is touched. Buttons and switches are pressed through
      UI Automation's Invoke or Toggle, Qt's accessible press and not mouse or key input; only the
      panel keys (Ctrl+, and Ctrl+4) are real input. It checks, on disk, in the registry or through UIA:
        (a) the first start: the card offers Set up and Not now; state.json is on disk; Not now puts it
@@ -79,11 +80,13 @@ function Enter-TestChannel {
     New-Item -ItemType Directory $root | Out-Null
     foreach ($s in 'roaming', 'local', 'profile') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
     # The pipe's name comes from the channel alone, so a core left by a crashed run would serve this
-    # run from its old root; and its registry root would pass for what this run wrote.
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    # run from its old root; and its registry root would pass for what this run wrote. The pipes are
+    # listed, not asked: another deploy's core makes `lil --no-start status` fail as if there were none,
+    # and cleanup's `lil core stop` could then drain it.
+    $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*-$channel" })
+    if ($pipes.Count -gt 0) {
         $script:channelTaken = $true
-        throw "a core already runs on $channel. It isn't this run's, so nothing was started and it wasn't stopped: run ``lil core stop`` with LIL_CHANNEL=$channel and LIL_TEST_ROOT set, or end it, then run this again"
+        throw "a core or an app already serves $channel, from this deploy or another. It isn't this run's, so nothing was started and it wasn't stopped: end it, then run this again"
     }
     if (Test-Path "HKCU:\Software\LILITH-$channel") {
         $script:channelTaken = $true
@@ -243,8 +246,8 @@ function Self-Test {
 if ($DryRun) {
     Add-Type -AssemblyName System.Windows.Forms
     Self-Test
-    Enter-TestChannel
     try {
+        Enter-TestChannel
         [void](Invoke-Lil @('status'))
         $id = Get-CorePid
         Check ($id -gt 0) "dry run: the test core runs, pid $id"
