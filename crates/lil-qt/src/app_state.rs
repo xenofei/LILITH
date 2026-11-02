@@ -107,6 +107,38 @@ impl AppState {
     }
 }
 
+/// Whether this start is the app's first on its channel, `dir` being its state folder
+/// (`Env::app_state_dir`), and if it is, the record that it was: `state.json` with no workspaces, so
+/// a later start isn't one, whatever this one did (Appendix G, app state). A `state.json` that was set
+/// aside, or a folder that can't be read, isn't a first start. A record that can't be written is
+/// logged: this start still is the first, and so is the next.
+pub fn claim_first_start(dir: &Path) -> bool {
+    let seen = match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("state.json")
+        }),
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    };
+    if seen {
+        return false;
+    }
+    let file = StateFile {
+        state: STATE_VERSION,
+        workspaces: BTreeMap::new(),
+    };
+    let written = serde_json::to_vec_pretty(&file)
+        .map_err(io::Error::other)
+        .and_then(|text| write_replacing(&dir.join("state.json"), &text));
+    if let Err(e) = written {
+        tracing::warn!(kind = ?e.kind(), "the app's first start couldn't be recorded");
+    }
+    true
+}
+
 /// Now, as `YYYYMMDDTHHMMSSZ`.
 pub(crate) fn utc_now() -> String {
     let secs = std::time::SystemTime::now()
@@ -201,6 +233,44 @@ mod tests {
             again.last_seen("ws_b").as_deref(),
             Some("2026-10-26T09:00:00Z")
         );
+    }
+
+    #[test] // spec: APP-022
+    fn only_a_start_with_no_state_is_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let app_dir = env.app_state_dir("image");
+        assert!(claim_first_start(&app_dir), "no folder yet");
+        assert!(!claim_first_start(&app_dir), "recorded");
+        // The record is a state like any other, and takes what comes later.
+        let mut state = AppState::load(&env, "image");
+        assert_eq!(state.last_seen("ws_a"), None);
+        assert_eq!(
+            std::fs::read_dir(&app_dir).unwrap().count(),
+            1,
+            "nothing was set aside"
+        );
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        assert!(!claim_first_start(&app_dir));
+        assert_eq!(
+            AppState::load(&env, "image").last_seen("ws_a").as_deref(),
+            Some("2026-10-27T10:00:00Z"),
+            "a claim never writes over a state"
+        );
+
+        // A state set aside is an app that has run before.
+        let other = env.app_state_dir("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("state.json"), "{nope").unwrap();
+        let _ = AppState::load(&env, "other");
+        assert!(!other.join("state.json").exists());
+        assert!(!claim_first_start(&other), "set aside, not new");
+
+        // Another file in the folder (the layout) says nothing of it.
+        let third = env.app_state_dir("third");
+        std::fs::create_dir_all(&third).unwrap();
+        std::fs::write(third.join("layout.json"), "{}").unwrap();
+        assert!(claim_first_start(&third));
     }
 
     #[test] // spec: APP-111

@@ -69,6 +69,7 @@ pub mod preview;
 pub mod requests;
 pub mod retry;
 pub mod series;
+pub mod setup;
 pub mod shortcuts;
 pub mod single_instance;
 pub mod throttle;
