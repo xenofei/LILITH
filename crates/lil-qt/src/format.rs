@@ -183,6 +183,19 @@ pub fn cap_share_permille(e: &Estimate, caps: &CapsView) -> Option<u32> {
     (permille.is_finite() && permille >= 0.0).then(|| permille.min(f64::from(u32::MAX)) as u32)
 }
 
+/// A job kind's words, or `None` for a kind this build doesn't name: that one shows as it is
+/// (P4a-R40).
+pub fn kind_word(kind: &str) -> Option<&'static str> {
+    match kind {
+        "comfy.prompt" => Some("ComfyUI prompt"),
+        "comfy.inventory" => Some("ComfyUI inventory"),
+        "comfy.install_node" => Some("Node pack install"),
+        "test.job" => Some("Test job"),
+        "assistant_task" => Some("Director task"),
+        _ => None,
+    }
+}
+
 /// An RFC 3339 time (`YYYY-MM-DDTHH:MM:SS`, an optional fraction, then `Z` or `±HH:MM`) as
 /// Unix milliseconds; `None` when it doesn't read.
 pub fn parse_utc_ms(s: &str) -> Option<i64> {
