@@ -3,6 +3,7 @@
 // folder: nothing here writes anything real.
 import QtQuick
 import QtTest
+import Lilith.Core
 import Lilith.Shim
 import Lilith.UiKit
 import "CoreShapes.js" as Shapes
@@ -351,6 +352,28 @@ TestCase {
         answerRead(core, missing)
         tryVerify(() => shell.firstStartCard.visible, 5000, "this start began as a first")
         compare(TestFiles.read(dir + "/state.json"), home)
+    }
+
+    // On the stack with Home: its last-seen write, through the same ShellState call Home makes, lands
+    // before the card's first answer. This start was a first, so the card still shows, and Home's row
+    // is kept, since the record never replaces a file.
+    function test_home_s_write_first_keeps_the_offer_and_home_s_row() { // spec: APP-022, APP-111
+        const dir = TestFiles.newDir("homefirst")
+        const core = fakeComponent.createObject(tc)
+        const shell = makeShell(core, dir, fakeSetupComponent.createObject(tc))
+        verify(shell.firstStartCard.firstStart)
+        tryVerify(() => reads(core) >= 1, 5000)
+        compare(ShellState.setLastSeen(dir, "ws1", "2026-10-31T10:00:00Z"), "")
+        verify(TestFiles.list(dir).indexOf("state.json") >= 0)
+        answerRead(core, missing)
+        tryVerify(() => shell.firstStartCard.visible, 5000, "still offered")
+        compare(ShellState.lastSeen(dir, "ws1"), "2026-10-31T10:00:00Z", "Home's row is kept")
+        compare(JSON.parse(TestFiles.read(dir + "/state.json")).workspaces.ws1.last_seen_at, "2026-10-31T10:00:00Z")
+        // And the next start is no first start.
+        dropShell(shell)
+        answered = {}
+        const later = makeShell(fakeComponent.createObject(tc), dir, fakeSetupComponent.createObject(tc))
+        verify(!later.firstStartCard.firstStart)
     }
 
     function test_a_read_open_when_set_up_answers_doesnt_undo_it() { // spec: APP-022
