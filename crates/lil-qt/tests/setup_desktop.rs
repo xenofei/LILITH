@@ -347,9 +347,10 @@ fn a_missing_app_is_set_up_never() {
     assert!(!app_missing(&channel_env(Channel::Dev, dir.path()), &gone));
 }
 
-/// The path the core checks (`lil_core::server`): else `shortcut` reads `wrong`.
+/// The folders the core's own check uses (`lil_core::server`, which this can't reach): the path itself
+/// reading `ok` is `desktop_set_up_writes_the_shortcut_and_handlers`'s to show.
 #[test] // spec: APP-022
-fn the_app_path_is_the_one_the_core_checks() {
+fn the_app_path_is_in_the_install_folder_or_beside_the_core() {
     let dir = tempfile::tempdir().unwrap();
     let config = |channel| {
         let env = channel_env(channel, dir.path());
@@ -370,11 +371,25 @@ fn the_app_path_is_the_one_the_core_checks() {
     );
 }
 
+/// A run that panicked: nothing is known of what it wrote, and the core was never asked.
+#[test] // spec: APP-022
+fn a_stopped_run_claims_nothing() {
+    let report = SetupReport::stopped();
+    assert!(report.stopped);
+    assert_eq!(report.reread_error, None, "the core was never asked");
+    assert_eq!(report.notification_path, None);
+    assert_eq!(
+        (report.shortcut, report.scheme),
+        (Step::NotTried, Step::NotTried)
+    );
+}
+
 /// What QML reads (`NotificationText.setupOutcome`, `tst_settings.qml`'s fixtures).
 #[test] // spec: APP-022
 fn the_report_reads_as_qml_expects() {
     let report = SetupReport {
         app_missing: None,
+        stopped: false,
         shortcut: Step::Written,
         scheme: Step::Failed {
             why: "denied".to_string(),
@@ -389,7 +404,7 @@ fn the_report_reads_as_qml_expects() {
     };
     assert_eq!(
         serde_json::to_value(&report).unwrap(),
-        json!({"app_missing": null, "shortcut": {"state": "written"},
+        json!({"app_missing": null, "stopped": false, "shortcut": {"state": "written"},
                "scheme": {"state": "failed", "why": "denied"},
                "notification_path": {"toasts": "not_yet_shown", "shortcut": "ok", "handlers": "missing"},
                "reread_error": null})

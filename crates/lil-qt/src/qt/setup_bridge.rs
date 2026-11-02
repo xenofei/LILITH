@@ -21,7 +21,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::QString;
 
-use crate::setup::{SetupReport, Step, app_exe, app_missing, set_up};
+use crate::setup::{SetupReport, app_exe, app_missing, set_up};
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -101,15 +101,8 @@ impl qobject::SetupBridge {
         let spawned = std::thread::Builder::new()
             .name("lil-setup".to_string())
             .spawn(move || {
-                let report = catch_unwind(AssertUnwindSafe(|| set_up(&cfg))).unwrap_or_else(|_| {
-                    SetupReport {
-                        app_missing: None,
-                        shortcut: Step::NotTried,
-                        scheme: Step::NotTried,
-                        notification_path: None,
-                        reread_error: Some("the setup stopped with an error".to_string()),
-                    }
-                });
+                let report = catch_unwind(AssertUnwindSafe(|| set_up(&cfg)))
+                    .unwrap_or_else(|_| SetupReport::stopped());
                 let json = serde_json::to_string(&report).expect("a report serialises");
                 // A setup whose object is gone has nobody to tell.
                 let _ = thread.queue(move |mut obj| {

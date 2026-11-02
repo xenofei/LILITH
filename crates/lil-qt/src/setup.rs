@@ -100,6 +100,8 @@ pub enum Step {
 pub struct SetupReport {
     /// The path `lil-image.exe` should be at, when it isn't there: then nothing was written.
     pub app_missing: Option<String>,
+    /// The run stopped with an error ([`SetupReport::stopped`]).
+    pub stopped: bool,
     pub shortcut: Step,
     pub scheme: Step,
     /// `desktop.get {fresh: true}`'s `notification_path`; `None` when it couldn't be read.
@@ -108,12 +110,27 @@ pub struct SetupReport {
     pub reread_error: Option<String>,
 }
 
+impl SetupReport {
+    /// A run that panicked: what it wrote isn't known, and the core was never asked.
+    pub fn stopped() -> SetupReport {
+        SetupReport {
+            app_missing: None,
+            stopped: true,
+            shortcut: Step::NotTried,
+            scheme: Step::NotTried,
+            notification_path: None,
+            reread_error: None,
+        }
+    }
+}
+
 /// [`set_up_with`] on the real desktop and the core of `cfg`'s channel, as far as `cfg` names the
 /// app's path. Blocks; never call it on the GUI thread.
 pub fn set_up(cfg: &ClientConfig) -> SetupReport {
     let Some(exe) = app_exe(cfg) else {
         return SetupReport {
             app_missing: Some(cfg.core_exe.join(APP_EXE).display().to_string()),
+            stopped: false,
             shortcut: Step::NotTried,
             scheme: Step::NotTried,
             notification_path: None,
@@ -135,6 +152,7 @@ pub fn set_up_with(
     if app_missing(env, exe) {
         return SetupReport {
             app_missing: Some(exe.display().to_string()),
+            stopped: false,
             shortcut: Step::NotTried,
             scheme: Step::NotTried,
             notification_path: None,
@@ -171,6 +189,7 @@ pub fn set_up_with(
     };
     SetupReport {
         app_missing: None,
+        stopped: false,
         shortcut,
         scheme,
         notification_path,
