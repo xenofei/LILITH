@@ -357,25 +357,26 @@ TestCase {
         return null
     }
 
-    function test_float_and_redock_a_placeholder_keeps_its_state() { // spec: ARCH-116
+    // The shell's side of ARCH-116: floating and docking back moves the panel's own item, so whatever
+    // it holds stays. Every panel is real now; each also checks its own state (tst_settings and the rest).
+    function test_float_and_redock_keeps_the_panel_s_own_item() { // spec: ARCH-116
         const shell = makeShell("")
         showShell(shell)
-        // A panel still a placeholder: Home has its own test (tst_home).
         const dock = shell.docks.settings
         const panel = dock.content
         dock.setAsCurrentTab()
         tryVerify(() => panel.visible && panel.width > 0, 5000, "Settings is in front")
-        panel.note = "kept"
+        panel.objectName = "kept"
         dock.isFloating = true
         tryVerify(() => dock.isFloating && panel.Window.window && panel.Window.window !== shell, 5000,
                   "Settings floats in its own window")
         tryVerify(() => panel.Window.window.visible, 5000)
         verify(dock.content === panel, "the same panel item")
-        compare(panel.note, "kept")
+        compare(panel.objectName, "kept")
         dock.isFloating = false
         tryVerify(() => panel.Window.window === shell, 5000, "Settings docks back")
         verify(dock.content === panel, "still the same panel item")
-        compare(panel.note, "kept")
+        compare(panel.objectName, "kept")
     }
 
     function test_window_title_names_the_project() { // spec: APP-164
