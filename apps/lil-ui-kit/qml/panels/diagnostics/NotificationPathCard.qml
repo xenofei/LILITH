@@ -14,8 +14,10 @@ LCard {
     property var path: null
     // Why it couldn't be read, in words; "" for none.
     property string problem
+    // The setup is withheld: lil-image.exe isn't where the core looks for it.
+    property bool appMissing: false
 
-    readonly property var problems: NotificationText.problems(path)
+    readonly property var problems: NotificationText.problems(path, appMissing)
 
     title: "Notifications"
 

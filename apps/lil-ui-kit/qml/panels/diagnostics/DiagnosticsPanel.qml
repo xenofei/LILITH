@@ -35,6 +35,8 @@ Rectangle {
     property var eventLog: null
     // What reaches Explorer and the app's versions: LilShim, or a test's fake.
     property var shim: LilShim
+    // The setup bridge: whether "Set up" can be offered at all. SetupBridge, or a test's fake.
+    property var setup: SetupBridge
 
     // The bundle Show in Explorer shows; "" until there is one.
     property string exportedPath
@@ -357,6 +359,7 @@ Rectangle {
                     width: parent.width
                     core: root.core
                     path: root.desktopRead.result ? root.desktopRead.result.notification_path : null
+                    appMissing: !!root.setup && root.setup.appMissing === true
                     problem: Words.errorText(root.core, root.desktopRead.error)
                 }
             }

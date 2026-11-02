@@ -999,9 +999,9 @@ TestCase {
             [off("no_platform"), "Windows isn't showing LILITH's notifications on this PC"],
             [off("a_new_reason"), "Windows won't show LILITH's notifications (a_new_reason)"],
             [path({shortcut: "missing"}), "The Start-menu shortcut is missing"],
-            [path({shortcut: "wrong"}), "The Start-menu shortcut opens another program or build"],
+            [path({shortcut: "wrong"}), "The Start-menu shortcut isn't right for this LILITH"],
             [path({handlers: "missing"}), "This LILITH's lil: links aren't registered"],
-            [path({handlers: "other_channel"}), "Another LILITH build handles lil: links"]
+            [path({handlers: "other_channel"}), "Another LILITH build or another program handles lil: links"]
         ]
         for (const [p, sentence] of cases) {
             const problems = NotificationText.problems(p)
@@ -1029,7 +1029,7 @@ TestCase {
         core.emit("desktop", "event", {kind: "settings", settings: desktop()})
         answer(core, isTool("desktop.get"), ok(desktop({notification_path: path({toasts: "unavailable", toasts_reason: "disabled_for_user", shortcut: "wrong"})})))
         tryVerify(() => shows(panel.notifications, "Notifications are off in Windows Settings"), 5000)
-        verify(shows(panel.notifications, "The Start-menu shortcut opens another program or build"))
+        verify(shows(panel.notifications, "The Start-menu shortcut isn't right for this LILITH"))
         verify(!shows(panel.notifications, NotificationText.reachable))
     }
 
