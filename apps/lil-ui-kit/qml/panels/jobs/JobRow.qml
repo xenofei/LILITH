@@ -225,8 +225,11 @@ Rectangle {
         })
     }
 
-    // Only once the row is made (PreviewImage's rule): a follow() while the row was being made left a
-    // subscription the next follow() didn't end, so each event reached the row twice (bench_event_to_ui).
+    // Only once the row is made (PreviewImage's rule). While the list makes the row, `jobId` and
+    // `running` change as their bindings first take the model's values, before the row's own
+    // initializers have run; `_subscription: null` then overwrote the subscription that follow() had
+    // just made. Nothing ended that one, and its handler lives as long as the row, so each event
+    // reached the row twice (bench_event_to_ui).
     property bool _complete: false
     onRunningChanged: if (_complete) follow()
     onJobIdChanged: if (_complete) follow()
