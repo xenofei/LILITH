@@ -9,7 +9,9 @@
   1. The hands-off pop-up (tools/sandbox/hands-off.ps1: 10 s of warning, then a countdown).
   2. A test channel under a new temporary root (LIL_CHANNEL=test-homecheck, LIL_TEST_ROOT), with the
      deployed lil-image on it, driven through UI Automation. A job has finished since the kept time
-     (state.json, written before the start). It checks, on disk or through UIA:
+     (state.json, written before the start, so the app's start isn't its first and the first-start
+     card never shows: the docks sit where they would without it). state.json is read sharing
+     deletion, as the app's swap needs. It checks, on disk or through UIA:
        (a) minimized as soon as the window is there: the kept time stays for 6 s. Restored: the away
            card lists the job, and the time moves 3 s or more after the restore.
        (b) minimized for longer, with two more jobs finishing: the time stays. Restored: the card
@@ -191,10 +193,33 @@ function Wait-Count([scriptblock]$count, [int]$want, [int]$sec) {
         Start-Sleep -Milliseconds 200
     }
 }
+# `path`'s text, read as the app's other readers do: sharing reading, writing and deletion, so the
+# app's swap (ReplaceFileW, which opens the file for deletion) can go on while this reads. Get-Content
+# shares no deletion, and so can stop that swap or be stopped by it. A sharing violation, the swap
+# meeting this read, is tried again for up to 2 s.
+function Read-Shared([string]$path) {
+    $end = (Get-Date).AddSeconds(2)
+    while ($true) {
+        try {
+            $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+            $stream = [IO.FileStream]::new($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+            try { return ([IO.StreamReader]::new($stream)).ReadToEnd() } finally { $stream.Dispose() }
+        } catch [System.IO.FileNotFoundException] {
+            return $null
+        } catch [System.IO.IOException] {
+            # 0x80070020 ERROR_SHARING_VIOLATION, 0x80070021 ERROR_LOCK_VIOLATION.
+            $code = $_.Exception.HResult -band 0xFFFF
+            if (($code -ne 32 -and $code -ne 33) -or (Get-Date) -ge $end) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
 # The app's kept time as written: the text itself, since ConvertFrom-Json would turn it into a date.
 function Get-Kept {
     if (-not (Test-Path -LiteralPath $stateFile)) { return '' }
-    $m = [regex]::Match((Get-Content -Raw -LiteralPath $stateFile), '"last_seen_at"\s*:\s*"([^"]+)"')
+    $text = Read-Shared $stateFile
+    if ($null -eq $text) { return '' }
+    $m = [regex]::Match($text, '"last_seen_at"\s*:\s*"([^"]+)"')
     return $(if ($m.Success) { $m.Groups[1].Value } else { '' })
 }
 function Set-Kept([string]$workspace, [string]$at) {
@@ -277,6 +302,11 @@ if ($DryRun) {
         Check (Test-Path -LiteralPath (Join-Path $root "local\LILITH-$channel")) 'dry run: the local data folder is where the kept time goes'
         Set-Kept $wsId '2026-01-01T00:00:00Z'
         Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads back'
+        # The read shares deletion: a holder that wants to delete or replace the file, as the app's swap
+        # does, goes on beside it.
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $swap = [IO.FileStream]::new($stateFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        try { Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads beside a holder that shares deletion' } finally { $swap.Dispose() }
         Check (Test-Path -LiteralPath $image) "dry run: $image is deployed"
     } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
     Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
