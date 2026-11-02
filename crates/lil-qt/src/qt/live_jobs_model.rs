@@ -36,7 +36,7 @@ use crate::live_jobs::{JobChange, LiveJobs, LiveRow, Op, apply};
 const USER_ROLE: i32 = 0x0100;
 
 /// The roles, in order.
-pub const ROLES: [&str; 33] = [
+pub const ROLES: [&str; 34] = [
     "job_id",
     "kind",
     "lane",
@@ -70,6 +70,7 @@ pub const ROLES: [&str; 33] = [
     "eta_text",
     "elapsed_text",
     "batch_size",
+    "project",
 ];
 
 #[cxx_qt::bridge]

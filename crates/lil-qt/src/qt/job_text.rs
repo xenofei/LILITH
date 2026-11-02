@@ -9,7 +9,8 @@
 //! - `queuedEtaText(runningLeft, aheadJson, ownJson)`: `aheadJson` is a JSON array of the
 //!   estimates (or nulls) of the jobs ahead in lane order, the running job without a `wall_s`
 //!   and each job the panel can't see included as null;
-//! - `elapsedText(s)`.
+//! - `elapsedText(s)`;
+//! - `kindWord(kind)`: a job kind's words, empty for one this build doesn't name.
 
 use cxx_qt_lib::QString;
 use lil_protocol::app::CapsView;
@@ -53,6 +54,9 @@ pub mod qobject {
 
         #[qinvokable]
         fn elapsed_text(self: &JobText, s: f64) -> QString;
+
+        #[qinvokable]
+        fn kind_word(self: &JobText, kind: &QString) -> QString;
     }
 }
 
@@ -110,5 +114,9 @@ impl qobject::JobText {
 
     fn elapsed_text(&self, s: f64) -> QString {
         QString::from(&format::elapsed_text(s))
+    }
+
+    fn kind_word(&self, kind: &QString) -> QString {
+        QString::from(format::kind_word(&kind.to_string()).unwrap_or_default())
     }
 }

@@ -188,10 +188,7 @@ Rectangle {
     }
 
     function kindLabel(kind) {
-        const known = {"comfy.prompt": "ComfyUI prompt", "comfy.inventory": "ComfyUI inventory",
-                       "comfy.install_node": "Node pack install", "test.job": "Test job",
-                       "assistant_task": "Director task"}
-        return kind ? word(known, kind) : "Job"
+        return kind ? JobText.kindWord(kind) || shown(kind) : "Job"
     }
 
     function originLabel(origin) {
