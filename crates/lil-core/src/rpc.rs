@@ -58,7 +58,9 @@
 //! A process is assumed to keep one session at a time: a second live one of the same pid and
 //! caller in another workspace counts as a switch, but one with no workspace doesn't, since a
 //! toast's Deny from the app connects so. So a real move to no workspace leaves the prompts
-//! answerable until they expire or the process exits. The waits live in one core instance: after
+//! answerable until they expire, the process exits, or it opens another workspace; the app's call
+//! that asked has already ended on such a move, so answering runs nothing, though a raise still
+//! changes the cap. The waits live in one core instance: after
 //! a core restart, prompts reloaded from `state.db` end at their expiry (Appendix G).
 //!
 //! **Lifecycle** (ARCH-020, ruling P23). [`Router::opened`] and [`Router::closed`] feed the
