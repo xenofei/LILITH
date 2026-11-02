@@ -32,14 +32,18 @@
 //
 // Last seen. The time is kept per workspace in the app's state (`stateDir`, AppState); a shell
 // without a `stateDir` keeps none, and so has no card. A person must never lose a line they weren't
-// shown, and a line they watched arrive shouldn't come back. So after Home has been really on screen
-// for `seenAfterMs` in a row with no read of the card's out (not behind a tab, in a closed dock, on a
-// minimized window, or with the core away), it does one more jobs read, and the time written is when
-// that read began (`seenStamp`, never `now`). That is a second or more after the read that showed the
-// last line, which matters because the core's `since` lists again the second a fractional time falls
-// in. If that read brings a new line, fails, or lands off screen, nothing is written, and the wait
-// starts again. A new line on the card starts it again too, and a steady stream of reads puts the
-// write off, never the other way. A `{since}` read cut at `awayPages` writes nothing: the card says
+// shown, and a line they watched arrive shouldn't come back. So after Home has been on screen in the
+// active window for `seenAfterMs` in a row with no read of the card's out (not behind a tab, in a
+// closed dock, on a minimized window, under another program, on a locked screen, or with the core
+// away), it does one more jobs read, and the time written is when that read began (`seenStamp`, never
+// `now`). That is a second or more after the read that showed the last line, which matters because the
+// core's `since` lists again the second a fractional time falls in. If that read brings a new line,
+// fails, or lands with Home off screen or inactive, nothing is written, and the wait starts again. A
+// new line on the card starts it again too, and a steady stream of reads puts the write off, never the
+// other way. Active is Qt's: a floating Home counts while any of the app's windows has the focus. A
+// window watched on a second monitor while you work elsewhere holds its lines until you come back to
+// it; a line scrolled out of view counts as shown, as the card's scroll area is on screen. A write that
+// fails isn't taken as written: it is tried at the next mark, and the card says so if it keeps failing. A `{since}` read cut at `awayPages` writes nothing: the card says
 // there is more, until Dismiss. The card goes on counting from the time it opened with, so its lines
 // don't vanish as you read them: it moves to the kept time when Home has been off screen for
 // `seenAfterMs` (a float, which hides it for a moment, doesn't). Dismiss forgets the lines it
@@ -82,7 +86,8 @@ Rectangle {
     readonly property bool hasWorkspace: workspaceId !== ""
     // The session is up and has no workspace at all (APP-016).
     readonly property bool noWorkspace: connected && !hasWorkspace
-    // Really on screen, as far as Qt can tell.
+    // On screen, as far as Qt can tell: a window under another program or on a locked screen is too,
+    // which is why the time also asks for the active window.
     readonly property bool onScreen: visible && width > 0 && height > 0 && Window.visibility !== Window.Hidden
                                      && Window.visibility !== Window.Minimized
     // The card has a time to count from.
@@ -145,6 +150,11 @@ Rectangle {
     property var _dismissed: ({})
     // The card's reads have landed for this time.
     property bool _awayLoaded: false
+    // `Window.active` as last looked at.
+    property bool _activeNow: false
+    // Writes of the time that failed in a row: from two, the card says so.
+    property int _writesFailed: 0
+    readonly property bool seenWriteFailing: _writesFailed >= 2
     // The one more jobs read before the time is written is due or out.
     property bool _confirming: false
     // There is something Home hasn't been seen with yet.
@@ -596,13 +606,17 @@ Rectangle {
     // That read is in. `_unseen` stays as it is unless all is well, and the wait starts again.
     function finishSeen(grew) {
         _confirming = false
-        if (readState.jobs === "ok" && !grew && !awayCut && onScreen && connectedNow())
+        if (readState.jobs === "ok" && !grew && !awayCut && onScreen && Window.active && connectedNow())
             writeSeen(_seenUpTo)
     }
 
+    // Not written, it stays unseen: the wait starts again, and so the next mark tries again.
     function writeSeen(at) {
-        if (stateDir !== "" && workspaceNow() !== "")
-            ShellState.setLastSeen(stateDir, workspaceNow(), at)
+        if (stateDir !== "" && workspaceNow() !== "" && ShellState.setLastSeen(stateDir, workspaceNow(), at) !== "") {
+            _writesFailed++
+            return
+        }
+        _writesFailed = 0
         _unseen = false
         _wroteSeen = true
     }
@@ -635,7 +649,10 @@ Rectangle {
     function moveCardTime() {
         _moveTime = false
         _wroteSeen = false
-        lastSeen = keptSince(workspaceNow())
+        // One that can't be read just now leaves the card's own: as a first run it would lose lines.
+        const kept = keptSince(workspaceNow())
+        if (kept !== "")
+            lastSeen = kept
         _unseen = true
         _awayLoaded = false
         due({jobs: true, confirmations: true})
@@ -651,6 +668,7 @@ Rectangle {
         _moveTime = false
         _awayLoaded = false
         _confirming = false
+        _writesFailed = 0
         _known = {}
         _dismissed = {}
     }
@@ -793,12 +811,22 @@ Rectangle {
         onTriggered: root.applyPendingJobs()
     }
 
-    // After this long really on screen, the read that moves the time.
+    // Qt signals `active` only on the window that gains or loses the focus, while a floating Home's
+    // follows the app's other windows too, so a binding would go stale: it is looked at while it matters.
+    Timer {
+        interval: 250
+        repeat: true
+        triggeredOnStart: true
+        running: root.onScreen && root._unseen
+        onTriggered: root._activeNow = root.Window.active
+    }
+
+    // After this long on screen in the active window, the read that moves the time.
     Timer {
         id: seenTimer
         interval: root.seenAfterMs
-        running: root.onScreen && root.connected && root.hasWorkspace && root.stateDir !== "" && root._awayLoaded
-                 && root._unseen && !root.awayCut
+        running: root.onScreen && root._activeNow && root.connected && root.hasWorkspace && root.stateDir !== ""
+                 && root._awayLoaded && root._unseen && !root.awayCut
         onTriggered: root.confirmSeen()
     }
 

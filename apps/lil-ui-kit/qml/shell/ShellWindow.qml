@@ -23,8 +23,8 @@
 // Open requests (APP-014, APP-020, APP-065, P4a-R21; the block marked "Open requests" below):
 // a launch (handleLaunchJson, from main.cpp: this start's own, then each one a second launch
 // forwards) and each `open_requests:image` event. A target, raw ref or `.lilref` shows in Home's
-// Opened card, and a refused link's message there, with Home opened and brought to the front (the
-// keyboard focus moves into it only with `focus`); `task` opens Jobs on that job (`shownJob`, and
+// Opened card, and a refused link's message there, with Home opened and brought to the front, or
+// with no `focus` only where that covers no panel holding the keyboard (showWithoutFocus); `task` opens Jobs on that job (`shownJob`, and
 // the panel's showJob(id) when it has one); `confirm` opens Confirmations on that confirmation
 // (`shownConfirmation`, and the panel's showConfirmation(id)). The window comes forward through
 // `shim.activate(window, focus)` (LilShim; the tests pass a fake): an agent's request, or a launch
@@ -652,19 +652,32 @@ Window {
             _focusHomeOnSettle = _focusHomeOnSettle || focus
     }
 
+    // A panel shown with no keyboard focus (APP-065): never over a panel that holds the focus, and a
+    // floating one's window isn't activated (a dock's raise does that). The person's way to it is the
+    // taskbar flash or the agent's toast, then its shortcut. A closed panel may come back in the tabs
+    // of the one with the focus, and nothing says where before it does, so then it stays closed.
+    function showWithoutFocus(dock) {
+        if (dock.content && dock.content.visible)
+            return
+        const holder = openPanels().find(d => d !== dock && d.panelHasFocus)
+        if (!dock.isOpen) {
+            if (!holder)
+                dock.open()
+        } else if (!holder || holder.tabHolder() !== dock.tabHolder()) {
+            dock.setAsCurrentTab()
+        }
+    }
+
     // Opens panel `id`, and calls its `method(arg, focus)` when the panel has one; the keyboard
     // focus moves into it only with `focus`.
     function openPanelOn(id, method, arg, focus) {
         const dock = docks[id]
         if (!dock)
             return
-        if (focus) {
+        if (focus)
             showPanel(id)
-        } else {
-            if (!dock.isOpen)
-                dock.open()
-            dock.raise()
-        }
+        else
+            showWithoutFocus(dock)
         const content = dock.content
         if (method && content && typeof content[method] === "function")
             content[method](arg, focus)

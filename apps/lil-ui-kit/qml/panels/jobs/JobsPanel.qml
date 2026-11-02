@@ -236,14 +236,7 @@ Rectangle {
 
     // A running job's substatus: nothing for `executing`, else its words or its name.
     function runningLabel(substatus) {
-        if (!substatus || substatus === "executing")
-            return ""
-        const retrying = /^retrying_(\d+)_of_(\d+)$/.exec(substatus)
-        if (retrying)
-            return "Retrying (" + retrying[1] + " of " + retrying[2] + ")"
-        const known = {cancelling: "Cancelling", interrupted_unknown: "Outcome unknown",
-                       ingesting: "Bringing in the outputs"}
-        return word(known, substatus)
+        return PausedText.runningWords(substatus, core)
     }
 
     // --- Rows. ---

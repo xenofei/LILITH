@@ -24,6 +24,12 @@ KDDW.DockWidget {
     uniqueName: panel.id
     title: panel.title
 
+    // The item that holds this dock's tabs: two docks with the same one are tabs of one group. Null
+    // while it is closed, when no one can say where it would come back.
+    function tabHolder() {
+        return loader.parent ? loader.parent.parent : null
+    }
+
     // Gives the keyboard focus to the panel's first focusable item, else to the panel.
     function focusPanel() {
         if (!loader.item)

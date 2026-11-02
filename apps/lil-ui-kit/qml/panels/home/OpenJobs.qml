@@ -33,8 +33,7 @@ LCard {
             // Nothing is running it any more, whatever its status says: it waits for you.
             if (substatus === "interrupted_unknown")
                 return "Outcome unknown"
-            const known = {executing: "", cancelling: "Cancelling", ingesting: "Bringing in the outputs"}
-            const word = Object.prototype.hasOwnProperty.call(known, substatus) ? known[substatus] : panel.shown(substatus)
+            const word = PausedText.runningWords(substatus, panel.core)
             return word !== "" ? "Running · " + word : "Running"
         }
         if (status === "queued") {

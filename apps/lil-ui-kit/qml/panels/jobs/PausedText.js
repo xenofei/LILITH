@@ -25,3 +25,16 @@ function label(reasons, core) {
 function laneLabel(lane, core) {
     return lane === "gpu-heavy" ? "GPU work" : lane === "cpu" ? "CPU work" : shown(core, lane, 40)
 }
+
+// A running job's substatus in words, shared by the Jobs panel's rows and Home's open jobs: nothing
+// for `executing`, an unknown one by its name.
+function runningWords(substatus, core) {
+    if (!substatus || substatus === "executing")
+        return ""
+    const retrying = /^retrying_(\d+)_of_(\d+)$/.exec(substatus)
+    if (retrying)
+        return "Retrying (" + retrying[1] + " of " + retrying[2] + ")"
+    const known = {cancelling: "Cancelling", interrupted_unknown: "Outcome unknown",
+                   ingesting: "Bringing in the outputs"}
+    return Object.prototype.hasOwnProperty.call(known, substatus) ? known[substatus] : shown(core, substatus, 60)
+}

@@ -54,9 +54,27 @@ TestCase {
         }
     }
 
+    // Another program's window in front. It has no parent: Qt calls a window active while any of its
+    // transient family has the focus, so a child of this test's window wouldn't take it from Home.
+    Component {
+        id: otherWindow
+        Window {
+            width: 100
+            height: 100
+            visible: true
+        }
+    }
+
     A11yWalk { id: walk }
 
     property var answered: ({})
+    property var cleanups: []
+
+    function cleanup() {
+        for (const w of cleanups)
+            w.destroy()
+        cleanups = []
+    }
 
     function init() {
         // The shell of the test before deletes its docks later (KDDockWidgets' names are process-wide).
@@ -72,6 +90,7 @@ TestCase {
         const host = createTemporaryObject(hostComponent, tc, {core: core, stateDir: stateDir || ""})
         verify(host && host.panel, "HomePanel created")
         tryVerify(() => host.panel.onScreen, 5000, "Home is on screen")
+        activate(host)
         return host.panel
     }
 
@@ -80,7 +99,26 @@ TestCase {
         verify(shell, "ShellWindow created")
         shell.visible = true
         tryVerify(() => shell.docks.home.content && shell.docks.home.content.onScreen, 5000, "the docks are laid out")
+        activate(shell)
         return shell
+    }
+
+    // The time moves only in the active window.
+    function activate(win) {
+        win.requestActivate()
+        tryVerify(() => win.active, 3000, "the window is active")
+    }
+
+    function otherProgram() {
+        const other = otherWindow.createObject(null)
+        verify(other)
+        tc.cleanups.push(other)
+        return other
+    }
+
+    function restore(win) {
+        win.visibility = Window.Windowed
+        activate(win)
     }
 
     function stateWith(ws, at) {
@@ -518,7 +556,7 @@ TestCase {
 
         // Back, with the core away.
         core.applyState({connection: "reconnecting"})
-        shell.visibility = Window.Windowed
+        restore(shell)
         tryVerify(() => panel.onScreen, 5000, "the window is back")
         wait(3300)
         compare(keptTime(dir, "ws1"), seen, "not with the core away")
@@ -568,7 +606,7 @@ TestCase {
         host.visibility = Window.Minimized
         tryVerify(() => !panel.onScreen, 5000)
         wait(300)
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => panel.onScreen, 5000)
         compare(panel.lastSeen, seen)
         verify(panel.awayCard.visible)
@@ -576,7 +614,7 @@ TestCase {
         host.visibility = Window.Minimized
         tryVerify(() => !panel.onScreen, 5000)
         wait(3300)
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => panel.onScreen, 5000)
         settle(core, panel, s)
         compare(panel.lastSeen, kept)
@@ -880,7 +918,7 @@ TestCase {
         core.emit("jobs", "event", {kind: "job", job: Shapes.job("j_0000000000000001", "succeeded")})
         wait(1200)
         compare(core.calls.slice(before), [], "it waits")
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => core.calls.length > before, 5000, "and reads when it shows")
         settle(core, panel, s)
     }
@@ -961,27 +999,39 @@ TestCase {
         card.dismissButton.clicked()
         verify(!card.visible)
 
-        // Home behind a tab: a launch brings it to the front.
+        // Home behind a tab, with the keyboard in another group: it comes to the front of its tabs,
+        // and the focus stays where it was.
         shell.docks.home.addDockWidgetAsTab(shell.docks.jobs)
         wait(100)
         shell.docks.jobs.setAsCurrentTab()
         tryVerify(() => !home.visible, 5000)
+        activate(shell)
+        shell.docks.hardware.focusPanel()
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000)
+        let holder = shell.activeFocusItem
         launch({kind: "target", target: "C:\\art\\c.png", focus: false})
         tryVerify(() => card.visible && home.visible, 5000, "the card shows with Home in front")
+        verify(shell.activeFocusItem === holder, "focus: false moves no focus")
 
-        // Home closed: a launch that takes no focus opens it, and the focus stays where it was.
+        // Home closed, with the keyboard in a panel: it may come back over that panel, so it stays
+        // closed, and the card waits in it.
         card.dismissButton.clicked()
         shell.docks.home.forceClose()
         tryVerify(() => !shell.docks.home.isOpen, 5000)
-        shell.requestActivate()
-        tryVerify(() => shell.active, 2000)
-        // A panel Home's tab won't cover.
         shell.docks.hardware.focusPanel()
-        tryVerify(() => shell.activeFocusItem !== null, 2000)
-        const holder = shell.activeFocusItem
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000)
+        holder = shell.activeFocusItem
         launch({kind: "refused", message: "This link isn't one LILITH opens: x", focus: false})
-        tryVerify(() => shell.docks.home.isOpen && card.visible, 5000, "Home opens on the refusal")
         compare(card.message, "This link isn't one LILITH opens: x")
+        wait(200)
+        verify(!shell.docks.home.isOpen, "it stays closed")
+        verify(shell.activeFocusItem === holder, "focus: false moves no focus")
+        // Home closed, with the keyboard in no panel: it opens.
+        shell.topBar.projectSwitcher.button.forceActiveFocus()
+        tryVerify(() => !shell.docks.hardware.panelHasFocus, 2000)
+        holder = shell.activeFocusItem
+        launch({kind: "refused", message: "This link isn't one LILITH opens: y", focus: false})
+        tryVerify(() => shell.docks.home.isOpen && card.visible, 5000, "Home opens on the refusal")
         verify(shell.activeFocusItem === holder, "focus: false moves no focus")
         // With the focus: it goes into Home, the card's buttons the next tab stops.
         launch({kind: "target", target: "C:\\art\\d.png", focus: true})
@@ -1074,7 +1124,7 @@ TestCase {
         tryVerify(() => !panel.onScreen, 5000)
         answerAll(core, scene({jobs: [job]}))
         wait(3400)
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => panel.onScreen, 5000)
         settle(core, panel, scene({jobs: [job]}))
         verify(panel.awayCard.visible, "the job nobody saw is on the card")
@@ -1154,7 +1204,7 @@ TestCase {
         tryVerify(() => !panel.onScreen, 5000)
         wait(100)
         let before = core.calls.length
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => panel.onScreen, 5000)
         wait(400)
         compare(core.calls.slice(before), [], "a brief hide reads nothing")
@@ -1163,7 +1213,7 @@ TestCase {
         tryVerify(() => !panel.onScreen, 5000)
         wait(1300)
         before = core.calls.length
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => panel.onScreen, 5000)
         compare(core.calls.slice(before), [], "coalesced, not at once")
         tryVerify(() => core.calls.slice(before).some(c => c.name === "projects.list"), 3000, "the cards are read")
@@ -1456,7 +1506,7 @@ TestCase {
         host.visibility = Window.Minimized
         tryVerify(() => !panel.onScreen, 5000)
         wait(3400)
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => panel.onScreen, 5000)
         settle(core, panel, s)
         compare(lineTexts(panel.awayCard), [], "it doesn't come back")
@@ -1534,7 +1584,7 @@ TestCase {
         answerAll(core, s)
         answerFor(core, s, 300)
         compare(keptTime(dir, "ws1"), seen, "nobody was there")
-        host.visibility = Window.Windowed
+        restore(host)
         tryVerify(() => panel.onScreen, 5000)
         keptMoved(core, s, dir, "ws1", seen, 5000, "back, after the wait")
     }
@@ -1679,6 +1729,182 @@ TestCase {
         settle(core, panel, scene({status: Shapes.projectStatus("lantern", {stale: 3})}))
         compare(panel.statusCounts.title, "Assets in lantern")
         shell.destroy()
+    }
+
+    // --- The merge audit. ---
+
+    function test_focus_false_does_not_cover_the_tab_you_are_in() { // spec: APP-065
+        const core = makeCore()
+        const shell = makeShell(core)
+        const home = shell.docks.home.content
+        const jobs = shell.docks.jobs
+        const card = shell.openedCard
+        shell.docks.home.addDockWidgetAsTab(jobs)
+        wait(100)
+        jobs.setAsCurrentTab()
+        tryVerify(() => !home.visible && jobs.content.visible, 5000, "Jobs is in front of Home")
+        activate(shell)
+        jobs.focusPanel()
+        tryVerify(() => jobs.panelHasFocus, 2000, "the keyboard is in Jobs")
+        const holder = shell.activeFocusItem
+        // An agent's open request, and a launch with --no-activate.
+        core.emit("open_requests:image", "event", {target: "C:\\art\\c.png", intent: "open", focus: false})
+        shell.handleLaunchJson(JSON.stringify({kind: "target", target: "C:\\art\\d.png", intent: "open", focus: false, activate: false}))
+        wait(300)
+        verify(jobs.content.visible, "Jobs stays in front")
+        verify(!home.visible, "Home stays behind it")
+        verify(jobs.panelHasFocus && shell.activeFocusItem === holder, "the keys still go to Jobs")
+        compare(card.targetText, "C:\\art\\d.png", "the card is filled")
+        // The person brings it up.
+        shell.showPanel("home")
+        tryVerify(() => home.visible && card.visible, 5000, "and it is there")
+        // The same for a task link, the other way round: the keyboard in Home, Jobs behind it.
+        home.scroller.forceActiveFocus()
+        tryVerify(() => shell.docks.home.panelHasFocus, 2000)
+        shell.handleLaunchJson(JSON.stringify({kind: "task", job: "j_0000000000000001", focus: false, activate: false}))
+        wait(300)
+        verify(home.visible && !jobs.content.visible, "Home stays in front")
+        verify(shell.docks.home.panelHasFocus, "the keys still go to Home")
+        shell.destroy()
+    }
+
+    function test_focus_false_activates_no_floating_home() { // spec: APP-065
+        const core = makeCore()
+        const shell = makeShell(core)
+        const dock = shell.docks.home
+        const home = dock.content
+        dock.isFloating = true
+        tryVerify(() => home.Window.window && home.Window.window !== shell && home.onScreen, 5000, "Home floats")
+        activate(shell)
+        // A floating dock's raise activates its window; this platform says so when it is asked.
+        failOnWarning(/does not support raise/)
+        shell.handleLaunchJson(JSON.stringify({kind: "target", target: "C:\\art\\d.png", intent: "open", focus: false, activate: false}))
+        wait(200)
+        verify(shell.active, "the main window keeps the front")
+        verify(shell.openedCard.visible)
+        dock.isFloating = false
+        tryVerify(() => home.Window.window === shell, 5000)
+        shell.destroy()
+    }
+
+    function test_the_time_waits_for_the_window_to_be_active() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const host = panel.Window.window
+        const s = awayScene()
+        // Covered by another program, or a locked screen: it shows, and nobody is looking.
+        const other = otherProgram()
+        activate(other)
+        tryVerify(() => !host.active, 3000)
+        verify(panel.onScreen, "Qt still calls it on screen")
+        answerFor(core, s, 3400)
+        verify(panel.awayCard.visible, "the reads go on")
+        compare(keptTime(dir, "ws1"), seen, "the time holds")
+        // Dismiss is a person's own act, whatever is active: tested below. Back to the window.
+        activate(host)
+        keptMoved(core, s, dir, "ws1", seen, 4500, "the time moves once it is active")
+    }
+
+    function test_one_more_read_landing_in_an_inactive_window_moves_nothing() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const host = panel.Window.window
+        const s = scene()
+        settle(core, panel, s)
+        const before = callsOf(core, "jobs.list").length
+        tryVerify(() => callsOf(core, "jobs.list").length > before, 3500, "one more jobs read")
+        const other = otherProgram()
+        activate(other)
+        answerFor(core, s, 300)
+        compare(keptTime(dir, "ws1"), seen, "nobody was looking")
+        activate(host)
+        keptMoved(core, s, dir, "ws1", seen, 5000)
+    }
+
+    function test_dismiss_in_an_inactive_window_moves_the_time_at_once() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        settle(core, panel, awayScene())
+        const other = otherProgram()
+        activate(other)
+        panel.dismissAway()
+        verify(keptTime(dir, "ws1") !== seen, "a person's own act")
+    }
+
+    function test_a_floating_home_counts_as_the_app_s_own_window() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const shell = makeShell(core, dir)
+        const dock = shell.docks.home
+        const panel = dock.content
+        const s = awayScene()
+        settle(core, panel, s)
+        dock.isFloating = true
+        tryVerify(() => panel.Window.window && panel.Window.window !== shell && panel.onScreen, 5000, "Home floats")
+        // Another program in front: it holds.
+        const other = otherProgram()
+        activate(other)
+        tryVerify(() => !panel.Window.active, 3000)
+        answerFor(core, s, 3400)
+        compare(keptTime(dir, "ws1"), seen, "the time holds")
+        // The app in front, by its main window: Qt calls the floating window active too.
+        activate(shell)
+        verify(panel.Window.active, "the floating window counts with the main one")
+        keptMoved(core, s, dir, "ws1", seen, 4500, "the time moves")
+        dock.isFloating = false
+        tryVerify(() => panel.Window.window === shell, 5000)
+        shell.destroy()
+    }
+
+    function test_open_jobs_says_a_retry_in_words() { // spec: APP-114
+        const core = makeCore()
+        const panel = makeHome(core)
+        compare(panel.openJobs.stateWords("running", "retrying_2_of_5", []), "Running · Retrying (2 of 5)")
+        compare(panel.openJobs.stateWords("running", "cancelling", []), "Running · Cancelling")
+        compare(panel.openJobs.stateWords("running", "executing", []), "Running")
+        compare(panel.openJobs.stateWords("running", "future_sub", []), "Running · future_sub")
+    }
+
+    function test_a_kept_time_that_cannot_be_written_is_tried_again_and_says_so() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const s = awayScene()
+        settle(core, panel, s)
+        // A state.json that can't be read or replaced: a folder of that name.
+        const bad = TestFiles.newDir("home-bad")
+        verify(TestFiles.mkpath(bad + "/state.json"))
+        panel.stateDir = bad
+        verify(panel.awayCard.visible)
+        compare(panel.awayCard.saveNote, "")
+        // It isn't taken as written: the card doesn't move on, and it is tried at the next mark.
+        tryVerify(() => {
+            answerAll(core, s)
+            return panel.awayCard.saveNote !== ""
+        }, 10000, "it says so once it has kept failing")
+        compare(panel.awayCard.saveNote, "Couldn't save when you last looked, so these lines may show again.")
+        compare(panel._wroteSeen, false)
+        verify(panel.awayCard.saveLabel.visible)
+        // The file is back: the next mark writes it, and the words go.
+        panel.stateDir = dir
+        keptMoved(core, s, dir, "ws1", seen, 5000, "the next mark writes it")
+        compare(panel.awayCard.saveNote, "")
+    }
+
+    function test_a_kept_time_gone_for_a_moment_keeps_the_card_s_time() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        settle(core, panel, awayScene())
+        const bad = TestFiles.newDir("home-bad")
+        verify(TestFiles.mkpath(bad + "/state.json"))
+        panel.stateDir = bad
+        panel._moveTime = true
+        panel.moveCardTime()
+        compare(panel.lastSeen, seen, "not as a first run, which would lose lines")
     }
 
     function test_a11y_walk_passes() { // spec: APP-156

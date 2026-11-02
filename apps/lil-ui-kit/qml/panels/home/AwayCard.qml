@@ -40,6 +40,10 @@ LCard {
         return lines.length > 0 ? "and more. " + whereHidden
                                 : "More jobs changed while you were away than this card reads. Jobs lists them."
     }
+    // The time can't be saved: true of whatever the card shows.
+    readonly property string saveNote: panel.seenWriteFailing
+                                       ? "Couldn't save when you last looked, so these lines may show again." : ""
+    readonly property alias saveLabel: saveLabel
     readonly property alias dismissButton: dismissButton
     readonly property alias noteText: noteText
     readonly property alias moreLabel: moreLabel
@@ -100,6 +104,19 @@ LCard {
             text: root.note
             textFormat: Text.PlainText
             color: Theme.warning
+            font.pixelSize: Theme.fontSize
+            wrapMode: Text.Wrap
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+
+        Text {
+            id: saveLabel
+            width: parent.width
+            visible: root.saveNote !== ""
+            text: root.saveNote
+            textFormat: Text.PlainText
+            color: Theme.textMuted
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap
             Accessible.role: Accessible.StaticText
