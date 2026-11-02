@@ -8,10 +8,13 @@
 // `{kind: "queue"}`) reads the jobs, one that ended the cards too, and a confirmation's event the
 // confirmations. They wait 150 ms after the last such event, at most 1 s after the first, so a burst
 // is one read. The counts walk the project's folder, so job ends read them at most once in
-// `statusGapMs`, with a last read so that they settle; choosing a project reads them at once. A
+// `statusGapMs`, with a last read so that they settle. Choosing a project reads them at once, and so
+// does the top bar's switcher having set the project again on a new session (`contextSet`): a read
+// made before that answered for whatever the hint says. A
 // snapshot, a `resync_required` or `ready` reads everything, and until each read lands what it covers
 // is grey and says it is being read again. A failed read keeps what the card shows, greyed, says so,
-// and is asked again after 1 s, doubling up to 30 s, or with the next read of anything. While Home
+// and is asked again after 1 s, doubling up to 30 s, or with the next read of anything, except the
+// counts, which keep to the wait, so a failing walk of the folder doesn't run back to back. While Home
 // isn't on screen nothing is read: what came meanwhile is read when it shows, and after a second or
 // more off screen everything is (a float's moment off screen isn't that). A workspace switch cancels
 // what is out and clears the cards. Everything needing a workspace waits for one (APP-016): without
@@ -29,20 +32,25 @@
 //
 // Last seen. The time is kept per workspace in the app's state (`stateDir`, AppState); a shell
 // without a `stateDir` keeps none, and so has no card. A person must never lose a line they weren't
-// shown, so the time written is when the last jobs read that landed began (`seenStamp`, never `now`),
-// after Home has been really on screen for `seenAfterMs` in a row with no read of the card's out: not
-// behind a tab, in a closed dock, on a minimized window, or with the core away. A new line on the card
-// starts that wait again, and a steady stream of reads puts the write off, never the other way. A
-// `{since}` read cut at `awayPages` writes nothing: the card says there is more, until Dismiss. The
-// card goes on counting from the time it opened with, so its lines don't vanish as you read them: it
-// moves to the kept time when Home has been off screen for `seenAfterMs` (a float, which hides it for
-// a moment, doesn't). Dismiss forgets the lines it dismissed, the jobs a restart holds and the pending
-// confirmations among them, until they change, the workspace changes or the app starts again, and
-// moves both times to that same read's start; with a jobs read due, out or failing it moves neither,
-// and the usual write follows once a read has landed. There is no card on the first run. A kept time
-// ahead of now (the clock was ahead) can't say when you last looked: the card counts from
-// `aheadLookBackMs` before now, so lines may show twice but none is lost, and the usual write mends
-// the kept time. A kept time the core's `since` wouldn't take counts as none (`ShellState.lastSeen`).
+// shown, and a line they watched arrive shouldn't come back. So after Home has been really on screen
+// for `seenAfterMs` in a row with no read of the card's out (not behind a tab, in a closed dock, on a
+// minimized window, or with the core away), it does one more jobs read, and the time written is when
+// that read began (`seenStamp`, never `now`). That is a second or more after the read that showed the
+// last line, which matters because the core's `since` lists again the second a fractional time falls
+// in. If that read brings a new line, fails, or lands off screen, nothing is written, and the wait
+// starts again. A new line on the card starts it again too, and a steady stream of reads puts the
+// write off, never the other way. A `{since}` read cut at `awayPages` writes nothing: the card says
+// there is more, until Dismiss. The card goes on counting from the time it opened with, so its lines
+// don't vanish as you read them: it moves to the kept time when Home has been off screen for
+// `seenAfterMs` (a float, which hides it for a moment, doesn't). Dismiss forgets the lines it
+// dismissed, the jobs a restart holds and the pending confirmations among them, until they change, the
+// workspace changes or the app starts again, and moves both times to when the read they came from
+// began, the usual write then taking the kept time past that second; with a jobs read due, out or
+// failing it moves neither, and the usual write follows once a read has landed. There is no card on
+// the first run. A kept time ahead of now (the clock was ahead) can't say when you last looked: the
+// card counts from `aheadLookBackMs` before now, so lines may show twice but none is lost, and the
+// usual write mends the kept time. A kept time the core's `since` wouldn't take counts as none
+// (`ShellState.lastSeen`).
 //
 // Everything from outside is plain text through `core.shownText` (P4a-R8), and every count goes
 // through MoneyText.count.
@@ -137,6 +145,8 @@ Rectangle {
     property var _dismissed: ({})
     // The card's reads have landed for this time.
     property bool _awayLoaded: false
+    // The one more jobs read before the time is written is due or out.
+    property bool _confirming: false
     // There is something Home hasn't been seen with yet.
     property bool _unseen: true
     // The time moved since the card's time was taken, and Home has been off screen since.
@@ -264,10 +274,14 @@ Rectangle {
     function read() {
         if (!connectedNow() || !onScreen)
             return
-        // A part that failed is asked again with this read, whatever brought it on.
-        due(_toRetry)
-        _toRetry = {}
-        retry.stop()
+        // A part that failed is asked again with this read, whatever brought it on; the counts wait
+        // for their retry.
+        const again = Object.assign({}, _toRetry)
+        delete again.status
+        due(again)
+        _toRetry = _toRetry.status ? {status: true} : {}
+        if (!_toRetry.status)
+            retry.stop()
         const here = workspaceNow() !== ""
         const wanted = {
             jobs: !!_due.jobs,
@@ -290,6 +304,10 @@ Rectangle {
         if (Object.keys(start).length === 0)
             return
         _out = out
+        if (start.status && _toRetry.status) {
+            _toRetry = {}
+            retry.stop()
+        }
         const old = Object.assign({}, _oldDue)
         for (const kind in start)
             delete old[kind]
@@ -313,8 +331,9 @@ Rectangle {
         const out = Object.assign({}, _out)
         delete out[kind]
         _out = out
-        if (kind === "jobs" || kind === "confirmations")
-            updateAway()
+        const grew = kind === "jobs" || kind === "confirmations" ? updateAway() : false
+        if (kind === "jobs" && _confirming)
+            finishSeen(grew)
         if (Object.keys(_toRetry).length > 0) {
             if (!retry.running) {
                 _retryMs = _retryMs === 0 ? 1000 : Math.min(_retryMs * 2, 30000)
@@ -489,6 +508,7 @@ Rectangle {
         coalesce.stop()
         retry.stop()
         statusGate.stop()
+        _confirming = false
     }
 
     // --- Events. ---
@@ -540,14 +560,15 @@ Rectangle {
         return item.kind + "|" + item.id + "|" + item.at
     }
 
+    // Works out the card's lines; whether there is a new one.
     function updateAway() {
+        let grew = false
         if (!awayOn) {
             awayItems = []
         } else {
             const items = JSON.parse(ShellState.awayItems(_awayPages, JSON.stringify(_pending), lastSeen))
                               .filter(item => !_dismissed[lineKey(item)])
             const known = {}
-            let grew = false
             for (const item of items) {
                 known[lineKey(item)] = true
                 grew = grew || !_known[lineKey(item)]
@@ -562,6 +583,21 @@ Rectangle {
         }
         _awayLoaded = readState.jobs === "ok" && !_out.jobs && !_out.confirmations
                       && (!awayOn || readState.confirmations === "ok")
+        return grew
+    }
+
+    // The wait is over: one more jobs read, whose start is what the time may move to.
+    function confirmSeen() {
+        _confirming = true
+        due({jobs: true})
+        read()
+    }
+
+    // That read is in. `_unseen` stays as it is unless all is well, and the wait starts again.
+    function finishSeen(grew) {
+        _confirming = false
+        if (readState.jobs === "ok" && !grew && !awayCut && onScreen && connectedNow())
+            writeSeen(_seenUpTo)
     }
 
     function writeSeen(at) {
@@ -583,9 +619,9 @@ Rectangle {
             writeSeen(_seenUpTo)
             lastSeen = _seenUpTo
             awayCut = false
-        } else {
-            _unseen = true
         }
+        // The usual write follows, past the second of that read: a later start won't remember these.
+        _unseen = true
         updateAway()
     }
 
@@ -614,8 +650,16 @@ Rectangle {
         _wroteSeen = false
         _moveTime = false
         _awayLoaded = false
+        _confirming = false
         _known = {}
         _dismissed = {}
+    }
+
+    // The top bar's switcher has set the session's project again: the counts asked before that answered
+    // for whatever the hint says.
+    function contextSet() {
+        due({status: true})
+        requestRead()
     }
 
     onOnScreenChanged: {
@@ -726,7 +770,11 @@ Rectangle {
 
     Timer {
         id: retry
-        onTriggered: root.read()
+        onTriggered: {
+            root.due(root._toRetry)
+            root._toRetry = {}
+            root.read()
+        }
     }
 
     // The last read of the counts after job ends.
@@ -745,13 +793,13 @@ Rectangle {
         onTriggered: root.applyPendingJobs()
     }
 
-    // The time moves after this long really on screen.
+    // After this long really on screen, the read that moves the time.
     Timer {
         id: seenTimer
         interval: root.seenAfterMs
         running: root.onScreen && root.connected && root.hasWorkspace && root.stateDir !== "" && root._awayLoaded
                  && root._unseen && !root.awayCut
-        onTriggered: root.writeSeen(root._seenUpTo)
+        onTriggered: root.confirmSeen()
     }
 
     // A float hides Home for a moment; this long off screen is really away.

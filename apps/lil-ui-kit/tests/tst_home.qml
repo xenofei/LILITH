@@ -149,6 +149,15 @@ TestCase {
         return !!(panel._due.jobs || panel._due.confirmations || panel._due.cards || panel._due.status)
     }
 
+    // Keeps answering until the kept time isn't `from`: it is written once one more jobs read has
+    // landed.
+    function keptMoved(core, s, dir, ws, from, ms, what) {
+        tryVerify(() => {
+            answerAll(core, s)
+            return keptTime(dir, ws) !== from
+        }, ms, what || "the kept time moves")
+    }
+
     function isoAgo(ms) {
         return new Date(Date.now() - ms).toISOString().replace(/\.\d+Z$/, "Z")
     }
@@ -297,7 +306,7 @@ TestCase {
             answerAll(core, scene({jobs: jobs}))
             return panel.openJobs.count === 11 && panel._open === 0
         }, 5000)
-        compare(panel.openJobs.moreLabel.text, "and 3 more")
+        compare(panel.openJobs.moreLabel.text, "and 3 more. Jobs lists them.")
         compare(panel.openJobs.note, "")
     }
 
@@ -355,9 +364,9 @@ TestCase {
         compare(walk.problems(panel.awayCard), [])
         wait(Math.max(0, 2000 - (Date.now() - shownAt)))
         compare(keptTime(dir, "ws1"), seen, "not yet")
-        tryVerify(() => keptTime(dir, "ws1") !== seen, 2500, "written after 3 s")
+        keptMoved(core, awayScene(), dir, "ws1", seen, 2500, "written after 3 s")
         const at = Date.parse(keptTime(dir, "ws1"))
-        verify(at >= shownAt - 2000 && at <= shownAt + 500, "it is when the read that was shown began: " + keptTime(dir, "ws1"))
+        verify(at >= shownAt + 2500 && at <= Date.now(), "it is when one more read began, at the 3 s: " + keptTime(dir, "ws1"))
         verify(Date.now() - shownAt >= 2900, "and not before 3 s")
         // The lines stay: they don't vanish as you read them, nor on the next read.
         verify(panel.awayCard.visible)
@@ -378,7 +387,7 @@ TestCase {
         verify(!panel.awayCard.visible, "the first run shows no card")
         verify(callsOf(core, "jobs.list").every(c => c.args.since === undefined), "and reads no `since`")
         compare(callsOf(core, "app/confirmations.list"), [])
-        tryVerify(() => keptTime(dir, "ws1") !== null, 4000, "the time starts")
+        keptMoved(core, awayScene(), dir, "ws1", null, 4000, "the time starts")
     }
 
     function test_a_time_that_does_not_read_is_as_a_first_run() { // spec: P4a-R16
@@ -455,7 +464,7 @@ TestCase {
         const panel = makeHome(core, dir)
         const s = awayScene()
         settle(core, panel, s)
-        tryVerify(() => keptTime(dir, "ws1") !== seen, 4000)
+        keptMoved(core, s, dir, "ws1", seen, 4000)
         const first = keptTime(dir, "ws1")
         // A job fails while Home shows: it joins the card, and the time moves past it once it has shown.
         const fresh = Shapes.job("j_00000000000000c1", "failed", {updated: new Date().toISOString().replace(/\.\d+Z$/, "Z")})
@@ -465,7 +474,7 @@ TestCase {
             return panel.awayCard.lineRepeater.count === 5
         }, 5000, "it joins the card")
         compare(keptTime(dir, "ws1"), first, "not at once")
-        tryVerify(() => keptTime(dir, "ws1") !== first, 4000, "after it has shown for 3 s")
+        keptMoved(core, awayScene({jobs: s.jobs.concat([fresh])}), dir, "ws1", first, 4000, "after it has shown for 3 s")
     }
 
     function test_last_seen_waits_until_really_on_screen() { // spec: P4a-R16
@@ -518,7 +527,7 @@ TestCase {
         core.applyState({connection: "ready"})
         const from = Date.now()
         settle(core, panel, s)
-        tryVerify(() => keptTime(dir, "ws1") !== seen, 5000, "written")
+        keptMoved(core, s, dir, "ws1", seen, 5000, "written")
         verify(Date.now() - from >= 2900, "a whole wait: " + (Date.now() - from))
         shell.destroy()
     }
@@ -553,7 +562,7 @@ TestCase {
         const s = awayScene()
         const host = panel.Window.window
         settle(core, panel, s)
-        tryVerify(() => keptTime(dir, "ws1") !== seen, 4000)
+        keptMoved(core, s, dir, "ws1", seen, 4000)
         const kept = keptTime(dir, "ws1")
         // Off screen for a moment (a float, a quick look away): nothing moves.
         host.visibility = Window.Minimized
@@ -590,7 +599,7 @@ TestCase {
         settle(core, panel, awayScene())
         const since = core.calls.slice(before).filter(c => c.name === "jobs.list" && c.args.since !== undefined)
         verify(since.length > 0 && since.every(c => c.args.since === later), "never the other workspace's time")
-        tryVerify(() => keptTime(dir, "ws2") !== later, 4000)
+        keptMoved(core, awayScene(), dir, "ws2", later, 4000)
         compare(keptTime(dir, "ws1"), seen, "the other workspace's time stays")
         // A workspace seen for the first time has no card, whatever another's time.
         const third = {id: "ws3", path: "D:/art/third"}
@@ -885,7 +894,7 @@ TestCase {
             jobs.push(Shapes.job("j_00000000000" + String(10000 + i), "succeeded", {updated: "2026-10-30T13:00:05Z"}))
         settle(core, panel, scene({jobs: jobs}))
         compare(panel.awayCard.lineRepeater.count, 20)
-        compare(panel.awayCard.moreLabel.text, "and 5 more")
+        compare(panel.awayCard.moreLabel.text, "and 5 more. Jobs lists them.")
     }
 
     function test_a_since_read_stops_at_its_page_limit_and_says_so() { // spec: APP-111
@@ -900,7 +909,7 @@ TestCase {
         settle(core, panel, scene({jobs: jobs}))
         compare(callsOf(core, "jobs.list").filter(c => c.args.since !== undefined).length, panel.awayPages)
         verify(panel.awayCut)
-        compare(panel.awayCard.moreLabel.text, "and more")
+        compare(panel.awayCard.moreLabel.text, "and more. Jobs lists them.")
     }
 
     function test_outside_text_is_plain() { // spec: AI-222, P4a-R8
@@ -1082,11 +1091,11 @@ TestCase {
         compare(panel._awayLoaded, false, "cleared as the read starts")
         wait(3400)
         compare(keptTime(dir, "ws1"), seen)
-        // Once it lands, it is that read's start, not the time of the write.
+        // Once it lands, the wait, then one more read: the time is when that read began.
         const landing = Date.now()
         settle(core, panel, scene())
-        tryVerify(() => keptTime(dir, "ws1") !== seen, 4000)
-        verify(Date.parse(keptTime(dir, "ws1")) <= landing, keptTime(dir, "ws1"))
+        keptMoved(core, scene(), dir, "ws1", seen, 4000)
+        verify(Date.parse(keptTime(dir, "ws1")) >= landing + 2500, keptTime(dir, "ws1"))
     }
 
     function test_a_kept_time_never_has_a_fraction_of_exactly_000() { // spec: APP-111
@@ -1317,7 +1326,7 @@ TestCase {
         verify(callsOf(core, "jobs.list").every(c => c.args.since !== future))
         verify(panel.awayCard.visible, "a job from a minute ago is listed")
         compare(panel.awayCard.lineRepeater.count, 1, "a week back, no further")
-        tryVerify(() => keptTime(dir, "ws1") !== future, 4000, "the kept time comes back to now")
+        keptMoved(core, scene({jobs: [job, old]}), dir, "ws1", future, 4000, "the kept time comes back to now")
         verify(Date.parse(keptTime(dir, "ws1")) <= Date.now())
         compare(panel.awayCard.lineRepeater.count, 1, "and the line stays")
     }
@@ -1419,6 +1428,197 @@ TestCase {
         const view = panel.openJobs.view
         tryVerify(() => !!view.itemAtIndex(0), 5000)
         compare(view.itemAtIndex(0).text, "ComfyUI prompt · sketchbook · Outcome unknown")
+    }
+
+    // --- Fix round 2. ---
+
+    function test_a_job_watched_ending_does_not_come_back_after_you_leave() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const host = panel.Window.window
+        const empty = scene()
+        settle(core, panel, empty)
+        keptMoved(core, empty, dir, "ws1", seen, 4000)
+        const first = keptTime(dir, "ws1")
+        // A job ends while Home shows; its line shows for its 3 s.
+        const job = Shapes.job("j_00000000000000e1", "failed", {updated: isoAgo(0), project: "sketchbook"})
+        const s = scene({jobs: [job]})
+        core.emit("jobs", "event", {kind: "job", job: job})
+        tryVerify(() => {
+            answerAll(core, s)
+            return panel.awayCard.lineRepeater.count === 1
+        }, 3000, "it joins the card")
+        keptMoved(core, s, dir, "ws1", first, 5000)
+        // The core's `since` lists the second before a fractional time and on: past the job's.
+        const keptSecond = Math.floor(Date.parse(keptTime(dir, "ws1")) / 1000)
+        verify(keptSecond - 1 >= Date.parse(job.updated) / 1000, keptTime(dir, "ws1") + " against " + job.updated)
+        host.visibility = Window.Minimized
+        tryVerify(() => !panel.onScreen, 5000)
+        wait(3400)
+        host.visibility = Window.Windowed
+        tryVerify(() => panel.onScreen, 5000)
+        settle(core, panel, s)
+        compare(lineTexts(panel.awayCard), [], "it doesn't come back")
+        verify(!panel.awayCard.visible)
+    }
+
+    function test_the_time_waits_for_one_more_read() { // spec: APP-111, P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const s = scene()
+        settle(core, panel, s)
+        const before = callsOf(core, "jobs.list").length
+        tryVerify(() => callsOf(core, "jobs.list").length > before, 3500, "one more jobs read at the 3 s")
+        const startedAt = Date.now()
+        wait(800)
+        compare(keptTime(dir, "ws1"), seen, "nothing is written until it lands")
+        answerAll(core, s)
+        tryVerify(() => {
+            answerAll(core, s)
+            return keptTime(dir, "ws1") !== seen
+        }, 1000, "it lands, and the time is written at once")
+        const at = Date.parse(keptTime(dir, "ws1"))
+        verify(at >= startedAt - 100 && at <= startedAt + 100, "when that read began: " + keptTime(dir, "ws1"))
+    }
+
+    function test_one_more_read_with_a_new_line_waits_again() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        settle(core, panel, scene())
+        const before = callsOf(core, "jobs.list").length
+        tryVerify(() => callsOf(core, "jobs.list").length > before, 3500, "one more jobs read")
+        // It brings a line nobody has been shown.
+        const job = Shapes.job("j_00000000000000e1", "failed", {updated: isoAgo(0)})
+        const s = scene({jobs: [job]})
+        answerAll(core, s)
+        tryVerify(() => panel._open === 0 || panel.awayCard.lineRepeater.count === 1, 2000)
+        answerFor(core, s, 300)
+        compare(panel.awayCard.lineRepeater.count, 1)
+        compare(keptTime(dir, "ws1"), seen, "not written")
+        answerFor(core, s, 1800)
+        compare(keptTime(dir, "ws1"), seen, "the wait starts again")
+        keptMoved(core, s, dir, "ws1", seen, 3000, "then it is")
+    }
+
+    function test_one_more_read_that_fails_moves_nothing() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const s = scene()
+        settle(core, panel, s)
+        const before = callsOf(core, "jobs.list").length
+        tryVerify(() => callsOf(core, "jobs.list").length > before, 3500, "one more jobs read")
+        const bad = scene({fail: {"jobs.list": Shapes.refusal("store.io", "busy")}})
+        answerAll(core, bad)
+        compare(panel.readState.jobs, "failed")
+        compare(keptTime(dir, "ws1"), seen)
+        answerFor(core, bad, 500)
+        compare(keptTime(dir, "ws1"), seen, "while it fails")
+        keptMoved(core, s, dir, "ws1", seen, 6000, "and once it reads again, after the wait")
+    }
+
+    function test_one_more_read_landing_off_screen_moves_nothing() { // spec: P4a-R16
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const host = panel.Window.window
+        const s = scene()
+        settle(core, panel, s)
+        const before = callsOf(core, "jobs.list").length
+        tryVerify(() => callsOf(core, "jobs.list").length > before, 3500, "one more jobs read")
+        host.visibility = Window.Minimized
+        tryVerify(() => !panel.onScreen, 5000)
+        answerAll(core, s)
+        answerFor(core, s, 300)
+        compare(keptTime(dir, "ws1"), seen, "nobody was there")
+        host.visibility = Window.Windowed
+        tryVerify(() => panel.onScreen, 5000)
+        keptMoved(core, s, dir, "ws1", seen, 5000, "back, after the wait")
+    }
+
+    function test_dismiss_also_ends_past_the_second_of_the_read() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const job = Shapes.job("j_00000000000000e1", "failed", {updated: isoAgo(0)})
+        const s = scene({jobs: [job]})
+        settle(core, panel, s)
+        panel.dismissAway()
+        const dismissed = keptTime(dir, "ws1")
+        verify(dismissed !== seen, "it moves at once")
+        // A later start has forgotten what was dismissed: the time goes past the job's second too.
+        keptMoved(core, s, dir, "ws1", dismissed, 5000, "and on, after the wait")
+        const keptSecond = Math.floor(Date.parse(keptTime(dir, "ws1")) / 1000)
+        verify(keptSecond - 1 >= Date.parse(job.updated) / 1000, keptTime(dir, "ws1") + " against " + job.updated)
+    }
+
+    function test_counts_are_read_again_once_the_switcher_has_set_the_project() { // spec: APP-111, ARCH-088
+        const core = makeCore()
+        const shell = makeShell(core)
+        const panel = shell.docks.home.content
+        const sketch = Shapes.projectStatus("sketchbook", {candidate: 1})
+        settle(core, panel, scene({status: sketch}))
+        compare(panel.statusCounts.title, "Assets in sketchbook")
+        core.applyState({connection: "reconnecting"})
+        core.applyState({connection: "ready", workspace: wsOne})
+        // The new session: Home's read is answered first, by the hint another client has moved.
+        settle(core, panel, scene({status: Shapes.projectStatus("lantern", {stale: 3})}))
+        compare(panel.statusCounts.title, "Assets in lantern")
+        const before = callsOf(core, "project.status").length
+        const set = core.calls.filter(c => c.name === "app/set_context" && c.args.project === "sketchbook" && !answered[c.id]).pop()
+        verify(set, "the switcher sends its project again")
+        answered[set.id] = true
+        verify(core.respond(set.id, Shapes.context("ws1", "sketchbook", "sketchbook")))
+        tryVerify(() => callsOf(core, "project.status").length === before + 1, 3000, "the counts are read again")
+        compare(callsOf(core, "project.status")[before].args, {}, "never naming it")
+        settle(core, panel, scene({status: sketch}))
+        compare(panel.statusCounts.title, "Assets in sketchbook")
+        shell.destroy()
+    }
+
+    function test_a_failing_status_read_stays_on_the_backoff() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core, stateWith("ws1", seen))
+        const bad = scene({fail: {"project.status": Shapes.refusal("store.io", "The walk failed.")}})
+        settle(core, panel, bad)
+        verify(panel.statusCounts.note.indexOf("Trying again") >= 0, panel.statusCounts.note)
+        const count = () => callsOf(core, "project.status").length
+        const n = count()
+        // Reads of anything else go on, and don't walk the folder again.
+        const others = callsOf(core, "app/confirmations.list").length
+        for (let i = 0; i < 3; ++i) {
+            core.emit("confirmations", "event", Shapes.confirmationEvent("pending", Shapes.confirmation("cf_00000000000000b1", "comfy.run", "2026-10-30T13:00:01Z")))
+            answerFor(core, bad, 200)
+        }
+        verify(callsOf(core, "app/confirmations.list").length > others, "the confirmations are read")
+        compare(count(), n, "the counts wait for their backoff")
+        tryVerify(() => {
+            answerAll(core, bad)
+            return count() === n + 1
+        }, 2000, "and then are asked again")
+        // The next wait is longer.
+        const again = Date.now()
+        tryVerify(() => {
+            answerAll(core, bad)
+            return count() === n + 2
+        }, 4000, "after a longer wait")
+        verify(Date.now() - again >= 1500, String(Date.now() - again))
+    }
+
+    function test_lines_that_hide_rows_say_where_they_are() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const jobs = []
+        for (let i = 0; i < 25; ++i)
+            jobs.push(Shapes.job("j_00000000000" + String(10000 + i), "succeeded", {updated: "2026-10-30T13:00:05Z"}))
+        // An older confirmation sorts below them, so it is one of the rows hidden.
+        const pending = [Shapes.confirmation("cf_00000000000000b1", "comfy.run", "2026-10-30T12:30:00Z")]
+        settle(core, panel, scene({jobs: jobs, pending: pending}))
+        compare(panel.awayCard.moreLabel.text, "and 6 more. Jobs and Confirmations list them.")
     }
 
     function test_a11y_walk_passes() { // spec: APP-156

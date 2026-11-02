@@ -95,6 +95,16 @@ Window {
 
     onGpuPauseToggleRequested: topBar.togglePause()
 
+    // Home reads the counts of the session's project, which a new connection has only once the switcher
+    // has set it again.
+    Connections {
+        target: topBar.projectSwitcher
+        function onContextSet() {
+            if (root.docks.home && root.docks.home.content)
+                root.docks.home.content.contextSet()
+        }
+    }
+
     // --- Open requests (Task 19) ---
     // The shim the window is activated through: LilShim, or a test's fake.
     property var shim: LilShim

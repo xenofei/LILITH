@@ -52,6 +52,9 @@ Item {
 
     // As the workspace switcher's.
     signal workspaceRefused(string message)
+    // A new connection's project has been set again, and calls made from now on use it: a call
+    // naming no project made before this answered for whatever the hint says.
+    signal contextSet()
 
     implicitWidth: Math.min(button.implicitWidth, 200)
     implicitHeight: button.implicitHeight
@@ -187,6 +190,7 @@ Item {
                     return
                 root.core.noteProject(r.project || "")
                 root.effectiveProject = r.effective_project || ""
+                root.contextSet()
             },
             error: e => {
                 if (!same())

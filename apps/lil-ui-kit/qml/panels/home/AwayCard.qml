@@ -24,12 +24,15 @@ LCard {
             return panel.noteFor("jobs", "the jobs")
         return panel.isStale("confirmations") ? panel.noteFor("confirmations", "the confirmations") : ""
     }
+    // Where the rows it doesn't show are.
+    readonly property string whereHidden: panel.awayItems.slice(maxLines).some(item => item.kind === "confirmation")
+                                          ? "Jobs and Confirmations list them." : "Jobs lists them."
     readonly property string moreText: {
         if (moreLines <= 0 && !panel.awayCut)
             return ""
         if (moreLines > 0)
-            return "and " + MoneyText.count(String(moreLines)) + (panel.awayCut ? " or more" : " more")
-        return lines.length > 0 ? "and more"
+            return "and " + MoneyText.count(String(moreLines)) + (panel.awayCut ? " or more. " : " more. ") + whereHidden
+        return lines.length > 0 ? "and more. " + whereHidden
                                 : "More jobs changed while you were away than this card reads. Jobs lists them."
     }
     readonly property alias dismissButton: dismissButton

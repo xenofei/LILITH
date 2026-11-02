@@ -1072,6 +1072,44 @@ fn home_s_reads_leave_the_hint_alone() {
     });
 }
 
+/// A session's project is set when `app/set_context` has answered: `project.status {}` asked after
+/// that answers for it, and Home reads the counts again then (the switcher's `contextSet`).
+#[test] // spec: APP-111, ARCH-088
+fn counts_read_after_set_context_answer_for_its_project() {
+    launch(
+        "counts_read_after_set_context_answer_for_its_project",
+        || {
+            let mut served = PathBuf::new();
+            let mut rig = Rig::start(|env| {
+                served = env.make_workspace("home");
+                env.register_workspace(&served, true);
+            });
+            let ws = QString::from(rig.env.workspace_id(&served).as_str());
+            let id = rig
+                .probe
+                .on_gui(move |core| core.set_workspace(&ws).to_string());
+            rig.probe.finished(&id);
+            for project in ["lantern", "harbor"] {
+                let id = rig.probe.call(
+                    "project.create",
+                    json!({"project": project, "name": project}),
+                );
+                rig.probe.finished(&id);
+            }
+            for i in 0..20 {
+                let want = if i % 2 == 0 { "lantern" } else { "harbor" };
+                let id = rig
+                    .probe
+                    .app_call("app/set_context", json!({"project": want}));
+                rig.probe.finished(&id);
+                let id = rig.probe.call("project.status", json!({}));
+                let status = rig.probe.finished(&id);
+                assert_eq!(status["structured"]["project"], want, "{status}");
+            }
+        },
+    );
+}
+
 /// Home's reads against a real core (APP-111): each answers in the shape the panel reads, a time
 /// with a fraction is taken as `since`, and the finished job it lists comes out of `away_items`.
 #[test] // spec: APP-111

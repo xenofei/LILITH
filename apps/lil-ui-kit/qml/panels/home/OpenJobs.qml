@@ -95,12 +95,14 @@ LCard {
             text: {
                 const capped = root.panel.jobsCapped
                 if (root.count > root.maxRows)
-                    return "and " + MoneyText.count(String(root.count - root.maxRows)) + (capped >= 0 ? " or more" : " more")
-                return capped >= 0 ? "and more" : ""
+                    return "and " + MoneyText.count(String(root.count - root.maxRows)) + (capped >= 0 ? " or more. " : " more. ")
+                           + "Jobs lists them."
+                return capped >= 0 ? "and more. Jobs lists them." : ""
             }
             textFormat: Text.PlainText
             color: Theme.textMuted
             font.pixelSize: Theme.fontSize
+            wrapMode: Text.Wrap
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
