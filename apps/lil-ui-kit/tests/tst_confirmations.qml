@@ -1154,6 +1154,33 @@ TestCase {
         tryVerify(() => !panel.dialogPopup.visible, 2000)
     }
 
+    // Two links before the layout has settled: a target that asks for the focus (Home's, once laid
+    // out) and a confirmation (held until then). The confirmation's dialog ends with the focus.
+    function test_a_held_confirm_link_keeps_the_focus_over_home_at_settle() { // spec: P4a-R10, P4a-R21
+        wait(100)
+        const shell = createTemporaryObject(shellComponent, tc)
+        verify(shell)
+        verify(!shell.layoutSettled)
+        shell.handleLaunchJson(JSON.stringify({kind: "target", target: "C:\art\crane.png", intent: "open",
+                                               focus: true, activate: true}))
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: true, activate: true}))
+        shell.visible = true
+        shell.requestActivate()
+        const panel = shell.docks.confirmations.content
+        panel.pointerSource = hand
+        Shapes.answerLists(fake, [crane], [])
+        tryVerify(() => shell.layoutSettled, 5000, "the layout settles")
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the held link opens the dialog")
+        tryVerify(() => shell.active, 2000)
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the focus")
+        wait(200)
+        verify(panel.dialog.denyButton.activeFocus, "and keeps it")
+        verify(!shell.docks.home.panelHasFocus, "Home didn't take it")
+        verify(shell.openedCard.visible, "the target is on Home's card all the same")
+        closeDialog(panel)
+        shell.destroy()
+    }
+
     function test_app_wide_shortcuts_stay_quiet_under_the_dialog() { // spec: P4a-R10, APP-011
         wait(100)
         const shell = createTemporaryObject(shellComponent, tc)
