@@ -15,6 +15,12 @@
 //! - `clamp(windowJson, savedScreen, screensJson, marginsJson)`: `clamp_client` over JSON (the
 //!   window's client area and its frame margins).
 //! - `shortcuts()`: the plan 4a map as `[{"keys", "action", "scope"}]`.
+//! - `lastSeen(dir, workspace)`: when Home was last seen in that workspace (RFC 3339), empty when
+//!   never or when what is kept doesn't read; `setLastSeen(dir, workspace, at)`: writes it through
+//!   `AppState`; empty, or why it couldn't (P4a-R16).
+//! - `awayItems(pagesJson, pendingJson, lastSeen)`: [`crate::away::away_items_json`] as JSON;
+//!   `nextCursor(resultJson)`: a `jobs.list` result's `next_cursor`, empty on the last page, so
+//!   QML needn't parse the page.
 
 use core::pin::Pin;
 use std::path::{Path, PathBuf};
@@ -22,6 +28,9 @@ use std::path::{Path, PathBuf};
 use cxx_qt_lib::QString;
 use serde_json::json;
 
+use crate::app_state::AppState;
+use crate::away::away_items_json;
+use crate::format::parse_utc_ms;
 use crate::layout_file::{LayoutError, LayoutFile, Margins, Rect, Screen, clamp_client, set_aside};
 use crate::shortcuts::ShortcutMap;
 
@@ -60,6 +69,28 @@ pub mod qobject {
 
         #[qinvokable]
         fn shortcuts(self: &ShellState) -> QString;
+
+        #[qinvokable]
+        fn last_seen(self: Pin<&mut ShellState>, dir: &QString, workspace: &QString) -> QString;
+
+        #[qinvokable]
+        fn set_last_seen(
+            self: Pin<&mut ShellState>,
+            dir: &QString,
+            workspace: &QString,
+            at: &QString,
+        ) -> QString;
+
+        #[qinvokable]
+        fn next_cursor(self: &ShellState, result_json: &QString) -> QString;
+
+        #[qinvokable]
+        fn away_items(
+            self: &ShellState,
+            pages_json: &QString,
+            pending_json: &QString,
+            last_seen: &QString,
+        ) -> QString;
     }
 
     #[namespace = "lil_qt"]
@@ -171,6 +202,58 @@ impl qobject::ShellState {
 
     fn shortcuts(&self) -> QString {
         qs(json!(ShortcutMap::plan_4a().bindings()))
+    }
+
+    fn last_seen(self: Pin<&mut Self>, dir: &QString, workspace: &QString) -> QString {
+        let dir = dir.to_string();
+        if dir.is_empty() {
+            return QString::default();
+        }
+        AppState::load_in(Path::new(&dir))
+            .last_seen(&workspace.to_string())
+            .filter(|at| parse_utc_ms(at).is_some())
+            .map_or_else(QString::default, |at| QString::from(&at))
+    }
+
+    fn set_last_seen(
+        self: Pin<&mut Self>,
+        dir: &QString,
+        workspace: &QString,
+        at: &QString,
+    ) -> QString {
+        let dir = dir.to_string();
+        if dir.is_empty() {
+            return QString::from("no state folder");
+        }
+        let mut state = AppState::load_in(Path::new(&dir));
+        match state.set_last_seen(&workspace.to_string(), &at.to_string()) {
+            Ok(()) => QString::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "when Home was last seen wasn't saved");
+                QString::from(&e.to_string())
+            }
+        }
+    }
+
+    fn next_cursor(&self, result_json: &QString) -> QString {
+        let result: serde_json::Value =
+            serde_json::from_str(&result_json.to_string()).unwrap_or_default();
+        result["structured"]["next_cursor"]
+            .as_str()
+            .map_or_else(QString::default, QString::from)
+    }
+
+    fn away_items(
+        &self,
+        pages_json: &QString,
+        pending_json: &QString,
+        last_seen: &QString,
+    ) -> QString {
+        qs(away_items_json(
+            &pages_json.to_string(),
+            &pending_json.to_string(),
+            &last_seen.to_string(),
+        ))
     }
 }
 

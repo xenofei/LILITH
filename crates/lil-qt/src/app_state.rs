@@ -42,6 +42,11 @@ impl AppState {
         AppState::load_from(&env.app_state_dir(app).join("state.json"))
     }
 
+    /// The state in the app's state folder `dir` (what QML is handed, `ShellState`'s `dir`).
+    pub fn load_in(dir: &Path) -> AppState {
+        AppState::load_from(&dir.join("state.json"))
+    }
+
     fn load_from(path: &Path) -> AppState {
         let workspaces = match std::fs::read_to_string(path) {
             Ok(text) => match serde_json::from_str::<StateFile>(&text) {
