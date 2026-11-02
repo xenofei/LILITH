@@ -232,3 +232,14 @@ set_tests_properties(grab_settings PROPERTIES
 lil_qml_test(tst_layout_full tst_layout_full.qml)
 set_property(TEST tst_layout_full APPEND PROPERTY
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+# Task 29: the whole shell under the fake feed (label bench), against test-params.toml's budgets
+# (LIL_BUDGET_ENV, apps/lil-ui-kit/CMakeLists.txt): the GUI thread's stalls and an event's way to
+# the screen. Offscreen on the 1280 x 800 screen; the QML files are in ../bench.
+foreach(bench bench_gui_stalls bench_event_to_ui)
+    add_test(NAME ${bench} COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/../bench/${bench}.qml)
+    set_tests_properties(${bench} PROPERTIES
+        LABELS bench
+        TIMEOUT 300
+        ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json;${LIL_BUDGET_ENV}"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+endforeach()
