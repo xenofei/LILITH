@@ -18,7 +18,8 @@
 
   -First times the first start alone, with no untimed start before it: Task 29 Step 4's first start
   of a fresh copy of the deploy folder after a Defender scan of it (APP-136, spike 10's S0.5 (c)). The
-  test channel is new each run, so Qt's caches for it start empty.
+  channel's root is new each run, and its Qt cache folder (%LOCALAPPDATA%\LILITH-test-coldstart) is
+  removed before the first start (the run refuses if it can't be), so Qt's caches start empty.
 
   The budget is -BudgetMs, else LIL_BUDGET_COLD_START_MS (test-params.toml's [budgets]
   cold_start_ms, which CMake passes), else it fails.
@@ -54,6 +55,17 @@ if ($First) { $Starts = 1 }
 $channel = 'test-coldstart'
 $root = Join-Path ([IO.Path]::GetTempPath()) ("lil-coldstart-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 foreach ($s in 'roaming', 'local', 'profile') { New-Item -ItemType Directory -Force (Join-Path $root $s) | Out-Null }
+# This channel's Qt cache folder (the organisation name is the channel's) from an earlier run that
+# didn't finish: gone before the first start, or the run refuses, since its caches would be warm.
+$cacheBefore = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cacheBefore); ++$i) {
+    try { Remove-Item -Recurse -Force -LiteralPath $cacheBefore } catch { Start-Sleep -Milliseconds 500 }
+}
+if (Test-Path -LiteralPath $cacheBefore) {
+    Remove-Item -Recurse -Force -LiteralPath $root -ErrorAction SilentlyContinue
+    Write-Host "bench_cold_start: $cacheBefore, an earlier run's Qt cache, can't be removed; nothing ran"
+    exit 1
+}
 
 # The stripped environment (check-deploy.ps1's).
 $stripRe = '\\Qt\\|Microsoft Visual Studio|Windows Kits|\\MSVC\\|\\Qt6?$'
@@ -117,10 +129,12 @@ $popup = $null
 $state = $null
 if (-not $NoHandsOff -and $env:GITHUB_ACTIONS -ne 'true') {
     $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-cold-start-{0}.state" -f $PID)
+    # How many starts: one with -First, else the untimed one and the timed ones.
+    $n = if ($First) { 1 } else { $Starts + 1 }
     $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
     foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
-                   '-What', "starts the app $($Starts + 1) times (a window opens each time)", '-WarnSec', '10',
-                   '-RunSec', ([string](($Starts + 1) * 4)), '-CapSec', ([string](($Starts + 1) * ($TimeoutSec + 60))),
+                   '-What', "starts the app $n times (a window opens each time)", '-WarnSec', '10',
+                   '-RunSec', ([string]($n * 4)), '-CapSec', ([string]($n * ($TimeoutSec + 60))),
                    '-StateFile', $state, '-ParentPid', ([string]$PID)) {
         $psi.ArgumentList.Add($a)
     }
