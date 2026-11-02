@@ -1216,6 +1216,51 @@ TestCase {
         shell.destroy()
     }
 
+    // A no-focus confirm link to a floated panel that is already open: its dialog takes the keyboard,
+    // so its window is made active (P4a-R10).
+    function test_a_no_focus_confirm_link_activates_an_open_floated_panel() { // spec: P4a-R10
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        const panel = dock.content
+        dock.isFloating = true
+        tryVerify(() => dock.isFloating && panel.Window.window && panel.Window.window !== shell && panel.visible, 5000,
+                  "the panel floats, open")
+        const float = panel.Window.window
+        shell.requestActivate()
+        tryVerify(() => shell.active, 2000)
+        shell.docks.hardware.focusPanel()
+        tryVerify(() => shell.docks.hardware.panelHasFocus, 2000, "the keyboard is in Hardware")
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: crane.id, focus: false, activate: false}))
+        tryVerify(() => panel.dialogPopup.opened, 3000, "the dialog opens")
+        // Qt calls the float active with the main window (a window's transient family), so the proof
+        // is the keyboard: Deny has it only once the float is the focus window.
+        tryVerify(() => panel.dialog.denyButton.activeFocus, 2000, "Deny has the keyboard")
+        verify(float.activeFocusItem === panel.dialog.denyButton, "in the float")
+        closeDialog(panel)
+        dock.isFloating = false
+        tryVerify(() => panel.Window.window === shell, 5000)
+        shell.destroy()
+    }
+
+    // A no-focus link that opens no dialog (an id the core doesn't know) leaves a closed panel closed
+    // and the keyboard where it was (APP-065).
+    function test_a_no_focus_link_to_an_unknown_id_leaves_the_panel_closed() { // spec: APP-065
+        const shell = settledShell()
+        const dock = shell.docks.confirmations
+        dock.forceClose()
+        tryVerify(() => !dock.isOpen, 2000)
+        shell.docks.jobs.setAsCurrentTab()
+        shell.docks.jobs.focusPanel()
+        tryVerify(() => shell.docks.jobs.panelHasFocus, 2000, "the keyboard is in Jobs")
+        const holder = shell.activeFocusItem
+        shell.handleLaunchJson(JSON.stringify({kind: "confirm", id: "cf_00000000000000ff", focus: false, activate: false}))
+        wait(300)
+        verify(!dock.isOpen, "Confirmations stays closed")
+        verify(shell.docks.jobs.panelHasFocus && shell.activeFocusItem === holder, "Jobs keeps the keyboard")
+        compare(OpenPrompts.count, 0)
+        shell.destroy()
+    }
+
     // Opening the panel while its dialog is open leaves the keyboard on the dialog.
     function test_showing_the_panel_under_its_dialog_keeps_deny_focused() { // spec: P4a-R10
         const shell = settledShell()

@@ -633,13 +633,30 @@ Window {
         } else if (launch.kind === "confirm") {
             shownConfirmation = launch.id
             // Its dialog takes the keyboard whatever the link asked (P4a-R10), and opens only in an open
-            // panel: so the panel opens even with no focus.
-            if (!focus && docks.confirmations && !docks.confirmations.isOpen)
-                docks.confirmations.open()
+            // panel: so with no focus a closed panel opens when a dialog may follow, and a floated
+            // panel's window is made active once it shows one. A link no dialog follows (an id the core
+            // doesn't know, or one already answered) leaves a closed panel closed (APP-065).
+            const dock = docks.confirmations
+            if (!focus && dock && !dock.isOpen && confirmDialogMayOpen(launch.id))
+                dock.open()
             openPanelOn("confirmations", "showConfirmation", launch.id, focus)
+            const panel = dock ? dock.content : null
+            const win = panel ? panel.Window.window : null
+            if (!focus && win && win !== root && panel.dialogPopup && panel.dialogPopup.visible)
+                win.requestActivate()
         } else if (launch.kind === "confirm_list") {
             openPanelOn("confirmations", "", "", focus)
         }
+    }
+
+    // Whether the Confirmations panel would open its dialog on `id`: yes while its list isn't in
+    // (the dialog may follow), else only for a pending confirmation it lists.
+    function confirmDialogMayOpen(id) {
+        const panel = docks.confirmations ? docks.confirmations.content : null
+        if (!panel || !panel.list || !panel.list.loaded)
+            return true
+        const view = panel.list.view(id)
+        return !!view && view.state === "pending"
     }
 
     // An `open_requests:image` event: {target, intent, focus} (APP-063, APP-065).
