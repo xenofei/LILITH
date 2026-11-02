@@ -197,12 +197,12 @@ function Wait-Count([scriptblock]$count, [int]$want, [int]$sec) {
 # app's swap (ReplaceFileW, which opens the file for deletion) can go on while this reads. Get-Content
 # shares no deletion, and so can stop that swap or be stopped by it. A sharing violation, the swap
 # meeting this read, is tried again for up to 2 s.
+$readShare = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
 function Read-Shared([string]$path) {
     $end = (Get-Date).AddSeconds(2)
     while ($true) {
         try {
-            $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-            $stream = [IO.FileStream]::new($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+            $stream = [IO.FileStream]::new($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $readShare)
             try { return ([IO.StreamReader]::new($stream)).ReadToEnd() } finally { $stream.Dispose() }
         } catch [System.IO.FileNotFoundException] {
             return $null
@@ -306,11 +306,22 @@ if ($DryRun) {
         # and back, as the app's swap (ReplaceFileW) needs. Get-Content's open, which shares no deletion,
         # makes the rename fail: that half shows the check can tell them apart.
         $moved = "$stateFile.renamed"
-        $renames = { param($stream) try { [IO.File]::Move($stateFile, $moved); [IO.File]::Move($moved, $stateFile); $true } catch { $false } finally { $stream.Dispose() } }
-        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-        $asRead = & $renames ([IO.FileStream]::new($stateFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share))
-        $asGetContent = & $renames ([IO.FileStream]::new($stateFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite))
-        if (Test-Path -LiteralPath $moved) { [IO.File]::Move($moved, $stateFile) }
+        # Opened inside, so the restore in `finally` runs whatever fails; the file is back before the next.
+        $renames = {
+            param([IO.FileShare]$share)
+            $stream = $null
+            try {
+                $stream = [IO.FileStream]::new($stateFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+                [IO.File]::Move($stateFile, $moved)
+                [IO.File]::Move($moved, $stateFile)
+                $true
+            } catch { $false } finally {
+                if ($stream) { $stream.Dispose() }
+                if ((Test-Path -LiteralPath $moved) -and -not (Test-Path -LiteralPath $stateFile)) { [IO.File]::Move($moved, $stateFile) }
+            }
+        }
+        $asRead = & $renames $readShare
+        $asGetContent = & $renames ([IO.FileShare]::ReadWrite)
         Check ($asRead -and -not $asGetContent) "dry run: the file renames away and back while held as Read-Shared holds it, and not as Get-Content does ($asRead, $asGetContent)"
         Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads back after the renames'
         Check (Test-Path -LiteralPath $image) "dry run: $image is deployed"
