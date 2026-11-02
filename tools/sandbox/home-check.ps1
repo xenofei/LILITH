@@ -136,6 +136,22 @@ function Get-WorkspaceId {
     $rows = (Invoke-Lil @('call', 'workspaces.list', '{}') | ConvertFrom-Json).structured.workspaces
     return ($rows | Where-Object { $_.default } | Select-Object -First 1).id
 }
+# Refuses a channel already taken, before anything can stop or change what runs on it: a core that
+# answers on it, or a lil-image from this deploy. It then leaves the channel, so that the cleanup does
+# nothing.
+function Assert-ChannelFree {
+    $taken = ''
+    $o = & $lil --no-start status 2>&1
+    if ($LASTEXITCODE -eq 0 -and [regex]::IsMatch(($o -join "`n"), 'pid \d+, channel ')) { $taken = 'a core already runs on it' }
+    $apps = @(Get-Process -Name 'lil-image' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Deploy, [StringComparison]::OrdinalIgnoreCase) })
+    if ($apps.Count -gt 0) { $taken = "a lil-image from this deploy runs (pid $($apps[0].Id))" }
+    if ($taken) {
+        Set-Location -LiteralPath $Repo
+        Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force -LiteralPath $root -ErrorAction SilentlyContinue
+        throw "refused: the test channel is taken: $taken"
+    }
+}
 # A job that finishes, from another session: its id once it has.
 function Invoke-FinishedJob {
     $id = (Invoke-Lil @('call', 'test.job', '{"lane":"cpu"}') | ConvertFrom-Json).structured.job.job_id
@@ -202,8 +218,10 @@ function Self-Test {
 
 if ($DryRun) {
     Self-Test
-    Enter-TestChannel
     try {
+        Enter-TestChannel
+        Assert-ChannelFree
+        Pass 'dry run: the test channel isn''t taken'
         $ws = Join-Path $root 'places\harbor'
         [void](Invoke-Lil @('workspace', 'init', $ws, '--default'))
         $id = Get-CorePid
@@ -387,8 +405,12 @@ function Wait-KeptMoved([string]$from, [datetime]$since, [string]$what) {
 
 $script:app = $null
 $script:main = $null
+# The second launches: stopped in the cleanup if they never ended.
+$second = $null
+$refused = $null
 try {
     Enter-TestChannel
+    Assert-ChannelFree
     $harbor = Join-Path $root 'places\harbor'
     [void](Invoke-Lil @('workspace', 'init', $harbor, '--default'))
     [void](Get-CorePid)
@@ -475,6 +497,9 @@ try {
         $shown = Get-Date
         $n = 0
         try { [void](Wait-For { $n = Count-FinishedLines; if ($n -eq 1) { $true } } 15 'one line') } catch { }
+        # One line: Home was behind the tab long enough for the card to count from the kept time, and
+        # that is past the second of the jobs it listed before, since it was written from a read made
+        # 3 s after they showed.
         Check ($n -eq 1) "(d) Home's tab chosen: the card lists that job, counting from the kept time ($n lines)"
         $took = Wait-KeptMoved $kept $shown 'the kept time to move'
         Check ($took -ge 2.5) "(d) the time moved 3 s or more after Home showed ($took s)"
@@ -505,6 +530,12 @@ try {
         Write-Host "diagnostics in $DiagDir"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
+    foreach ($p in $second, $refused) {
+        if ($p -and -not $p.HasExited) {
+            Write-Host "stopping a second launch that never ended, pid $($p.Id)"
+            try { Stop-Process -Id $p.Id -Force } catch { Fail "cleanup: stopping a second launch: $_" }
+        }
+    }
     try { Close-App } catch { Fail "cleanup: closing lil-image: $_" }
     try { Exit-TestChannel } catch { Fail "cleanup: $_" }
     try { Set-Content -LiteralPath $state -Value 'done' } catch { Write-Host "note: the pop-up wasn't told: $_" }
