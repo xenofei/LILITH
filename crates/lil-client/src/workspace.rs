@@ -180,7 +180,7 @@ pub fn registered_default(env: &Env) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// What a workspace named by `--workspace` that the core can't use is told (Appendix G): which
+/// What a workspace named by `--workspace` that the core can't use is told (Appendix E): which
 /// workspace the core serves, `default`, and to run the command without the flag; never to make
 /// it the default.
 pub fn serves_only_default(default: Option<&Path>) -> String {
@@ -358,7 +358,7 @@ mod tests {
 
     /// An app opens `suite.toml`'s default, never a workspace file above its data folder: one in
     /// the user folder (or at the drive's root) would otherwise be opened at every start.
-    #[test] // spec: ARCH-030
+    #[test] // spec: APP-015, ARCH-030
     fn the_apps_default_ignores_a_workspace_above_the_data_folder() {
         let env = TestEnv::new();
         let default = env.make_workspace("default");
