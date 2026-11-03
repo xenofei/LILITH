@@ -1,8 +1,11 @@
 // The core connection's banner (APP-034, APP-036, ARCH-100), from `Core.connection`:
 //
 // - `reconnecting`: "Reconnecting…", with AI and workspace actions off meanwhile.
-// - `incompatible`: "restart the core when it's idle", and how. Text only: the session goes on trying
-//   by itself, and an older app never drains a newer core (ARCH-023).
+// - `incompatible`: by direction, as the core's protocol major is above this app's or not. A newer core
+//   can't be drained by this app's own `lil` (an older client never drains, ARCH-023), so the way is to
+//   restart LILITH on its newer build. An older core is one this app failed to replace itself, and
+//   "restart the core when it's idle" (APP-036) with `lil core stop` is right, and the app reconnects
+//   by itself. Text only: the session goes on trying by itself.
 // - `unavailable`: the real cause, from `Core.unavailable`. "Try again" (`Core.retryNow`: after a
 //   failed start the session only looks for a core someone else started until then) shows where it
 //   can help. A hello refused over its workspace would only be refused again, so that offers "Use the
@@ -22,6 +25,9 @@ LBanner {
     // Why the core refuses this session while connected, shown text; empty when it doesn't.
     property string movedReason
 
+    // The protocol major this app speaks (lil_protocol::session::PROTOCOL).
+    readonly property int appMajor: 1
+    readonly property bool coreIsNewer: core ? parseInt(String(core.coreProtocol)) > appMajor : false
     readonly property string connection: core ? core.connection : ""
     readonly property var cause: core && connection === "unavailable" ? core.unavailable : null
     readonly property bool refusedWorkspace: CoreGate.refusedWorkspace(core)
@@ -39,6 +45,9 @@ LBanner {
         case "reconnecting":
             return "Reconnecting… AI and workspace actions are off until the core is back."
         case "incompatible":
+            if (coreIsNewer)
+                return "This app is older than the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
+                       + "). Restart LILITH to use it."
             return "This app can't use the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
                    + "). Restart the core when it's idle: run lil core stop, and the app reconnects by itself."
         case "unavailable":
@@ -60,6 +69,8 @@ LBanner {
             announce()
     }
     onConnectionChanged: _useError = ""
+    // A failed try belongs to the refusal it was made for.
+    onMovedReasonChanged: _useError = ""
 
     function useDefault() {
         _useError = ""

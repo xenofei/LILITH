@@ -142,19 +142,36 @@ TestCase {
     }
 
     function test_incompatible_says_restart_the_core_when_it_is_idle() { // spec: APP-036, ARCH-023
+        // The core is older than this app (the app drains and replaces an older core itself, so this
+        // is a start that failed): `lil core stop` is the way, and the app reconnects by itself.
         const t = load()
         const banner = t.shell.connectionBanner
-        t.core.applyState({connection: "incompatible", coreProtocol: "2.0"})
+        t.core.applyState({connection: "incompatible", coreProtocol: "0.9"})
         verify(banner.visible)
         verify(banner.text.indexOf("Restart the core when it's idle") >= 0, banner.text)
         verify(banner.text.indexOf("lil core stop") >= 0, "it says how: " + banner.text)
         verify(banner.text.indexOf("reconnects by itself") >= 0, banner.text)
-        verify(banner.text.indexOf("protocol 2.0") >= 0, banner.text)
+        verify(banner.text.indexOf("protocol 0.9") >= 0, banner.text)
         compare(banner.kind, "danger")
         verify(!banner.retryButton.visible, "the session goes on trying by itself")
         for (const a of actionsOf(t.shell.contentItem))
             verify(!a.enabled, "disabled: " + a.text)
         compare(t.shell.topBar.connectionIndicator.text, "Core incompatible")
+        compare(walk.report(banner), [])
+    }
+
+    function test_incompatible_with_a_newer_core_says_to_restart_the_app() { // spec: APP-036, ARCH-023
+        // The core is newer: this app's own `lil` can't drain it (an older client never does), so
+        // `lil core stop` would not help. What helps is restarting LILITH on its newer build (PROTO-4).
+        const t = load()
+        const banner = t.shell.connectionBanner
+        t.core.applyState({connection: "incompatible", coreProtocol: "2.0"})
+        verify(banner.visible)
+        verify(banner.text.indexOf("This app is older than the running core") >= 0, banner.text)
+        verify(banner.text.indexOf("protocol 2.0") >= 0, banner.text)
+        verify(banner.text.indexOf("restart LILITH") >= 0 || banner.text.indexOf("Restart LILITH") >= 0, banner.text)
+        verify(banner.text.indexOf("lil core stop") < 0, "that can't help here: " + banner.text)
+        compare(banner.kind, "danger")
         compare(walk.report(banner), [])
     }
 
@@ -276,6 +293,88 @@ TestCase {
         t.core.respond(hello[0].id, Shapes.refusal("core.unreachable", "No core answered."))
         compare(banner.text, "Couldn't use the default workspace: No core answered.")
         verify(banner.defaultButton.visible)
+    }
+
+    function test_an_old_failed_use_of_the_default_is_not_shown_for_a_new_refusal() { // spec: ARCH-100, ARCH-090
+        const t = load()
+        const banner = t.shell.connectionBanner
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/quay"))
+        verify(banner.text.startsWith("The core refused this workspace: quay became the default workspace"), banner.text)
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.refusal("core.unreachable", "No core answered."))
+        compare(banner.text, "Couldn't use the default workspace: No core answered.")
+
+        // The default moves back, so the refusal ends; the failed try belongs to it.
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws1", "D:/art/harbor"))
+        verify(!banner.visible)
+        // Days later, no reconnect between: a new refusal says its own words.
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws3", "D:/art/other"))
+        verify(banner.text.startsWith("The core refused this workspace: other became the default workspace"), banner.text)
+    }
+
+    function test_a_no_workspace_answer_that_lands_before_ready_is_not_lost() { // spec: APP-016
+        // Core.useDefaultWorkspace's hello answers before the state reaches `ready` again (SH-05).
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        const lost = {workspaces: [{id: "ws1", path: "E:/art/harbor", name: "Harbor", default: true, served: false, missing: true}]}
+        answer(t.core, named("workspaces.list"), Shapes.tool(lost))
+        verify(banner.defaultButton.visible)
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        t.core.applyState({connection: "connecting"})
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.hello(null))
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(banner.visible)
+        answer(t.core, named("workspaces.list"), Shapes.tool(lost), "read again")
+        verify(banner.text.endsWith("It still can't be found."), banner.text)
+
+        // It is said once: a later reconnect starts clean.
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(!banner.text.endsWith("It still can't be found."), banner.text)
+    }
+
+    function test_a_folder_chosen_while_the_core_restarts_says_so_on_the_bar() { // spec: APP-016
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        banner.folderChosen("file:///D:/art/gone")
+        t.core.applyState({connection: "reconnecting"})
+        verify(!banner.visible)
+        answer(t.core, named("workspace.create"), Shapes.refusal("workspace.path_invalid", "Not here."))
+        verify(t.shell.topBar.notice.visible, "the banner is away, so the bar says it")
+        compare(t.shell.topBar.notice.text, "That folder couldn't be used: Not here.")
+        compare(t.shell.topBar.notice.kind, "danger")
+    }
+
+    function test_a_default_that_was_made_but_could_not_be_opened_says_so() { // spec: APP-016, P4a-R34
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: []}))
+        banner.folderChosen("file:///D:/art/quay")
+        answer(t.core, named("workspace.create"), Shapes.tool({id: "ws2", path: "D:/art/quay", created: true, default: true, warnings: []}))
+        const hello = open(t.core, c => c.kind === "setWorkspace")[0]
+        answered[hello.id] = true
+        t.core.respond(hello.id, Shapes.refusal("workspace.unsupported", "This core serves another one."))
+        verify(banner.visible)
+        verify(banner.text.indexOf("That folder couldn't be used") < 0, "it was used: " + banner.text)
+        verify(banner.text.indexOf("quay is now your default workspace, but this session couldn't open it: "
+                                   + "This core serves another one. Use the default workspace to try again.") >= 0, banner.text)
+        compare(banner.kind, "danger")
+
+        // The default is read again, so "Use the default workspace" is there to try again.
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: [
+            {id: "ws2", path: "D:/art/quay", name: "Quay", default: true, served: true, missing: false}]}), "read again")
+        verify(banner.defaultButton.visible)
+        verify(banner.text.indexOf("couldn't open it") >= 0, "the refusal stays after the read: " + banner.text)
     }
 
     function test_connecting_shows_no_banner() { // spec: APP-033
