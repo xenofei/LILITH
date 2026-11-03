@@ -50,6 +50,31 @@ fn launched_argv(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// How long `lil-fake-comfyui` takes, started the way the core starts it, to write its file: a
+/// control, so a check that no process started waits for as long as one would take on this
+/// machine now, not for a fixed time.
+fn fake_start_latency(env: &TestEnv) -> std::time::Duration {
+    let dir = env.root().join("fake-control");
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = lil_testkit::free_loopback_port().to_string();
+    let started = std::time::Instant::now();
+    let mut fake = std::process::Command::new(ensure_built().fake_comfyui.clone())
+        .args(["main.py", "--listen", "127.0.0.1", "--port", port.as_str()])
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the fake ComfyUI starts");
+    poll("the control fake's file", || {
+        dir.join("fake-comfyui.json").exists().then_some(())
+    });
+    let latency = started.elapsed();
+    let _ = fake.kill();
+    let _ = fake.wait();
+    latency
+}
+
 #[test] // spec: ARCH-126
 fn owned_comfyui_starts_with_the_launch_profile() {
     let env = TestEnv::new();
@@ -102,6 +127,7 @@ fn enable_assets_in_extra_args_stops_the_start() {
     for flag in ["--enable-assets", "--enable-as=1"] {
         let env = TestEnv::new();
         let (root, _) = own(&env, Some(&format!("[\"{flag}\"]")));
+        let latency = fake_start_latency(&env);
         let _core = CoreFixture::start(&env);
         let mut pipe = session(&env, None);
 
@@ -117,6 +143,10 @@ fn enable_assets_in_extra_args_stops_the_start() {
                 .is_some_and(|m| m.contains(flag)),
             "the message names {flag}: {refused}"
         );
+        // A process the refusal started would write its file about `latency` after the start,
+        // as the control did: wait three times that, and the same again for the core's own
+        // work, before looking.
+        std::thread::sleep(latency * 4);
         assert!(
             !root.join("fake-comfyui.json").exists(),
             "a refused start starts no process"

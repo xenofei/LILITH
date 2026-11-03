@@ -200,18 +200,29 @@ fn keep_awake_is_held_only_while_a_gpu_job_runs() {
     release(&mut pipe, &cpu);
     wait_done(&mut pipe, &cpu);
 
-    // Never with keep_awake_gpu off: turning it off lets go of a request held for a running
-    // gpu job, and the job runs on.
+    // Never with keep_awake_gpu off. First, off before the job starts: not held. That check is
+    // only as good as two polls (nothing observable follows keep-awake's decision), but it
+    // catches a regression that shows at once.
     let mut app = app_4a(&env, None, &[]);
+    app_ok(
+        &mut app,
+        "app/desktop.set",
+        json!({"keep_awake_gpu": false}),
+    );
     let gpu = submit(
         &mut pipe,
         "test.job",
         json!({"lane": "gpu-heavy", "gated": true}),
     );
     until_job(&mut pipe, &gpu, "running", running);
-    poll("the power request held", || {
+    two_more_polls(&mut pipe);
+    assert!(!power_held(&mut pipe), "never with keep_awake_gpu off");
+    // Then on: held, which also shows keep-awake has seen the running job.
+    app_ok(&mut app, "app/desktop.set", json!({"keep_awake_gpu": true}));
+    poll("the power request held once keep_awake_gpu is on", || {
         power_held(&mut pipe).then_some(())
     });
+    // Off again: let go of a request held for a running gpu job, which runs on.
     app_ok(
         &mut app,
         "app/desktop.set",
