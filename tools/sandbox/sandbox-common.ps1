@@ -14,6 +14,8 @@
   - Retry-Walk: UI Automation can throw for a whole walk while the tree moves.
   - Hide-Paths and Copy-MaskedLogs: a failure's copy of the app's logs, without this PC's paths.
   - Get-ChannelPipes: a test channel already served by a core or an app.
+  - Assert-Gone: a UI Automation element is gone, proved over three whole walks. It needs the caller's
+    `App-Windows`, `$TS`, `Check` and the Windows UI Automation types.
 #>
 
 # A `lil` call with a limit. ProcessStartInfo with ArgumentList keeps each argument (the JSON ones)
@@ -100,4 +102,27 @@ $script:runStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
 # asked: another deploy's core makes `lil --no-start status` fail as if there were none.
 function Get-ChannelPipes([string]$channel) {
     return @([System.IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*-$channel" })
+}
+
+# `prefix` is gone from the app's windows: three whole walks 300 ms apart, each holding a 'Core
+# connection: ' element (so the walk saw the top bar, and an empty walk can't pass) and none whose name
+# starts with `prefix`. With -Exact the name is `prefix` itself.
+function Assert-Gone([string]$prefix, [string]$what, [switch]$Exact) {
+    $why = ''
+    for ($i = 0; $i -lt 3 -and -not $why; ++$i) {
+        if ($i -gt 0) { Start-Sleep -Milliseconds 300 }
+        $sawBar = $false
+        $found = $false
+        foreach ($w in App-Windows) {
+            $all = Retry-Walk { $w.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) }
+            foreach ($e in $all) {
+                try { $name = $e.Current.Name } catch { continue }
+                if ($name.StartsWith('Core connection: ')) { $sawBar = $true }
+                if ($(if ($Exact) { $name -ceq $prefix } else { $name.StartsWith($prefix) })) { $found = $true }
+            }
+        }
+        if (-not $sawBar) { $why = "walk $($i + 1) saw no 'Core connection: ' element, so it proves nothing" }
+        elseif ($found) { $why = "walk $($i + 1) still has it" }
+    }
+    Check (-not $why) $(if ($why) { "$what ($why)" } else { $what })
 }
