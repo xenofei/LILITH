@@ -46,10 +46,9 @@ use std::time::Duration;
 
 use lil_client::session::{Session, SessionState, UnavailableCause};
 use lil_client::{ClientConfig, ClientError};
-use lil_protocol::codes::{CONFIRM_EXPIRED, CORE_BUG, PARAMS_INVALID};
+use lil_protocol::codes::{CONFIRM_EXPIRED, PARAMS_INVALID};
 use lil_protocol::{
-    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, NO_WORKSPACE, Outcome,
-    ToolOutput, rpc_code,
+    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, NO_WORKSPACE, Outcome, ToolOutput,
 };
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -1242,14 +1241,18 @@ mod tests {
     #[test] // spec: APP-029, ARCH-025
     fn a_snapshot_the_core_cant_send_ends_the_pending_call() {
         let over = ClientError::Protocol(lil_protocol::RpcError::new(
-            rpc_code::INTERNAL_ERROR,
+            lil_protocol::rpc_code::INTERNAL_ERROR,
             "internal error: the response was too large to send",
         ));
         let Some(PendingStep::Settle(outcome)) = snapshot_failed(&over, "tr_1") else {
             panic!("an over-cap list is read again forever");
         };
         assert_eq!(outcome["status"], "error", "{outcome}");
-        assert_eq!(outcome["error"]["code"], CORE_BUG.code, "{outcome}");
+        assert_eq!(
+            outcome["error"]["code"],
+            lil_protocol::codes::CORE_BUG.code,
+            "{outcome}"
+        );
         assert_eq!(outcome["error"]["trace_id"], "tr_1", "{outcome}");
         let message = outcome["error"]["message"].as_str().unwrap_or_default();
         assert!(message.contains("couldn't be read"), "{message}");
