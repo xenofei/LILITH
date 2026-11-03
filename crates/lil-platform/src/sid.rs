@@ -1,6 +1,8 @@
 //! The current user's SID from the process token.
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_DATA, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_DATA, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree, SetLastError,
+};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsTokenRestricted,
@@ -97,6 +99,23 @@ pub struct TokenTrust {
     pub app_container: bool,
 }
 
+/// Whether `token` is restricted. `IsTokenRestricted` returns FALSE both for "not restricted" and
+/// for a failure, and only the last error tells them apart; so the last error is cleared first,
+/// and whatever an earlier call left (`ERROR_INSUFFICIENT_BUFFER` from a size query) can't be read
+/// as this call's.
+fn restricted(token: HANDLE) -> Result<bool, windows::core::Error> {
+    // SAFETY: `token` is an open token handle with TOKEN_QUERY; this sets only this thread's last
+    // error.
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+        match IsTokenRestricted(token) {
+            Ok(()) => Ok(true),
+            Err(e) if e.code().is_ok() => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// [`TokenTrust`] of the token of `process` (open with at least
 /// `PROCESS_QUERY_LIMITED_INFORMATION`). On failure, the name of the call that failed.
 pub(crate) fn token_trust(
@@ -137,12 +156,7 @@ pub(crate) fn token_trust(
             ));
         }
         let integrity = *GetSidSubAuthority(sid, u32::from(count) - 1);
-        // FALSE with no error is "not restricted"; FALSE with an error is a failure.
-        let restricted = match IsTokenRestricted(token.0) {
-            Ok(()) => true,
-            Err(e) if e.code().is_ok() => false,
-            Err(e) => return Err(("IsTokenRestricted", e)),
-        };
+        let restricted = restricted(token.0).map_err(|e| ("IsTokenRestricted", e))?;
         let mut app_container = 0u32;
         let mut len = 0u32;
         GetTokenInformation(
@@ -164,6 +178,23 @@ pub(crate) fn token_trust(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever an earlier call left as the last error, "not restricted" is `Ok(false)`: here the
+    /// one `GetTokenInformation` leaves when it is asked for a size.
+    #[test] // spec: ARCH-027
+    fn restricted_ignores_a_stale_last_error() {
+        use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+        // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid; the token handle
+        // is closed by `Token`.
+        let token = unsafe {
+            let mut handle = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle).unwrap();
+            Token(handle)
+        };
+        // SAFETY: sets this thread's last error only.
+        unsafe { SetLastError(ERROR_INSUFFICIENT_BUFFER) };
+        assert!(!restricted(token.0).unwrap());
+    }
 
     /// Read-only: queries the process token and writes nothing.
     #[test] // spec: ARCH-095
