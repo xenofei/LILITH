@@ -329,8 +329,8 @@ TestCase {
     function test_a_refused_set_restores_the_toggle_and_says_why() { // spec: APP-146, APP-039
         for (const [code, message] of [
             ["caller.not_allowed", "Only the LILITH app changes these settings."],
-            // A -32602 as it really reaches the app (the e2e test checks it); the core is still there.
-            ["core.unreachable", "The LILITH core answered with a protocol error (-32602): invalid params: \"job_failed\" is not a notification category"]]) {
+            // A -32602 as it really reaches the app (the e2e test checks it): a refusal.
+            ["params.invalid", "The LILITH core answered with a protocol error (-32602): invalid params: \"job_failed\" is not a notification category"]]) {
             answered = {}
             const core = makeCore()
             const host = loaded(core)
@@ -344,15 +344,8 @@ TestCase {
             verify(panel.banner.text.indexOf(message) >= 0, panel.banner.text)
             verify(panel.banner.text.indexOf("Job failed") >= 0, panel.banner.text)
             verify(!shows(panel, "Saving…"))
-            if (code === "core.unreachable") {
-                // It reads again, to be sure, and the message stays: the core never went away.
-                verify(panel.banner.text.indexOf("may not have changed") >= 0, panel.banner.text)
-                verify(panel.banner.text.indexOf("went away") < 0, panel.banner.text)
-                verify(panel.banner.text.indexOf("category. The switch") >= 0, panel.banner.text)
-                answer(core, isRead, readOk())
-                wait(50)
-                verify(panel.banner.visible, "still says why")
-            }
+            // A refusal: nothing changed, and the words say so.
+            verify(panel.banner.text.indexOf("\"Job failed\" wasn't changed: ") === 0, panel.banner.text)
             // The next set that works takes the message away, and the switch still sets.
             wait(Qt.styleHints.mouseDoubleClickInterval + 50)
             toggle.click()
