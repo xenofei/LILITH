@@ -65,8 +65,16 @@ fn the_shell_s_workspace_paths_against_a_real_core() {
         .env("PATH", path)
         .env("LIL_QML_REAL_CORE", "1")
         .env("LIL_QML_LIL", folder.path().join("lil.exe"))
-        .env("LIL_QML_WS_A", &a)
-        .env("LIL_QML_WS_B", &b)
+        // Canonical, as the core lists them: TEMP can be an 8.3 short path (GitHub's runners), and
+        // the QML compares the paths as text.
+        .env(
+            "LIL_QML_WS_A",
+            std::fs::canonicalize(&a).expect("canonical a"),
+        )
+        .env(
+            "LIL_QML_WS_B",
+            std::fs::canonicalize(&b).expect("canonical b"),
+        )
         .env(
             "QT_QPA_PLATFORM",
             "offscreen:configfile=offscreen-screen.json",
