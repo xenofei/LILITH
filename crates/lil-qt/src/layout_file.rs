@@ -279,7 +279,18 @@ pub(crate) fn write_replacing_stoppable(
     let temp = dir.join(format!(".{name}.lil-tmp"));
     let backup = dir.join(backup(&name));
     let written = (|| {
-        let mut file = std::fs::File::create(&temp)?;
+        // Never written through what is already at the temporary name: a hard link there (anyone
+        // may make one in a shared folder) would overwrite the file it leads to. Removed first, then
+        // made new, so a writer that races in between makes this fail instead.
+        match std::fs::remove_file(&temp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
         for chunk in bytes.chunks(WRITE_CHUNK) {
             if stop() {
                 return Err(io::Error::new(
@@ -397,6 +408,30 @@ fn prune_set_aside(dir: &Path, name: &str, made: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DG-10b: a hard link planted at the temporary file's name (in a shared folder, which needs no
+    /// privilege) is removed, not written through: the file it leads to stays as it was.
+    #[test] // spec: ARCH-121
+    fn a_hard_link_at_the_temporary_name_isnt_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::fs::hard_link(&victim, dir.path().join(".layout.json.lil-tmp")).unwrap();
+        let path = dir.path().join("layout.json");
+        write_replacing(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["layout.json", "victim.txt"],
+            "no temporary file left"
+        );
+    }
 
     #[test] // spec: ARCH-121
     fn a_write_told_to_stop_leaves_no_temporary_file_and_the_old_file_as_it_was() {
