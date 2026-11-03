@@ -396,17 +396,12 @@ struct Decimal<'a> {
 }
 
 impl<'a> Decimal<'a> {
-    /// Digits, at most 18 before the point, and any after it.
+    /// Digits before the point, and any after it. Compared as text, so no length can overflow.
     fn parse(text: &'a str) -> Option<Decimal<'a>> {
         let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
         let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
         let dangling_point = text.contains('.') && fraction.is_empty();
-        if whole.is_empty()
-            || whole.len() > 18
-            || !digits(whole)
-            || !digits(fraction)
-            || dangling_point
-        {
+        if whole.is_empty() || !digits(whole) || !digits(fraction) || dangling_point {
             return None;
         }
         Some(Decimal {
@@ -667,7 +662,7 @@ mod tests {
             (".5", "0", "USD", Some("not_a_number")),
             ("-5", "1", "USD", Some("not_a_number")),
             ("1e3", "1", "USD", Some("not_a_number")),
-            ("1234567890123456789", "1", "USD", Some("not_a_number")),
+            ("1234567890123456789", "1", "USD", Some("too_large")),
             ("25.999", "1", "USD", Some("too_many_decimals")),
             ("0.001", "0", "USD", Some("too_many_decimals")),
             ("120.7", "1", "JPY", Some("too_many_decimals")),
@@ -699,6 +694,8 @@ mod tests {
             ("9223372036854.776", "KWD", Some("too_large")),
             ("99999999999999", "USD", Some("too_large")),
             ("000009223372036854.77", "USD", None),
+            ("0000000000000000009223372036854.77", "USD", None),
+            ("123456789012345678901234567890", "USD", Some("too_large")),
         ] {
             assert_eq!(
                 raise_refusal(amount, "1", currency),
