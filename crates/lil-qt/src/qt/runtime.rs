@@ -896,24 +896,16 @@ async fn wait_for_answer(
         let mut failed = false;
         match ready.as_deref() {
             Some(ws) if ws != workspace => return left_workspace(trace),
-            Some(_) if need_snapshot => match snapshot(session).await {
-                Ok((pending, answered)) => {
-                    need_snapshot = false;
-                    backoff = SNAPSHOT_RETRY_FIRST;
-                    let step = call.on_snapshot(&pending, &answered);
-                    if step != PendingStep::Wait {
-                        return step;
+            Some(_) if need_snapshot => {
+                match after_snapshot(&mut call, snapshot(session).await, trace) {
+                    AfterSnapshot::End(step) => return step,
+                    AfterSnapshot::Read => {
+                        need_snapshot = false;
+                        backoff = SNAPSHOT_RETRY_FIRST;
                     }
+                    AfterSnapshot::ReadAgain => failed = true,
                 }
-                Err(e) => {
-                    if let Some(step) = snapshot_failed(&e, trace) {
-                        tracing::warn!(error = %e, confirmation = call.confirmation_id(), "the confirmations can't be read; the call stops waiting");
-                        return step;
-                    }
-                    tracing::debug!(error = %e, confirmation = call.confirmation_id(), "the confirmations snapshot failed; it is read again");
-                    failed = true;
-                }
-            },
+            }
             _ => {}
         }
         let wait = backoff;
@@ -945,6 +937,39 @@ async fn wait_for_answer(
                 }
             }
             () = retry => {}
+        }
+    }
+}
+
+/// What a snapshot read of the confirmations means for a pending call.
+#[derive(Debug, PartialEq)]
+enum AfterSnapshot {
+    /// The wait is over: an answer was found, or the list can't be read ([`snapshot_failed`]).
+    End(PendingStep),
+    /// Read, and nothing new: wait on.
+    Read,
+    /// The read failed: read it again after the backoff.
+    ReadAgain,
+}
+
+/// `call`'s step after the snapshot read `got` ([`wait_for_answer`]).
+fn after_snapshot(
+    call: &mut PendingCall,
+    got: Result<(Vec<String>, Vec<(String, String)>), ClientError>,
+    trace: &str,
+) -> AfterSnapshot {
+    match got {
+        Ok((pending, answered)) => match call.on_snapshot(&pending, &answered) {
+            PendingStep::Wait => AfterSnapshot::Read,
+            step => AfterSnapshot::End(step),
+        },
+        Err(e) => {
+            if let Some(step) = snapshot_failed(&e, trace) {
+                tracing::warn!(error = %e, confirmation = call.confirmation_id(), "the confirmations can't be read; the call stops waiting");
+                return AfterSnapshot::End(step);
+            }
+            tracing::debug!(error = %e, confirmation = call.confirmation_id(), "the confirmations snapshot failed; it is read again");
+            AfterSnapshot::ReadAgain
         }
     }
 }
@@ -1259,6 +1284,35 @@ mod tests {
         assert!(message.contains("too large"), "{message}");
         assert_eq!(snapshot_failed(&ClientError::Closed, "tr_1"), None);
         assert_eq!(snapshot_failed(&ClientError::NotConnected, "tr_1"), None);
+
+        // The step `wait_for_answer` takes with each read (N-2): the over-cap list ends the wait.
+        let mut call = PendingCall::new("cf_1".into(), "ik_1".into());
+        match after_snapshot(&mut call, Err(over), "tr_1") {
+            AfterSnapshot::End(PendingStep::Settle(outcome)) => {
+                assert_eq!(outcome["error"]["code"], "core.bug", "{outcome}");
+            }
+            other => panic!("an over-cap list doesn't end the wait: {other:?}"),
+        }
+        let mut call = PendingCall::new("cf_1".into(), "ik_1".into());
+        assert_eq!(
+            after_snapshot(&mut call, Err(ClientError::Closed), "tr_1"),
+            AfterSnapshot::ReadAgain
+        );
+        let still = Ok((vec!["cf_1".to_string()], Vec::new()));
+        assert_eq!(
+            after_snapshot(&mut call, still, "tr_1"),
+            AfterSnapshot::Read
+        );
+        let approved = Ok((
+            Vec::new(),
+            vec![("cf_1".to_string(), "approved".to_string())],
+        ));
+        assert_eq!(
+            after_snapshot(&mut call, approved, "tr_1"),
+            AfterSnapshot::End(PendingStep::Resend {
+                retry_token: "ik_1".into()
+            })
+        );
     }
 
     #[test] // spec: APP-028
