@@ -435,6 +435,27 @@ impl fmt::Display for ClientError {
     }
 }
 
+/// The error result a caller reports for `fault`, a [`ClientError::Protocol`]: never
+/// `core.unreachable`, since the core was reached (or, for a request too long to send, never
+/// needed) and the same request would only be faulted again. A request the core faults as invalid
+/// (-32602), or too long to send (-32002, refused here before anything was sent), is
+/// `params.invalid`; any other fault (an answer too large to send, an unknown method, an answer
+/// this client can't read) is `core.bug`. The fault's own text is kept.
+pub fn protocol_fault_body(fault: &RpcError, trace_id: &str) -> ErrorBody {
+    use lil_protocol::codes::{CORE_BUG, PARAMS_INVALID};
+    use lil_protocol::rpc_code;
+    let said = || ClientError::Protocol(fault.clone()).to_string();
+    match fault.code {
+        rpc_code::LINE_TOO_LONG => ErrorBody::new(
+            &PARAMS_INVALID,
+            format!("Nothing was sent: {}.", fault.message),
+            trace_id,
+        ),
+        rpc_code::INVALID_PARAMS => ErrorBody::new(&PARAMS_INVALID, said(), trace_id),
+        _ => ErrorBody::new(&CORE_BUG, said(), trace_id),
+    }
+}
+
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

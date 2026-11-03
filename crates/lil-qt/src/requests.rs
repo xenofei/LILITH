@@ -10,7 +10,8 @@
 //!
 //! [`client_error`] is the error a call reports when the core couldn't be used: the core's own
 //! errors keep their code; a core that can't be reached is `core.unreachable` (ruling P3-R25,
-//! as `lil-mcp` reports it), with the client's plain-language message.
+//! as `lil-mcp` reports it), with the client's plain-language message; a protocol fault is
+//! `params.invalid` or `core.bug` ([`lil_client::protocol_fault_body`]), never `core.unreachable`.
 //!
 //! Qt-free: the bridge's `Core` owns one, on the GUI thread.
 
@@ -114,6 +115,7 @@ pub fn client_error(e: &ClientError, trace_id: &str) -> ErrorBody {
             "The connection to the core closed while the call was under way. It may have run.",
             trace_id,
         ),
+        ClientError::Protocol(fault) => lil_client::protocol_fault_body(fault, trace_id),
         other => ErrorBody::new(&CORE_UNREACHABLE, other.to_string(), trace_id),
     }
 }
@@ -172,5 +174,38 @@ mod tests {
         );
         assert_eq!(e.code, "protocol.incompatible");
         assert_eq!(e.data, Some(json!({"core_protocol": "2.0"})));
+    }
+
+    /// PROTO-3: a protocol fault isn't an unreachable core, and the same request would only be
+    /// faulted again. An invalid request, or one too long to send, is `params.invalid`; any other
+    /// fault is `core.bug`. The fault's text is kept.
+    #[test] // spec: APP-028, QA-010
+    fn a_protocol_fault_is_params_invalid_or_core_bug() {
+        use lil_protocol::{RpcError, rpc_code};
+        for (code, want, retry) in [
+            (rpc_code::INVALID_PARAMS, "params.invalid", "after_resolve"),
+            (rpc_code::LINE_TOO_LONG, "params.invalid", "after_resolve"),
+            (rpc_code::INTERNAL_ERROR, "core.bug", "never"),
+            (rpc_code::METHOD_NOT_FOUND, "core.bug", "never"),
+            (rpc_code::PARSE_ERROR, "core.bug", "never"),
+        ] {
+            let fault = ClientError::Protocol(RpcError::new(code, "the fault's own words"));
+            let e = client_error(&fault, "tr_1");
+            assert_eq!(e.code, want, "{code}");
+            assert_eq!(serde_json::to_value(e.retry).unwrap(), retry, "{code}");
+            assert_eq!(e.trace_id, "tr_1");
+            assert!(
+                e.message.contains("the fault's own words"),
+                "{code}: {}",
+                e.message
+            );
+        }
+        // The client refused it before sending.
+        let too_long = ClientError::Protocol(RpcError::new(
+            rpc_code::LINE_TOO_LONG,
+            "the tools/call request is longer than the 4 MiB line limit",
+        ));
+        let e = client_error(&too_long, "tr_1");
+        assert!(e.message.starts_with("Nothing was sent"), "{}", e.message);
     }
 }

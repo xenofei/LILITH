@@ -209,11 +209,16 @@ fn incompatible(core_protocol: &str) -> ErrorBody {
 
 /// The error result for a client failure. The core's own error results keep their code; a
 /// core that cannot be reached or started is `core.unreachable` (ruling P3-R25; transient: wait,
-/// then retry the call with the same `retry_token`), with the client's plain-language message.
+/// then retry the call with the same `retry_token`), with the client's plain-language message;
+/// a protocol fault is `params.invalid` or `core.bug` (`lil_client::protocol_fault_body`), which
+/// sending the same request again can't help.
 fn error_body(e: &ClientError) -> ErrorBody {
     match e {
         ClientError::Refused(error) | ClientError::UnknownWorkspace { error, .. } => error.clone(),
         ClientError::Incompatible { core_protocol } => incompatible(core_protocol),
+        ClientError::Protocol(fault) => {
+            lil_client::protocol_fault_body(fault, &lil_client::mint_id("t"))
+        }
         other => ErrorBody::new(
             &CORE_UNREACHABLE,
             other.to_string(),
@@ -256,5 +261,23 @@ mod tests {
         });
         assert_eq!(refused.code, "protocol.incompatible");
         assert_eq!(refused.data, Some(json!({"core_protocol": "2.0"})));
+    }
+
+    /// PROTO-3: a protocol fault is not an unreachable core, so an agent isn't told to send the
+    /// same request again: too long to send (nothing was sent) or invalid is `params.invalid`,
+    /// anything else `core.bug`.
+    #[test] // spec: QA-010, QA-003
+    fn a_protocol_fault_is_not_an_unreachable_core() {
+        use lil_protocol::{RpcError, rpc_code};
+        for (code, want) in [
+            (rpc_code::LINE_TOO_LONG, "params.invalid"),
+            (rpc_code::INVALID_PARAMS, "params.invalid"),
+            (rpc_code::INTERNAL_ERROR, "core.bug"),
+            (rpc_code::PARSE_ERROR, "core.bug"),
+        ] {
+            let body = error_body(&ClientError::Protocol(RpcError::new(code, "its words")));
+            assert_eq!(body.code, want, "{code}");
+            assert!(body.message.contains("its words"), "{}", body.message);
+        }
     }
 }
