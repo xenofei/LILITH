@@ -232,6 +232,9 @@ Item {
             root._workspaceId = id
             root.core.noteProject("")
             root.effectiveProject = ""
+            // The names and rows are the old workspace's: another one may use a slug differently.
+            root._names = Object.create(null)
+            root.projects = []
             if (root.core.connection === "ready" && id !== "")
                 root.readEffective()
         }

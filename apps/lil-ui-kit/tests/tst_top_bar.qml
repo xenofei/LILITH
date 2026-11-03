@@ -223,7 +223,7 @@ TestCase {
         tryCompare(t.bar.jobsIndicator, "text", "2 running · 3 queued")
 
         t.core.emit("telemetry", "event", Shapes.sample(Shapes.gpu()))
-        compare(t.bar.gpuIndicator.text, "GPU 63 % · 9.5/16 GiB · 71 °C")
+        compare(t.bar.gpuIndicator.text, "GPU 63 % · 9.5 / 16 GiB · 71 °C")
 
         t.core.emit("caps", "event", Shapes.capsChanged([Shapes.capRow("monthly", 412)]))
         answer(t.core, named("caps.get"), Shapes.tool(Shapes.capsView([Shapes.capRow("monthly", 412)])))
@@ -283,7 +283,7 @@ TestCase {
         answer(t.core, named("caps.get"), Shapes.refusal("core.unreachable", "No core."))
         refuseRead(t.core, "core.unreachable", "No core.")
         compare(t.bar.jobsIndicator.text, "—")
-        verify(!t.bar.spendIndicator.visible)
+        compare(t.bar.spendIndicator.text, "Spend —", "a read that failed while connected is said, not hidden")
 
         // Disconnected: nothing polls.
         t.core.applyState({connection: "reconnecting"})
@@ -468,7 +468,7 @@ TestCase {
         t.core.emit("telemetry", "event", Shapes.sample(Shapes.gpu({measured: false})))
         compare(t.bar.gpuIndicator.text, "GPU —", "a lost GPU's last reading isn't shown as live")
         t.core.emit("telemetry", "event", Shapes.sample(Shapes.gpu()))
-        compare(t.bar.gpuIndicator.text, "GPU 63 % · 9.5/16 GiB · 71 °C")
+        compare(t.bar.gpuIndicator.text, "GPU 63 % · 9.5 / 16 GiB · 71 °C")
         t.core.applyState({connection: "reconnecting"})
         compare(t.bar.gpuIndicator.text, "GPU —", "no live reading without a connection")
         t.core.applyState({connection: "ready", workspace: workspaceOne})
@@ -712,28 +712,61 @@ TestCase {
         t.core.respond(hello.id, Shapes.refusal("core.unreachable", "No core answered."))
         compare(t.core.workspace.id, "ws1", "nothing shown changes by itself")
         verify(sw.popup.opened, "it stays open to say why")
-        compare(sw.popup.message, "Quay is now your default workspace, but the app couldn't switch to it: No core answered.")
+        const said = "Quay is now your default workspace, but the app couldn't switch to it: No core answered."
+        compare(sw.popup.message, said)
         compare(t.bar.notice.kind, "danger")
 
-        // The rows say what the core now serves, without asking the old session.
-        const quay = row(sw.popup, w => w.id === "ws2")
-        tryCompare(quay, "reason", "")
-        verify(!makeDefaultButton(sw.popup, "ws2"), "it is the default now")
-        const old = row(sw.popup, w => w.id === "ws1")
-        tryCompare(old, "reason", "This core serves only the default workspace")
-
-        // A switch by itself: Core.setWorkspace, and never set_default (P4a-R34).
-        mouseClick(row(sw.popup, w => w.id === "ws2"), 5, 5)
-        const again = open(t.core, c => c.kind === "setWorkspace")
+        // The core refuses every call of this session now, and the bar says so (SHELL-6): it is no
+        // longer "Connected", and the way out is offered where the refusal is shown.
+        compare(t.bar.movedReason, said)
+        compare(t.bar.connectionIndicator.text, "Workspace refused")
+        compare(t.bar.jobsIndicator.text, "—", "the last counts aren't shown as live")
+        verify(sw.popup.defaultButton.visible)
+        wait(50)
+        mouseClick(sw.popup.defaultButton)
+        const again = open(t.core, c => c.kind === "useDefaultWorkspace")
         compare(again.length, 1)
-        compare(again[0].name, "ws2")
-        compare(t.core.calls.filter(named("workspace.set_default")).length, 1, "a switch never sets the default")
+        compare(t.core.calls.filter(named("workspace.set_default")).length, 1, "using the default never sets it again")
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        answered[again[0].id] = true
+        t.core.respond(again[0].id, Shapes.hello(quay))
+        t.core.applyState({connection: "ready", workspace: quay})
+        compare(t.bar.movedReason, "")
+        compare(t.bar.connectionIndicator.text, "Connected")
+    }
+
+    function test_a_switch_by_itself_is_a_new_hello_and_never_the_default() { // spec: ARCH-090, P4a-R34
+        const t = load()
+        const rows = Shapes.workspaceRows().map(w => w.id === "ws2" ? Object.assign({}, w, {served: true}) : w)
+        const sw = openWorkspaces(t, rows)
+        mouseClick(row(sw.popup, w => w.id === "ws2"), 5, 5)
+        const hello = open(t.core, c => c.kind === "setWorkspace")
+        compare(hello.length, 1)
+        compare(hello[0].name, "ws2")
+        compare(t.core.calls.filter(named("workspace.set_default")).length, 0, "a switch never sets the default")
 
         // The core refuses: nothing shown changes but the message.
-        answered[again[0].id] = true
-        t.core.respond(again[0].id, Shapes.refusal("workspace.unsupported", "This core serves \"Harbor\"."))
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.refusal("workspace.unsupported", "This core serves \"Harbor\"."))
         compare(t.core.workspace.id, "ws1")
         compare(sw.popup.message, "Couldn't switch the workspace: This core serves \"Harbor\".")
+    }
+
+    function test_a_default_moved_during_the_own_switch_is_told_when_the_hello_fails() { // spec: ARCH-090, P4a-R34
+        // The event overtakes the answer, so the bar ignored it as its own click's. Then the hello
+        // fails: the refusal is real, in the words of the move.
+        const t = load()
+        const sw = openWorkspaces(t)
+        mouseClick(makeDefaultButton(sw.popup, "ws2"))
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        t.core.emit("workspace", "event", Shapes.defaultChanged(quay.id, quay.path))
+        compare(t.bar.movedReason, "")
+        answer(t.core, named("workspace.set_default"), Shapes.tool(quay))
+        const hello = open(t.core, c => c.kind === "setWorkspace")[0]
+        answered[hello.id] = true
+        t.core.respond(hello.id, Shapes.refusal("core.unreachable", "No core answered."))
+        verify(t.bar.movedReason.indexOf("quay became the default workspace") >= 0, t.bar.movedReason)
+        compare(t.bar.connectionIndicator.text, "Workspace refused")
     }
 
     function test_a_late_resend_answer_cannot_cross_a_workspace_switch() { // spec: ARCH-088
@@ -1293,6 +1326,7 @@ TestCase {
         answer(core, isContextRead, Shapes.context(workspaceOne, null, "sketchbook"))
         compare(shell.title, "LILITH — sketchbook")
         core.noteProject("harbor")
+        shell.topBar.projectSwitcher.effectiveProject = "harbor"
         compare(shell.title, "LILITH — harbor")
 
         // The event log runs from the shell's start, whichever panel opens later.
@@ -1301,6 +1335,276 @@ TestCase {
         core.emit("jobs", "event", {kind: "queue", state: Shapes.lane()})
         compare(shell.eventLog.rowCount(), logged + 1)
         compare(shell.eventLog.get(logged).topic, "jobs")
+    }
+
+    // --- Batch C of the final review of plan 4a ---
+
+    Component {
+        id: queueWindow
+        Window {
+            id: qwin
+            required property var core
+            property alias queue: queue
+            width: 600
+            height: 400
+            visible: true
+            color: Theme.bg
+            QueueSummary {
+                id: queue
+                width: parent.width
+                core: qwin.core
+            }
+        }
+    }
+
+    function unknownJob(id) {
+        return Shapes.job(id, "running", {substatus: "interrupted_unknown"})
+    }
+
+    function test_a_job_with_an_unknown_outcome_is_in_neither_count() { // spec: APP-006, APP-114
+        // A crash left it `running` and nothing runs it (HM-03). Jobs and Home list it as such.
+        const t = load({running: [Shapes.job("r1", "running"), unknownJob("u1")], queued: [Shapes.job("q1", "queued")]})
+        tryCompare(t.bar.jobsIndicator, "text", "1 running · 1 queued")
+
+        // A running job that becomes one of unknown outcome leaves the count at once.
+        t.core.emit("jobs", "event", {kind: "job", job: unknownJob("r1")})
+        tryCompare(t.bar.jobsIndicator, "text", "0 running · 1 queued")
+    }
+
+    function test_the_queue_card_counts_unknown_outcomes_as_the_bar_does() { // spec: APP-006, ARCH-121
+        const core = createTemporaryObject(fakeComponent, tc, {workspace: workspaceOne})
+        const w = createTemporaryObject(queueWindow, tc, {core: core})
+        windows.push(w)
+        const all = [Shapes.job("r1", "running"), unknownJob("u1"), Shapes.job("q1", "queued")]
+        answer(core, isRunningRead, core.jobsListAnswer({status: "running"}, all, []), "the running read")
+        answer(core, isQueuedRead, core.jobsListAnswer({status: "queued"}, all, []), "the queued read")
+        const line = () => {
+            const item = findItem(w.queue, i => typeof i.text === "string" && i.text.indexOf(" running, ") >= 0)
+            return item ? item.text : ""
+        }
+        tryVerify(() => line() === "1 running, 1 queued", 2000, line())
+    }
+
+    function test_a_clock_set_back_does_not_freeze_the_pause_control() { // spec: APP-011, CORE-160
+        // The double-click guard compares with the time of the last answer. A clock that went back
+        // makes that time later than now, and the control must not wait it out.
+        const t = load()
+        t.bar._pauseAnswered = Date.now() + 3600000
+        t.bar.togglePause()
+        compare(t.core.calls.filter(named("app/queue.pause")).length, 1)
+    }
+
+    function test_ctrl_shift_p_does_not_repeat_while_held() { // spec: APP-011
+        const core = createTemporaryObject(fakeComponent, tc, {workspace: workspaceOne})
+        const shell = createTemporaryObject(shellComponent, tc, {core: core})
+        windows.push(shell)
+        shell.visible = true
+        tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
+        let found = 0
+        for (let i = 0; i < shell.shortcuts.count; ++i) {
+            const s = shell.shortcuts.objectAt(i)
+            if (s.modelData.action === "gpu.toggle_pause") {
+                compare(s.autoRepeat, false, "a held key would pause and then resume")
+                ++found
+            } else {
+                compare(s.autoRepeat, true, s.modelData.action + " keeps the default")
+            }
+        }
+        compare(found, 1)
+    }
+
+    function test_a_failed_caps_read_mutes_the_old_figure_and_says_so() { // spec: APP-006, ARCH-100
+        const t = load({caps: [Shapes.capRow("monthly", 412)]})
+        compare(t.bar.spendIndicator.text, "41 % of cap")
+        compare(t.bar.spendIndicator.kind, "")
+        t.core.emit("caps", "event", Shapes.capsChanged([]))
+        answer(t.core, named("caps.get"), Shapes.refusal("store.io", "Busy."))
+        compare(t.bar.spendIndicator.text, "41 % of cap", "the last figure stays")
+        tryCompare(t.bar.spendIndicator, "kind", "muted")
+        const name = LilShim.accessibleOf(t.bar.spendIndicator).name
+        verify(name.indexOf("not current: reading again") >= 0, name)
+
+        // Read again (after 1 s), it is current again.
+        answer(t.core, named("caps.get"), Shapes.tool(Shapes.capsView([Shapes.capRow("monthly", 500)])))
+        tryCompare(t.bar.spendIndicator, "text", "50 % of cap")
+        compare(t.bar.spendIndicator.kind, "")
+        verify(LilShim.accessibleOf(t.bar.spendIndicator).name.indexOf("not current") < 0)
+    }
+
+    function test_a_first_caps_read_that_fails_shows_spend_as_not_known() { // spec: APP-006, ARCH-100
+        const t = load({unanswered: true})
+        verify(!t.bar.spendIndicator.visible, "nothing before an answer")
+        answer(t.core, named("caps.get"), Shapes.refusal("store.io", "Busy."))
+        verify(t.bar.spendIndicator.visible)
+        compare(t.bar.spendIndicator.text, "Spend —")
+        compare(t.bar.spendIndicator.kind, "muted")
+        verify(LilShim.accessibleOf(t.bar.spendIndicator).name.indexOf("reading again") >= 0)
+
+        // And it goes as soon as a read says there are no caps.
+        answer(t.core, named("caps.get"), Shapes.tool(Shapes.capsView([])))
+        tryVerify(() => !t.bar.spendIndicator.visible)
+    }
+
+    function test_an_outage_before_the_first_caps_read_shows_no_placeholder() { // spec: APP-006, ARCH-100
+        const t = load({unanswered: true})
+        t.core.applyState({connection: "reconnecting"})
+        verify(!t.bar.spendIndicator.visible)
+        t.core.applyState({connection: "ready", workspace: workspaceOne})
+        verify(!t.bar.spendIndicator.visible, "a read that is out has not failed")
+    }
+
+    function test_a_new_workspace_forgets_the_old_ones_project_names_and_rows() { // spec: ARCH-088, APP-006
+        const t = load()
+        t.core.project = "harbor"
+        const sw = openProjects(t, [{project: "harbor", name: "Harbor Town", status: "active", assets: 1}])
+        compare(sw.currentName, "Harbor Town")
+        sw.popup.close()
+        tryVerify(() => !sw.popup.visible)
+
+        // Another workspace has a project of the same slug.
+        const quay = {id: "ws2", path: "D:/art/quay"}
+        t.core.applyState({connection: "ready", workspace: quay})
+        answer(t.core, isContextRead, Shapes.context(quay, null, "harbor"))
+        tryCompare(sw, "currentName", "harbor")
+        compare(sw.button.text, "harbor ▾", "not the other workspace's name for it")
+
+        // A list that can't be read has nothing of the old one's to offer.
+        mouseClick(sw.button)
+        tryVerify(() => sw.popup.opened)
+        answer(t.core, named("projects.list"), Shapes.refusal("store.io", "Busy."))
+        tryCompare(sw.popup, "message", "Couldn't list the projects: Busy.")
+        compare(sw.popup.view.count, 0)
+    }
+
+    function notServedBoth(t) {
+        answer(t.core, isRunningRead, Shapes.notServed("D:/art/quay", "D:/art/harbor"), "the running read")
+        answer(t.core, isQueuedRead, Shapes.notServed("D:/art/quay", "D:/art/harbor"), "the queued read")
+    }
+
+    function test_a_refusal_ends_when_a_jobs_read_is_served_again() { // spec: ARCH-090, ARCH-100
+        // A hand-edited suite.toml publishes nothing, to the refusal or to its end.
+        const t = load({running: [Shapes.job("r1", "running")]})
+        t.core.emit("jobs", "event", {kind: "job", job: Shapes.job("q1", "queued")})
+        tryVerify(() => open(t.core, isRunningRead).length > 0, 2000, "the read")
+        notServedBoth(t)
+        verify(t.bar.movedReason !== "")
+        compare(t.bar.connectionIndicator.text, "Workspace refused")
+
+        // The read asks again after 1 s, and the core serves this workspace again.
+        answerRead(t.core, [Shapes.job("r1", "running")], [])
+        tryCompare(t.bar, "movedReason", "")
+        compare(t.bar.connectionIndicator.text, "Connected")
+        tryCompare(t.bar.jobsIndicator, "text", "1 running · 0 queued")
+    }
+
+    function test_a_refusal_ends_when_a_caps_read_is_served_again() { // spec: ARCH-090, ARCH-100
+        const t = load({caps: [Shapes.capRow("monthly", 412)]})
+        t.core.emit("caps", "event", Shapes.capsChanged([]))
+        answer(t.core, named("caps.get"), Shapes.notServed("D:/art/quay", "D:/art/harbor"), "caps.get")
+        verify(t.bar.movedReason !== "")
+        answer(t.core, named("caps.get"), Shapes.tool(Shapes.capsView([Shapes.capRow("monthly", 500)])), "the retry")
+        tryCompare(t.bar, "movedReason", "")
+        compare(t.bar.connectionIndicator.text, "Connected")
+    }
+
+    function test_a_moved_default_that_is_moved_back_ends_without_an_event() { // spec: ARCH-090, ARCH-100
+        // `default_changed` is the only news there is, and moving it back by hand publishes none:
+        // the bar asks, with a backoff, and is served.
+        const t = load()
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/quay"))
+        verify(t.bar.movedReason !== "")
+        answer(t.core, named("caps.get"), Shapes.notServed("D:/art/quay", "D:/art/harbor"), "the first probe")
+        verify(t.bar.movedReason !== "", "still refused")
+        answer(t.core, named("caps.get"), Shapes.tool(Shapes.capsView([])), "the next probe")
+        tryCompare(t.bar, "movedReason", "")
+        compare(t.bar.connectionIndicator.text, "Connected")
+    }
+
+    function test_a_pause_refusal_goes_when_the_gpu_lane_changes() { // spec: APP-011, CORE-160
+        const t = load()
+        t.bar.togglePause()
+        answer(t.core, named("app/queue.pause"), Shapes.refusal("core.unreachable", "No core answered."))
+        verify(t.bar.notice.visible)
+        verify(t.bar.notice.text.startsWith("Couldn't pause GPU work"), t.bar.notice.text)
+
+        // Another lane, or the same state again, leaves it: it is still true.
+        const before = t.bar.jobs.laneUpdates
+        t.core.emit("jobs", "event", {kind: "queue", state: Shapes.lane({lane: "cpu", paused: true, reasons: ["manual"]})})
+        t.core.emit("jobs", "event", {kind: "queue", state: Shapes.lane()})
+        tryVerify(() => t.bar.jobs.laneUpdates > before)
+        verify(t.bar.notice.visible)
+
+        // The GPU lane's state changes: the notice describes a state that is gone.
+        t.core.emit("jobs", "event", {kind: "queue", state: Shapes.lane({paused: true, reasons: ["manual"]})})
+        tryVerify(() => !t.bar.notice.visible)
+        compare(t.bar.pauseButton.text, "Resume GPU work")
+
+        // What another part of the bar said stays.
+        t.bar.showNotice("Quay is now your default workspace.", "ok")
+        t.core.emit("jobs", "event", {kind: "queue", state: Shapes.lane()})
+        tryCompare(t.bar.pauseButton, "text", "Pause GPU work")
+        verify(t.bar.notice.visible)
+    }
+
+    function test_a_panel_shortcut_closes_an_open_switcher_list() { // spec: APP-006, APP-156
+        const core = createTemporaryObject(fakeComponent, tc, {workspace: workspaceOne})
+        const shell = createTemporaryObject(shellComponent, tc, {core: core})
+        windows.push(shell)
+        shell.visible = true
+        tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
+        answerAllReads(core)
+        const sw = shell.topBar.workspaceSwitcher
+        for (const action of ["panel.jobs", "panel.next"]) {
+            mouseClick(sw.button)
+            tryVerify(() => sw.popup.opened)
+            answer(core, named("workspaces.list"), Shapes.tool({workspaces: Shapes.workspaceRows()}), "workspaces.list")
+            tryVerify(() => sw.popup.view.activeFocus)
+            shell.runAction(action)
+            tryVerify(() => !sw.popup.visible, 2000, action + " takes the focus, so the list goes")
+            answerAllReads(core)
+        }
+    }
+
+    function test_a_refused_hello_is_named_the_same_in_the_bar_and_the_banner() { // spec: ARCH-100, APP-034
+        const t = load()
+        t.core.applyState({connection: "unavailable", unavailable: Shapes.refusedHello("workspace.unknown", "The folder is gone.")})
+        compare(t.bar.connectionIndicator.text, "Workspace refused")
+        compare(t.bar.connectionIndicator.kind, "danger")
+        t.core.applyState({connection: "unavailable", unavailable: Shapes.otherCause("start_failed", "The core exited.")})
+        compare(t.bar.connectionIndicator.text, "Core unavailable", "other causes keep their words")
+    }
+
+    function test_the_window_title_names_the_project_as_the_bar_does() { // spec: APP-164, ARCH-088
+        const core = createTemporaryObject(fakeComponent, tc, {workspace: workspaceOne})
+        const shell = createTemporaryObject(shellComponent, tc, {core: core})
+        windows.push(shell)
+        shell.visible = true
+        tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
+        answerAllReads(core)
+        answer(core, isContextRead, Shapes.context(workspaceOne, null, "harbor"))
+        compare(shell.title, "LILITH — harbor")
+
+        // Once the list says its name, the bar and the title both use it.
+        const sw = shell.topBar.projectSwitcher
+        mouseClick(sw.button)
+        tryVerify(() => sw.popup.opened)
+        // Home reads the list too: every read out gets the answer.
+        tryVerify(() => open(core, named("projects.list")).length > 0, 2000, "projects.list")
+        for (const c of open(core, named("projects.list"))) {
+            answered[c.id] = true
+            core.respond(c.id, Shapes.tool({projects: [{project: "harbor", name: "Harbor Town", status: "active", assets: 1}]}))
+        }
+        tryCompare(sw, "currentName", "Harbor Town")
+        compare(shell.title, "LILITH — Harbor Town")
+
+        // A stale slug in Core.project is not what the bar shows, nor the title.
+        core.noteProject("old")
+        compare(sw.currentName, "Harbor Town")
+        compare(shell.title, "LILITH — Harbor Town")
+
+        // No workspace, no project.
+        core.applyState({connection: "ready", workspace: null})
+        compare(shell.title, "LILITH")
     }
 
     function test_core_keeps_the_noted_project() { // spec: ARCH-088

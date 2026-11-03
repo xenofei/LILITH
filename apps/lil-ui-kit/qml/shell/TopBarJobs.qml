@@ -49,6 +49,11 @@ Item {
     signal jobEnded()
     // The core refused a read with `workspace.unsupported`: it no longer serves this workspace.
     signal workspaceRefused(string message)
+    // A read was served. `epoch` is the owner's `refusalEpoch` when it began: the owner ends a
+    // refusal only for a read made after it.
+    signal served(int epoch)
+    // The owner's count of the refusals it has been told of.
+    property int refusalEpoch: 0
 
     readonly property int _maxWaitMs: 1000
     readonly property bool _connected: !!core && core.connection === "ready"
@@ -115,6 +120,7 @@ Item {
         const fresh = _fresh
         const stale = _stale
         const losses = _losses
+        const epoch = refusalEpoch
         _fresh = false
         _stale = false
         _reading = true
@@ -132,6 +138,9 @@ Item {
             root.applyLanes(Object.keys(root._lanesDuringRead).map(k => root._lanesDuringRead[k]))
             if (stale && !root._stale && losses === root._losses && root._connected)
                 root.current = true
+            if (losses === root._losses && root._connected
+                    && asked === (root.core.workspace ? String(root.core.workspace.id) : ""))
+                root.served(epoch)
             if (root._again) {
                 root._again = false
                 if (root._stale)
@@ -187,7 +196,8 @@ Item {
             queueEvent(data.state)
         } else if (data.kind === "job" && data.job) {
             const j = data.job
-            const change = live.applyJob(JSON.stringify({job_id: j.job_id, status: j.status, updated: j.updated}), 0)
+            const change = live.applyJob(JSON.stringify({job_id: j.job_id, status: j.status, substatus: j.substatus,
+                                                         updated: j.updated}), 0)
             if (change === 2)
                 requestRead()
             if (j.status === "succeeded" || j.status === "failed" || j.status === "cancelled")
