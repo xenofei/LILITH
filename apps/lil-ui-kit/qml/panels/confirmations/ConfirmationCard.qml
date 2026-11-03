@@ -40,9 +40,10 @@ LCard {
         return ConfirmInput.shownLine(String(text), max)
     }
 
+    // Each name from outside is isolated: its own letters can't reorder the words beside it.
     readonly property string actionTitle: !view ? _shown(confirmationId, 60)
-                                                : Words.ltr(whoText + " asks to run " + actionText)
-    readonly property string factsText: kindText + (view && view.project ? " · project " + _shown(view.project, 100) : "")
+                                                : Words.ltr(Words.isolate(whoText) + " asks to run " + Words.isolate(actionText))
+    readonly property string factsText: kindText + (view && view.project ? " · project " + Words.isolate(_shown(view.project, 100)) : "")
                                         + (countdownText !== "" ? " · " + countdownText : "")
 
     title: factsOutside ? "" : actionTitle

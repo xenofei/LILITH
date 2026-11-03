@@ -38,6 +38,12 @@ function ltr(text) {
     return "‎" + String(text).replace(/\n/g, "\n‎")
 }
 
+// A name from outside set apart from the words around it (a first strong isolate): right-to-left
+// letters in it lay out only the name, never the words or the countdown beside it.
+function isolate(text) {
+    return "⁨" + text + "⁩"
+}
+
 // "14:02" in local time, from an RFC 3339 time.
 function clock(iso) {
     return Qt.formatTime(new Date(iso), "HH:mm")
