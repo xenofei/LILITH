@@ -15,7 +15,8 @@ ListView {
     readonly property string errorText: list.error
         ? "Couldn't read the past confirmations: " + Words.errorWords(list.error, (t, n) => ConfirmInput.shownLine(t, n))
         : ""
-    readonly property Item errorItem: headerItem
+    // The line that says so (a Text), inside the list's header.
+    readonly property Item errorItem: headerItem ? headerItem.line : null
 
     activeFocusOnTab: true
     clip: true
@@ -28,17 +29,25 @@ ListView {
 
     QQC.ScrollBar.vertical: QQC.ScrollBar {}
 
-    header: Text {
+    // The header is as tall as the wrapped words: the Text sizes itself from its width, and the
+    // header follows the Text, never the other way round.
+    header: Item {
+        readonly property alias line: line
         width: ListView.view.width
-        height: visible ? implicitHeight + Theme.spacing : 0
-        visible: text !== ""
-        text: root.errorText
-        textFormat: Text.PlainText
-        color: Theme.textMuted
-        font.pixelSize: Theme.fontSize
-        wrapMode: Text.Wrap
-        Accessible.role: Accessible.StaticText
-        Accessible.name: text
+        height: line.visible ? line.contentHeight + Theme.spacing : 0
+
+        Text {
+            id: line
+            width: parent.width
+            visible: text !== ""
+            text: root.errorText
+            textFormat: Text.PlainText
+            color: Theme.textMuted
+            font.pixelSize: Theme.fontSize
+            wrapMode: Text.Wrap
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
     }
 
     delegate: Rectangle {
