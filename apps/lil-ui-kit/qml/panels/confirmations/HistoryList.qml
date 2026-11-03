@@ -1,5 +1,6 @@
 // The Confirmations panel's History tab (APP-046): past answers, newest first, each with how it was
-// given (`confirmed_via`). One tab stop; its rows are named for a screen reader.
+// given (`confirmed_via`). One tab stop; its rows are named for a screen reader. While the lists
+// can't be read (a history too large for the core to send, say), the tab says so above its rows.
 import QtQuick
 import QtQuick.Controls.Basic as QQC
 import Lilith.Core
@@ -10,6 +11,11 @@ ListView {
     id: root
 
     required property var list
+    // Why the lists couldn't be read, shown text; empty once a read is in.
+    readonly property string errorText: list.error
+        ? "Couldn't read the past confirmations: " + Words.errorWords(list.error, (t, n) => ConfirmInput.shownLine(t, n))
+        : ""
+    readonly property Item errorItem: headerItem
 
     activeFocusOnTab: true
     clip: true
@@ -21,6 +27,19 @@ ListView {
     Accessible.name: "Past confirmations"
 
     QQC.ScrollBar.vertical: QQC.ScrollBar {}
+
+    header: Text {
+        width: ListView.view.width
+        height: visible ? implicitHeight + Theme.spacing : 0
+        visible: text !== ""
+        text: root.errorText
+        textFormat: Text.PlainText
+        color: Theme.textMuted
+        font.pixelSize: Theme.fontSize
+        wrapMode: Text.Wrap
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+    }
 
     delegate: Rectangle {
         id: row

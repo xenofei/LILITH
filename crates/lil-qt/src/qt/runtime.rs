@@ -21,7 +21,8 @@
 //!   calls watch. A `resync_required` on it (a reconnect to another core, an overflow) makes a
 //!   pending call read `app/confirmations.list`, so an answer given while the app was away is
 //!   still found (Review Focus 1). That read-only list is the one `app_call` the bridge makes
-//!   again: after a failure, 1 s later at first, doubling to 30 s, until it is read.
+//!   again: after a failure, 1 s later at first, doubling to 30 s, until it is read. A protocol
+//!   fault (a list too large to send) would only come again, so the call ends with it instead.
 //! - **Events.** Each topic counts its QML subscribers ([`Runtime::subscribe`], [`Topics`]): the
 //!   session subscribes it for the first and unsubscribes it after the last (`confirmations`
 //!   never), so a panel that stops following a topic never stops another's events. A subscribe
@@ -45,9 +46,10 @@ use std::time::Duration;
 
 use lil_client::session::{Session, SessionState, UnavailableCause};
 use lil_client::{ClientConfig, ClientError};
-use lil_protocol::codes::{CONFIRM_EXPIRED, PARAMS_INVALID};
+use lil_protocol::codes::{CONFIRM_EXPIRED, CORE_BUG, PARAMS_INVALID};
 use lil_protocol::{
-    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, NO_WORKSPACE, Outcome, ToolOutput,
+    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, NO_WORKSPACE, Outcome,
+    ToolOutput, rpc_code,
 };
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -905,6 +907,10 @@ async fn wait_for_answer(
                     }
                 }
                 Err(e) => {
+                    if let Some(step) = snapshot_failed(&e, trace) {
+                        tracing::warn!(error = %e, confirmation = call.confirmation_id(), "the confirmations can't be read; the call stops waiting");
+                        return step;
+                    }
                     tracing::debug!(error = %e, confirmation = call.confirmation_id(), "the confirmations snapshot failed; it is read again");
                     failed = true;
                 }
@@ -942,6 +948,25 @@ async fn wait_for_answer(
             () = retry => {}
         }
     }
+}
+
+/// What a pending call does when its snapshot of the confirmations failed with `e`. A protocol
+/// fault (above all a list too large to send, which the core answers -32603, ARCH-025) would
+/// fail the same way at every read, so the call ends with it; anything else (a lost connection,
+/// a busy state database) is `None`: read it again later.
+fn snapshot_failed(e: &ClientError, trace: &str) -> Option<PendingStep> {
+    let ClientError::Protocol(_) = e else {
+        return None;
+    };
+    let mut error = client_error(e, trace);
+    error.message = format!(
+        "The call stopped waiting for its confirmation: the confirmations couldn't be read. {}",
+        error.message
+    );
+    let outcome: Outcome<Value> = Outcome::Error { error };
+    Some(PendingStep::Settle(
+        serde_json::to_value(outcome).expect("an outcome serialises"),
+    ))
 }
 
 /// The ids of the pending confirmations, and the answered ones with their state.
@@ -1209,6 +1234,28 @@ mod tests {
         gui.push(event("test:a", 2, 1));
         let st = lock(&gui.state);
         assert!(st.gone && st.waiting.is_empty());
+    }
+
+    /// PROTO-2: a confirmations list the core can't send (over the line cap, -32603) would fail
+    /// the same way at every read, so a pending call whose snapshot gets it ends with the error
+    /// instead of reading again forever. A lost connection is still read again.
+    #[test] // spec: APP-029, ARCH-025
+    fn a_snapshot_the_core_cant_send_ends_the_pending_call() {
+        let over = ClientError::Protocol(lil_protocol::RpcError::new(
+            rpc_code::INTERNAL_ERROR,
+            "internal error: the response was too large to send",
+        ));
+        let Some(PendingStep::Settle(outcome)) = snapshot_failed(&over, "tr_1") else {
+            panic!("an over-cap list is read again forever");
+        };
+        assert_eq!(outcome["status"], "error", "{outcome}");
+        assert_eq!(outcome["error"]["code"], CORE_BUG.code, "{outcome}");
+        assert_eq!(outcome["error"]["trace_id"], "tr_1", "{outcome}");
+        let message = outcome["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("couldn't be read"), "{message}");
+        assert!(message.contains("too large"), "{message}");
+        assert_eq!(snapshot_failed(&ClientError::Closed, "tr_1"), None);
+        assert_eq!(snapshot_failed(&ClientError::NotConnected, "tr_1"), None);
     }
 
     #[test] // spec: APP-028
