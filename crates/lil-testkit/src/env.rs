@@ -20,8 +20,8 @@
 //! ([`sweep_test_registry_roots`]). That first `TestEnv` also sweeps the old folders killed
 //! tests left, `lil-testenv-*` in the temporary folder and `LILITH-test-<id>` in the real local
 //! folder ([`folders_to_sweep`]: only a folder at least an hour old whose channel has no live
-//! owner), a few at a time under a cross-process lock, and cuts the leftovers log to its tail
-//! when it is long ([`trim_log`]).
+//! owner), a few at a time under a cross-process lock, and, when the leftovers log is long,
+//! renames it to `<log>.old` and cuts that copy to its tail ([`trim_log`]).
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
@@ -589,7 +589,8 @@ impl Drop for TestEnv {
     /// temporary directory and this channel's Qt cache folder (`LILITH-test-<id>` in the real
     /// local app-data folder) with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
     /// another handle still holds a file, and reports what it had to leave, each folder under
-    /// its own path, on stderr and in [`crate::cleanup::leftovers_log`]. Never panics. After [`TestEnv::close`] it does nothing.
+    /// its own path, on stderr and in [`crate::cleanup::leftovers_log`]. Never panics. After
+    /// [`TestEnv::close`] it does nothing.
     fn drop(&mut self) {
         if !self.closed {
             let _ = self.clean_up();
@@ -614,7 +615,8 @@ const QT_CACHE_PREFIX: &str = "LILITH-test-";
 /// holding its test up for all of them.
 const SWEEP_FOLDERS_PER_PASS: usize = 40;
 
-/// The leftovers log is cut to [`LOG_KEEP`] bytes once it is over [`LOG_LIMIT`].
+/// The leftovers log is renamed to `<log>.old`, and that copy cut to [`LOG_KEEP`] bytes, once the
+/// log is over [`LOG_LIMIT`].
 const LOG_LIMIT: u64 = 4 * 1024 * 1024;
 const LOG_KEEP: u64 = 1024 * 1024;
 
@@ -860,7 +862,14 @@ pub fn trim_log(path: &Path, over: u64, keep: u64) -> std::io::Result<bool> {
         .iter()
         .position(|b| *b == b'\n')
         .map_or(tail.len(), |i| i + 1);
-    std::fs::write(&old, &tail[from..])?;
+    // Through a temporary file and a rename, so a kill part-way leaves the earlier copy whole.
+    let mut cut = old.as_os_str().to_owned();
+    cut.push(".cut");
+    let cut = PathBuf::from(cut);
+    std::fs::write(&cut, &tail[from..])?;
+    std::fs::rename(&cut, &old).inspect_err(|_| {
+        let _ = std::fs::remove_file(&cut);
+    })?;
     Ok(true)
 }
 

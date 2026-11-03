@@ -383,17 +383,8 @@ fn the_leftovers_log_is_trimmed_to_its_tail_over_the_limit() {
         .append(true)
         .open(&log)
         .unwrap();
-    std::io::Write::write_all(
-        &mut fresh,
-        b"a new report
-",
-    )
-    .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&log).unwrap(),
-        "a new report
-"
-    );
+    std::io::Write::write_all(&mut fresh, b"a new report\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "a new report\n");
     assert_eq!(std::fs::read_to_string(&old).unwrap(), kept);
 }
 

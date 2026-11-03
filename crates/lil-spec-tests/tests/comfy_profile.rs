@@ -50,6 +50,16 @@ fn launched_argv(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The control fake, killed and waited for when this goes out of scope, however the test ends.
+struct ControlFake(std::process::Child);
+
+impl Drop for ControlFake {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// How long `lil-fake-comfyui` takes, started the way the core starts it, to write its file: a
 /// control, so a check that no process started waits for as long as one would take on this
 /// machine now, not for a fixed time.
@@ -58,21 +68,21 @@ fn fake_start_latency(env: &TestEnv) -> std::time::Duration {
     std::fs::create_dir_all(&dir).unwrap();
     let port = lil_testkit::free_loopback_port().to_string();
     let started = std::time::Instant::now();
-    let mut fake = std::process::Command::new(ensure_built().fake_comfyui.clone())
-        .args(["main.py", "--listen", "127.0.0.1", "--port", port.as_str()])
-        .current_dir(&dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("the fake ComfyUI starts");
-    poll("the control fake's file", || {
-        dir.join("fake-comfyui.json").exists().then_some(())
-    });
-    let latency = started.elapsed();
-    let _ = fake.kill();
-    let _ = fake.wait();
-    latency
+    let _fake = ControlFake(
+        std::process::Command::new(ensure_built().fake_comfyui.clone())
+            .args(["main.py", "--listen", "127.0.0.1", "--port", port.as_str()])
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the fake ComfyUI starts"),
+    );
+    poll(
+        "the CONTROL fake (started by the test, not by the core) to write its file",
+        || dir.join("fake-comfyui.json").exists().then_some(()),
+    );
+    started.elapsed()
 }
 
 #[test] // spec: ARCH-126
@@ -144,8 +154,9 @@ fn enable_assets_in_extra_args_stops_the_start() {
             "the message names {flag}: {refused}"
         );
         // A process the refusal started would write its file about `latency` after the start,
-        // as the control did: wait three times that, and the same again for the core's own
-        // work, before looking.
+        // as the control did: wait four times that before looking. Limit: a refusal that
+        // spawns the process and then kills it at once (its job closing) writes no file, and
+        // the start leaves nothing else this crate can read before that, so it isn't seen.
         std::thread::sleep(latency * 4);
         assert!(
             !root.join("fake-comfyui.json").exists(),
