@@ -6,7 +6,10 @@
 //   restart LILITH on its newer build. An older core is one this app failed to replace itself (a start
 //   that failed): "restart the core when it's idle" (APP-036), and "Try again" (`Core.retryNow`) is
 //   how, since its attempt may start a core and so drains and replaces the older one once it is idle.
-//   Nothing reconnects by itself after `lil core stop`.
+//   Nothing reconnects by itself after `lil core stop`. The session stays `incompatible` while it
+//   does, so the banner says it is trying, until the state changes or `retryShownMs` is out (the
+//   client waits at most 60 s). A protocol it can't read says no direction and offers no button:
+//   the client treats it as not older, and would only be incompatible again.
 // - `unavailable`: the real cause, from `Core.unavailable`. "Try again" (`Core.retryNow`: after a
 //   failed start the session only looks for a core someone else started until then) shows where it
 //   can help. A hello refused over its workspace would only be refused again, so that offers "Use the
@@ -28,7 +31,9 @@ LBanner {
 
     // The protocol major this app speaks (lil_protocol::session::PROTOCOL).
     readonly property int appMajor: 1
-    readonly property bool coreIsNewer: core ? parseInt(String(core.coreProtocol)) > appMajor : false
+    readonly property real coreMajor: core ? parseInt(String(core.coreProtocol)) : NaN
+    readonly property bool coreIsNewer: coreMajor > appMajor
+    readonly property bool coreIsOlder: coreMajor < appMajor
     readonly property string connection: core ? core.connection : ""
     readonly property var cause: core && connection === "unavailable" ? core.unavailable : null
     readonly property bool refusedWorkspace: CoreGate.refusedWorkspace(core)
@@ -36,6 +41,10 @@ LBanner {
     property alias retryButton: retryButton
     property alias defaultButton: defaultButton
     property string _useError
+    // "Try again" was pressed on an older core and the session has not changed state since.
+    property bool _retrying: false
+    // How long that is shown if nothing changes: the client's own wait is 60 s.
+    property int retryShownMs: 65000
 
     closable: false
     kind: connection === "reconnecting" ? "warning" : "danger"
@@ -49,14 +58,19 @@ LBanner {
             if (coreIsNewer)
                 return "This app is older than the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
                        + "). Restart LILITH to use it."
+            if (!coreIsOlder)
+                return "This app can't use the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
+                       + "). Restart LILITH, and the core when it's idle."
+            if (_retrying)
+                return "Trying again: replacing the core once nothing is running…"
             return "This app can't use the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
                    + "). Restart the core when it's idle: Try again replaces it once nothing is running."
         case "unavailable":
             if (_useError !== "")
                 return _useError
-            if (refusedWorkspace)
-                return "The core refused this workspace: " + reason
-            return reason !== "" ? "The core isn't available: " + reason : "The core isn't available."
+            // The core's own lead, for the bar's label as well (runtime.rs `unavailable_json`).
+            const lead = cause && cause.lead ? cause.lead : "The core isn't available"
+            return reason !== "" ? lead + ": " + reason : lead + "."
         case "ready":
             if (movedReason === "")
                 return ""
@@ -69,7 +83,10 @@ LBanner {
         if (text !== "")
             announce()
     }
-    onConnectionChanged: _useError = ""
+    onConnectionChanged: {
+        _useError = ""
+        _retrying = false
+    }
     // A failed try belongs to the refusal it was made for.
     onMovedReasonChanged: _useError = ""
 
@@ -84,15 +101,29 @@ LBanner {
         })
     }
 
+    Timer {
+        id: retryShown
+        interval: root.retryShownMs
+        onTriggered: root._retrying = false
+    }
+
     actions: [
         LButton {
             id: retryButton
             primary: true
             visible: root.connection === "unavailable" && !root.refusedWorkspace
                      && !(root.cause && root.cause.retry === "never")
-                     || root.connection === "incompatible" && !root.coreIsNewer
+                     || root.connection === "incompatible" && root.coreIsOlder
+            enabled: !root._retrying
             text: "Try again"
-            onClicked: root.core.retryNow()
+            onClicked: {
+                root.core.retryNow()
+                // The state doesn't change while an older core is replaced: say that it is working.
+                if (root.connection === "incompatible") {
+                    root._retrying = true
+                    retryShown.restart()
+                }
+            }
         },
         LButton {
             id: defaultButton

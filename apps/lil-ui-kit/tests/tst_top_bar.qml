@@ -47,6 +47,11 @@ TestCase {
         ShellWindow {}
     }
 
+    Component {
+        id: spyComponent
+        SignalSpy {}
+    }
+
     A11yWalk { id: walk }
 
     // Request ids answered in this test.
@@ -662,6 +667,7 @@ TestCase {
 
     function test_make_this_the_default_then_a_new_hello() { // spec: APP-006, ARCH-030, ARCH-090
         const t = load()
+        const failed = createTemporaryObject(spyComponent, tc, {target: t.bar.workspaceSwitcher, signalName: "defaultSwitchFailed"})
         compare(t.bar.workspaceSwitcher.button.text, "harbor ▾", "the folder's name until the list says more")
         const sw = openWorkspaces(t)
         compare(t.bar.workspaceSwitcher.currentName, "Harbor")
@@ -694,6 +700,9 @@ TestCase {
         verify(t.bar.notice.visible, "the UI says what happened")
         compare(t.bar.notice.text, "Quay is now your default workspace, and the app has switched to it.")
         compare(t.bar.notice.kind, "ok")
+        compare(t.bar.movedReason, "", "a switch that worked is no refusal")
+        compare(t.bar.connectionIndicator.text, "Connected")
+        compare(failed.count, 0, "defaultSwitchFailed is only for a failed hello")
 
         // The session's reload follows its mark, as every panel's does.
         t.core.emit("jobs", "resync_required", null)
@@ -1602,6 +1611,32 @@ TestCase {
         compare(t.bar.connectionIndicator.kind, "danger")
         t.core.applyState({connection: "unavailable", unavailable: Shapes.otherCause("start_failed", "The core exited.")})
         compare(t.bar.connectionIndicator.text, "Core unavailable", "other causes keep their words")
+    }
+
+    function test_the_bar_names_a_refused_hello_by_the_cores_label() { // spec: ARCH-100, APP-034
+        const t = load()
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "Gone.", cause: "refused", code: "workspace.unknown",
+                                                                    retry: "after_resolve", label: "Their label", lead: "Their lead"}})
+        compare(t.bar.connectionIndicator.text, "Their label")
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "Down.", cause: "other", label: "Other label", lead: "Other lead"}})
+        compare(t.bar.connectionIndicator.text, "Other label")
+    }
+
+    // A failed spend read says so unless the connection cut the call; the core's protocol faults
+    // (params.invalid, core.bug) are real failures of a read made while connected.
+    function protocolFaultIsAFailedRead(code) {
+        const t = load({unanswered: true})
+        answer(t.core, named("caps.get"), Shapes.refusal(code, "The core said no."))
+        tryCompare(t.bar.spendIndicator, "text", "Spend —", 2000, code)
+        compare(t.bar.spendIndicator.kind, "muted")
+    }
+
+    function test_a_params_invalid_fault_is_a_failed_spend_read() { // spec: APP-006, ARCH-100
+        protocolFaultIsAFailedRead("params.invalid")
+    }
+
+    function test_a_core_bug_fault_is_a_failed_spend_read() { // spec: APP-006, ARCH-100
+        protocolFaultIsAFailedRead("core.bug")
     }
 
     function test_the_window_title_names_the_project_as_the_bar_does() { // spec: APP-164, ARCH-088

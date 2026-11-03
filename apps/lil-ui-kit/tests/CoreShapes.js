@@ -23,6 +23,7 @@ const codes = {
     "store.io": ["transient", "same_idempotency_key"],
     "caller.not_allowed": ["declined", "never"],
     "params.invalid": ["user_fixable", "after_resolve"],
+    "core.bug": ["bug", "never"],
 }
 
 function errorBody(code, message) {
@@ -137,14 +138,19 @@ function workspaceRows() {
             {id: "ws6", path: "D:/art/locked", default: false, served: false, missing: false, problem: "unreadable"}]
 }
 
-// Core.unavailable (runtime.rs): a hello refused over its workspace, whose message is the core's
-// (workspace.rs), and any other cause.
+// Core.unavailable (runtime.rs `unavailable_json`): a hello refused over its workspace, whose message
+// is the core's (workspace.rs), and any other cause. `label` (the bar's) and `lead` (the banner's)
+// are the core's constants: REFUSED_WORKSPACE_* for a refusal with a `workspace.*` code, else
+// UNAVAILABLE_*.
 function refusedHello(code, message) {
-    return {reason: message, cause: "refused", code: code, retry: "after_resolve"}
+    const ws = code.startsWith("workspace.")
+    return {reason: message, cause: "refused", code: code, retry: "after_resolve",
+            label: ws ? "Workspace refused" : "Core unavailable",
+            lead: ws ? "The core refused this workspace" : "The core isn't available"}
 }
 
 function otherCause(cause, reason) {
-    return {reason: reason, cause: cause}
+    return {reason: reason, cause: cause, label: "Core unavailable", lead: "The core isn't available"}
 }
 
 // `project.status` (projects/mod.rs ProjectStatus): only the statuses that have assets are listed.

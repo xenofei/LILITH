@@ -36,7 +36,6 @@ import QtQuick
 import QtQuick.Controls.Basic as QQC
 import Lilith.Core
 import Lilith.UiKit
-import "../core/CoreGate.js" as CoreGate
 import "../panels/hardware/HardwareFormat.js" as Format
 import "../panels/jobs/PausedText.js" as PausedText
 
@@ -164,7 +163,9 @@ Rectangle {
         case "connecting": return "Connecting…"
         case "reconnecting": return "Reconnecting…"
         case "incompatible": return "Core incompatible"
-        default: return CoreGate.refusedWorkspace(core) ? "Workspace refused" : "Core unavailable"
+        // The core words its own states (runtime.rs `unavailable_json`), the bar's and the banner's alike.
+        case "unavailable": return core.unavailable && core.unavailable.label ? core.unavailable.label : "Core unavailable"
+        default: return "Core unavailable"
         }
     }
 

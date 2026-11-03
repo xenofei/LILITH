@@ -230,7 +230,8 @@ TestCase {
         verify(!banner.visible)
 
         // A refusal marked `never` can't be retried.
-        t.core.applyState({connection: "unavailable", unavailable: {reason: "No.", cause: "refused", code: "core.refused", retry: "never"}})
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "No.", cause: "refused", code: "core.refused", retry: "never",
+                                                                        label: "Core unavailable", lead: "The core isn't available"}})
         verify(!banner.retryButton.visible)
 
         // A failed proof, in `ClientError::Untrusted`'s words: the cut at 300 only costs the path.
@@ -430,6 +431,55 @@ TestCase {
         verify(banner.visible)
         answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: []}), "read again")
         verify(banner.text.indexOf("It still can't be found.") < 0, banner.text)
+    }
+
+    function test_the_banner_leads_with_the_cores_own_words() { // spec: ARCH-100, APP-034
+        // The core says how to name its refusal (`lead`), as it does for the bar (`label`): the
+        // banner holds none of its own for a state that has them.
+        const t = load()
+        const banner = t.shell.connectionBanner
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "Nope.", cause: "other", label: "L1", lead: "Lead one"}})
+        compare(banner.text, "Lead one: Nope.")
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "", cause: "other", label: "L1", lead: "Lead one"}})
+        compare(banner.text, "Lead one.")
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "Gone.", cause: "refused", code: "workspace.unknown",
+                                                                    retry: "after_resolve", label: "L2", lead: "Lead two"}})
+        compare(banner.text, "Lead two: Gone.")
+        compare(t.shell.topBar.connectionIndicator.text, "L2")
+    }
+
+    function test_try_again_on_an_older_core_shows_that_it_is_working() { // spec: APP-036, ARCH-023
+        const t = load()
+        const banner = t.shell.connectionBanner
+        banner.retryShownMs = 400
+        t.core.applyState({connection: "incompatible", coreProtocol: "0.9"})
+        waitForItemPolished(banner.retryButton.parent)
+        wait(50)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 1)
+        verify(banner.text.indexOf("Trying again") >= 0, banner.text)
+        verify(!banner.retryButton.enabled, "one attempt at a time")
+        // It may end where it began (still incompatible): the words and the button come back.
+        tryVerify(() => banner.text.indexOf("Trying again") < 0, 3000, banner.text)
+        verify(banner.retryButton.enabled)
+        // A state change ends it at once.
+        mouseClick(banner.retryButton)
+        verify(banner.text.indexOf("Trying again") >= 0, banner.text)
+        t.core.applyState({connection: "connecting"})
+        verify(banner.text.indexOf("Trying again") < 0, banner.text)
+    }
+
+    function test_a_core_protocol_that_cant_be_read_offers_no_try_again() { // spec: APP-036, ARCH-023
+        // The client treats it as not older and would only be incompatible again.
+        const t = load()
+        const banner = t.shell.connectionBanner
+        for (const protocol of ["", "abc"]) {
+            t.core.applyState({connection: "incompatible", coreProtocol: protocol})
+            verify(banner.visible)
+            verify(!banner.retryButton.visible, "no button for protocol '" + protocol + "'")
+            verify(banner.text.indexOf("Try again") < 0, banner.text)
+            verify(banner.text.indexOf("This app can't use the running core") >= 0, banner.text)
+        }
     }
 
     function test_connecting_shows_no_banner() { // spec: APP-033
