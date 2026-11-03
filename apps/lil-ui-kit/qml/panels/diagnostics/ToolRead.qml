@@ -7,13 +7,15 @@
 //   apply as full state or to `request()` a read.
 // - `request()` is at most one read a second: the first of a burst at once, the rest as one read
 //   when the second has passed. Reads don't overlap.
-// - After a failed read (`error` set, none open), a `request()` made from this ToolRead's own
-//   `topicEvent` doesn't read at once: a failed read can itself be what the topic's next event reports,
-//   so reading for each event would loop. Such requests wait for the backoff window that began at the
-//   failure (`backoffStartMs`, doubling with each consecutive failure up to `backoffMaxMs`) and are
-//   coalesced into one read when it ends; a successful read resets the delay. Only that request is
-//   gated: a card's request on another ToolRead (from this one's `topicEvent`), a reload, the session
-//   coming ready, the panel shown again, and an event while a read is open are not.
+// - After a failed read (`error` set), a `request()` made from this ToolRead's own `topicEvent` doesn't
+//   read at once: a failed read can itself be what the topic's next event reports, so reading for each
+//   event would loop. Such requests wait for the backoff window that began at the failure
+//   (`backoffStartMs`, doubling with each consecutive failure up to `backoffMaxMs`) and are coalesced
+//   into one read when it ends; a successful read resets the delay. A read that fails never schedules
+//   its own re-read: a request that came while it was open waits for the window too. An event during a
+//   read that succeeds still gets its one follow-up read. Not gated: a card's request on another
+//   ToolRead (from this one's `topicEvent`), a reload, the session coming ready and the panel shown
+//   again.
 // - An answer can be older than an event: a card that applies an event as full state calls
 //   `eventApplied()`. `answered(structured, current)` then has `current` false for a read that was
 //   open at that moment, the card keeps the event's state, and a fresh read follows.
@@ -39,8 +41,8 @@ QtObject {
     property bool loaded: false
 
     readonly property int showIntervalMs: 2000
-    readonly property int backoffStartMs: 1000
-    readonly property int backoffMaxMs: 30000
+    property int backoffStartMs: 1000
+    property int backoffMaxMs: 30000
 
     signal topicEvent(var data)
     signal reloading()
@@ -90,6 +92,11 @@ QtObject {
                                                             : Math.min(root._failDelayMs * 2, root.backoffMaxMs)
                 root._backoff.interval = root._failDelayMs
                 root._backoff.restart()
+                // A request that came while this read was open waits for the window, never read now.
+                if (root._due) {
+                    root._due = false
+                    root._eventDue = true
+                }
                 root._settled()
             }
         })

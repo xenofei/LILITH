@@ -487,52 +487,72 @@ TestCase {
     }
 
     // PROTO-1: a refused session's read is recorded as an error, which is an event, which read again.
-    // After a failed read the card reads again for events only as its backoff allows (1 s, doubling),
-    // events inside the window coalesced into one read, and it recovers by itself once a read works.
-    function test_a_failed_errors_read_backs_off_and_recovers_on_an_event() { // spec: ARCH-121, APP-033
+    // After a failed read the card reads again for events only as its backoff allows (1 s, doubling to
+    // a cap), requests inside the window coalesced into one read at its end, and it recovers by itself
+    // once a read works. The windows are timed from each failure, which the test answers itself.
+    function test_a_failing_errors_read_backs_off_up_to_a_cap_and_recovers() { // spec: ARCH-121, APP-033
         const core = makeCore()
         const panel = makePanel(core)
-        const refused = failed({code: "workspace.unsupported", message: "This core serves only the default workspace."})
-        const event = () => core.emit("diagnostics", "event", {kind: "error", code: "workspace.unsupported", at: "2026-10-30T10:00:00Z"})
-        load(core, {"diagnostics.recent": refused})
-        tryVerify(() => shows(panel.errors, "This core serves only the default workspace."), 5000, texts(panel.errors).join(" | "))
-        const reads = callsOf(core, "diagnostics.recent").length
-
-        // A burst inside the first window (1 s) reads nothing; at its end, one read.
-        for (let n = 0; n < 3; ++n)
-            event()
-        wait(500)
-        compare(callsOf(core, "diagnostics.recent").length, reads, "no 1 Hz loop: nothing inside the window")
-        tryVerify(() => callsOf(core, "diagnostics.recent").length === reads + 1, 3000)
-        answer(core, isTool("diagnostics.recent"), refused)
-
-        // It failed again: the window is 2 s now, and a burst inside it is still one read at its end.
-        for (let n = 0; n < 3; ++n)
-            event()
-        wait(1300)
-        compare(callsOf(core, "diagnostics.recent").length, reads + 1, "the second window is longer")
-        tryVerify(() => callsOf(core, "diagnostics.recent").length === reads + 2, 3000)
-        // The cause has cleared: the read works, and the card shows it with no reconnect or re-show.
-        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
+        panel.errors.errorsRead.backoffMaxMs = 2000
+        const refused = failed({code: "state.unavailable", message: "The workspace state can't be opened."})
+        const event = () => core.emit("diagnostics", "event", {kind: "error", code: "state.unavailable", at: "2026-10-30T10:00:00Z"})
+        const calls = () => callsOf(core, "diagnostics.recent").length
+        const recent = isTool("diagnostics.recent")
+        load(core)
         tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
-        verify(!shows(panel.errors, "This core serves only the default workspace."))
+        const base = calls()
 
-        // A success resets the delay: the next event reads at once (past the one-second gate).
-        wait(1100)
+        // The first failure. A burst right after it, inside its 1 s window, reads nothing; at the
+        // window's end, one read.
         event()
-        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
-        compare(callsOf(core, "diagnostics.recent").length, reads + 3)
+        answer(core, recent, refused)
+        for (let n = 0; n < 3; ++n)
+            event()
+        wait(400)
+        compare(calls(), base + 1, "no 1 Hz loop: nothing inside the window")
+        tryVerify(() => calls() === base + 2, 3000)
 
-        // A reload reads whatever the window says.
-        const failing = failed({code: "workspace.unsupported", message: "Refused again."})
-        wait(1100)
+        // An event arrives while that read is open, and the read fails: the window is 2 s now, and the
+        // failed read schedules no re-read of its own.
         event()
-        answer(core, isTool("diagnostics.recent"), failing)
-        tryVerify(() => shows(panel.errors, "Refused again."), 5000)
-        const before = callsOf(core, "diagnostics.recent").length
-        core.emit("diagnostics", "resync_required", null)
-        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
-        compare(callsOf(core, "diagnostics.recent").length, before + 1)
+        answer(core, recent, refused)
+        wait(1300)
+        compare(calls(), base + 2, "a failed read never re-reads at once; its window is longer now")
+        tryVerify(() => calls() === base + 3, 3000)
+
+        // It fails again: 4 s without a cap, 2 s with it.
+        answer(core, recent, refused)
+        event()
+        tryVerify(() => calls() === base + 4, 2600, "the window stops growing at its cap")
+
+        // The cause has cleared: the read works, with no reconnect or re-show.
+        answer(core, recent, ok({errors: []}))
+        verify(!shows(panel.errors, "The workspace state can't be opened."), texts(panel.errors).join(" | "))
+    }
+
+    // Hiding the panel forgets how long its card has been failing: after a show, the first failure's
+    // window is the shortest again.
+    function test_hiding_the_panel_resets_the_backoff() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        panel.errors.errorsRead.backoffMaxMs = 2000
+        const refused = failed({code: "state.unavailable", message: "The workspace state can't be opened."})
+        const event = () => core.emit("diagnostics", "event", {kind: "error", code: "state.unavailable", at: "2026-10-30T10:00:00Z"})
+        const calls = () => callsOf(core, "diagnostics.recent").length
+        const recent = isTool("diagnostics.recent")
+        load(core)
+        tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
+        event()
+        answer(core, recent, refused)
+
+        // Away and back: the show reads, and it fails. Reset, its window is 1 s; not reset, 2 s.
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        panel.visible = true
+        answer(core, recent, refused)
+        const reads = calls()
+        event()
+        tryVerify(() => calls() === reads + 1, 1600, "the first window after a show is the shortest")
     }
 
     // --- The event log --------------------------------------------------------------------------
