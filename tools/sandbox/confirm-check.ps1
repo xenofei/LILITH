@@ -78,6 +78,9 @@
   Anything left behind fails the run. Exit 0 only when every check passed and the cleanup was complete:
   -NoHand can't pass.
 
+  Every `lil` call is limited to 30 s (sandbox-common.ps1's Invoke-LilTimed), and no input or wait goes on
+  past the pop-up's cap less 30 s: the run stops with "out of the stretch's time" and cleans up.
+
   -DryRun starts no lil-image and shows no window or pop-up, and sends no input. It runs the guards' self
   test and the log's parsing, then every command-line step on the test channel (a core, which has no
   window: its confirmations, the retry that reads them, the cap and the core's restart), and cleans up.
@@ -111,6 +114,8 @@ function Fail([string]$what) {
     Save-Evidence $what
 }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
+# Invoke-LilTimed, the stretch's deadline, Retry-Walk and the masked log copy.
+. (Join-Path $PSScriptRoot 'sandbox-common.ps1')
 
 # --- The test channel ------------------------------------------------------------------------
 $channel = 'test-confirmcheck'
@@ -125,19 +130,19 @@ function Enter-TestChannel {
     foreach ($s in 'roaming', 'local', 'profile', 'places') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
     Set-Location -LiteralPath $root
     # With a fresh root no core of ours can answer; one that does isn't ours to touch.
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -eq 0 -and ($o -join "`n") -match 'pid \d+') { throw "$channel already has a core running: not touching it" }
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -eq 0 -and ($r.Output -join "`n") -match 'pid \d+') { throw "$channel already has a core running: not touching it" }
     $script:channelMine = $true
 }
 function Invoke-Lil([string[]]$a) {
-    $o = & $lil @a 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "lil $($a -join ' ') exited $LASTEXITCODE`: $($o -join ' ')" }
-    return ($o -join "`n")
+    $r = Invoke-LilTimed $a
+    if ($r.ExitCode -ne 0) { throw "lil $($a -join ' ') exited $($r.ExitCode): $($r.Output -join ' ')" }
+    return ($r.Output -join "`n")
 }
 function Get-CorePid {
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -ne 0) { return 0 }
-    $m = [regex]::Match(($o -join "`n"), 'pid (\d+), channel (\S+?)\)')
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -ne 0) { return 0 }
+    $m = [regex]::Match(($r.Output -join "`n"), 'pid (\d+), channel (\S+?)\)')
     if (-not $m.Success -or $m.Groups[2].Value -notlike '*confirmcheck*') { return 0 }
     $id = [int]$m.Groups[1].Value
     [void]$corePids.Add($id)
@@ -158,7 +163,7 @@ function Exit-TestChannel {
     if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
     if ($script:channelMine) {
         try { [void](Get-CorePid) } catch { }
-        try { [void](& $lil core stop 2>&1) } catch { }
+        try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
         Start-Sleep -Milliseconds 500
         try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     } else {
@@ -205,9 +210,9 @@ function Exit-TestChannel {
 $keys_ = @{}
 function New-Confirmation([string]$args_ = '{}', [string]$tool = 'test.destructive') {
     $key = [guid]::NewGuid().ToString('N')
-    $o = & $lil call $tool $args_ --idempotency-key $key 2>&1
-    if ($LASTEXITCODE -ne 4) { throw "$tool didn't wait for an answer (exit $LASTEXITCODE): $($o -join ' ')" }
-    $id = (($o -join "`n") | ConvertFrom-Json).confirmation_id
+    $r = Invoke-LilTimed @('call', $tool, $args_, '--idempotency-key', $key)
+    if ($r.ExitCode -ne 4) { throw "$tool didn't wait for an answer (exit $($r.ExitCode)): $($r.Output -join ' ')" }
+    $id = (($r.Output -join "`n") | ConvertFrom-Json).confirmation_id
     $keys_[$id] = @{ key = $key; args = $args_; tool = $tool }
     return $id
 }
@@ -215,12 +220,12 @@ function New-Confirmation([string]$args_ = '{}', [string]$tool = 'test.destructi
 # runs (`approved`).
 function Get-Answer([string]$id) {
     $c = $keys_[$id]
-    $o = & $lil call $c.tool $c.args --idempotency-key $c.key 2>&1
-    switch ($LASTEXITCODE) {
+    $r = Invoke-LilTimed @('call', $c.tool, $c.args, '--idempotency-key', $c.key)
+    switch ($r.ExitCode) {
         4 { return 'pending' }
         0 { return 'approved' }
         default {
-            $text = $o -join ' '
+            $text = $r.Output -join ' '
             if ($text -match 'confirm\.denied') { return 'denied' }
             return "other: $text"
         }
@@ -327,6 +332,7 @@ function Get-WindowProcessId([System.IntPtr]$hwnd) {
     return [int]$owner
 }
 function Assert-AppInFront {
+    Assert-InStretch
     for ($i = 0; $i -lt 5; ++$i) {
         if ((Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
         Start-Sleep -Milliseconds 200
@@ -334,6 +340,7 @@ function Assert-AppInFront {
     throw 'no input sent: another program''s window is in front'
 }
 function Assert-AppAt([int]$x, [int]$y) {
+    Assert-InStretch
     $point = [LilConfirmCheck.Win+POINT]::new()
     $point.X = $x
     $point.Y = $y
@@ -346,8 +353,16 @@ function Self-Test {
     $refused = 0
     try { Assert-AppInFront } catch { if ("$_" -like 'no input sent*') { ++$refused } }
     try { Assert-AppAt 0 0 } catch { if ("$_" -like 'no input sent*') { ++$refused } }
+    # Past the stretch's deadline, the guards stop before they look at any window.
+    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $late = 0
+    foreach ($guard in { Assert-AppInFront }, { Assert-AppAt 0 0 }) {
+        try { & $guard } catch { if ("$_" -like "out of the stretch's time*") { ++$late } }
+    }
+    $script:stopAt = $null
     $script:app = $null
     Check ($refused -eq 2) "self-test: the guards refuse a window that isn't the app's ($refused of 2)"
+    Check ($late -eq 2) "self-test: past the stretch's deadline the guards stop ($late of 2)"
 }
 function Save-Evidence([string]$what) {
     # Never for a dry run, and never able to mask the failure it records.
@@ -356,10 +371,10 @@ function Save-Evidence([string]$what) {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
         $stamp = (Get-Date).ToUniversalTime().ToString('HHmmssfff')
         $lines = @("failed: $what", "the window said: $(Get-WindowReason)", 'the log since this step:') + @(Get-LogSinceStep)
-        Set-Content -LiteralPath (Join-Path $DiagDir "failure-$stamp-evidence.txt") -Value $lines -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $DiagDir "failure-$stamp-evidence.txt") -Value @($lines | ForEach-Object { Hide-Paths $_ }) -Encoding utf8
         Save-UiaTree (Join-Path $DiagDir "failure-$stamp-uia.txt")
         $logs = Get-LogFolder
-        if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir "failure-$stamp-logs") -Recurse -Force }
+        if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$stamp-logs") }
         Write-Host "evidence in $DiagDir"
     } catch { Write-Host "the evidence wasn't saved: $_" }
 }
@@ -525,10 +540,11 @@ $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-confirmcheck-{0}.state" -f $
 $cueFile = "$state.cue"
 $what = if ($NoHand) { 'checks the confirm window (a window, synthesized clicks and keys)' }
         else { 'checks the confirm window (a window, synthesized clicks and keys). When this turns blue it needs you' }
+$capSec = 1800
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
                '-What', $what, '-WarnSec', '10', '-RunSec', '900',
-               '-CapSec', '1800', '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-CapSec', [string]$capSec, '-StateFile', $state, '-CueFile', $cueFile, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -538,6 +554,8 @@ while (-not (Test-Path -LiteralPath "$state.shown")) {
     if ((Get-Date) -gt $deadline) { throw 'the hands-off pop-up was not on screen within 30 s, so nothing ran' }
     Start-Sleep -Milliseconds 250
 }
+# From here no input goes after the pop-up's cap less 30 s.
+Start-Stretch $capSec
 Start-Sleep -Seconds 10
 
 # --- 2. The check --------------------------------------------------------------------------------
@@ -551,17 +569,12 @@ function Prop($p, $v) { [System.Windows.Automation.PropertyCondition]::new($p, $
 function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     $end = (Get-Date).AddSeconds($sec)
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $e = & $find
         if ($e) { return $e }
         Start-Sleep -Milliseconds 200
     }
     throw "timed out after $sec s waiting for $what"
-}
-# UI Automation can throw for a whole walk while the tree moves: such a walk is tried again.
-function Retry-Walk([scriptblock]$walk) {
-    for ($i = 0; ; ++$i) {
-        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
-    }
 }
 function Find-Named([string]$name) {
     return Retry-Walk { $script:main.FindFirst($TS::Descendants, (Prop $AE::NameProperty $name)) }
@@ -601,6 +614,7 @@ function Show-App {
     $end = (Get-Date).AddSeconds(240)
     $waited = $false
     while ($true) {
+        Assert-InStretch
         [void][LilConfirmCheck.Win]::SetForegroundWindow($hwnd)
         Start-Sleep -Milliseconds 800
         $holder = Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())
@@ -639,7 +653,12 @@ function Save-UiaTree([string]$path) {
 function Open-Window([string]$id, [string]$button = 'Approve') {
     Close-App
     $script:app = Start-Process -FilePath $image -ArgumentList @('--confirm', $id) -WorkingDirectory $root -PassThru
-    $findMain = { $AE::RootElement.FindFirst($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)) }
+    # A window: another top-level element of the app's process can't stand in for it.
+    $findMain = {
+        $AE::RootElement.FindFirst($TS::Children, [System.Windows.Automation.AndCondition]::new(
+            (Prop $AE::ProcessIdProperty $script:app.Id),
+            (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::Window))))
+    }
     $script:main = Wait-For $findMain 40 'the confirm window'
     $first = $script:main
     # The element is found again each time: one found while the window was being made can stay empty.
@@ -662,14 +681,15 @@ function Find-Deny {
 }
 # The pop-up is click-through, but it mustn't hide the window, whose title bar (j) needs: it sits at the
 # top of the primary screen, and takes up to 284 of the system's scaled pixels when it says what to do.
-# The whole window stays on the screen, or its clicks wouldn't count.
+# The whole window stays on the screen, or its clicks wouldn't count: one opened low, with its bottom
+# off the screen, is moved up as well.
 function Move-ClearOfPopUp {
     $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     $w = Get-Rect $script:main
     $clear = $work.Top + [int](300 * [LilConfirmCheck.Win]::GetDpiForSystem() / 96)
-    if ($w.Top -ge $clear -or $w.Left -ge $work.Right -or $w.Right -le $work.Left) { return }
-    $newTop = [math]::Min($clear, $work.Bottom - $w.Height)
-    if ($newTop -le $w.Top) { return }
+    if ($w.Left -ge $work.Right -or $w.Right -le $work.Left) { return }
+    $newTop = [math]::Min([math]::Max($w.Top, $clear), $work.Bottom - $w.Height)
+    if ([int]$newTop -eq [int]$w.Top) { return }
     $hwnd = [System.IntPtr]$script:main.Current.NativeWindowHandle
     [void][LilConfirmCheck.Win]::SetWindowPos($hwnd, [System.IntPtr]::Zero, [int]$w.Left, [int]$newTop, 0, 0, 0x0015)
     # The answer gate's half second starts again with a move.
@@ -716,9 +736,13 @@ $script:app = $null
 $script:main = $null
 $script:id = ''
 
-# A block of checks: a throw in it is recorded, and the next block still runs.
+# A block of checks: a throw in it is recorded, and the next block still runs. Out of the stretch's time
+# is not: no block may start, so it goes on up to the check's own catch and the cleanup.
 function Step([string]$name, [scriptblock]$body) {
-    try { . $body } catch { Fail "$name stopped: $_" }
+    try { . $body } catch {
+        if ("$_" -like "out of the stretch's time*") { throw }
+        Fail "$name stopped: $_"
+    }
 }
 # What a person sees: the pop-up's large blue text, and the console for whoever has one.
 # Whole or not at all: the pop-up reads the file four times a second.
@@ -753,6 +777,7 @@ function Wait-RealClick([string]$cue) {
     $said = ''
     $refusedSoFar = 0
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $answer = Get-Answer $script:id
         if ($answer -ne 'pending') { break }
         $left = [int]($end - (Get-Date)).TotalSeconds
@@ -804,6 +829,7 @@ function Wait-Front([bool]$ours) {
     $end = (Get-Date).AddSeconds($HandSec)
     $since = $null
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $front = Get-WindowProcessId ([LilConfirmCheck.Win]::GetForegroundWindow())
         if (($front -eq $script:app.Id) -eq $ours) {
             if (-not $since) { $since = Get-Date }
@@ -843,11 +869,18 @@ try {
             Start-Step
             $script:approve.SetFocus()
             Start-Sleep -Milliseconds 200
-            Send-Key ' '
-            Send-Key '{ENTER}'
-            Check ((Get-Answer $script:id) -eq 'pending') '(b) Space and Enter on Approve answered nothing'
-            Check (@(Get-Refusals | Where-Object { $_ -like '*"key"*' }).Count -ge 1) '(b) refusals named key in the log'
-            Check ((Get-WindowReason) -like 'No key answers Approve*') "(b) and the window says why: $(Get-WindowReason)"
+            if (-not $script:approve.Current.HasKeyboardFocus) {
+                # With the focus elsewhere, Space could press Deny and answer the confirmation later steps reuse.
+                $note = "(b) not checked: Approve didn't take the focus"
+                Write-Host $note
+                $results.Add($note)
+            } else {
+                Send-Key ' '
+                Send-Key '{ENTER}'
+                Check ((Get-Answer $script:id) -eq 'pending') '(b) Space and Enter on Approve answered nothing'
+                Check (@(Get-Refusals | Where-Object { $_ -like '*"key"*' }).Count -ge 1) '(b) refusals named key in the log'
+                Check ((Get-WindowReason) -like 'No key answers Approve*') "(b) and the window says why: $(Get-WindowReason)"
+            }
         }
         Step '(c)' {
             # Deny's gate is the same clock.
@@ -1021,6 +1054,7 @@ try {
                 $restSince = $null
                 $last = $null
                 while ((Get-Date) -lt $end) {
+                    Assert-InStretch
                     $p = Get-Cursor
                     $on = Test-InRect (Get-Rect $script:approve) $p
                     if (-not $on) { $wasOff = $true; $restSince = $null }
@@ -1289,6 +1323,7 @@ try {
                     # Only the window it clicks: another of the app's coming forward says nothing here.
                     $clicked = [System.IntPtr]$script:main.Current.NativeWindowHandle
                     while ((Get-Date) -lt $end -and -not $press) {
+                        Assert-InStretch
                         if ($null -eq $frontBackTick -and [LilConfirmCheck.Win]::GetForegroundWindow() -eq $clicked) {
                             $frontBackTick = [Environment]::TickCount
                         }
