@@ -128,7 +128,15 @@ fn toasts_follow_categories_and_defaults() {
     );
     assert_eq!(set["notifications"]["job_finished"], false, "{set}");
     finished_batch(&mut pipe, 2);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // The notifier handles one batch's end at a time, in order, on its own task: once a failed
+    // batch's toast is up, it has dealt with the finished batch before it.
+    let failing = submit(
+        &mut pipe,
+        "test.job",
+        json!({"lane": "cpu", "fail": "final"}),
+    );
+    assert_eq!(wait_done(&mut pipe, &failing)["status"], "failed");
+    until_posted(&mut pipe, "job_failed");
     assert_eq!(
         posts_in(&mut pipe, "job_finished").len(),
         1,

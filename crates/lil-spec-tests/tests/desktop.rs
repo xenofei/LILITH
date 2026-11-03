@@ -175,27 +175,52 @@ fn keep_awake_is_held_only_while_a_gpu_job_runs() {
         (!power_held(&mut pipe)).then_some(())
     });
 
+    // Never for a cpu job. Keep-awake reacts to the jobs' changes on its own task, so "not held
+    // yet" proves nothing; the proof waits for a release that only a cpu-blind keep-awake
+    // refuses. A gpu job runs beside the cpu job and holds the request; once it ends, the
+    // request goes although the cpu job still runs.
     let cpu = submit(&mut pipe, "test.job", json!({"lane": "cpu", "gated": true}));
     until_job(&mut pipe, &cpu, "running", running);
-    two_more_polls(&mut pipe);
-    assert!(!power_held(&mut pipe), "never for a cpu job");
-    release(&mut pipe, &cpu);
-    wait_done(&mut pipe, &cpu);
-
-    let mut app = app_4a(&env, None, &[]);
-    app_ok(
-        &mut app,
-        "app/desktop.set",
-        json!({"keep_awake_gpu": false}),
-    );
     let gpu = submit(
         &mut pipe,
         "test.job",
         json!({"lane": "gpu-heavy", "gated": true}),
     );
     until_job(&mut pipe, &gpu, "running", running);
-    two_more_polls(&mut pipe);
-    assert!(!power_held(&mut pipe), "never with keep_awake_gpu off");
+    poll("the power request held for the gpu job", || {
+        power_held(&mut pipe).then_some(())
+    });
+    release(&mut pipe, &gpu);
+    wait_done(&mut pipe, &gpu);
+    poll(
+        "the power request released, the cpu job still running",
+        || (!power_held(&mut pipe)).then_some(()),
+    );
+    assert!(running(&job(&mut pipe, &cpu)), "the cpu job runs on");
+    release(&mut pipe, &cpu);
+    wait_done(&mut pipe, &cpu);
+
+    // Never with keep_awake_gpu off: turning it off lets go of a request held for a running
+    // gpu job, and the job runs on.
+    let mut app = app_4a(&env, None, &[]);
+    let gpu = submit(
+        &mut pipe,
+        "test.job",
+        json!({"lane": "gpu-heavy", "gated": true}),
+    );
+    until_job(&mut pipe, &gpu, "running", running);
+    poll("the power request held", || {
+        power_held(&mut pipe).then_some(())
+    });
+    app_ok(
+        &mut app,
+        "app/desktop.set",
+        json!({"keep_awake_gpu": false}),
+    );
+    poll("the power request released with keep_awake_gpu off", || {
+        (!power_held(&mut pipe)).then_some(())
+    });
+    assert!(running(&job(&mut pipe, &gpu)), "the gpu job runs on");
     release(&mut pipe, &gpu);
     wait_done(&mut pipe, &gpu);
 }
