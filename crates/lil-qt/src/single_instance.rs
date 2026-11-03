@@ -198,7 +198,8 @@ impl InstanceServer {
     /// thread, which ends at once when the pipe isn't claimed.
     ///
     /// # Errors
-    /// When the pipe can't be created for another reason, or the thread can't start.
+    /// When the pipe can't be created for another reason, or the thread can't start, or this
+    /// process can't tell who it is (no pipe is made).
     pub fn claim(env: &Env, app: &str, confirm: bool) -> io::Result<Option<InstanceServer>> {
         match InstanceServer::claim_with(env, app, confirm, Identity::of_this_process)? {
             Claim::Server(server) => Ok(Some(server)),

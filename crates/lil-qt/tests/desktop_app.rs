@@ -3,6 +3,11 @@
 //! the hands-off pop-up, with `LIL_DEPLOY_DIR` naming the deploy folder (`build\dev\deploy`).
 //! Each starts that folder's `lil-image.exe` on a test channel of its own, with a core started
 //! from the same folder (which takes it for `ui:image`), and leaves nothing running.
+//!
+//! The exception is `desktop_a_link_started_by_windows_reaches_the_app_as_one_argument`: it runs
+//! only in the Windows Sandbox (`lil dev desktop-tests`, not `--host`), because it registers a
+//! test channel's scheme under the shell's classes root; it uses `lil-fake-image` and no
+//! deploy folder, core or window, and is not in the host set.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -471,6 +476,32 @@ impl Drop for Unregister<'_> {
     }
 }
 
+/// COM initialised on this thread (`COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE`, as the
+/// `ShellExecute` documentation asks) until dropped.
+struct ComApartment(bool);
+
+impl ComApartment {
+    fn init() -> ComApartment {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+        };
+        // SAFETY: a plain call; the matching CoUninitialize is in `drop`, on this thread.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        // S_OK and S_FALSE (already initialised) are balanced by one CoUninitialize each;
+        // RPC_E_CHANGED_MODE (another mode is set) leaves COM usable and is not.
+        ComApartment(hr.is_ok())
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: balances the successful CoInitializeEx on this thread.
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
 /// The lines `lil-fake-image` appended to `file`.
 fn recorded_launches(file: &std::path::Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(file)
@@ -517,8 +548,13 @@ fn desktop_a_link_started_by_windows_reaches_the_app_as_one_argument() {
 
     // A long path to a file that exists, as a deployed exe's is.
     let base = std::fs::canonicalize(dir.path()).unwrap();
-    let base = PathBuf::from(base.to_string_lossy().trim_start_matches(r"\?\"));
+    let base = PathBuf::from(base.to_string_lossy().trim_start_matches(r"\\?\"));
     let exe = base.join("app").join("lil-image.exe");
+    assert!(
+        !exe.to_string_lossy().starts_with(r"\\"),
+        "the registered exe is a plain path: {}",
+        exe.display()
+    );
     std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
     std::fs::copy(&ensure_built().fake_image, &exe).unwrap();
     register_scheme(&env, &exe).unwrap();
@@ -532,6 +568,9 @@ fn desktop_a_link_started_by_windows_reaches_the_app_as_one_argument() {
     let recorded = base.join("fake-image-args.jsonl");
 
     let scheme = env.activation_scheme();
+    // ShellExecute may hand a launch to COM shell extensions: initialise COM as its
+    // documentation asks, for the rest of the test.
+    let _com = ComApartment::init();
     let links = [
         format!("{scheme}:task/j_0123456789abcdef"),
         format!("{scheme}:confirm/cf_0123456789abcdef"),
