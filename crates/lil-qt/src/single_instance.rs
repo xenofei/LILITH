@@ -73,8 +73,8 @@ pub const DENY_BOUND: Duration = Duration::from_secs(10);
 /// a launch never gives up just before the pipe goes (review M-13).
 pub const CLOSING_WAIT: Duration = Duration::from_secs(15);
 /// What the shell's banner says when another program holds the pipe (review I-2, M-10).
-pub const NOTICE_HELD: &str = "Another program is holding LILITH's launch channel, so a second \
-                               launch may open a second window.";
+pub const NOTICE_HELD: &str = "Another program, or a LILITH this launch couldn't check, holds \
+                               LILITH's launch channel, so this launch opened a window of its own.";
 /// What it says when LILITH's own instance never answered (review M-14).
 pub const NOTICE_BUSY: &str =
     "The running LILITH didn't answer in time, so this launch opened a window of its own.";
@@ -181,14 +181,53 @@ impl std::fmt::Debug for InstanceServer {
     }
 }
 
+/// What [`InstanceServer::claim_with`] found.
+#[derive(Debug)]
+pub(crate) enum Claim {
+    /// This process owns the pipe and serves it.
+    Server(InstanceServer),
+    /// Another process owns the pipe.
+    Held,
+    /// This process can't tell who it is: it made no pipe.
+    SelfUnknown,
+}
+
 impl InstanceServer {
     /// Creates `app`'s pipe (its confirm window's with `confirm`) as its first instance and
     /// serves it: `None` when another process owns it. The pipe is made on the server's own
     /// thread, which ends at once when the pipe isn't claimed.
     ///
     /// # Errors
-    /// When the pipe can't be created for another reason, or the thread can't start.
+    /// When the pipe can't be created for another reason, or the thread can't start, or this
+    /// process can't tell who it is (no pipe is made).
     pub fn claim(env: &Env, app: &str, confirm: bool) -> io::Result<Option<InstanceServer>> {
+        match InstanceServer::claim_with(env, app, confirm, Identity::of_this_process)? {
+            Claim::Server(server) => Ok(Some(server)),
+            Claim::Held => Ok(None),
+            Claim::SelfUnknown => Err(io::Error::other("this process can't tell who it is")),
+        }
+    }
+
+    /// [`InstanceServer::claim`], reading who this process is with `identity` first (ARCH-027):
+    /// if it can't, [`Claim::SelfUnknown`] and no pipe is made, so the channel isn't held by an
+    /// instance that would take no launch, and a later launch that can read its identity takes
+    /// it.
+    ///
+    /// # Errors
+    /// As [`InstanceServer::claim`].
+    pub(crate) fn claim_with(
+        env: &Env,
+        app: &str,
+        confirm: bool,
+        identity: impl FnOnce() -> io::Result<Identity>,
+    ) -> io::Result<Claim> {
+        let me = match identity() {
+            Ok(me) => me,
+            Err(e) => {
+                tracing::error!(error = %e, "this process can't tell who it is: it claims no pipe");
+                return Ok(Claim::SelfUnknown);
+            }
+        };
         let name = env.app_pipe_name(app, confirm);
         let (tx, rx) = mpsc::channel();
         let (claimed_tx, claimed_rx) = mpsc::channel::<io::Result<bool>>();
@@ -214,13 +253,8 @@ impl InstanceServer {
                     match first {
                         Ok(first) => {
                             let _ = claimed_tx.send(Ok(true));
-                            // Who a client must be (ARCH-027): unknown, and none is taken.
-                            let me = Identity::of_this_process()
-                                .inspect_err(|e| {
-                                    tracing::error!(error = %e, "this process can't tell who it is: no launch is taken");
-                                })
-                                .ok();
-                            rt.block_on(serve(first, name, app, me, tx, closing, stop));
+                            // Who a client must be (ARCH-027).
+                            rt.block_on(serve(first, name, app, Some(me), tx, closing, stop));
                         }
                         Err(CreateError::AlreadyOwned) => {
                             let _ = claimed_tx.send(Ok(false));
@@ -236,7 +270,7 @@ impl InstanceServer {
             .recv()
             .unwrap_or_else(|_| Err(io::Error::other("the instance thread ended early")));
         match claimed {
-            Ok(true) => Ok(Some(InstanceServer {
+            Ok(true) => Ok(Claim::Server(InstanceServer {
                 rx: Mutex::new(rx),
                 closing,
                 stop,
@@ -244,7 +278,7 @@ impl InstanceServer {
             })),
             other => {
                 let _ = thread.join();
-                other.map(|_| None)
+                other.map(|_| Claim::Held)
             }
         }
     }
@@ -886,9 +920,13 @@ fn instance(plan: &mut BootPlan, env: &Env, confirm: bool, grant: bool) -> Start
     let app = plan.app.clone();
     let until = Instant::now() + CLOSING_WAIT;
     loop {
-        match InstanceServer::claim(env, &app, confirm) {
-            Ok(Some(server)) => return Start::Run(Some(server)),
-            Ok(None) => {}
+        match InstanceServer::claim_with(env, &app, confirm, Identity::of_this_process) {
+            Ok(Claim::Server(server)) => return Start::Run(Some(server)),
+            Ok(Claim::Held) => {}
+            Ok(Claim::SelfUnknown) => {
+                plan.pipe_notice = Some(NOTICE_SELF_UNKNOWN);
+                return Start::Run(None);
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -1130,6 +1168,95 @@ mod tests {
         Identity::of_this_process().unwrap()
     }
 
+    /// Set in the process [`in_own_process`] starts.
+    const OWN_PROCESS: &str = "LIL_SINGLE_INSTANCE_OWN_PROCESS";
+
+    /// For a test that makes a `TestEnv`, which arms the process-global real-location guard for
+    /// everything else the test binary runs (the `args` tests, which build a dev `Env`, then
+    /// fail under a plain `cargo test --lib`). Starts this test binary again for the test
+    /// `name` (its function's name) alone and checks it passed there. `true` here, once it
+    /// has: the caller returns. `false` in that process: the caller runs its body.
+    fn in_own_process(name: &str) -> bool {
+        if std::env::var_os(OWN_PROCESS).is_some() {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                &format!("single_instance::tests::{name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OWN_PROCESS, name)
+            .output()
+            .expect("the test binary starts");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("test result: ok. 1 passed"),
+            "{name} in a process of its own:\n{text}"
+        );
+        true
+    }
+
+    #[test] // spec: ARCH-027, APP-013
+    fn an_instance_that_cannot_tell_who_it_is_leaves_the_pipe_free() {
+        if in_own_process("an_instance_that_cannot_tell_who_it_is_leaves_the_pipe_free") {
+            return;
+        }
+        let env = lil_testkit::TestEnv::new();
+        // It takes no launch, so it must not hold the channel either: a later launch that can
+        // read its identity takes the pipe.
+        let claim = InstanceServer::claim_with(&env.env, "image", false, || {
+            Err(io::Error::other("no token"))
+        })
+        .unwrap();
+        assert!(matches!(claim, Claim::SelfUnknown), "{claim:?}");
+        let launch = Identity {
+            pid: std::process::id() + 4,
+            ..this_identity()
+        };
+        let args = vec!["--no-activate".to_string()];
+        assert!(
+            matches!(
+                forward_as(
+                    &env.env,
+                    "image",
+                    false,
+                    &args,
+                    &launch,
+                    false,
+                    filetime_now
+                ),
+                Err(ForwardError::NotRunning)
+            ),
+            "the failed claim left no pipe"
+        );
+        let claim = InstanceServer::claim_with(&env.env, "image", false, Identity::of_this_process)
+            .unwrap();
+        let Claim::Server(server) = claim else {
+            panic!("the pipe is free: {claim:?}");
+        };
+        // And it serves: a launch from another process is handed over.
+        forward_as(
+            &env.env,
+            "image",
+            false,
+            &args,
+            &launch,
+            false,
+            filetime_now,
+        )
+        .unwrap();
+        assert_eq!(
+            server.next_within(Duration::from_secs(5)),
+            Some(Forwarded { args })
+        );
+    }
+
     #[test] // spec: APP-013
     fn refused_launches_get_a_few_lines_then_a_count_once_a_minute() {
         let start = Instant::now();
@@ -1191,6 +1318,11 @@ mod tests {
 
     #[test] // spec: ARCH-027, APP-013
     fn a_launch_hands_over_only_after_the_proof_and_only_to_a_server_older_than_its_open() {
+        if in_own_process(
+            "a_launch_hands_over_only_after_the_proof_and_only_to_a_server_older_than_its_open",
+        ) {
+            return;
+        }
         // A real exchange in this one process, as if this launch were another process: its pid
         // told apart, and the pipe opened before or after the server started.
         let env = lil_testkit::TestEnv::new();
@@ -1226,6 +1358,9 @@ mod tests {
 
     #[test] // spec: APP-014
     fn a_forward_gives_up_after_2_s() {
+        if in_own_process("a_forward_gives_up_after_2_s") {
+            return;
+        }
         let env = lil_testkit::TestEnv::new();
         // A server that passes every check and never says hello.
         let rt = tokio::runtime::Builder::new_multi_thread()

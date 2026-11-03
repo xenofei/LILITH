@@ -308,7 +308,8 @@ fn a_killed_app_releases_its_holds_and_stops_running() {
     let _core = CoreFixture::start(&env);
     let mut pipe = RawPipe::connect(&env);
     assert_eq!(pipe.hello(json!({}))["result"]["status"], "ok");
-    let mut app = TestApp::start(&env, None, &[]);
+    // An app is running while a session of it reads its open requests.
+    let mut app = TestApp::start(&env, None, &["open_requests:test"]);
 
     let doc = json!({"doc_id": "d_1", "path": r"C:\scratch\a.lildoc"});
     let held = app.tool("test.hold", doc, Some("k1"));

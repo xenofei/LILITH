@@ -613,6 +613,15 @@ impl EventBus {
         self.lock().providers.push((topic_prefix.to_string(), p));
     }
 
+    /// Whether `client` is subscribed to `topic` now (a subscription whose snapshot is still
+    /// being computed counts).
+    pub fn is_subscribed(&self, client: ClientId, topic: &str) -> bool {
+        self.lock()
+            .clients
+            .get(&client)
+            .is_some_and(|c| c.topics.contains(topic))
+    }
+
     /// How many clients the bus knows (attached or subscribed, not yet dropped).
     pub fn clients(&self) -> usize {
         self.lock().clients.len()

@@ -15,8 +15,10 @@
 //! forward from a terminal's job object. [`Interchange::open_in`] answers
 //! `{running, pid, launch_command}`:
 //!
-//! - the app is running (a `ui:<app>` connection is open): the core publishes
-//!   `{target, intent, focus}` on `open_requests:<app>`, and `pid` is the app's process.
+//! - the app is running (a `ui:<app>` connection is open and subscribed to
+//!   `open_requests:<app>`): the core publishes `{target, intent, focus}` on that topic, and
+//!   `pid` is the app's process. A `ui:<app>` window that doesn't read the topic (the confirm
+//!   window) doesn't count, because the request would reach nobody.
 //!   `focus` is `false` for every agent caller (`assistant`, `mcp`, `cli`) and `true` for an
 //!   app (APP-065), so an agent's request shows the content without activating the window;
 //! - it isn't: nothing is published, and `launch_command` is the registered `exe` with
@@ -53,6 +55,7 @@ pub use notify::{Notifier, NotifierParts, NotifyOutcome};
 pub use toast_xml::{ToastActions, ToastText, toast_xml};
 pub use tools::register_interchange_tools;
 
+use crate::events::EventBus;
 use crate::session::Session;
 use crate::tools::CallCtx;
 use crate::transport::ConnObserver;
@@ -176,13 +179,16 @@ impl Interchange {
         &self.env
     }
 
-    /// The pid of the running `app` (the oldest of its connections); `Some(0)` when Windows
-    /// didn't report one.
-    fn running(&self, app: &str) -> Option<u32> {
+    /// The pid of the running `app` (the oldest of its connections that reads
+    /// `open_requests:<app>` on `events`); `Some(0)` when Windows didn't report one. A
+    /// connection that doesn't read the topic, such as the confirm window, isn't running the
+    /// app: a request published for it would reach nobody.
+    fn running(&self, app: &str, events: &EventBus) -> Option<u32> {
+        let topic = format!("open_requests:{app}");
         self.connected()
-            .values()
-            .find(|c| c.app == app)
-            .map(|c| c.pid)
+            .iter()
+            .find(|(conn, c)| c.app == app && events.is_subscribed(**conn, &topic))
+            .map(|(_, c)| c.pid)
     }
 
     /// The apps that can open `target`, with their intents (APP-061). A target that isn't
@@ -244,7 +250,7 @@ impl Interchange {
             .filter(|h| h.intents.contains(&Intent::Open));
         let chosen = openers
             .clone()
-            .find(|h| self.running(&h.app).is_some())
+            .find(|h| self.running(&h.app, &ctx.events).is_some())
             .or_else(|| openers.clone().next());
         let Some(reg) = chosen.and_then(|h| regs.iter().find(|r| r.app == h.app)) else {
             return Err(ErrorBody::new(
@@ -266,7 +272,7 @@ impl Interchange {
         target: &Target,
         intent: Intent,
     ) -> OpenResult {
-        if let Some(pid) = self.running(&reg.app) {
+        if let Some(pid) = self.running(&reg.app, &ctx.events) {
             // Agents never take focus (APP-065).
             let focus = !ctx.session.caller.is_agent();
             ctx.events.publish(
