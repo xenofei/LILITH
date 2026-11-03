@@ -223,7 +223,7 @@ fn workflow_files_parse_and_name_jobs() {
             ],
         ),
         ("ci-guard.yml", &["protected-test-check"]),
-        ("nightly.yml", &["nightly"]),
+        ("nightly.yml", &["nightly", "benchmarks"]),
         ("post-merge.yml", &["post-merge-tests", "post-merge-check"]),
     ];
     for (file, ids) in expected_jobs {

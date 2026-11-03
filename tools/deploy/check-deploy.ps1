@@ -5,12 +5,11 @@
 
 .DESCRIPTION
   1. Measures the folder (every file, in MiB) against the budget: test-params.toml's
-     [budgets] deploy_folder_mib once Task 29 adds it; until then an interim budget, the latest
-     legitimate measurement plus 10 % (plan 4a ruling, 2026-10-26): 399.6 MiB, Task 18's
-     363.3 MiB plus 10 %, with the bundled Inter faces (it was 397.1, Task 16's 361.0 MiB plus
-     10 %, and before that 365.3, Task 0's trimmed 332.1 MiB plus 10 %, spike 10 §8.2). A
-     later task that grows the deploy legitimately re-measures it, updates this value and says
-     so in its PR body.
+     [budgets] deploy_folder_mib (the owner's, protected), or -BudgetMiB. Plan 4a Task 29 set it
+     to the folder it measured plus 10 % (371.9 MiB, so 409.1); the interim budgets before it were
+     399.6 (Task 18's 363.3 MiB plus 10 %), 397.1 (Task 16's) and 365.3 (Task 0's trimmed
+     332.1 MiB, spike 10 §8.2). A later change that grows the deploy legitimately re-measures it
+     and asks the owner for a new value in its PR body.
   2. Starts the deployed lil-image.exe with spike 02's stripped environment (every PATH folder of
      Qt, Visual Studio, MSVC or the Windows Kits removed, the developer-environment variables
      unset) plus a hostile one: a value for every prefix lil-image clears (Checkpoint A I-3), as
@@ -50,12 +49,14 @@ $failures = [System.Collections.Generic.List[string]]::new()
 
 # 1. Size.
 if ($BudgetMiB -le 0) {
-    # The interim budget (see the description): Task 18's 363.3 MiB plus 10 %.
-    $BudgetMiB = 399.6
     $params = Join-Path $Repo 'test-params.toml'
     if (Test-Path -LiteralPath $params) {
         $line = Select-String -LiteralPath $params -Pattern '^\s*deploy_folder_mib\s*=\s*([0-9.]+)' | Select-Object -First 1
         if ($line) { $BudgetMiB = [double]$line.Matches[0].Groups[1].Value }
+    }
+    if ($BudgetMiB -le 0) {
+        Write-Host "deploy_runs_off_path: no deploy_folder_mib in $params's [budgets], and no -BudgetMiB"
+        exit 1
     }
 }
 $all = @(Get-ChildItem -LiteralPath $Deploy -Recurse -File)

@@ -227,3 +227,30 @@ set_tests_properties(grab_settings PROPERTIES
     TIMEOUT 300
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};LIL_GRAB_DEFAULT_DIR=${CMAKE_BINARY_DIR}/grabs;QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
+# Task 29: the whole shell's layout (it makes shells, so on the 1280 x 800 offscreen screen).
+lil_qml_test(tst_layout_full tst_layout_full.qml)
+set_property(TEST tst_layout_full APPEND PROPERTY
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
+# Task 29: the whole shell under the fake feed (label bench), against test-params.toml's budgets
+# (LIL_BUDGET_ENV, apps/lil-ui-kit/CMakeLists.txt): the GUI thread's stalls and an event's way to
+# the screen. Offscreen on the 1280 x 800 screen; the QML files are in ../bench.
+foreach(bench bench_gui_stalls bench_event_to_ui)
+    add_test(NAME ${bench} COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/../bench/${bench}.qml)
+    set_tests_properties(${bench} PROPERTIES
+        LABELS bench
+        TIMEOUT 300
+        ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_FONTDIR=${LIL_WINDOWS_FONTS};QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json;${LIL_BUDGET_ENV}"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+endforeach()
+# Task 29 (ledger TC-01): the shell's workspace paths against a real test-channel core, Task 20's C1
+# and I3 through the UI. Cargo runs the launcher (crates/lil-qt/tests/qml_real_core.rs), which runs
+# this runner as lil-image.exe beside the core; label qml, so the qml presets run it.
+add_test(NAME tst_real_core
+    COMMAND cargo test --locked -p lil_qt --test qml_real_core -- --ignored --nocapture
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(tst_real_core PROPERTIES
+    LABELS qml
+    TIMEOUT 900
+    ENVIRONMENT "LIL_QML_RUNNER=$<TARGET_FILE:tst_lil_ui_kit>;LIL_QML_REAL_CORE_TEST=${CMAKE_CURRENT_SOURCE_DIR}/tst_real_core.qml"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")

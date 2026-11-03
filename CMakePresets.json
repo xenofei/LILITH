@@ -43,6 +43,7 @@
     { "name": "deploy", "inherits": "base", "configurePreset": "dev", "filter": { "include": { "label": "^deploy$" } } },
     { "name": "bench", "inherits": "base", "configurePreset": "dev", "filter": { "include": { "label": "^bench$" } }, "execution": { "noTestsAction": "ignore" } },
     { "name": "ci-qml", "inherits": "offscreen", "configurePreset": "ci", "filter": { "include": { "label": "^qml$" } } },
-    { "name": "ci-deploy", "inherits": "base", "configurePreset": "ci", "filter": { "include": { "label": "^deploy$" } } }
+    { "name": "ci-deploy", "inherits": "base", "configurePreset": "ci", "filter": { "include": { "label": "^deploy$" } } },
+    { "name": "ci-bench", "inherits": "base", "configurePreset": "ci", "filter": { "include": { "label": "^bench$" } } }
   ]
 }

@@ -43,10 +43,29 @@
   app; Ctrl+C and errors still clean up explicitly, and closing the job's handle at the end ends
   whatever is left of them. Each of them is created suspended, put in the job, and only then
   resumed, so its own children are in the job from their start too. The script's own pwsh is not
-  in the job.
+  in the job. One exception: a packaged (MSIX) program's out-of-package children start outside
+  every job (see Start-ProcessInJob), so with -BenchCommand pwsh, where pwsh is the Store build,
+  ctest and the bench it starts are outside the job (below).
 
   -SamplersOnly -ProcessId <pid> runs just the two samplers against another process for
   -SamplerSeconds and reports their coverage (no ComfyUI, no app); it checks the sampling.
+
+  -BenchCommand <program>, <arguments...> (plan 4a Task 29 Step 4, APP-135): the same ComfyUI load and
+  GPU gate, but in place of the spike app it runs that command (in the job, under the hands-off
+  notice) and waits for it, at most -MeasureSeconds + 600 s. The command's own exit code is its
+  verdict, and the GPU's coverage over its run says whether the load held (INVALID if not, as above).
+  Its output goes to the run's folder (bench.out.log, bench.err.log) and the result to
+  results/s06-bench.json. The spike's deploy folder isn't needed. <program> is a path or a name
+  on PATH: it is resolved with Get-Command before anything starts, and the script stops at once
+  if it isn't found (the job starts a full path only). An offscreen bench uses Qt Quick's software
+  renderer, so the load reaches it only as CPU contention, not as a GPU stall. When <program> is
+  the Store (MSIX) pwsh, its children (ctest, then the bench) start outside the kill-on-close job:
+  closing this console doesn't end them; the timeout, Ctrl+C and an error still do (the script
+  kills the command's process with its tree). For bench_gui_stalls, from a pwsh prompt (the call operator: under
+  `pwsh -File`, a comma list binds as one string, and the run fails):
+    $env:LIL_BENCH_MEASURE_S = 60
+    & <repo>\spikes\app-shell\comfy-load.ps1 -BenchCommand pwsh, -NoProfile, -File,
+      <repo>\tools\dev-shell.ps1, ctest, --test-dir, <repo>\build\dev, -R, '^bench_gui_stalls$', -V
 
 .EXAMPLE
   pwsh -NoProfile -File spikes/app-shell/comfy-load.ps1
@@ -62,9 +81,17 @@ param(
     [switch]$SamplersOnly,
     [int]$ProcessId = 0,
     [int]$SamplerSeconds = 60,
-    [string]$ResultsDir = ''   # default: results/, or results/agent-runs/<stamp>/ with -SamplersOnly
+    [string]$ResultsDir = '',  # default: results/, or results/agent-runs/<stamp>/ with -SamplersOnly
+    [string[]]$BenchCommand = @()
 )
 $ErrorActionPreference = 'Stop'
+# -BenchCommand's program, as a full path, before anything starts: Start-ProcessInJob passes it to
+# CreateProcessW, which doesn't search PATH.
+if ($BenchCommand.Count) {
+    $found = Get-Command -CommandType Application -Name $BenchCommand[0] -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { throw "-BenchCommand: '$($BenchCommand[0])' isn't a program on PATH or a path to one; nothing was started" }
+    $BenchCommand[0] = $found.Source
+}
 $Root    = $PSScriptRoot
 $Repo    = (Resolve-Path (Join-Path $Root '..\..')).Path
 $Deploy  = Join-Path $Root 'build\deploy'
@@ -128,7 +155,9 @@ if ($SamplersOnly) {
     return
 }
 
-# The deployed folder must be complete before anything starts (no launch blind).
+# The deployed folder must be complete before anything starts (no launch blind); -BenchCommand
+# runs no spike app.
+if (-not $BenchCommand.Count) {
 $need = 'app_shell_spike.exe', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Qml.dll', 'Qt6Quick.dll', 'kddockwidgets-qt62.dll', 'spike_shell_shim.dll', 'vcruntime140.dll', 'platforms\qwindows.dll', 'SpikeWeb\spike_web.dll'
 $missing = @($need | Where-Object { -not (Test-Path (Join-Path $Deploy $_)) })
 if ($missing.Count) { throw "the deploy folder is incomplete (run run-spike.ps1 first): missing $($missing -join ', ')" }
@@ -139,11 +168,12 @@ if ($stale.Count) { throw "the deploy folder is older than the build ($($stale -
 # persistent WebEngine profile (for example a spike window left open from an earlier check).
 $others = @(Get-SpikeAppProcesses)
 if ($others.Count) { throw "another spike app is running (pid $(($others | ForEach-Object ProcessId) -join ', ')); close it first" }
+}
 if (Test-Comfy) { throw "something already answers on $Url; this script only measures with a ComfyUI it starts itself" }
 if (-not (Test-Path $ComfyPython) -or -not (Test-Path $ComfyMain)) { throw "ComfyUI not found at $ComfyMain" }
 
 $res = [ordered]@{ check = 'S0.6'; started = (Get-Date).ToString('o'); rate_hz = $RateHz; charts_batched = [bool]$ChartsBatched; runs = $Runs }
-$comfy = $null; $load = $null; $app = $null; $gpuProc = $null; $vramProc = $null; $handsOffDone = $null
+$comfy = $null; $load = $null; $app = $null; $bench = $null; $gpuProc = $null; $vramProc = $null; $handsOffDone = $null
 try {
     # Checked again right before the start (run-owner.ps1 checked minutes ago): no ComfyUI or spike
     # process by path. An elevated ComfyUI on another port can't be seen this way (Windows hides
@@ -210,6 +240,28 @@ try {
     $res.hands_off_notice.start = Wait-HandsOffStart $notice   # shown, and at least 10 s of warning on screen
 
     $res.cpu_percent_before_app = Get-CpuPercent
+    if ($BenchCommand.Count) {
+        # The command in place of the spike app: its exit code, and the GPU's coverage over its run.
+        $res.check = 'S0.6 bench'
+        $res.bench_command = $BenchCommand -join ' '
+        $benchStart = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $bench = Start-ProcessInJob $job $BenchCommand[0] -ArgumentList @($BenchCommand | Select-Object -Skip 1) `
+            -WorkingDirectory $Repo -StdOut (Join-Path $Runs 'bench.out.log') -StdErr (Join-Path $Runs 'bench.err.log')
+        $waitUntil = (Get-Date).AddSeconds($MeasureSeconds + 600)
+        while (-not $bench.WaitForExit(250) -and (Get-Date) -lt $waitUntil) { }
+        $res.bench_timed_out = -not $bench.HasExited
+        if ($res.bench_timed_out) { try { $bench.Kill($true) } catch {}; $bench.WaitForExit() }
+        $res.bench_exit_code = if ($res.bench_timed_out) { $null } else { $bench.ExitCode }
+        $benchEnd = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        Set-Content -Path $stopFile -Value 'stop'
+        Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue
+        $res.gpu_coverage = Test-GpuCoverage -Samples (Read-GpuSamples $gpuFile) -StartMs $benchStart -EndMs $benchEnd
+        $res.bench_lines = @(Get-Content (Join-Path $Runs 'bench.out.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match 'bench:|FAIL|Totals' })
+        $res.verdict = if ($res.bench_timed_out) { 'FAIL (the command timed out)' }
+                       elseif (-not ($res.gpu_coverage.dense -and $res.gpu_coverage.saturated)) { "INVALID (the GPU load didn't hold over the run; bench exit $($res.bench_exit_code))" }
+                       elseif ($res.bench_exit_code -eq 0) { 'PASS' } else { "FAIL (bench exit $($res.bench_exit_code))" }
+        return
+    }
     $log = Join-Path $Runs 's06.jsonl'
     # The Web dock shows a local page with content and script (Get-S06WebUrl), not about:blank,
     # so the run shows WebEngine rendering inside the job and the VRAM figure has a page in it.
@@ -297,6 +349,8 @@ try {
     if ($handsOffDone) { Set-Content -Path $handsOffDone -Value 'done' -ErrorAction SilentlyContinue }   # the notice says the PC is free
     if ($stopFile -and -not (Test-Path $stopFile)) { Set-Content -Path $stopFile -Value 'stop' -ErrorAction SilentlyContinue }
     if ($app -and -not $app.HasExited) { try { $app.Kill($true) } catch {} }
+    # -BenchCommand's process with its tree: a Store pwsh's children are outside the job.
+    if ($bench -and -not $bench.HasExited) { try { $bench.Kill($true) } catch {} }
     if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue }
     if ($vramProc -and -not $vramProc.HasExited) { try { $vramProc.Kill() } catch {} }
     # .NET's tree kill takes a child only if it started after its parent, so a reused parent pid
@@ -309,7 +363,7 @@ try {
     # Then whatever is left in the job (exactly what this script put there) ends with its handle.
     $job.Dispose()
     $res.comfy_stopped = -not (Test-Comfy)
-    $suffix = if ($RateHz -ne 10 -or $ChartsBatched) { '-fallback' } else { '' }
+    $suffix = if ($BenchCommand.Count) { '-bench' } elseif ($RateHz -ne 10 -or $ChartsBatched) { '-fallback' } else { '' }
     $res | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 (Join-Path $Results "s06$suffix.json")
     Write-Host "S0.6: $($res.verdict)"
 }

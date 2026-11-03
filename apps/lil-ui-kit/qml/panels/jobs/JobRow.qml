@@ -2,14 +2,15 @@
 // who started it, its class and its lane when they aren't the usual (`user`, `gpu-heavy`), its
 // status in words, and its controls. The same row shows a live job (LiveJobsModel, whose `place`,
 // `eta_text`, `elapsed_text` and `batch_size` Rust works out) and a finished one (the panel's
-// JsonListModel); nothing in it reads the clock.
+// JsonListModel); only its progress limit reads the clock (`Date.now`).
 //
 // - **Running:** its substatus ("Retrying (1 of 3)", "Cancelling", "Outcome unknown" with its
 //   error and no clock, any other by its name), its phase, its progress, how long it has run and
 //   its time left, the "unresponsive" and slow flags, its live preview (PreviewImage), and
 //   Cancel. Progress comes only on `job:<id>`, which the row follows while the job runs, and is
-//   applied at most 10 times a second (leading edge: the first at once, then the newest waiting
-//   one every 100 ms); a status event of the job drops the waiting one.
+//   applied about 10 times a second: an event 100 ms or more after the one before shows at once,
+//   so it can follow a held one within a few ms; a faster burst waits, and its newest is shown
+//   100 ms after the last one shown. A status event of the job drops the waiting one.
 // - **Queued:** why it waits (a held job names its reasons, "Held after a restart" among them;
 //   "Waiting for GPU memory"; a job the core has dispatched, which has no place: "Submitting", "In
 //   ComfyUI's queue", or a retry waiting on the earlier ComfyUI prompt it inherited, as the core
@@ -168,22 +169,40 @@ Rectangle {
         }
     }
 
-    // --- Live progress, at most 10 times a second. ---
+    // --- Live progress, about 10 times a second. ---
+    // A burst faster than that is held back to the newest, shown 100 ms after the last one shown. An
+    // event that comes 100 ms or more after the one before it is shown at once: the core already sends
+    // at most 10 a second, and holding those back by a Timer, which fires late, kept each one waiting
+    // a whole period (bench_event_to_ui: p99 126 ms against APP-139's 100).
 
     property var _waiting: null
     property var _subscription: null
+    property real _appliedAt: 0
+    property real _arrivedAt: 0
 
-    function applyProgress(p) {
+    function applyProgress(p, at) {
         liveProgress = p
         progressApplied++
+        _appliedAt = at === undefined ? Date.now() : at
     }
 
-    function offerProgress(p) {
-        if (gate.running) {
-            _waiting = p
+    // `now` (a test's) defaults to the clock. A clock set back makes a time since negative, which
+    // counts as long ago: the event shows at once, never waits a whole step back.
+    function offerProgress(p, now) {
+        const at = now === undefined ? Date.now() : now
+        const sinceShown = at - _appliedAt
+        const sinceLast = at - _arrivedAt
+        _arrivedAt = at
+        if (sinceShown >= 100 || sinceLast >= 100 || sinceShown < 0 || sinceLast < 0) {
+            gate.stop()
+            _waiting = null
+            applyProgress(p, at)
         } else {
-            applyProgress(p)
-            gate.start()
+            _waiting = p
+            if (!gate.running) {
+                gate.interval = Math.min(100, Math.max(1, 100 - sinceShown))
+                gate.start()
+            }
         }
     }
 
@@ -209,9 +228,18 @@ Rectangle {
         })
     }
 
-    onRunningChanged: follow()
-    onJobIdChanged: follow()
-    Component.onCompleted: follow()
+    // Only once the row is made (PreviewImage's rule). While the list makes the row, follow() ran
+    // re-entrantly: reading `jobId` inside it evaluated that binding for the first time, whose
+    // onJobIdChanged ran a nested follow() that subscribed, and the outer follow() then assigned its
+    // own subscription over that one. Nothing ended the nested one, and its handler lives as long as
+    // the row, so each event reached the row twice (bench_event_to_ui).
+    property bool _complete: false
+    onRunningChanged: if (_complete) follow()
+    onJobIdChanged: if (_complete) follow()
+    Component.onCompleted: {
+        _complete = true
+        follow()
+    }
     // A newer summary of the job carries its progress; one made before the newest progress
     // event (a lower value of the same steps) doesn't take it back.
     readonly property var modelProgress: model.progress
@@ -236,7 +264,6 @@ Rectangle {
             if (root._waiting) {
                 root.applyProgress(root._waiting)
                 root._waiting = null
-                gate.start()
             }
         }
     }
@@ -307,7 +334,13 @@ Rectangle {
             width: parent.width
             height: item && item.visible ? 96 : 0
             sourceComponent: PreviewImage {
-                visible: status === Image.Ready
+                // Shown from its first frame on: while the next frame loads it keeps the one it has
+                // (retainWhileLoading), so its place stays, and the rows below don't jump at each frame.
+                // A finished job's preview has no source, and goes.
+                property bool hadFrame: false
+                onStatusChanged: if (status === Image.Ready) hadFrame = true
+                onSourceChanged: if (String(source) === "") hadFrame = false
+                visible: status === Image.Ready || (hadFrame && status === Image.Loading)
                 core: root.panel.core
                 jobId: root.jobId
                 horizontalAlignment: Image.AlignLeft

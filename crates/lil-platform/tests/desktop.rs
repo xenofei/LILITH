@@ -587,6 +587,19 @@ fn host_env(dir: &Path) -> Env {
 /// so a killed run's leftovers are swept like any other.
 const HOST_TOAST_TEST_ID: &str = "desktop-00000000000000f1";
 
+/// `LIL_DESKTOP_TOAST_HOLD_MS`: the owner's look at a real toast (plan 4a Task 29 Step 5's yes/no
+/// question, ruling 2026-11-01). Set, `desktop_toast_posts_under_the_shortcut_aumid` waits 3 s
+/// after writing its shortcut, so the shell has the new sender before the toast comes, posts its
+/// toast without `SuppressPopup` (a banner for Windows' own time, 5 s unless the user changed it),
+/// and keeps it that long before the test removes it. It prints what can say whether the banner
+/// showed: `SHQueryUserNotificationState` before and after (a full-screen app, a game or a
+/// presentation turns on Windows' automatic do-not-disturb, which files a toast with no banner)
+/// and the toast's own events (`dismissed: TimedOut` means its banner was shown and timed out).
+/// Run with `NEXTEST_SUCCESS_OUTPUT=immediate` to see that. Unset, the toast is quiet and removed
+/// as soon as History shows it, as in every host run. Nothing else changes: the same channel,
+/// registrations and `Cleanup`.
+const ENV_TOAST_HOLD_MS: &str = "LIL_DESKTOP_TOAST_HOLD_MS";
+
 #[test] // spec: APP-022, QA-042
 #[ignore = "desktop"]
 fn desktop_toast_posts_under_the_shortcut_aumid() {
@@ -605,6 +618,15 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         || format!("toasts_state {:?}", desktop.toasts_state()),
     );
 
+    let hold = std::env::var(ENV_TOAST_HOLD_MS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis);
+    if hold.is_some() {
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    let quiet_before = desktop.fullscreen();
     let tag = "j_00000000000000a5";
     let xml = format!(
         concat!(
@@ -616,8 +638,8 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         tag
     );
     // The toast's own events say why a dropped toast never reached History (P4a-R39).
-    let watched =
-        post_watched(&env, &toast(tag, "job_finished", &xml, true)).expect("the toast posts");
+    let watched = post_watched(&env, &toast(tag, "job_finished", &xml, hold.is_none()))
+        .expect("the toast posts");
     let context = || {
         format!(
             "toasts_state {:?}, the toast's events {:?}, History {:?}",
@@ -642,6 +664,21 @@ fn desktop_toast_posts_under_the_shortcut_aumid() {
         || desktop.toasts_state() == ToastsState::Ready,
         context,
     );
+    if let Some(hold) = hold {
+        std::thread::sleep(hold);
+        eprintln!(
+            concat!(
+                "{}: held {:?}; SHQueryUserNotificationState before the post {:?}, after the hold {:?} ",
+                "(anything but No means Windows' automatic do-not-disturb may have filed it with no ",
+                "banner); the toast's events {:?} (`dismissed: TimedOut`: its banner showed)"
+            ),
+            ENV_TOAST_HOLD_MS,
+            hold,
+            quiet_before,
+            desktop.fullscreen(),
+            watched.events()
+        );
+    }
     desktop.remove(tag, "job_finished");
     eventually(
         "the toast gone from History",

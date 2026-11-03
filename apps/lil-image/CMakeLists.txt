@@ -54,3 +54,10 @@ add_test(NAME deploy_runs_off_path
     COMMAND ${LIL_PWSH} -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_SOURCE_DIR}/tools/deploy/check-deploy.ps1
         -Deploy ${LIL_DEPLOY_DIR})
 set_tests_properties(deps_walk deploy_runs_off_path PROPERTIES LABELS deploy TIMEOUT 300)
+# Task 29: the deploy folder's warm starts (label bench; APP-136), each `interactive` under
+# test-params.toml's cold_start_ms (LIL_BUDGET_ENV, apps/lil-ui-kit/CMakeLists.txt). A window shows
+# at each start, inside the hands-off pop-up off CI.
+add_test(NAME bench_cold_start
+    COMMAND ${LIL_PWSH} -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_SOURCE_DIR}/tools/deploy/bench-cold-start.ps1
+        -Deploy ${LIL_DEPLOY_DIR})
+set_tests_properties(bench_cold_start PROPERTIES LABELS bench TIMEOUT 600 ENVIRONMENT "${LIL_BUDGET_ENV}")

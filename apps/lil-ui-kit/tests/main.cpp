@@ -13,8 +13,11 @@
 #include <kddockwidgets/Config.h>
 #include <kddockwidgets/qtquick/Platform.h>
 
+#include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstring>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -26,7 +29,12 @@
 #include <QNetworkRequest>
 #include <QQmlNetworkAccessManagerFactory>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QHash>
 #include <QProcess>
+#include <QQuickWindow>
+#include <QThread>
+#include <QTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcessEnvironment>
@@ -45,8 +53,10 @@
 #  define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <timeapi.h>
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "winmm.lib")
 
 Q_IMPORT_QML_PLUGIN(Lilith_UiKitPlugin)
 Q_IMPORT_QML_PLUGIN(Lilith_ShimPlugin)
@@ -70,6 +80,115 @@ public:
                                                              rust::Str(d.constData(), size_t(d.size())));
         return QString::fromUtf8(out.data(), qsizetype(out.size()));
     }
+};
+
+// The benches' one clock (BenchPump and BenchProbe): milliseconds, monotonic, sub-millisecond.
+static double benchNowMs()
+{
+    static const QElapsedTimer clock = [] {
+        QElapsedTimer t;
+        t.start();
+        return t;
+    }();
+    return double(clock.nsecsElapsed()) / 1e6;
+}
+
+// BenchPump (a context property): the session's event pump for the benches (src/qt/runtime.rs). Each
+// event posted goes, in order, through the bridge's own event step (preview_feed_event: a preview's
+// base64 and image decode, inline) on one thread of its own, as Core's do on the pump, and then through
+// the pump's throttle for a job's progress (src/throttle.rs: a `job:<id>` stream's first event at
+// once, then at most one every 100 ms, the newest waiting one delivered when it is due), and is then
+// signalled on the GUI thread as `delivered(topic, kind, dataJson, postedMs)`, `postedMs` being the
+// benches' clock when it was posted (its receipt). So a progress event waits behind the previews posted
+// before it, as in the app (the Task 17 and 23 carry), and the GUI thread does only what it does there.
+// It is a re-implementation, not lil_qt::throttle::Coalescer, and simpler: it throttles every `job:`
+// event, not only progress, and has neither the drop of a waiting update on a `status` or `retrying`
+// event nor the 1 Hz limit on telemetry samples.
+class BenchPump : public QObject
+{
+    Q_OBJECT
+
+public:
+    BenchPump()
+    {
+        m_worker.moveToThread(&m_thread);
+        m_thread.start();
+    }
+
+    ~BenchPump() override
+    {
+        m_thread.quit();
+        m_thread.wait();
+    }
+
+    Q_INVOKABLE double nowMs() const { return benchNowMs(); }
+
+    Q_INVOKABLE void post(const QString &topic, const QString &kind, const QString &dataJson)
+    {
+        const double posted = nowMs();
+        QMetaObject::invokeMethod(&m_worker, [this, topic, kind, dataJson, posted] {
+            const QByteArray t = topic.toUtf8();
+            const QByteArray k = kind.toUtf8();
+            const QByteArray d = dataJson.toUtf8();
+            const rust::String out = lil_qt::preview_feed_event(rust::Str(t.constData(), size_t(t.size())),
+                                                                 rust::Str(k.constData(), size_t(k.size())),
+                                                                 rust::Str(d.constData(), size_t(d.size())));
+            const QString data = QString::fromUtf8(out.data(), qsizetype(out.size()));
+            if (!topic.startsWith(QStringLiteral("job:"))) {
+                deliver(topic, kind, data, posted);
+                return;
+            }
+            // The throttle, on this thread: at once when 100 ms have passed since the stream's last
+            // one, else the newest waits for its turn.
+            Stream &s = m_streams[topic];
+            const double now = nowMs();
+            if (!s.waiting && now - s.last >= 100.0) {
+                s.last = now;
+                deliver(topic, kind, data, posted);
+                return;
+            }
+            const bool scheduled = s.waiting;
+            s.waiting = true;
+            s.kind = kind;
+            s.data = data;
+            s.posted = posted;
+            if (scheduled)
+                return;
+            const int wait = std::max(0, int(std::ceil(s.last + 100.0 - now)));
+            QTimer::singleShot(wait, Qt::PreciseTimer, &m_worker, [this, topic] {
+                Stream &due = m_streams[topic];
+                due.waiting = false;
+                due.last = nowMs();
+                deliver(topic, due.kind, due.data, due.posted);
+            });
+        }, Qt::QueuedConnection);
+    }
+
+signals:
+    void delivered(const QString &topic, const QString &kind, const QString &dataJson, double postedMs);
+
+private:
+    struct Stream
+    {
+        double last = -1e9;
+        bool waiting = false;
+        QString kind;
+        QString data;
+        double posted = 0;
+    };
+
+    // From the worker thread: the event goes to the GUI thread.
+    void deliver(const QString &topic, const QString &kind, const QString &data, double posted)
+    {
+        QMetaObject::invokeMethod(this, [this, topic, kind, data, posted] {
+            emit delivered(topic, kind, data, posted);
+        }, Qt::QueuedConnection);
+    }
+
+    QThread m_thread;
+    QObject m_worker;
+    // The worker thread's own.
+    QHash<QString, Stream> m_streams;
 };
 
 // Every network request the QML engine makes (an <img> in rich text among them), counted: a
@@ -163,9 +282,112 @@ public:
     // How many network requests the QML engine has made so far.
     Q_INVOKABLE int networkRequests() const { return s_networkRequests; }
 
+    // A file's bytes as base64, or "" when it can't be read (the benches' preview frames).
+    Q_INVOKABLE QString readBase64(const QString &path) const
+    {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly))
+            return {};
+        return QString::fromLatin1(f.readAll().toBase64());
+    }
+
+    // Runs `program` with `args` in this process's environment and waits for it (at most 120 s):
+    // {code, out} with stdout and stderr together, code -1 when it didn't finish (tst_real_core's
+    // `lil` commands).
+    Q_INVOKABLE QVariantMap run(const QString &program, const QStringList &args) const
+    {
+        QProcess child;
+        child.setProcessChannelMode(QProcess::MergedChannels);
+        child.start(program, args);
+        const bool finished = child.waitForFinished(120000);
+        if (!finished)
+            child.kill();
+        return {{QStringLiteral("code"), finished && child.exitStatus() == QProcess::NormalExit ? child.exitCode() : -1},
+                {QStringLiteral("out"), QString::fromUtf8(child.readAll())}};
+    }
+
 private:
     QTemporaryDir m_root;
     int m_dirs = 0;
+};
+
+// BenchProbe (a context property): the benches' measures of the GUI thread, as spike 10's shim took
+// them (S0.6): a 4 ms precise heartbeat's lateness (each interval minus 4 ms) and the interval
+// between a window's frames (`frameSwapped`), in ms with microsecond resolution. While it measures,
+// this process asks Windows for 1 ms timer resolution (timeBeginPeriod, undone at stop and gone with
+// the process), so the figures are the GUI thread's lateness and not the system timer's 15.6 ms
+// steps; the app's own timers run at whatever resolution the system has.
+class BenchProbe : public QObject
+{
+    Q_OBJECT
+
+public:
+    BenchProbe()
+    {
+        m_beat.setTimerType(Qt::PreciseTimer);
+        m_beat.setInterval(4);
+        connect(&m_beat, &QTimer::timeout, this, [this] {
+            const qint64 now = m_clock.nsecsElapsed();
+            if (m_lastBeat >= 0)
+                m_lateness.push_back(std::max(0.0, double(now - m_lastBeat) / 1e6 - 4.0));
+            m_lastBeat = now;
+        });
+        m_clock.start();
+    }
+
+    // Starts measuring: the heartbeat, and the frames of `window` (a QQuickWindow), if any.
+    Q_INVOKABLE void start(QObject *window)
+    {
+        stop();
+        m_lateness.clear();
+        m_frames.clear();
+        m_lastBeat = -1;
+        m_lastFrame = -1;
+        if (!m_period)
+            m_period = timeBeginPeriod(1) == TIMERR_NOERROR;
+        if (auto *w = qobject_cast<QQuickWindow *>(window)) {
+            m_frameConnection = connect(w, &QQuickWindow::frameSwapped, this, [this] {
+                const qint64 now = m_clock.nsecsElapsed();
+                if (m_lastFrame >= 0)
+                    m_frames.push_back(double(now - m_lastFrame) / 1e6);
+                m_lastFrame = now;
+            }, Qt::DirectConnection);
+        }
+        m_beat.start();
+    }
+
+    // Stops: {lateness: {n, p50, p99, max}, frames: {n, p50, p99, max}}.
+    Q_INVOKABLE QVariantMap stop()
+    {
+        m_beat.stop();
+        disconnect(m_frameConnection);
+        if (m_period) {
+            timeEndPeriod(1);
+            m_period = false;
+        }
+        return {{QStringLiteral("lateness"), stats(m_lateness)}, {QStringLiteral("frames"), stats(m_frames)}};
+    }
+
+    // Milliseconds on the benches' clock (BenchPump's too), with sub-millisecond resolution.
+    Q_INVOKABLE double nowMs() const { return benchNowMs(); }
+
+private:
+    static QVariantMap stats(std::vector<double> v)
+    {
+        std::sort(v.begin(), v.end());
+        const auto at = [&v](double q) { return v.empty() ? 0.0 : v[std::min(v.size() - 1, size_t(q * double(v.size())))]; };
+        return {{QStringLiteral("n"), qulonglong(v.size())}, {QStringLiteral("p50"), at(0.5)},
+                {QStringLiteral("p99"), at(0.99)}, {QStringLiteral("max"), v.empty() ? 0.0 : v.back()}};
+    }
+
+    QElapsedTimer m_clock;
+    QTimer m_beat;
+    qint64 m_lastBeat = -1;
+    qint64 m_lastFrame = -1;
+    std::vector<double> m_lateness;
+    std::vector<double> m_frames;
+    QMetaObject::Connection m_frameConnection;
+    bool m_period = false;
 };
 
 // TestLaunch (a context property): lil-image's own launch path for tst_launch (review I-5),
@@ -303,6 +525,14 @@ public slots:
         KDDockWidgets::initFrontend(KDDockWidgets::FrontendType::QtQuick);
         lilshim::DockFactory::install();
         lil_qt::setPreviewSink(&lilshim::putPreviewFrame, &lilshim::dropPreviewFrame);
+        // tst_real_core (crates/lil-qt/tests/qml_real_core.rs starts this runner as lil-image.exe,
+        // beside a test channel's lil-core.exe): the Core singleton connects to that channel's core
+        // as lil-image's does, before the QML engine makes it. No other test sets this.
+        if (qEnvironmentVariableIsSet("LIL_QML_REAL_CORE")) {
+            const rust::String why = lil_qt::serve_core();
+            if (!why.empty())
+                qWarning("serve_core: %s", std::string(why).c_str());
+        }
     }
 
     void qmlEngineAvailable(QQmlEngine *engine)
@@ -316,6 +546,8 @@ public slots:
         engine->rootContext()->setContextProperty(QStringLiteral("TestFiles"), &m_files);
         engine->rootContext()->setContextProperty(QStringLiteral("TestLaunch"), &m_launch);
         engine->rootContext()->setContextProperty(QStringLiteral("TestInput"), &m_input);
+        engine->rootContext()->setContextProperty(QStringLiteral("BenchProbe"), &m_probe);
+        engine->rootContext()->setContextProperty(QStringLiteral("BenchPump"), &m_pump);
         // The theme's bundled face as the application font, as lil-image sets it.
         if (QObject *theme = engine->singletonInstance<QObject *>("Lilith.UiKit", "Theme"))
             lilshim::applyThemeFont(theme->property("fontFamily").toString());
@@ -325,6 +557,8 @@ private:
     TestFiles m_files;
     TestLaunch m_launch;
     TestInput m_input;
+    BenchProbe m_probe;
+    BenchPump m_pump;
     CountingNamFactory m_nam;
 };
 
