@@ -697,6 +697,15 @@ impl Inner {
                     ),
                 )
             }
+            Some(ReplayDecision::Cancelled) => {
+                self.release(&db, idem).await;
+                fail(
+                    &codes::CONFIRM_EXPIRED,
+                    format!(
+                        "The confirmation for {tool} was cancelled before it was answered, so it did not run. Call it again to ask again."
+                    ),
+                )
+            }
             Some(ReplayDecision::Run(approval)) => {
                 match db
                     .get()

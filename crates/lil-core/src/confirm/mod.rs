@@ -313,8 +313,10 @@ pub enum Replay {
     Run(Box<ConfirmationRow>),
     StillPending(PendingConfirmation),
     Denied,
-    /// Expired, cancelled, or gone.
+    /// Expired, or gone.
     Expired,
+    /// Cancelled unanswered (an app's cap prompt when its app closed).
+    Cancelled,
 }
 
 /// Appendix F's `mcp_confirmation`: whether Claude Code's own prompt is an `mcp` call's
@@ -703,7 +705,8 @@ impl Confirm {
             }
             ConfState::Approved => Replay::Run(Box::new(row)),
             ConfState::Denied => Replay::Denied,
-            ConfState::Expired | ConfState::Cancelled => Replay::Expired,
+            ConfState::Expired => Replay::Expired,
+            ConfState::Cancelled => Replay::Cancelled,
         })
     }
 

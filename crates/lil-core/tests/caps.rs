@@ -1697,7 +1697,8 @@ fn ui_cap_prompt_is_cancelled_when_its_app_closes() {
     let _core = core(&env);
     let mut app = TestApp::start(&env, None, &[]);
     let args = json!({"provider": "fakeprov", "amount": "2"});
-    let own = app.tool("test.meter_external", args, Some(&next_key()));
+    let key = next_key();
+    let own = app.tool("test.meter_external", args.clone(), Some(&key));
     assert_eq!(own["status"], "pending_confirmation", "{own}");
     assert_eq!(
         own["covers"],
@@ -1724,6 +1725,16 @@ fn ui_cap_prompt_is_cancelled_when_its_app_closes() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A retry with its token is told it was cancelled, under the same code, never that it
+    // expired.
+    let retry = other.tool("test.meter_external", args, Some(&key));
+    assert_eq!(retry["status"], "error", "{retry}");
+    assert_eq!(retry["error"]["code"], "confirm.expired", "{retry}");
+    let message = retry["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("cancelled") && !message.contains("expired"),
+        "{message}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
