@@ -12,10 +12,16 @@
 //! still serving its channel (QA-041), so no core outlives its test and no temporary folder
 //! stays locked. It then removes its folder with [`crate::cleanup`], which clears sealed
 //! read-only files, never follows a junction out of the folder, retries briefly while another
-//! handle still holds a file, and reports anything it had to leave. Its channel's registry root,
+//! handle still holds a file, and reports anything it had to leave. The same goes for its
+//! channel's Qt cache folder, `LILITH-test-<id>` in the real local app-data folder, which an
+//! app run on the channel creates there. Its channel's registry root,
 //! `HKCU\Software\LILITH-test-<id>`, names its owner process from the start and is removed on
 //! drop; the one a killed test leaves is swept by a later process's first `TestEnv`
-//! ([`sweep_test_registry_roots`]).
+//! ([`sweep_test_registry_roots`]). That first `TestEnv` also sweeps the old folders killed
+//! tests left, `lil-testenv-*` in the temporary folder and `LILITH-test-<id>` in the real local
+//! folder ([`folders_to_sweep`]: only a folder at least an hour old whose channel has no live
+//! owner), a few at a time under a cross-process lock, and cuts the leftovers log to its tail
+//! when it is long ([`trim_log`]).
 
 use std::ffi::OsString;
 use std::hash::{BuildHasher, RandomState};
@@ -528,8 +534,9 @@ impl TestEnv {
     /// What the drop does, now, for a fixture that has closed everything that held files in
     /// the folder (its hub and state databases) and wants to know the folder went: drains any
     /// core still on the channel, removes the folder (retrying for up to 2 s while another
-    /// handle holds a file), and returns what it had to leave, each entry as `<path>: <error>`.
-    /// Leftovers are also reported as the drop reports them.
+    /// handle holds a file), and does the same for the channel's Qt cache folder in the real
+    /// local app-data folder (`LILITH-test-<id>`); it returns what it had to leave, each entry as
+    /// `<path>: <error>`. Leftovers are also reported as the drop reports them.
     ///
     /// # Errors
     /// The entries left behind.
@@ -549,41 +556,40 @@ impl TestEnv {
         if let Err(e) = lil_platform::desktop::remove_test_registry(&self.env) {
             eprintln!("{} could not be removed: {e}", self.env.registry_root());
         }
-        let removed = crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR);
+        let mut left = Vec::new();
+        let mut remove = |path: &Path| {
+            if let Err(entries) = crate::cleanup::remove_tree(path, crate::cleanup::RETRY_FOR) {
+                crate::cleanup::report_leftovers(path, &entries);
+                left.extend(
+                    entries
+                        .iter()
+                        .map(|(entry, e)| format!("{}: {e}", entry.display())),
+                );
+            }
+        };
+        remove(&self.root);
         // The Qt cache of this channel, `LILITH-test-<id>` in the real local app-data folder
-        // (the OS's, not the environment's): by its exact name, nothing else.
-        let cache = self.env.channel().to_string();
-        let cache = cache.strip_prefix("test-").map(|id| {
-            real_locations()
-                .local
-                .join(format!("{QT_CACHE_PREFIX}{id}"))
-        });
-        let cache_removed = cache.map_or(Ok(()), |path| {
-            crate::cleanup::remove_tree(&path, crate::cleanup::RETRY_FOR)
-        });
-        let left: Vec<_> = removed
-            .err()
-            .into_iter()
-            .flatten()
-            .chain(cache_removed.err().into_iter().flatten())
-            .collect();
-        if left.is_empty() {
-            return Ok(());
+        // (the OS's, not the environment's): by its exact name, nothing else, and reported
+        // under its own path.
+        let channel = self.env.channel().to_string();
+        if let Some(id) = channel.strip_prefix("test-") {
+            remove(
+                &real_locations()
+                    .local
+                    .join(format!("{QT_CACHE_PREFIX}{id}")),
+            );
         }
-        crate::cleanup::report_leftovers(&self.root, &left);
-        Err(left
-            .iter()
-            .map(|(path, e)| format!("{}: {e}", path.display()))
-            .collect())
+        if left.is_empty() { Ok(()) } else { Err(left) }
     }
 }
 
 impl Drop for TestEnv {
     /// Drains any core still serving this channel, for example one that `lil` started and this
     /// process holds no handle for, and waits up to 5 s for it to go (QA-041). Then removes the
-    /// temporary directory with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
-    /// another handle still holds a file, and reports what it had to leave on stderr and in
-    /// [`crate::cleanup::leftovers_log`]. Never panics. After [`TestEnv::close`] it does nothing.
+    /// temporary directory and this channel's Qt cache folder (`LILITH-test-<id>` in the real
+    /// local app-data folder) with [`crate::cleanup::remove_tree`], retrying for up to 2 s while
+    /// another handle still holds a file, and reports what it had to leave, each folder under
+    /// its own path, on stderr and in [`crate::cleanup::leftovers_log`]. Never panics. After [`TestEnv::close`] it does nothing.
     fn drop(&mut self) {
         if !self.closed {
             let _ = self.clean_up();
@@ -827,18 +833,24 @@ fn sweep_test_folders() {
     );
 }
 
-/// Cuts the log at `path` to its last `keep` bytes, from the start of a line, when it is longer
-/// than `over` bytes; `true` when it did.
+/// When the log at `path` is longer than `over` bytes, renames it to `<path>.old` (replacing an
+/// earlier one) and cuts that copy to its last `keep` bytes, from the start of a line; `true`
+/// when it did. The rename comes first, so a report appended meanwhile starts a fresh log at
+/// `path` and none is lost.
 ///
 /// # Errors
-/// When the log can't be read or replaced.
+/// When the log can't be read or renamed.
 pub fn trim_log(path: &Path, over: u64, keep: u64) -> std::io::Result<bool> {
     use std::io::{Seek as _, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len <= over {
+    if std::fs::metadata(path)?.len() <= over {
         return Ok(false);
     }
+    let mut old = path.as_os_str().to_owned();
+    old.push(".old");
+    let old = PathBuf::from(old);
+    std::fs::rename(path, &old)?;
+    let mut file = std::fs::File::open(&old)?;
+    let len = file.metadata()?.len();
     file.seek(SeekFrom::Start(len.saturating_sub(keep)))?;
     let mut tail = Vec::new();
     file.read_to_end(&mut tail)?;
@@ -848,13 +860,7 @@ pub fn trim_log(path: &Path, over: u64, keep: u64) -> std::io::Result<bool> {
         .iter()
         .position(|b| *b == b'\n')
         .map_or(tail.len(), |i| i + 1);
-    let mut cut = path.as_os_str().to_owned();
-    cut.push(".trim");
-    let cut = PathBuf::from(cut);
-    std::fs::write(&cut, &tail[from..])?;
-    std::fs::rename(&cut, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&cut);
-    })?;
+    std::fs::write(&old, &tail[from..])?;
     Ok(true)
 }
 

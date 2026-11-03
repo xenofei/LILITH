@@ -138,7 +138,7 @@ fn leftover_test_registry_keys_are_swept() {
     ];
     let folders = [
         "lil-testenv-0000000e-x1y2z3".to_string(),
-        "lil-testenv-ÃœnÃ¯cÃ¶dÃ© space-0000000f-a1b2c3".to_string(),
+        "lil-testenv-Ünïcödé space-0000000f-a1b2c3".to_string(),
         // Not a TestEnv folder, and the id doesn't end a segment: neither counts.
         "lil-other-0000000a-a1b2c3".to_string(),
         "lil-testenv-0000000b0-a1b2c3".to_string(),
@@ -344,8 +344,9 @@ fn the_sweep_removes_what_the_rule_chooses_up_to_its_cap() {
     assert!(alive_dir.exists() && by_hand.exists() && file.exists() && log.exists());
 }
 
-/// The leftovers log is cut to its tail once it is over its limit, from a line start, and left
-/// alone at or below it.
+/// The leftovers log is renamed aside once it is over its limit, so a report appended meanwhile
+/// starts a fresh log and is never lost; the renamed copy (`.old`) is cut to its tail, from a
+/// line start. At or below the limit it is left alone.
 #[test] // spec: QA-038
 fn the_leftovers_log_is_trimmed_to_its_tail_over_the_limit() {
     let dir = tempfile::Builder::new()
@@ -366,7 +367,9 @@ fn the_leftovers_log_is_trimmed_to_its_tail_over_the_limit() {
     assert_eq!(std::fs::metadata(&log).unwrap().len(), size);
 
     assert!(lil_testkit::env::trim_log(&log, size - 1, 1000).unwrap());
-    let kept = std::fs::read_to_string(&log).unwrap();
+    assert!(!log.exists(), "the log itself is a fresh one now");
+    let old = dir.path().join("lil-testenv-leftovers.log.old");
+    let kept = std::fs::read_to_string(&old).unwrap();
     assert!(kept.len() <= 1000 && kept.len() > 900, "{}", kept.len());
     assert!(kept.starts_with("line "), "from a line start: {kept:?}");
     assert!(
@@ -374,6 +377,24 @@ fn the_leftovers_log_is_trimmed_to_its_tail_over_the_limit() {
         "the newest line is kept"
     );
     assert!(!kept.contains("line 000"));
+    // A report after the trim lands in the fresh log, and the tail stays as it was.
+    let mut fresh = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut fresh,
+        b"a new report
+",
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "a new report
+"
+    );
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), kept);
 }
 
 /// SC-05: a `TestEnv` removes its channel's Qt cache folder in the real local app-data folder,
