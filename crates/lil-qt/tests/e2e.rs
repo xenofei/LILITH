@@ -1030,6 +1030,11 @@ fn a_refused_hello_shows_its_cause_and_the_default_gets_out() {
             let reason = reason.unwrap_or_default();
             assert!(reason.contains("lil workspace use"), "the fix: {reason}");
 
+            // A workspace file above the app's data folder (in the user folder, say) is never
+            // what "Use the default workspace" opens (SH-07).
+            assert!(rig.env.env.local_dir().starts_with(rig.env.root()));
+            std::fs::write(rig.env.root().join("lilith.yaml"), "name: above\n")
+                .expect("a workspace file above the data folder");
             let id = rig
                 .probe
                 .on_gui(|core| core.use_default_workspace().to_string());
