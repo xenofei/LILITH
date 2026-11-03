@@ -84,12 +84,13 @@ impl Rig {
         self.interchange.ready(conn, &session);
     }
 
-    /// Subscribes a client to `topic` and returns where its events arrive.
-    async fn listen(&self, topic: &str) -> tokio::sync::mpsc::Receiver<String> {
+    /// Subscribes connection `conn` to `topic` and returns where its events arrive. An app
+    /// counts as running only if its connection reads `open_requests:<app>`.
+    async fn listen(&self, conn: u64, topic: &str) -> tokio::sync::mpsc::Receiver<String> {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        self.events.attach(1, tx);
+        self.events.attach(conn, tx);
         self.events
-            .subscribe(1, &[topic.to_string()], &BTreeMap::new())
+            .subscribe(conn, &[topic.to_string()], &BTreeMap::new())
             .await;
         rx
     }
@@ -285,7 +286,7 @@ async fn open_in_running_publishes_without_focus_for_agents() {
         r#""open", "edit""#,
     );
     r.connect_app(5, "test", 4242);
-    let mut rx = r.listen("open_requests:test").await;
+    let mut rx = r.listen(5, "open_requests:test").await;
     let args = json!({"app": "test", "target": r"C:\pics\a.png", "intent": "open"});
 
     let agent = r.ctx(CallerKind::Cli);
