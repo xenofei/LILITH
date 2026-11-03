@@ -487,28 +487,52 @@ TestCase {
     }
 
     // PROTO-1: a refused session's read is recorded as an error, which is an event, which read again.
-    function test_a_failed_errors_read_isnt_read_again_by_an_event() { // spec: ARCH-121, APP-033
+    // After a failed read the card reads again for events only as its backoff allows (1 s, doubling),
+    // events inside the window coalesced into one read, and it recovers by itself once a read works.
+    function test_a_failed_errors_read_backs_off_and_recovers_on_an_event() { // spec: ARCH-121, APP-033
         const core = makeCore()
         const panel = makePanel(core)
         const refused = failed({code: "workspace.unsupported", message: "This core serves only the default workspace."})
+        const event = () => core.emit("diagnostics", "event", {kind: "error", code: "workspace.unsupported", at: "2026-10-30T10:00:00Z"})
         load(core, {"diagnostics.recent": refused})
         tryVerify(() => shows(panel.errors, "This core serves only the default workspace."), 5000, texts(panel.errors).join(" | "))
         const reads = callsOf(core, "diagnostics.recent").length
 
-        // The event of its own recorded refusal, and a burst of them, past the one-second gate.
+        // A burst inside the first window (1 s) reads nothing; at its end, one read.
         for (let n = 0; n < 3; ++n)
-            core.emit("diagnostics", "event", {kind: "error", code: "workspace.unsupported", at: "2026-10-30T10:00:00Z"})
-        wait(1300)
-        compare(callsOf(core, "diagnostics.recent").length, reads, "no read follows an event while the last read failed")
+            event()
+        wait(500)
+        compare(callsOf(core, "diagnostics.recent").length, reads, "no 1 Hz loop: nothing inside the window")
+        tryVerify(() => callsOf(core, "diagnostics.recent").length === reads + 1, 3000)
+        answer(core, isTool("diagnostics.recent"), refused)
 
-        // A reload still reads, and once a read works, events read again.
-        core.emit("diagnostics", "resync_required", null)
+        // It failed again: the window is 2 s now, and a burst inside it is still one read at its end.
+        for (let n = 0; n < 3; ++n)
+            event()
+        wait(1300)
+        compare(callsOf(core, "diagnostics.recent").length, reads + 1, "the second window is longer")
+        tryVerify(() => callsOf(core, "diagnostics.recent").length === reads + 2, 3000)
+        // The cause has cleared: the read works, and the card shows it with no reconnect or re-show.
         answer(core, isTool("diagnostics.recent"), ok({errors: []}))
         tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
+        verify(!shows(panel.errors, "This core serves only the default workspace."))
+
+        // A success resets the delay: the next event reads at once (past the one-second gate).
         wait(1100)
-        core.emit("diagnostics", "event", {kind: "error", code: "x", at: "2026-10-30T10:00:00Z"})
+        event()
         answer(core, isTool("diagnostics.recent"), ok({errors: []}))
-        compare(callsOf(core, "diagnostics.recent").length, reads + 2)
+        compare(callsOf(core, "diagnostics.recent").length, reads + 3)
+
+        // A reload reads whatever the window says.
+        const failing = failed({code: "workspace.unsupported", message: "Refused again."})
+        wait(1100)
+        event()
+        answer(core, isTool("diagnostics.recent"), failing)
+        tryVerify(() => shows(panel.errors, "Refused again."), 5000)
+        const before = callsOf(core, "diagnostics.recent").length
+        core.emit("diagnostics", "resync_required", null)
+        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
+        compare(callsOf(core, "diagnostics.recent").length, before + 1)
     }
 
     // --- The event log --------------------------------------------------------------------------
