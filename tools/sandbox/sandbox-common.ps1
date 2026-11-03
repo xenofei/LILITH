@@ -14,6 +14,7 @@
   - Retry-Walk: UI Automation can throw for a whole walk while the tree moves.
   - Hide-Paths and Copy-MaskedLogs: a failure's copy of the app's logs, without this PC's paths.
   - Get-ChannelPipes: a test channel already served by a core or an app.
+  - Assert-PipeFree: after a cleanup, the channel's pipe is not served any more.
   - Assert-Gone: a UI Automation element is gone, proved over three whole walks. It needs the caller's
     `App-Windows`, `$TS`, `Check` and the Windows UI Automation types.
 #>
@@ -38,8 +39,10 @@ function Invoke-LilTimed([string[]]$a, [int]$timeoutMs = 30000) {
         $err = $p.StandardError.ReadToEndAsync()
         if (-not $p.WaitForExit($timeoutMs)) {
             try { $p.Kill() } catch { }
-            Fail "$call timed out"
-            throw "$call timed out"
+            # The call's arguments can hold this PC's paths.
+            $message = Hide-Paths "$call timed out"
+            Fail $message
+            throw $message
         }
         # A core started by this call can keep the pipes open after the call has ended: don't wait for ever.
         $text = ''
@@ -52,10 +55,13 @@ function Invoke-LilTimed([string[]]$a, [int]$timeoutMs = 30000) {
 
 # The deadline: set when the pop-up shows, `capSec` less 30 s on. Every real key and click goes through
 # a guard that calls Assert-InStretch, and so do the waits, so a step with no wait in it stops as well.
+# It is counted on the UTC clock, as the pop-up counts its cap, so a change of the local clock can't move it.
+# After it, nothing reaches the desktop: no key, no click, no focus change and no cursor move, so every
+# SetForegroundWindow, SetFocus and SetCursorPos of a check is preceded by Assert-InStretch.
 $script:stopAt = $null
-function Start-Stretch([int]$capSec) { $script:stopAt = (Get-Date).AddSeconds($capSec - 30) }
+function Start-Stretch([int]$capSec) { $script:stopAt = [DateTime]::UtcNow.AddSeconds($capSec - 30) }
 function Assert-InStretch {
-    if ($null -ne $script:stopAt -and (Get-Date) -gt $script:stopAt) { throw "out of the stretch's time" }
+    if ($null -ne $script:stopAt -and [DateTime]::UtcNow -gt $script:stopAt) { throw "out of the stretch's time" }
 }
 
 # UI Automation can throw for a whole walk while the tree moves: walk again, a few times.
@@ -125,4 +131,12 @@ function Assert-Gone([string]$prefix, [string]$what, [switch]$Exact) {
         elseif ($found) { $why = "walk $($i + 1) still has it" }
     }
     Check (-not $why) $(if ($why) { "$what ($why)" } else { $what })
+}
+
+# At the end of a cleanup of a channel that was this run's: no core or app serves its pipe any more. A core
+# that hung before any `status` answered is never recorded, so it can only be found this way. The pipe
+# can take a moment to go after the core has exited.
+function Assert-PipeFree([string]$channel) {
+    for ($i = 0; $i -lt 20 -and (Get-ChannelPipes $channel).Count -gt 0; ++$i) { Start-Sleep -Milliseconds 250 }
+    if ((Get-ChannelPipes $channel).Count -gt 0) { Fail "cleanup: the test channel's pipe is still served" }
 }

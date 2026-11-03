@@ -108,8 +108,9 @@ $image = Join-Path $Deploy 'lil-image.exe'
 $desktopArgs = '{"handlers": true, "shortcut": true, "toasts": "ready"}'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
-function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
+function Pass([string]$what) { $what = Hide-Paths $what; $results.Add("PASS $what"); Write-Host "PASS $what" }
 function Fail([string]$what) {
+    $what = Hide-Paths $what
     $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what"
     Save-Evidence $what
 }
@@ -163,7 +164,7 @@ function Exit-TestChannel {
     if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
     if ($script:channelMine) {
         try { [void](Get-CorePid) } catch { }
-        try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
+        try { [void](Invoke-LilTimed @('core', 'stop', '--timeout-secs', '20')) } catch { }
         Start-Sleep -Milliseconds 500
         try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     } else {
@@ -203,6 +204,8 @@ function Exit-TestChannel {
             if (-not $p.WaitForExit(5000)) { Fail "cleanup: the test core, pid $id, is still running" }
         }
     }
+    # A core that hung before any status answered was never recorded: its pipe is the last trace.
+    if ($script:channelMine) { Assert-PipeFree $channel }
 }
 # A new confirmation: a `cli` call of test.destructive with a key of its own, which comes back
 # pending (exit 4) with the confirmation's id. test.desktop has made the notification path reachable,
@@ -354,7 +357,7 @@ function Self-Test {
     try { Assert-AppInFront } catch { if ("$_" -like 'no input sent*') { ++$refused } }
     try { Assert-AppAt 0 0 } catch { if ("$_" -like 'no input sent*') { ++$refused } }
     # Past the stretch's deadline, the guards stop before they look at any window.
-    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $script:stopAt = [DateTime]::UtcNow.AddSeconds(-1)
     $late = 0
     foreach ($guard in { Assert-AppInFront }, { Assert-AppAt 0 0 }) {
         try { & $guard } catch { if ("$_" -like "out of the stretch's time*") { ++$late } }
@@ -471,7 +474,7 @@ function Set-CapAndRestart {
     if (-not $suite) { throw 'no suite.toml under the test root' }
     Add-Content -LiteralPath $suite.FullName -Value "`n[money]`ndisplay_currency = `"USD`"`n[caps]`nmonthly = `"1`"`n"
     $old = Get-CorePid
-    [void](Invoke-Lil @('core', 'stop'))
+    [void](Invoke-Lil @('core', 'stop', '--timeout-secs', '20'))
     $end = (Get-Date).AddSeconds(15)
     while ($old -and (Get-Process -Id $old -ErrorAction SilentlyContinue)) {
         if ((Get-Date) -gt $end) { throw 'the test core didn''t stop' }
@@ -512,8 +515,8 @@ if ($DryRun) {
     Check ($verdict -like 'fail*') "dry run: (q) fails it when its own look saw the window come forward with the press: $verdict"
     # winuser.h's sizes on x64: what InjectTouchInput and InjectSyntheticPointerInput will read.
     Check ([LilConfirmCheck.Win]::TouchInfoSize() -eq 144 -and [LilConfirmCheck.Win]::PenTypeInfoSize() -eq 152) "dry run: (m)'s structures have Windows' sizes ($([LilConfirmCheck.Win]::TouchInfoSize()), $([LilConfirmCheck.Win]::PenTypeInfoSize()))"
-    Enter-TestChannel
     try {
+        Enter-TestChannel
         [void](Invoke-Lil @('workspace', 'init', (Join-Path $root 'places\harbor'), '--default'))
         $id = Get-CorePid
         Check ($id -gt 0) "dry run: the test core runs, pid $id"
@@ -529,7 +532,9 @@ if ($DryRun) {
         Check ($c -like 'cf_*') "dry run: on the cap, a confirmation that also passes it waits: $c"
         $c2 = New-Confirmation
         Check ($c2 -like 'cf_*') 'dry run: a plain one still waits'
-    } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
+    } catch { Fail "dry run: $_" } finally {
+        try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    }
     Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
     exit ([int]($failures.Count -gt 0))
 }
@@ -640,7 +645,8 @@ function Save-UiaTree([string]$path) {
         if ($lines.Count -ge 4000) { return }
         try {
             $c = $e.Current
-            $name = if ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            $shown = Hide-Paths $c.Name
+            $name = if ($shown.Length -gt 100) { $shown.Substring(0, 100) + '…' } else { $shown }
             $lines.Add(('{0}{1} "{2}" enabled={3}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.IsEnabled))
         } catch { $lines.Add(('{0}(gone)' -f ('  ' * $depth))); return }
         $child = $walker.GetFirstChild($e)
@@ -867,6 +873,7 @@ try {
         }
         Step '(b)' {
             Start-Step
+            Assert-InStretch
             $script:approve.SetFocus()
             Start-Sleep -Milliseconds 200
             if (-not $script:approve.Current.HasKeyboardFocus) {
@@ -896,6 +903,7 @@ try {
         }
         Step '(e) Enter' {
             Start-Step
+            Assert-InStretch
             $script:deny.SetFocus()
             Start-Sleep -Milliseconds 200
             Send-Key '{ENTER}'
@@ -917,6 +925,7 @@ try {
             $script:id = New-Confirmation
             Open-Window $script:id
             $r = Get-Rect $script:approve
+            Assert-InStretch
             [void][LilConfirmCheck.Win]::SetCursorPos([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
             Start-Sleep -Milliseconds 300
             $table = [System.Collections.Generic.List[string]]::new()
@@ -959,6 +968,7 @@ try {
             Check ((Get-Answer $script:id) -eq 'pending') '(s) none of the injected pairs answered anything'
             # Off the button, so the gesture starts from somewhere else.
             $w = Get-Rect $script:main
+            Assert-InStretch
             [void][LilConfirmCheck.Win]::SetCursorPos([int]$w.X + 20, [int]$w.Y + 10)
         }
 
@@ -1221,7 +1231,11 @@ try {
                         Start-Sleep -Milliseconds 250
                         Set-Cue "$cue`n($([int]($end - (Get-Date)).TotalSeconds) s left)"
                     }
-                } catch { $stopped = "$_" }
+                } catch {
+                    # Out of the stretch's time ends the run: (j) must not prompt or beep after it.
+                    if ("$_" -like "out of the stretch's time*") { throw }
+                    $stopped = "$_"
+                }
                 # The last warp left the cursor on Approve. Nothing moves it from here but the hand.
                 Set-Cue 'Stop moving the mouse, and do not click. The next step comes in a moment.'
                 Start-Sleep -Milliseconds 500
@@ -1390,6 +1404,7 @@ try {
             Check ((Get-Answer $script:id) -eq 'pending') '(d) and nothing was answered'
             $b = Wait-For { Find-Button 'Raise the cap to 25' } 5 'the button to show the amount'
             Pass "(d) a program's value on the field shows on the button: $($b.Current.Name)"
+            Assert-InStretch
             $field.SetFocus()
             Start-Sleep -Milliseconds 200
             $hwnd = [System.IntPtr]$script:main.Current.NativeWindowHandle

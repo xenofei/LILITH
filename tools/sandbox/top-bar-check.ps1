@@ -55,8 +55,8 @@ $lil = Join-Path $Deploy 'lil.exe'
 $image = Join-Path $Deploy 'lil-image.exe'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
-function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
-function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
+function Pass([string]$what) { $what = Hide-Paths $what; $results.Add("PASS $what"); Write-Host "PASS $what" }
+function Fail([string]$what) { $what = Hide-Paths $what; $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
 # Invoke-LilTimed, the stretch's deadline, Retry-Walk, Assert-Gone and the masked log copy.
 . (Join-Path $PSScriptRoot 'sandbox-common.ps1')
@@ -121,7 +121,7 @@ function Exit-TestChannel {
         return
     }
     try { [void](Get-CorePid) } catch { }
-    try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
+    try { [void](Invoke-LilTimed @('core', 'stop', '--timeout-secs', '20')) } catch { }
     Start-Sleep -Milliseconds 500
     try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     try { Set-Location -LiteralPath $Repo } catch { }
@@ -156,6 +156,8 @@ function Exit-TestChannel {
             if (-not $p.WaitForExit(5000)) { Fail "cleanup: the test core, pid $id, is still running" }
         }
     }
+    # A core that hung before any status answered was never recorded: its pipe is the last trace.
+    Assert-PipeFree $channel
 }
 # What the core says of the GPU lane, from another session (the test channel's `lil`).
 function Get-GpuLane {
@@ -216,7 +218,7 @@ function Self-Test {
     try { Assert-AppInFront } catch { if ("$_" -like 'no keys sent*') { ++$refused } }
     try { Assert-AppAt 0 0 } catch { if ("$_" -like 'no press sent*') { ++$refused } }
     # Past the stretch's deadline, the guards stop before they look at any window.
-    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $script:stopAt = [DateTime]::UtcNow.AddSeconds(-1)
     $late = 0
     foreach ($guard in { Assert-AppInFront }, { Assert-AppAt 0 0 }) {
         try { & $guard } catch { if ("$_" -like "out of the stretch's time*") { ++$late } }
@@ -243,7 +245,9 @@ if ($DryRun) {
         Check (Test-Path -LiteralPath (Join-Path $Deploy 'qml\QtQuick\Dialogs')) 'dry run: QtQuick\Dialogs is deployed'
         $s = Get-DiskState
         Check ($s -notlike 'none;*') 'dry run: suite.toml is read from the test root'
-    } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
+    } catch { Fail "dry run: $_" } finally {
+        try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    }
     Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
     exit ([int]($failures.Count -gt 0))
 }
@@ -293,6 +297,7 @@ function Find-Window([int]$procId, [string]$name) {
     return $e
 }
 function Show-Element($e) {
+    Assert-InStretch
     try { [void][LilTopBarCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
     Start-Sleep -Milliseconds 300
 }
@@ -300,6 +305,7 @@ function Show-App { Show-Element $script:main }
 function Send-Keys([string]$keys) { Show-App; Send-Checked $keys; Start-Sleep -Milliseconds 200 }
 # A real press, at screen coordinates, only if the app's window is there.
 function Press-At([double]$x, [double]$y) {
+    Assert-InStretch
     [void][LilTopBarCheck.Win]::SetCursorPos([int]$x, [int]$y)
     Start-Sleep -Milliseconds 100
     Assert-AppAt ([int]$x) ([int]$y)
@@ -315,6 +321,7 @@ function Press-Center($e) {
 function Invoke-Element($e) {
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
+    Assert-InStretch
     try { $e.SetFocus() } catch { Show-App }
     Send-Checked ' '
 }
@@ -352,7 +359,8 @@ function Save-UiaTree([string]$path) {
         try {
             $c = $e.Current
             $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
-            $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            $shown = Hide-Paths $c.Name
+            $name = if (-not $ours) { '' } elseif ($shown.Length -gt 100) { $shown.Substring(0, 100) + '…' } else { $shown }
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
             # A dialog's file list, navigation pane and address bar or breadcrumb: the node alone.
             if ($c.AutomationId -in 'listview', 'ProperTreeHost', '40965', '41477' -or $c.ClassName -in 'Breadcrumb Parent', 'Address Band Root') { return }
@@ -537,6 +545,7 @@ try {
     $end = (Get-Date).AddSeconds(60)
     $done = $false
     while (-not $done -and (Get-Date) -lt $end) {
+        Assert-InStretch
         $conn = Find-NameStarting 'Core connection: '
         $connName = if ($conn) { try { $conn.Current.Name } catch { '' } } else { '' }
         $control = Find-NameStarting 'Resume GPU work'

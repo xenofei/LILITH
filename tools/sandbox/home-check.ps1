@@ -65,8 +65,8 @@ $lil = Join-Path $Deploy 'lil.exe'
 $image = Join-Path $Deploy 'lil-image.exe'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
-function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
-function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
+function Pass([string]$what) { $what = Hide-Paths $what; $results.Add("PASS $what"); Write-Host "PASS $what" }
+function Fail([string]$what) { $what = Hide-Paths $what; $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
 # Invoke-LilTimed, the stretch's deadline, Retry-Walk and the masked log copy.
 . (Join-Path $PSScriptRoot 'sandbox-common.ps1')
@@ -115,7 +115,7 @@ function Exit-TestChannel {
     # Never off the test channel: `lil core stop` would reach the channel this shell defaults to.
     if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
     try { [void](Get-CorePid) } catch { }
-    try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
+    try { [void](Invoke-LilTimed @('core', 'stop', '--timeout-secs', '20')) } catch { }
     Start-Sleep -Milliseconds 500
     try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     try { Set-Location -LiteralPath $Repo } catch { }
@@ -150,6 +150,8 @@ function Exit-TestChannel {
             if (-not $p.WaitForExit(5000)) { Fail "cleanup: the test core, pid $id, is still running" }
         }
     }
+    # A core that hung before any status answered was never recorded: its pipe is the last trace.
+    Assert-PipeFree $channel
 }
 # The default workspace's id, from the test channel's core.
 function Get-WorkspaceId {
@@ -176,7 +178,7 @@ function Assert-ChannelFree {
 $jobEnds = [ordered]@{}
 function Invoke-FinishedJob {
     $id = (Invoke-Lil @('call', 'test.job', '{"lane":"cpu"}') | ConvertFrom-Json -DateKind String).structured.job.job_id
-    $done = Invoke-Lil @('call', 'job.wait', ('{"job_id":"' + $id + '","timeout_s":30}')) | ConvertFrom-Json -DateKind String
+    $done = Invoke-Lil @('call', 'job.wait', ('{"job_id":"' + $id + '","timeout_s":20}')) | ConvertFrom-Json -DateKind String
     if ($done.structured.job.status -ne 'succeeded') { throw "the test job ended $($done.structured.job.status)" }
     $jobEnds[$id] = "$($done.structured.job.updated)"
     return $id
@@ -283,7 +285,7 @@ function Self-Test {
     try { Assert-AppInFront } catch { if ("$_" -like 'no press sent*') { ++$refused } }
     try { Assert-AppAt 0 0 } catch { if ("$_" -like 'no press sent*') { ++$refused } }
     # Past the stretch's deadline, the guards stop before they look at any window.
-    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $script:stopAt = [DateTime]::UtcNow.AddSeconds(-1)
     $late = 0
     foreach ($guard in { Assert-AppInFront }, { Assert-AppAt 0 0 }) {
         try { & $guard } catch { if ("$_" -like "out of the stretch's time*") { ++$late } }
@@ -340,7 +342,9 @@ if ($DryRun) {
         Check ($asRead -and -not $asGetContent) "dry run: the file renames away and back while held as Read-Shared holds it, and not as Get-Content does ($asRead, $asGetContent)"
         Check ((Get-Kept) -eq '2026-01-01T00:00:00Z') 'dry run: the kept time reads back after the renames'
         Check (Test-Path -LiteralPath $image) "dry run: $image is deployed"
-    } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
+    } catch { Fail "dry run: $_" } finally {
+        try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    }
     Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
     exit ([int]($failures.Count -gt 0))
 }
@@ -535,11 +539,13 @@ function Drag-From([double]$fromX, [double]$fromY, [double]$toX, [double]$toY) {
     [LilHomeCheck.Win]::mouse_event(2, 0, 0, 0, [System.UIntPtr]::Zero)
     try {
         foreach ($i in 1..30) {
+            Assert-InStretch
             [void][LilHomeCheck.Win]::SetCursorPos([int]($fromX + ($toX - $fromX) * $i / 30), [int]($fromY + ($toY - $fromY) * $i / 30))
             Start-Sleep -Milliseconds 40
         }
         Start-Sleep -Milliseconds 500
         foreach ($d in 6, 3, 0) {
+            Assert-InStretch
             [void][LilHomeCheck.Win]::SetCursorPos([int]$toX + $d, [int]$toY)
             Start-Sleep -Milliseconds 150
         }
@@ -577,7 +583,8 @@ function Save-UiaTree([string]$path) {
         try {
             $c = $e.Current
             $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
-            $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            $shown = Hide-Paths $c.Name
+            $name = if (-not $ours) { '' } elseif ($shown.Length -gt 100) { $shown.Substring(0, 100) + '…' } else { $shown }
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
             # A dialog's file list, navigation pane and address bar or breadcrumb: the node alone.
             if ($c.AutomationId -in 'listview', 'ProperTreeHost', '40965', '41477' -or $c.ClassName -in 'Breadcrumb Parent', 'Address Band Root') { return }

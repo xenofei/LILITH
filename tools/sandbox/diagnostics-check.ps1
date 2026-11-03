@@ -68,10 +68,10 @@ $coreExe = Join-Path $Deploy 'lil-core.exe'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
 $notChecked = [System.Collections.Generic.List[string]]::new()
-function Not-Checked([string]$what) { $notChecked.Add($what); $results.Add("NOT CHECKED $what"); Write-Host "NOT CHECKED $what" }
+function Not-Checked([string]$what) { $what = Hide-Paths $what; $notChecked.Add($what); $results.Add("NOT CHECKED $what"); Write-Host "NOT CHECKED $what" }
 function Write-Summary { Write-Host ("{0} passed, {1} failed, {2} not checked" -f ($results.Count - $failures.Count - $notChecked.Count), $failures.Count, $notChecked.Count) }
-function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
-function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
+function Pass([string]$what) { $what = Hide-Paths $what; $results.Add("PASS $what"); Write-Host "PASS $what" }
+function Fail([string]$what) { $what = Hide-Paths $what; $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
 # Invoke-LilTimed, the stretch's deadline, Retry-Walk and the masked log copy.
 . (Join-Path $PSScriptRoot 'sandbox-common.ps1')
@@ -264,7 +264,7 @@ function Exit-TestChannel {
         Write-Host 'the core on the test channel is not this run''s: it stays, with the channel''s registry keys'
     } else {
         try { [void](Get-CorePid) } catch { }
-        try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
+        try { [void](Invoke-LilTimed @('core', 'stop', '--timeout-secs', '20')) } catch { }
         foreach ($id in $corePids) {
             $p = Get-RecordedCore $id
             if ($p -and -not $p.WaitForExit(10000)) {
@@ -312,12 +312,14 @@ function Exit-TestChannel {
             Check (-not (Test-Path -LiteralPath $cache)) "cleanup: the test channel's Qt cache folder is gone"
         }
     }
+    # A core that hung before any status answered was never recorded: its pipe is the last trace.
+    if (-not $script:channelTaken) { Assert-PipeFree $channel }
 }
 
 if ($DryRun) {
     Self-Test
     # Past the stretch's deadline, the input guard (Assert-InputGoesToApp) and the waits stop at once.
-    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $script:stopAt = [DateTime]::UtcNow.AddSeconds(-1)
     $late = $false
     try { Assert-InStretch } catch { $late = "$_" -like "out of the stretch's time*" }
     $script:stopAt = $null
@@ -435,6 +437,7 @@ function Invoke-Element($e, [string]$what) {
     Assert-InputGoesToApp $e $script:main $what
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
+    Assert-InStretch
     try { $e.SetFocus() } catch { }
     Send-Keys ' ' $e $script:main $what
 }

@@ -60,8 +60,8 @@ $lil = Join-Path $Deploy 'lil.exe'
 $image = Join-Path $Deploy 'lil-image.exe'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
-function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
-function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
+function Pass([string]$what) { $what = Hide-Paths $what; $results.Add("PASS $what"); Write-Host "PASS $what" }
+function Fail([string]$what) { $what = Hide-Paths $what; $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
 # Invoke-LilTimed, the stretch's deadline, Retry-Walk, Assert-Gone and the masked log copy.
 . (Join-Path $PSScriptRoot 'sandbox-common.ps1')
@@ -163,7 +163,7 @@ function Exit-TestChannel {
         return
     }
     try { [void](Get-CorePid) } catch { }
-    try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
+    try { [void](Invoke-LilTimed @('core', 'stop', '--timeout-secs', '20')) } catch { }
     Start-Sleep -Milliseconds 500
     try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     try { Set-Location -LiteralPath $Repo } catch { }
@@ -203,6 +203,8 @@ function Exit-TestChannel {
             if (-not $p.WaitForExit(5000)) { Fail "cleanup: the test core, pid $id, is still running" }
         }
     }
+    # A core that hung before any status answered was never recorded: its pipe is the last trace.
+    Assert-PipeFree $channel
 }
 # The fake desktop's state, from another session: the core reads it at once.
 function Set-FakeDesktop([string]$json) { [void](Invoke-Lil @('call', 'test.desktop', $json)) }
@@ -247,7 +249,7 @@ function Self-Test {
     $refused = 0
     try { Assert-AppInFront } catch { if ("$_" -like 'no keys sent*') { ++$refused } }
     # Past the stretch's deadline, the guard stops before it looks at any window.
-    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $script:stopAt = [DateTime]::UtcNow.AddSeconds(-1)
     $late = $false
     try { Assert-AppInFront } catch { $late = "$_" -like "out of the stretch's time*" }
     $script:stopAt = $null
@@ -274,7 +276,9 @@ if ($DryRun) {
         Check ($d.notification_path.toasts_reason -eq 'disabled_for_app') 'dry run: and Windows'' reason'
         Check (Test-Path -LiteralPath $image) "dry run: $image is deployed"
         Check (-not (Test-Path "$realClasses\$scheme")) 'dry run: nothing under the real classes root'
-    } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
+    } catch { Fail "dry run: $_" } finally {
+        try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    }
     Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
     exit ([int]($failures.Count -gt 0))
 }
@@ -322,6 +326,7 @@ function Find-Window([int]$procId, [string]$name) {
     return $AE::RootElement.FindFirst($TS::Children, $c)
 }
 function Show-Element($e) {
+    Assert-InStretch
     try { [void][LilSettingsCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
     Start-Sleep -Milliseconds 300
 }
@@ -331,6 +336,7 @@ function Invoke-Element($e) {
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
     if ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$p)) { $p.Toggle(); return }
+    Assert-InStretch
     try { $e.SetFocus() } catch { Show-App }
     Send-Checked ' '
 }
@@ -370,7 +376,8 @@ function Save-UiaTree([string]$path) {
         try {
             $c = $e.Current
             $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
-            $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            $shown = Hide-Paths $c.Name
+            $name = if (-not $ours) { '' } elseif ($shown.Length -gt 100) { $shown.Substring(0, 100) + '…' } else { $shown }
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
             # A dialog's file list, navigation pane and address bar or breadcrumb: the node alone.
             if ($c.AutomationId -in 'listview', 'ProperTreeHost', '40965', '41477' -or $c.ClassName -in 'Breadcrumb Parent', 'Address Band Root') { return }

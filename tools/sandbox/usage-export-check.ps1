@@ -50,8 +50,8 @@ $lil = Join-Path $Deploy 'lil.exe'
 $image = Join-Path $Deploy 'lil-image.exe'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
-function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
-function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
+function Pass([string]$what) { $what = Hide-Paths $what; $results.Add("PASS $what"); Write-Host "PASS $what" }
+function Fail([string]$what) { $what = Hide-Paths $what; $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
 # Invoke-LilTimed, the stretch's deadline, Retry-Walk and the masked log copy.
 . (Join-Path $PSScriptRoot 'sandbox-common.ps1')
@@ -154,7 +154,7 @@ function Exit-TestChannel {
         Write-Host 'the test channel is not this run''s: its core, its keys and its cache stay'
     } else {
         try { [void](Get-CorePid) } catch { }
-        try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
+        try { [void](Invoke-LilTimed @('core', 'stop', '--timeout-secs', '20')) } catch { }
         Start-Sleep -Milliseconds 500
         foreach ($id in $corePids) {
             $p = Get-RecordedCore $id
@@ -202,6 +202,8 @@ function Exit-TestChannel {
     foreach ($id in $corePids) {
         if (Get-RecordedCore $id) { Fail "cleanup: the test core, pid $id, is still running" }
     }
+    # A core that hung before any status answered was never recorded: its pipe is the last trace.
+    if (-not $script:channelTaken) { Assert-PipeFree $channel }
 }
 
 if (-not ('LilUsageCheck.Win' -as [type])) {
@@ -237,7 +239,7 @@ if ($DryRun) {
     $refused = $false
     try { Assert-AppInFront } catch { $refused = "$_" -like 'no keys sent*' }
     # Past the stretch's deadline, the guard stops before it looks at any window.
-    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $script:stopAt = [DateTime]::UtcNow.AddSeconds(-1)
     $late = $false
     try { Assert-AppInFront } catch { $late = "$_" -like "out of the stretch's time*" }
     $script:stopAt = $null
@@ -316,11 +318,13 @@ function Find-Window([int]$procId, [string]$name) {
 function Invoke-Element($e) {
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
+    Assert-InStretch
     try { $e.SetFocus() } catch { Show-App }
     Send-Checked ' '
 }
 # The app's window in front, through Win32 (UIA's SetFocus is refused on a top-level window).
 function Show-App {
+    Assert-InStretch
     try { [void][LilUsageCheck.Win]::SetForegroundWindow([System.IntPtr]$script:main.Current.NativeWindowHandle) } catch { }
     Start-Sleep -Milliseconds 300
 }
@@ -382,7 +386,8 @@ function Save-UiaTree([string]$path) {
             # Names only for the app's own Qt elements (their ids start "QGuiApplication"):
             # nothing of the system dialogs, whose lists show the PC's own folders and files.
             $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
-            $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            $shown = Hide-Paths $c.Name
+            $name = if (-not $ours) { '' } elseif ($shown.Length -gt 100) { $shown.Substring(0, 100) + '…' } else { $shown }
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
             # The save dialog's file list, navigation pane and address bar or breadcrumb: the
             # node alone, nothing under it.
@@ -410,6 +415,7 @@ function Open-SaveDialog {
 }
 # `e`'s window in front (Win32).
 function Show-Element($e) {
+    Assert-InStretch
     try { [void][LilUsageCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
     Start-Sleep -Milliseconds 300
 }

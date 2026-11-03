@@ -20,7 +20,8 @@ SWP_SHOWWINDOW), not with the form's TopMost property, whose show path focuses t
 is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT). It closes when -ParentPid has gone, and at
 the latest -CapSec seconds after the countdown's start (the runner's worst case), removing its state files whichever way it
 closes. At the cap it first shows, on green for 5 s as Done does, "Time limit reached: the check stopped sending input.
-You can use the PC again." (the checks stop sending input 30 s before it). It changes nothing else.
+You can use the PC again." The tools/sandbox checks stop their own input 30 s before the cap; the other runners
+that start this pop-up (desktop-tests, check-deploy, bench-cold-start) keep to their own timeouts. It changes nothing else.
 #>
 param(
     [string]$What = 'runs the desktop tests',
@@ -127,8 +128,8 @@ $timer.Add_Tick({
         if ($nowMs - $script:doneAt -gt 5000) { Remove-StateFiles; $form.Close() }
         return
     }
-    # At the cap the checks have stopped sending input (they stop 30 s before it). Say so, as Done does:
-    # closing in silence could read as free while a script is still running.
+    # At the cap, say so as Done does: closing in silence could read as free while a script is still running.
+    # The tools/sandbox checks stop their input 30 s before it; the other runners keep to their own timeouts.
     if ($nowMs -gt $capMs) {
         if ($null -eq $script:capAt) { $script:capAt = $nowMs }
         $form.BackColor = $green
