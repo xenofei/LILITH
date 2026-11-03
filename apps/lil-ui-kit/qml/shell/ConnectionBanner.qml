@@ -32,6 +32,9 @@ LBanner {
     // The protocol major this app speaks (lil_protocol::session::PROTOCOL).
     readonly property int appMajor: 1
     readonly property real coreMajor: core ? parseInt(String(core.coreProtocol)) : NaN
+    // " (protocol 2.0)", or nothing when the core named none.
+    readonly property string protocolWords: core && String(core.coreProtocol) !== ""
+                                            ? " (protocol " + core.shownText(String(core.coreProtocol), 16) + ")" : ""
     readonly property bool coreIsNewer: coreMajor > appMajor
     readonly property bool coreIsOlder: coreMajor < appMajor
     readonly property string connection: core ? core.connection : ""
@@ -56,15 +59,13 @@ LBanner {
             return "Reconnecting… AI and workspace actions are off until the core is back."
         case "incompatible":
             if (coreIsNewer)
-                return "This app is older than the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
-                       + "). Restart LILITH to use it."
+                return "This app is older than the running core" + protocolWords + ". Restart LILITH to use it."
             if (!coreIsOlder)
-                return "This app can't use the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
-                       + "). Restart LILITH, and the core when it's idle."
+                return "This app can't use the running core" + protocolWords + ". Restart LILITH, and the core when it's idle."
             if (_retrying)
                 return "Trying again: replacing the core once nothing is running…"
-            return "This app can't use the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
-                   + "). Restart the core when it's idle: Try again replaces it once nothing is running."
+            return "This app can't use the running core" + protocolWords
+                   + ". Restart the core when it's idle: Try again replaces it once nothing is running."
         case "unavailable":
             if (_useError !== "")
                 return _useError
@@ -114,9 +115,11 @@ LBanner {
             visible: root.connection === "unavailable" && !root.refusedWorkspace
                      && !(root.cause && root.cause.retry === "never")
                      || root.connection === "incompatible" && root.coreIsOlder
-            enabled: !root._retrying
             text: "Try again"
             onClicked: {
+                // It keeps the focus while it runs (the banner's words say so), and ignores a click.
+                if (root._retrying)
+                    return
                 root.core.retryNow()
                 // The state doesn't change while an older core is replaced: say that it is working.
                 if (root.connection === "incompatible") {

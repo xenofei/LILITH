@@ -458,15 +458,23 @@ TestCase {
         mouseClick(banner.retryButton)
         compare(t.core.retries, 1)
         verify(banner.text.indexOf("Trying again") >= 0, banner.text)
-        verify(!banner.retryButton.enabled, "one attempt at a time")
-        // It may end where it began (still incompatible): the words and the button come back.
-        tryVerify(() => banner.text.indexOf("Trying again") < 0, 3000, banner.text)
+        // The button keeps the focus (the words are the cue), and one attempt runs at a time.
         verify(banner.retryButton.enabled)
-        // A state change ends it at once.
         mouseClick(banner.retryButton)
+        compare(t.core.retries, 1, "a click during the attempt starts no second one")
+        // It may end where it began (still incompatible): the words come back.
+        tryVerify(() => banner.text.indexOf("Trying again") < 0, 3000, banner.text)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 2)
         verify(banner.text.indexOf("Trying again") >= 0, banner.text)
+        // A state change ends it at once, and the incompatible state that follows is idle again.
         t.core.applyState({connection: "connecting"})
+        t.core.applyState({connection: "incompatible", coreProtocol: "0.9"})
         verify(banner.text.indexOf("Trying again") < 0, banner.text)
+        verify(banner.text.indexOf("Try again replaces it") >= 0, banner.text)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 3, "a new attempt")
+        verify(banner.text.indexOf("Trying again") >= 0, banner.text)
     }
 
     function test_a_core_protocol_that_cant_be_read_offers_no_try_again() { // spec: APP-036, ARCH-023
@@ -479,6 +487,8 @@ TestCase {
             verify(!banner.retryButton.visible, "no button for protocol '" + protocol + "'")
             verify(banner.text.indexOf("Try again") < 0, banner.text)
             verify(banner.text.indexOf("This app can't use the running core") >= 0, banner.text)
+            // An empty protocol is no number to show.
+            verify(protocol !== "" || banner.text.indexOf("(protocol") < 0, banner.text)
         }
     }
 
