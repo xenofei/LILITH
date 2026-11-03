@@ -120,7 +120,7 @@ Column {
             font.bold: true
             wrapMode: Text.WrapAnywhere
             Accessible.role: Accessible.StaticText
-            Accessible.name: text
+            Accessible.name: Words.spoken(text)
         }
 
         Text {
@@ -131,7 +131,7 @@ Column {
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap
             Accessible.role: Accessible.StaticText
-            Accessible.name: text
+            Accessible.name: Words.spoken(text)
         }
     }
 

@@ -47,7 +47,7 @@ LCard {
                                         + (countdownText !== "" ? " · " + countdownText : "")
 
     title: factsOutside ? "" : actionTitle
-    Accessible.name: actionTitle
+    Accessible.name: Words.spoken(actionTitle)
 
     Timer {
         interval: 1000
@@ -71,7 +71,7 @@ LCard {
             font.pixelSize: Theme.fontSize
             wrapMode: Text.Wrap
             Accessible.role: Accessible.StaticText
-            Accessible.name: text
+            Accessible.name: Words.spoken(text)
         }
 
         Text {

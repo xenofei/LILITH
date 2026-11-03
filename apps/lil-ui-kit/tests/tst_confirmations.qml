@@ -1140,6 +1140,28 @@ TestCase {
         closeDialog(panel)
     }
 
+    // The isolates around names lay out what is drawn; what UI Automation reads has none of them.
+    function test_no_accessible_name_holds_a_bidi_isolate() { // spec: APP-156, P4a-R8
+        const named = Shapes.view({id: "cf_00000000000000e5", tool: "א.tool", caller_kind: "ב", project: "ג 100"})
+        const panel = makePanel([crane, named])
+        const found = []
+        const check = root => {
+            const visit = item => {
+                const name = LilShim.accessibleOf(item).name || ""
+                if (/[⁨⁩]/.test(name))
+                    found.push(name)
+                for (let i = 0; i < item.children.length; ++i)
+                    visit(item.children[i])
+            }
+            visit(root)
+        }
+        check(panel)
+        openDialog(panel, named.id)
+        check(panel.dialogPopup.contentItem)
+        closeDialog(panel)
+        compare(found, [], "names with an isolate")
+    }
+
     // The dialog is where the panel is: a floated panel's dialog opens in its float, whose front is
     // the one Windows reports, with the cap prompt and the waiting notice in it.
     function test_a_floated_panels_dialog_opens_in_its_float() { // spec: P4a-R10

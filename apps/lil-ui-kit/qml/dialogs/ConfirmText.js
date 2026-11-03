@@ -44,6 +44,13 @@ function isolate(text) {
     return "⁨" + text + "⁩"
 }
 
+// What an accessible name says of `text`: without the layout marks this file adds (ltr's first
+// strong mark and the isolates), which a reader has no use for. Every such character that came
+// from outside is already a visible marker (ConfirmInput.shownLine), so nothing sent is lost.
+function spoken(text) {
+    return String(text).replace(/[‎⁨⁩]/g, "")
+}
+
 // "14:02" in local time, from an RFC 3339 time.
 function clock(iso) {
     return Qt.formatTime(new Date(iso), "HH:mm")
