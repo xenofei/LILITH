@@ -103,8 +103,8 @@ set_property(TEST tst_open_card grab_open_card tst_launch APPEND PROPERTY
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
 
 # The stall watchdog's check: offscreen whatever the preset. It asserts behaviour (a 300 ms block
-# gives one gui_stall and one gui_stall_stack), not a budget, so it is labelled qml and the pull
-# request tier runs it; the name stays.
+# gives at least one gui_stall and one gui_stall_stack), not a budget, so it is labelled qml and
+# the pull request tier runs it; the name stays.
 add_test(NAME bench_stall_watchdog COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/bench_stall_watchdog.qml)
 set_tests_properties(bench_stall_watchdog PROPERTIES
     LABELS qml
