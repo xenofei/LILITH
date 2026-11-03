@@ -44,8 +44,8 @@
 //! the tool and arguments you approved (an approval with the cap action `allow_once` lets the
 //! reservation pass the caps the prompt named, up to the estimate it showed, this once: the
 //! reserve stage gets them as `allow_once` and asks again for anything else), and the outcome
-//! is stored as usual; denied or expired,
-//! the key is released and the call is `confirm.denied` or `confirm.expired`; still pending,
+//! is stored as usual; denied, expired or cancelled, the key is released and the call is
+//! `confirm.denied` or `confirm.expired` (a cancelled one in its own words); still pending,
 //! the same `pending_confirmation`.
 //!
 //! **Retries** (`job.retry`, ARCH-052, CORE-146). The retry tool asks the jobs module for the

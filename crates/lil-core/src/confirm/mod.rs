@@ -25,7 +25,8 @@
 //!   [`Confirm::on_replay`]: approved runs the call once, for the tool, arguments and project
 //!   you saw, if the retry comes within the lifetime from your answer (the row is taken back
 //!   with `StateDb::idem_reclaim`, so of racing retries exactly one runs it; later the approval
-//!   has expired); denied and expired release the key; still pending replays the same
+//!   has expired); denied, expired and cancelled release the key (a cancelled one answers
+//!   `confirm.expired` in words that say it was cancelled); still pending replays the same
 //!   `pending_confirmation` (a non-interactive caller gets `confirm.unavailable` instead, and
 //!   the key stays). Answered, expired and cancelled rows older than 30 days are pruned with
 //!   the idempotency rows.
