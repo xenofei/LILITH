@@ -187,7 +187,7 @@ Rectangle {
                 LButton {
                     id: reviewButton
                     text: "Review and answer"
-                    Accessible.description: card.title
+                    Accessible.description: Words.spoken(card.title)
                     onClicked: root._show(card.cid, true)
                 }
             }

@@ -38,6 +38,19 @@ function ltr(text) {
     return "‎" + String(text).replace(/\n/g, "\n‎")
 }
 
+// A name from outside set apart from the words around it (a first strong isolate): right-to-left
+// letters in it lay out only the name, never the words or the countdown beside it.
+function isolate(text) {
+    return "⁨" + text + "⁩"
+}
+
+// What an accessible name says of `text`: without the layout marks this file adds (ltr's first
+// strong mark and the isolates), which a reader has no use for. Every such character that came
+// from outside is already a visible marker (ConfirmInput.shownLine), so nothing sent is lost.
+function spoken(text) {
+    return String(text).replace(/[‎⁨⁩]/g, "")
+}
+
 // "14:02" in local time, from an RFC 3339 time.
 function clock(iso) {
     return Qt.formatTime(new Date(iso), "HH:mm")
@@ -74,7 +87,7 @@ function timeLeft(expiresAt, nowMs) {
 // A refused or failed answer in plain words, never the code.
 function errorWords(error, shown) {
     switch (error ? error.code : "") {
-    case "confirm.expired": return "This confirmation has expired, so that answer didn't count."
+    case "confirm.expired": return "This confirmation has ended (it expired or was cancelled), so that answer didn't count."
     case "confirm.already_answered": return "This confirmation was answered somewhere else first."
     case "confirm.unknown": return "LILITH doesn't know this confirmation any more."
     default: return error && error.message ? shown(String(error.message), 300) : "That answer didn't reach the core."

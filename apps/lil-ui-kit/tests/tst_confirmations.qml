@@ -487,6 +487,34 @@ TestCase {
         closeDialog(panel)
     }
 
+    // The same words said again are said now: the second refusal's words stay as the window comes back.
+    function test_words_said_again_count_from_the_second_time() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const bar = panel.dialog.bar
+        bar.refuse("no_move", "Approve")
+        const words = bar.reason
+        wait(1100)
+        bar.refuse("no_move", "Approve")
+        bar.inFront = false
+        bar.inFront = true
+        compare(bar.reason, words, "said just now: they stay")
+        closeDialog(panel)
+    }
+
+    // "Bring this window to the front first" is answered once it is in front, however soon.
+    function test_coming_to_the_front_clears_the_words_that_asked_for_it() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const bar = panel.dialog.bar
+        bar.refuse("not_in_front", "Deny")
+        verify(bar.reason.indexOf("Bring this window") === 0, bar.reason)
+        bar.inFront = false
+        bar.inFront = true
+        compare(bar.reason, "", "the window is in front now")
+        closeDialog(panel)
+    }
+
     function test_approve_waits_500_ms_and_for_the_front() { // spec: P4a-R10
         const panel = makePanel([crane])
         panel.showConfirmation(crane.id)
@@ -643,7 +671,7 @@ TestCase {
         fake.respond(sent[0].id, {status: "error", error: {code: "confirm.expired", category: "cancelled",
                                                            message: "Confirmation cf_x expired before it was answered.",
                                                            trace_id: "t", retry: "after_resolve"}})
-        compare(dialog.bar.reason, "This confirmation has expired, so that answer didn't count.")
+        compare(dialog.bar.reason, "This confirmation has ended (it expired or was cancelled), so that answer didn't count.")
         verify(dialog.bar.reason.indexOf("confirm.") < 0)
     }
 
@@ -1112,6 +1140,28 @@ TestCase {
         closeDialog(panel)
     }
 
+    // The isolates and first strong marks lay out what is drawn; what UI Automation reads has none.
+    function test_no_accessible_name_holds_a_layout_mark() { // spec: APP-156, P4a-R8
+        const named = Shapes.view({id: "cf_00000000000000e5", tool: "א.tool", caller_kind: "ב", project: "ג 100"})
+        const panel = makePanel([crane, named])
+        const found = []
+        const check = root => {
+            const visit = item => {
+                const name = LilShim.accessibleOf(item).name || ""
+                if (/[‎⁨⁩]/.test(name))
+                    found.push(name)
+                for (let i = 0; i < item.children.length; ++i)
+                    visit(item.children[i])
+            }
+            visit(root)
+        }
+        check(panel)
+        openDialog(panel, named.id)
+        check(panel.dialogPopup.contentItem)
+        closeDialog(panel)
+        compare(found, [], "names with a layout mark")
+    }
+
     // The dialog is where the panel is: a floated panel's dialog opens in its float, whose front is
     // the one Windows reports, with the cap prompt and the waiting notice in it.
     function test_a_floated_panels_dialog_opens_in_its_float() { // spec: P4a-R10
@@ -1137,6 +1187,13 @@ TestCase {
         tryVerify(() => panel.dialogPopup.opened, 2000)
         compare(panel.dialog.Window.window, panel.Window.window, "the dialog is in the float")
         compare(panel.dialog.capPrompt.Window.window, panel.Window.window, "and its cap prompt")
+        compare(panel.dialog.approveButton.Window.window, panel.Window.window, "and Approve")
+        // The modal dim is over the float too: it shares the popup's overlay, in the float's content.
+        const popupItem = panel.dialogPopup.background.parent
+        const overlay = popupItem.parent
+        verify(overlay.parent === panel.Window.window.contentItem, "the popup is in the float's overlay")
+        verify(overlay.children.some(c => c !== popupItem && c.visible && c.color !== undefined
+                                          && Qt.colorEqual(c.color, Qt.rgba(0, 0, 0, 0.5))), "and so is its dim")
         panel.showConfirmation(crane.id)
         verify(panel.waitingNotice.visible)
         compare(panel.waitingNotice.Window.window, panel.Window.window, "and the waiting notice")

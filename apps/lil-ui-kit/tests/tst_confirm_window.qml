@@ -187,6 +187,53 @@ TestCase {
         verify(!dialog.approveButton.activeFocus)
     }
 
+    // Whether `item` is wholly inside what the window's column shows.
+    function inView(w, item) {
+        const column = w.cardColumn
+        const top = item.mapToItem(column.column, 0, 0).y
+        return top >= column.contentY - 1 && top + item.height <= column.contentY + column.height + 1
+    }
+
+    // Scrolled to the last card, an outage leaves the view there, and the keyboard comes back only to
+    // a Deny that is on screen.
+    function test_an_outage_doesnt_scroll_you_away() { // spec: P4a-R10
+        let pending = []
+        for (let i = 0; i < 6; ++i)
+            pending.push(Shapes.view({id: "cf_000000000000011" + i, tool: "tool.number" + i}))
+        const w = makeWindow(pending)
+        inFront(w)
+        launch(w, {kind: "confirm_list"})
+        tryCompare(w.dialogs, "count", 6)
+        const first = w.dialogs.itemAt(0)
+        const last = w.dialogs.itemAt(5)
+        tryVerify(() => first.denyButton.activeFocus, 2000, "the top Deny has the keyboard")
+        const column = w.cardColumn
+        tryVerify(() => column.contentHeight > column.height, 2000, "the cards scroll")
+        column.contentY = column.contentHeight - column.height
+        const scrolled = column.contentY
+        verify(inView(w, last.denyButton) && !inView(w, first.denyButton), "the last card is in view, the top one isn't")
+
+        fake.connection = "reconnecting"
+        tryVerify(() => !first.denyButton.activeFocus, 1000)
+        fake.connection = "ready"
+        tryVerify(() => last.bar.live, 1000)
+        wait(50)
+        verify(column.contentY >= scrolled - 1, "still where it was: " + column.contentY + " < " + scrolled)
+        verify(inView(w, last.denyButton), "the last card is still in view")
+
+        // Nothing has the keyboard when the core is back: only a Deny on screen takes it.
+        fake.connection = "reconnecting"
+        tryVerify(() => !first.denyButton.activeFocus, 1000)
+        first.denyButton.focus = false
+        fake.connection = "ready"
+        tryVerify(() => last.bar.live, 1000)
+        wait(50)
+        verify(column.contentY >= scrolled - 1, "still where it was: " + column.contentY + " < " + scrolled)
+        const focused = w.activeFocusItem
+        verify(!first.denyButton.activeFocus, "not the Deny scrolled away")
+        verify(focused && focused.text === "Deny" && inView(w, focused), "a Deny on screen: " + (focused ? focused.text : "nothing"))
+    }
+
     function test_the_long_words_fit_here_too() { // spec: P4a-R10
         const w = makeWindow([first])
         launch(w, {kind: "confirm", id: first.id})

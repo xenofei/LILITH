@@ -25,7 +25,8 @@
 //!   [`Confirm::on_replay`]: approved runs the call once, for the tool, arguments and project
 //!   you saw, if the retry comes within the lifetime from your answer (the row is taken back
 //!   with `StateDb::idem_reclaim`, so of racing retries exactly one runs it; later the approval
-//!   has expired); denied and expired release the key; still pending replays the same
+//!   has expired); denied, expired and cancelled release the key (a cancelled one answers
+//!   `confirm.expired` in words that say it was cancelled); still pending replays the same
 //!   `pending_confirmation` (a non-interactive caller gets `confirm.unavailable` instead, and
 //!   the key stays). Answered, expired and cancelled rows older than 30 days are pruned with
 //!   the idempotency rows.
@@ -313,8 +314,10 @@ pub enum Replay {
     Run(Box<ConfirmationRow>),
     StillPending(PendingConfirmation),
     Denied,
-    /// Expired, cancelled, or gone.
+    /// Expired, or gone.
     Expired,
+    /// Cancelled unanswered (an app's cap prompt when its app closed).
+    Cancelled,
 }
 
 /// Appendix F's `mcp_confirmation`: whether Claude Code's own prompt is an `mcp` call's
@@ -703,7 +706,8 @@ impl Confirm {
             }
             ConfState::Approved => Replay::Run(Box::new(row)),
             ConfState::Denied => Replay::Denied,
-            ConfState::Expired | ConfState::Cancelled => Replay::Expired,
+            ConfState::Expired => Replay::Expired,
+            ConfState::Cancelled => Replay::Cancelled,
         })
     }
 
@@ -864,7 +868,12 @@ impl Confirm {
             )
         };
         let ended = |row: &ConfirmationRow| match row.state {
-            ConfState::Expired | ConfState::Cancelled => expired(),
+            ConfState::Expired => expired(),
+            // The same code, in words that don't say it ran out of time.
+            ConfState::Cancelled => fail(
+                &codes::CONFIRM_EXPIRED,
+                format!("Confirmation {id} was cancelled before it was answered."),
+            ),
             _ => fail(
                 &codes::CONFIRM_ALREADY_ANSWERED,
                 format!(

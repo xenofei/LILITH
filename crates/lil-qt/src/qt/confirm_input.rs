@@ -245,6 +245,7 @@ fn refusal_words(name: &str, label: &str) -> String {
             "That has more decimals than this currency uses. Enter it as the button should say it."
                 .to_string()
         }
+        "too_large" => "That amount is too large.".to_string(),
         "not_higher" => {
             "That isn't higher than the limit now, so it wouldn't be a raise. Enter a higher one, or use Allow once or Cancel."
                 .to_string()
@@ -567,4 +568,29 @@ fn pointer_gate_reset() {
     GATE.with(|g| g.borrow_mut().reset());
     // What the windows' fronts were before anything was watched is old too.
     FRONT_GAINED_AT.with(|fronts| fronts.borrow_mut().clear());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{confirm_text, refusal_words};
+
+    // Each refusal of the amount field reads as its own words, never the catch-all "click again".
+    #[test] // spec: APP-054
+    fn each_raise_refusal_has_its_own_words() {
+        for (amount, words) in [
+            ("lots", "Enter the new limit as a number, like 25 or 12.50."),
+            (
+                "25.999",
+                "That has more decimals than this currency uses. Enter it as the button should say it.",
+            ),
+            ("9223372036854.78", "That amount is too large."),
+            (
+                "1",
+                "That isn't higher than the limit now, so it wouldn't be a raise. Enter a higher one, or use Allow once or Cancel.",
+            ),
+        ] {
+            let name = confirm_text::raise_refusal(amount, "1", "USD").expect(amount);
+            assert_eq!(refusal_words(name, "Raise the cap"), words, "{amount}");
+        }
+    }
 }

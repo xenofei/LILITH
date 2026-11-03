@@ -38,7 +38,9 @@ Column {
     // The answer went through: nothing more goes out.
     property bool sent: false
     property string reason
+    // When the reason was last said, and the refusal's name, if it is one.
     property real _reasonAtMs: -1000
+    property string _reasonName
     readonly property bool connected: CoreGate.ready(root)
     readonly property bool buttonsOn: open && !busy && !sent
     readonly property bool live: buttonsOn && connected
@@ -64,11 +66,13 @@ Column {
     onInFrontChanged: {
         restartClock()
         // Old words go. Ones just set stay: the activation can reach QML right after the click that
-        // caused it was refused, and those words say what to do next.
-        if (inFront && ConfirmInput.nowMs() - _reasonAtMs >= 1000)
+        // caused it was refused, and those words say what to do next. Words that asked for the front
+        // go at once: it has come.
+        if (inFront && (_reasonName === "not_in_front" || ConfirmInput.nowMs() - _reasonAtMs >= 1000)) {
             reason = ""
+            _reasonName = ""
+        }
     }
-    onReasonChanged: _reasonAtMs = ConfirmInput.nowMs()
     onVisibleChanged: restartClock()
     // Words from before it could answer again are old news. An answer that fails with the core still
     // there sets its words after this.
@@ -99,9 +103,13 @@ Column {
     function rearm() {
         restartClock()
         reason = ""
+        _reasonName = ""
     }
 
+    // Stamped each time, so words said again count from now.
     function refuse(name, label) {
+        _reasonAtMs = ConfirmInput.nowMs()
+        _reasonName = name
         reason = ConfirmInput.refusalText(name, label)
         ConfirmInput.logRefusal(name)
         Accessible.announce(reason)
@@ -137,6 +145,7 @@ Column {
     function _send(answer, cap) {
         busy = true
         reason = ""
+        _reasonName = ""
         const id = confirmationId
         const params = {confirmation_id: id, answer: answer}
         if (cap)
@@ -155,6 +164,7 @@ Column {
                 if (id !== confirmationId)
                     return
                 busy = false
+                _reasonAtMs = ConfirmInput.nowMs()
                 reason = Words.errorWords(error, (t, n) => ConfirmInput.shownLine(t, n))
                 Accessible.announce(reason)
             }

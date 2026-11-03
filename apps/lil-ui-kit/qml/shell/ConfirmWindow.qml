@@ -34,6 +34,7 @@ Window {
     readonly property alias instanceBanner: instanceBanner
     readonly property alias shown: shown
     readonly property alias dialogs: dialogs
+    readonly property alias cardColumn: column
     readonly property alias emptyText: emptyText
 
     width: 620
@@ -104,13 +105,28 @@ Window {
         }
     }
 
-    // The dialogs can answer again, and nothing has the keyboard: the same rule, while this window
-    // has it. Qt gives it back to a control that held it.
+    // The dialogs can answer again, and nothing has the keyboard: the first pending Deny (or a cap
+    // prompt's Cancel) on screen takes it, while this window has it, and the view stays where the
+    // owner scrolled it. Qt gives it back to a control that held it.
     function _focusBack() {
-        if (!active)
+        if (!active || (activeFocusItem && activeFocusItem !== contentItem))
             return
-        _focusWanted = true
-        _focusFirst()
+        for (let i = 0; i < dialogs.count; ++i) {
+            const d = dialogs.itemAt(i)
+            if (!d || !d.pending)
+                continue
+            const target = d.isCap ? (d.capPrompt ? d.capPrompt.cancelButton : null) : d.denyButton
+            if (target && _onScreen(target)) {
+                d.focusDeny()
+                return
+            }
+        }
+    }
+
+    // Whether `item` is wholly inside what the column shows.
+    function _onScreen(item) {
+        const top = item.mapToItem(column.column, 0, 0).y
+        return top >= column.contentY && top + item.height <= column.contentY + column.height
     }
 
     // The dialog on `id`, once made.

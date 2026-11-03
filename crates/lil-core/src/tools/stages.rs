@@ -234,8 +234,11 @@ pub enum ReplayDecision {
     StillPending(PendingConfirmation),
     /// `confirm.denied`; the key is released.
     Denied,
-    /// `confirm.expired` (also a prompt cancelled unanswered); the key is released.
+    /// `confirm.expired`; the key is released.
     Expired,
+    /// `confirm.expired` too, for a prompt cancelled unanswered, in words that say so; the key
+    /// is released.
+    Cancelled,
 }
 
 /// What the confirm-and-caps stage decided (CORE-017).

@@ -212,6 +212,7 @@ impl ConfirmStage for AgentConfirm {
                 Replay::StillPending(pending) => ReplayDecision::StillPending(pending),
                 Replay::Denied => ReplayDecision::Denied,
                 Replay::Expired => ReplayDecision::Expired,
+                Replay::Cancelled => ReplayDecision::Cancelled,
             }))
         })
     }

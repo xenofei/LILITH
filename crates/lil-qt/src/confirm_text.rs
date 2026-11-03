@@ -367,13 +367,26 @@ pub fn shown_action(arguments: &Value) -> ShownAction {
 /// Why a typed amount can't be the new limit of a cap now at `limit` (the core's decimal string), by
 /// name, or `None` when it can. The Raise button shows the amount through `money_text`, which rounds
 /// to the currency's minor unit, and what is sent must be what it says, so more decimals are refused.
-/// A raise that isn't higher is refused too. Text, never a float.
+/// The core reads it as written (`app/caps.set`'s rules: `i64` micro-units), so more than 6 decimals
+/// are refused even when the extra ones are zeros. A raise that isn't higher is refused too, and so
+/// is one above the largest amount the core holds. Text, never a float.
 pub fn raise_refusal(amount: &str, limit: &str, currency: &str) -> Option<&'static str> {
+    const CORE_DECIMALS: usize = 6;
     let Some(new) = Decimal::parse(amount) else {
         return Some("not_a_number");
     };
-    if new.fraction.len() > crate::money::minor_unit(currency) {
+    let written = amount
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    if new.fraction.len() > crate::money::minor_unit(currency) || written > CORE_DECIMALS {
         return Some("too_many_decimals");
+    }
+    let largest = Decimal {
+        whole: "9223372036854",
+        fraction: "775807",
+    };
+    if new.compare(&largest) == std::cmp::Ordering::Greater {
+        return Some("too_large");
     }
     // A limit that can't be read refuses nothing here: the core has the say.
     Decimal::parse(limit)
@@ -388,17 +401,12 @@ struct Decimal<'a> {
 }
 
 impl<'a> Decimal<'a> {
-    /// Digits, at most 18 before the point, and any after it.
+    /// Digits before the point, and any after it. Compared as text, so no length can overflow.
     fn parse(text: &'a str) -> Option<Decimal<'a>> {
         let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
         let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
         let dangling_point = text.contains('.') && fraction.is_empty();
-        if whole.is_empty()
-            || whole.len() > 18
-            || !digits(whole)
-            || !digits(fraction)
-            || dangling_point
-        {
+        if whole.is_empty() || !digits(whole) || !digits(fraction) || dangling_point {
             return None;
         }
         Some(Decimal {
@@ -659,10 +667,15 @@ mod tests {
             (".5", "0", "USD", Some("not_a_number")),
             ("-5", "1", "USD", Some("not_a_number")),
             ("1e3", "1", "USD", Some("not_a_number")),
-            ("1234567890123456789", "1", "USD", Some("not_a_number")),
+            ("1234567890123456789", "1", "USD", Some("too_large")),
             ("25.999", "1", "USD", Some("too_many_decimals")),
             ("0.001", "0", "USD", Some("too_many_decimals")),
             ("120.7", "1", "JPY", Some("too_many_decimals")),
+            // The core takes at most 6 decimals as written (micro-units), trailing zeros included.
+            ("1.500000", "1", "USD", None),
+            ("1.5000000", "1", "USD", Some("too_many_decimals")),
+            ("121.000000", "1", "JPY", None),
+            ("121.0000000", "1", "JPY", Some("too_many_decimals")),
             ("1", "1", "USD", Some("not_higher")),
             ("1.00", "1", "USD", Some("not_higher")),
             ("0.5", "1", "USD", Some("not_higher")),
@@ -674,6 +687,30 @@ mod tests {
                 raise_refusal(amount, limit, currency),
                 want,
                 "{amount} over {limit}"
+            );
+        }
+    }
+
+    // The core holds a limit as i64 micro-units, at most 9,223,372,036,854.775807: one step of the
+    // currency more is refused here, in words of its own, not sent for the core to call it no number.
+    #[test] // spec: APP-054
+    fn a_raise_past_the_cores_largest_amount_is_too_large() {
+        for (amount, currency, want) in [
+            ("9223372036854.77", "USD", None),
+            ("9223372036854.78", "USD", Some("too_large")),
+            ("9223372036854", "JPY", None),
+            ("9223372036855", "JPY", Some("too_large")),
+            ("9223372036854.775", "KWD", None),
+            ("9223372036854.776", "KWD", Some("too_large")),
+            ("99999999999999", "USD", Some("too_large")),
+            ("000009223372036854.77", "USD", None),
+            ("0000000000000000009223372036854.77", "USD", None),
+            ("123456789012345678901234567890", "USD", Some("too_large")),
+        ] {
+            assert_eq!(
+                raise_refusal(amount, "1", currency),
+                want,
+                "{amount} {currency}"
             );
         }
     }
