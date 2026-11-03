@@ -101,6 +101,15 @@ pub enum Delivery {
     Event(EventParams),
 }
 
+/// The shell's words for a hello refused over its workspace (`refused` with a `workspace.*`
+/// code): the top bar's connection label and the banner's lead, which the core's reason follows.
+/// `Core.unavailable` carries them as `label` and `lead`.
+pub const REFUSED_WORKSPACE_LABEL: &str = "Workspace refused";
+pub const REFUSED_WORKSPACE_LEAD: &str = "The core refused this workspace";
+/// The same words for every other cause.
+pub const UNAVAILABLE_LABEL: &str = "Core unavailable";
+pub const UNAVAILABLE_LEAD: &str = "The core isn't available";
+
 /// The `Core` properties a session state sets; `None` leaves one as it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateView {
@@ -111,7 +120,7 @@ pub struct StateView {
     pub core_build_id: Option<String>,
     /// The hello's workspace as JSON (`None` inside: no workspace).
     pub workspace: Option<Option<String>>,
-    /// While unavailable, why as JSON: `{reason, cause, code?, retry?}`.
+    /// While unavailable, why as JSON: `{reason, cause, code?, retry?, label, lead}`.
     pub unavailable: Option<String>,
 }
 
@@ -366,8 +375,9 @@ impl Runtime {
                 core_build_id: None,
                 workspace: Some(None),
                 unavailable: Some(
-                    json!({"reason": "This process has no core session.", "cause": "other"})
-                        .to_string(),
+                    json!({"reason": "This process has no core session.", "cause": "other",
+                           "label": UNAVAILABLE_LABEL, "lead": UNAVAILABLE_LEAD})
+                    .to_string(),
                 ),
             })),
         }
@@ -615,12 +625,19 @@ fn unavailable_json(reason: &str, cause: &UnavailableCause) -> String {
         UnavailableCause::Refused(_) => "refused",
         UnavailableCause::Other => "other",
     });
+    let (mut label, mut lead) = (UNAVAILABLE_LABEL, UNAVAILABLE_LEAD);
     if let UnavailableCause::Refused(error) = cause {
         // The core's own words name the fix.
         out["reason"] = json!(error.message);
         out["code"] = json!(error.code);
         out["retry"] = serde_json::to_value(error.retry).unwrap_or(Value::Null);
+        // As `CoreGate.refusedWorkspace` tells it.
+        if error.code.starts_with("workspace.") {
+            (label, lead) = (REFUSED_WORKSPACE_LABEL, REFUSED_WORKSPACE_LEAD);
+        }
     }
+    out["label"] = json!(label);
+    out["lead"] = json!(lead);
     out.to_string()
 }
 
@@ -1071,7 +1088,8 @@ mod tests {
     }
 
     /// A refused hello reaches the banner in the core's words, with what it takes to get out;
-    /// any other cause keeps the client's reason.
+    /// any other cause keeps the client's reason. Each carries the shell's words for it: a hello
+    /// refused over its workspace is "Workspace refused", anything else "Core unavailable".
     #[test] // spec: ARCH-100
     fn an_unavailable_state_carries_its_cause() {
         let refused = ErrorBody::new(
@@ -1092,6 +1110,8 @@ mod tests {
             shown["reason"],
             "This core serves only the default workspace, \"B\"."
         );
+        assert_eq!(shown["label"], "Workspace refused");
+        assert_eq!(shown["lead"], "The core refused this workspace");
 
         let view = StateView::of(&SessionState::Unavailable {
             reason: "Cannot start the core.".into(),
@@ -1101,6 +1121,20 @@ mod tests {
         assert_eq!(shown["cause"], "cannot_start");
         assert_eq!(shown["reason"], "Cannot start the core.");
         assert_eq!(shown.get("code"), None);
+        assert_eq!(shown["label"], "Core unavailable");
+        assert_eq!(shown["lead"], "The core isn't available");
+
+        let other = ErrorBody::new(
+            &lil_protocol::codes::CALLER_NOT_ALLOWED,
+            "Not for this caller.",
+            "t_2",
+        );
+        let view = StateView::of(&SessionState::Unavailable {
+            reason: "The core refused the hello.".into(),
+            cause: UnavailableCause::Refused(Box::new(other)),
+        });
+        let shown: Value = serde_json::from_str(view.unavailable.as_deref().unwrap()).unwrap();
+        assert_eq!(shown["label"], "Core unavailable");
 
         assert_eq!(StateView::of(&SessionState::Connecting).unavailable, None);
     }

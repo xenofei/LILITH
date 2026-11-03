@@ -5,9 +5,11 @@
 //!   `unavailable`), `coreProtocol`, `workspace` (`{id, path}`, or null), `project` (the
 //!   app's project as the last `app/set_context` answered it, empty for none: the project
 //!   switcher tells it through `noteProject`, since the session keeps its project per connection),
-//!   `unavailable` (while `connection` is `unavailable`: `{reason, cause, code?, retry?}`, `cause`
-//!   one of `start_failed`, `cannot_start`, `untrusted`, `refused` or `other`, and `code` and `retry`
-//!   those of a refused hello; else null),
+//!   `unavailable` (while `connection` is `unavailable`: `{reason, cause, code?, retry?, label,
+//!   lead}`, `cause` one of `start_failed`, `cannot_start`, `untrusted`, `refused` or `other`,
+//!   `code` and `retry` those of a refused hello, and `label` and `lead` the shell's words for it,
+//!   "Workspace refused" and "The core refused this workspace" for a hello refused over its
+//!   workspace, else "Core unavailable" and "The core isn't available"; else null),
 //!   `channelScheme`, `startTimes` (`{firstFrameMs, interactiveMs}` of this start, APP-136, as
 //!   they become known), `buildId` (this app's own) and `coreBuildId` (the `build_id` of the core's
 //!   hello; empty until one is in).
