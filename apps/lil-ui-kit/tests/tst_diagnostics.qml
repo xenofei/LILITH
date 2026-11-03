@@ -551,6 +551,17 @@ TestCase {
         compare(callsOf(core, "diagnostics.recent").length, reads + 1, "no retry after a success")
     }
 
+    // Only Recent errors retries on its own: a refusal of the other cards' reads is recorded, so a retry at
+    // each window's end would put one entry a minute (and more) in the ring for each of them.
+    function test_a_failing_card_other_than_recent_errors_isnt_retried_with_no_event() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core, {"telemetry.snapshot": failed({code: "workspace.unsupported", message: "This core serves only the default workspace."})})
+        const reads = callsOf(core, "telemetry.snapshot").length
+        wait(1800)
+        compare(callsOf(core, "telemetry.snapshot").length, reads, "no read at the end of its window with no event")
+    }
+
     // Hiding the panel forgets how long its card has been failing: after a show, the first failure's
     // window is the shortest again.
     function test_hiding_the_panel_resets_the_backoff() { // spec: ARCH-121, APP-033

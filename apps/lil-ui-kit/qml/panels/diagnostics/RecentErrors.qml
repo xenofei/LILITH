@@ -96,6 +96,8 @@ LCard {
         tool: "diagnostics.recent"
         args: ({limit: 50})
         topic: "diagnostics"
+        // Its refusal isn't recorded, so no event follows it: the window's end is its retry.
+        retryWhenWindowEnds: true
         active: root.active
         onTopicEvent: root.errorsRead.request()
     }
