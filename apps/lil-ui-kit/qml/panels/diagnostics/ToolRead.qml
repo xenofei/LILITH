@@ -7,6 +7,10 @@
 //   apply as full state or to `request()` a read.
 // - `request()` is at most one read a second: the first of a burst at once, the rest as one read
 //   when the second has passed. Reads don't overlap.
+// - A `request()` made by a card from `topicEvent` reads nothing while the last read failed and none
+//   is open: a failed read can itself be what the topic's next event reports (a refused read of the
+//   core's recent errors is one), so reading again for it would loop. A reload, the session coming
+//   ready and the panel shown again still read.
 // - An answer can be older than an event: a card that applies an event as full state calls
 //   `eventApplied()`. `answered(structured, current)` then has `current` false for a read that was
 //   open at that moment, the card keeps the event's state, and a fresh read follows.
@@ -44,6 +48,7 @@ QtObject {
     property int _events: 0
     property int _eventsAtStart: 0
     property var _subscription: null
+    property bool _inEvent: false
 
     function eventApplied() {
         _events++
@@ -87,6 +92,8 @@ QtObject {
     function request() {
         if (!active)
             return
+        if (_inEvent && error && !_reading)
+            return
         if (_gate.running) {
             _due = true
             return
@@ -98,9 +105,14 @@ QtObject {
     function _shown() {
         if (topic !== "" && !_subscription) {
             _subscription = CoreCall.subscribe(core, topic, root, (kind, seq, data) => {
-                if (kind === "event")
-                    root.topicEvent(data)
-                else {
+                if (kind === "event") {
+                    root._inEvent = true
+                    try {
+                        root.topicEvent(data)
+                    } finally {
+                        root._inEvent = false
+                    }
+                } else {
                     root.request()
                     root.reloading()
                 }

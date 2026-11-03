@@ -486,6 +486,31 @@ TestCase {
         compare(callsOf(core, "diagnostics.recent").length, reads + 1)
     }
 
+    // PROTO-1: a refused session's read is recorded as an error, which is an event, which read again.
+    function test_a_failed_errors_read_isnt_read_again_by_an_event() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        const refused = failed({code: "workspace.unsupported", message: "This core serves only the default workspace."})
+        load(core, {"diagnostics.recent": refused})
+        tryVerify(() => shows(panel.errors, "This core serves only the default workspace."), 5000, texts(panel.errors).join(" | "))
+        const reads = callsOf(core, "diagnostics.recent").length
+
+        // The event of its own recorded refusal, and a burst of them, past the one-second gate.
+        for (let n = 0; n < 3; ++n)
+            core.emit("diagnostics", "event", {kind: "error", code: "workspace.unsupported", at: "2026-10-30T10:00:00Z"})
+        wait(1300)
+        compare(callsOf(core, "diagnostics.recent").length, reads, "no read follows an event while the last read failed")
+
+        // A reload still reads, and once a read works, events read again.
+        core.emit("diagnostics", "resync_required", null)
+        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
+        tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
+        wait(1100)
+        core.emit("diagnostics", "event", {kind: "error", code: "x", at: "2026-10-30T10:00:00Z"})
+        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
+        compare(callsOf(core, "diagnostics.recent").length, reads + 2)
+    }
+
     // --- The event log --------------------------------------------------------------------------
 
     function test_event_log_keeps_the_newest_1000() { // spec: ARCH-121, APP-134
