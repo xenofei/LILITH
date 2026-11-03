@@ -505,3 +505,35 @@ fn status_with_an_unusable_default_still_tells_a_running_core() {
     let call = env.lil(&["call", "test.echo", "{\"text\":\"x\"}"]);
     assert_eq!(call.code, 2, "{call:?}");
 }
+
+/// N-3: `status` warns and shows the status without a workspace for a default the core refuses
+/// too, `workspace.unknown` or `workspace.unsupported`. A relative `default_workspace` names a
+/// folder from `lil`'s current folder (the TestEnv root) but not from the core's.
+#[test] // spec: ARCH-102, AI-109, ARCH-030
+fn status_with_a_default_the_core_refuses_still_tells_a_running_core() {
+    let env = TestEnv::new();
+    let ws = env.make_workspace("relative default");
+    let name = ws.file_name().unwrap().to_str().unwrap().to_string();
+    let _core = CoreFixture::start(&env);
+    let check = |want_in_warning: &str| {
+        for args in [&["--no-start", "status"][..], &["status"]] {
+            let status = env.lil(args);
+            assert_eq!(status.code, 0, "{args:?}: {status:?}");
+            assert!(status.stdout.contains("\nworkspace: none\n"), "{status:?}");
+            assert_eq!(status.stderr.lines().count(), 1, "{status:?}");
+            assert!(status.stderr.starts_with("warning: "), "{status:?}");
+            assert!(status.stderr.contains(want_in_warning), "{status:?}");
+        }
+        let call = env.lil(&["call", "test.echo", "{\"text\":\"x\"}"]);
+        assert_eq!(call.code, 2, "{call:?}");
+    };
+
+    // The core can't open the relative default: workspace.unknown, from the Default step.
+    env.suite_toml_set(&format!("default_workspace = '{name}'\n"));
+    check("default_workspace");
+
+    // The same folder registered by its full path too: the core knows it, but it isn't the
+    // default the core serves (workspace.unsupported).
+    env.suite_toml_set(&format!("[[workspaces]]\npath = '{}'\n", ws.display()));
+    check("serves only the default workspace");
+}

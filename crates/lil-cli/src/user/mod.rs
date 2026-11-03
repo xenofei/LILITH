@@ -276,10 +276,13 @@ pub(crate) enum UnknownCwdWorkspace {
 /// (`workspace.unsupported`) the same way. One found from the current folder is handled as
 /// `unknown_cwd` says.
 ///
-/// Under [`UnknownCwdWorkspace::WarnAndUseNone`] (`status`), any workspace the chain can't name
-/// or the core can't use, except one named by `--workspace`, is one warning line while a core
-/// runs, and the status without a workspace: so `lil status --no-start` exits only 0 (a core
-/// runs) or 3 (none does), which is what a skill reads (ARCH-102).
+/// Under [`UnknownCwdWorkspace::WarnAndUseNone`] (`status`), a workspace failure while a core
+/// runs (the chain can't name one, or the core refuses the one it names with `workspace.unknown`
+/// or `workspace.unsupported`), except for a folder named by `--workspace`, is one warning line
+/// and the status without a workspace, exit 0. So a workspace never makes `lil status
+/// --no-start` exit 2 while a core runs, and the skill's 0/3 rule holds for it (ARCH-102). Other
+/// failures still exit 2: an untrusted or incompatible core, one that is draining or doesn't
+/// answer in time, and any `--workspace` error.
 pub(crate) fn connect(
     global: &GlobalArgs,
     unknown_cwd: UnknownCwdWorkspace,
