@@ -138,7 +138,7 @@ fn leftover_test_registry_keys_are_swept() {
     ];
     let folders = [
         "lil-testenv-0000000e-x1y2z3".to_string(),
-        "lil-testenv-Ünïcödé space-0000000f-a1b2c3".to_string(),
+        "lil-testenv-ÃœnÃ¯cÃ¶dÃ© space-0000000f-a1b2c3".to_string(),
         // Not a TestEnv folder, and the id doesn't end a segment: neither counts.
         "lil-other-0000000a-a1b2c3".to_string(),
         "lil-testenv-0000000b0-a1b2c3".to_string(),
@@ -248,4 +248,155 @@ fn a_test_env_owns_its_registry_root_and_its_drop_removes_it() {
     assert!(reg(&["query", &format!(r"{key}\Classes")]));
     drop(env);
     assert!(!reg(&["query", &key]), "{key} was left after the drop");
+}
+
+/// A folder entry as the sweep sees it, last written `age` before `now`.
+fn entry(name: &str, is_dir: bool, now: SystemTime, age: Duration) -> lil_testkit::env::SweepEntry {
+    lil_testkit::env::SweepEntry {
+        path: std::path::PathBuf::from(r"C:\scratch").join(name),
+        is_dir,
+        modified: now - age,
+    }
+}
+
+/// SC-06, SC-05: the age-gated sweep of leftover test folders chooses a `lil-testenv-<id>-*`
+/// folder in `%TEMP%` or a `LILITH-test-<8 hex>` folder in the real local folder only when it is
+/// a directory, at least an hour old, and no registry root with its id has a live owner.
+#[test] // spec: QA-038
+fn old_test_folders_without_a_live_owner_are_chosen() {
+    let now = SystemTime::now();
+    let old = Duration::from_secs(2 * 60 * 60);
+    let new = Duration::from_secs(10 * 60);
+    let entries = [
+        entry("lil-testenv-0000000a-x1y2z3", true, now, old), // chosen: no root
+        entry("lil-testenv-0000000b-x1y2z3", true, now, new), // too new
+        entry("lil-testenv-0000000c-x1y2z3", true, now, old), // its root's owner is alive
+        entry("lil-testenv-0000000d-x1y2z3", true, now, old), // its root's owner is dead: chosen
+        entry("lil-testenv-Ünïcödé space-0000000e-a1b2c3", true, now, old), // labelled: chosen
+        entry("lil-testenv-0000000f-x1y2z3", false, now, old), // a file
+        entry("lil-testenv-leftovers.log", false, now, old),
+        entry("lil-testenv-a1b2c3", true, now, old), // the old no-id form
+        entry("lil-testenv-0000000A-x1y2z3", true, now, old), // not lowercase hex
+        entry("lil-testenv-00000010-x1y2z3", true, now + old, old), // modified after now
+        entry("LILITH-test-00000011", true, now, old), // a Qt cache folder: chosen
+        entry("LILITH-test-00000012", true, now, new),
+        entry("LILITH-test-topbarcheck", true, now, old), // a hand-made folder
+        entry("LILITH-test-t18uia", true, now, old),
+        entry("LILITH-test-00000013-extra", true, now, old),
+        entry("LILITH", true, now, old),
+        entry("other-0000000a-x1y2z3", true, now, old),
+    ];
+    let roots = [
+        root("0000000c", Some("live"), now, old),
+        root("0000000d", Some("dead"), now, old),
+    ];
+    let alive = |owner: &str| owner == "live";
+    let chosen: Vec<String> = lil_testkit::env::folders_to_sweep(&entries, &roots, now, &alive)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        chosen,
+        [
+            "lil-testenv-0000000a-x1y2z3",
+            "lil-testenv-0000000d-x1y2z3",
+            "lil-testenv-Ünïcödé space-0000000e-a1b2c3",
+            "LILITH-test-00000011",
+        ]
+    );
+}
+
+/// The sweep over real folders (a scratch one, so no other run's folder can be hit): what the
+/// rule chooses goes, at most `cap` per pass, and nothing else is touched. Time is read as two
+/// hours on, so the fresh folders are old.
+#[test] // spec: QA-038
+fn the_sweep_removes_what_the_rule_chooses_up_to_its_cap() {
+    let scratch = tempfile::Builder::new()
+        .prefix("lil-testkit-sweep-")
+        .tempdir()
+        .unwrap();
+    let make = |name: &str| {
+        let dir = scratch.path().join(name);
+        std::fs::create_dir_all(dir.join("local")).unwrap();
+        std::fs::write(dir.join("local").join("f.txt"), name).unwrap();
+        dir
+    };
+    let doomed: Vec<_> = (0..3)
+        .map(|i| make(&format!("lil-testenv-0000001{i}-x1y2z3")))
+        .collect();
+    let alive_dir = make("lil-testenv-0000001a-x1y2z3");
+    let by_hand = make("LILITH-test-topbarcheck");
+    let file = scratch.path().join("lil-testenv-0000001b-x1y2z3");
+    std::fs::write(&file, "a file").unwrap();
+    let log = scratch.path().join("lil-testenv-leftovers.log");
+    std::fs::write(&log, "a log").unwrap();
+
+    let now = SystemTime::now() + Duration::from_secs(2 * 60 * 60);
+    let roots = [root("0000001a", Some("live"), now, Duration::from_secs(60))];
+    let alive = |owner: &str| owner == "live";
+    let sweep =
+        |cap| lil_testkit::env::sweep_folders_in(&[scratch.path()], &roots, now, &alive, cap);
+    assert_eq!(sweep(2), 2, "the cap holds");
+    assert_eq!(doomed.iter().filter(|d| d.exists()).count(), 1);
+    assert_eq!(sweep(2), 1);
+    assert!(doomed.iter().all(|d| !d.exists()));
+    assert_eq!(sweep(2), 0);
+    assert!(alive_dir.exists() && by_hand.exists() && file.exists() && log.exists());
+}
+
+/// The leftovers log is cut to its tail once it is over its limit, from a line start, and left
+/// alone at or below it.
+#[test] // spec: QA-038
+fn the_leftovers_log_is_trimmed_to_its_tail_over_the_limit() {
+    let dir = tempfile::Builder::new()
+        .prefix("lil-testkit-trim-")
+        .tempdir()
+        .unwrap();
+    let log = dir.path().join("lil-testenv-leftovers.log");
+    let lines: Vec<String> = (0..100)
+        .map(|i| format!("line {i:03} {}", "x".repeat(40)))
+        .collect();
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let size = std::fs::metadata(&log).unwrap().len();
+
+    assert!(
+        !lil_testkit::env::trim_log(&log, size, 1000).unwrap(),
+        "at the limit: kept"
+    );
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), size);
+
+    assert!(lil_testkit::env::trim_log(&log, size - 1, 1000).unwrap());
+    let kept = std::fs::read_to_string(&log).unwrap();
+    assert!(kept.len() <= 1000 && kept.len() > 900, "{}", kept.len());
+    assert!(kept.starts_with("line "), "from a line start: {kept:?}");
+    assert!(
+        kept.ends_with(&format!("{}\n", lines[99])),
+        "the newest line is kept"
+    );
+    assert!(!kept.contains("line 000"));
+}
+
+/// SC-05: a `TestEnv` removes its channel's Qt cache folder in the real local app-data folder,
+/// `LILITH-test-<own id>`, when it closes; a folder of another id there stays.
+#[test] // spec: QA-038
+fn closing_a_test_env_removes_its_qt_cache_folder() {
+    let env = lil_testkit::TestEnv::new();
+    let id = env.env.channel().to_string();
+    let id = id.strip_prefix("test-").unwrap().to_string();
+    let real = lil_platform::RealLocations::from_system().unwrap();
+    let ours = real.local.join(format!("LILITH-test-{id}"));
+    std::fs::create_dir_all(ours.join("image").join("cache")).unwrap();
+    // Exactly this id: one more character is another channel's folder, never touched.
+    let other = real.local.join(format!("LILITH-test-{id}0"));
+    std::fs::create_dir_all(&other).unwrap();
+
+    let closed = env.close();
+    let ours_left = ours.exists();
+    let other_left = other.exists();
+    // Exact names, made by this test.
+    let _ = std::fs::remove_dir_all(&ours);
+    let _ = std::fs::remove_dir_all(&other);
+    closed.unwrap();
+    assert!(!ours_left, "{} was left", ours.display());
+    assert!(other_left, "another id's folder was removed");
 }

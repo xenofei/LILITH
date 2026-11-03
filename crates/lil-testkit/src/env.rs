@@ -83,12 +83,9 @@ impl TestEnv {
     }
 
     fn make(prefix: String) -> TestEnv {
-        static REAL: OnceLock<RealLocations> = OnceLock::new();
         static SWEPT: Once = Once::new();
-        let real = REAL.get_or_init(|| {
-            RealLocations::from_system().expect("cannot resolve the real known folders")
-        });
-        arm_test_guard(real.clone());
+        static SWEPT_FOLDERS: Once = Once::new();
+        arm_test_guard(real_locations().clone());
         SWEPT.call_once(|| match sweep_test_registry_roots() {
             Ok(sweep) => {
                 for (key, e) in sweep.failed {
@@ -97,6 +94,7 @@ impl TestEnv {
             }
             Err(e) => eprintln!("the sweep of leftover test registry keys failed: {e}"),
         });
+        SWEPT_FOLDERS.call_once(sweep_test_folders);
 
         // The id in the folder's name lets the sweep match a registry key to its folder.
         let id = unique_id();
@@ -551,12 +549,32 @@ impl TestEnv {
         if let Err(e) = lil_platform::desktop::remove_test_registry(&self.env) {
             eprintln!("{} could not be removed: {e}", self.env.registry_root());
         }
-        crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR).map_err(|left| {
-            crate::cleanup::report_leftovers(&self.root, &left);
-            left.iter()
-                .map(|(path, e)| format!("{}: {e}", path.display()))
-                .collect()
-        })
+        let removed = crate::cleanup::remove_tree(&self.root, crate::cleanup::RETRY_FOR);
+        // The Qt cache of this channel, `LILITH-test-<id>` in the real local app-data folder
+        // (the OS's, not the environment's): by its exact name, nothing else.
+        let cache = self.env.channel().to_string();
+        let cache = cache.strip_prefix("test-").map(|id| {
+            real_locations()
+                .local
+                .join(format!("{QT_CACHE_PREFIX}{id}"))
+        });
+        let cache_removed = cache.map_or(Ok(()), |path| {
+            crate::cleanup::remove_tree(&path, crate::cleanup::RETRY_FOR)
+        });
+        let left: Vec<_> = removed
+            .err()
+            .into_iter()
+            .flatten()
+            .chain(cache_removed.err().into_iter().flatten())
+            .collect();
+        if left.is_empty() {
+            return Ok(());
+        }
+        crate::cleanup::report_leftovers(&self.root, &left);
+        Err(left
+            .iter()
+            .map(|(path, e)| format!("{}: {e}", path.display()))
+            .collect())
     }
 }
 
@@ -580,6 +598,30 @@ pub const SWEEP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The folder name every `TestEnv` folder starts with.
 const FOLDER_PREFIX: &str = "lil-testenv-";
+
+/// The start of the name of a test channel's Qt cache folder in the real local app-data folder:
+/// `LILITH-test-<id>`.
+const QT_CACHE_PREFIX: &str = "LILITH-test-";
+
+/// How many folders one sweep pass removes. Nextest starts a process per test and each runs the
+/// sweep once, so the first passes after a purge take a share each instead of one process
+/// holding its test up for all of them.
+const SWEEP_FOLDERS_PER_PASS: usize = 40;
+
+/// The leftovers log is cut to [`LOG_KEEP`] bytes once it is over [`LOG_LIMIT`].
+const LOG_LIMIT: u64 = 4 * 1024 * 1024;
+const LOG_KEEP: u64 = 1024 * 1024;
+
+/// The mutex that lets one process at a time sweep folders and trim the log.
+const SWEEP_LOCK: &str = r"Local\LILITH-testenv-folder-sweep";
+
+/// The real folders, resolved once from the known folders (never from the environment).
+fn real_locations() -> &'static RealLocations {
+    static REAL: OnceLock<RealLocations> = OnceLock::new();
+    REAL.get_or_init(|| {
+        RealLocations::from_system().expect("cannot resolve the real known folders")
+    })
+}
 
 /// What a sweep did: the keys removed, and each key it couldn't remove with why.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -670,6 +712,150 @@ pub fn sweep_with(
         }
     }
     sweep
+}
+
+/// A folder the sweep of leftover test folders looks at: `lil-testenv-*` in the system
+/// temporary folder, `LILITH-test-*` in the real local app-data folder.
+#[derive(Debug, Clone)]
+pub struct SweepEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    /// When the folder was last written.
+    pub modified: std::time::SystemTime,
+}
+
+/// The sweep's rule for folders (SC-06, SC-05): the paths among `entries` to remove. A folder is
+/// chosen only when
+/// - it is a directory (a file, such as the leftovers log, never is);
+/// - its name is `lil-testenv-[<label>-]<id>-<random>` or `LILITH-test-<id>`, `<id>` being 8
+///   lowercase hex characters (a name that doesn't parse, as the old no-id form, is kept);
+/// - it was last written at least [`SWEEP_MIN_AGE`] before `now` (a time after `now` keeps it);
+/// - and no registry root with its id has an owner that is `alive`.
+pub fn folders_to_sweep(
+    entries: &[SweepEntry],
+    roots: &[lil_platform::desktop::TestRegistryRoot],
+    now: std::time::SystemTime,
+    alive: &dyn Fn(&str) -> bool,
+) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|entry| entry.is_dir)
+        .filter(|entry| {
+            let name = entry.path.file_name().map(|n| n.to_string_lossy());
+            let Some(id) = name.as_deref().and_then(swept_id) else {
+                return false;
+            };
+            let old = now
+                .duration_since(entry.modified)
+                .is_ok_and(|age| age >= SWEEP_MIN_AGE);
+            old && !roots
+                .iter()
+                .any(|root| root.id == id && root.owner.as_deref().is_some_and(alive))
+        })
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+/// The channel id in the name of a folder the sweep may take: the 8 lowercase hex characters
+/// before the random tail of `lil-testenv-[<label>-]<id>-<random>`, or all of `<id>` in
+/// `LILITH-test-<id>`.
+fn swept_id(name: &str) -> Option<&str> {
+    fn hex8(s: &str) -> bool {
+        s.len() == 8 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+    if let Some(rest) = name.strip_prefix(FOLDER_PREFIX) {
+        let parts: Vec<&str> = rest.split('-').collect();
+        let id = *parts.get(parts.len().checked_sub(2)?)?;
+        return hex8(id).then_some(id);
+    }
+    name.strip_prefix(QT_CACHE_PREFIX).filter(|id| hex8(id))
+}
+
+/// [`folders_to_sweep`] over the folders of `dirs`, removing at most `cap` of them with
+/// [`crate::cleanup::remove_tree`] and no retry; returns how many went. A folder that can't be
+/// removed is left for a later sweep and is never reported.
+pub fn sweep_folders_in(
+    dirs: &[&Path],
+    roots: &[lil_platform::desktop::TestRegistryRoot],
+    now: std::time::SystemTime,
+    alive: &dyn Fn(&str) -> bool,
+    cap: usize,
+) -> usize {
+    let entries: Vec<SweepEntry> = dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name();
+            swept_id(&name.to_string_lossy())?;
+            let meta = std::fs::symlink_metadata(e.path()).ok()?;
+            Some(SweepEntry {
+                path: e.path(),
+                is_dir: meta.is_dir(),
+                modified: meta.modified().ok()?,
+            })
+        })
+        .collect();
+    folders_to_sweep(&entries, roots, now, alive)
+        .into_iter()
+        .take(cap)
+        .filter(|path| crate::cleanup::remove_tree(path, Duration::ZERO).is_ok())
+        .count()
+}
+
+/// The sweep of leftover folders (SC-06, SC-05) and the trim of the leftovers log, for the first
+/// `TestEnv` of a process. One process at a time does it (a named mutex it doesn't wait for), at
+/// most [`SWEEP_FOLDERS_PER_PASS`] folders each. Its own failures are never reported: the
+/// leftovers log is for tests' folders.
+fn sweep_test_folders() {
+    use lil_platform::named_mutex::{Taken, try_lock};
+    let Ok(Taken::Acquired(_lock) | Taken::Abandoned(_lock)) = try_lock(SWEEP_LOCK) else {
+        return;
+    };
+    let _ = trim_log(&crate::cleanup::leftovers_log(), LOG_LIMIT, LOG_KEEP);
+    let Ok(roots) = lil_platform::desktop::test_registry_roots() else {
+        return;
+    };
+    let temp = std::env::temp_dir();
+    sweep_folders_in(
+        &[&temp, &real_locations().local],
+        &roots,
+        std::time::SystemTime::now(),
+        &owner_alive,
+        SWEEP_FOLDERS_PER_PASS,
+    );
+}
+
+/// Cuts the log at `path` to its last `keep` bytes, from the start of a line, when it is longer
+/// than `over` bytes; `true` when it did.
+///
+/// # Errors
+/// When the log can't be read or replaced.
+pub fn trim_log(path: &Path, over: u64, keep: u64) -> std::io::Result<bool> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= over {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(len.saturating_sub(keep)))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    drop(file);
+    // From the start of a line: drop the cut one.
+    let from = tail
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(tail.len(), |i| i + 1);
+    let mut cut = path.as_os_str().to_owned();
+    cut.push(".trim");
+    let cut = PathBuf::from(cut);
+    std::fs::write(&cut, &tail[from..])?;
+    std::fs::rename(&cut, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&cut);
+    })?;
+    Ok(true)
 }
 
 /// This process as a test registry root's owner: `<pid>:<creation FILETIME>`, or `None` when
