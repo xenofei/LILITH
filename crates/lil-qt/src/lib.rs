@@ -94,7 +94,7 @@ const CLEAR_PREFIXES: [&str; 7] = [
     "VK_LOADER_",
 ];
 
-/// The Vulkan loader's layer and driver variables, removed by name, compared the same way.
+/// The Vulkan loader's layer and driver variables, and TZ, removed by name, compared the same way.
 const CLEAR_EXACT: [&str; 6] = [
     "VK_INSTANCE_LAYERS",
     "VK_LAYER_PATH",

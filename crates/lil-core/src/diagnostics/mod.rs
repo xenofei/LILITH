@@ -233,8 +233,9 @@ const BUNDLE_DESCRIPTION: &str = "Writes a diagnostics bundle, one zip in the su
     names, Windows SIDs, well-known token formats and open/ link targets are redacted, the \
     user-profile folder becomes %USERPROFILE%, the account name <user> and the computer name \
     <machine>. Still in it: the names of other programs and network adapters (the hardware \
-    snapshot), the job's arguments with any prompt text, and model file names and workspace \
-    paths outside the user-profile folder (the logs). It never holds a workspace file; a bundle \
+    snapshot), the job's arguments with any prompt text, your folder names and any file a log \
+    or an error mentions (only the start of a path in the user-profile folder is replaced), \
+    ComfyUI's folder and node packs, and your hardware. It never holds a workspace file; a bundle \
     made in the same second as another gets a name of its own, the folder keeps the newest 10 \
     (and every bundle made in the last minute, and the one before the newest), and nothing is \
     sent anywhere: the bundle leaves \
