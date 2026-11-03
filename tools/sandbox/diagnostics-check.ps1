@@ -35,9 +35,12 @@
      no check failed, and the cleanup too; the summary counts what wasn't checked apart from what
      passed.
 
-  It refuses to start if a core already runs on the test channel, and then stops nothing: that core
-  isn't this run's, and the app would attach to it. It never touches the real stable or dev channel
-  or their registrations: the cleanup does nothing unless LIL_CHANNEL is this script's test channel.
+  It refuses to start if a pipe of the test channel is there (a core or an app already serves it,
+  whichever deploy's), and then stops nothing: that core isn't this run's, and the app would attach
+  to it. It never touches the real stable or dev channel or their registrations: the cleanup does
+  nothing unless LIL_CHANNEL is this script's test channel. Every `lil` call is limited to 30 s
+  (sandbox-common.ps1's Invoke-LilTimed), and no input or wait goes on past the pop-up's cap less
+  30 s: the run stops with "out of the stretch's time" and cleans up.
   No key or press is sent unless the foreground window, and the window under the target's point, are
   lil-image's (the run fails instead).
 
@@ -70,6 +73,8 @@ function Write-Summary { Write-Host ("{0} passed, {1} failed, {2} not checked" -
 function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
 function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
+# Invoke-LilTimed, the stretch's deadline, Retry-Walk and the masked log copy.
+. (Join-Path $PSScriptRoot 'sandbox-common.ps1')
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 if (-not ('LilDiagCheck.Win' -as [type])) {
     Add-Type -Namespace LilDiagCheck -Name Win -MemberDefinition @'
@@ -216,9 +221,9 @@ $script:channelTaken = $false
 # The core on the test channel, recorded, or 0 for none. The channel in the answer must be the test
 # channel's, whatever the environment says.
 function Get-CorePid {
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -ne 0) { return 0 }
-    $m = [regex]::Match(($o -join "`n"), 'pid (\d+), channel (\S+?)\)')
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -ne 0) { return 0 }
+    $m = [regex]::Match(($r.Output -join "`n"), 'pid (\d+), channel (\S+?)\)')
     if (-not $m.Success -or $m.Groups[2].Value -cne $channel) { return 0 }
     $id = [int]$m.Groups[1].Value
     [void]$corePids.Add($id)
@@ -236,19 +241,20 @@ function Enter-TestChannel {
     New-Item -ItemType Directory $root | Out-Null
     foreach ($s in 'roaming', 'local', 'profile', 'out') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
     # The pipe's name comes from the channel alone, so a core left by a crashed run would serve this
-    # run from its old root.
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    # run from its old root. The channel's name is fixed, so this matters here: the pipes are listed,
+    # not asked, as another deploy's core makes `lil --no-start status` fail as if there were none,
+    # and cleanup's `lil core stop` could then drain it.
+    if ((Get-ChannelPipes $channel).Count -gt 0) {
         $script:channelTaken = $true
-        throw "a core already runs on $channel. It isn't this run's, so nothing was started and it wasn't stopped: run ``lil core stop`` with LIL_CHANNEL=$channel and LIL_TEST_ROOT set, or end it, then run this again"
+        throw "a core or an app already serves $channel, from this deploy or another. It isn't this run's, so nothing was started and it wasn't stopped: end it, then run this again"
     }
     # The core finds no workspace from this folder.
     Set-Location -LiteralPath $root
 }
 function Invoke-Lil([string[]]$a) {
-    $o = & $lil @a 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "lil $($a -join ' ') exited $LASTEXITCODE`: $($o -join ' ')" }
-    return ($o -join "`n")
+    $r = Invoke-LilTimed $a
+    if ($r.ExitCode -ne 0) { throw "lil $($a -join ' ') exited $($r.ExitCode): $($r.Output -join ' ')" }
+    return ($r.Output -join "`n")
 }
 # Each step's failure counts in the exit code. Unless this is the test channel it does nothing: a
 # setup that failed early must not run `lil core stop` against another channel's core.
@@ -258,7 +264,7 @@ function Exit-TestChannel {
         Write-Host 'the core on the test channel is not this run''s: it stays, with the channel''s registry keys'
     } else {
         try { [void](Get-CorePid) } catch { }
-        try { [void](& $lil core stop 2>&1) } catch { }
+        try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
         foreach ($id in $corePids) {
             $p = Get-RecordedCore $id
             if ($p -and -not $p.WaitForExit(10000)) {
@@ -270,7 +276,7 @@ function Exit-TestChannel {
         $alive = @($corePids | Where-Object { Get-RecordedCore $_ })
         Check ($alive.Count -eq 0) "cleanup: none of the $($corePids.Count) core PID(s) from lil status on the test channel still runs"
     }
-    Set-Location -LiteralPath $Repo
+    try { Set-Location -LiteralPath $Repo } catch { }
     Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
     $keysLeft = 0
     # Each exactly the test channel's: its registry root, its scheme, and Windows' notification
@@ -296,16 +302,26 @@ function Exit-TestChannel {
     # real local data folder, outside the test root. Exactly this channel's folder: on any other
     # channel this function has returned above. A core this run didn't start can be using it.
     if (-not $script:channelTaken) {
-        $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
-        for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
-            try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+        if (-not $env:LOCALAPPDATA) {
+            Fail 'cleanup: LOCALAPPDATA is not set, so the test channel''s Qt cache folder could not be looked for'
+        } else {
+            $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+            for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
+                try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+            }
+            Check (-not (Test-Path -LiteralPath $cache)) "cleanup: the test channel's Qt cache folder is gone"
         }
-        Check (-not (Test-Path -LiteralPath $cache)) "cleanup: the test channel's Qt cache folder is gone"
     }
 }
 
 if ($DryRun) {
     Self-Test
+    # Past the stretch's deadline, the input guard (Assert-InputGoesToApp) and the waits stop at once.
+    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $late = $false
+    try { Assert-InStretch } catch { $late = "$_" -like "out of the stretch's time*" }
+    $script:stopAt = $null
+    Check $late 'self-test: past the stretch''s deadline the check stops'
     try {
         Enter-TestChannel
         $b = (Invoke-Lil @('call', 'diagnostics.bundle', '{}')) | ConvertFrom-Json
@@ -330,10 +346,11 @@ if ($DryRun) {
 
 # --- 1. The pop-up -------------------------------------------------------------------------------
 $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-diagcheck-{0}.state" -f $PID)
+$capSec = 600
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
                '-What', 'checks the diagnostics bundle (a window, a save dialog and an Explorer window open)', '-WarnSec', '10', '-RunSec', '60',
-               '-CapSec', '600', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-CapSec', [string]$capSec, '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -343,6 +360,8 @@ while (-not (Test-Path -LiteralPath "$state.shown")) {
     if ((Get-Date) -gt $deadline) { throw 'the hands-off pop-up was not on screen within 30 s, so nothing ran' }
     Start-Sleep -Milliseconds 250
 }
+# From here no input goes after the pop-up's cap less 30 s.
+Start-Stretch $capSec
 Start-Sleep -Seconds 10
 
 # --- 2. The check --------------------------------------------------------------------------------
@@ -354,17 +373,12 @@ function And($a, $b) { [System.Windows.Automation.AndCondition]::new($a, $b) }
 function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     $end = (Get-Date).AddSeconds($sec)
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $e = & $find
         if ($e) { return $e }
         Start-Sleep -Milliseconds 250
     }
     throw "timed out after $sec s waiting for $what"
-}
-# UI Automation can throw for a whole walk while the tree moves: walk again, a few times.
-function Retry-Walk([scriptblock]$walk) {
-    for ($i = 0; ; ++$i) {
-        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
-    }
 }
 function Find-Window([int]$procId, [string]$name) {
     $c = Prop $AE::ProcessIdProperty $procId
@@ -386,6 +400,7 @@ function Get-WindowProcess([System.IntPtr]$hwnd) {
 function Assert-InputGoesToApp($e, $win, [string]$what) {
     $end = (Get-Date).AddSeconds(3)
     while ($true) {
+        Assert-InStretch
         $front = [LilDiagCheck.Win]::GetForegroundWindow()
         $frontOk = $front -ne [System.IntPtr]::Zero -and (Get-WindowProcess $front) -eq $script:app.Id
         $area = $win.Current.BoundingRectangle
@@ -413,16 +428,6 @@ function Send-Keys([string]$keys, $e, $win, [string]$what) {
     Assert-InputGoesToApp $e $win $what
     [System.Windows.Forms.SendKeys]::SendWait($keys)
 }
-# The masks of what a dump holds of this PC's paths: the temporary root and the profile folder, in
-# either separator (the app's own paths use `/`).
-function Hide-Paths([string]$text) {
-    foreach ($pair in @(@($root, '<root>'), @($env:USERPROFILE, '%USERPROFILE%'))) {
-        foreach ($form in @($pair[0], $pair[0].Replace('\', '/'), $pair[0].Replace('\', '\\'))) {
-            $text = [regex]::Replace($text, [regex]::Escape($form), $pair[1], [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        }
-    }
-    return $text
-}
 # A press of a control of the app's main window or a floating dock, once that holds: its Invoke
 # pattern, else Space with the focus on it.
 function Invoke-Element($e, [string]$what) {
@@ -440,6 +445,7 @@ function Show-Element($e) {
     $end = (Get-Date).AddSeconds(240)
     $waited = $false
     while ($true) {
+        Assert-InStretch
         try { [void][LilDiagCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
         Start-Sleep -Milliseconds 300
         if ((Get-WindowProcess ([LilDiagCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
@@ -757,7 +763,8 @@ try {
         $box = Get-NameBox $dlg
         Show-Element $dlg
         try { $box.SetFocus() } catch { }
-        Send-Keys $probe $box $dlg 'the file name box'
+        # Each character after its own check: a window taking the focus gets none of the rest.
+        foreach ($key in [regex]::Matches((Escape-Keys $probe), '\{.\}|.')) { Send-Keys $key.Value $box $dlg 'the file name box' }
         $seen = $null
         $end = (Get-Date).AddSeconds(3)
         while ((Get-Date) -lt $end -and $seen -cne $probe) {
@@ -841,7 +848,7 @@ try {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
-        if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir 'logs') -Recurse -Force }
+        if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
         Write-Host "diagnostics in $DiagDir"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
@@ -864,8 +871,8 @@ try {
             $bad | Select-Object -First 3 | ForEach-Object { Write-Host ((Hide-Paths $_) -replace '^(.{300}).*$', '$1…') }
         } else { Fail "the app's log wasn't found" }
     } catch { Fail "the app's log couldn't be read: $_" }
-    Exit-TestChannel
-    Set-Content -LiteralPath $state -Value 'done'
+    try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    try { Set-Content -LiteralPath $state -Value 'done' } catch { Fail "cleanup: the pop-up wasn't told: $_" }
 }
 
 Write-Host ''
