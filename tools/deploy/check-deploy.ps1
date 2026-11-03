@@ -182,6 +182,9 @@ function Remove-TestChannel {
 }
 Remove-TestChannel
 if (Test-Path -LiteralPath $cache) { $failures.Add("$cache, an earlier run's Qt cache, can't be removed") }
+# From here an error must not leave the root or the cache behind: the `finally` below removes them
+# (as bench-cold-start.ps1's does), and tells the pop-up it is done.
+try {
 foreach ($s in 'roaming', 'local', 'profile') { New-Item -ItemType Directory -Force (Join-Path $testRoot $s) | Out-Null }
 
 # The refused launch, inside the hands-off window: exit 2 before Qt starts, so no window and
@@ -246,8 +249,11 @@ if (-not $coreObject) { $failures.Add('no core_object event') }
 elseif ($coreObject.loaded -ne $true) { $failures.Add('the Lilith.Core module did not make its Core') }
 if ($foreground -gt 0) { $failures.Add("lil-image.exe took the foreground with --no-activate ($foreground samples)") }
 
-Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
-Remove-TestChannel
+} finally {
+    Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-TestChannel
+    if ($state) { Set-Content -LiteralPath $state -Value 'done' }
+}
 foreach ($d in $testRoot, $cache) { if (Test-Path -LiteralPath $d) { $failures.Add("cleanup: $d is still there") } }
 if ($failures.Count) {
     Write-Host 'deploy_runs_off_path: FAIL'
