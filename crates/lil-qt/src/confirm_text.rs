@@ -367,13 +367,18 @@ pub fn shown_action(arguments: &Value) -> ShownAction {
 /// Why a typed amount can't be the new limit of a cap now at `limit` (the core's decimal string), by
 /// name, or `None` when it can. The Raise button shows the amount through `money_text`, which rounds
 /// to the currency's minor unit, and what is sent must be what it says, so more decimals are refused.
-/// A raise that isn't higher is refused too, and so is one above the largest amount the core holds
-/// (`i64` micro-units). Text, never a float.
+/// The core reads it as written (`app/caps.set`'s rules: `i64` micro-units), so more than 6 decimals
+/// are refused even when the extra ones are zeros. A raise that isn't higher is refused too, and so
+/// is one above the largest amount the core holds. Text, never a float.
 pub fn raise_refusal(amount: &str, limit: &str, currency: &str) -> Option<&'static str> {
+    const CORE_DECIMALS: usize = 6;
     let Some(new) = Decimal::parse(amount) else {
         return Some("not_a_number");
     };
-    if new.fraction.len() > crate::money::minor_unit(currency) {
+    let written = amount
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    if new.fraction.len() > crate::money::minor_unit(currency) || written > CORE_DECIMALS {
         return Some("too_many_decimals");
     }
     let largest = Decimal {
@@ -666,6 +671,11 @@ mod tests {
             ("25.999", "1", "USD", Some("too_many_decimals")),
             ("0.001", "0", "USD", Some("too_many_decimals")),
             ("120.7", "1", "JPY", Some("too_many_decimals")),
+            // The core takes at most 6 decimals as written (micro-units), trailing zeros included.
+            ("1.500000", "1", "USD", None),
+            ("1.5000000", "1", "USD", Some("too_many_decimals")),
+            ("121.000000", "1", "JPY", None),
+            ("121.0000000", "1", "JPY", Some("too_many_decimals")),
             ("1", "1", "USD", Some("not_higher")),
             ("1.00", "1", "USD", Some("not_higher")),
             ("0.5", "1", "USD", Some("not_higher")),
