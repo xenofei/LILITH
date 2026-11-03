@@ -419,3 +419,54 @@ fn an_unregistered_workspace_folder_is_named_plainly() {
         "{flagged:?}"
     );
 }
+
+/// PROTO-5: a registered workspace that isn't the default (`workspace.unsupported`) is handled by
+/// where it came from, as an unregistered one is. From its folder, `status` warns and shows the
+/// status without a workspace, exit 0 (a skill's `lil status --no-start` tells a running core by
+/// exit 0, ARCH-102); named with --workspace, it is never told to become the default.
+#[test] // spec: ARCH-030, ARCH-102, AI-109
+fn a_registered_workspace_the_core_doesnt_serve_is_handled_by_where_it_came_from() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let default = env.make_workspace("Ünïcödé default");
+    env.register_workspace(&default, true);
+    let other = env.make_workspace("Ünïcödé other");
+    env.register_workspace(&other, false);
+    let inside = other.join("sub folder");
+    std::fs::create_dir_all(&inside).unwrap();
+    let names = |path: &Path, text: &str| path_forms(path).iter().any(|p| text.contains(p));
+    let _core = CoreFixture::start(&env);
+
+    for args in [&["status"][..], &["--no-start", "status"]] {
+        let status = env.lil_in(&inside, args);
+        assert_eq!(status.code, 0, "{args:?}: {status:?}");
+        assert!(status.stdout.contains("\nworkspace: none\n"), "{status:?}");
+        assert_eq!(status.stderr.lines().count(), 1, "{status:?}");
+        assert!(status.stderr.starts_with("warning: "), "{status:?}");
+        assert!(names(&other, &status.stderr), "{status:?}");
+        assert!(status.stderr.contains("current folder"), "{status:?}");
+    }
+
+    // `call` from its folder still can't run (exit 2), with the core's way out.
+    let call = env.lil_in(&inside, &["call", "test.echo", "{\"text\":\"x\"}"]);
+    assert_eq!(call.code, 2, "{call:?}");
+    assert!(call.stderr.contains("lil workspace use \""), "{call:?}");
+
+    // Named with --workspace: told which workspace the core serves, never to switch.
+    let ws_arg = other.to_str().expect("a UTF-8 test path");
+    for args in [
+        &["status", "--workspace", ws_arg][..],
+        &["call", "test.echo", "--workspace", ws_arg],
+    ] {
+        let out = env.lil(args);
+        assert_eq!(out.code, 2, "{args:?}: {out:?}");
+        assert_eq!(out.stdout, "", "{out:?}");
+        assert!(names(&other, &out.stderr), "{out:?}");
+        assert!(names(&default, &out.stderr), "{out:?}");
+        assert!(out.stderr.contains("--workspace"), "{out:?}");
+        assert!(!out.stderr.contains("lil workspace use"), "{out:?}");
+        assert!(
+            out.stderr.contains("serves only the default workspace"),
+            "{out:?}"
+        );
+    }
+}

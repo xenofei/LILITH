@@ -171,13 +171,26 @@ pub fn resolve_default_workspace(env: &Env) -> Result<ResolvedWorkspace, ClientE
 
 /// The default workspace `env`'s `suite.toml` names, as written there; `None` when there is
 /// no file, it doesn't parse, or it names none. For messages only.
-pub(crate) fn registered_default(env: &Env) -> Option<PathBuf> {
+pub fn registered_default(env: &Env) -> Option<PathBuf> {
     let text = std::fs::read_to_string(env.suite_toml_to_read()).ok()?;
     let suite = SuiteToml::parse(&text).ok()?;
     suite
         .default_workspace
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
+}
+
+/// What a workspace named by `--workspace` that the core can't use is told (Appendix G): which
+/// workspace the core serves, `default`, and to run the command without the flag; never to make
+/// it the default.
+pub fn serves_only_default(default: Option<&Path>) -> String {
+    match default {
+        Some(default) => format!(
+            "The core serves only the default workspace, \"{}\": run the command without --workspace, or from inside that workspace.",
+            default.display()
+        ),
+        None => "The core serves only the default workspace, and none is set: run the command without --workspace.".to_string(),
+    }
 }
 
 /// The id of the workspace folder `path`.

@@ -43,8 +43,8 @@ pub use blocking::mark_gui_thread;
 pub use conn::EventStream;
 pub use connect::{Client, DrainOutcome, drain_and_wait};
 pub use workspace::{
-    ResolvedWorkspace, WorkspaceOrigin, WorkspaceSource, resolve_default_workspace,
-    resolve_workspace, resolve_workspace_id,
+    ResolvedWorkspace, WorkspaceOrigin, WorkspaceSource, registered_default,
+    resolve_default_workspace, resolve_workspace, resolve_workspace_id, serves_only_default,
 };
 
 /// The start of an `Untrusted` reason for a core of the current user whose executable is in
@@ -401,20 +401,11 @@ impl fmt::Display for ClientError {
             } => {
                 write!(
                     f,
-                    "The workspace \"{}\" ({}) is not registered in suite.toml, so the core cannot use it. ",
+                    "The workspace \"{}\" ({}) is not registered in suite.toml, so the core cannot use it. {}",
                     path.display(),
-                    WorkspaceSource::Flag
-                )?;
-                match default {
-                    Some(default) => write!(
-                        f,
-                        "The core serves only the default workspace, \"{}\": run the command without --workspace, or from inside that workspace.",
-                        default.display()
-                    ),
-                    None => f.write_str(
-                        "The core serves only the default workspace, and none is set: run the command without --workspace.",
-                    ),
-                }
+                    WorkspaceSource::Flag,
+                    serves_only_default(default.as_deref())
+                )
             }
             ClientError::UnknownWorkspace {
                 origin: WorkspaceOrigin { path, source },

@@ -8,9 +8,11 @@
 //! (ARCH-030); `core stop` and `workspace init|use` name none, and `doctor` names the default
 //! workspace it read itself, so a broken workspace registry never stops them.
 //!
-//! A workspace found from the current folder that is not registered in `suite.toml` stops
-//! `call` and `events` with a plain message naming the folder; `status` warns once on stderr
-//! and shows the status without a workspace ([`connect`]).
+//! A workspace found from the current folder that the core can't use (not registered in
+//! `suite.toml`, or registered but not the default) stops `call` and `events` with a plain
+//! message naming the folder; `status` warns once on stderr and shows the status without a
+//! workspace ([`connect`]). One named by `--workspace` is told which workspace the core serves,
+//! never to become the default (Appendix G).
 //!
 //! A [`ClientError`] (about 250 bytes) never crosses a function boundary here: each command
 //! maps it where it occurs to its plain message on stderr and exit code 2 ([`cannot_run`]).
@@ -34,9 +36,10 @@ use std::path::PathBuf;
 use lil_client::blocking::BlockingClient;
 use lil_client::{
     ClientConfig, ClientError, ResolvedWorkspace, StartPolicy, WorkspaceOrigin, WorkspaceSource,
-    resolve_workspace,
+    registered_default, resolve_workspace, serves_only_default,
 };
 use lil_platform::Env;
+use lil_protocol::codes::WORKSPACE_UNSUPPORTED;
 use lil_protocol::{CallerKind, NO_WORKSPACE};
 
 /// The call or command succeeded.
@@ -249,8 +252,8 @@ pub(crate) fn config(global: &GlobalArgs, start: StartPolicy) -> Result<ClientCo
     Ok(cfg)
 }
 
-/// What [`connect`] does when the core does not know a workspace found from the current
-/// folder (one not registered in `suite.toml`).
+/// What [`connect`] does when the core can't use a workspace found from the current folder
+/// (one not registered in `suite.toml`, or registered but not the default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnknownCwdWorkspace {
     /// The command cannot run (exit 2) and says why: `call`, `events`.
@@ -268,7 +271,8 @@ pub(crate) enum UnknownCwdWorkspace {
 /// core, say) rather than hiding them behind the workspace message.
 ///
 /// A workspace the core does not know is named by its folder and where it came from
-/// ([`ClientError::UnknownWorkspace`]); one found from the current folder is handled as
+/// ([`ClientError::UnknownWorkspace`]); a registered one it doesn't serve
+/// (`workspace.unsupported`) the same way. One found from the current folder is handled as
 /// `unknown_cwd` says.
 pub(crate) fn connect(
     global: &GlobalArgs,
@@ -292,6 +296,16 @@ pub(crate) fn connect(
             return Err(cannot_run(e));
         }
     }
+    let warn_and_use_none = |cfg: &mut ClientConfig, why: &str| {
+        eprintln!("warning: {why}; showing the status without a workspace.");
+        cfg.set_workspace(no_workspace());
+        match BlockingClient::connect(cfg) {
+            Ok(client) => Ok(Some(client)),
+            Err(ClientError::NotRunning) => Ok(None),
+            Err(e) => Err(cannot_run(e)),
+        }
+    };
+    let warn = unknown_cwd == UnknownCwdWorkspace::WarnAndUseNone;
     match BlockingClient::connect(&cfg) {
         Ok(client) => Ok(Some(client)),
         Err(ClientError::NotRunning) => Ok(None),
@@ -302,16 +316,36 @@ pub(crate) fn connect(
                     source: WorkspaceSource::CurrentFolder,
                 },
             ..
-        }) if unknown_cwd == UnknownCwdWorkspace::WarnAndUseNone => {
-            eprintln!(
-                "warning: the workspace {} (found from the current folder) is not registered in suite.toml; showing the status without a workspace.",
+        }) if warn => warn_and_use_none(
+            &mut cfg,
+            &format!(
+                "the workspace {} (found from the current folder) is not registered in suite.toml",
                 path.display()
-            );
-            cfg.set_workspace(no_workspace());
-            match BlockingClient::connect(&cfg) {
-                Ok(client) => Ok(Some(client)),
-                Err(ClientError::NotRunning) => Ok(None),
-                Err(e) => Err(cannot_run(e)),
+            ),
+        ),
+        // Registered, but not the workspace the core serves.
+        Err(ClientError::Refused(error)) if error.code == WORKSPACE_UNSUPPORTED.code => {
+            match cfg.workspace_origin.clone() {
+                Some(WorkspaceOrigin {
+                    path,
+                    source: WorkspaceSource::CurrentFolder,
+                }) if warn => warn_and_use_none(
+                    &mut cfg,
+                    &format!(
+                        "the workspace {} (found from the current folder) is not the one the core serves",
+                        path.display()
+                    ),
+                ),
+                Some(WorkspaceOrigin {
+                    path,
+                    source: WorkspaceSource::Flag,
+                }) => Err(cannot_run(format!(
+                    "The workspace \"{}\" ({}) is not the one the core serves. {}",
+                    path.display(),
+                    WorkspaceSource::Flag,
+                    serves_only_default(registered_default(&cfg.env).as_deref())
+                ))),
+                _ => Err(cannot_run(ClientError::Refused(error))),
             }
         }
         Err(e) => Err(cannot_run(e)),
