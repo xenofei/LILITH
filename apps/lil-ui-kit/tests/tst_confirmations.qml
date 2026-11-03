@@ -1137,6 +1137,13 @@ TestCase {
         tryVerify(() => panel.dialogPopup.opened, 2000)
         compare(panel.dialog.Window.window, panel.Window.window, "the dialog is in the float")
         compare(panel.dialog.capPrompt.Window.window, panel.Window.window, "and its cap prompt")
+        compare(panel.dialog.approveButton.Window.window, panel.Window.window, "and Approve")
+        // The modal dim is over the float too: it shares the popup's overlay, in the float's content.
+        const popupItem = panel.dialogPopup.background.parent
+        const overlay = popupItem.parent
+        verify(overlay.parent === panel.Window.window.contentItem, "the popup is in the float's overlay")
+        verify(overlay.children.some(c => c !== popupItem && c.visible && c.color !== undefined
+                                          && Qt.colorEqual(c.color, Qt.rgba(0, 0, 0, 0.5))), "and so is its dim")
         panel.showConfirmation(crane.id)
         verify(panel.waitingNotice.visible)
         compare(panel.waitingNotice.Window.window, panel.Window.window, "and the waiting notice")
