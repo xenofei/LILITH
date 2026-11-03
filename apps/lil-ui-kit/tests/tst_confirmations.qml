@@ -671,7 +671,7 @@ TestCase {
         fake.respond(sent[0].id, {status: "error", error: {code: "confirm.expired", category: "cancelled",
                                                            message: "Confirmation cf_x expired before it was answered.",
                                                            trace_id: "t", retry: "after_resolve"}})
-        compare(dialog.bar.reason, "This confirmation has expired, so that answer didn't count.")
+        compare(dialog.bar.reason, "This confirmation has ended (it expired or was cancelled), so that answer didn't count.")
         verify(dialog.bar.reason.indexOf("confirm.") < 0)
     }
 

@@ -80,7 +80,7 @@ function timeLeft(expiresAt, nowMs) {
 // A refused or failed answer in plain words, never the code.
 function errorWords(error, shown) {
     switch (error ? error.code : "") {
-    case "confirm.expired": return "This confirmation has expired, so that answer didn't count."
+    case "confirm.expired": return "This confirmation has ended (it expired or was cancelled), so that answer didn't count."
     case "confirm.already_answered": return "This confirmation was answered somewhere else first."
     case "confirm.unknown": return "LILITH doesn't know this confirmation any more."
     default: return error && error.message ? shown(String(error.message), 300) : "That answer didn't reach the core."

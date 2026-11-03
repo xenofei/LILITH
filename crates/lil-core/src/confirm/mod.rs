@@ -864,7 +864,12 @@ impl Confirm {
             )
         };
         let ended = |row: &ConfirmationRow| match row.state {
-            ConfState::Expired | ConfState::Cancelled => expired(),
+            ConfState::Expired => expired(),
+            // The same code, in words that don't say it ran out of time.
+            ConfState::Cancelled => fail(
+                &codes::CONFIRM_EXPIRED,
+                format!("Confirmation {id} was cancelled before it was answered."),
+            ),
             _ => fail(
                 &codes::CONFIRM_ALREADY_ANSWERED,
                 format!(
