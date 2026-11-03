@@ -38,6 +38,10 @@
      outside its root is a failure of the check, removed only if it wasn't there when the run began.
      The pop-up is told it is done. Anything left behind fails the run. Exit 0 only when every check
      passed and the cleanup was complete.
+  Every `lil` call is limited to 30 s (sandbox-common.ps1's Invoke-LilTimed), and no input or wait goes
+  on past the pop-up's cap less 30 s: the run stops with "out of the stretch's time" and cleans up. A
+  card or button that "went" is proved over three whole walks 300 ms apart, each of which still shows
+  the connection indicator.
   -DryRun does step 2's channel set-up, the real registrations' read and the guards' self-test only,
   with no pop-up, no window and no input.
 #>
@@ -59,6 +63,8 @@ $failures = [System.Collections.Generic.List[string]]::new()
 function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
 function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
+# Invoke-LilTimed, the stretch's deadline, Retry-Walk, Assert-Gone and the masked log copy.
+. (Join-Path $PSScriptRoot 'sandbox-common.ps1')
 
 # --- The test channel ------------------------------------------------------------------------
 $channel = 'test-settingscheck'
@@ -84,8 +90,7 @@ function Enter-TestChannel {
     # run from its old root; and its registry root would pass for what this run wrote. The pipes are
     # listed, not asked: another deploy's core makes `lil --no-start status` fail as if there were none,
     # and cleanup's `lil core stop` could then drain it.
-    $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*-$channel" })
-    if ($pipes.Count -gt 0) {
+    if ((Get-ChannelPipes $channel).Count -gt 0) {
         $script:channelTaken = $true
         throw "a core or an app already serves $channel, from this deploy or another. It isn't this run's, so nothing was started and it wasn't stopped: end it, then run this again"
     }
@@ -121,15 +126,15 @@ function Compare-RealRegistrations([string[]]$before, [string[]]$after) {
     Check ($changed.Count -eq 0) "(b) the real registrations are as they were, $($before.Count) read before and after$(if ($changed.Count) { ': changed: ' + ($changed -join ', ') })"
 }
 function Invoke-Lil([string[]]$a) {
-    $o = & $lil @a 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "lil $($a -join ' ') exited $LASTEXITCODE`: $($o -join ' ')" }
-    return ($o -join "`n")
+    $r = Invoke-LilTimed $a
+    if ($r.ExitCode -ne 0) { throw "lil $($a -join ' ') exited $($r.ExitCode): $($r.Output -join ' ')" }
+    return ($r.Output -join "`n")
 }
 # The running test core's PID, from its own hello (recorded), or 0 with none.
 function Get-CorePid {
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -ne 0) { return 0 }
-    $m = [regex]::Match(($o -join "`n"), 'pid (\d+), channel (\S+?)\)')
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -ne 0) { return 0 }
+    $m = [regex]::Match(($r.Output -join "`n"), 'pid (\d+), channel (\S+?)\)')
     if (-not $m.Success -or $m.Groups[2].Value -cne $channel) { return 0 }
     $id = [int]$m.Groups[1].Value
     [void]$corePids.Add($id)
@@ -158,7 +163,7 @@ function Exit-TestChannel {
         return
     }
     try { [void](Get-CorePid) } catch { }
-    try { [void](& $lil core stop 2>&1) } catch { }
+    try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
     Start-Sleep -Milliseconds 500
     try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     try { Set-Location -LiteralPath $Repo } catch { }
@@ -225,6 +230,7 @@ function Get-WindowProcessId([System.IntPtr]$hwnd) {
     return [int]$owner
 }
 function Assert-AppInFront {
+    Assert-InStretch
     for ($i = 0; $i -lt 5; ++$i) {
         if ((Get-WindowProcessId ([LilSettingsCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
         Start-Sleep -Milliseconds 200
@@ -240,8 +246,14 @@ function Self-Test {
     $script:app = [pscustomobject]@{ Id = -1 }
     $refused = 0
     try { Assert-AppInFront } catch { if ("$_" -like 'no keys sent*') { ++$refused } }
+    # Past the stretch's deadline, the guard stops before it looks at any window.
+    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $late = $false
+    try { Assert-AppInFront } catch { $late = "$_" -like "out of the stretch's time*" }
+    $script:stopAt = $null
     $script:app = $null
     Check ($refused -eq 1) 'self-test: the guard refuses a window that isn''t the app''s'
+    Check $late 'self-test: past the stretch''s deadline the guard stops'
 }
 
 if ($DryRun) {
@@ -269,10 +281,11 @@ if ($DryRun) {
 
 # --- 1. The pop-up -------------------------------------------------------------------------------
 $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-settingscheck-{0}.state" -f $PID)
+$capSec = 300
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
                '-What', 'checks the Settings panel (windows, real key presses, and Windows'' Settings once)', '-WarnSec', '10', '-RunSec', '120',
-               '-CapSec', '300', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-CapSec', [string]$capSec, '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -282,6 +295,8 @@ while (-not (Test-Path -LiteralPath "$state.shown")) {
     if ((Get-Date) -gt $deadline) { throw 'the hands-off pop-up was not on screen within 30 s, so nothing ran' }
     Start-Sleep -Milliseconds 250
 }
+# From here no input goes after the pop-up's cap less 30 s.
+Start-Stretch $capSec
 Start-Sleep -Seconds 10
 
 # --- 2. The check --------------------------------------------------------------------------------
@@ -293,6 +308,7 @@ function And($a, $b) { [System.Windows.Automation.AndCondition]::new($a, $b) }
 function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     $end = (Get-Date).AddSeconds($sec)
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $e = & $find
         if ($e) { return $e }
         Start-Sleep -Milliseconds 200
@@ -320,12 +336,6 @@ function Invoke-Element($e) {
 }
 function App-Windows {
     @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
-}
-# UI Automation can throw for a whole walk while the tree moves: walk again, a few times.
-function Retry-Walk([scriptblock]$walk) {
-    for ($i = 0; ; ++$i) {
-        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
-    }
 }
 function Find-Named($name) {
     $c = Prop $AE::NameProperty $name
@@ -411,7 +421,7 @@ try {
     Close-App
     Start-App
     Start-Sleep -Seconds 3
-    Check ($null -eq (Find-Named 'Not now')) '(a) the next start doesn''t show it'
+    Assert-Gone 'Not now' '(a) the next start doesn''t show it' -Exact
     Close-App
 
     # (b) A first start again, and Set up, pressed through Invoke: what it writes is real.
@@ -448,7 +458,7 @@ try {
     Send-Keys '^,'
     [void](Wait-For { Find-NameStarting 'Nothing LILITH can check stands in the way' } 15 'Settings to say so')
     Pass '(c) Settings says nothing it can check stands in the way'
-    Check ($null -eq (Find-Named 'Set up')) '(c) and has no Set up'
+    Assert-Gone 'Set up' '(c) and has no Set up' -Exact
 
     # (d) A switch, pressed through Toggle or Invoke.
     $switch = Wait-Enabled 'Job failed' 15
@@ -484,8 +494,7 @@ try {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
-        if (Test-Path -LiteralPath (Join-Path $DiagDir 'logs')) { Remove-Item -Recurse -Force -LiteralPath (Join-Path $DiagDir 'logs') }
-        if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir 'logs') -Recurse -Force }
+        if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
         Write-Host "diagnostics in $DiagDir"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
