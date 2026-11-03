@@ -220,31 +220,109 @@ fn pipe_holder() -> ! {
     }
 }
 
-/// `opener`: opens the pipe by its name with the one access mask `PROBE_MASK` (hex) asks for,
-/// writes `open ok` or `open <code>`, and stays on, holding what it opened.
+/// What `NtCreateFile` takes, declared here (`CreateFileW` adds `SYNCHRONIZE` and
+/// `FILE_READ_ATTRIBUTES` to every access it is given, so it can't send a mask on its own).
+mod nt {
+    use std::ffi::c_void;
+
+    use windows::Win32::Foundation::HANDLE;
+
+    #[repr(C)]
+    pub struct UnicodeString {
+        pub length: u16,
+        pub maximum_length: u16,
+        pub buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    pub struct ObjectAttributes {
+        pub length: u32,
+        pub root_directory: HANDLE,
+        pub object_name: *mut UnicodeString,
+        pub attributes: u32,
+        pub security_descriptor: *mut c_void,
+        pub security_quality_of_service: *mut c_void,
+    }
+
+    #[repr(C)]
+    pub struct IoStatusBlock {
+        pub status: usize,
+        pub information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        pub fn NtCreateFile(
+            file: *mut HANDLE,
+            access: u32,
+            attributes: *mut ObjectAttributes,
+            status: *mut IoStatusBlock,
+            allocation: *mut i64,
+            file_attributes: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+            ea: *mut c_void,
+            ea_length: u32,
+        ) -> i32;
+    }
+}
+
+/// `opener`: opens the pipe by its name through `NtCreateFile` with exactly the access mask
+/// `PROBE_MASK` (hex) and no other, writes `open ok` or `open <NTSTATUS in hex>`, and stays on,
+/// holding what it opened.
 fn pipe_opener() -> ! {
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    use windows::core::HSTRING;
+    // `\\.\pipe\<name>` is `\Device\NamedPipe\<name>` to the kernel.
     let name = std::env::var(PROBE_PIPE).expect("the pipe's name");
+    let name = format!(
+        r"\Device\NamedPipe\{}",
+        name.strip_prefix(r"\\.\pipe\").expect("a pipe's name")
+    );
     let mask = u32::from_str_radix(&std::env::var(PROBE_MASK).expect("the mask"), 16).unwrap();
-    // SAFETY: the name outlives the call; the handle, if any, is kept until the process ends.
-    let opened = unsafe {
-        CreateFileW(
-            &HSTRING::from(name),
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap();
+    let mut object_name = nt::UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attributes = nt::ObjectAttributes {
+        length: u32::try_from(size_of::<nt::ObjectAttributes>()).unwrap(),
+        root_directory: HANDLE::default(),
+        object_name: &raw mut object_name,
+        // OBJ_CASE_INSENSITIVE.
+        attributes: 0x40,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut status = nt::IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut handle = HANDLE::default();
+    // SAFETY: every pointer is to a local that outlives the call; the handle, if any, is kept
+    // until the process ends. FILE_SHARE_READ | FILE_SHARE_WRITE (3), FILE_OPEN (1), no options
+    // (a synchronous open would need SYNCHRONIZE).
+    let result = unsafe {
+        nt::NtCreateFile(
+            &raw mut handle,
             mask,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
+            &raw mut attributes,
+            &raw mut status,
+            std::ptr::null_mut(),
+            0,
+            3,
+            1,
+            0,
+            std::ptr::null_mut(),
+            0,
         )
     };
-    write_out(&format!(
-        "open {}",
-        opened.map_or_else(|e| (e.code().0 & 0xFFFF).to_string(), |_| "ok".to_string())
-    ));
+    write_out(&if result >= 0 {
+        "open ok".to_string()
+    } else {
+        format!("open {result:08x}")
+    });
     loop {
         // A test's end kills it.
         std::thread::sleep(Duration::from_secs(1));
@@ -612,9 +690,12 @@ fn a_holder_at_the_clients_own_level_passes_the_proof_outside_the_threat_model()
     );
 }
 
-/// The access masks a Low process might open a pipe with, each on its own. A mask the DACL lets
-/// through (`GA` for this user) and the label's no-write-up alone don't stop: only a label that
-/// also has no-read-up and no-execute-up does (CP-03, NF-04).
+/// The access masks a Low process might open a pipe with, each on its own and exactly (through
+/// `NtCreateFile`). The DACL lets this user through (`GA`), and the label's no-write-up alone
+/// doesn't stop `GENERIC_READ`, `FILE_EXECUTE`, `SYNCHRONIZE` or `FILE_READ_ATTRIBUTES`: only a
+/// label that also has no-read-up and no-execute-up does (CP-03, NF-04). With `NWNR` alone
+/// `FILE_EXECUTE` and `SYNCHRONIZE` connect, and with `NW` alone every mask but 0 does; a mask of
+/// 0 is refused by the kernel whatever the label says.
 const LOW_MASKS: [(&str, u32); 5] = [
     ("GENERIC_READ", 0x8000_0000),
     ("FILE_EXECUTE", 0x20),
@@ -648,8 +729,8 @@ fn low_opens(pipe: &str, mut more: impl FnMut()) -> Vec<(&'static str, String)> 
         .collect()
 }
 
-/// `ERROR_ACCESS_DENIED`.
-const DENIED: &str = "5";
+/// `STATUS_ACCESS_DENIED`.
+const DENIED: &str = "c0000022";
 
 #[test] // spec: ARCH-026
 fn a_low_process_cannot_open_a_pipe_instance_with_any_one_access() {
@@ -659,7 +740,8 @@ fn a_low_process_cannot_open_a_pipe_instance_with_any_one_access() {
         .unwrap();
     let _guard = rt.enter();
     let env = TestEnv::new();
-    let pipe = env.env.pipe_name();
+    // The apps' instance pipe: the name the instance server claims, and the same `create_instance`.
+    let pipe = env.env.app_pipe_name("shell", false);
     let mut servers = vec![lil_platform::pipe::create_instance(&pipe, true).unwrap()];
     let opens = low_opens(&pipe, || {
         servers.push(lil_platform::pipe::create_instance(&pipe, false).unwrap());

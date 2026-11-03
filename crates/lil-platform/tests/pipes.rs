@@ -134,12 +134,11 @@ fn sockets_of_reports_a_loopback_listener() {
     let theirs = sockets_of(child.id()).unwrap();
     child.wait().unwrap();
     assert!(theirs.is_empty(), "{theirs:?}");
-}
 
-#[test] // spec: ARCH-006
-fn sockets_of_reports_a_connected_socket_as_other() {
     // A loopback connection to this process's own listener: three sockets, one listening and
-    // the two ends of the connection.
+    // the two ends of the connection. In this test, not its own: the tables are read for the whole
+    // process, so two tests that bind sockets would see each other's under plain `cargo test`,
+    // which runs them as threads of one process.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (accepted, _) = listener.accept().unwrap();

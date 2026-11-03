@@ -2,7 +2,9 @@
 //!
 //! Every instance carries the security descriptor [`pipe_sddl`] for the current user's real
 //! SID (never the fixed test SID that test channels put in the pipe *name*), so only that user
-//! and SYSTEM can open it. Remote clients are rejected. The core's first instance uses
+//! and SYSTEM can open it, and, from a process at Medium or above, only a process at Medium or
+//! above (the label has no write, read or execute up; a process below Medium makes its pipes
+//! without it, see [`create_instance`]). Remote clients are rejected. The core's first instance uses
 //! `FILE_FLAG_FIRST_PIPE_INSTANCE` as its singleton check.
 
 use std::ffi::c_void;
@@ -42,23 +44,21 @@ use crate::process::{current_user_sid, io_error, own_integrity_rid};
 /// with any access. The implicit label only has no write up: a Low process could still open with
 /// read, execute or no access, and connect.
 pub fn pipe_sddl(user_sid: &str) -> String {
-    format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY){PIPE_LABEL}")
+    sddl(user_sid, true)
 }
 
-/// The Medium label of [`pipe_sddl`].
-const PIPE_LABEL: &str = "S:(ML;;NWNRNX;;;ME)";
-
 /// [`pipe_sddl`] for a pipe a process at the level `own_integrity` makes. A process below Medium
-/// can't label an object above its own level, so it makes the pipe without the label and the
-/// kernel gives it the process's own level: a client at Medium can still tell what holds it (a
-/// pipe's peer is checked by its token, ARCH-027).
+/// can't label an object above its own level, so it makes the pipe without the label, and the
+/// kernel gives it the process's own level. What holds such a pipe is vetted by the client, as
+/// before: by the pipe server's token on the apps' path, and by the proof event on the core's
+/// (ARCH-027).
 fn instance_sddl(user_sid: &str, own_integrity: u32) -> String {
-    let sddl = pipe_sddl(user_sid);
-    if own_integrity < MEDIUM_RID {
-        sddl.trim_end_matches(PIPE_LABEL).to_string()
-    } else {
-        sddl
-    }
+    sddl(user_sid, own_integrity >= MEDIUM_RID)
+}
+
+fn sddl(user_sid: &str, labelled: bool) -> String {
+    let label = if labelled { "S:(ML;;NWNRNX;;;ME)" } else { "" };
+    format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY){label}")
 }
 
 /// Why [`create_instance`] failed.
