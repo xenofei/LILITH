@@ -367,13 +367,21 @@ pub fn shown_action(arguments: &Value) -> ShownAction {
 /// Why a typed amount can't be the new limit of a cap now at `limit` (the core's decimal string), by
 /// name, or `None` when it can. The Raise button shows the amount through `money_text`, which rounds
 /// to the currency's minor unit, and what is sent must be what it says, so more decimals are refused.
-/// A raise that isn't higher is refused too. Text, never a float.
+/// A raise that isn't higher is refused too, and so is one above the largest amount the core holds
+/// (`i64` micro-units). Text, never a float.
 pub fn raise_refusal(amount: &str, limit: &str, currency: &str) -> Option<&'static str> {
     let Some(new) = Decimal::parse(amount) else {
         return Some("not_a_number");
     };
     if new.fraction.len() > crate::money::minor_unit(currency) {
         return Some("too_many_decimals");
+    }
+    let largest = Decimal {
+        whole: "9223372036854",
+        fraction: "775807",
+    };
+    if new.compare(&largest) == std::cmp::Ordering::Greater {
+        return Some("too_large");
     }
     // A limit that can't be read refuses nothing here: the core has the say.
     Decimal::parse(limit)
@@ -674,6 +682,28 @@ mod tests {
                 raise_refusal(amount, limit, currency),
                 want,
                 "{amount} over {limit}"
+            );
+        }
+    }
+
+    // The core holds a limit as i64 micro-units, at most 9,223,372,036,854.775807: one step of the
+    // currency more is refused here, in words of its own, not sent for the core to call it no number.
+    #[test] // spec: APP-054
+    fn a_raise_past_the_cores_largest_amount_is_too_large() {
+        for (amount, currency, want) in [
+            ("9223372036854.77", "USD", None),
+            ("9223372036854.78", "USD", Some("too_large")),
+            ("9223372036854", "JPY", None),
+            ("9223372036855", "JPY", Some("too_large")),
+            ("9223372036854.775", "KWD", None),
+            ("9223372036854.776", "KWD", Some("too_large")),
+            ("99999999999999", "USD", Some("too_large")),
+            ("000009223372036854.77", "USD", None),
+        ] {
+            assert_eq!(
+                raise_refusal(amount, "1", currency),
+                want,
+                "{amount} {currency}"
             );
         }
     }

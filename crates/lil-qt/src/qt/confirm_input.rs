@@ -245,6 +245,7 @@ fn refusal_words(name: &str, label: &str) -> String {
             "That has more decimals than this currency uses. Enter it as the button should say it."
                 .to_string()
         }
+        "too_large" => "That amount is too large.".to_string(),
         "not_higher" => {
             "That isn't higher than the limit now, so it wouldn't be a raise. Enter a higher one, or use Allow once or Cancel."
                 .to_string()
