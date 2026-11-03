@@ -45,6 +45,8 @@
      registry keys, temporary root and Qt cache folder (%LOCALAPPDATA%\LILITH-test-homecheck) removed,
      and the pop-up told it is done. Anything left behind fails the run. Exit 0 only when every check
      passed and the cleanup was complete.
+  Every `lil` call is limited to 30 s (sandbox-common.ps1's Invoke-LilTimed), and no input or wait goes
+  on past the pop-up's cap less 30 s: the run stops with "out of the stretch's time" and cleans up.
   -DryRun does step 2's channel set-up, a job, and the guards' self-test only, with no pop-up, no
   window and no input.
 #>
@@ -66,6 +68,8 @@ $failures = [System.Collections.Generic.List[string]]::new()
 function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
 function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
+# Invoke-LilTimed, the stretch's deadline, Retry-Walk and the masked log copy.
+. (Join-Path $PSScriptRoot 'sandbox-common.ps1')
 
 # --- The test channel ------------------------------------------------------------------------
 $channel = 'test-homecheck'
@@ -82,16 +86,16 @@ function Enter-TestChannel {
     Set-Location -LiteralPath $root
 }
 function Invoke-Lil([string[]]$a) {
-    $o = & $lil @a 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "lil $($a -join ' ') exited $LASTEXITCODE`: $($o -join ' ')" }
-    return ($o -join "`n")
+    $r = Invoke-LilTimed $a
+    if ($r.ExitCode -ne 0) { throw "lil $($a -join ' ') exited $($r.ExitCode): $($r.Output -join ' ')" }
+    return ($r.Output -join "`n")
 }
 # The running test core's PID, from its own hello (recorded), or 0 with none. It refuses a channel
 # that isn't this one.
 function Get-CorePid {
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -ne 0) { return 0 }
-    $m = [regex]::Match(($o -join "`n"), 'pid (\d+), channel (\S+?)\)')
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -ne 0) { return 0 }
+    $m = [regex]::Match(($r.Output -join "`n"), 'pid (\d+), channel (\S+?)\)')
     if (-not $m.Success -or $m.Groups[2].Value -notlike '*homecheck*') { return 0 }
     $id = [int]$m.Groups[1].Value
     [void]$corePids.Add($id)
@@ -111,7 +115,7 @@ function Exit-TestChannel {
     # Never off the test channel: `lil core stop` would reach the channel this shell defaults to.
     if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
     try { [void](Get-CorePid) } catch { }
-    try { [void](& $lil core stop 2>&1) } catch { }
+    try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
     Start-Sleep -Milliseconds 500
     try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     try { Set-Location -LiteralPath $Repo } catch { }
@@ -157,8 +161,8 @@ function Get-WorkspaceId {
 # nothing.
 function Assert-ChannelFree {
     $taken = ''
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -eq 0 -and [regex]::IsMatch(($o -join "`n"), 'pid \d+, channel ')) { $taken = 'a core already runs on it' }
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -eq 0 -and [regex]::IsMatch(($r.Output -join "`n"), 'pid \d+, channel ')) { $taken = 'a core already runs on it' }
     $apps = @(Get-Process -Name 'lil-image' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Deploy, [StringComparison]::OrdinalIgnoreCase) })
     if ($apps.Count -gt 0) { $taken = "a lil-image from this deploy runs (pid $($apps[0].Id))" }
     if ($taken) {
@@ -187,6 +191,7 @@ function Get-SinceIds([string]$at) {
 function Wait-Count([scriptblock]$count, [int]$want, [int]$sec) {
     $end = (Get-Date).AddSeconds($sec)
     while ($true) {
+        Assert-InStretch
         $n = -1
         try { $n = [int](& $count) } catch { Write-Host "the count threw: $_" }
         if ($n -eq $want -or (Get-Date) -ge $end) { return $n }
@@ -255,6 +260,7 @@ function Get-WindowProcessId([System.IntPtr]$hwnd) {
     return [int]$owner
 }
 function Assert-AppInFront {
+    Assert-InStretch
     for ($i = 0; $i -lt 5; ++$i) {
         if ((Get-WindowProcessId ([LilHomeCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
         Start-Sleep -Milliseconds 200
@@ -262,6 +268,7 @@ function Assert-AppInFront {
     throw 'no press sent: another program''s window is in front'
 }
 function Assert-AppAt([int]$x, [int]$y) {
+    Assert-InStretch
     $point = [LilHomeCheck.Win+POINT]::new()
     $point.X = $x
     $point.Y = $y
@@ -275,8 +282,16 @@ function Self-Test {
     $refused = 0
     try { Assert-AppInFront } catch { if ("$_" -like 'no press sent*') { ++$refused } }
     try { Assert-AppAt 0 0 } catch { if ("$_" -like 'no press sent*') { ++$refused } }
+    # Past the stretch's deadline, the guards stop before they look at any window.
+    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $late = 0
+    foreach ($guard in { Assert-AppInFront }, { Assert-AppAt 0 0 }) {
+        try { & $guard } catch { if ("$_" -like "out of the stretch's time*") { ++$late } }
+    }
+    $script:stopAt = $null
     $script:app = $null
     Check ($refused -eq 2) "self-test: the guards refuse a window that isn't the app's ($refused of 2)"
+    Check ($late -eq 2) "self-test: past the stretch's deadline the guards stop ($late of 2)"
     $own = Get-WindowProcessId ([LilHomeCheck.Win]::GetForegroundWindow())
     Check ($own -ge 0) 'self-test: the foreground window''s owner can be read'
 }
@@ -332,10 +347,11 @@ if ($DryRun) {
 
 # --- 1. The pop-up -------------------------------------------------------------------------------
 $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-homecheck-{0}.state" -f $PID)
+$capSec = 600
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
                '-What', 'checks Home (windows that minimize and float, and a real drag)', '-WarnSec', '10', '-RunSec', '150',
-               '-CapSec', '600', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-CapSec', [string]$capSec, '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -345,6 +361,8 @@ while (-not (Test-Path -LiteralPath "$state.shown")) {
     if ((Get-Date) -gt $deadline) { throw 'the hands-off pop-up was not on screen within 30 s, so nothing ran' }
     Start-Sleep -Milliseconds 250
 }
+# From here no input goes after the pop-up's cap less 30 s.
+Start-Stretch $capSec
 Start-Sleep -Seconds 10
 
 # --- 2. The check --------------------------------------------------------------------------------
@@ -357,17 +375,12 @@ function And($a, $b) { [System.Windows.Automation.AndCondition]::new($a, $b) }
 function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     $end = (Get-Date).AddSeconds($sec)
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $e = & $find
         if ($e) { return $e }
         Start-Sleep -Milliseconds 200
     }
     throw "timed out after $sec s waiting for $what"
-}
-# UI Automation can throw for a whole walk while the tree moves: walk again, a few times.
-function Retry-Walk([scriptblock]$walk) {
-    for ($i = 0; ; ++$i) {
-        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
-    }
 }
 function App-Windows {
     @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
@@ -465,6 +478,7 @@ function Show-App {
     $end = (Get-Date).AddSeconds(240)
     $waited = $false
     while ($true) {
+        Assert-InStretch
         [void][LilHomeCheck.Win]::SetForegroundWindow($hwnd)
         Start-Sleep -Milliseconds 800
         $holder = Get-WindowProcessId ([LilHomeCheck.Win]::GetForegroundWindow())
@@ -488,6 +502,8 @@ function Show-Cover {
     $form.Show()
     $end = (Get-Date).AddSeconds(240)
     while ($true) {
+        # Its own window mustn't be left open when the time is up.
+        try { Assert-InStretch } catch { $form.Close(); $form.Dispose(); throw }
         [System.Windows.Forms.Application]::DoEvents()
         $form.Activate()
         [void][LilHomeCheck.Win]::SetForegroundWindow($form.Handle)
@@ -752,8 +768,7 @@ try {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
-        if (Test-Path -LiteralPath (Join-Path $DiagDir 'logs')) { Remove-Item -Recurse -Force -LiteralPath (Join-Path $DiagDir 'logs') }
-        if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir 'logs') -Recurse -Force }
+        if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
         Write-Host "diagnostics in $DiagDir"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
