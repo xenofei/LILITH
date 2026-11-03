@@ -469,6 +469,11 @@ fn end_session_leaves_the_core_s_running_apps() {
         )
         .expect("the test app's registration");
         let mut rig = Rig::start(|_| {});
+        // As the shell does: the app follows its open requests. The answer to a call made after
+        // the subscribe shows that it reached the core.
+        rig.probe.subscribe("open_requests:test");
+        let fence = rig.probe.call("test.echo", json!({"text": "fence"}));
+        rig.probe.finished(&fence);
         let open = json!({"app": "test", "target": r"C:\pics\a.png", "intent": "open"});
         let id = rig.probe.call("open_in", open.clone());
         let answer = rig.probe.finished(&id);
