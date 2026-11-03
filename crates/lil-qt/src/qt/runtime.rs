@@ -45,9 +45,10 @@ use std::time::Duration;
 
 use lil_client::session::{Session, SessionState, UnavailableCause};
 use lil_client::{ClientConfig, ClientError};
-use lil_protocol::codes::{CONFIRM_EXPIRED, PARAMS_INVALID};
+use lil_protocol::codes::{CONFIRM_EXPIRED, CORE_BUG, PARAMS_INVALID};
 use lil_protocol::{
-    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, NO_WORKSPACE, Outcome, ToolOutput,
+    CLIENT_QUEUE, ErrorBody, EventKind, EventParams, HelloResult, NO_WORKSPACE, Outcome,
+    ToolOutput, rpc_code,
 };
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -435,7 +436,7 @@ impl Runtime {
                 },
                 Err(e) => Delivery::Failed {
                     id,
-                    json: to_json(&client_error(&e, &trace)),
+                    json: to_json(&bridge_error(&e, &trace)),
                 },
             };
             shared.gui.push(delivery);
@@ -459,7 +460,7 @@ impl Runtime {
                 },
                 Err(e) => Delivery::Failed {
                     id,
-                    json: to_json(&client_error(&e, &lil_client::mint_id("t"))),
+                    json: to_json(&bridge_error(&e, &lil_client::mint_id("t"))),
                 },
             };
             shared.gui.push(delivery);
@@ -492,7 +493,7 @@ impl Runtime {
                 },
                 Err(e) => Delivery::Failed {
                     id,
-                    json: to_json(&client_error(&e, &lil_client::mint_id("t"))),
+                    json: to_json(&bridge_error(&e, &lil_client::mint_id("t"))),
                 },
             };
             shared.gui.push(delivery);
@@ -581,6 +582,26 @@ fn parse_object(text: &str) -> Result<Map<String, Value>, String> {
         Ok(Value::Object(map)) => Ok(map),
         Ok(_) => Err("The arguments must be a JSON object.".to_string()),
         Err(e) => Err(format!("The arguments aren't valid JSON: {e}")),
+    }
+}
+
+/// The error a request reports for `e` ([`client_error`]), except a protocol fault, which isn't an
+/// unreachable core and is never worth sending again as it is: a request the core faulted as
+/// invalid (-32602), or too long to send (-32002, refused before anything was sent), is
+/// `params.invalid`; any other fault (an over-cap answer, an unknown method, an answer the client
+/// can't read) is `core.bug`. The fault's own text is kept.
+fn bridge_error(e: &ClientError, trace_id: &str) -> ErrorBody {
+    let ClientError::Protocol(fault) = e else {
+        return client_error(e, trace_id);
+    };
+    match fault.code {
+        rpc_code::LINE_TOO_LONG => ErrorBody::new(
+            &PARAMS_INVALID,
+            format!("Nothing was sent: {}.", fault.message),
+            trace_id,
+        ),
+        rpc_code::INVALID_PARAMS => ErrorBody::new(&PARAMS_INVALID, e.to_string(), trace_id),
+        _ => ErrorBody::new(&CORE_BUG, e.to_string(), trace_id),
     }
 }
 
@@ -826,7 +847,7 @@ fn finished(
         },
         Err(e) => Delivery::Failed {
             id,
-            json: to_json(&client_error(&e, trace)),
+            json: to_json(&bridge_error(&e, trace)),
         },
     }
 }

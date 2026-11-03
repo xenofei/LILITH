@@ -404,6 +404,53 @@ fn call_finishes_through_the_core_object() {
     });
 }
 
+/// A protocol fault is not an unreachable core (PROTO-3): a request the core faults as invalid,
+/// or that is too long to send, is `params.invalid`, and a method the core doesn't define is
+/// `core.bug`. Neither is `core.unreachable`, which tells a caller to send the same thing again.
+#[test] // spec: APP-028, QA-010
+fn a_protocol_fault_is_not_an_unreachable_core() {
+    launch("a_protocol_fault_is_not_an_unreachable_core", || {
+        let mut rig = Rig::start(|_| {});
+        let failed = |rig: &mut Rig, id: &str| match rig.probe.outcome(id) {
+            Seen::Failed(_, error) => error,
+            other => panic!("{id} didn't fail: {other:?}"),
+        };
+        // The core's -32602: `held_only` is for a resume.
+        let id = rig
+            .probe
+            .app_call("app/queue.pause", json!({"held_only": true}));
+        let error = failed(&mut rig, &id);
+        assert_eq!(error["code"], "params.invalid", "{error}");
+        assert_eq!(error["retry"], "after_resolve", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("held_only")),
+            "the fault's own text: {error}"
+        );
+        // The core's -32601.
+        let id = rig.probe.app_call("app/not.a.method", json!({}));
+        let error = failed(&mut rig, &id);
+        assert_eq!(error["code"], "core.bug", "{error}");
+        assert_eq!(error["retry"], "never", "{error}");
+        // The client's own line cap: the core never sees it.
+        let id = rig
+            .probe
+            .call("test.echo", json!({"text": "x".repeat(5 << 20)}));
+        let error = failed(&mut rig, &id);
+        assert_eq!(error["code"], "params.invalid", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Nothing was sent")),
+            "{error}"
+        );
+        // The connection is as it was.
+        let id = rig.probe.call("test.echo", json!({"text": "still"}));
+        assert_eq!(rig.probe.finished(&id)["structured"]["text"], "still");
+    });
+}
+
 /// A monthly cap of 1 USD: a `test.destructive` call costing 5 asks about the cap.
 const MONTHLY_1: &str = "[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n";
 
