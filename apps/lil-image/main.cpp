@@ -321,8 +321,8 @@ int main(int, char **)
     // The core session ends now, not with the engine: while the exports finish, the core no longer
     // counts this app as running, so an agent's open_in gets the launch command, not a window
     // that's gone.
-    if (core)
-        QMetaObject::invokeMethod(core, "endSession", Qt::DirectConnection);
+    if (core && !QMetaObject::invokeMethod(core, "endSession", Qt::DirectConnection))
+        lilshim::logEvent(QStringLiteral("error"), {{"what", "endSession not invoked"}});
     // An export under way finishes, or at the limit stops and cleans up, before the process ends.
     lil_qt::wait_for_exports();
     lilshim::logEvent(QStringLiteral("exit"), {{"code", rc}});
