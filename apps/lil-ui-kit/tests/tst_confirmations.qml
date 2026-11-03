@@ -487,6 +487,34 @@ TestCase {
         closeDialog(panel)
     }
 
+    // The same words said again are said now: the second refusal's words stay as the window comes back.
+    function test_words_said_again_count_from_the_second_time() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const bar = panel.dialog.bar
+        bar.refuse("no_move", "Approve")
+        const words = bar.reason
+        wait(1100)
+        bar.refuse("no_move", "Approve")
+        bar.inFront = false
+        bar.inFront = true
+        compare(bar.reason, words, "said just now: they stay")
+        closeDialog(panel)
+    }
+
+    // "Bring this window to the front first" is answered once it is in front, however soon.
+    function test_coming_to_the_front_clears_the_words_that_asked_for_it() { // spec: P4a-R10
+        const panel = makePanel([crane])
+        openDialog(panel, crane.id)
+        const bar = panel.dialog.bar
+        bar.refuse("not_in_front", "Deny")
+        verify(bar.reason.indexOf("Bring this window") === 0, bar.reason)
+        bar.inFront = false
+        bar.inFront = true
+        compare(bar.reason, "", "the window is in front now")
+        closeDialog(panel)
+    }
+
     function test_approve_waits_500_ms_and_for_the_front() { // spec: P4a-R10
         const panel = makePanel([crane])
         panel.showConfirmation(crane.id)
