@@ -391,8 +391,8 @@ TestCase {
         compare(shell.title, "LILITH — storyboard")
         fake.project = ""
         compare(shell.title, "LILITH")
-        fake.project = "sketchbook"
         fake.workspace = null
+        fake.project = "sketchbook"
     }
 
     function test_shortcuts_show_their_panels() { // spec: APP-011

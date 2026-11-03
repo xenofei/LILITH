@@ -283,7 +283,7 @@ TestCase {
         answer(t.core, named("caps.get"), Shapes.refusal("core.unreachable", "No core."))
         refuseRead(t.core, "core.unreachable", "No core.")
         compare(t.bar.jobsIndicator.text, "—")
-        compare(t.bar.spendIndicator.text, "Spend —", "a read that failed while connected is said, not hidden")
+        verify(!t.bar.spendIndicator.visible, "a call cut by the connection isn't a failed read")
 
         // Disconnected: nothing polls.
         t.core.applyState({connection: "reconnecting"})
@@ -715,13 +715,15 @@ TestCase {
         const said = "Quay is now your default workspace, but the app couldn't switch to it: No core answered."
         compare(sw.popup.message, said)
         compare(t.bar.notice.kind, "danger")
+        compare(t.bar.notice.text, said)
 
         // The core refuses every call of this session now, and the bar says so (SHELL-6): it is no
-        // longer "Connected", and the way out is offered where the refusal is shown.
-        compare(t.bar.movedReason, said)
+        // longer "Connected", and the way out is offered where the refusal is shown, with the focus.
+        compare(t.bar.movedReason, "Quay became the default workspace, and this core serves only the default, so it refuses this one's calls.")
         compare(t.bar.connectionIndicator.text, "Workspace refused")
         compare(t.bar.jobsIndicator.text, "—", "the last counts aren't shown as live")
         verify(sw.popup.defaultButton.visible)
+        tryVerify(() => sw.popup.defaultButton.activeFocus, 2000, "the button takes the keyboard")
         wait(50)
         mouseClick(sw.popup.defaultButton)
         const again = open(t.core, c => c.kind === "useDefaultWorkspace")
@@ -733,6 +735,7 @@ TestCase {
         t.core.applyState({connection: "ready", workspace: quay})
         compare(t.bar.movedReason, "")
         compare(t.bar.connectionIndicator.text, "Connected")
+        verify(!t.bar.notice.visible, "the notice described a state that is gone")
     }
 
     function test_a_switch_by_itself_is_a_new_hello_and_never_the_default() { // spec: ARCH-090, P4a-R34
@@ -765,8 +768,26 @@ TestCase {
         const hello = open(t.core, c => c.kind === "setWorkspace")[0]
         answered[hello.id] = true
         t.core.respond(hello.id, Shapes.refusal("core.unreachable", "No core answered."))
-        verify(t.bar.movedReason.indexOf("quay became the default workspace") >= 0, t.bar.movedReason)
+        verify(t.bar.movedReason.indexOf("Quay became the default workspace") >= 0, t.bar.movedReason)
         compare(t.bar.connectionIndicator.text, "Workspace refused")
+    }
+
+    function test_the_name_of_a_failed_set_default_does_not_reach_a_later_failure() { // spec: ARCH-090
+        const t = load()
+        const sw = openWorkspaces(t)
+        mouseClick(makeDefaultButton(sw.popup, "ws2"))
+        // Another client's move comes during the call, and the call itself fails.
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws3", "D:/art/other"))
+        answer(t.core, named("workspace.set_default"), Shapes.refusal("store.io", "Busy."))
+        compare(t.bar.movedReason, "")
+        // A later one succeeds on set_default and fails on the hello: its own name.
+        mouseClick(makeDefaultButton(sw.popup, "ws2"))
+        answer(t.core, named("workspace.set_default"), Shapes.tool({id: "ws2", path: "D:/art/quay"}))
+        const hello = open(t.core, c => c.kind === "setWorkspace")[0]
+        answered[hello.id] = true
+        t.core.respond(hello.id, Shapes.refusal("core.unreachable", "No core answered."))
+        verify(t.bar.movedReason.indexOf("Quay became the default workspace") >= 0, t.bar.movedReason)
+        verify(t.bar.movedReason.indexOf("other") < 0, t.bar.movedReason)
     }
 
     function test_a_late_resend_answer_cannot_cross_a_workspace_switch() { // spec: ARCH-088
@@ -1446,11 +1467,20 @@ TestCase {
     }
 
     function test_an_outage_before_the_first_caps_read_shows_no_placeholder() { // spec: APP-006, ARCH-100
+        // The call in flight is cut by the connection, whichever of the error and the state change
+        // the bar hears first: `ready` reads again, and nothing was said in between.
         const t = load({unanswered: true})
+        answer(t.core, named("caps.get"), Shapes.refusal("core.unreachable", "No core."))
+        verify(!t.bar.spendIndicator.visible, "cut while still `ready`")
         t.core.applyState({connection: "reconnecting"})
         verify(!t.bar.spendIndicator.visible)
         t.core.applyState({connection: "ready", workspace: workspaceOne})
         verify(!t.bar.spendIndicator.visible, "a read that is out has not failed")
+        // A bar made before the connection: nothing to read, nothing said.
+        const core = createTemporaryObject(fakeComponent, tc, {connection: "connecting", workspace: null})
+        const w = createTemporaryObject(barWindow, tc, {core: core})
+        windows.push(w)
+        verify(!w.bar.spendIndicator.visible)
     }
 
     function test_a_new_workspace_forgets_the_old_ones_project_names_and_rows() { // spec: ARCH-088, APP-006

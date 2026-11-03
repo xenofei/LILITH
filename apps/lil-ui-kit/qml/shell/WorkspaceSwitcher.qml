@@ -10,8 +10,8 @@
 // "Make this the default" is its own click, on its own button, and it moves the app too: in M1 the
 // core serves only the default, so from that answer on it refuses every call of the old session
 // (the list's re-read included) until a new hello. So the answer's id goes straight to
-// `Core.setWorkspace`, and `noticed` says what happened. If that hello fails, the rows say what
-// the core now serves, so the new default can be chosen by hand.
+// `Core.setWorkspace`, and `noticed` says what happened. If that hello fails, `defaultSwitchFailed`
+// says the core refuses this session now, and the list gives way to "Use the default workspace".
 //
 // While the core refuses the session's workspace, nothing can be listed, but the button stays usable
 // and offers the way out. That is a refused hello (`lil workspace use` elsewhere, then a lost
@@ -53,6 +53,10 @@ Item {
     signal noticed(string text, string kind)
     // The core refused this session's workspace while connected, in its words.
     signal workspaceRefused(string message)
+    // "Make this the default" took, and the hello that followed to the new default failed: from now
+    // on the core refuses every call of this session. `name` is the new default's. `noticed` has
+    // just said it, in words.
+    signal defaultSwitchFailed(string name)
 
     // Its own click is moving the default, and the hello that follows is on the way.
     function changingDefault() {
@@ -195,6 +199,7 @@ Item {
                              + root.shown(e && e.message ? e.message : "the core didn't answer.", 300)
                 popup.message = text
                 root.noticed(text, "danger")
+                root.defaultSwitchFailed(name)
             }
         })
     }

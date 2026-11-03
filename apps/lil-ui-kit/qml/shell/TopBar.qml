@@ -22,7 +22,8 @@
 //   connection banner and both switchers then offer "Use the default workspace". A new hello ends it,
 //   and so does a read made after the refusal and served again (suite.toml edited back by hand, which
 //   publishes nothing): while it stands the bar asks again with a backoff. A "Make this the default"
-//   whose own hello then fails is such a refusal too.
+//   whose own hello then fails is such a refusal too (`defaultSwitchFailed`), and the notice it
+//   raised goes with it.
 //
 // Without a connection no figure is live: the GPU and the jobs read "—", the spend is muted, and the
 // badge goes. While the core refuses this session the jobs and the spend do the same; the GPU's
@@ -107,8 +108,9 @@ Rectangle {
     // How many refusals the bar has been told of: a read made before the last one doesn't speak for
     // the core as it is now, and doesn't end the refusal.
     property int _refusals: 0
-    // The folder of a `default_changed` that came during the switcher's own "Make this the default".
-    property string _ownDefault
+    // The notice on the bar is the switcher's "couldn't switch to it", raised with a refusal: it goes
+    // when that refusal ends.
+    property bool _defaultNotice: false
     // The GPU lane's pause as it was when the pause control's notice was raised ("refusal").
     property string _refusedPause
     // What the bar's items leave of its width: all of it pushes the indicators to the right. When
@@ -213,6 +215,7 @@ Rectangle {
 
     function showNotice(text, kind) {
         _pauseNotice = ""
+        _defaultNotice = false
         notice.kind = kind
         notice.show(text)
     }
@@ -228,8 +231,15 @@ Rectangle {
     }
 
     // A read was refused with `workspace.unsupported`, while this switcher isn't moving the default.
+    // While a refusal already stands its words stay (another client's move says which folder; the
+    // core's own say to run a command): a later read refused only counts, so that a read made before
+    // it can't end the refusal.
     function noteRefused(message) {
-        if (!workspaceSwitcher.changingDefault())
+        if (workspaceSwitcher.changingDefault())
+            return
+        if (movedReason !== "")
+            _refusals++
+        else
             refuse(core.shownText(message, 300))
     }
 
@@ -245,18 +255,15 @@ Rectangle {
             movedReason = ""
         else if (!workspaceSwitcher.changingDefault())
             refuse(movedWords(folderName(data.path)))
-        else
-            _ownDefault = folderName(data.path)
     }
 
-    // What the workspace switcher says has happened. "danger" is the hello that follows "Make this
-    // the default" failing: the core serves only the new default now and refuses this session's
-    // calls, and the connection banner's way out must show, as it does for any other refusal.
-    function onSwitcherNotice(text, kind) {
-        showNotice(text, kind)
-        if (kind === "danger")
-            refuse(_ownDefault !== "" ? movedWords(_ownDefault) : text)
-        _ownDefault = ""
+    // The hello that follows "Make this the default" failed: the core serves only the new default
+    // now and refuses this session's calls, and the connection banner's way out must show, as it
+    // does for any other refusal. Its notice (the switcher's `noticed`, which came first) goes
+    // when the refusal does.
+    function onDefaultSwitchFailed(name) {
+        refuse(movedWords(name))
+        _defaultNotice = notice.visible
     }
 
     // A read made after the last refusal was served: the core serves this workspace again.
@@ -299,7 +306,8 @@ Rectangle {
             },
             error: e => {
                 root._capsFailed = true
-                if (root.coreReady)
+                // A call cut by the connection is not a failed read: `ready` reads again.
+                if (root.coreReady && !(e && e.code === "core.unreachable"))
                     root._capsReadFailed = true
                 if (e && e.code === "workspace.unsupported" && asked === (root.core.workspace ? String(root.core.workspace.id) : ""))
                     root.noteRefused(String(e.message))
@@ -352,7 +360,6 @@ Rectangle {
         ignoreUnknownSignals: true
         function onWorkspaceChanged() {
             root.movedReason = ""
-            root._ownDefault = ""
         }
         function onConnectionChanged() {
             root.movedReason = ""
@@ -368,6 +375,10 @@ Rectangle {
     onMovedReasonChanged: {
         if (movedReason !== "" && coreReady && !_capsReading && !capsRetry.running)
             askCapsAgain()
+        if (movedReason === "" && _defaultNotice) {
+            _defaultNotice = false
+            notice.close()
+        }
     }
 
     Connections {
@@ -446,7 +457,8 @@ Rectangle {
                 core: root.core
                 ready: root.coreReady
                 movedReason: root.movedReason
-                onNoticed: (text, kind) => root.onSwitcherNotice(text, kind)
+                onNoticed: (text, kind) => root.showNotice(text, kind)
+                onDefaultSwitchFailed: name => root.onDefaultSwitchFailed(name)
                 onWorkspaceRefused: message => root.noteRefused(message)
             }
 

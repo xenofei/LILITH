@@ -3,9 +3,10 @@
 // - `reconnecting`: "Reconnecting…", with AI and workspace actions off meanwhile.
 // - `incompatible`: by direction, as the core's protocol major is above this app's or not. A newer core
 //   can't be drained by this app's own `lil` (an older client never drains, ARCH-023), so the way is to
-//   restart LILITH on its newer build. An older core is one this app failed to replace itself, and
-//   "restart the core when it's idle" (APP-036) with `lil core stop` is right, and the app reconnects
-//   by itself. Text only: the session goes on trying by itself.
+//   restart LILITH on its newer build. An older core is one this app failed to replace itself (a start
+//   that failed): "restart the core when it's idle" (APP-036), and "Try again" (`Core.retryNow`) is
+//   how, since its attempt may start a core and so drains and replaces the older one once it is idle.
+//   Nothing reconnects by itself after `lil core stop`.
 // - `unavailable`: the real cause, from `Core.unavailable`. "Try again" (`Core.retryNow`: after a
 //   failed start the session only looks for a core someone else started until then) shows where it
 //   can help. A hello refused over its workspace would only be refused again, so that offers "Use the
@@ -49,7 +50,7 @@ LBanner {
                 return "This app is older than the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
                        + "). Restart LILITH to use it."
             return "This app can't use the running core (protocol " + core.shownText(String(core.coreProtocol), 16)
-                   + "). Restart the core when it's idle: run lil core stop, and the app reconnects by itself."
+                   + "). Restart the core when it's idle: Try again replaces it once nothing is running."
         case "unavailable":
             if (_useError !== "")
                 return _useError
@@ -89,6 +90,7 @@ LBanner {
             primary: true
             visible: root.connection === "unavailable" && !root.refusedWorkspace
                      && !(root.cause && root.cause.retry === "never")
+                     || root.connection === "incompatible" && !root.coreIsNewer
             text: "Try again"
             onClicked: root.core.retryNow()
         },

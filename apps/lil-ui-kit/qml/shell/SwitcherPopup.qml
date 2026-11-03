@@ -65,6 +65,13 @@ T.Popup {
             list.forceActiveFocus(Qt.PopupFocusReason)
     }
 
+    // The refusal came while it is open (a failed switch after "Make this the default"): the list
+    // that held the focus is gone, and the way out takes it.
+    onOfferDefaultChanged: {
+        if (opened && offerDefault)
+            defaultButton.forceActiveFocus(Qt.PopupFocusReason)
+    }
+
     background: Rectangle {
         color: Theme.surface
         radius: Theme.radius

@@ -217,6 +217,16 @@ LBanner {
         }
     ]
 
+    // The hello that left it behind found a workspace after all.
+    Connections {
+        target: root.core
+        ignoreUnknownSignals: true
+        function onWorkspaceChanged() {
+            if (root.core.workspace)
+                root._stillMissing = false
+        }
+    }
+
     Loader {
         id: dialogLoader
         active: false

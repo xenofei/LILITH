@@ -143,21 +143,29 @@ TestCase {
 
     function test_incompatible_says_restart_the_core_when_it_is_idle() { // spec: APP-036, ARCH-023
         // The core is older than this app (the app drains and replaces an older core itself, so this
-        // is a start that failed): `lil core stop` is the way, and the app reconnects by itself.
+        // is a start that failed). After `lil core stop` nothing reconnects by itself; the way is
+        // Core.retryNow, whose attempt may start a core and so replaces the older one when it is idle.
         const t = load()
         const banner = t.shell.connectionBanner
         t.core.applyState({connection: "incompatible", coreProtocol: "0.9"})
         verify(banner.visible)
         verify(banner.text.indexOf("Restart the core when it's idle") >= 0, banner.text)
-        verify(banner.text.indexOf("lil core stop") >= 0, "it says how: " + banner.text)
-        verify(banner.text.indexOf("reconnects by itself") >= 0, banner.text)
+        verify(banner.text.indexOf("Try again") >= 0, "it says how: " + banner.text)
+        verify(banner.text.indexOf("reconnects by itself") < 0, "that is false here: " + banner.text)
         verify(banner.text.indexOf("protocol 0.9") >= 0, banner.text)
         compare(banner.kind, "danger")
-        verify(!banner.retryButton.visible, "the session goes on trying by itself")
+        verify(banner.retryButton.visible, "Try again is the way")
+        compare(banner.retryButton.text, "Try again")
         for (const a of actionsOf(t.shell.contentItem))
             verify(!a.enabled, "disabled: " + a.text)
         compare(t.shell.topBar.connectionIndicator.text, "Core incompatible")
         compare(walk.report(banner), [])
+        // Try again asks the session to attempt again, this time allowed to start a core.
+        compare(t.core.retries, 0)
+        waitForItemPolished(banner.retryButton.parent)
+        wait(50)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 1, "Core.retryNow")
     }
 
     function test_incompatible_with_a_newer_core_says_to_restart_the_app() { // spec: APP-036, ARCH-023
@@ -171,6 +179,7 @@ TestCase {
         verify(banner.text.indexOf("protocol 2.0") >= 0, banner.text)
         verify(banner.text.indexOf("restart LILITH") >= 0 || banner.text.indexOf("Restart LILITH") >= 0, banner.text)
         verify(banner.text.indexOf("lil core stop") < 0, "that can't help here: " + banner.text)
+        verify(!banner.retryButton.visible, "a newer core stays newer")
         compare(banner.kind, "danger")
         compare(walk.report(banner), [])
     }
@@ -375,6 +384,52 @@ TestCase {
             {id: "ws2", path: "D:/art/quay", name: "Quay", default: true, served: true, missing: false}]}), "read again")
         verify(banner.defaultButton.visible)
         verify(banner.text.indexOf("couldn't open it") >= 0, "the refusal stays after the read: " + banner.text)
+    }
+
+    function test_a_refusal_keeps_its_words_when_a_read_is_refused_too() { // spec: ARCH-100, APP-033
+        // The bar asks again while the refusal stands. The core's refusal of that read is the same
+        // news in other words (a command line to run): it must not replace the words, or announce
+        // them again.
+        const t = load()
+        const banner = t.shell.connectionBanner
+        const heard = createTemporaryObject(spyComponent, tc, {target: banner, signalName: "announced"})
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/quay"))
+        const said = banner.text
+        verify(said.startsWith("The core refused this workspace: quay became the default workspace"), said)
+        compare(heard.count, 1)
+        // Every caps.get out (panels read it too) and the bar's probe, a second later, is refused.
+        tryVerify(() => open(t.core, named("caps.get")).length > 0, 2000, "the probe")
+        wait(1300)
+        for (const c of open(t.core, named("caps.get"))) {
+            answered[c.id] = true
+            t.core.respond(c.id, Shapes.notServed("D:/art/quay", "D:/art/harbor"))
+        }
+        wait(100)
+        compare(banner.text, said)
+        compare(heard.count, 1, "announced once")
+    }
+
+    function test_a_no_workspace_answer_that_lands_before_ready_does_not_outlive_its_hello() { // spec: APP-016
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        const lost = {workspaces: [{id: "ws1", path: "E:/art/harbor", name: "Harbor", default: true, served: false, missing: true}]}
+        answer(t.core, named("workspaces.list"), Shapes.tool(lost))
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        t.core.applyState({connection: "connecting"})
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.hello(null))
+        // The next hello finds the default (the drive is back), so the banner is never wanted.
+        t.core.applyState({connection: "ready", workspace: {id: "ws1", path: "E:/art/harbor"}})
+        verify(!banner.visible)
+        // Later, an unrelated no-workspace state.
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(banner.visible)
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: []}), "read again")
+        verify(banner.text.indexOf("It still can't be found.") < 0, banner.text)
     }
 
     function test_connecting_shows_no_banner() { // spec: APP-033
