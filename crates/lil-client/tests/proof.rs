@@ -705,7 +705,7 @@ const LOW_MASKS: [(&str, u32); 5] = [
 ];
 
 /// What a Low process gets opening `pipe` with each of [`LOW_MASKS`] on its own: `ok` or the
-/// Windows error code, in order. `more` is called before each, to make a free instance.
+/// NTSTATUS in hex, in order. `more` is called before each, to make a free instance.
 fn low_opens(pipe: &str, mut more: impl FnMut()) -> Vec<(&'static str, String)> {
     let low_dir = tempfile::tempdir().unwrap();
     label_low(low_dir.path());
@@ -729,6 +729,28 @@ fn low_opens(pipe: &str, mut more: impl FnMut()) -> Vec<(&'static str, String)> 
         .collect()
 }
 
+/// What a process at this test's own integrity (Medium) gets opening `pipe` with `mask`, through
+/// the same opener: the control that a Low process's refusals come from the label and not from a
+/// probe that can't open anything. The child is killed, and its handle closed, on return.
+fn medium_open(pipe: &str, mask: u32) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let mask = format!("{mask:x}");
+    let opener = Probe::start(
+        "opener",
+        dir.path().join("open.txt"),
+        &[
+            (PROBE_PIPE, std::ffi::OsStr::new(pipe)),
+            (PROBE_MASK, std::ffi::OsStr::new(&mask)),
+        ],
+    );
+    wait_line(|| opener.lines(), "open ");
+    let line = opener.lines().remove(0);
+    line.strip_prefix("open ").unwrap().to_string()
+}
+
+/// `GENERIC_READ`, the control's mask.
+const GENERIC_READ: u32 = 0x8000_0000;
+
 /// `STATUS_ACCESS_DENIED`.
 const DENIED: &str = "c0000022";
 
@@ -747,12 +769,18 @@ fn a_low_process_cannot_open_a_pipe_instance_with_any_one_access() {
         servers.push(lil_platform::pipe::create_instance(&pipe, false).unwrap());
     });
     assert!(opens.iter().all(|(_, got)| got == DENIED), "{opens:?}");
+    // The same opener at Medium connects to the same pipe.
+    servers.push(lil_platform::pipe::create_instance(&pipe, false).unwrap());
+    assert_eq!(medium_open(&pipe, GENERIC_READ), "ok");
 }
 
 #[test] // spec: ARCH-026
 fn a_low_process_cannot_open_the_core_pipe_with_any_one_access() {
     let env = TestEnv::new();
     let _core = lil_testkit::CoreFixture::start_ready(&env);
-    let opens = low_opens(&env.env.pipe_name(), || {});
+    let pipe = env.env.pipe_name();
+    let opens = low_opens(&pipe, || {});
     assert!(opens.iter().all(|(_, got)| got == DENIED), "{opens:?}");
+    // The same opener at Medium connects to the same pipe.
+    assert_eq!(medium_open(&pipe, GENERIC_READ), "ok");
 }

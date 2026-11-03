@@ -4,8 +4,8 @@
 //! SID (never the fixed test SID that test channels put in the pipe *name*), so only that user
 //! and SYSTEM can open it, and, from a process at Medium or above, only a process at Medium or
 //! above (the label has no write, read or execute up; a process below Medium makes its pipes
-//! without it, see [`create_instance`]). Remote clients are rejected. The core's first instance uses
-//! `FILE_FLAG_FIRST_PIPE_INSTANCE` as its singleton check.
+//! without it, see [`create_instance`]). Remote clients are rejected. The core's first instance
+//! uses `FILE_FLAG_FIRST_PIPE_INSTANCE` as its singleton check.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -56,6 +56,7 @@ fn instance_sddl(user_sid: &str, own_integrity: u32) -> String {
     sddl(user_sid, own_integrity >= MEDIUM_RID)
 }
 
+/// The pipe's descriptor for `user_sid`, with the Medium label if `labelled`.
 fn sddl(user_sid: &str, labelled: bool) -> String {
     let label = if labelled { "S:(ML;;NWNRNX;;;ME)" } else { "" };
     format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY){label}")
@@ -116,7 +117,8 @@ impl Drop for LocalDescriptor {
 }
 
 /// Creates one server instance of the pipe `name` (a full `\\.\pipe\...` path) with the
-/// user-only descriptor, rejecting remote clients. With `first`, the pipe must not exist yet:
+/// user-only descriptor ([`pipe_sddl`], without its label when this process is below Medium: it
+/// can't label an object above its own level), rejecting remote clients. With `first`, the pipe must not exist yet:
 /// `ERROR_ACCESS_DENIED` then means another server owns it ([`CreateError::AlreadyOwned`]).
 /// Must be called inside a tokio runtime.
 pub fn create_instance(name: &str, first: bool) -> Result<NamedPipeServer, CreateError> {
