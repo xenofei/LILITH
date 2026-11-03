@@ -1,7 +1,8 @@
 // The queue (ARCH-121, QA-083): how many jobs run and wait, and each lane's pause. It reads
 // `jobs.list` for each status, at most one page, and follows `jobs`: a `queue` event is a lane's
 // full state, and a job's change reads the counts again, at most once a second. The Jobs panel is
-// where you act on them.
+// where you act on them. A job whose outcome is unknown (`running`, substatus `interrupted_unknown`:
+// a crash left it, and nothing runs it) is in neither count, as in the top bar; Jobs and Home list it.
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit
@@ -48,7 +49,8 @@ LCard {
         const r = read.result
         if (!r)
             return Words.notKnown
-        const n = MoneyText.count(String((r.jobs || []).length))
+        const known = (r.jobs || []).filter(j => !(j.status === "running" && j.substatus === "interrupted_unknown"))
+        const n = MoneyText.count(String(known.length))
         return r.next_cursor ? n + " or more" : n
     }
 
