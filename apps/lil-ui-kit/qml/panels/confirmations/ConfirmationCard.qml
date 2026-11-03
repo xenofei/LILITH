@@ -120,7 +120,7 @@ LCard {
                         font.bold: true
                         wrapMode: Text.WrapAnywhere
                         Accessible.role: Accessible.StaticText
-                        Accessible.name: text
+                        Accessible.name: Words.spoken(text)
                     }
 
                     Text {
@@ -133,7 +133,7 @@ LCard {
                         font.pixelSize: Theme.fontSize
                         wrapMode: Text.WrapAnywhere
                         Accessible.role: Accessible.StaticText
-                        Accessible.name: text
+                        Accessible.name: Words.spoken(text)
                     }
 
                     Text {

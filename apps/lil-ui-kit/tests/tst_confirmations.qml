@@ -1140,15 +1140,15 @@ TestCase {
         closeDialog(panel)
     }
 
-    // The isolates around names lay out what is drawn; what UI Automation reads has none of them.
-    function test_no_accessible_name_holds_a_bidi_isolate() { // spec: APP-156, P4a-R8
+    // The isolates and first strong marks lay out what is drawn; what UI Automation reads has none.
+    function test_no_accessible_name_holds_a_layout_mark() { // spec: APP-156, P4a-R8
         const named = Shapes.view({id: "cf_00000000000000e5", tool: "א.tool", caller_kind: "ב", project: "ג 100"})
         const panel = makePanel([crane, named])
         const found = []
         const check = root => {
             const visit = item => {
                 const name = LilShim.accessibleOf(item).name || ""
-                if (/[⁨⁩]/.test(name))
+                if (/[‎⁨⁩]/.test(name))
                     found.push(name)
                 for (let i = 0; i < item.children.length; ++i)
                     visit(item.children[i])
@@ -1159,7 +1159,7 @@ TestCase {
         openDialog(panel, named.id)
         check(panel.dialogPopup.contentItem)
         closeDialog(panel)
-        compare(found, [], "names with an isolate")
+        compare(found, [], "names with a layout mark")
     }
 
     // The dialog is where the panel is: a floated panel's dialog opens in its float, whose front is
