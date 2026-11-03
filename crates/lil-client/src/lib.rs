@@ -296,6 +296,20 @@ impl fmt::Display for ClientError {
                 }
                 Ok(())
             }
+            // Only a same-user core in another folder can be asked to drain. As above, the way
+            // out comes first and the paths last.
+            ClientError::Untrusted { pid, image, reason } if reason.starts_with(WRONG_FOLDER) => {
+                f.write_str(
+                    "The LILITH core pipe is served by a core in another folder, which this \
+                     client doesn't trust. `lil core stop` can ask it to finish; a core from an \
+                     older LILITH build needs that build's own `lil core stop`.",
+                )?;
+                if image.as_os_str().is_empty() {
+                    write!(f, " That core is process {pid}: {reason}.")
+                } else {
+                    write!(f, " That core is {} (pid {pid}): {reason}.", image.display())
+                }
+            }
             ClientError::Untrusted { pid, image, reason } => {
                 if image.as_os_str().is_empty() {
                     write!(f, "The LILITH core pipe is served by process {pid}")?;
@@ -306,12 +320,7 @@ impl fmt::Display for ClientError {
                         image.display()
                     )?;
                 }
-                write!(f, ", which this client does not trust: {reason}.")?;
-                // Only a same-user core in another folder can be asked to drain.
-                if reason.starts_with(WRONG_FOLDER) {
-                    f.write_str(" `lil core stop` can ask it to finish.")?;
-                }
-                Ok(())
+                write!(f, ", which this client does not trust: {reason}.")
             }
             ClientError::Incompatible { core_protocol } if core_protocol.is_empty() => f
                 .write_str(
@@ -626,6 +635,29 @@ mod tests {
         assert!(shown.contains("Task Manager."), "{shown}");
         assert!(shown.contains(&u32::MAX.to_string()), "{shown}");
         assert!(text.contains("lil-core.exe"), "{text}");
+    }
+
+    /// A core in another folder (an install moved while an old core runs): the way out comes
+    /// first, however long the path and the trusted folders are.
+    #[test] // spec: ARCH-027
+    fn a_core_in_another_folder_says_what_to_do_within_a_banners_300_characters() {
+        let long = "long folder ".repeat(40);
+        let text = ClientError::Untrusted {
+            pid: u32::MAX,
+            image: PathBuf::from(format!(r"C:\{long}\lil-core.exe")),
+            reason: format!(r"{WRONG_FOLDER} (C:\{long}\bin)"),
+        }
+        .to_string();
+        // `lil_parse::shown_text` keeps 299 characters and `…` when it cuts.
+        let shown: String = text.chars().take(299).collect();
+        assert!(
+            shown.contains("`lil core stop` can ask it to finish"),
+            "{shown}"
+        );
+        assert!(shown.contains("older LILITH build"), "{shown}");
+        assert!(text.contains("lil-core.exe"), "{text}");
+        assert!(text.contains(&u32::MAX.to_string()), "{text}");
+        assert!(text.contains(r"\bin)"), "the trusted folders: {text}");
     }
 
     #[test]
