@@ -50,6 +50,19 @@ set_tests_properties(lil_qt_e2e PROPERTIES
     ENVIRONMENT "QMAKE=$<TARGET_FILE:Qt6::qmake>"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
 
+# lil_qt's own unit tests behind the qt feature (crates/lil-qt/src/qt/runtime.rs's mod tests: the
+# GUI fold and its outcomes, the refused-hello cause, the core build id). The default-feature build
+# the other tiers run doesn't compile that module, so this is where they run. Label qml, so the qml
+# presets run it. One test at a time, as lil_qt_e2e.
+add_test(NAME lil_qt_runtime_unit
+    COMMAND cargo test --locked -p lil_qt --features qt --lib -- --test-threads=1
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(lil_qt_runtime_unit PROPERTIES
+    LABELS qml
+    TIMEOUT 900
+    ENVIRONMENT "QMAKE=$<TARGET_FILE:Qt6::qmake>"
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
+
 # Task 18: the shell's theme, controls, accessibility walk and layout.
 lil_qml_test(tst_theme tst_theme.qml)
 lil_qml_test(tst_controls tst_controls.qml)
@@ -89,10 +102,12 @@ lil_qml_test(tst_launch tst_launch.qml)
 set_property(TEST tst_open_card grab_open_card tst_launch APPEND PROPERTY
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=offscreen-screen.json")
 
-# The stall watchdog's bench check (label bench): offscreen whatever the preset.
+# The stall watchdog's check: offscreen whatever the preset. It asserts behaviour (a 300 ms block
+# gives one gui_stall and one gui_stall_stack), not a budget, so it is labelled qml and the pull
+# request tier runs it; the name stays.
 add_test(NAME bench_stall_watchdog COMMAND tst_lil_ui_kit -input ${CMAKE_CURRENT_SOURCE_DIR}/bench_stall_watchdog.qml)
 set_tests_properties(bench_stall_watchdog PROPERTIES
-    LABELS bench
+    LABELS qml
     TIMEOUT 120
     ENVIRONMENT "QT_FORCE_STDERR_LOGGING=1;QT_QPA_PLATFORM=offscreen"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${LIL_QT_BIN_DIR}")
