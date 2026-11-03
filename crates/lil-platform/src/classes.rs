@@ -256,7 +256,8 @@ pub(crate) fn marked_ids(subkey: &str) -> io::Result<Vec<String>> {
 }
 
 /// `"<exe>"`: the exe as the registry values quote it. An exe path that isn't valid Unicode
-/// (it would be written lossily) or holds a `"` (it can't be quoted) is refused.
+/// (it would be written lossily), holds a `"` (it can't be quoted) or holds a `%` (Windows would
+/// replace what follows it in a link handler's command) is refused.
 pub(crate) fn quoted(exe: &Path) -> io::Result<String> {
     let exe = exe.to_str().ok_or_else(|| {
         io::Error::new(
@@ -268,6 +269,12 @@ pub(crate) fn quoted(exe: &Path) -> io::Result<String> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "the exe path contains a quote",
+        ));
+    }
+    if exe.contains('%') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the exe path contains a percent sign, which Windows would replace in a link handler",
         ));
     }
     Ok(format!("\"{exe}\""))
@@ -1114,6 +1121,18 @@ mod tests {
         assert_eq!(handler_writes(&own, exe).unwrap(), both);
         let shell = env(Channel::Test("desktop-0123456789abcdef".into())).with_shell_classes_root();
         assert!(lilref_writes(&shell, exe).unwrap().is_empty());
+    }
+
+    /// Windows replaces `%1` and the like in a link handler's command, so a path holding a `%`
+    /// would open a different program or none. Only what the writes would be: nothing is written.
+    #[test] // spec: APP-020, APP-022
+    fn an_exe_path_with_a_percent_sign_is_refused() {
+        let exe = Path::new(r"C:\a%1b\lil-image.exe");
+        let err = quoted(exe).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        let own = env(Channel::Test("0123abcd".into()));
+        let err = scheme_writes(&own, exe).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[test] // spec: APP-022
