@@ -1177,9 +1177,9 @@ fn desktop_settings_answer_as_the_settings_panel_reads_them() {
             let Seen::Failed(_, error) = rig.probe.outcome(&id) else {
                 panic!("job_progress wasn't refused")
             };
-            // A -32602 reaches the app as this, the core still there: tst_settings' fixture is this.
-            assert_eq!(error["code"], "core.unreachable", "{error}");
-            assert_eq!(error["retry"], "same_idempotency_key", "{error}");
+            // A -32602 reaches the app as a refusal, not as a lost core (PROTO-3).
+            assert_eq!(error["code"], "params.invalid", "{error}");
+            assert_eq!(error["retry"], "after_resolve", "{error}");
             let message = error["message"].as_str().expect("a message");
             assert!(message.contains("protocol error (-32602)"), "{message}");
             assert!(message.contains("job_progress"), "{message}");
