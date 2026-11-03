@@ -1221,7 +1221,15 @@ mod tests {
         let args = vec!["--no-activate".to_string()];
         assert!(
             matches!(
-                forward_as(&env.env, "image", false, &args, &launch, false, filetime_now),
+                forward_as(
+                    &env.env,
+                    "image",
+                    false,
+                    &args,
+                    &launch,
+                    false,
+                    filetime_now
+                ),
                 Err(ForwardError::NotRunning)
             ),
             "the failed claim left no pipe"
@@ -1232,7 +1240,16 @@ mod tests {
             panic!("the pipe is free: {claim:?}");
         };
         // And it serves: a launch from another process is handed over.
-        forward_as(&env.env, "image", false, &args, &launch, false, filetime_now).unwrap();
+        forward_as(
+            &env.env,
+            "image",
+            false,
+            &args,
+            &launch,
+            false,
+            filetime_now,
+        )
+        .unwrap();
         assert_eq!(
             server.next_within(Duration::from_secs(5)),
             Some(Forwarded { args })

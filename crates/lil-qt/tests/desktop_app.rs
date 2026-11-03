@@ -9,9 +9,11 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use lil_platform::desktop::DESKTOP_TEST_ID_PREFIX;
 use lil_platform::guard::require_desktop_group;
 use lil_platform::hello::{OwnerWindow, Raise};
-use lil_testkit::{CoreFixture, TestEnv};
+use lil_platform::{Channel, Env, Roots};
+use lil_testkit::{CoreFixture, TestEnv, ensure_built};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -443,4 +445,131 @@ fn desktop_second_launch_comes_to_front() {
         "the second launch showed no window"
     );
     drop(blocker);
+}
+
+/// Removes, on drop, what the test below registered under its desktop test channel, through the
+/// removers that refuse anything but a test channel, and fails when something is left.
+struct Unregister<'a>(&'a Env);
+
+impl Drop for Unregister<'_> {
+    fn drop(&mut self) {
+        use lil_platform::desktop::{
+            leftover_registrations, remove_test_registry, unregister_handlers,
+        };
+        let env = self.0;
+        let mut left: Vec<String> = [unregister_handlers(env), remove_test_registry(env)]
+            .into_iter()
+            .filter_map(|r| r.err().map(|e| e.to_string()))
+            .collect();
+        match leftover_registrations(env) {
+            Ok(keys) => left.extend(keys),
+            Err(e) => left.push(e.to_string()),
+        }
+        if !std::thread::panicking() {
+            assert!(left.is_empty(), "left behind: {left:?}");
+        }
+    }
+}
+
+/// The lines `lil-fake-image` appended to `file`.
+fn recorded_launches(file: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// A `lil-…:` link started by Windows itself reaches the app as exactly one argument, whole
+/// (APP-020; P4a-R39; final review SPEC-4). Every other launch test hands the argument to the
+/// exe directly, so a registered command that quoted `%1` wrongly, or a `DefaultIcon` or
+/// `URL Protocol` value written wrongly, would pass them all while a toast's Open and Deny did
+/// nothing. This registers the channel's scheme for a copy of `lil-fake-image` as
+/// `lil-image.exe`, under a desktop test channel on the shell's classes root (so the Sandbox
+/// runner only), starts each link with `ShellExecuteW`, as a click on a toast does, and reads
+/// what the exe recorded. The exe is the fake, so no window opens; the registration is real.
+#[test] // spec: APP-020, APP-048, P4a-R39, QA-042
+#[ignore = "desktop"]
+fn desktop_a_link_started_by_windows_reaches_the_app_as_one_argument() {
+    use lil_platform::desktop::{HandlerPart, handler_parts, register_scheme};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{PCWSTR, w};
+
+    require_desktop_group(false);
+    let dir = tempfile::tempdir().unwrap();
+    // A fresh id per run, so a killed run's leftovers are swept by name.
+    let id = {
+        use std::hash::{BuildHasher, RandomState};
+        RandomState::new().hash_one(std::process::id())
+    };
+    let env = Env::with_roots(
+        Channel::Test(format!("{DESKTOP_TEST_ID_PREFIX}{id:016x}")),
+        Roots {
+            roaming: dir.path().join("roaming"),
+            local: dir.path().join("local"),
+            user_profile: dir.path().join("profile"),
+        },
+        "S-1".into(),
+    )
+    .with_shell_classes_root();
+    let _unregister = Unregister(&env);
+
+    // A long path to a file that exists, as a deployed exe's is.
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let base = PathBuf::from(base.to_string_lossy().trim_start_matches(r"\?\"));
+    let exe = base.join("app").join("lil-image.exe");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::copy(&ensure_built().fake_image, &exe).unwrap();
+    register_scheme(&env, &exe).unwrap();
+    assert_eq!(handler_parts(&env, &exe).scheme, HandlerPart::Ok);
+
+    // The fake appends to `%LIL_TEST_ROOT%\fake-image-args.jsonl`; a process that Windows
+    // starts for this one inherits its environment.
+    // SAFETY: this test is the only thing running in its process (nextest), and nothing else
+    // reads the environment while it is set.
+    unsafe { std::env::set_var("LIL_TEST_ROOT", &base) };
+    let recorded = base.join("fake-image-args.jsonl");
+
+    let scheme = env.activation_scheme();
+    let links = [
+        format!("{scheme}:task/j_0123456789abcdef"),
+        format!("{scheme}:confirm/cf_0123456789abcdef"),
+        format!("{scheme}:deny/cf_0123456789abcdef/0123456789abcdef0123456789abcdef"),
+        lil_parse::open_url(&scheme, r"C:\My Art\a b%41.png"),
+    ];
+    for (n, link) in links.iter().enumerate() {
+        let url: Vec<u16> = link.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `url` is a NUL-terminated wide string that lives through the call; the other
+        // strings are literals.
+        let started = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(url.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // At most 32 is an error code.
+        assert!(
+            started.0 as isize > 32,
+            "ShellExecuteW({link}) failed: {started:?}"
+        );
+        wait_until(&format!("the app's record of link {n}"), || {
+            recorded_launches(&recorded).len() > n
+        });
+        let launches = recorded_launches(&recorded);
+        assert_eq!(
+            launches[n]["args"],
+            serde_json::json!([link]),
+            "the one argument the app got for {link}"
+        );
+    }
+    assert_eq!(
+        recorded_launches(&recorded).len(),
+        links.len(),
+        "one launch each"
+    );
 }
