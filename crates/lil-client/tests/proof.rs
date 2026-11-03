@@ -358,11 +358,7 @@ impl LowHolder {
     }
 
     /// The probe `role` at Low integrity, with `extra` in its environment.
-    fn start_role(
-        role: &str,
-        out: PathBuf,
-        extra: &[(&str, std::ffi::OsString)],
-    ) -> LowHolder {
+    fn start_role(role: &str, out: PathBuf, extra: &[(&str, std::ffi::OsString)]) -> LowHolder {
         use std::os::windows::ffi::OsStrExt as _;
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
