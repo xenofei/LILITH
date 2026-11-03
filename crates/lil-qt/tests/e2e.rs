@@ -404,6 +404,107 @@ fn call_finishes_through_the_core_object() {
     });
 }
 
+/// A protocol fault is not an unreachable core (PROTO-3): a request the core faults as invalid,
+/// or that is too long to send, is `params.invalid`, and a method the core doesn't define is
+/// `core.bug`. Neither is `core.unreachable`, which tells a caller to send the same thing again.
+#[test] // spec: APP-028, QA-010
+fn a_protocol_fault_is_not_an_unreachable_core() {
+    launch("a_protocol_fault_is_not_an_unreachable_core", || {
+        let mut rig = Rig::start(|_| {});
+        let failed = |rig: &mut Rig, id: &str| match rig.probe.outcome(id) {
+            Seen::Failed(_, error) => error,
+            other => panic!("{id} didn't fail: {other:?}"),
+        };
+        // The core's -32602: `held_only` is for a resume.
+        let id = rig
+            .probe
+            .app_call("app/queue.pause", json!({"held_only": true}));
+        let error = failed(&mut rig, &id);
+        assert_eq!(error["code"], "params.invalid", "{error}");
+        assert_eq!(error["retry"], "after_resolve", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("held_only")),
+            "the fault's own text: {error}"
+        );
+        // The core's -32601.
+        let id = rig.probe.app_call("app/not.a.method", json!({}));
+        let error = failed(&mut rig, &id);
+        assert_eq!(error["code"], "core.bug", "{error}");
+        assert_eq!(error["retry"], "never", "{error}");
+        // The client's own line cap: the core never sees it.
+        let id = rig
+            .probe
+            .call("test.echo", json!({"text": "x".repeat(5 << 20)}));
+        let error = failed(&mut rig, &id);
+        assert_eq!(error["code"], "params.invalid", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Nothing was sent")),
+            "{error}"
+        );
+        // The connection is as it was.
+        let id = rig.probe.call("test.echo", json!({"text": "still"}));
+        assert_eq!(rig.probe.finished(&id)["structured"]["text"], "still");
+    });
+}
+
+/// DG-07: `endSession` ends the app's session at once. `main.cpp` calls it once the event loop has
+/// ended, before it waits for the exports, so in those seconds an agent's `open_in` is told the
+/// app isn't running (and gets the launch command) rather than being sent to a window that's gone.
+#[test] // spec: APP-063, APP-064
+fn end_session_leaves_the_core_s_running_apps() {
+    launch("end_session_leaves_the_core_s_running_apps", || {
+        // The test app, installed beside the core: `ui:test` opens PNG images.
+        let exe = own_folder().join("lil-test-app.exe");
+        std::fs::create_dir_all(own_folder().join("apps")).expect("the apps folder");
+        std::fs::write(
+            own_folder().join("apps").join("test.toml"),
+            format!(
+                "app = \"test\"\nexe = '{}'\n[[opens]]\ntypes = [\"image\"]\nformats = [\"png\"]\nintents = [\"open\"]\n",
+                exe.display()
+            ),
+        )
+        .expect("the test app's registration");
+        let mut rig = Rig::start(|_| {});
+        // As the shell does: the app follows its open requests. The answer to a call made after
+        // the subscribe shows that it reached the core.
+        rig.probe.subscribe("open_requests:test");
+        let fence = rig.probe.call("test.echo", json!({"text": "fence"}));
+        rig.probe.finished(&fence);
+        let open = json!({"app": "test", "target": r"C:\pics\a.png", "intent": "open"});
+        let id = rig.probe.call("open_in", open.clone());
+        let answer = rig.probe.finished(&id);
+        assert_eq!(answer["structured"]["running"], true, "{answer}");
+
+        rig.probe.on_gui(|core| core.end_session());
+
+        let mut cfg = ClientConfig::for_env(rig.env.env.clone(), "cli".parse().unwrap())
+            .expect("a client configuration");
+        cfg.start = StartPolicy::NoStart;
+        let agent = lil_client::blocking::BlockingClient::connect(&cfg).expect("connect");
+        let args = match open {
+            Value::Object(args) => args,
+            _ => unreachable!(),
+        };
+        poll("the app no longer running", || {
+            let answer = agent
+                .call_tool("open_in", args.clone(), None)
+                .expect("open_in");
+            let answer = serde_json::to_value(&answer).unwrap();
+            (answer["structured"]["running"] == false).then_some(())
+        });
+        // Calls after the end fail at once: there is no session to make them.
+        let id = rig.probe.call("test.echo", json!({"text": "after"}));
+        match rig.probe.outcome(&id) {
+            Seen::Failed(_, error) => assert_eq!(error["code"], "core.unreachable", "{error}"),
+            other => panic!("a call after endSession: {other:?}"),
+        }
+    });
+}
+
 /// A monthly cap of 1 USD: a `test.destructive` call costing 5 asks about the cap.
 const MONTHLY_1: &str = "[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n";
 
@@ -929,6 +1030,11 @@ fn a_refused_hello_shows_its_cause_and_the_default_gets_out() {
             let reason = reason.unwrap_or_default();
             assert!(reason.contains("lil workspace use"), "the fix: {reason}");
 
+            // A workspace file above the app's data folder (in the user folder, say) is never
+            // what "Use the default workspace" opens (SH-07).
+            assert!(rig.env.env.local_dir().starts_with(rig.env.root()));
+            std::fs::write(rig.env.root().join("lilith.yaml"), "name: above\n")
+                .expect("a workspace file above the data folder");
             let id = rig
                 .probe
                 .on_gui(|core| core.use_default_workspace().to_string());
@@ -1081,9 +1187,9 @@ fn desktop_settings_answer_as_the_settings_panel_reads_them() {
             let Seen::Failed(_, error) = rig.probe.outcome(&id) else {
                 panic!("job_progress wasn't refused")
             };
-            // A -32602 reaches the app as this, the core still there: tst_settings' fixture is this.
-            assert_eq!(error["code"], "core.unreachable", "{error}");
-            assert_eq!(error["retry"], "same_idempotency_key", "{error}");
+            // A -32602 reaches the app as a refusal, not as a lost core (PROTO-3).
+            assert_eq!(error["code"], "params.invalid", "{error}");
+            assert_eq!(error["retry"], "after_resolve", "{error}");
             let message = error["message"].as_str().expect("a message");
             assert!(message.contains("protocol error (-32602)"), "{message}");
             assert!(message.contains("job_progress"), "{message}");
@@ -1364,6 +1470,149 @@ fn a_toast_s_deny_leaves_the_app_s_cap_prompts_alone() {
             "an app with no workspace"
         );
     });
+}
+
+/// XT-01 M5: an app that switches workspace (its process has a session in another workspace when
+/// its old connection closes) has its old session's cap prompts cancelled at once, not when the
+/// process exits. The default moves by an edit of `suite.toml`, which leaves the old workspace open
+/// in the core, so the cancel is seen in its list (`workspace.set_default` closes it, and its
+/// rows can't be read until it opens again).
+#[test] // spec: APP-029, ARCH-030
+fn a_switch_cancels_the_old_workspace_s_cap_prompts_at_once() {
+    launch(
+        "a_switch_cancels_the_old_workspace_s_cap_prompts_at_once",
+        || {
+            let env = TestEnv::new();
+            env.suite_toml_set(MONTHLY_1);
+            let one = env.make_workspace("one");
+            let two = env.make_workspace("two");
+            env.register_workspace(&one, true);
+            env.register_workspace(&two, false);
+            let _core = CoreFixture::start_exe(&env, &own_folder().join("lil-core.exe"));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let connect = |workspace: String| {
+                let mut cfg = ClientConfig::for_env(env.env.clone(), "ui:test".parse().unwrap())
+                    .expect("a client configuration");
+                cfg.start = StartPolicy::NoStart;
+                cfg.workspace = workspace;
+                rt.block_on(lil_client::Client::connect(&cfg))
+                    .expect("connect")
+            };
+            let call = |c: &lil_client::Client, tool: &str, args: Value| -> Value {
+                let Value::Object(args) = args else {
+                    unreachable!()
+                };
+                let key = Some(lil_client::mint_id("ik"));
+                let got = rt.block_on(c.call_tool(tool, args, key)).expect("the tool");
+                serde_json::to_value(&got).unwrap()
+            };
+            let state_of = |c: &lil_client::Client, id: &str| -> String {
+                for which in ["pending", "history"] {
+                    let got = rt
+                        .block_on(c.app_call("app/confirmations.list", json!({"state": which})))
+                        .expect("the list");
+                    let got = serde_json::to_value(&got).unwrap();
+                    let rows = got["confirmations"].as_array().cloned().unwrap_or_default();
+                    if let Some(row) = rows.iter().find(|r| r["id"] == id) {
+                        return row["state"].as_str().unwrap_or_default().to_string();
+                    }
+                }
+                "not listed".to_string()
+            };
+
+            // A, in workspace one, asks about the cap.
+            let a = connect(env.workspace_id(&one));
+            let asked = call(&a, "test.destructive", json!({"cost": "5"}));
+            let id = asked["confirmation_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{asked}"))
+                .to_string();
+            // The default moves, then the new hello: B, in workspace two, from the same process,
+            // while A's connection is still open.
+            env.register_workspace(&two, true);
+            let b = connect(env.workspace_id(&two));
+            assert_eq!(state_of(&b, &id), "pending", "A's connection is open");
+
+            // A's connection closes: the process is in workspace two now, so the prompt ends
+            // now, though the process still runs.
+            drop(a);
+            poll("the old workspace's prompt cancelled", || {
+                (state_of(&b, &id) == "cancelled").then_some(())
+            });
+        },
+    );
+}
+
+/// GT-19: a raise sent as the cap prompt sends it, against the real core. The prompt takes the cap's
+/// name from the core's own view of the confirmation (`view.cap[i].cap`, CapPrompt.qml) and
+/// answers `{action: "raise", raise_to: {cap, amount}}`; the core sets the cap, and the call that
+/// asked is sent again once and runs once.
+#[test] // spec: APP-029, CORE-008, CORE-091
+fn a_raise_sent_as_the_cap_prompt_sends_it_sets_the_cap_and_runs_the_call_once() {
+    launch(
+        "a_raise_sent_as_the_cap_prompt_sends_it_sets_the_cap_and_runs_the_call_once",
+        || {
+            let mut rig = Rig::start(|env| env.suite_toml_set(MONTHLY_1));
+            let id = rig.probe.call("test.destructive", json!({"cost": "5"}));
+            let pending = match rig.probe.outcome(&id) {
+                Seen::Pending(_, p) => p,
+                other => panic!("expected a pending confirmation, got {other:?}"),
+            };
+            let confirmation = pending["confirmation_id"].as_str().unwrap().to_string();
+            // The prompt's rows are the core's view of the confirmation.
+            let list = rig
+                .probe
+                .app_call("app/confirmations.list", json!({"state": "pending"}));
+            let listed = rig.probe.finished(&list);
+            let view = listed["confirmations"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["id"] == confirmation.as_str()))
+                .cloned()
+                .unwrap_or_else(|| panic!("{confirmation} isn't listed: {listed}"));
+            let cap = view["cap"][0]["cap"].clone();
+            assert!(cap.is_string(), "the view's cap row: {view}");
+
+            let answer = rig.probe.app_call(
+                "app/confirmation.answer",
+                json!({"confirmation_id": confirmation, "answer": "approve",
+                       "cap": {"action": "raise", "raise_to": {"cap": cap, "amount": "10"}}}),
+            );
+            let answered = rig.probe.finished(&answer);
+            assert_eq!(answered["confirmation"]["state"], "approved", "{answered}");
+            let result = rig.probe.finished(&id);
+            assert_eq!(result["structured"]["count"], 1, "it ran once: {result}");
+
+            // The cap reads the raised amount.
+            let read = rig.probe.call("caps.get", json!({}));
+            let caps = rig.probe.finished(&read);
+            let row = caps["structured"]["caps"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["cap"] == cap))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {cap} row: {caps}"));
+            assert_eq!(row["limit"], "10", "{caps}");
+            // Nothing more for the request: it finished once.
+            let later = rig.probe.gather(Duration::from_millis(500));
+            assert!(
+                !later.iter().any(|s| matches!(s,
+                    Seen::Finished(rid, _) | Seen::Failed(rid, _) | Seen::Pending(rid, _) if *rid == id)),
+                "{later:#?}"
+            );
+            let history = rig
+                .probe
+                .app_call("app/confirmations.list", json!({"state": "history"}));
+            let history = rig.probe.finished(&history);
+            let row = history["confirmations"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["id"] == confirmation.as_str()))
+                .cloned()
+                .unwrap_or_else(|| panic!("{confirmation} isn't in the history: {history}"));
+            assert_eq!(row["state"], "approved", "{row}");
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

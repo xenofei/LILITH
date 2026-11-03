@@ -5,9 +5,11 @@
 //!   `unavailable`), `coreProtocol`, `workspace` (`{id, path}`, or null), `project` (the
 //!   app's project as the last `app/set_context` answered it, empty for none: the project
 //!   switcher tells it through `noteProject`, since the session keeps its project per connection),
-//!   `unavailable` (while `connection` is `unavailable`: `{reason, cause, code?, retry?}`, `cause`
-//!   one of `start_failed`, `cannot_start`, `untrusted`, `refused` or `other`, and `code` and `retry`
-//!   those of a refused hello; else null),
+//!   `unavailable` (while `connection` is `unavailable`: `{reason, cause, code?, retry?, label,
+//!   lead}`, `cause` one of `start_failed`, `cannot_start`, `untrusted`, `refused` or `other`,
+//!   `code` and `retry` those of a refused hello, and `label` and `lead` the shell's words for it,
+//!   "Workspace refused" and "The core refused this workspace" for a hello refused over its
+//!   workspace, else "Core unavailable" and "The core isn't available"; else null),
 //!   `channelScheme`, `startTimes` (`{firstFrameMs, interactiveMs}` of this start, APP-136, as
 //!   they become known), `buildId` (this app's own) and `coreBuildId` (the `build_id` of the core's
 //!   hello; empty until one is in).
@@ -48,9 +50,10 @@
 //!   - `lastSeq(topic)` is the session's receive cursor (-1 for none), ahead of what QML has
 //!     applied (events wait in the throttle and the GUI queue): for tests and diagnostics, never
 //!     a model's loaded-at seq.
-//! - **Others:** `retryNow()` (the Unavailable banner's "Try again"), `shownText(text,
-//!   maxChars)` (`lil_parse::shown_text`, P4a-R8), `shownLinkText(text, maxChars)`
-//!   (`args::shown_outside`, P4a-R9).
+//! - **Others:** `retryNow()` (the Unavailable banner's "Try again"), `endSession()` (the app
+//!   closes: the session ends now, and every later request fails `core.unreachable`),
+//!   `shownText(text, maxChars)` (`lil_parse::shown_text`, P4a-R8), `shownLinkText(text,
+//!   maxChars)` (`args::shown_outside`, P4a-R9).
 //!
 //! The session starts only in a process that asked for one ([`super::serve`]): lil-image does,
 //! the QML tests don't, and there every request fails `core.unreachable` and the connection is
@@ -117,7 +120,8 @@ pub mod qobject {
         fn shown_text(self: &Core, text: &QString, max_chars: i32) -> QString;
 
         /// `text` from a link, a `.lilref`, a target or a title as shown: `shownText`, with what
-        /// may be a deny token cut first, however it is spelled (P4a-R9).
+        /// may be a deny token cut first, in every spelling a toast or a URL decoder produces; a
+        /// token split by a visible mark or written in fullwidth digits still shows (P4a-R9).
         #[qinvokable]
         fn shown_link_text(self: &Core, text: &QString, max_chars: i32) -> QString;
 
@@ -137,6 +141,12 @@ pub mod qobject {
         /// Tries to reach the core now (the Unavailable banner's "Try again").
         #[qinvokable]
         fn retry_now(self: &Core);
+
+        /// Ends the core session now, as dropping the object would: the app's connection
+        /// closes, so the core no longer counts the app as running. Every later request fails
+        /// `core.unreachable`. `main.cpp` calls it once the event loop has ended.
+        #[qinvokable]
+        fn end_session(self: Pin<&mut Core>);
 
         /// The session's last seq of `topic`; -1 when it has none.
         #[qinvokable]
@@ -479,6 +489,15 @@ impl qobject::Core {
     pub fn retry_now(&self) {
         if let Some(runtime) = &self.runtime {
             runtime.retry_now();
+        }
+    }
+
+    pub fn end_session(mut self: Pin<&mut Self>) {
+        // The object holds the only lasting reference: dropping it is `Runtime::drop`, which
+        // closes the session's connection within its short bound.
+        if let Some(runtime) = self.as_mut().rust_mut().runtime.take() {
+            drop(runtime);
+            tracing::info!("the core session ended with the app");
         }
     }
 

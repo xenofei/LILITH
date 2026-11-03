@@ -852,12 +852,8 @@ impl RpcRouter {
             // A panic there is this handler's panic (see `transport::conn`).
             Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
             Err(e) => {
-                tracing::error!(conn_id = conn.conn_id, error = %e, trace_id, "core/hello stopped");
-                let error = ErrorBody::new(
-                    &codes::CORE_BUG,
-                    "core/hello could not finish. This is a bug in LILITH.",
-                    trace_id,
-                );
+                tracing::warn!(conn_id = conn.conn_id, error = %e, trace_id, "core/hello stopped");
+                let error = hello_stopped(&e, trace_id);
                 return Some(self.hello_error(conn, id, error));
             }
         };
@@ -1238,6 +1234,17 @@ fn prove(id: Id, params: Option<Value>) -> Response {
     }
 }
 
+/// The answer to a hello whose identify step was stopped without a panic: the core's runtime is
+/// shutting down, so the hello gets what a draining core's does. A panic is resumed instead.
+fn hello_stopped(e: &tokio::task::JoinError, trace_id: String) -> ErrorBody {
+    debug_assert!(!e.is_panic(), "a panic is resumed, not answered");
+    ErrorBody::new(
+        &codes::CORE_DRAINING,
+        "The core is shutting down. Connect again once a core runs.",
+        trace_id,
+    )
+}
+
 fn fault(id: Id, code: i64, message: &str) -> Response {
     Response::Error {
         id: Some(id),
@@ -1287,6 +1294,21 @@ mod tests {
         parse_params::<ToolsListParams>(None).unwrap();
         let err = parse_params::<HelloParams>(None).unwrap_err();
         assert_eq!(err.code, rpc_code::INVALID_PARAMS);
+    }
+
+    /// A hello whose identify step is stopped by a runtime that is shutting down (a core stopping
+    /// just as an app says hello) is `core.draining`, which the session retries by itself, not
+    /// `core.bug`, which a banner offers no Try again for.
+    #[tokio::test] // spec: ARCH-029, APP-034
+    async fn a_hello_stopped_by_the_runtime_is_core_draining() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let stopped = task.await.expect_err("an aborted task");
+        assert!(stopped.is_cancelled(), "{stopped}");
+        let error = hello_stopped(&stopped, "t_1".to_string());
+        assert_eq!(error.code, codes::CORE_DRAINING.code, "{error:?}");
+        assert_eq!(error.retry, codes::CORE_DRAINING.retry, "{error:?}");
+        assert_eq!(error.trace_id, "t_1");
     }
 }
 

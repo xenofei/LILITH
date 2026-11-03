@@ -196,9 +196,9 @@ Rectangle {
         }
     }
 
-    // `core.unreachable` is what the bridge makes of anything but a refusal: the connection lost with
-    // the set on it, nothing sent, or a protocol error from a core that is still there. So the words say
-    // only what holds of all three, with the bridge's own for which it was.
+    // `core.unreachable` is what the bridge makes of a lost core: the connection lost with the set on
+    // it, or nothing sent. So the words say only what holds of both, with the bridge's own for which it
+    // was.
     function refused(label, error) {
         const shownLabel = Words.shown(core, label, 80)
         panelBanner.kind = "danger"

@@ -419,3 +419,121 @@ fn an_unregistered_workspace_folder_is_named_plainly() {
         "{flagged:?}"
     );
 }
+
+/// PROTO-5: a registered workspace that isn't the default (`workspace.unsupported`) is handled by
+/// where it came from, as an unregistered one is. From its folder, `status` warns and shows the
+/// status without a workspace, exit 0 (a skill's `lil status --no-start` tells a running core by
+/// exit 0, ARCH-102); named with --workspace, it is never told to become the default.
+#[test] // spec: ARCH-030, ARCH-102, AI-109
+fn a_registered_workspace_the_core_doesnt_serve_is_handled_by_where_it_came_from() {
+    let env = TestEnv::with_label("Ünïcödé space");
+    let default = env.make_workspace("Ünïcödé default");
+    env.register_workspace(&default, true);
+    let other = env.make_workspace("Ünïcödé other");
+    env.register_workspace(&other, false);
+    let inside = other.join("sub folder");
+    std::fs::create_dir_all(&inside).unwrap();
+    let names = |path: &Path, text: &str| path_forms(path).iter().any(|p| text.contains(p));
+    let _core = CoreFixture::start(&env);
+
+    for args in [&["status"][..], &["--no-start", "status"]] {
+        let status = env.lil_in(&inside, args);
+        assert_eq!(status.code, 0, "{args:?}: {status:?}");
+        assert!(status.stdout.contains("\nworkspace: none\n"), "{status:?}");
+        assert_eq!(status.stderr.lines().count(), 1, "{status:?}");
+        assert!(status.stderr.starts_with("warning: "), "{status:?}");
+        assert!(names(&other, &status.stderr), "{status:?}");
+        assert!(status.stderr.contains("current folder"), "{status:?}");
+    }
+
+    // `call` from its folder still can't run (exit 2), with the core's way out.
+    let call = env.lil_in(&inside, &["call", "test.echo", "{\"text\":\"x\"}"]);
+    assert_eq!(call.code, 2, "{call:?}");
+    assert!(call.stderr.contains("lil workspace use \""), "{call:?}");
+
+    // Named with --workspace: told which workspace the core serves, never to switch.
+    let ws_arg = other.to_str().expect("a UTF-8 test path");
+    for args in [
+        &["status", "--workspace", ws_arg][..],
+        &["call", "test.echo", "--workspace", ws_arg],
+    ] {
+        let out = env.lil(args);
+        assert_eq!(out.code, 2, "{args:?}: {out:?}");
+        assert_eq!(out.stdout, "", "{out:?}");
+        assert!(names(&other, &out.stderr), "{out:?}");
+        assert!(names(&default, &out.stderr), "{out:?}");
+        assert!(out.stderr.contains("--workspace"), "{out:?}");
+        assert!(!out.stderr.contains("lil workspace use"), "{out:?}");
+        assert!(
+            out.stderr.contains("serves only the default workspace"),
+            "{out:?}"
+        );
+    }
+}
+
+/// M-5: whatever stops the `cli` chain from naming a workspace the core can use (here a default
+/// whose folder is gone), `lil status` with a core running warns once and shows the status
+/// without a workspace, exit 0, so a skill's `lil status --no-start` still tells a running core;
+/// with no core, `--no-start` gives 3.
+#[test] // spec: ARCH-102, AI-109, ARCH-016
+fn status_with_an_unusable_default_still_tells_a_running_core() {
+    let env = TestEnv::new();
+    let gone = env.make_workspace("gone");
+    env.register_workspace(&gone, true);
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    let none = env.lil(&["--no-start", "status"]);
+    assert_eq!(none.code, 3, "{none:?}");
+
+    let _core = CoreFixture::start(&env);
+    for args in [&["--no-start", "status"][..], &["status"]] {
+        let status = env.lil(args);
+        assert_eq!(status.code, 0, "{args:?}: {status:?}");
+        assert!(status.stdout.contains("\nworkspace: none\n"), "{status:?}");
+        assert_eq!(status.stderr.lines().count(), 1, "{status:?}");
+        assert!(status.stderr.starts_with("warning: "), "{status:?}");
+        assert!(status.stderr.contains("suite.toml"), "{status:?}");
+        assert!(
+            status
+                .stderr
+                .trim_end()
+                .ends_with("Showing the status without a workspace."),
+            "{status:?}"
+        );
+    }
+    // `call` still can't run without the workspace it would name.
+    let call = env.lil(&["call", "test.echo", "{\"text\":\"x\"}"]);
+    assert_eq!(call.code, 2, "{call:?}");
+}
+
+/// N-3: `status` warns and shows the status without a workspace for a default the core refuses
+/// too, `workspace.unknown` or `workspace.unsupported`. A relative `default_workspace` names a
+/// folder from `lil`'s current folder (the TestEnv root) but not from the core's.
+#[test] // spec: ARCH-102, AI-109, ARCH-030
+fn status_with_a_default_the_core_refuses_still_tells_a_running_core() {
+    let env = TestEnv::new();
+    let ws = env.make_workspace("relative default");
+    let name = ws.file_name().unwrap().to_str().unwrap().to_string();
+    let _core = CoreFixture::start(&env);
+    let check = |want_in_warning: &str| {
+        for args in [&["--no-start", "status"][..], &["status"]] {
+            let status = env.lil(args);
+            assert_eq!(status.code, 0, "{args:?}: {status:?}");
+            assert!(status.stdout.contains("\nworkspace: none\n"), "{status:?}");
+            assert_eq!(status.stderr.lines().count(), 1, "{status:?}");
+            assert!(status.stderr.starts_with("warning: "), "{status:?}");
+            assert!(status.stderr.contains(want_in_warning), "{status:?}");
+        }
+        let call = env.lil(&["call", "test.echo", "{\"text\":\"x\"}"]);
+        assert_eq!(call.code, 2, "{call:?}");
+    };
+
+    // The core can't open the relative default: workspace.unknown, from the Default step.
+    env.suite_toml_set(&format!("default_workspace = '{name}'\n"));
+    check("default_workspace");
+
+    // The same folder registered by its full path too: the core knows it, but it isn't the
+    // default the core serves (workspace.unsupported).
+    env.suite_toml_set(&format!("[[workspaces]]\npath = '{}'\n", ws.display()));
+    check("serves only the default workspace");
+}

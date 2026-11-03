@@ -301,5 +301,15 @@ TestCase {
         failedSpy.wait(5000)
         compare(failedSpy.signalArguments[0][0], bad)
         compare(JSON.parse(failedSpy.signalArguments[0][1]).code, "params.invalid")
+
+        // endSession, by the name main.cpp invokes it through the meta-object (DG-07): the session
+        // ends, and a later call fails core.unreachable. Last, as nothing after it has a session.
+        compare(typeof Core.endSession, "function")
+        Core.endSession()
+        failedSpy.clear()
+        const after = Core.call("test.echo", JSON.stringify({text: "after"}))
+        failedSpy.wait(5000)
+        compare(failedSpy.signalArguments[0][0], after)
+        compare(JSON.parse(failedSpy.signalArguments[0][1]).code, "core.unreachable")
     }
 }

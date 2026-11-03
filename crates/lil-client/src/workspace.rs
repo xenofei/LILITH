@@ -88,10 +88,6 @@ pub fn resolve_workspace(
             }),
         })
     };
-    let none = || ResolvedWorkspace {
-        id: NO_WORKSPACE.to_string(),
-        origin: None,
-    };
     if let Some(explicit) = explicit {
         let path = cwd.join(explicit);
         if workspace_file_in(&path).is_none() {
@@ -108,6 +104,22 @@ pub fn resolve_workspace(
     if let Some(dir) = cwd.ancestors().find(|dir| workspace_file_in(dir).is_some()) {
         return found(dir, WorkspaceSource::CurrentFolder);
     }
+    resolve_default_workspace(env)
+}
+
+/// What an app opens at start and after "Use the default workspace": steps 3-4 of
+/// [`resolve_workspace`] alone, `default_workspace` in the channel's `suite.toml`, else
+/// `"none"`. An app has no current folder of its own, so a workspace file above its data folder
+/// (in the user folder, say) is never taken for it.
+///
+/// # Errors
+/// As [`resolve_workspace`]: `suite.toml` cannot be read or isn't valid, or the default
+/// workspace's folder does not exist.
+pub fn resolve_default_workspace(env: &Env) -> Result<ResolvedWorkspace, ClientError> {
+    let none = || ResolvedWorkspace {
+        id: NO_WORKSPACE.to_string(),
+        origin: None,
+    };
     let file = env.suite_toml_to_read();
     let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
@@ -159,13 +171,26 @@ pub fn resolve_workspace(
 
 /// The default workspace `env`'s `suite.toml` names, as written there; `None` when there is
 /// no file, it doesn't parse, or it names none. For messages only.
-pub(crate) fn registered_default(env: &Env) -> Option<PathBuf> {
+pub fn registered_default(env: &Env) -> Option<PathBuf> {
     let text = std::fs::read_to_string(env.suite_toml_to_read()).ok()?;
     let suite = SuiteToml::parse(&text).ok()?;
     suite
         .default_workspace
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
+}
+
+/// What a workspace named by `--workspace` that the core can't use is told (Appendix E): which
+/// workspace the core serves, `default`, and to run the command without the flag; never to make
+/// it the default.
+pub fn serves_only_default(default: Option<&Path>) -> String {
+    match default {
+        Some(default) => format!(
+            "The core serves only the default workspace, \"{}\": run the command without --workspace, or from inside that workspace.",
+            default.display()
+        ),
+        None => "The core serves only the default workspace, and none is set: run the command without --workspace.".to_string(),
+    }
 }
 
 /// The id of the workspace folder `path`.
@@ -329,6 +354,34 @@ mod tests {
         // A missing folder is an error too, never a fallback to another workspace.
         let missing = plain.path().join("gone");
         assert!(resolve_workspace_id(&env.env, Some(&missing), &ws).is_err());
+    }
+
+    /// An app opens `suite.toml`'s default, never a workspace file above its data folder: one in
+    /// the user folder (or at the drive's root) would otherwise be opened at every start.
+    #[test] // spec: APP-015, ARCH-030
+    fn the_apps_default_ignores_a_workspace_above_the_data_folder() {
+        let env = TestEnv::new();
+        let default = env.make_workspace("default");
+        env.register_workspace(&default, true);
+        let local = mkdir(env.env.local_dir());
+        assert!(local.starts_with(env.root()), "{}", local.display());
+        std::fs::write(env.root().join(WORKSPACE_FILE), "name: above\n").unwrap();
+
+        // The scenario is real: the `cli` chain from the data folder finds the folder above.
+        let from_local = resolve_workspace(&env.env, None, &local).unwrap();
+        assert_eq!(from_local.id, id(env.root()));
+
+        let ws = resolve_default_workspace(&env.env).unwrap();
+        assert_eq!(ws.id, id(&default));
+        assert_eq!(
+            ws.origin.map(|o| (o.source, o.path)),
+            Some((WorkspaceSource::Default, default.clone()))
+        );
+
+        // No default: none, whatever lies above.
+        let bare = TestEnv::new();
+        std::fs::write(bare.root().join(WORKSPACE_FILE), "name: above\n").unwrap();
+        assert_eq!(resolve_default_workspace(&bare.env).unwrap().id, "none");
     }
 
     #[test] // spec: ARCH-030

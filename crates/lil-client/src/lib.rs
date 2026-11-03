@@ -43,7 +43,8 @@ pub use blocking::mark_gui_thread;
 pub use conn::EventStream;
 pub use connect::{Client, DrainOutcome, drain_and_wait};
 pub use workspace::{
-    ResolvedWorkspace, WorkspaceOrigin, WorkspaceSource, resolve_workspace, resolve_workspace_id,
+    ResolvedWorkspace, WorkspaceOrigin, WorkspaceSource, registered_default,
+    resolve_default_workspace, resolve_workspace, resolve_workspace_id, serves_only_default,
 };
 
 /// The start of an `Untrusted` reason for a core of the current user whose executable is in
@@ -295,6 +296,20 @@ impl fmt::Display for ClientError {
                 }
                 Ok(())
             }
+            // Only a same-user core in another folder can be asked to drain. As above, the way
+            // out comes first and the paths last.
+            ClientError::Untrusted { pid, image, reason } if reason.starts_with(WRONG_FOLDER) => {
+                f.write_str(
+                    "The LILITH core pipe is served by a core in another folder, which this \
+                     client doesn't trust. `lil core stop` can ask it to finish; a core from an \
+                     older LILITH build needs that build's own `lil core stop`.",
+                )?;
+                if image.as_os_str().is_empty() {
+                    write!(f, " That core is process {pid}: {reason}.")
+                } else {
+                    write!(f, " That core is {} (pid {pid}): {reason}.", image.display())
+                }
+            }
             ClientError::Untrusted { pid, image, reason } => {
                 if image.as_os_str().is_empty() {
                     write!(f, "The LILITH core pipe is served by process {pid}")?;
@@ -305,12 +320,7 @@ impl fmt::Display for ClientError {
                         image.display()
                     )?;
                 }
-                write!(f, ", which this client does not trust: {reason}.")?;
-                // Only a same-user core in another folder can be asked to drain.
-                if reason.starts_with(WRONG_FOLDER) {
-                    f.write_str(" `lil core stop` can ask it to finish.")?;
-                }
-                Ok(())
+                write!(f, ", which this client does not trust: {reason}.")
             }
             ClientError::Incompatible { core_protocol } if core_protocol.is_empty() => f
                 .write_str(
@@ -391,20 +401,11 @@ impl fmt::Display for ClientError {
             } => {
                 write!(
                     f,
-                    "The workspace \"{}\" ({}) is not registered in suite.toml, so the core cannot use it. ",
+                    "The workspace \"{}\" ({}) is not registered in suite.toml, so the core cannot use it. {}",
                     path.display(),
-                    WorkspaceSource::Flag
-                )?;
-                match default {
-                    Some(default) => write!(
-                        f,
-                        "The core serves only the default workspace, \"{}\": run the command without --workspace, or from inside that workspace.",
-                        default.display()
-                    ),
-                    None => f.write_str(
-                        "The core serves only the default workspace, and none is set: run the command without --workspace.",
-                    ),
-                }
+                    WorkspaceSource::Flag,
+                    serves_only_default(default.as_deref())
+                )
             }
             ClientError::UnknownWorkspace {
                 origin: WorkspaceOrigin { path, source },
@@ -431,6 +432,27 @@ impl fmt::Display for ClientError {
                 "The LILITH core is not connected right now; nothing was sent. Try again once it is.",
             ),
         }
+    }
+}
+
+/// The error result a caller reports for `fault`, a [`ClientError::Protocol`]: never
+/// `core.unreachable`, since the core was reached (or, for a request too long to send, never
+/// needed) and the same request would only be faulted again. A request the core faults as invalid
+/// (-32602), or too long to send (-32002, refused here before anything was sent), is
+/// `params.invalid`; any other fault (an answer too large to send, an unknown method, an answer
+/// this client can't read) is `core.bug`. The fault's own text is kept.
+pub fn protocol_fault_body(fault: &RpcError, trace_id: &str) -> ErrorBody {
+    use lil_protocol::codes::{CORE_BUG, PARAMS_INVALID};
+    use lil_protocol::rpc_code;
+    let said = || ClientError::Protocol(fault.clone()).to_string();
+    match fault.code {
+        rpc_code::LINE_TOO_LONG => ErrorBody::new(
+            &PARAMS_INVALID,
+            format!("Nothing was sent: {}.", fault.message),
+            trace_id,
+        ),
+        rpc_code::INVALID_PARAMS => ErrorBody::new(&PARAMS_INVALID, said(), trace_id),
+        _ => ErrorBody::new(&CORE_BUG, said(), trace_id),
     }
 }
 
@@ -625,6 +647,29 @@ mod tests {
         assert!(shown.contains("Task Manager."), "{shown}");
         assert!(shown.contains(&u32::MAX.to_string()), "{shown}");
         assert!(text.contains("lil-core.exe"), "{text}");
+    }
+
+    /// A core in another folder (an install moved while an old core runs): the way out comes
+    /// first, however long the path and the trusted folders are.
+    #[test] // spec: ARCH-027
+    fn a_core_in_another_folder_says_what_to_do_within_a_banners_300_characters() {
+        let long = "long folder ".repeat(40);
+        let text = ClientError::Untrusted {
+            pid: u32::MAX,
+            image: PathBuf::from(format!(r"C:\{long}\lil-core.exe")),
+            reason: format!(r"{WRONG_FOLDER} (C:\{long}\bin)"),
+        }
+        .to_string();
+        // `lil_parse::shown_text` keeps 299 characters and `…` when it cuts.
+        let shown: String = text.chars().take(299).collect();
+        assert!(
+            shown.contains("`lil core stop` can ask it to finish"),
+            "{shown}"
+        );
+        assert!(shown.contains("older LILITH build"), "{shown}");
+        assert!(text.contains("lil-core.exe"), "{text}");
+        assert!(text.contains(&u32::MAX.to_string()), "{text}");
+        assert!(text.contains(r"\bin)"), "the trusted folders: {text}");
     }
 
     #[test]

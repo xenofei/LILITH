@@ -728,6 +728,67 @@ TestCase {
         compare(panel.list.historyModel.get(0).cid, crane.id)
     }
 
+    // PROTO-2: a history the core can't send (over its line cap, -32603) reaches the panel as the
+    // bridge maps it, core.bug; the History tab says it couldn't read, not an empty list.
+    function test_history_tab_says_when_it_couldnt_read() { // spec: APP-046, ARCH-025
+        failOnWarning(/Binding loop/)
+        const panel = createTemporaryObject(panelComponent, tc)
+        verify(panel, "the panel")
+        const message = "The LILITH core answered with a protocol error (-32603): internal error: the response was too large to send (5242880 bytes; a line holds at most 4194304)"
+        for (const c of fake.calls) {
+            if (c.kind === "appCall" && c.name === "app/confirmations.list" && !c.answered) {
+                c.answered = true
+                fake.respond(c.id, c.args.state === "pending" ? Shapes.listAnswer([])
+                    : {status: "error", error: {code: "core.bug", category: "bug", message: message,
+                                                trace_id: "t_0123456789abcdef", retry: "never"}})
+            }
+        }
+        tryVerify(() => panel.list.error !== null, 2000, "the read failed")
+        panel.historyTab.clicked()
+        compare(panel.tab, "history")
+        verify(panel.history.errorText.indexOf("Couldn't read the past confirmations: ") === 0, panel.history.errorText)
+        verify(panel.history.errorText.indexOf("too large to send") > 0, panel.history.errorText)
+        verify(panel.history.errorItem.visible, "the words are shown")
+        compare(panel.history.errorItem.Accessible.name, panel.history.errorText)
+        // Once a read comes in, the words go.
+        const lists = () => fake.calls.filter(c => c.name === "app/confirmations.list")
+        const before = lists().length
+        tryVerify(() => lists().length > before, 3000, "it asks again")
+        Shapes.answerLists(fake, [], [])
+        tryVerify(() => panel.list.loaded, 3000, "the next read is in")
+        compare(panel.history.errorText, "")
+        verify(!panel.history.errorItem.visible)
+    }
+
+    // N-1: a long message wraps above the rows the tab still holds, never over them.
+    function test_a_long_read_error_sits_above_the_history_rows() { // spec: APP-046
+        failOnWarning(/Binding loop/)
+        const viaApp = Shapes.answeredView(Shapes.view({id: "cf_00000000000000e1", tool: "one.tool"}), "approved", "app")
+        const panel = makePanel([], [viaApp])
+        panel.width = 320
+        panel.historyTab.clicked()
+        tryCompare(panel.history, "count", 1)
+        // A resync reads the lists again, and that read fails: the rows stay, with the words.
+        fake.emit("confirmations", "resync_required", null)
+        const words = "the core couldn't send the list. ".repeat(12)
+        for (const c of fake.calls) {
+            if (c.kind === "appCall" && c.name === "app/confirmations.list" && !c.answered) {
+                c.answered = true
+                fake.respond(c.id, {status: "error", error: {code: "core.bug", category: "bug", message: words,
+                                                             trace_id: "t_0123456789abcdef", retry: "never"}})
+            }
+        }
+        tryVerify(() => panel.history.errorText !== "", 2000, "the read failed")
+        const line = panel.history.errorItem
+        tryVerify(() => line.lineCount > 2, 2000, "the words wrap")
+        verify(line.height >= line.contentHeight, line.height + " < " + line.contentHeight)
+        const header = panel.history.headerItem
+        tryVerify(() => panel.history.itemAtIndex(0), 2000, "the row is there")
+        const row = panel.history.itemAtIndex(0)
+        verify(row.y >= header.y + header.height, "row at " + row.y + ", words end at " + (header.y + header.height))
+        verify(header.height >= line.contentHeight)
+    }
+
     function test_expiry_countdown() { // spec: APP-115
         const soon = Shapes.view({id: "cf_00000000000000d1", expires_at: Shapes.iso(Date.now() + 2500)})
         const panel = makePanel([soon])

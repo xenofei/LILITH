@@ -21,7 +21,8 @@
 //!   calls watch. A `resync_required` on it (a reconnect to another core, an overflow) makes a
 //!   pending call read `app/confirmations.list`, so an answer given while the app was away is
 //!   still found (Review Focus 1). That read-only list is the one `app_call` the bridge makes
-//!   again: after a failure, 1 s later at first, doubling to 30 s, until it is read.
+//!   again: after a failure, 1 s later at first, doubling to 30 s, until it is read. A protocol
+//!   fault (a list too large to send) would only come again, so the call ends with it instead.
 //! - **Events.** Each topic counts its QML subscribers ([`Runtime::subscribe`], [`Topics`]): the
 //!   session subscribes it for the first and unsubscribes it after the last (`confirmations`
 //!   never), so a panel that stops following a topic never stops another's events. A subscribe
@@ -100,6 +101,15 @@ pub enum Delivery {
     Event(EventParams),
 }
 
+/// The shell's words for a hello refused over its workspace (`refused` with a `workspace.*`
+/// code): the top bar's connection label and the banner's lead, which the core's reason follows.
+/// `Core.unavailable` carries them as `label` and `lead`.
+pub const REFUSED_WORKSPACE_LABEL: &str = "Workspace refused";
+pub const REFUSED_WORKSPACE_LEAD: &str = "The core refused this workspace";
+/// The same words for every other cause.
+pub const UNAVAILABLE_LABEL: &str = "Core unavailable";
+pub const UNAVAILABLE_LEAD: &str = "The core isn't available";
+
 /// The `Core` properties a session state sets; `None` leaves one as it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateView {
@@ -110,7 +120,7 @@ pub struct StateView {
     pub core_build_id: Option<String>,
     /// The hello's workspace as JSON (`None` inside: no workspace).
     pub workspace: Option<Option<String>>,
-    /// While unavailable, why as JSON: `{reason, cause, code?, retry?}`.
+    /// While unavailable, why as JSON: `{reason, cause, code?, retry?, label, lead}`.
     pub unavailable: Option<String>,
 }
 
@@ -365,8 +375,9 @@ impl Runtime {
                 core_build_id: None,
                 workspace: Some(None),
                 unavailable: Some(
-                    json!({"reason": "This process has no core session.", "cause": "other"})
-                        .to_string(),
+                    json!({"reason": "This process has no core session.", "cause": "other",
+                           "label": UNAVAILABLE_LABEL, "lead": UNAVAILABLE_LEAD})
+                    .to_string(),
                 ),
             })),
         }
@@ -476,7 +487,7 @@ impl Runtime {
                 Ok(session) => {
                     let env = session.env();
                     let ws = tokio::task::spawn_blocking(move || {
-                        lil_client::resolve_workspace(&env, None, &env.local_dir())
+                        lil_client::resolve_default_workspace(&env)
                             .map_or_else(|_| NO_WORKSPACE.to_string(), |ws| ws.id)
                     })
                     .await
@@ -594,12 +605,19 @@ fn unavailable_json(reason: &str, cause: &UnavailableCause) -> String {
         UnavailableCause::Refused(_) => "refused",
         UnavailableCause::Other => "other",
     });
+    let (mut label, mut lead) = (UNAVAILABLE_LABEL, UNAVAILABLE_LEAD);
     if let UnavailableCause::Refused(error) = cause {
         // The core's own words name the fix.
         out["reason"] = json!(error.message);
         out["code"] = json!(error.code);
         out["retry"] = serde_json::to_value(error.retry).unwrap_or(Value::Null);
+        // As `CoreGate.refusedWorkspace` tells it.
+        if error.code.starts_with("workspace.") {
+            (label, lead) = (REFUSED_WORKSPACE_LABEL, REFUSED_WORKSPACE_LEAD);
+        }
     }
+    out["label"] = json!(label);
+    out["lead"] = json!(lead);
     out.to_string()
 }
 
@@ -878,20 +896,16 @@ async fn wait_for_answer(
         let mut failed = false;
         match ready.as_deref() {
             Some(ws) if ws != workspace => return left_workspace(trace),
-            Some(_) if need_snapshot => match snapshot(session).await {
-                Ok((pending, answered)) => {
-                    need_snapshot = false;
-                    backoff = SNAPSHOT_RETRY_FIRST;
-                    let step = call.on_snapshot(&pending, &answered);
-                    if step != PendingStep::Wait {
-                        return step;
+            Some(_) if need_snapshot => {
+                match after_snapshot(&mut call, snapshot(session).await, trace) {
+                    AfterSnapshot::End(step) => return step,
+                    AfterSnapshot::Read => {
+                        need_snapshot = false;
+                        backoff = SNAPSHOT_RETRY_FIRST;
                     }
+                    AfterSnapshot::ReadAgain => failed = true,
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, confirmation = call.confirmation_id(), "the confirmations snapshot failed; it is read again");
-                    failed = true;
-                }
-            },
+            }
             _ => {}
         }
         let wait = backoff;
@@ -927,8 +941,63 @@ async fn wait_for_answer(
     }
 }
 
+/// What a snapshot read of the confirmations means for a pending call.
+#[derive(Debug, PartialEq)]
+enum AfterSnapshot {
+    /// The wait is over: an answer was found, or the list can't be read ([`snapshot_failed`]).
+    End(PendingStep),
+    /// Read, and nothing new: wait on.
+    Read,
+    /// The read failed: read it again after the backoff.
+    ReadAgain,
+}
+
+/// `call`'s step after the snapshot read `got` ([`wait_for_answer`]).
+fn after_snapshot(
+    call: &mut PendingCall,
+    got: Result<Snapshot, ClientError>,
+    trace: &str,
+) -> AfterSnapshot {
+    match got {
+        Ok((pending, answered)) => match call.on_snapshot(&pending, &answered) {
+            PendingStep::Wait => AfterSnapshot::Read,
+            step => AfterSnapshot::End(step),
+        },
+        Err(e) => {
+            if let Some(step) = snapshot_failed(&e, trace) {
+                tracing::warn!(error = %e, confirmation = call.confirmation_id(), "the confirmations can't be read; the call stops waiting");
+                return AfterSnapshot::End(step);
+            }
+            tracing::debug!(error = %e, confirmation = call.confirmation_id(), "the confirmations snapshot failed; it is read again");
+            AfterSnapshot::ReadAgain
+        }
+    }
+}
+
+/// What a pending call does when its snapshot of the confirmations failed with `e`. A protocol
+/// fault (above all a list too large to send, which the core answers -32603, ARCH-025) would
+/// fail the same way at every read, so the call ends with it; anything else (a lost connection,
+/// a busy state database) is `None`: read it again later.
+fn snapshot_failed(e: &ClientError, trace: &str) -> Option<PendingStep> {
+    let ClientError::Protocol(_) = e else {
+        return None;
+    };
+    let mut error = client_error(e, trace);
+    error.message = format!(
+        "The call stopped waiting for its confirmation: the confirmations couldn't be read. {}",
+        error.message
+    );
+    let outcome: Outcome<Value> = Outcome::Error { error };
+    Some(PendingStep::Settle(
+        serde_json::to_value(outcome).expect("an outcome serialises"),
+    ))
+}
+
 /// The ids of the pending confirmations, and the answered ones with their state.
-async fn snapshot(session: &Session) -> Result<(Vec<String>, Vec<(String, String)>), ClientError> {
+type Snapshot = (Vec<String>, Vec<(String, String)>);
+
+/// [`Snapshot`], read from the core.
+async fn snapshot(session: &Session) -> Result<Snapshot, ClientError> {
     let list = async |which: &str| -> Result<Vec<Value>, ClientError> {
         let params = json!({"state": which, "limit": 500});
         match session.app_call("app/confirmations.list", params).await? {
@@ -1050,7 +1119,8 @@ mod tests {
     }
 
     /// A refused hello reaches the banner in the core's words, with what it takes to get out;
-    /// any other cause keeps the client's reason.
+    /// any other cause keeps the client's reason. Each carries the shell's words for it: a hello
+    /// refused over its workspace is "Workspace refused", anything else "Core unavailable".
     #[test] // spec: ARCH-100
     fn an_unavailable_state_carries_its_cause() {
         let refused = ErrorBody::new(
@@ -1071,6 +1141,8 @@ mod tests {
             shown["reason"],
             "This core serves only the default workspace, \"B\"."
         );
+        assert_eq!(shown["label"], "Workspace refused");
+        assert_eq!(shown["lead"], "The core refused this workspace");
 
         let view = StateView::of(&SessionState::Unavailable {
             reason: "Cannot start the core.".into(),
@@ -1080,6 +1152,20 @@ mod tests {
         assert_eq!(shown["cause"], "cannot_start");
         assert_eq!(shown["reason"], "Cannot start the core.");
         assert_eq!(shown.get("code"), None);
+        assert_eq!(shown["label"], "Core unavailable");
+        assert_eq!(shown["lead"], "The core isn't available");
+
+        let other = ErrorBody::new(
+            &lil_protocol::codes::CALLER_NOT_ALLOWED,
+            "Not for this caller.",
+            "t_2",
+        );
+        let view = StateView::of(&SessionState::Unavailable {
+            reason: "The core refused the hello.".into(),
+            cause: UnavailableCause::Refused(Box::new(other)),
+        });
+        let shown: Value = serde_json::from_str(view.unavailable.as_deref().unwrap()).unwrap();
+        assert_eq!(shown["label"], "Core unavailable");
 
         assert_eq!(StateView::of(&SessionState::Connecting).unavailable, None);
     }
@@ -1175,6 +1261,61 @@ mod tests {
         gui.push(event("test:a", 2, 1));
         let st = lock(&gui.state);
         assert!(st.gone && st.waiting.is_empty());
+    }
+
+    /// PROTO-2: a confirmations list the core can't send (over the line cap, -32603) would fail
+    /// the same way at every read, so a pending call whose snapshot gets it ends with the error
+    /// instead of reading again forever. A lost connection is still read again.
+    #[test] // spec: APP-029, ARCH-025
+    fn a_snapshot_the_core_cant_send_ends_the_pending_call() {
+        let over = ClientError::Protocol(lil_protocol::RpcError::new(
+            lil_protocol::rpc_code::INTERNAL_ERROR,
+            "internal error: the response was too large to send",
+        ));
+        let Some(PendingStep::Settle(outcome)) = snapshot_failed(&over, "tr_1") else {
+            panic!("an over-cap list is read again forever");
+        };
+        assert_eq!(outcome["status"], "error", "{outcome}");
+        assert_eq!(
+            outcome["error"]["code"],
+            lil_protocol::codes::CORE_BUG.code,
+            "{outcome}"
+        );
+        assert_eq!(outcome["error"]["trace_id"], "tr_1", "{outcome}");
+        let message = outcome["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("couldn't be read"), "{message}");
+        assert!(message.contains("too large"), "{message}");
+        assert_eq!(snapshot_failed(&ClientError::Closed, "tr_1"), None);
+        assert_eq!(snapshot_failed(&ClientError::NotConnected, "tr_1"), None);
+
+        // The step `wait_for_answer` takes with each read (N-2): the over-cap list ends the wait.
+        let mut call = PendingCall::new("cf_1".into(), "ik_1".into());
+        match after_snapshot(&mut call, Err(over), "tr_1") {
+            AfterSnapshot::End(PendingStep::Settle(outcome)) => {
+                assert_eq!(outcome["error"]["code"], "core.bug", "{outcome}");
+            }
+            other => panic!("an over-cap list doesn't end the wait: {other:?}"),
+        }
+        let mut call = PendingCall::new("cf_1".into(), "ik_1".into());
+        assert_eq!(
+            after_snapshot(&mut call, Err(ClientError::Closed), "tr_1"),
+            AfterSnapshot::ReadAgain
+        );
+        let still = Ok((vec!["cf_1".to_string()], Vec::new()));
+        assert_eq!(
+            after_snapshot(&mut call, still, "tr_1"),
+            AfterSnapshot::Read
+        );
+        let approved = Ok((
+            Vec::new(),
+            vec![("cf_1".to_string(), "approved".to_string())],
+        ));
+        assert_eq!(
+            after_snapshot(&mut call, approved, "tr_1"),
+            AfterSnapshot::End(PendingStep::Resend {
+                retry_token: "ik_1".into()
+            })
+        );
     }
 
     #[test] // spec: APP-028
