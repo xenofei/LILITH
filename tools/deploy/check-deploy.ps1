@@ -15,12 +15,17 @@
      unset) plus a hostile one: a value for every prefix lil-image clears (Checkpoint A I-3), as
      QT_QPA_PLATFORM=offscreen, QT_PLUGIN_PATH, QT_OPENGL=software, QT_OPENGL_DLL,
      QML_IMPORT_PATH, QML2_IMPORT_PATH, QSG_RHI_BACKEND=opengl, QV4_*, QTWEBENGINEPROCESS_PATH,
-     QTWEBENGINE_DISABLE_SANDBOX and the Vulkan loader's layer and driver variables, pointing at a
-     folder that doesn't exist. A probe DLL, lil-search-probe.dll, sits in a folder first on PATH
-     and in the run's current folder. Missing-DLL and crash dialogs are turned off for it.
+     QTWEBENGINE_DISABLE_SANDBOX, the Vulkan loader's layer and driver variables (pointing at a
+     folder that doesn't exist) and TZ ('XYZ-9'). A probe DLL, lil-search-probe.dll, sits in a
+     folder first on PATH and in the run's current folder. Missing-DLL and crash dialogs are
+     turned off for it.
      - First a refused launch, `lil-image.exe -platformpluginpath <that folder>`: it must exit 2
        before Qt starts (no `start` line), so it should open nothing.
      - Then `lil-image.exe --smoke-exit --no-activate`.
+     Both launches run on a test channel of their own (LIL_CHANNEL=test-deploycheck) under a new
+     temporary root (LIL_TEST_ROOT), so their logs and Qt's cache folder
+     (%LOCALAPPDATA%\LILITH-test-deploycheck) are the test's, never the dev channel's; the root
+     and that one cache folder are removed after.
   3. Passes when the smoke run exits 0 within -TimeoutSec; its log (JSON lines on stderr) has a
      `start` with platform `windows`, no variable left to clear and the probe DLL not found (the
      DLL search lockdown), import paths without the hostile folder, a `first_frame` whose
@@ -111,7 +116,13 @@ $hostileEnv = [ordered]@{
     VK_ICD_FILENAMES = (Join-Path $hostile 'icd.json')
     VK_DRIVER_FILES = (Join-Path $hostile 'icd.json')
     VK_LOADER_DEBUG = 'all'
+    TZ = 'XYZ-9'
 }
+
+# The test channel (as bench-cold-start.ps1's): its own root, created once the pop-up is up and
+# removed at the end with Qt's cache folder of that channel only.
+$channel = 'test-deploycheck'
+$testRoot = Join-Path ([IO.Path]::GetTempPath()) ("lil-deploycheck-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 
 # The DLL-search probe (main.cpp step 0): lil-search-probe.dll, a copy of a deployed DLL, in a
 # folder first on PATH and in the run's current folder. lil-image looks for it by bare name and
@@ -131,6 +142,8 @@ function New-StartInfo([string[]]$appArgs) {
     $psi.Environment['PATH'] = $probeOnPath + ';' + $cleanPath
     foreach ($k in $unset) { [void]$psi.Environment.Remove($k) }
     foreach ($k in $hostileEnv.Keys) { $psi.Environment[$k] = $hostileEnv[$k] }
+    $psi.Environment['LIL_CHANNEL'] = $channel
+    $psi.Environment['LIL_TEST_ROOT'] = $testRoot
     $psi
 }
 
@@ -156,6 +169,20 @@ if (-not $NoHandsOff -and $env:GITHUB_ACTIONS -ne 'true') {
     }
     Start-Sleep -Seconds 10
 }
+
+# This channel's Qt cache folder (the organisation name is the channel's), in the real local app
+# data folder: exactly this one is removed, before the starts (an earlier run's) and after them.
+$cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+function Remove-TestChannel {
+    foreach ($d in $testRoot, $cache) {
+        for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $d); ++$i) {
+            try { Remove-Item -Recurse -Force -LiteralPath $d } catch { Start-Sleep -Milliseconds 500 }
+        }
+    }
+}
+Remove-TestChannel
+if (Test-Path -LiteralPath $cache) { $failures.Add("$cache, an earlier run's Qt cache, can't be removed") }
+foreach ($s in 'roaming', 'local', 'profile') { New-Item -ItemType Directory -Force (Join-Path $testRoot $s) | Out-Null }
 
 # The refused launch, inside the hands-off window: exit 2 before Qt starts, so no window and
 # no `start` line.
@@ -220,6 +247,8 @@ elseif ($coreObject.loaded -ne $true) { $failures.Add('the Lilith.Core module di
 if ($foreground -gt 0) { $failures.Add("lil-image.exe took the foreground with --no-activate ($foreground samples)") }
 
 Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+Remove-TestChannel
+foreach ($d in $testRoot, $cache) { if (Test-Path -LiteralPath $d) { $failures.Add("cleanup: $d is still there") } }
 if ($failures.Count) {
     Write-Host 'deploy_runs_off_path: FAIL'
     $failures | ForEach-Object { Write-Host "  $_" }
