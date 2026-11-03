@@ -470,3 +470,38 @@ fn a_registered_workspace_the_core_doesnt_serve_is_handled_by_where_it_came_from
         );
     }
 }
+
+/// M-5: whatever stops the `cli` chain from naming a workspace the core can use (here a default
+/// whose folder is gone), `lil status` with a core running warns once and shows the status
+/// without a workspace, exit 0, so a skill's `lil status --no-start` still tells a running core;
+/// with no core, `--no-start` gives 3.
+#[test] // spec: ARCH-102, AI-109, ARCH-016
+fn status_with_an_unusable_default_still_tells_a_running_core() {
+    let env = TestEnv::new();
+    let gone = env.make_workspace("gone");
+    env.register_workspace(&gone, true);
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    let none = env.lil(&["--no-start", "status"]);
+    assert_eq!(none.code, 3, "{none:?}");
+
+    let _core = CoreFixture::start(&env);
+    for args in [&["--no-start", "status"][..], &["status"]] {
+        let status = env.lil(args);
+        assert_eq!(status.code, 0, "{args:?}: {status:?}");
+        assert!(status.stdout.contains("\nworkspace: none\n"), "{status:?}");
+        assert_eq!(status.stderr.lines().count(), 1, "{status:?}");
+        assert!(status.stderr.starts_with("warning: "), "{status:?}");
+        assert!(status.stderr.contains("suite.toml"), "{status:?}");
+        assert!(
+            status
+                .stderr
+                .trim_end()
+                .ends_with("Showing the status without a workspace."),
+            "{status:?}"
+        );
+    }
+    // `call` still can't run without the workspace it would name.
+    let call = env.lil(&["call", "test.echo", "{\"text\":\"x\"}"]);
+    assert_eq!(call.code, 2, "{call:?}");
+}

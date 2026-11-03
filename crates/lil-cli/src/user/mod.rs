@@ -11,8 +11,9 @@
 //! A workspace found from the current folder that the core can't use (not registered in
 //! `suite.toml`, or registered but not the default) stops `call` and `events` with a plain
 //! message naming the folder; `status` warns once on stderr and shows the status without a
-//! workspace ([`connect`]). One named by `--workspace` is told which workspace the core serves,
-//! never to become the default (Appendix G).
+//! workspace ([`connect`]), as it does for any workspace the chain can't name while a core runs.
+//! One named by `--workspace` is told which workspace the core serves, never to become the
+//! default (Appendix E).
 //!
 //! A [`ClientError`] (about 250 bytes) never crosses a function boundary here: each command
 //! maps it where it occurs to its plain message on stderr and exit code 2 ([`cannot_run`]).
@@ -274,6 +275,11 @@ pub(crate) enum UnknownCwdWorkspace {
 /// ([`ClientError::UnknownWorkspace`]); a registered one it doesn't serve
 /// (`workspace.unsupported`) the same way. One found from the current folder is handled as
 /// `unknown_cwd` says.
+///
+/// Under [`UnknownCwdWorkspace::WarnAndUseNone`] (`status`), any workspace the chain can't name
+/// or the core can't use, except one named by `--workspace`, is one warning line while a core
+/// runs, and the status without a workspace: so `lil status --no-start` exits only 0 (a core
+/// runs) or 3 (none does), which is what a skill reads (ARCH-102).
 pub(crate) fn connect(
     global: &GlobalArgs,
     unknown_cwd: UnknownCwdWorkspace,
@@ -281,13 +287,27 @@ pub(crate) fn connect(
     let mut cfg = config(global, StartPolicy::StartIfNeeded)?;
     let cwd = std::env::current_dir()
         .map_err(|e| cannot_run(format!("Cannot read the current folder: {e}")))?;
+    let warn = unknown_cwd == UnknownCwdWorkspace::WarnAndUseNone;
     match resolve_workspace(&cfg.env, global.workspace.as_deref(), &cwd) {
         Ok(ws) => cfg.set_workspace(ws),
         Err(e) => {
-            if cfg.start == StartPolicy::NoStart {
-                cfg.set_workspace(no_workspace());
-                match BlockingClient::connect(&cfg) {
-                    Err(ClientError::NotRunning) => return Ok(None),
+            // A folder named by --workspace that isn't a workspace is the person's own mistake.
+            let warn = warn && global.workspace.is_none();
+            if cfg.start == StartPolicy::NoStart || warn {
+                // Is a core running? Asked without a workspace, and never starting one.
+                let mut probe = cfg.clone();
+                probe.set_workspace(no_workspace());
+                probe.start = StartPolicy::NoStart;
+                match BlockingClient::connect(&probe) {
+                    Err(ClientError::NotRunning) if cfg.start == StartPolicy::NoStart => {
+                        return Ok(None);
+                    }
+                    // No core, and one may be started: the workspace message stands.
+                    Err(ClientError::NotRunning) => {}
+                    Ok(client) if warn => {
+                        warn_without_workspace(&e.to_string());
+                        return Ok(Some(client));
+                    }
                     // A core runs: the workspace message stands.
                     Ok(_) => {}
                     Err(probe) => return Err(cannot_run(probe)),
@@ -297,7 +317,7 @@ pub(crate) fn connect(
         }
     }
     let warn_and_use_none = |cfg: &mut ClientConfig, why: &str| {
-        eprintln!("warning: {why}; showing the status without a workspace.");
+        warn_without_workspace(why);
         cfg.set_workspace(no_workspace());
         match BlockingClient::connect(cfg) {
             Ok(client) => Ok(Some(client)),
@@ -305,7 +325,6 @@ pub(crate) fn connect(
             Err(e) => Err(cannot_run(e)),
         }
     };
-    let warn = unknown_cwd == UnknownCwdWorkspace::WarnAndUseNone;
     match BlockingClient::connect(&cfg) {
         Ok(client) => Ok(Some(client)),
         Err(ClientError::NotRunning) => Ok(None),
@@ -319,10 +338,20 @@ pub(crate) fn connect(
         }) if warn => warn_and_use_none(
             &mut cfg,
             &format!(
-                "the workspace {} (found from the current folder) is not registered in suite.toml",
+                "The workspace {} (found from the current folder) is not registered in suite.toml.",
                 path.display()
             ),
         ),
+        Err(
+            e @ ClientError::UnknownWorkspace {
+                origin:
+                    WorkspaceOrigin {
+                        source: WorkspaceSource::Default,
+                        ..
+                    },
+                ..
+            },
+        ) if warn => warn_and_use_none(&mut cfg, &e.to_string()),
         // Registered, but not the workspace the core serves.
         Err(ClientError::Refused(error)) if error.code == WORKSPACE_UNSUPPORTED.code => {
             match cfg.workspace_origin.clone() {
@@ -332,7 +361,7 @@ pub(crate) fn connect(
                 }) if warn => warn_and_use_none(
                     &mut cfg,
                     &format!(
-                        "the workspace {} (found from the current folder) is not the one the core serves",
+                        "The workspace {} (found from the current folder) is not the one the core serves.",
                         path.display()
                     ),
                 ),
@@ -345,11 +374,23 @@ pub(crate) fn connect(
                     WorkspaceSource::Flag,
                     serves_only_default(registered_default(&cfg.env).as_deref())
                 ))),
+                _ if warn => warn_and_use_none(&mut cfg, &error.message),
                 _ => Err(cannot_run(ClientError::Refused(error))),
             }
         }
         Err(e) => Err(cannot_run(e)),
     }
+}
+
+/// `status`'s one warning line when it shows the status without a workspace: `why`, a sentence.
+fn warn_without_workspace(why: &str) {
+    let why = why.trim_end();
+    let stop = if why.ends_with(['.', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
+    eprintln!("warning: {why}{stop} Showing the status without a workspace.");
 }
 
 /// `"none"`: no workspace.
