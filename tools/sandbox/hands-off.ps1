@@ -19,7 +19,8 @@ topmost with SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE
 SWP_SHOWWINDOW), not with the form's TopMost property, whose show path focuses the form), and it
 is click-through (WS_EX_LAYERED | WS_EX_TRANSPARENT). It closes when -ParentPid has gone, and at
 the latest -CapSec seconds after the countdown's start (the runner's worst case), removing its state files whichever way it
-closes. It changes nothing else.
+closes. At the cap it first shows, on green for 5 s as Done does, "Time limit reached: the check stopped sending input.
+You can use the PC again." (the checks stop sending input 30 s before it). It changes nothing else.
 #>
 param(
     [string]$What = 'runs the desktop tests',
@@ -75,6 +76,7 @@ if ($ParentPid -gt 0) {
 }
 $script:shownAt = $null
 $script:doneAt = $null
+$script:capAt = $null
 $script:cue = ''
 
 $form = New-Object LilHandsOff
@@ -114,7 +116,7 @@ $timer.Add_Tick({
     if ($null -eq $script:shownAt) { return }
     $startAt = $script:shownAt + $WarnSec * 1000
     $capMs = $startAt + [math]::Max($CapSec, $RunSec) * 1000
-    if (($null -ne $parent -and $parent.HasExited) -or $nowMs -gt $capMs) {
+    if ($null -ne $parent -and $parent.HasExited) {
         Remove-StateFiles
         $form.Close(); return
     }
@@ -123,6 +125,17 @@ $timer.Add_Tick({
         $form.BackColor = $green
         $label.Text = 'Done: you can use the PC again.'
         if ($nowMs - $script:doneAt -gt 5000) { Remove-StateFiles; $form.Close() }
+        return
+    }
+    # At the cap the checks have stopped sending input (they stop 30 s before it). Say so, as Done does:
+    # closing in silence could read as free while a script is still running.
+    if ($nowMs -gt $capMs) {
+        if ($null -eq $script:capAt) { $script:capAt = $nowMs }
+        $form.BackColor = $green
+        $form.Height = 130
+        $label.Font = $plainFont
+        $label.Text = "Time limit reached: the check stopped sending input.`nYou can use the PC again."
+        if ($nowMs - $script:capAt -gt 5000) { Remove-StateFiles; $form.Close() }
         return
     }
     if ($CueFile) {
