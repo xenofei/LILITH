@@ -834,6 +834,22 @@ fn a_refused_diagnostics_read_leaves_the_ring_unchanged() {
     assert_eq!(errors[0]["count"], 1, "{recent}");
 }
 
+/// A `diagnostics.recent` that failed after it was let in (here an arguments error) is a recent
+/// error like any tool's: only a refusal before it ran is left out (the test above).
+#[test] // spec: ARCH-121, QA-083
+fn a_failed_diagnostics_read_that_ran_is_a_recent_error() {
+    let env = TestEnv::new();
+    let _core = CoreFixture::start(&env);
+    let mut pipe = session(&env, None);
+    let refused = pipe.tool("diagnostics.recent", json!({"limit": 0}), None);
+    assert_eq!(refused["error"]["code"], "params.invalid", "{refused}");
+    let recent = pipe.tool_ok("diagnostics.recent", json!({}), None);
+    let errors = recent["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{recent}");
+    assert_eq!(errors[0]["code"], "params.invalid", "{recent}");
+    assert_eq!(errors[0]["last_tool"], "diagnostics.recent", "{recent}");
+}
+
 #[test] // spec: ARCH-122, QA-085
 fn nothing_is_sent_anywhere() {
     let env = TestEnv::new();

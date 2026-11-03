@@ -381,17 +381,21 @@ impl Inner {
         }
     }
 
-    /// Tells the error sink of `error`, an error outcome of `tool`. A failed `diagnostics.*`
-    /// read isn't recorded: the Diagnostics panel reads again on each `diagnostics` event, so
-    /// recording its own refusal (`workspace.unsupported` for a session whose workspace is no
-    /// longer the default) would feed itself and push every real error out of the ring.
+    /// Tells the error sink of `error`, an error outcome of `tool`. A `diagnostics.*` read that
+    /// was refused before it ran (a `workspace.*` code, or `core.draining`) isn't recorded: the
+    /// Diagnostics panel reads again on each `diagnostics` event, so recording its own refusal
+    /// (`workspace.unsupported` for a session whose workspace is no longer the default) would feed
+    /// itself and push every real error out of the ring. Any other outcome of it is recorded: a
+    /// failure of the handler or an arguments error is evidence like any tool's.
     fn record(&self, tool: &str, error: &ErrorBody) {
         let is_read = || {
             self.reg
                 .get(tool)
                 .is_some_and(|t| t.descriptor().effect == EffectClass::Read)
         };
-        if tool.starts_with("diagnostics.") && is_read() {
+        let refused_before_running =
+            error.code.starts_with("workspace.") || error.code == codes::CORE_DRAINING.code;
+        if refused_before_running && tool.starts_with("diagnostics.") && is_read() {
             return;
         }
         if let Some(sink) = self.errors.get() {
