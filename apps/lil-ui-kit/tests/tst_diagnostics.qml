@@ -526,8 +526,29 @@ TestCase {
         tryVerify(() => calls() === base + 4, 2600, "the window stops growing at its cap")
 
         // The cause has cleared: the read works, with no reconnect or re-show.
+        verify(shows(panel.errors, "The workspace state can't be opened."), "the warning was shown: " + texts(panel.errors).join(" | "))
         answer(core, recent, ok({errors: []}))
         verify(!shows(panel.errors, "The workspace state can't be opened."), texts(panel.errors).join(" | "))
+    }
+
+    // A refused read is not recorded, so no topic event follows it: the window's end reads again by
+    // itself (while the panel is shown), and the card shows the answer once the cause has cleared.
+    function test_a_failed_errors_read_is_retried_when_its_window_ends_with_no_event() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        const message = "This core serves only the default workspace."
+        load(core, {"diagnostics.recent": failed({code: "workspace.unsupported", message: message})})
+        tryVerify(() => shows(panel.errors, message), 5000, texts(panel.errors).join(" | "))
+        const reads = callsOf(core, "diagnostics.recent").length
+        // No event at all: the 1 s window's end is the retry.
+        tryVerify(() => callsOf(core, "diagnostics.recent").length === reads + 1, 3000, "no retry")
+        // The default is back: the retry works, and the card shows it.
+        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
+        tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
+        verify(!shows(panel.errors, message))
+        // A success ends the retries.
+        wait(1500)
+        compare(callsOf(core, "diagnostics.recent").length, reads + 1, "no retry after a success")
     }
 
     // Hiding the panel forgets how long its card has been failing: after a show, the first failure's

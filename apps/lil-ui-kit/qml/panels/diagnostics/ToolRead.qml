@@ -7,15 +7,16 @@
 //   apply as full state or to `request()` a read.
 // - `request()` is at most one read a second: the first of a burst at once, the rest as one read
 //   when the second has passed. Reads don't overlap.
-// - After a failed read (`error` set), a `request()` made from this ToolRead's own `topicEvent` doesn't
-//   read at once: a failed read can itself be what the topic's next event reports, so reading for each
-//   event would loop. Such requests wait for the backoff window that began at the failure
-//   (`backoffStartMs`, doubling with each consecutive failure up to `backoffMaxMs`) and are coalesced
-//   into one read when it ends; a successful read resets the delay. A read that fails never schedules
-//   its own re-read: a request that came while it was open waits for the window too. An event during a
-//   read that succeeds still gets its one follow-up read. Not gated: a card's request on another
-//   ToolRead (from this one's `topicEvent`), a reload, the session coming ready and the panel shown
-//   again.
+// - After a failed read (`error` set), a backoff window begins (`backoffStartMs`, doubling with each
+//   consecutive failure up to `backoffMaxMs`). The window's end reads again, while `active`, whether or
+//   not an event came: it is the retry schedule, since a refused read may be recorded nowhere and so
+//   be followed by no event. A pending request of any origin (an event's, or one that came while the
+//   failing read was open) waits for that window and is coalesced into that one read; a failed read
+//   never schedules its own re-read, so a failure that repeats reads once per window, not for each event
+//   (an event can itself be what a failed read reports). A successful read stops the retries and resets
+//   the window; hiding stops them too. An event during a read that succeeds still gets its one
+//   follow-up read. Not held to the window: a reload, the session coming ready and the panel shown
+//   again, which read at once, and a request made when no window is running.
 // - An answer can be older than an event: a card that applies an event as full state calls
 //   `eventApplied()`. `answered(structured, current)` then has `current` false for a read that was
 //   open at that moment, the card keeps the event's state, and a fresh read follows.
@@ -56,7 +57,6 @@ QtObject {
     property int _eventsAtStart: 0
     property var _subscription: null
     property bool _inEvent: false
-    property bool _eventDue: false
     property int _failDelayMs: 0
 
     function eventApplied() {
@@ -77,7 +77,6 @@ QtObject {
                 root.result = r.structured || null
                 root.error = null
                 root._failDelayMs = 0
-                root._eventDue = false
                 root._backoff.stop()
                 // Before `loaded`, so what follows `loaded` sees the card's new state.
                 root.answered(root.result, current)
@@ -93,10 +92,7 @@ QtObject {
                 root._backoff.interval = root._failDelayMs
                 root._backoff.restart()
                 // A request that came while this read was open waits for the window, never read now.
-                if (root._due) {
-                    root._due = false
-                    root._eventDue = true
-                }
+                root._due = false
                 root._settled()
             }
         })
@@ -113,10 +109,8 @@ QtObject {
     function request() {
         if (!active)
             return
-        if (_inEvent && error && !_reading && _backoff.running) {
-            _eventDue = true
+        if (_inEvent && error && !_reading && _backoff.running)
             return
-        }
         if (_gate.running) {
             _due = true
             return
@@ -156,7 +150,6 @@ QtObject {
         }
         _gate.stop()
         _backoff.stop()
-        _eventDue = false
         _failDelayMs = 0
         _due = false
         _showDue = false
@@ -183,12 +176,8 @@ QtObject {
     }
 
     property Timer _backoff: Timer {
-        onTriggered: {
-            if (!root._eventDue)
-                return
-            root._eventDue = false
-            root.request()
-        }
+        // The retry, with or without an event (`request()` reads nothing while not `active`).
+        onTriggered: root.request()
     }
 
     property Timer _showGate: Timer {
