@@ -955,7 +955,7 @@ enum AfterSnapshot {
 /// `call`'s step after the snapshot read `got` ([`wait_for_answer`]).
 fn after_snapshot(
     call: &mut PendingCall,
-    got: Result<(Vec<String>, Vec<(String, String)>), ClientError>,
+    got: Result<Snapshot, ClientError>,
     trace: &str,
 ) -> AfterSnapshot {
     match got {
@@ -994,7 +994,10 @@ fn snapshot_failed(e: &ClientError, trace: &str) -> Option<PendingStep> {
 }
 
 /// The ids of the pending confirmations, and the answered ones with their state.
-async fn snapshot(session: &Session) -> Result<(Vec<String>, Vec<(String, String)>), ClientError> {
+type Snapshot = (Vec<String>, Vec<(String, String)>);
+
+/// [`Snapshot`], read from the core.
+async fn snapshot(session: &Session) -> Result<Snapshot, ClientError> {
     let list = async |which: &str| -> Result<Vec<Value>, ClientError> {
         let params = json!({"state": which, "limit": 500});
         match session.app_call("app/confirmations.list", params).await? {
