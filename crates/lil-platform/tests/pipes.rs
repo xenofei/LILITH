@@ -37,7 +37,7 @@ fn unique_pipe() -> String {
 fn pipe_sddl_format() {
     assert_eq!(
         pipe_sddl("S-1-5-21-1-2-3-1001"),
-        "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)"
+        "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)S:(ML;;NWNRNX;;;ME)"
     );
 }
 

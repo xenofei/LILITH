@@ -26,6 +26,7 @@ const PROBE_OUT: &str = "LIL_CLIENT_PROBE_OUT";
 const PROBE_PIPE: &str = "LIL_CLIENT_PROBE_PIPE";
 const PROBE_HOLDER: &str = "LIL_CLIENT_PROBE_HOLDER";
 const PROBE_HANDED: &str = "LIL_CLIENT_PROBE_HANDED";
+const PROBE_MASK: &str = "LIL_CLIENT_PROBE_MASK";
 /// A failure deadline for each wait, never a measurement.
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -49,6 +50,7 @@ fn probe() {
     match std::env::var(PROBE_ROLE).as_deref() {
         Ok("creator") => pipe_creator(),
         Ok("holder") => pipe_holder(),
+        Ok("opener") => pipe_opener(),
         _ => {}
     }
 }
@@ -218,6 +220,37 @@ fn pipe_holder() -> ! {
     }
 }
 
+/// `opener`: opens the pipe by its name with the one access mask `PROBE_MASK` (hex) asks for,
+/// writes `open ok` or `open <code>`, and stays on, holding what it opened.
+fn pipe_opener() -> ! {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::core::HSTRING;
+    let name = std::env::var(PROBE_PIPE).expect("the pipe's name");
+    let mask = u32::from_str_radix(&std::env::var(PROBE_MASK).expect("the mask"), 16).unwrap();
+    // SAFETY: the name outlives the call; the handle, if any, is kept until the process ends.
+    let opened = unsafe {
+        CreateFileW(
+            &HSTRING::from(name),
+            mask,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+    };
+    write_out(&format!(
+        "open {}",
+        opened.map_or_else(|e| (e.code().0 & 0xFFFF).to_string(), |_| "ok".to_string())
+    ));
+    loop {
+        // A test's end kills it.
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The test's side.
 // ---------------------------------------------------------------------------------------------
@@ -314,6 +347,22 @@ struct LowHolder {
 
 impl LowHolder {
     fn start(out: PathBuf, pipe: &str, handed: &Path) -> LowHolder {
+        LowHolder::start_role(
+            "holder",
+            out,
+            &[
+                (PROBE_PIPE, pipe.into()),
+                (PROBE_HANDED, handed.as_os_str().to_owned()),
+            ],
+        )
+    }
+
+    /// The probe `role` at Low integrity, with `extra` in its environment.
+    fn start_role(
+        role: &str,
+        out: PathBuf,
+        extra: &[(&str, std::ffi::OsString)],
+    ) -> LowHolder {
         use std::os::windows::ffi::OsStrExt as _;
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -329,10 +378,9 @@ impl LowHolder {
         use windows::core::{HSTRING, PWSTR};
         let exe = std::env::current_exe().unwrap();
         let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-        vars.push((PROBE_ROLE.into(), "holder".into()));
+        vars.push((PROBE_ROLE.into(), role.into()));
         vars.push((PROBE_OUT.into(), out.clone().into_os_string()));
-        vars.push((PROBE_PIPE.into(), pipe.into()));
-        vars.push((PROBE_HANDED.into(), handed.as_os_str().to_owned()));
+        vars.extend(extra.iter().map(|(k, v)| ((*k).into(), v.clone())));
         let mut block: Vec<u16> = Vec::new();
         for (k, v) in &vars {
             block.extend(k.encode_wide());
@@ -566,4 +614,67 @@ fn a_holder_at_the_clients_own_level_passes_the_proof_outside_the_threat_model()
         ["core/prove", "core/hello", "core/prove", "core/hello"],
         "{lines:?}"
     );
+}
+
+/// The access masks a Low process might open a pipe with, each on its own. A mask the DACL lets
+/// through (`GA` for this user) and the label's no-write-up alone don't stop: only a label that
+/// also has no-read-up and no-execute-up does (CP-03, NF-04).
+const LOW_MASKS: [(&str, u32); 5] = [
+    ("GENERIC_READ", 0x8000_0000),
+    ("FILE_EXECUTE", 0x20),
+    ("SYNCHRONIZE", 0x0010_0000),
+    ("FILE_READ_ATTRIBUTES", 0x80),
+    ("0", 0),
+];
+
+/// What a Low process gets opening `pipe` with each of [`LOW_MASKS`] on its own: `ok` or the
+/// Windows error code, in order. `more` is called before each, to make a free instance.
+fn low_opens(pipe: &str, mut more: impl FnMut()) -> Vec<(&'static str, String)> {
+    let low_dir = tempfile::tempdir().unwrap();
+    label_low(low_dir.path());
+    LOW_MASKS
+        .iter()
+        .map(|&(name, mask)| {
+            more();
+            let out = low_dir.path().join(format!("open-{mask:x}.txt"));
+            let opener = LowHolder::start_role(
+                "opener",
+                out,
+                &[
+                    (PROBE_PIPE, pipe.into()),
+                    (PROBE_MASK, format!("{mask:x}").into()),
+                ],
+            );
+            wait_line(|| opener.lines(), "open ");
+            let line = opener.lines().remove(0);
+            (name, line.strip_prefix("open ").unwrap().to_string())
+        })
+        .collect()
+}
+
+/// `ERROR_ACCESS_DENIED`.
+const DENIED: &str = "5";
+
+#[test] // spec: ARCH-026
+fn a_low_process_cannot_open_a_pipe_instance_with_any_one_access() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let env = TestEnv::new();
+    let pipe = env.env.pipe_name();
+    let mut servers = vec![lil_platform::pipe::create_instance(&pipe, true).unwrap()];
+    let opens = low_opens(&pipe, || {
+        servers.push(lil_platform::pipe::create_instance(&pipe, false).unwrap());
+    });
+    assert!(opens.iter().all(|(_, got)| got == DENIED), "{opens:?}");
+}
+
+#[test] // spec: ARCH-026
+fn a_low_process_cannot_open_the_core_pipe_with_any_one_access() {
+    let env = TestEnv::new();
+    let _core = lil_testkit::CoreFixture::start_ready(&env);
+    let opens = low_opens(&env.env.pipe_name(), || {});
+    assert!(opens.iter().all(|(_, got)| got == DENIED), "{opens:?}");
 }

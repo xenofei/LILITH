@@ -36,10 +36,13 @@ use windows::core::{HSTRING, PWSTR};
 
 use crate::process::{current_user_sid, io_error, own_integrity_rid};
 
-/// `D:P(A;;GA;;;<user_sid>)(A;;GA;;;SY)`: a protected DACL granting all access to the user and
-/// to SYSTEM, and to nobody else (ARCH-026).
+/// `D:P(A;;GA;;;<user_sid>)(A;;GA;;;SY)S:(ML;;NWNRNX;;;ME)`: a protected DACL granting all access
+/// to the user and to SYSTEM, and to nobody else (ARCH-026), and an explicit Medium label with no
+/// write up, no read up and no execute up, so a same-user process below Medium can't open the pipe
+/// with any access. The implicit label only has no write up: a Low process could still open with
+/// read, execute or no access, and connect.
 pub fn pipe_sddl(user_sid: &str) -> String {
-    format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)")
+    format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)S:(ML;;NWNRNX;;;ME)")
 }
 
 /// Why [`create_instance`] failed.
