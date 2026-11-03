@@ -23,7 +23,8 @@
 //! path, once opened, isn't on a local drive.
 //!
 //! Text from a link, a `.lilref`, a target or a title reaches a card only through
-//! [`shown_outside`], which cuts what may be a deny token however it is spelled.
+//! [`shown_outside`], which cuts what may be a deny token in every spelling a toast or a URL
+//! decoder produces; a token split by a visible mark or written in fullwidth digits still shows.
 
 use std::io::Read as _;
 use std::path::Path;

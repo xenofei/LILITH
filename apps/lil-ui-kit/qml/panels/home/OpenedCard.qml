@@ -7,8 +7,9 @@
 // It shows a target as text only: nothing is fetched, loaded or run from it (AI-222). Every
 // string from outside (the target, a `.lilref` title, a refusal) goes through shownLinkText
 // (P4a-R8, P4a-R9), so control, bidi and zero-width characters are removed or marked, what may be
-// a deny token is cut however it is spelled (a sealed ref's hash with it), and it is shown as
-// plain text. Its actions are Copy (the target as it came, to the clipboard) and Dismiss.
+// a deny token is cut in every spelling a toast or a URL decoder produces (a sealed ref's hash with
+// it; a token split by a visible mark or written in fullwidth digits still shows), and it is shown
+// as plain text. Its actions are Copy (the target as it came, to the clipboard) and Dismiss.
 import QtQuick
 import Lilith.Core
 import Lilith.UiKit

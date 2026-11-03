@@ -117,7 +117,8 @@ pub mod qobject {
         fn shown_text(self: &Core, text: &QString, max_chars: i32) -> QString;
 
         /// `text` from a link, a `.lilref`, a target or a title as shown: `shownText`, with what
-        /// may be a deny token cut first, however it is spelled (P4a-R9).
+        /// may be a deny token cut first, in every spelling a toast or a URL decoder produces; a
+        /// token split by a visible mark or written in fullwidth digits still shows (P4a-R9).
         #[qinvokable]
         fn shown_link_text(self: &Core, text: &QString, max_chars: i32) -> QString;
 
