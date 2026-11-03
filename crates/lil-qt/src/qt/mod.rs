@@ -84,8 +84,8 @@ fn serve_core() -> String {
         Err(e) => return format!("Can't find this program's folder: {e}"),
     };
     // An app opens suite.toml's default workspace (ARCH-030: the session's choice, which
-    // starts there). The local data folder holds no workspace, so only that step applies.
-    match lil_client::resolve_workspace(&cfg.env, None, &cfg.env.local_dir()) {
+    // starts there), never a workspace file found above its data folder.
+    match lil_client::resolve_default_workspace(&cfg.env) {
         Ok(ws) => cfg.workspace = ws.id,
         Err(e) => tracing::warn!(error = %e, "no default workspace: the app starts without one"),
     }

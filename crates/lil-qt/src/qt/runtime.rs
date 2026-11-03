@@ -476,7 +476,7 @@ impl Runtime {
                 Ok(session) => {
                     let env = session.env();
                     let ws = tokio::task::spawn_blocking(move || {
-                        lil_client::resolve_workspace(&env, None, &env.local_dir())
+                        lil_client::resolve_default_workspace(&env)
                             .map_or_else(|_| NO_WORKSPACE.to_string(), |ws| ws.id)
                     })
                     .await

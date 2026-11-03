@@ -43,7 +43,8 @@ pub use blocking::mark_gui_thread;
 pub use conn::EventStream;
 pub use connect::{Client, DrainOutcome, drain_and_wait};
 pub use workspace::{
-    ResolvedWorkspace, WorkspaceOrigin, WorkspaceSource, resolve_workspace, resolve_workspace_id,
+    ResolvedWorkspace, WorkspaceOrigin, WorkspaceSource, resolve_default_workspace,
+    resolve_workspace, resolve_workspace_id,
 };
 
 /// The start of an `Untrusted` reason for a core of the current user whose executable is in
