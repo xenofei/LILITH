@@ -32,6 +32,11 @@
      registry keys, temporary root and Qt cache folder (%LOCALAPPDATA%\LILITH-test-topbarcheck)
      removed, and the pop-up told it is done. Anything left behind fails the run. Exit 0 only when
      every check passed and the cleanup was complete.
+  A channel already taken (a pipe of the test channel, whichever deploy's core or app serves it) is
+  refused: nothing is started, and neither is touched. Every `lil` call is limited to 30 s
+  (sandbox-common.ps1's Invoke-LilTimed), and no input or wait goes on past the pop-up's cap less
+  30 s: the run stops with "out of the stretch's time" and cleans up. A banner or badge that "went"
+  is proved over three whole walks 300 ms apart, each of which still shows the connection indicator.
   -DryRun does step 2's channel set-up and the guards' self-test only, with no pop-up, no window and
   no input.
 #>
@@ -53,30 +58,41 @@ $failures = [System.Collections.Generic.List[string]]::new()
 function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
 function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
+# Invoke-LilTimed, the stretch's deadline, Retry-Walk, Assert-Gone and the masked log copy.
+. (Join-Path $PSScriptRoot 'sandbox-common.ps1')
 
 # --- The test channel ------------------------------------------------------------------------
 $channel = 'test-topbarcheck'
 $root = Join-Path ([IO.Path]::GetTempPath()) ("lil-topbarcheck-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 # Every core PID seen on this test channel: the only core processes this script may stop.
 $corePids = [System.Collections.Generic.HashSet[int]]::new()
+# A pipe of the channel was there when the run came: not this run's, so nothing here stops it.
+$script:channelTaken = $false
 function Enter-TestChannel {
     # First, before anything that can throw: every `lil` from here on is on the test channel.
     $env:LIL_CHANNEL = $channel
     $env:LIL_TEST_ROOT = $root
     New-Item -ItemType Directory $root | Out-Null
     foreach ($s in 'roaming', 'local', 'profile', 'places') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
+    # The pipe's name comes from the channel alone, so a core left by a crashed run would serve this run
+    # from its old root. The pipes are listed, not asked: another deploy's core makes `lil --no-start
+    # status` fail as if there were none, and cleanup's `lil core stop` could then drain it.
+    if ((Get-ChannelPipes $channel).Count -gt 0) {
+        $script:channelTaken = $true
+        throw "a core or an app already serves $channel, from this deploy or another. It isn't this run's, so nothing was started and it wasn't stopped: end it, then run this again"
+    }
     Set-Location -LiteralPath $root
 }
 function Invoke-Lil([string[]]$a) {
-    $o = & $lil @a 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "lil $($a -join ' ') exited $LASTEXITCODE`: $($o -join ' ')" }
-    return ($o -join "`n")
+    $r = Invoke-LilTimed $a
+    if ($r.ExitCode -ne 0) { throw "lil $($a -join ' ') exited $($r.ExitCode): $($r.Output -join ' ')" }
+    return ($r.Output -join "`n")
 }
 # The running test core's PID, from its own hello (recorded), or 0 with none.
 function Get-CorePid {
-    $o = & $lil --no-start status 2>&1
-    if ($LASTEXITCODE -ne 0) { return 0 }
-    $m = [regex]::Match(($o -join "`n"), 'pid (\d+), channel (\S+?)\)')
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -ne 0) { return 0 }
+    $m = [regex]::Match(($r.Output -join "`n"), 'pid (\d+), channel (\S+?)\)')
     if (-not $m.Success -or $m.Groups[2].Value -notlike '*topbarcheck*') { return 0 }
     $id = [int]$m.Groups[1].Value
     [void]$corePids.Add($id)
@@ -95,8 +111,17 @@ function Stop-RecordedCores {
 function Exit-TestChannel {
     # Never off the test channel: `lil core stop` would reach the channel this shell defaults to.
     if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
+    if ($script:channelTaken) {
+        Write-Host 'the test channel is not this run''s: its core, its keys and its cache stay'
+        try { Set-Location -LiteralPath $Repo } catch { }
+        Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
+        for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $root); ++$i) {
+            try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
+        }
+        return
+    }
     try { [void](Get-CorePid) } catch { }
-    try { [void](& $lil core stop 2>&1) } catch { }
+    try { [void](Invoke-LilTimed @('core', 'stop')) } catch { }
     Start-Sleep -Milliseconds 500
     try { Stop-RecordedCores } catch { Fail "cleanup: stopping the test core: $_" }
     try { Set-Location -LiteralPath $Repo } catch { }
@@ -164,6 +189,7 @@ function Get-WindowProcessId([System.IntPtr]$hwnd) {
     return [int]$owner
 }
 function Assert-AppInFront {
+    Assert-InStretch
     for ($i = 0; $i -lt 5; ++$i) {
         if ((Get-WindowProcessId ([LilTopBarCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
         Start-Sleep -Milliseconds 200
@@ -175,6 +201,7 @@ function Send-Checked([string]$keys) {
     [System.Windows.Forms.SendKeys]::SendWait($keys)
 }
 function Assert-AppAt([int]$x, [int]$y) {
+    Assert-InStretch
     $point = [LilTopBarCheck.Win+POINT]::new()
     $point.X = $x
     $point.Y = $y
@@ -188,16 +215,24 @@ function Self-Test {
     $refused = 0
     try { Assert-AppInFront } catch { if ("$_" -like 'no keys sent*') { ++$refused } }
     try { Assert-AppAt 0 0 } catch { if ("$_" -like 'no press sent*') { ++$refused } }
+    # Past the stretch's deadline, the guards stop before they look at any window.
+    $script:stopAt = (Get-Date).AddSeconds(-1)
+    $late = 0
+    foreach ($guard in { Assert-AppInFront }, { Assert-AppAt 0 0 }) {
+        try { & $guard } catch { if ("$_" -like "out of the stretch's time*") { ++$late } }
+    }
+    $script:stopAt = $null
     $script:app = $null
     Check ($refused -eq 2) "self-test: the guards refuse a window that isn't the app's ($refused of 2)"
+    Check ($late -eq 2) "self-test: past the stretch's deadline the guards stop ($late of 2)"
     $own = Get-WindowProcessId ([LilTopBarCheck.Win]::GetForegroundWindow())
     Check ($own -ge 0) 'self-test: the foreground window''s owner can be read'
 }
 
 if ($DryRun) {
     Self-Test
-    Enter-TestChannel
     try {
+        Enter-TestChannel
         $ws = Join-Path $root 'places\harbor'
         [void](Invoke-Lil @('workspace', 'init', $ws, '--default'))
         $id = Get-CorePid
@@ -215,10 +250,11 @@ if ($DryRun) {
 
 # --- 1. The pop-up -------------------------------------------------------------------------------
 $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-topbarcheck-{0}.state" -f $PID)
+$capSec = 420
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
                '-What', 'checks the top bar (windows, a folder dialog, and real key presses)', '-WarnSec', '10', '-RunSec', '150',
-               '-CapSec', '420', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-CapSec', [string]$capSec, '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -228,6 +264,8 @@ while (-not (Test-Path -LiteralPath "$state.shown")) {
     if ((Get-Date) -gt $deadline) { throw 'the hands-off pop-up was not on screen within 30 s, so nothing ran' }
     Start-Sleep -Milliseconds 250
 }
+# From here no input goes after the pop-up's cap less 30 s.
+Start-Stretch $capSec
 Start-Sleep -Seconds 10
 
 # --- 2. The check --------------------------------------------------------------------------------
@@ -239,6 +277,7 @@ function And($a, $b) { [System.Windows.Automation.AndCondition]::new($a, $b) }
 function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     $end = (Get-Date).AddSeconds($sec)
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $e = & $find
         if ($e) { return $e }
         Start-Sleep -Milliseconds 200
@@ -281,12 +320,6 @@ function Invoke-Element($e) {
 }
 function App-Windows {
     @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
-}
-# UI Automation can throw for a whole walk while the tree moves (a reconnect): walk again, a few times.
-function Retry-Walk([scriptblock]$walk) {
-    for ($i = 0; ; ++$i) {
-        try { return (& $walk) } catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
-    }
 }
 function Find-Named($name) {
     $c = Prop $AE::NameProperty $name
@@ -403,7 +436,7 @@ try {
     [void](Wait-For { Find-Named 'Pause GPU work' } 10 'Pause GPU work again')
     $lane = Get-GpuLane
     Check ($lane.paused -eq $false) '(b) a second press: the core says it is not paused'
-    Check ($null -eq (Find-NameStarting 'GPU work paused')) '(b) a second press: the badge is gone'
+    Assert-Gone 'GPU work paused' '(b) a second press: the badge is gone'
 
     # (c) A switcher's list.
     function Open-List {
@@ -486,7 +519,7 @@ try {
     [void](Wait-For { Find-NameStarting 'Core connection: Connected' } 20 'the connection, on the new default')
     $label = Wait-For { Find-NameStarting 'Workspace: quay' } 10 'the switcher on the new default'
     Pass "(d) Use the default workspace: $($label.Current.Name)"
-    Check ($null -eq (Find-NameStarting 'The core refused this workspace: ')) '(d) the banner went'
+    Assert-Gone 'The core refused this workspace: ' '(d) the banner went'
 
     # (e) The core goes away. Your pause is set first: a core restart ends it.
     $jobs = Wait-For { $e = Find-NameStarting 'Jobs: 0 running'; if ($e) { $e } } 30 'the counts on the new workspace'
@@ -535,7 +568,7 @@ try {
     Check ($newCore -gt 0 -and $newCore -ne $victim) "(e) a new core runs, pid $newCore"
     $lane = Get-GpuLane
     Check ($lane.paused -eq $false) '(e) the core says the GPU lane is not paused: a restart ended it'
-    Check ($null -eq (Find-NameStarting 'Reconnecting… ')) '(e) the banner went'
+    Assert-Gone 'Reconnecting… ' '(e) the banner went'
     Send-Keys '^+p'
     [void](Wait-For { Find-Named 'Resume GPU work' } 10 'Resume GPU work after the restart')
     $lane = Get-GpuLane
@@ -546,8 +579,7 @@ try {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
-        if (Test-Path -LiteralPath (Join-Path $DiagDir 'logs')) { Remove-Item -Recurse -Force -LiteralPath (Join-Path $DiagDir 'logs') }
-        if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir 'logs') -Recurse -Force }
+        if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
         Write-Host "diagnostics in $DiagDir"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
