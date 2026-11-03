@@ -48,9 +48,10 @@
 //!   - `lastSeq(topic)` is the session's receive cursor (-1 for none), ahead of what QML has
 //!     applied (events wait in the throttle and the GUI queue): for tests and diagnostics, never
 //!     a model's loaded-at seq.
-//! - **Others:** `retryNow()` (the Unavailable banner's "Try again"), `shownText(text,
-//!   maxChars)` (`lil_parse::shown_text`, P4a-R8), `shownLinkText(text, maxChars)`
-//!   (`args::shown_outside`, P4a-R9).
+//! - **Others:** `retryNow()` (the Unavailable banner's "Try again"), `endSession()` (the app
+//!   closes: the session ends now, and every later request fails `core.unreachable`),
+//!   `shownText(text, maxChars)` (`lil_parse::shown_text`, P4a-R8), `shownLinkText(text,
+//!   maxChars)` (`args::shown_outside`, P4a-R9).
 //!
 //! The session starts only in a process that asked for one ([`super::serve`]): lil-image does,
 //! the QML tests don't, and there every request fails `core.unreachable` and the connection is
@@ -138,6 +139,12 @@ pub mod qobject {
         /// Tries to reach the core now (the Unavailable banner's "Try again").
         #[qinvokable]
         fn retry_now(self: &Core);
+
+        /// Ends the core session now, as dropping the object would: the app's connection
+        /// closes, so the core no longer counts the app as running. Every later request fails
+        /// `core.unreachable`. `main.cpp` calls it once the event loop has ended.
+        #[qinvokable]
+        fn end_session(self: Pin<&mut Core>);
 
         /// The session's last seq of `topic`; -1 when it has none.
         #[qinvokable]
@@ -480,6 +487,15 @@ impl qobject::Core {
     pub fn retry_now(&self) {
         if let Some(runtime) = &self.runtime {
             runtime.retry_now();
+        }
+    }
+
+    pub fn end_session(mut self: Pin<&mut Self>) {
+        // The object holds the only lasting reference: dropping it is `Runtime::drop`, which
+        // closes the session's connection within its short bound.
+        if let Some(runtime) = self.as_mut().rust_mut().runtime.take() {
+            drop(runtime);
+            tracing::info!("the core session ended with the app");
         }
     }
 

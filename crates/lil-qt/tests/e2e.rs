@@ -451,6 +451,55 @@ fn a_protocol_fault_is_not_an_unreachable_core() {
     });
 }
 
+/// DG-07: `endSession` ends the app's session at once. `main.cpp` calls it once the event loop has
+/// ended, before it waits for the exports, so in those seconds an agent's `open_in` is told the
+/// app isn't running (and gets the launch command) rather than being sent to a window that's gone.
+#[test] // spec: APP-063, APP-064
+fn end_session_leaves_the_core_s_running_apps() {
+    launch("end_session_leaves_the_core_s_running_apps", || {
+        // The test app, installed beside the core: `ui:test` opens PNG images.
+        let exe = own_folder().join("lil-test-app.exe");
+        std::fs::create_dir_all(own_folder().join("apps")).expect("the apps folder");
+        std::fs::write(
+            own_folder().join("apps").join("test.toml"),
+            format!(
+                "app = \"test\"\nexe = '{}'\n[[opens]]\ntypes = [\"image\"]\nformats = [\"png\"]\nintents = [\"open\"]\n",
+                exe.display()
+            ),
+        )
+        .expect("the test app's registration");
+        let mut rig = Rig::start(|_| {});
+        let open = json!({"app": "test", "target": r"C:\pics\a.png", "intent": "open"});
+        let id = rig.probe.call("open_in", open.clone());
+        let answer = rig.probe.finished(&id);
+        assert_eq!(answer["structured"]["running"], true, "{answer}");
+
+        rig.probe.on_gui(|core| core.end_session());
+
+        let mut cfg = ClientConfig::for_env(rig.env.env.clone(), "cli".parse().unwrap())
+            .expect("a client configuration");
+        cfg.start = StartPolicy::NoStart;
+        let agent = lil_client::blocking::BlockingClient::connect(&cfg).expect("connect");
+        let args = match open {
+            Value::Object(args) => args,
+            _ => unreachable!(),
+        };
+        poll("the app no longer running", || {
+            let answer = agent
+                .call_tool("open_in", args.clone(), None)
+                .expect("open_in");
+            let answer = serde_json::to_value(&answer).unwrap();
+            (answer["structured"]["running"] == false).then_some(())
+        });
+        // Calls after the end fail at once: there is no session to make them.
+        let id = rig.probe.call("test.echo", json!({"text": "after"}));
+        match rig.probe.outcome(&id) {
+            Seen::Failed(_, error) => assert_eq!(error["code"], "core.unreachable", "{error}"),
+            other => panic!("a call after endSession: {other:?}"),
+        }
+    });
+}
+
 /// A monthly cap of 1 USD: a `test.destructive` call costing 5 asks about the cap.
 const MONTHLY_1: &str = "[money]\ndisplay_currency = \"USD\"\n[caps]\nmonthly = \"1\"\n";
 
