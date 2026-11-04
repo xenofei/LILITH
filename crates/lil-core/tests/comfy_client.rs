@@ -2991,7 +2991,7 @@ async fn an_output_node_without_a_filename_prefix_is_judged_too() {
     let done = rig.done(&id).await;
     assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
     assert!(!done.all_cached, "the sampler ran: {done:?}");
-    // Nothing but the Save ran again: nothing changed.
+    // Nothing but the Save ran again: every judged node was cached.
     fake.cached_nodes(&["1", "3"]);
     let id = rig.submit(json!({"graph": graph}), Priority::Agent).await;
     let done = rig.done(&id).await;

@@ -531,7 +531,10 @@ pub struct JobSummary {
     pub last_progress_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_nodes: Option<Vec<String>>,
-    /// Present (and `true`) when every node of the prompt was served from the cache.
+    /// Present (and `true`) when ComfyUI served from its cache every node of the prompt that the
+    /// suite judges, which leaves out the save steps whose file prefix the suite sets: those always
+    /// run again. So it means the job reused its work and only saved again, never that nothing
+    /// changed: a save step's own settings may have changed what it wrote.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub all_cached: bool,
     /// Present (and `true`) while a running job has reported nothing for the stall time
