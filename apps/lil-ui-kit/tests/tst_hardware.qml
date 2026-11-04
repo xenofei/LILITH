@@ -851,6 +851,32 @@ TestCase {
         compare(count("telemetry.series"), 1)
     }
 
+    function test_a_resync_before_ready_is_read_when_ready_comes() { // spec: APP-127
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        answer(t.fake, "telemetry.series", {series: []})
+        const count = tool => callsTo(t.fake, tool).length
+        const before = {snapshot: count("telemetry.snapshot"), series: count("telemetry.series"),
+                        energy: count("telemetry.energy"), jobs: count("telemetry.jobs")}
+        // The event pump and the state watcher are separate: the new core's resync can arrive before
+        // its ready, and nothing is read for it then.
+        t.fake.connection = "reconnecting"
+        t.fake.emit("telemetry", "resync_required", null)
+        compare(count("telemetry.snapshot"), before.snapshot, "nothing is read while it isn't ready")
+        t.fake.connection = "ready"
+        compare(count("telemetry.snapshot"), before.snapshot + 1, "ready reads the snapshot")
+        compare(count("telemetry.series"), before.series + 1, "and the history")
+        compare(count("telemetry.energy"), before.energy + 4)
+        compare(count("telemetry.jobs"), before.jobs + 1)
+        // Read, so a later ready reads nothing again.
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        answer(t.fake, "telemetry.series", {series: []})
+        t.fake.connection = "reconnecting"
+        t.fake.connection = "ready"
+        compare(count("telemetry.snapshot"), before.snapshot + 1)
+        compare(count("telemetry.series"), before.series + 1)
+    }
+
     function test_history_that_failed_during_an_outage_is_read_again_when_the_core_is_back() { // spec: APP-129
         const t = makePanel()
         answer(t.fake, "telemetry.snapshot", snapshot())

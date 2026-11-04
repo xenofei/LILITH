@@ -52,7 +52,7 @@ Rectangle {
 
     // The telemetry snapshot shown, null until the first is in.
     property var snapshot: null
-    // Whether a snapshot has been loaded, so a later `ready` never reloads.
+    // Whether a snapshot has been loaded, so a later `ready` never reloads (a reload skipped for want of `ready` clears it).
     property bool loaded: false
     // The last failure to show, "" for none: a failed snapshot read's, else a failed history
     // read's. Each goes when a read of its own kind succeeds.
@@ -137,9 +137,13 @@ Rectangle {
     }
 
     function reload() {
-        // Not before the core is there: the reads would fail, and `ready` reads them.
-        if (!core || core.connection !== "ready")
+        // Not before the core is there: the reads would fail, and `ready` reads them. What the reload
+        // was for (a resync can arrive before `ready`) isn't read yet, so `ready` has to.
+        if (!core || core.connection !== "ready") {
+            loaded = false
+            _seriesLoaded = false
             return
+        }
         loadSnapshot()
         loadSeries()
         energy.reload()
