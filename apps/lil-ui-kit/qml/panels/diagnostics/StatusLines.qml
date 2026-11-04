@@ -31,7 +31,7 @@ LCard {
     }
 
     readonly property string startText: {
-        const times = core.startTimes || {}
+        const times = (core && core.startTimes) || {}
         const parts = []
         if (times.firstFrameMs !== undefined)
             parts.push("first frame in " + ms(times.firstFrameMs))
