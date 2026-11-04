@@ -73,7 +73,7 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-  # The benchmarks (label bench, test-params.toml's [budgets]): bench_stall_watchdog,
+  # The benchmarks (label bench, test-params.toml's [budgets]):
   # bench_hardware, bench_top_bar, bench_jobs_panel, bench_gui_stalls and bench_event_to_ui run
   # offscreen; bench_cold_start starts the deploy folder's lil-image 11 times on the runner's own
   # desktop session, as ci-deploy's deploy_runs_off_path does, with no hands-off pop-up on a
