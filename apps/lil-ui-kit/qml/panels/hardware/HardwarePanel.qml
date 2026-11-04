@@ -431,6 +431,8 @@ Rectangle {
                             visible: !root.gpu
                             text: root.sampled ? "No GPU reading: no NVIDIA GPU was found, or it can't be read."
                                                : "…"
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: root.sampled ? text : "GPU: not read yet"
                             width: parent.width
                             wrapMode: Text.Wrap
                             color: Theme.textMuted
@@ -558,6 +560,8 @@ Rectangle {
                         Text {
                             visible: !root.sampled
                             text: "…"
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: "RAM: not read yet"
                             color: Theme.textMuted
                             font.pixelSize: Theme.fontSize
                         }
@@ -581,6 +585,8 @@ Rectangle {
                         Text {
                             visible: !root.sampled
                             text: "…"
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: "Disks: not read yet"
                             color: Theme.textMuted
                             font.pixelSize: Theme.fontSize
                         }
@@ -620,6 +626,8 @@ Rectangle {
                         Text {
                             visible: !root.sampled
                             text: "…"
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: "Network: not read yet"
                             color: Theme.textMuted
                             font.pixelSize: Theme.fontSize
                         }

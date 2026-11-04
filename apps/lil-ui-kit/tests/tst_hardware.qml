@@ -928,6 +928,14 @@ TestCase {
         const card = name => named(t.panel, name)
         for (const name of ["gpuCard", "ramCard", "disksCard", "networkCard"])
             verifyShows(card(name), "…", name)
+        // A screen reader isn't left with an ellipsis: each says what it is.
+        const words = {gpuCard: "GPU", ramCard: "RAM", disksCard: "Disks", networkCard: "Network"}
+        for (const name in words) {
+            const dots = find(card(name), item => item.visible && item.text === "…")
+            verify(dots, name + " has its ellipsis")
+            compare(LilShim.accessibleOf(dots).name, words[name] + ": not read yet", name)
+            compare(dots.text, "…", "the visible text stays")
+        }
         verify(!shows(card("gpuCard"), "No GPU reading"), "no GPU claim")
         verify(!shows(card("networkCard"), "No network adapter"), "no adapter claim")
         verify(!shows(card("disksCard"), "not measured"), "no size claim")
