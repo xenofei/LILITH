@@ -2,8 +2,10 @@
 //!
 //! Every instance carries the security descriptor [`pipe_sddl`] for the current user's real
 //! SID (never the fixed test SID that test channels put in the pipe *name*), so only that user
-//! and SYSTEM can open it. Remote clients are rejected. The core's first instance uses
-//! `FILE_FLAG_FIRST_PIPE_INSTANCE` as its singleton check.
+//! and SYSTEM can open it, and, from a process at Medium or above, only a process at Medium or
+//! above (the label has no write, read or execute up; a process below Medium makes its pipes
+//! without it, see [`create_instance`]). Remote clients are rejected. The core's first instance
+//! uses `FILE_FLAG_FIRST_PIPE_INSTANCE` as its singleton check.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -36,10 +38,28 @@ use windows::core::{HSTRING, PWSTR};
 
 use crate::process::{current_user_sid, io_error, own_integrity_rid};
 
-/// `D:P(A;;GA;;;<user_sid>)(A;;GA;;;SY)`: a protected DACL granting all access to the user and
-/// to SYSTEM, and to nobody else (ARCH-026).
+/// `D:P(A;;GA;;;<user_sid>)(A;;GA;;;SY)S:(ML;;NWNRNX;;;ME)`: a protected DACL granting all access
+/// to the user and to SYSTEM, and to nobody else (ARCH-026), and an explicit Medium label with no
+/// write up, no read up and no execute up, so a same-user process below Medium can't open the pipe
+/// with any access. The implicit label only has no write up: a Low process could still open with
+/// read, execute or no access, and connect.
 pub fn pipe_sddl(user_sid: &str) -> String {
-    format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)")
+    sddl(user_sid, true)
+}
+
+/// [`pipe_sddl`] for a pipe a process at the level `own_integrity` makes. A process below Medium
+/// can't label an object above its own level, so it makes the pipe without the label, and the
+/// kernel gives it the process's own level. What holds such a pipe is vetted by the client, as
+/// before: by the pipe server's token on the apps' path, and by the proof event on the core's
+/// (ARCH-027).
+fn instance_sddl(user_sid: &str, own_integrity: u32) -> String {
+    sddl(user_sid, own_integrity >= MEDIUM_RID)
+}
+
+/// The pipe's descriptor for `user_sid`, with the Medium label if `labelled`.
+fn sddl(user_sid: &str, labelled: bool) -> String {
+    let label = if labelled { "S:(ML;;NWNRNX;;;ME)" } else { "" };
+    format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY){label}")
 }
 
 /// Why [`create_instance`] failed.
@@ -97,12 +117,15 @@ impl Drop for LocalDescriptor {
 }
 
 /// Creates one server instance of the pipe `name` (a full `\\.\pipe\...` path) with the
-/// user-only descriptor, rejecting remote clients. With `first`, the pipe must not exist yet:
+/// user-only descriptor ([`pipe_sddl`], without its label when this process is below Medium: it
+/// can't label an object above its own level), rejecting remote clients. With `first`, the pipe must not exist yet:
 /// `ERROR_ACCESS_DENIED` then means another server owns it ([`CreateError::AlreadyOwned`]).
 /// Must be called inside a tokio runtime.
 pub fn create_instance(name: &str, first: bool) -> Result<NamedPipeServer, CreateError> {
     let sid = current_user_sid().map_err(CreateError::Io)?;
-    let descriptor = LocalDescriptor::from_sddl(&pipe_sddl(&sid)).map_err(CreateError::Io)?;
+    let own_integrity = own_integrity_rid().map_err(CreateError::Io)?;
+    let descriptor =
+        LocalDescriptor::from_sddl(&instance_sddl(&sid, own_integrity)).map_err(CreateError::Io)?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0.0,
@@ -417,6 +440,16 @@ mod tests {
     const LOW: u32 = 0x1000;
     const HIGH: u32 = 0x3000;
     const USER: &str = "S-1-5-21-1-2-3-1001";
+
+    #[test] // spec: ARCH-026
+    fn only_a_process_at_medium_or_above_labels_its_pipe() {
+        let plain = format!("D:P(A;;GA;;;{USER})(A;;GA;;;SY)");
+        assert_eq!(instance_sddl(USER, LOW), plain);
+        let labelled = format!("{plain}S:(ML;;NWNRNX;;;ME)");
+        assert_eq!(instance_sddl(USER, MEDIUM_RID), labelled);
+        assert_eq!(instance_sddl(USER, HIGH), labelled);
+        assert_eq!(pipe_sddl(USER), labelled);
+    }
 
     #[test] // spec: ARCH-027
     fn only_a_process_above_medium_labels_its_proof_event() {

@@ -11,9 +11,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP_STATE_LISTEN, MIB_TCP6ROW_OWNER_PID,
-    MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID,
-    MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+    MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
     TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
@@ -29,63 +29,35 @@ pub enum SocketKind {
     Udp,
 }
 
-/// Every TCP and UDP socket (IPv4 and IPv6) owned by `pid`.
+/// Every TCP and UDP socket (IPv4 and IPv6) owned by `pid`. The OS picks which TCP rows are
+/// listeners (the `_LISTENER` table class) and which are connections (`_CONNECTIONS`): a row's
+/// `dwState` is never read, since some Windows builds report it wrongly in the `_ALL` class.
 pub fn sockets_of(pid: u32) -> io::Result<Vec<SocketKind>> {
-    let listen = MIB_TCP_STATE_LISTEN.0 as u32;
-    let tcp_kind = |state: u32| {
-        if state == listen {
-            SocketKind::TcpListen
-        } else {
-            SocketKind::TcpOther
-        }
-    };
     let mut found = Vec::new();
+    for (class, kind) in [
+        (TCP_TABLE_OWNER_PID_LISTENER, SocketKind::TcpListen),
+        (TCP_TABLE_OWNER_PID_CONNECTIONS, SocketKind::TcpOther),
+    ] {
+        let tcp4 = fetch(|buf, size| {
+            // SAFETY: `buf` is a writable buffer of `*size` bytes, as the call requires.
+            unsafe { GetExtendedTcpTable(buf, size, false, u32::from(AF_INET.0), class, 0) }
+        })?;
+        // SAFETY: the buffer holds a MIB_TCPTABLE_OWNER_PID written by the call above.
+        let rows = unsafe {
+            table_rows::<MIB_TCPROW_OWNER_PID>(&tcp4, offset_of!(MIB_TCPTABLE_OWNER_PID, table))
+        }?;
+        found.extend(rows.iter().filter(|r| r.dwOwningPid == pid).map(|_| kind));
 
-    let tcp4 = fetch(|buf, size| {
-        // SAFETY: `buf` is a writable buffer of `*size` bytes, as the call requires.
-        unsafe {
-            GetExtendedTcpTable(
-                buf,
-                size,
-                false,
-                u32::from(AF_INET.0),
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
-        }
-    })?;
-    // SAFETY: the buffer holds a MIB_TCPTABLE_OWNER_PID written by the call above.
-    let rows = unsafe {
-        table_rows::<MIB_TCPROW_OWNER_PID>(&tcp4, offset_of!(MIB_TCPTABLE_OWNER_PID, table))
-    }?;
-    found.extend(
-        rows.iter()
-            .filter(|r| r.dwOwningPid == pid)
-            .map(|r| tcp_kind(r.dwState)),
-    );
-
-    let tcp6 = fetch(|buf, size| {
-        // SAFETY: as above.
-        unsafe {
-            GetExtendedTcpTable(
-                buf,
-                size,
-                false,
-                u32::from(AF_INET6.0),
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
-        }
-    })?;
-    // SAFETY: the buffer holds a MIB_TCP6TABLE_OWNER_PID written by the call above.
-    let rows = unsafe {
-        table_rows::<MIB_TCP6ROW_OWNER_PID>(&tcp6, offset_of!(MIB_TCP6TABLE_OWNER_PID, table))
-    }?;
-    found.extend(
-        rows.iter()
-            .filter(|r| r.dwOwningPid == pid)
-            .map(|r| tcp_kind(r.dwState)),
-    );
+        let tcp6 = fetch(|buf, size| {
+            // SAFETY: as above.
+            unsafe { GetExtendedTcpTable(buf, size, false, u32::from(AF_INET6.0), class, 0) }
+        })?;
+        // SAFETY: the buffer holds a MIB_TCP6TABLE_OWNER_PID written by the call above.
+        let rows = unsafe {
+            table_rows::<MIB_TCP6ROW_OWNER_PID>(&tcp6, offset_of!(MIB_TCP6TABLE_OWNER_PID, table))
+        }?;
+        found.extend(rows.iter().filter(|r| r.dwOwningPid == pid).map(|_| kind));
+    }
 
     let udp4 = fetch(|buf, size| {
         // SAFETY: as above.
@@ -310,6 +282,8 @@ unsafe fn table_rows<T: Copy>(buf: &[u64], offset: usize) -> io::Result<&[T]> {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_LISTEN;
+
     use super::*;
 
     /// A port as the tables hold it: network byte order in the low 16 bits.

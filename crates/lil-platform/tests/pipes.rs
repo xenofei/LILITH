@@ -37,7 +37,7 @@ fn unique_pipe() -> String {
 fn pipe_sddl_format() {
     assert_eq!(
         pipe_sddl("S-1-5-21-1-2-3-1001"),
-        "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)"
+        "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)S:(ML;;NWNRNX;;;ME)"
     );
 }
 
@@ -123,6 +123,7 @@ fn sockets_of_reports_a_loopback_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mine = sockets_of(std::process::id()).unwrap();
     assert!(mine.contains(&SocketKind::TcpListen), "{mine:?}");
+    assert!(!mine.contains(&SocketKind::TcpOther), "{mine:?}");
     drop(listener);
 
     let comspec = std::env::var_os("ComSpec").expect("%ComSpec% is set");
@@ -133,6 +134,19 @@ fn sockets_of_reports_a_loopback_listener() {
     let theirs = sockets_of(child.id()).unwrap();
     child.wait().unwrap();
     assert!(theirs.is_empty(), "{theirs:?}");
+
+    // A loopback connection to this process's own listener: three sockets, one listening and
+    // the two ends of the connection. In this test, not its own: the tables are read for the whole
+    // process, so two tests that bind sockets would see each other's under plain `cargo test`,
+    // which runs them as threads of one process.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+    let mine = sockets_of(std::process::id()).unwrap();
+    let count = |kind| mine.iter().filter(|&&k| k == kind).count();
+    assert_eq!(count(SocketKind::TcpListen), 1, "{mine:?}");
+    assert_eq!(count(SocketKind::TcpOther), 2, "{mine:?}");
+    drop((client, accepted, listener));
 }
 
 #[test] // spec: ARCH-027, APP-013

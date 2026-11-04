@@ -26,6 +26,7 @@ const PROBE_OUT: &str = "LIL_CLIENT_PROBE_OUT";
 const PROBE_PIPE: &str = "LIL_CLIENT_PROBE_PIPE";
 const PROBE_HOLDER: &str = "LIL_CLIENT_PROBE_HOLDER";
 const PROBE_HANDED: &str = "LIL_CLIENT_PROBE_HANDED";
+const PROBE_MASK: &str = "LIL_CLIENT_PROBE_MASK";
 /// A failure deadline for each wait, never a measurement.
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -49,6 +50,7 @@ fn probe() {
     match std::env::var(PROBE_ROLE).as_deref() {
         Ok("creator") => pipe_creator(),
         Ok("holder") => pipe_holder(),
+        Ok("opener") => pipe_opener(),
         _ => {}
     }
 }
@@ -218,6 +220,115 @@ fn pipe_holder() -> ! {
     }
 }
 
+/// What `NtCreateFile` takes, declared here (`CreateFileW` adds `SYNCHRONIZE` and
+/// `FILE_READ_ATTRIBUTES` to every access it is given, so it can't send a mask on its own).
+mod nt {
+    use std::ffi::c_void;
+
+    use windows::Win32::Foundation::HANDLE;
+
+    #[repr(C)]
+    pub struct UnicodeString {
+        pub length: u16,
+        pub maximum_length: u16,
+        pub buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    pub struct ObjectAttributes {
+        pub length: u32,
+        pub root_directory: HANDLE,
+        pub object_name: *mut UnicodeString,
+        pub attributes: u32,
+        pub security_descriptor: *mut c_void,
+        pub security_quality_of_service: *mut c_void,
+    }
+
+    #[repr(C)]
+    pub struct IoStatusBlock {
+        pub status: usize,
+        pub information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        pub fn NtCreateFile(
+            file: *mut HANDLE,
+            access: u32,
+            attributes: *mut ObjectAttributes,
+            status: *mut IoStatusBlock,
+            allocation: *mut i64,
+            file_attributes: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+            ea: *mut c_void,
+            ea_length: u32,
+        ) -> i32;
+    }
+}
+
+/// `opener`: opens the pipe by its name through `NtCreateFile` with exactly the access mask
+/// `PROBE_MASK` (hex) and no other, writes `open ok` or `open <NTSTATUS in hex>`, and stays on,
+/// holding what it opened.
+fn pipe_opener() -> ! {
+    // `\\.\pipe\<name>` is `\Device\NamedPipe\<name>` to the kernel.
+    let name = std::env::var(PROBE_PIPE).expect("the pipe's name");
+    let name = format!(
+        r"\Device\NamedPipe\{}",
+        name.strip_prefix(r"\\.\pipe\").expect("a pipe's name")
+    );
+    let mask = u32::from_str_radix(&std::env::var(PROBE_MASK).expect("the mask"), 16).unwrap();
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap();
+    let mut object_name = nt::UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attributes = nt::ObjectAttributes {
+        length: u32::try_from(size_of::<nt::ObjectAttributes>()).unwrap(),
+        root_directory: HANDLE::default(),
+        object_name: &raw mut object_name,
+        // OBJ_CASE_INSENSITIVE.
+        attributes: 0x40,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut status = nt::IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut handle = HANDLE::default();
+    // SAFETY: every pointer is to a local that outlives the call; the handle, if any, is kept
+    // until the process ends. FILE_SHARE_READ | FILE_SHARE_WRITE (3), FILE_OPEN (1), no options
+    // (a synchronous open would need SYNCHRONIZE).
+    let result = unsafe {
+        nt::NtCreateFile(
+            &raw mut handle,
+            mask,
+            &raw mut attributes,
+            &raw mut status,
+            std::ptr::null_mut(),
+            0,
+            3,
+            1,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    write_out(&if result >= 0 {
+        "open ok".to_string()
+    } else {
+        format!("open {result:08x}")
+    });
+    loop {
+        // A test's end kills it.
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The test's side.
 // ---------------------------------------------------------------------------------------------
@@ -314,6 +425,18 @@ struct LowHolder {
 
 impl LowHolder {
     fn start(out: PathBuf, pipe: &str, handed: &Path) -> LowHolder {
+        LowHolder::start_role(
+            "holder",
+            out,
+            &[
+                (PROBE_PIPE, pipe.into()),
+                (PROBE_HANDED, handed.as_os_str().to_owned()),
+            ],
+        )
+    }
+
+    /// The probe `role` at Low integrity, with `extra` in its environment.
+    fn start_role(role: &str, out: PathBuf, extra: &[(&str, std::ffi::OsString)]) -> LowHolder {
         use std::os::windows::ffi::OsStrExt as _;
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -329,10 +452,9 @@ impl LowHolder {
         use windows::core::{HSTRING, PWSTR};
         let exe = std::env::current_exe().unwrap();
         let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-        vars.push((PROBE_ROLE.into(), "holder".into()));
+        vars.push((PROBE_ROLE.into(), role.into()));
         vars.push((PROBE_OUT.into(), out.clone().into_os_string()));
-        vars.push((PROBE_PIPE.into(), pipe.into()));
-        vars.push((PROBE_HANDED.into(), handed.as_os_str().to_owned()));
+        vars.extend(extra.iter().map(|(k, v)| ((*k).into(), v.clone())));
         let mut block: Vec<u16> = Vec::new();
         for (k, v) in &vars {
             block.extend(k.encode_wide());
@@ -566,4 +688,99 @@ fn a_holder_at_the_clients_own_level_passes_the_proof_outside_the_threat_model()
         ["core/prove", "core/hello", "core/prove", "core/hello"],
         "{lines:?}"
     );
+}
+
+/// The access masks a Low process might open a pipe with, each on its own and exactly (through
+/// `NtCreateFile`). The DACL lets this user through (`GA`), and the label's no-write-up alone
+/// doesn't stop `GENERIC_READ`, `FILE_EXECUTE`, `SYNCHRONIZE` or `FILE_READ_ATTRIBUTES`: only a
+/// label that also has no-read-up and no-execute-up does (CP-03, NF-04). With `NWNR` alone
+/// `FILE_EXECUTE` and `SYNCHRONIZE` connect, and with `NW` alone every mask but 0 does; a mask of
+/// 0 is refused by the kernel whatever the label says.
+const LOW_MASKS: [(&str, u32); 5] = [
+    ("GENERIC_READ", 0x8000_0000),
+    ("FILE_EXECUTE", 0x20),
+    ("SYNCHRONIZE", 0x0010_0000),
+    ("FILE_READ_ATTRIBUTES", 0x80),
+    ("0", 0),
+];
+
+/// What a Low process gets opening `pipe` with each of [`LOW_MASKS`] on its own: `ok` or the
+/// NTSTATUS in hex, in order. `more` is called before each, to make a free instance.
+fn low_opens(pipe: &str, mut more: impl FnMut()) -> Vec<(&'static str, String)> {
+    let low_dir = tempfile::tempdir().unwrap();
+    label_low(low_dir.path());
+    LOW_MASKS
+        .iter()
+        .map(|&(name, mask)| {
+            more();
+            let out = low_dir.path().join(format!("open-{mask:x}.txt"));
+            let opener = LowHolder::start_role(
+                "opener",
+                out,
+                &[
+                    (PROBE_PIPE, pipe.into()),
+                    (PROBE_MASK, format!("{mask:x}").into()),
+                ],
+            );
+            wait_line(|| opener.lines(), "open ");
+            let line = opener.lines().remove(0);
+            (name, line.strip_prefix("open ").unwrap().to_string())
+        })
+        .collect()
+}
+
+/// What a process at this test's own integrity (Medium) gets opening `pipe` with `mask`, through
+/// the same opener: the control that a Low process's refusals come from the label and not from a
+/// probe that can't open anything. The child is killed, and its handle closed, on return.
+fn medium_open(pipe: &str, mask: u32) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let mask = format!("{mask:x}");
+    let opener = Probe::start(
+        "opener",
+        dir.path().join("open.txt"),
+        &[
+            (PROBE_PIPE, std::ffi::OsStr::new(pipe)),
+            (PROBE_MASK, std::ffi::OsStr::new(&mask)),
+        ],
+    );
+    wait_line(|| opener.lines(), "open ");
+    let line = opener.lines().remove(0);
+    line.strip_prefix("open ").unwrap().to_string()
+}
+
+/// `GENERIC_READ`, the control's mask.
+const GENERIC_READ: u32 = 0x8000_0000;
+
+/// `STATUS_ACCESS_DENIED`.
+const DENIED: &str = "c0000022";
+
+#[test] // spec: ARCH-026
+fn a_low_process_cannot_open_a_pipe_instance_with_any_one_access() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let env = TestEnv::new();
+    // The apps' instance pipe: the name the instance server claims, and the same `create_instance`.
+    let pipe = env.env.app_pipe_name("shell", false);
+    let mut servers = vec![lil_platform::pipe::create_instance(&pipe, true).unwrap()];
+    let opens = low_opens(&pipe, || {
+        servers.push(lil_platform::pipe::create_instance(&pipe, false).unwrap());
+    });
+    assert!(opens.iter().all(|(_, got)| got == DENIED), "{opens:?}");
+    // The same opener at Medium connects to the same pipe.
+    servers.push(lil_platform::pipe::create_instance(&pipe, false).unwrap());
+    assert_eq!(medium_open(&pipe, GENERIC_READ), "ok");
+}
+
+#[test] // spec: ARCH-026
+fn a_low_process_cannot_open_the_core_pipe_with_any_one_access() {
+    let env = TestEnv::new();
+    let _core = lil_testkit::CoreFixture::start_ready(&env);
+    let pipe = env.env.pipe_name();
+    let opens = low_opens(&pipe, || {});
+    assert!(opens.iter().all(|(_, got)| got == DENIED), "{opens:?}");
+    // The same opener at Medium connects to the same pipe.
+    assert_eq!(medium_open(&pipe, GENERIC_READ), "ok");
 }
