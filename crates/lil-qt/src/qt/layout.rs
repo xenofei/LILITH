@@ -18,6 +18,9 @@
 //! - `lastSeen(dir, workspace)`: when Home was last seen in that workspace (RFC 3339), empty when
 //!   never or when what is kept doesn't read; `setLastSeen(dir, workspace, at)`: writes it through
 //!   `AppState`; empty, or why it couldn't (P4a-R16).
+//! - `keptTime(dir, workspace)`: `{"at": <as lastSeen>, "lost": bool}` from one load of the file;
+//!   `lost` says an empty `at` isn't a first run, because the file couldn't be read or was set aside
+//!   as it didn't parse ([`crate::app_state::kept_time`]).
 //! - `timeMs(text)`: [`crate::format::parse_utc_ms`], NaN when it doesn't read.
 //! - `awayItems(pagesJson, pendingJson, lastSeen)`: [`crate::away::away_items_json`] as JSON;
 //!   `nextCursor(resultJson)`: a `jobs.list` result's `next_cursor`, empty on the last page, so
@@ -86,6 +89,9 @@ pub mod qobject {
             workspace: &QString,
             at: &QString,
         ) -> QString;
+
+        #[qinvokable]
+        fn kept_time(self: Pin<&mut ShellState>, dir: &QString, workspace: &QString) -> QString;
 
         #[qinvokable]
         fn time_ms(self: &ShellState, text: &QString) -> f64;
@@ -248,6 +254,15 @@ impl qobject::ShellState {
                 QString::from(&e.to_string())
             }
         }
+    }
+
+    fn kept_time(self: Pin<&mut Self>, dir: &QString, workspace: &QString) -> QString {
+        let dir = dir.to_string();
+        if dir.is_empty() {
+            return qs(json!({"at": "", "lost": false}));
+        }
+        let (at, lost) = crate::app_state::kept_time(Path::new(&dir), &workspace.to_string());
+        qs(json!({"at": at, "lost": lost}))
     }
 
     fn time_ms(&self, text: &QString) -> f64 {

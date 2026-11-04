@@ -30,9 +30,9 @@ LCard {
         width: parent.width
         spacing: 2
 
-        LineText { text: "Core " + root.known(root.core.coreBuildId) }
-        LineText { text: "This app " + root.known(root.core.buildId) }
-        LineText { text: "Protocol " + root.known(root.core.coreProtocol) }
+        LineText { text: "Core " + root.known(root.core ? root.core.coreBuildId : "") }
+        LineText { text: "This app " + root.known(root.core ? root.core.buildId : "") }
+        LineText { text: "Protocol " + root.known(root.core ? root.core.coreProtocol : "") }
         LineText { text: "Qt " + root.known(root.built.qt) }
         LineText { text: "Qt WebEngine " + root.known(root.built.webEngine) }
         LineText { text: "KDDockWidgets " + root.known(root.built.kddockwidgets) }

@@ -81,6 +81,16 @@ TestCase {
         return Object.assign(s, over || {})
     }
 
+    // What the core sends before its first sample (telemetry::Snapshot::empty): nothing read, every
+    // part unknown.
+    function emptySnapshot() {
+        const part = name => ({part: name, mw: 0, measured: "unknown"})
+        return {ts: "2026-10-28T11:59:59.000Z", processes: [],
+                cpu: {util_permille: 0, per_core_permille: [], package_power_mw: 0, measured: false},
+                ram: {total_mib: 0, used_mib: 0}, disks: [], sizes: {}, net: [], system_power_mw: 0,
+                system_parts: [part("gpu"), part("cpu"), part("rest")], alerts: [], gpu_users: []}
+    }
+
     function makePanel() {
         const fake = createTemporaryObject(fakeComponent, tc)
         const w = createTemporaryObject(panelWindow, tc, {core: fake})
@@ -788,6 +798,208 @@ TestCase {
         t.panel.windowS = 3600
         verify(t.fake.cancelled.indexOf(open.id) >= 0, "the old window's call is cancelled")
         compare(callsTo(t.fake, "telemetry.series").slice(-1)[0].args.resolution, "1s")
+    }
+
+    function valueRow(card, label) {
+        return find(card, item => item.label === label)
+    }
+
+    function test_cpu_load_and_ram_wait_for_the_first_sample() { // spec: APP-127
+        const t = makePanel()
+        const cpu = named(t.panel, "cpuCard"), ram = named(t.panel, "ramCard")
+        // Before the first sample the core's snapshot has no per-core load and no RAM total: a 0 % and a
+        // 0 / 0 GiB would be readings that were never made.
+        answer(t.fake, "telemetry.snapshot", emptySnapshot())
+        verify(valueRow(cpu, "Load"), "the CPU card has a Load row")
+        verify(!valueRow(cpu, "Load").visible, "no CPU load before a sample")
+        verify(!valueRow(ram, "In use").visible, "no RAM figure before a sample")
+        verify(!shows(t.panel, "0 / 0 GiB"), JSON.stringify(texts(t.panel)))
+        // The rest of the snapshot still shows.
+        verify(valueRow(cpu, "Package power").visible)
+        verifyShows(t.panel, "unknown", "the whole system")
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot()})
+        verify(valueRow(cpu, "Load").visible, "the CPU load shows after one sample")
+        verify(valueRow(ram, "In use").visible, "and the RAM")
+        verifyShows(cpu, "18 %", "CPU")
+        verifyShows(ram, "41 / 64 GiB", "RAM")
+    }
+
+    function test_nothing_is_read_before_the_core_is_connected() { // spec: APP-127
+        const fake = createTemporaryObject(fakeComponent, tc, {connection: "connecting"})
+        const w = createTemporaryObject(panelWindow, tc, {core: fake})
+        verify(w, "the panel's window")
+        tryVerify(() => w.panel.width > 0)
+        const count = tool => callsTo(fake, tool).length
+        // A cold start: the calls would fail, and the panel would warn of a fault that is only the
+        // connecting.
+        compare(count("telemetry.snapshot"), 0)
+        compare(count("telemetry.series"), 0)
+        compare(count("telemetry.energy"), 0)
+        compare(count("telemetry.jobs"), 0)
+        compare(w.panel.problem, "")
+        fake.connection = "ready"
+        compare(count("telemetry.snapshot"), 1, "ready reads the snapshot")
+        compare(count("telemetry.series"), 1)
+        compare(count("telemetry.energy"), 4)
+        compare(count("telemetry.jobs"), 1)
+        answer(fake, "telemetry.snapshot", snapshot())
+        answer(fake, "telemetry.series", {series: []})
+        // And loaded, with the history in, a later ready reads nothing again.
+        fake.connection = "reconnecting"
+        fake.connection = "ready"
+        compare(count("telemetry.snapshot"), 1)
+        compare(count("telemetry.series"), 1)
+    }
+
+    function test_a_resync_before_ready_is_read_when_ready_comes() { // spec: APP-127
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        answer(t.fake, "telemetry.series", {series: []})
+        const count = tool => callsTo(t.fake, tool).length
+        const before = {snapshot: count("telemetry.snapshot"), series: count("telemetry.series"),
+                        energy: count("telemetry.energy"), jobs: count("telemetry.jobs")}
+        // The event pump and the state watcher are separate: the new core's resync can arrive before
+        // its ready, and nothing is read for it then.
+        t.fake.connection = "reconnecting"
+        t.fake.emit("telemetry", "resync_required", null)
+        compare(count("telemetry.snapshot"), before.snapshot, "nothing is read while it isn't ready")
+        t.fake.connection = "ready"
+        compare(count("telemetry.snapshot"), before.snapshot + 1, "ready reads the snapshot")
+        compare(count("telemetry.series"), before.series + 1, "and the history")
+        compare(count("telemetry.energy"), before.energy + 4)
+        compare(count("telemetry.jobs"), before.jobs + 1)
+        // Read, so a later ready reads nothing again.
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        answer(t.fake, "telemetry.series", {series: []})
+        t.fake.connection = "reconnecting"
+        t.fake.connection = "ready"
+        compare(count("telemetry.snapshot"), before.snapshot + 1)
+        compare(count("telemetry.series"), before.series + 1)
+    }
+
+    function test_history_that_failed_during_an_outage_is_read_again_when_the_core_is_back() { // spec: APP-129
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        const count = () => callsTo(t.fake, "telemetry.series").length
+        compare(count(), 1)
+        // The connection drops with the history read open, and it fails.
+        t.fake.connection = "reconnecting"
+        verify(t.fake.respond(callsTo(t.fake, "telemetry.series")[0].id,
+                              {status: "error", error: {code: "core.unreachable", message: "not connected"}}))
+        verify(t.panel.problem.indexOf("The hardware history can't be read now") === 0, t.panel.problem)
+        verifyShows(t.panel, "The hardware history can't be read now", "the banner")
+        // The same core comes back: the history is read again, and the warning goes with it.
+        t.fake.connection = "ready"
+        compare(count(), 2, "ready reads the history again")
+        answer(t.fake, "telemetry.series", {series: []})
+        compare(t.panel.problem, "")
+        verify(!shows(t.panel, "The hardware history"), "the banner is gone")
+        // A history that landed is not read again on the next ready.
+        t.fake.connection = "reconnecting"
+        t.fake.connection = "ready"
+        compare(count(), 2)
+    }
+
+    function test_a_window_picked_during_an_outage_reads_when_the_core_is_back() { // spec: APP-129
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        answer(t.fake, "telemetry.series", {series: []})
+        const count = () => callsTo(t.fake, "telemetry.series").length
+        t.fake.connection = "reconnecting"
+        t.panel.windowS = 3600
+        // The connection banner says it: no call that would fail, and no warning on top of it.
+        compare(count(), 1)
+        compare(t.panel.problem, "")
+        t.fake.connection = "ready"
+        compare(count(), 2, "ready reads the window that was picked")
+        const args = callsTo(t.fake, "telemetry.series")[1].args
+        compare(args.resolution, "1s")
+        compare(Date.parse(args.to) - Date.parse(args.from), 3600 * 1000 - 2000)
+        answer(t.fake, "telemetry.series", {series: []})
+        compare(t.panel.problem, "")
+    }
+
+    function test_a_snapshot_that_lands_does_not_hide_the_history_failing() { // spec: APP-129
+        const t = makePanel()
+        answer(t.fake, "telemetry.series", {series: []})
+        t.panel.windowS = 3600
+        verify(t.fake.respond(callsTo(t.fake, "telemetry.series")[1].id,
+                              {status: "error", error: {code: "store.io", message: "no history"}}))
+        verify(t.panel.problem !== "")
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        verify(t.panel.problem !== "", "the history is still missing")
+    }
+
+    function test_a_snapshot_read_that_failed_after_the_first_load_clears_with_a_sample() { // spec: APP-127
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        // A resync reads everything again, and the snapshot fails.
+        t.fake.emit("telemetry", "resync_required", null)
+        const reads = callsTo(t.fake, "telemetry.snapshot")
+        compare(reads.length, 2)
+        verify(t.fake.respond(reads[1].id, {status: "error", error: {code: "core.unreachable", message: "not connected"}}))
+        verify(t.panel.problem.indexOf("The hardware can't be read now") === 0, t.panel.problem)
+        // An older sample isn't a reading: the warning stays.
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({ts: "2026-10-28T11:59:00.000Z"})})
+        verify(t.panel.problem !== "", "an older sample is no reading")
+        // Samples are flowing again: the warning doesn't stay over live figures.
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:05.000Z"})})
+        compare(t.panel.problem, "")
+        verify(!shows(t.panel, "The hardware can't be read now"), "the banner is gone")
+    }
+
+    function test_cards_claim_nothing_before_the_first_sample() { // spec: APP-127
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", emptySnapshot())
+        const card = name => named(t.panel, name)
+        for (const name of ["gpuCard", "ramCard", "disksCard", "networkCard"])
+            verifyShows(card(name), "…", name)
+        // A screen reader isn't left with an ellipsis: each says what it is.
+        const words = {gpuCard: "GPU", ramCard: "RAM", disksCard: "Disks", networkCard: "Network"}
+        for (const name in words) {
+            const dots = find(card(name), item => item.visible && item.text === "…")
+            verify(dots, name + " has its ellipsis")
+            compare(LilShim.accessibleOf(dots).name, words[name] + ": not read yet", name)
+            compare(dots.text, "…", "the visible text stays")
+        }
+        verify(!shows(card("gpuCard"), "No GPU reading"), "no GPU claim")
+        verify(!shows(card("networkCard"), "No network adapter"), "no adapter claim")
+        verify(!shows(card("disksCard"), "not measured"), "no size claim")
+        // The first sample: the readings, and a PC with no GPU and no adapter says so.
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({gpu: undefined, net: [],
+                                                                            sizes: {}, ts: "2026-10-28T12:00:05.000Z"})})
+        for (const name of ["gpuCard", "ramCard", "disksCard", "networkCard"])
+            verify(!shows(card(name), "…"), name + " has its reading: " + JSON.stringify(texts(card(name))))
+        verifyShows(card("gpuCard"), "No GPU reading", "GPU")
+        verifyShows(card("networkCard"), "No network adapter reported.", "Network")
+        verifyShows(card("disksCard"), "not measured", "Disks")
+        verifyShows(card("ramCard"), "41 / 64 GiB", "RAM")
+    }
+
+    function test_the_keyboard_scrolls_the_figures() { // spec: APP-156
+        const t = makePanel()
+        t.w.height = 300
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        const flick = named(t.panel, "figures")
+        verify(flick, "the figures' scroll area")
+        tryVerify(() => flick.contentHeight > 2 * flick.height + 40, 3000, "there is more than fits")
+        verify(flick.activeFocusOnTab, "one tab stop")
+        compare(LilShim.accessibleOf(flick).name, "Hardware figures")
+        t.w.requestActivate()
+        tryVerify(() => t.w.active, 3000)
+        flick.forceActiveFocus()
+        verify(named(t.panel, "figuresRing").visible, "the ring shows the scroll area has the focus")
+        compare(flick.contentY, 0)
+        keyClick(Qt.Key_Down)
+        compare(flick.contentY, 40)
+        keyClick(Qt.Key_Up)
+        compare(flick.contentY, 0)
+        keyClick(Qt.Key_PageDown)
+        compare(flick.contentY, flick.height)
+        keyClick(Qt.Key_End)
+        compare(flick.contentY, flick.contentHeight - flick.height, "the energy table is reached")
+        keyClick(Qt.Key_Home)
+        compare(flick.contentY, 0)
     }
 
     function test_float_and_redock_keeps_hardware_state() { // spec: ARCH-116
