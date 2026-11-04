@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use lil_platform::Env;
 use serde::{Deserialize, Serialize};
 
+use crate::format::parse_utc_ms;
 use crate::layout_file::{retry_shared, set_aside, write_replacing};
 
 /// The `state` version this build reads and writes.
@@ -36,6 +37,9 @@ pub struct AppState {
     workspaces: BTreeMap<String, Seen>,
     /// The file is there and couldn't be read: writing now would drop what it holds.
     unread: bool,
+    /// The file was there and didn't parse (or had another version), and was set aside by this load:
+    /// what it held is gone, but a write now drops nothing more.
+    set_aside: bool,
 }
 
 impl AppState {
@@ -52,6 +56,7 @@ impl AppState {
 
     fn load_from(path: &Path) -> AppState {
         let mut unread = false;
+        let mut set_aside_now = false;
         // A program holding the file for a moment is waited for (SHARE_WAIT), so a brief hold doesn't
         // make it unread, which refuses Home's write.
         // Text that isn't UTF-8 is a file that doesn't parse, as LayoutFile::load takes it.
@@ -63,6 +68,7 @@ impl AppState {
             Ok(text) => match serde_json::from_str::<StateFile>(&text) {
                 Ok(file) if file.state == STATE_VERSION => file.workspaces,
                 Ok(_) | Err(_) => {
+                    set_aside_now = true;
                     if let Err(e) = set_aside(path, &utc_now()) {
                         tracing::warn!(error = %e, "the app state couldn't be set aside");
                     }
@@ -81,6 +87,7 @@ impl AppState {
             path: path.to_path_buf(),
             workspaces,
             unread,
+            set_aside: set_aside_now,
         }
     }
 
@@ -88,6 +95,12 @@ impl AppState {
     /// holds: a workspace with no time here may have had one.
     pub fn unread(&self) -> bool {
         self.unread
+    }
+
+    /// This load set a file that didn't parse aside (`state.json.bad-*`): the start isn't the
+    /// app's first (Appendix G, app state), though the times it held are gone. Writes go on.
+    pub fn was_set_aside(&self) -> bool {
+        self.set_aside
     }
 
     /// When workspace `ws` was last seen in this app (RFC 3339), if ever.
@@ -119,6 +132,20 @@ impl AppState {
         let text = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
         write_replacing(&self.path, &text)
     }
+}
+
+/// Home's kept time for `ws` in the state folder `dir`, read from one load: the time (RFC 3339, empty
+/// when none or when it doesn't read), and whether the file's time was lost, so that an empty one is
+/// no first run: the file couldn't be read, or didn't parse and was set aside. One load, so a hold
+/// that ends between two reads can't turn a lost time into a first run.
+pub fn kept_time(dir: &Path, ws: &str) -> (String, bool) {
+    let state = AppState::load_in(dir);
+    let at = state
+        .last_seen(ws)
+        .filter(|at| parse_utc_ms(at).is_some())
+        .unwrap_or_default();
+    let lost = at.is_empty() && (state.unread() || state.was_set_aside());
+    (at, lost)
 }
 
 /// Whether this start is the app's first on its channel, `dir` being its state folder
@@ -367,8 +394,9 @@ mod tests {
         read.set_last_seen("ws_b", "2026-10-28T10:00:00Z").unwrap();
     }
 
-    /// A `state.json` that can't be read (here a folder of that name, which gives PermissionDenied,
-    /// not NotFound) is told apart from one that isn't there, so Home needn't take it for a first run.
+    /// A `state.json` that can't be read is told apart from one that isn't there, so Home needn't take
+    /// it for a first run: a folder of that name (PermissionDenied, not NotFound), and a file another
+    /// program holds for longer than the read waits.
     #[test] // spec: P4a-R16
     fn a_state_that_cannot_be_read_is_not_a_missing_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -382,11 +410,93 @@ mod tests {
         let state = AppState::load_in(&app_dir);
         assert!(state.unread());
         assert_eq!(state.last_seen("ws_a"), None);
-        // A file that parses is read.
+
+        // A file held with no sharing for longer than the read waits.
+        let held_dir = env.app_state_dir("held");
+        std::fs::create_dir_all(&held_dir).unwrap();
+        AppState::load_in(&held_dir)
+            .set_last_seen("ws_a", "2026-10-27T10:00:00Z")
+            .unwrap();
+        let holder = hold(&held_dir.join("state.json"), 0, 500);
+        let held = AppState::load_in(&held_dir);
+        holder.join().unwrap();
+        assert!(held.unread(), "a held file is unread");
+        assert_eq!(held.last_seen("ws_a"), None);
+        assert_eq!(
+            AppState::load_in(&held_dir).last_seen("ws_a").as_deref(),
+            Some("2026-10-27T10:00:00Z"),
+            "and read once the hold ends"
+        );
+
+        // A file that parses is read; one that doesn't is set aside, which isn't unread.
         let other = env.app_state_dir("other");
         std::fs::create_dir_all(&other).unwrap();
         record_first_start(&other).unwrap();
         assert!(!AppState::load_in(&other).unread());
+        std::fs::write(other.join("state.json"), "{nope").unwrap();
+        assert!(!AppState::load_in(&other).unread());
+    }
+
+    /// A state that didn't parse is set aside, and says so once: the start isn't a first start, as
+    /// `is_first_start` reads it (a later load finds no file).
+    #[test] // spec: P4a-R16
+    fn a_state_set_aside_says_so_and_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let app_dir = env.app_state_dir("image");
+        assert!(!AppState::load_in(&app_dir).was_set_aside(), "no file");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        record_first_start(&app_dir).unwrap();
+        assert!(!AppState::load_in(&app_dir).was_set_aside(), "a good file");
+        // Not parsing, another version, and not UTF-8.
+        for (n, bytes) in [
+            (1, b"{nope".to_vec()),
+            (2, br#"{"state": 99, "workspaces": {}}"#.to_vec()),
+            (3, vec![b'{', 0xFF, b'}']),
+        ] {
+            std::fs::write(app_dir.join("state.json"), bytes).unwrap();
+            let mut state = AppState::load_in(&app_dir);
+            assert!(state.was_set_aside(), "case {n}");
+            assert!(!state.unread(), "case {n}: writes aren't refused");
+            state.set_last_seen("ws_a", "2026-10-28T10:00:00Z").unwrap();
+            assert!(
+                !AppState::load_in(&app_dir).was_set_aside(),
+                "case {n}: once"
+            );
+        }
+    }
+
+    /// What Home asks, from one load: the time, and whether a missing one was lost.
+    #[test] // spec: P4a-R16
+    fn the_kept_time_says_whether_an_empty_one_was_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let app_dir = env.app_state_dir("image");
+        // Nothing yet: a first run.
+        assert_eq!(kept_time(&app_dir, "ws_a"), (String::new(), false));
+        let mut state = AppState::load_in(&app_dir);
+        state.set_last_seen("ws_a", "2026-10-27T10:00:00Z").unwrap();
+        assert_eq!(
+            kept_time(&app_dir, "ws_a"),
+            ("2026-10-27T10:00:00Z".to_string(), false)
+        );
+        // Another workspace of a file that reads: a first run for it.
+        assert_eq!(kept_time(&app_dir, "ws_b"), (String::new(), false));
+        // A time that doesn't read is none, and not lost.
+        state.set_last_seen("ws_c", "yesterday").unwrap();
+        assert_eq!(kept_time(&app_dir, "ws_c"), (String::new(), false));
+        // Held: lost, from the one load.
+        let holder = hold(&app_dir.join("state.json"), 0, 500);
+        assert_eq!(kept_time(&app_dir, "ws_a"), (String::new(), true));
+        holder.join().unwrap();
+        // A folder of that name, and a file that doesn't parse (once).
+        let bad = env.app_state_dir("bad");
+        std::fs::create_dir_all(bad.join("state.json")).unwrap();
+        assert_eq!(kept_time(&bad, "ws_a"), (String::new(), true));
+        let torn = env.app_state_dir("torn");
+        std::fs::create_dir_all(&torn).unwrap();
+        std::fs::write(torn.join("state.json"), "{nope").unwrap();
+        assert_eq!(kept_time(&torn, "ws_a"), (String::new(), true));
     }
 
     #[test] // spec: APP-022

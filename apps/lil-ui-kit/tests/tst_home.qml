@@ -167,8 +167,11 @@ TestCase {
             else if (c.name === "jobs.list")
                 outcome = core.jobsListAnswer(c.args, s.jobs, [Shapes.lane(), Shapes.lane({lane: "cpu"})])
             else if (c.name === "app/confirmations.list")
-                // The core's own range (lil_protocol::app): 1 to 500, 100 when none is asked for.
-                outcome = Shapes.confirmations(s.pending.slice(0, c.args.limit || 100))
+                // The core's own range (lil_protocol::app): 1 to 500, 100 when none is asked for, and a
+                // refusal for any other.
+                outcome = c.args.limit !== undefined && !(c.args.limit >= 1 && c.args.limit <= 500)
+                    ? Shapes.refusal("params.invalid", "limit " + c.args.limit + " is not between 1 and 500")
+                    : Shapes.confirmations(s.pending.slice(0, c.args.limit || 100))
             if (outcome) {
                 answered[c.id] = true
                 core.respond(c.id, outcome)
@@ -1965,6 +1968,23 @@ TestCase {
         verify(panel.awayOn, "the card counts from somewhere")
         verify(panel.awayCard.visible, "and shows")
         compare(lineTexts(panel.awayCard), ["Finished · ComfyUI prompt · sketchbook · " + stamp(hourAgo)])
+    }
+
+    function test_a_state_that_did_not_parse_is_not_a_first_run() { // spec: P4a-R16
+        // Truncated by a crash: set aside at the start, which is a start with a past (Appendix G).
+        const dir = TestFiles.newDir("home-torn")
+        verify(TestFiles.write(dir + "/state.json", "{\"state\": 1, \"workspaces\": {\"ws"))
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        const hourAgo = isoAgo(3600 * 1000)
+        const s = scene({jobs: [Shapes.job("j_00000000000000a1", "succeeded",
+                                           {created: hourAgo, updated: hourAgo, project: "sketchbook"})]})
+        settle(core, panel, s)
+        verify(panel.awayOn, "the card counts from the look-back")
+        compare(lineTexts(panel.awayCard), ["Finished · ComfyUI prompt · sketchbook · " + stamp(hourAgo)])
+        verify(TestFiles.list(dir).some(f => f.indexOf("state.json.bad-") === 0), "the file was set aside")
+        // The writes go on: it isn't an unreadable file.
+        keptMoved(core, s, dir, "ws1", null, 5000, "the time is written")
     }
 
     function test_a11y_walk_passes() { // spec: APP-156
