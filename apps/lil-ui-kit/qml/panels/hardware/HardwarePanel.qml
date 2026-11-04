@@ -6,9 +6,12 @@
 //   event carries the whole snapshot and replaces it, unless it is older than the one shown
 //   (events can overtake one another); `alert` and `alert_cleared` change the alerts at once, and
 //   the next sample's `alerts` are the state again. A `snapshot` of the topic is the state too,
-//   and like `resync_required` it loads everything again. It never reloads on `ready`, but for a
-//   first load that failed (the session wasn't connected yet). The cards' rows are fixed items
-//   bound to the snapshot, updated in place every second, never rebuilt.
+//   and like `resync_required` it loads everything again. Nothing is read while the session isn't
+//   connected (it would only fail, and warn of the connecting): `ready` loads everything for a
+//   first load that hasn't landed, and otherwise only the chart history whose last read failed or
+//   never landed (the outage cost it). The cards' rows are fixed items bound to the snapshot,
+//   updated in place every second, never rebuilt. Before the first sample the core's snapshot is
+//   empty: the CPU load and the RAM total show only once they are read.
 // - **Charts.** One `telemetry.series` call loads every chart for the window, at
 //   Hardware.resolutionFor(window) (1 s up to an hour, else 1 min), from `to` minus the window
 //   plus two steps, so a range stays under the tool's 3,600 points even with a clock running a
@@ -49,8 +52,11 @@ Rectangle {
     property var snapshot: null
     // Whether a snapshot has been loaded, so a later `ready` never reloads.
     property bool loaded: false
-    // The last failure to show, "" for none.
-    property string problem: ""
+    // The last failure to show, "" for none: a failed snapshot read's, else a failed history
+    // read's. Each goes when a read of its own kind succeeds.
+    property string _snapshotProblem: ""
+    property string _seriesProblem: ""
+    readonly property string problem: _snapshotProblem !== "" ? _snapshotProblem : _seriesProblem
 
     readonly property var gpu: snapshot ? snapshot.gpu || null : null
     readonly property var cpu: snapshot ? snapshot.cpu : null
@@ -84,6 +90,8 @@ Rectangle {
     ]
 
     property var _seriesCall: null
+    // The last history read landed for the window shown.
+    property bool _seriesLoaded: false
     // Set once made: a window change before that (its first value) loads nothing of its own.
     property bool _complete: false
     property var _snapshotCall: null
@@ -113,12 +121,19 @@ Rectangle {
     Connections {
         target: root.core
         function onConnectionChanged() {
-            if (root.core.connection === "ready" && !root.loaded)
+            if (root.core.connection !== "ready")
+                return
+            if (!root.loaded)
                 root.reload()
+            else if (!root._seriesLoaded)
+                root.loadSeries()
         }
     }
 
     function reload() {
+        // Not before the core is there: the reads would fail, and `ready` reads them.
+        if (!core || core.connection !== "ready")
+            return
         loadSnapshot()
         loadSeries()
         energy.reload()
@@ -136,16 +151,17 @@ Rectangle {
             owner: root,
             ok: out => {
                 root.loaded = true
-                root.problem = ""
+                root._snapshotProblem = ""
                 root.apply(out.structured)
             },
-            error: e => { root.problem = root.failure("The hardware can't be read now: ", e) }
+            error: e => { root._snapshotProblem = root.failure("The hardware can't be read now: ", e) }
         })
     }
 
     function loadSeries() {
         if (_seriesCall)
             _seriesCall.cancel()
+        _seriesLoaded = false
         const resolution = Hardware.resolutionFor(windowS)
         const step = resolution === "1s" ? 1000 : 60000
         const to = Date.now()
@@ -160,6 +176,8 @@ Rectangle {
             ok: out => {
                 if (window !== root.windowS)
                     return
+                root._seriesLoaded = true
+                root._seriesProblem = ""
                 const series = (out.structured && out.structured.series) || []
                 for (const s of series) {
                     const tile = root.chartTiles.find(t => t.metric === s.metric)
@@ -167,7 +185,7 @@ Rectangle {
                         tile.series.load(JSON.stringify(s.points))
                 }
             },
-            error: e => { root.problem = root.failure("The hardware history can't be read now: ", e) }
+            error: e => { root._seriesProblem = root.failure("The hardware history can't be read now: ", e) }
         })
     }
 
@@ -296,13 +314,39 @@ Rectangle {
 
     Flickable {
         id: flick
+        objectName: "figures"
         anchors.fill: parent
         contentWidth: width
         contentHeight: body.implicitHeight + 2 * Theme.spacing
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        // The keyboard scrolls it: one tab stop, then the arrows, Page Up and Page Down, Home and End.
+        activeFocusOnTab: true
+
+        Accessible.role: Accessible.Pane
+        Accessible.name: root.title + " figures"
 
         QQC.ScrollBar.vertical: QQC.ScrollBar {}
+
+        function scrollBy(dy) {
+            contentY = Math.max(0, Math.min(contentHeight - height, contentY + dy))
+        }
+
+        Keys.onUpPressed: scrollBy(-40)
+        Keys.onDownPressed: scrollBy(40)
+        Keys.onPressed: event => {
+            if (event.key === Qt.Key_PageUp)
+                scrollBy(-height)
+            else if (event.key === Qt.Key_PageDown)
+                scrollBy(height)
+            else if (event.key === Qt.Key_Home)
+                contentY = 0
+            else if (event.key === Qt.Key_End)
+                scrollBy(contentHeight)
+            else
+                return
+            event.accepted = true
+        }
 
         Column {
             id: body
@@ -315,7 +359,10 @@ Rectangle {
                 id: problemBanner
                 width: parent.width
                 kind: "warning"
-                onClosed: root.problem = ""
+                onClosed: {
+                    root._snapshotProblem = ""
+                    root._seriesProblem = ""
+                }
             }
 
             AlertsStrip {
@@ -446,8 +493,9 @@ Rectangle {
                         width: parent.width
                         spacing: 2
 
+                        // Before the first sample there is no per-core load: not a 0 %.
                         ValueRow {
-                            visible: !!root.cpu
+                            visible: !!root.cpu && root.cpu.per_core_permille.length > 0
                             label: "Load"
                             value: root.cpu ? Format.percent(root.cpu.util_permille / 10) : ""
                         }
@@ -496,8 +544,9 @@ Rectangle {
 
                     Column {
                         width: parent.width
+                        // Before the first sample the total is 0: not a "0 / 0 GiB".
                         ValueRow {
-                            visible: !!root.snapshot
+                            visible: !!root.snapshot && root.snapshot.ram.total_mib > 0
                             label: "In use"
                             value: root.snapshot ? Format.gibOf(root.snapshot.ram.used_mib, root.snapshot.ram.total_mib) : ""
                         }
@@ -625,6 +674,16 @@ Rectangle {
                 parts: root.snapshot ? root.snapshot.system_parts || [] : []
             }
         }
+    }
+
+    // The keyboard focus on the figures.
+    Rectangle {
+        objectName: "figuresRing"
+        visible: flick.activeFocus
+        anchors.fill: flick
+        color: "transparent"
+        border.color: Theme.focus
+        border.width: Theme.focusWidth
     }
 
     // A label and its value in a card.

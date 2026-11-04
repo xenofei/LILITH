@@ -238,7 +238,7 @@ LCard {
                     color: Theme.text
                     font.pixelSize: Theme.fontSize
                     font.bold: true
-                    elide: Text.ElideRight
+                    wrapMode: Text.Wrap
                 }
                 Text {
                     objectName: "energyGpu"
@@ -303,7 +303,7 @@ LCard {
                     text: root.jobLine(modelData)
                     color: Theme.textMuted
                     font.pixelSize: Theme.fontSize
-                    elide: Text.ElideRight
+                    wrapMode: Text.Wrap
                 }
             }
         }
