@@ -843,37 +843,54 @@ TestCase {
         compare(count("telemetry.energy"), 4)
         compare(count("telemetry.jobs"), 1)
         answer(fake, "telemetry.snapshot", snapshot())
-        // And loaded, a later ready loads nothing again.
+        answer(fake, "telemetry.series", {series: []})
+        // And loaded, with the history in, a later ready reads nothing again.
         fake.connection = "reconnecting"
         fake.connection = "ready"
         compare(count("telemetry.snapshot"), 1)
+        compare(count("telemetry.series"), 1)
     }
 
     function test_history_that_failed_during_an_outage_is_read_again_when_the_core_is_back() { // spec: APP-129
         const t = makePanel()
         answer(t.fake, "telemetry.snapshot", snapshot())
-        answer(t.fake, "telemetry.series", {series: []})
         const count = () => callsTo(t.fake, "telemetry.series").length
-        const before = count()
-        // The connection drops and a window is picked: the read fails.
+        compare(count(), 1)
+        // The connection drops with the history read open, and it fails.
         t.fake.connection = "reconnecting"
-        t.panel.windowS = 3600
-        compare(count(), before + 1)
-        verify(t.fake.respond(callsTo(t.fake, "telemetry.series")[before].id,
+        verify(t.fake.respond(callsTo(t.fake, "telemetry.series")[0].id,
                               {status: "error", error: {code: "core.unreachable", message: "not connected"}}))
         verify(t.panel.problem.indexOf("The hardware history can't be read now") === 0, t.panel.problem)
         verifyShows(t.panel, "The hardware history can't be read now", "the banner")
         // The same core comes back: the history is read again, and the warning goes with it.
         t.fake.connection = "ready"
-        compare(count(), before + 2, "ready reads the history again")
-        compare(callsTo(t.fake, "telemetry.series")[before + 1].args.resolution, "1s")
+        compare(count(), 2, "ready reads the history again")
         answer(t.fake, "telemetry.series", {series: []})
         compare(t.panel.problem, "")
         verify(!shows(t.panel, "The hardware history"), "the banner is gone")
         // A history that landed is not read again on the next ready.
         t.fake.connection = "reconnecting"
         t.fake.connection = "ready"
-        compare(count(), before + 2)
+        compare(count(), 2)
+    }
+
+    function test_a_window_picked_during_an_outage_reads_when_the_core_is_back() { // spec: APP-129
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        answer(t.fake, "telemetry.series", {series: []})
+        const count = () => callsTo(t.fake, "telemetry.series").length
+        t.fake.connection = "reconnecting"
+        t.panel.windowS = 3600
+        // The connection banner says it: no call that would fail, and no warning on top of it.
+        compare(count(), 1)
+        compare(t.panel.problem, "")
+        t.fake.connection = "ready"
+        compare(count(), 2, "ready reads the window that was picked")
+        const args = callsTo(t.fake, "telemetry.series")[1].args
+        compare(args.resolution, "1s")
+        compare(Date.parse(args.to) - Date.parse(args.from), 3600 * 1000 - 2000)
+        answer(t.fake, "telemetry.series", {series: []})
+        compare(t.panel.problem, "")
     }
 
     function test_a_snapshot_that_lands_does_not_hide_the_history_failing() { // spec: APP-129
@@ -885,6 +902,44 @@ TestCase {
         verify(t.panel.problem !== "")
         answer(t.fake, "telemetry.snapshot", snapshot())
         verify(t.panel.problem !== "", "the history is still missing")
+    }
+
+    function test_a_snapshot_read_that_failed_after_the_first_load_clears_with_a_sample() { // spec: APP-127
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", snapshot())
+        // A resync reads everything again, and the snapshot fails.
+        t.fake.emit("telemetry", "resync_required", null)
+        const reads = callsTo(t.fake, "telemetry.snapshot")
+        compare(reads.length, 2)
+        verify(t.fake.respond(reads[1].id, {status: "error", error: {code: "core.unreachable", message: "not connected"}}))
+        verify(t.panel.problem.indexOf("The hardware can't be read now") === 0, t.panel.problem)
+        // An older sample isn't a reading: the warning stays.
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({ts: "2026-10-28T11:59:00.000Z"})})
+        verify(t.panel.problem !== "", "an older sample is no reading")
+        // Samples are flowing again: the warning doesn't stay over live figures.
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({ts: "2026-10-28T12:00:05.000Z"})})
+        compare(t.panel.problem, "")
+        verify(!shows(t.panel, "The hardware can't be read now"), "the banner is gone")
+    }
+
+    function test_cards_claim_nothing_before_the_first_sample() { // spec: APP-127
+        const t = makePanel()
+        answer(t.fake, "telemetry.snapshot", emptySnapshot())
+        const card = name => named(t.panel, name)
+        for (const name of ["gpuCard", "ramCard", "disksCard", "networkCard"])
+            verifyShows(card(name), "…", name)
+        verify(!shows(card("gpuCard"), "No GPU reading"), "no GPU claim")
+        verify(!shows(card("networkCard"), "No network adapter"), "no adapter claim")
+        verify(!shows(card("disksCard"), "not measured"), "no size claim")
+        // The first sample: the readings, and a PC with no GPU and no adapter says so.
+        t.fake.emit("telemetry", "event", {kind: "sample", snapshot: snapshot({gpu: undefined, net: [],
+                                                                            sizes: {}, ts: "2026-10-28T12:00:05.000Z"})})
+        for (const name of ["gpuCard", "ramCard", "disksCard", "networkCard"])
+            verify(!shows(card(name), "…"), name + " has its reading: " + JSON.stringify(texts(card(name))))
+        verifyShows(card("gpuCard"), "No GPU reading", "GPU")
+        verifyShows(card("networkCard"), "No network adapter reported.", "Network")
+        verifyShows(card("disksCard"), "not measured", "Disks")
+        verifyShows(card("ramCard"), "41 / 64 GiB", "RAM")
     }
 
     function test_the_keyboard_scrolls_the_figures() { // spec: APP-156

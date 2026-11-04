@@ -7,11 +7,13 @@
 //   (events can overtake one another); `alert` and `alert_cleared` change the alerts at once, and
 //   the next sample's `alerts` are the state again. A `snapshot` of the topic is the state too,
 //   and like `resync_required` it loads everything again. Nothing is read while the session isn't
-//   connected (it would only fail, and warn of the connecting): `ready` loads everything for a
-//   first load that hasn't landed, and otherwise only the chart history whose last read failed or
-//   never landed (the outage cost it). The cards' rows are fixed items bound to the snapshot,
-//   updated in place every second, never rebuilt. Before the first sample the core's snapshot is
-//   empty: the CPU load and the RAM total show only once they are read.
+//   connected (it would only fail, and warn of the connecting; that goes for a window picked in an
+//   outage too): `ready` loads everything for a first load that hasn't landed, and otherwise only
+//   the chart history whose last read failed or never landed (the outage cost it). A warning for a
+//   failed read goes when a read of its kind lands, and a failed snapshot's also with the next
+//   sample. The cards' rows are fixed items bound to the snapshot, updated in place every second,
+//   never rebuilt. Before the first sample the core's snapshot is empty: the cards show "…" for
+//   what it lacks (`sampled`), and claim no missing GPU, adapter or size.
 // - **Charts.** One `telemetry.series` call loads every chart for the window, at
 //   Hardware.resolutionFor(window) (1 s up to an hour, else 1 min), from `to` minus the window
 //   plus two steps, so a range stays under the tool's 3,600 points even with a clock running a
@@ -60,6 +62,10 @@ Rectangle {
 
     readonly property var gpu: snapshot ? snapshot.gpu || null : null
     readonly property var cpu: snapshot ? snapshot.cpu : null
+    // A sample has been read. The core's snapshot before its first sample is empty (no per-core load,
+    // no RAM total, no GPU, adapters or sizes): what it lacks was never read, so the cards show "…"
+    // for it and claim nothing.
+    readonly property bool sampled: !!snapshot && !!cpu && (cpu.per_core_permille.length > 0 || snapshot.ram.total_mib > 0)
 
     // The charts, in order, as they are made.
     property var chartTiles: []
@@ -162,6 +168,9 @@ Rectangle {
         if (_seriesCall)
             _seriesCall.cancel()
         _seriesLoaded = false
+        // Not before the core is there: the call would fail, and `ready` reads it.
+        if (!core || core.connection !== "ready")
+            return
         const resolution = Hardware.resolutionFor(windowS)
         const step = resolution === "1s" ? 1000 : 60000
         const to = Date.now()
@@ -197,6 +206,8 @@ Rectangle {
         if (snapshot && s.ts < snapshot.ts)
             return
         snapshot = s
+        // A reading that is applied is the state, whatever failed before it.
+        _snapshotProblem = ""
         alerts.setAll(s.alerts || [], s.ts, seq)
         if (append) {
             const ts = Date.parse(s.ts)
@@ -418,8 +429,8 @@ Rectangle {
 
                         Text {
                             visible: !root.gpu
-                            text: root.snapshot ? "No GPU reading: no NVIDIA GPU was found, or it can't be read."
-                                                : "…"
+                            text: root.sampled ? "No GPU reading: no NVIDIA GPU was found, or it can't be read."
+                                               : "…"
                             width: parent.width
                             wrapMode: Text.Wrap
                             color: Theme.textMuted
@@ -544,6 +555,12 @@ Rectangle {
 
                     Column {
                         width: parent.width
+                        Text {
+                            visible: !root.sampled
+                            text: "…"
+                            color: Theme.textMuted
+                            font.pixelSize: Theme.fontSize
+                        }
                         // Before the first sample the total is 0: not a "0 / 0 GiB".
                         ValueRow {
                             visible: !!root.snapshot && root.snapshot.ram.total_mib > 0
@@ -561,6 +578,12 @@ Rectangle {
                     Column {
                         width: parent.width
                         spacing: 2
+                        Text {
+                            visible: !root.sampled
+                            text: "…"
+                            color: Theme.textMuted
+                            font.pixelSize: Theme.fontSize
+                        }
                         // By count, so a sample updates the rows in place.
                         Repeater {
                             model: root.snapshot ? root.snapshot.disks.length : 0
@@ -572,13 +595,13 @@ Rectangle {
                             }
                         }
                         ValueRow {
-                            visible: !!root.snapshot
+                            visible: root.sampled
                             label: "Workspace"
                             value: root.snapshot && root.snapshot.sizes.workspace_mib !== undefined
                                    ? Format.gib(root.snapshot.sizes.workspace_mib) : "not measured"
                         }
                         ValueRow {
-                            visible: !!root.snapshot
+                            visible: root.sampled
                             label: "Models"
                             value: root.snapshot && root.snapshot.sizes.models_mib !== undefined
                                    ? Format.gib(root.snapshot.sizes.models_mib) : "not measured"
@@ -595,7 +618,13 @@ Rectangle {
                         width: parent.width
                         spacing: 2
                         Text {
-                            visible: !!root.snapshot && root.snapshot.net.length === 0
+                            visible: !root.sampled
+                            text: "…"
+                            color: Theme.textMuted
+                            font.pixelSize: Theme.fontSize
+                        }
+                        Text {
+                            visible: root.sampled && root.snapshot.net.length === 0
                             text: "No network adapter reported."
                             color: Theme.textMuted
                             font.pixelSize: Theme.fontSize
