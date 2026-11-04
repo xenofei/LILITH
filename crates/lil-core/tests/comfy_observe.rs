@@ -653,6 +653,9 @@ async fn engines_topic_says_when_the_inventory_and_the_capture_are_kept() {
     let inventory = seen.last().unwrap();
     assert_eq!(inventory["kind"], "status", "{inventory}");
     assert_eq!(inventory["engine"]["inventory"]["models"], 1, "{inventory}");
+    // The panel's models.report read waits on this: the table names a models folder.
+    assert_eq!(inventory["engine"]["models_root_set"], true, "{inventory}");
+    assert!(rig.comfy().await.models_root_set);
     let refreshed = &inventory["engine"]["inventory"]["refreshed"];
     assert_eq!(
         refreshed,
@@ -675,6 +678,13 @@ async fn engines_topic_says_when_the_inventory_and_the_capture_are_kept() {
         .filter(|w| w[0]["engine"] == w[1]["engine"])
         .count();
     assert_eq!(repeats, 1, "one status for the kept capture: {statuses:?}");
+    rig.close().await;
+
+    // An [engines.comfyui] table with no root names no models folder.
+    let env = TestEnv::new();
+    attach(&env, &fake, false);
+    let rig = Rig::new(&env);
+    assert!(!rig.comfy().await.models_root_set);
     rig.close().await;
 }
 

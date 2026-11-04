@@ -486,6 +486,107 @@ TestCase {
         compare(callsOf(core, "diagnostics.recent").length, reads + 1)
     }
 
+    // PROTO-1: a refused session's read is recorded as an error, which is an event, which read again.
+    // After a failed read the card reads again for events only as its backoff allows (1 s, doubling to
+    // a cap), requests inside the window coalesced into one read at its end, and it recovers by itself
+    // once a read works. The windows are timed from each failure, which the test answers itself.
+    function test_a_failing_errors_read_backs_off_up_to_a_cap_and_recovers() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        panel.errors.errorsRead.backoffMaxMs = 2000
+        const refused = failed({code: "state.unavailable", message: "The workspace state can't be opened."})
+        const event = () => core.emit("diagnostics", "event", {kind: "error", code: "state.unavailable", at: "2026-10-30T10:00:00Z"})
+        const calls = () => callsOf(core, "diagnostics.recent").length
+        const recent = isTool("diagnostics.recent")
+        load(core)
+        tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
+        const base = calls()
+
+        // The first failure. A burst right after it, inside its 1 s window, reads nothing; at the
+        // window's end, one read.
+        event()
+        answer(core, recent, refused)
+        for (let n = 0; n < 3; ++n)
+            event()
+        wait(400)
+        compare(calls(), base + 1, "no 1 Hz loop: nothing inside the window")
+        tryVerify(() => calls() === base + 2, 3000)
+
+        // An event arrives while that read is open, and the read fails: the window is 2 s now, and the
+        // failed read schedules no re-read of its own.
+        event()
+        answer(core, recent, refused)
+        wait(1300)
+        compare(calls(), base + 2, "a failed read never re-reads at once; its window is longer now")
+        tryVerify(() => calls() === base + 3, 3000)
+
+        // It fails again: 4 s without a cap, 2 s with it.
+        answer(core, recent, refused)
+        event()
+        tryVerify(() => calls() === base + 4, 2600, "the window stops growing at its cap")
+
+        // The cause has cleared: the read works, with no reconnect or re-show.
+        verify(shows(panel.errors, "The workspace state can't be opened."), "the warning was shown: " + texts(panel.errors).join(" | "))
+        answer(core, recent, ok({errors: []}))
+        verify(!shows(panel.errors, "The workspace state can't be opened."), texts(panel.errors).join(" | "))
+    }
+
+    // A refused read is not recorded, so no topic event follows it: the window's end reads again by
+    // itself (while the panel is shown), and the card shows the answer once the cause has cleared.
+    function test_a_failed_errors_read_is_retried_when_its_window_ends_with_no_event() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        const message = "This core serves only the default workspace."
+        load(core, {"diagnostics.recent": failed({code: "workspace.unsupported", message: message})})
+        tryVerify(() => shows(panel.errors, message), 5000, texts(panel.errors).join(" | "))
+        const reads = callsOf(core, "diagnostics.recent").length
+        // No event at all: the 1 s window's end is the retry.
+        tryVerify(() => callsOf(core, "diagnostics.recent").length === reads + 1, 3000, "no retry")
+        // The default is back: the retry works, and the card shows it.
+        answer(core, isTool("diagnostics.recent"), ok({errors: []}))
+        tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
+        verify(!shows(panel.errors, message))
+        // A success ends the retries.
+        wait(1500)
+        compare(callsOf(core, "diagnostics.recent").length, reads + 1, "no retry after a success")
+    }
+
+    // Only Recent errors retries on its own: a refusal of the other cards' reads is recorded, so a retry at
+    // each window's end would put one entry a minute (and more) in the ring for each of them.
+    function test_a_failing_card_other_than_recent_errors_isnt_retried_with_no_event() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        load(core, {"telemetry.snapshot": failed({code: "workspace.unsupported", message: "This core serves only the default workspace."})})
+        const reads = callsOf(core, "telemetry.snapshot").length
+        wait(1800)
+        compare(callsOf(core, "telemetry.snapshot").length, reads, "no read at the end of its window with no event")
+    }
+
+    // Hiding the panel forgets how long its card has been failing: after a show, the first failure's
+    // window is the shortest again.
+    function test_hiding_the_panel_resets_the_backoff() { // spec: ARCH-121, APP-033
+        const core = makeCore()
+        const panel = makePanel(core)
+        panel.errors.errorsRead.backoffMaxMs = 2000
+        const refused = failed({code: "state.unavailable", message: "The workspace state can't be opened."})
+        const event = () => core.emit("diagnostics", "event", {kind: "error", code: "state.unavailable", at: "2026-10-30T10:00:00Z"})
+        const calls = () => callsOf(core, "diagnostics.recent").length
+        const recent = isTool("diagnostics.recent")
+        load(core)
+        tryVerify(() => shows(panel.errors, "No errors since the core started"), 5000)
+        event()
+        answer(core, recent, refused)
+
+        // Away and back: the show reads, and it fails. Reset, its window is 1 s; not reset, 2 s.
+        panel.visible = false
+        tryVerify(() => !panel.shown, 5000)
+        panel.visible = true
+        answer(core, recent, refused)
+        const reads = calls()
+        event()
+        tryVerify(() => calls() === reads + 1, 1600, "the first window after a show is the shortest")
+    }
+
     // --- The event log --------------------------------------------------------------------------
 
     function test_event_log_keeps_the_newest_1000() { // spec: ARCH-121, APP-134

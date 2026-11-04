@@ -7,6 +7,18 @@
 //   apply as full state or to `request()` a read.
 // - `request()` is at most one read a second: the first of a burst at once, the rest as one read
 //   when the second has passed. Reads don't overlap.
+// - After a failed read (`error` set), a backoff window begins (`backoffStartMs`, doubling with each
+//   consecutive failure up to `backoffMaxMs`). Held to it, and coalesced into one read when it ends
+//   (while `active`): only a `request()` made from this ToolRead's own `topicEvent` while the window
+//   runs, and a request that was pending (made while the failing read was open) when the read failed. A
+//   failed read never schedules its own re-read, so a failure that repeats reads once per window, not
+//   for each event (an event can itself be what a failed read reports). A window's end with nothing
+//   held reads only if `retryWhenWindowEnds` is true (default false); it is for a card whose refused
+//   read is recorded nowhere, so no event follows it. A successful read stops the retries and resets
+//   the window; hiding stops them too. An event during a read that succeeds still gets its one
+//   follow-up read. Not held to the window, and read at once (through the one-second gate): a sibling
+//   ToolRead's `request()` (from this one's `topicEvent`), a reload or snapshot, the session coming
+//   ready and the panel shown again.
 // - An answer can be older than an event: a card that applies an event as full state calls
 //   `eventApplied()`. `answered(structured, current)` then has `current` false for a read that was
 //   open at that moment, the card keeps the event's state, and a fresh read follows.
@@ -32,6 +44,10 @@ QtObject {
     property bool loaded: false
 
     readonly property int showIntervalMs: 2000
+    property int backoffStartMs: 1000
+    property int backoffMaxMs: 30000
+    // The window's end reads even when no event or request was held (see the header).
+    property bool retryWhenWindowEnds: false
 
     signal topicEvent(var data)
     signal reloading()
@@ -44,6 +60,9 @@ QtObject {
     property int _events: 0
     property int _eventsAtStart: 0
     property var _subscription: null
+    property bool _inEvent: false
+    property bool _eventDue: false
+    property int _failDelayMs: 0
 
     function eventApplied() {
         _events++
@@ -62,6 +81,9 @@ QtObject {
                 const current = root._events === root._eventsAtStart
                 root.result = r.structured || null
                 root.error = null
+                root._failDelayMs = 0
+                root._eventDue = false
+                root._backoff.stop()
                 // Before `loaded`, so what follows `loaded` sees the card's new state.
                 root.answered(root.result, current)
                 root.loaded = true
@@ -71,6 +93,15 @@ QtObject {
             },
             error: e => {
                 root.error = e
+                root._failDelayMs = root._failDelayMs === 0 ? root.backoffStartMs
+                                                            : Math.min(root._failDelayMs * 2, root.backoffMaxMs)
+                root._backoff.interval = root._failDelayMs
+                root._backoff.restart()
+                // A request that came while this read was open waits for the window, never read now.
+                if (root._due) {
+                    root._due = false
+                    root._eventDue = true
+                }
                 root._settled()
             }
         })
@@ -87,6 +118,10 @@ QtObject {
     function request() {
         if (!active)
             return
+        if (_inEvent && error && !_reading && _backoff.running) {
+            _eventDue = true
+            return
+        }
         if (_gate.running) {
             _due = true
             return
@@ -98,9 +133,14 @@ QtObject {
     function _shown() {
         if (topic !== "" && !_subscription) {
             _subscription = CoreCall.subscribe(core, topic, root, (kind, seq, data) => {
-                if (kind === "event")
-                    root.topicEvent(data)
-                else {
+                if (kind === "event") {
+                    root._inEvent = true
+                    try {
+                        root.topicEvent(data)
+                    } finally {
+                        root._inEvent = false
+                    }
+                } else {
                     root.request()
                     root.reloading()
                 }
@@ -120,6 +160,9 @@ QtObject {
             _subscription = null
         }
         _gate.stop()
+        _backoff.stop()
+        _eventDue = false
+        _failDelayMs = 0
         _due = false
         _showDue = false
     }
@@ -141,6 +184,16 @@ QtObject {
             root._due = false
             root.read()
             start()
+        }
+    }
+
+    property Timer _backoff: Timer {
+        // `request()` reads nothing while not `active`.
+        onTriggered: {
+            const held = root._eventDue
+            root._eventDue = false
+            if (held || root.retryWhenWindowEnds)
+                root.request()
         }
     }
 

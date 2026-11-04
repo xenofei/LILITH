@@ -445,7 +445,7 @@ impl Comfy {
     }
 
     /// Probes the asset catalogue when the engine becomes ready (ARCH-065; Appendix G), and
-    /// again after a probe that failed to connect, timed out or got a 5xx, at least
+    /// again after a probe that didn't settle (anything but an answer or a 404), at least
     /// [`CATALOGUE_RETRY_AFTER`] later and at most [`CATALOGUE_PROBES`] times per readiness
     /// epoch, until an answer stands; publishes the status once it is `on` or `off`. Called by a
     /// supervisor pass that found the engine ready.
@@ -1495,4 +1495,153 @@ fn start_failed(message: String, tail: Vec<String>) -> ErrorBody {
     let mut error = ErrorBody::new(&codes::COMFYUI_START_FAILED, message, "");
     error.detail = output_tail_detail(&tail);
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use lil_platform::fs::SystemProbe;
+    use lil_platform::sockets::OsSockets;
+    use lil_platform::{Clock, IdSource};
+    use lil_testkit::{FakeClock, SeqIds, TestEnv};
+
+    use super::*;
+    use crate::meter::{UsageCtx, UsageDraft};
+    use crate::state::StateRegistry;
+    use crate::store::FailPoints;
+    use crate::telemetry::{HwSources, PowerSettings, TickMode};
+    use crate::workspace::WorkspaceHub;
+
+    /// A usage sink that keeps nothing.
+    struct NoUsage;
+
+    impl UsageSink for NoUsage {
+        fn record<'a>(
+            &'a self,
+            _u: UsageDraft,
+            _ctx: UsageCtx,
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    fn inventory(models: usize) -> Inventory {
+        let file = |n: usize| super::super::inventory::ModelFile {
+            path: format!(r"checkpoints\m{n}.safetensors"),
+            size: 4,
+            sha256: None,
+            family: None,
+            file_key: None,
+        };
+        Inventory {
+            files: (0..models).map(file).collect(),
+            refreshed: "2026-10-30T10:00:00Z".to_string(),
+            argv: Vec::new(),
+        }
+    }
+
+    /// Reads the `engines` topic's events up to a marker published after them: their kinds.
+    async fn kinds_until_marker(
+        events: &EventBus,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> Vec<String> {
+        events.publish(TOPIC, json!({"kind": "marker"}));
+        let mut kinds = Vec::new();
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("the marker arrives")
+                .expect("the stream stays open");
+            let line: Value = serde_json::from_str(&line).unwrap();
+            if line["params"]["topic"] != TOPIC {
+                continue;
+            }
+            let kind = line["params"]["data"]["kind"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if kind == "marker" {
+                return kinds;
+            }
+            kinds.push(kind);
+        }
+    }
+
+    /// DG-02: an inventory a job refreshed in a readiness epoch the engine has left since is only
+    /// `models.report`'s: no `status` event says it (it would carry no inventory to tell it by),
+    /// and the engine's current inventory stays none; the newest one of the run is kept. One of
+    /// the current epoch is told on the topic and is the current one.
+    #[tokio::test] // spec: CORE-130, CORE-164
+    async fn an_inventory_from_an_overtaken_epoch_is_only_the_reports() {
+        let env = TestEnv::new();
+        let states = Arc::new(StateRegistry::open(&env.env, Arc::new(|_: &str| {})).unwrap());
+        let clock: Arc<dyn Clock> = FakeClock::new();
+        let events = Arc::new(EventBus::new(clock.clone()));
+        let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
+        let hub = WorkspaceHub::new(
+            env.env.clone(),
+            states.clone(),
+            events.clone(),
+            clock.clone(),
+            ids.clone(),
+            FailPoints::none(),
+            Arc::new(SystemProbe),
+            Default::default(),
+        );
+        let jobs = Jobs::new(
+            states.clone(),
+            hub,
+            events.clone(),
+            clock.clone(),
+            ids,
+            FailPoints::none(),
+        );
+        let telemetry = Telemetry::start(
+            HwSources::none(),
+            env.env.local_dir().join("telemetry.db"),
+            clock.clone(),
+            PowerSettings::default(),
+            events.clone(),
+            TickMode::Manual,
+        );
+        let comfy = Comfy::new(
+            &env.env,
+            jobs,
+            telemetry,
+            events.clone(),
+            clock,
+            Arc::new(NoUsage),
+            Arc::new(OsSockets),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        events.attach(1, tx);
+        events
+            .subscribe(1, &[TOPIC.to_string()], &BTreeMap::new())
+            .await;
+        // The engine has become ready twice: epoch 1's job finishes in epoch 2.
+        comfy.ready.send_modify(|(epoch, ready)| {
+            *epoch = 2;
+            *ready = true;
+        });
+
+        comfy.set_inventory(1, inventory(3));
+        assert_eq!(
+            kinds_until_marker(&events, &mut rx).await,
+            Vec::<String>::new()
+        );
+        assert!(comfy.current_inventory().is_none());
+        assert_eq!(comfy.last_inventory().unwrap().files.len(), 3);
+
+        comfy.set_inventory(2, inventory(5));
+        assert_eq!(kinds_until_marker(&events, &mut rx).await, ["status"]);
+        assert_eq!(comfy.current_inventory().unwrap().files.len(), 5);
+        assert_eq!(comfy.last_inventory().unwrap().files.len(), 5);
+
+        let states = states.clone();
+        drop(comfy);
+        tokio::task::spawn_blocking(move || states.close())
+            .await
+            .unwrap();
+    }
 }

@@ -613,8 +613,8 @@ impl ComfyClient {
     /// Appendix G), within [`CATALOGUE_TIMEOUT`]: `Some` for an answer that stands
     /// ([`Catalogue::Unknown`] for a missing route, an older ComfyUI's 404, or a JSON answer
     /// without `assets`), `None` for any other failure (no connection, a timeout, another 4xx,
-    /// a 5xx, an answer that isn't JSON), so it may be asked again. `/api/assets` is never asked: ComfyUI registers it even when the catalogue
-    /// is off.
+    /// a 5xx, an answer that isn't JSON), so it may be asked again. `/api/assets` is never asked:
+    /// ComfyUI registers it even when the catalogue is off.
     pub async fn asset_catalogue(&self) -> Option<Catalogue> {
         let answer = tokio::time::timeout(CATALOGUE_TIMEOUT, self.get_json("api/features")).await;
         match answer {
