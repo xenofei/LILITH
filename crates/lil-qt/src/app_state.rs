@@ -84,6 +84,12 @@ impl AppState {
         }
     }
 
+    /// The file is there and couldn't be read, so [`AppState::last_seen`] says nothing of what it
+    /// holds: a workspace with no time here may have had one.
+    pub fn unread(&self) -> bool {
+        self.unread
+    }
+
     /// When workspace `ws` was last seen in this app (RFC 3339), if ever.
     pub fn last_seen(&self, ws: &str) -> Option<String> {
         self.workspaces.get(ws).map(|s| s.last_seen_at.clone())
@@ -359,6 +365,28 @@ mod tests {
             Some("2026-10-27T10:00:00Z")
         );
         read.set_last_seen("ws_b", "2026-10-28T10:00:00Z").unwrap();
+    }
+
+    /// A `state.json` that can't be read (here a folder of that name, which gives PermissionDenied,
+    /// not NotFound) is told apart from one that isn't there, so Home needn't take it for a first run.
+    #[test] // spec: P4a-R16
+    fn a_state_that_cannot_be_read_is_not_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let app_dir = env.app_state_dir("image");
+        assert!(
+            !AppState::load(&env, "image").unread(),
+            "no file is no state, and not an unreadable one"
+        );
+        std::fs::create_dir_all(app_dir.join("state.json")).unwrap();
+        let state = AppState::load_in(&app_dir);
+        assert!(state.unread());
+        assert_eq!(state.last_seen("ws_a"), None);
+        // A file that parses is read.
+        let other = env.app_state_dir("other");
+        std::fs::create_dir_all(&other).unwrap();
+        record_first_start(&other).unwrap();
+        assert!(!AppState::load_in(&other).unread());
     }
 
     #[test] // spec: APP-022
