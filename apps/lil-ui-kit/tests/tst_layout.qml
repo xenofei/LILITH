@@ -380,12 +380,18 @@ TestCase {
     }
 
     function test_window_title_names_the_project() { // spec: APP-164
+        // The title follows the bar's project, and with no workspace there is no project (APP-016).
         const shell = makeShell("")
+        compare(shell.title, "LILITH")
+        // Another workspace forgets the project (ARCH-088), so it is set after.
+        fake.workspace = {id: "ws1", path: "D:/art/harbor"}
+        fake.project = "sketchbook"
         compare(shell.title, "LILITH — sketchbook")
         fake.project = "storyboard"
         compare(shell.title, "LILITH — storyboard")
         fake.project = ""
         compare(shell.title, "LILITH")
+        fake.workspace = null
         fake.project = "sketchbook"
     }
 

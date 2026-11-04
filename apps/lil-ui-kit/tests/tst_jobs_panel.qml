@@ -1176,6 +1176,16 @@ TestCase {
         verify(t.panel.banner.visible, "the refusal shows")
     }
 
+    function test_a_clock_set_back_does_not_freeze_the_lane_control() { // spec: APP-114, CORE-160
+        // The guard compares with the time of the lane's last answer, which a clock set back makes
+        // later than now: the control must not wait that out.
+        const t = load({jobs: [job("j1")]})
+        const header = t.panel.laneHeader("gpu-heavy")
+        t.panel._laneAnswered["gpu-heavy"] = Date.now() + 3600000
+        button(header, "Pause").click()
+        compare(callsOf(t.core, c => c.kind === "appCall").length, 1)
+    }
+
     function test_an_event_waiting_for_its_frame_outlives_a_read_that_missed_it() { // spec: APP-114
         const t = load({jobs: [job("j1")]})
         const reads = callsOf(t.core, isRunningRead).length

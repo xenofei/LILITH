@@ -10,14 +10,20 @@
 //   doesn't parse counts as exceeded and calls are refused, so "Cap invalid" takes over from the
 //   figure. The `caps` topic says nothing about spend between alerts, so `caps.get` is read again on
 //   `caps` and `usage` events and when a job ends, at most once a second. A failed read is asked
-//   again after 1 s, doubling up to 30 s while connected, and at once on `ready` while it has none.
-// - **GPU** ("GPU 63 % · 9.5/16 GiB · 71 °C"): the `telemetry` topic's samples, whose throttle is
+//   again after 1 s, doubling up to 30 s while connected, and at once on `ready` while it has none. While
+//   a read has failed, the figure is muted and its name says it isn't current; if the first one failed,
+//   "Spend —" stands for it.
+// - **GPU** ("GPU 63 % · 9.5 / 16 GiB · 71 °C"): the `telemetry` topic's samples, whose throttle is
 //   Core's (APP-027).
 // - **Connection:** `Core.connection` in words. While connected, the core can still refuse this
 //   session: another client moved the default (`lil workspace use`, an agent), and it serves only
 //   the default. `movedReason` says so, from the `workspace` topic's `default_changed`, or from any
 //   read here refused with `workspace.unsupported` (a hand-edited suite.toml publishes nothing); the
-//   connection banner and both switchers then offer "Use the default workspace". A new hello ends it.
+//   connection banner and both switchers then offer "Use the default workspace". A new hello ends it,
+//   and so does a read made after the refusal and served again (suite.toml edited back by hand, which
+//   publishes nothing): while it stands the bar asks again with a backoff. A "Make this the default"
+//   whose own hello then fails is such a refusal too (`defaultSwitchFailed`), and the notice it
+//   raised goes with it.
 //
 // Without a connection no figure is live: the GPU and the jobs read "—", the spend is muted, and the
 // badge goes. While the core refuses this session the jobs and the spend do the same; the GPU's
@@ -90,12 +96,22 @@ Rectangle {
     property bool _capsReading: false
     property bool _capsDue: false
     property bool _capsFailed: false
+    // The last caps.get ended in an error while connected (not a read skipped for want of a connection).
+    property bool _capsReadFailed: false
     property int _capsRetryMs: 0
     // What `notice` holds from the pause control: "wait" (a press had to wait; it goes when the wait
     // is over), "refusal" (it goes with the next attempt), else "" (not the pause control's: stays).
     property string _pauseNotice
     // See the header. Shown text; empty while the core serves this session.
     property string movedReason
+    // How many refusals the bar has been told of: a read made before the last one doesn't speak for
+    // the core as it is now, and doesn't end the refusal.
+    property int _refusals: 0
+    // The notice on the bar is the switcher's "couldn't switch to it", raised with a refusal: it goes
+    // when that refusal ends.
+    property bool _defaultNotice: false
+    // The GPU lane's pause as it was when the pause control's notice was raised ("refusal").
+    property string _refusedPause
     // What the bar's items leave of its width: all of it pushes the indicators to the right. When
     // they don't all fit they wrap to a next line instead, so none is out of reach.
     readonly property real _spare: {
@@ -121,15 +137,24 @@ Rectangle {
     function spendText() {
         if (capInvalid)
             return "Cap invalid"
-        return capPermille >= 0 ? Math.floor(capPermille / 10) + " % of cap" : ""
+        if (capPermille >= 0)
+            return Math.floor(capPermille / 10) + " % of cap"
+        return _capsReadFailed && !capsView ? "Spend —" : ""
+    }
+
+    function spendName() {
+        if (capInvalid)
+            return "Spend this month: a cap's value can't be read, so calls are refused"
+        const said = "Spend this month: " + (capsView ? spendText() : "not known")
+        return _capsReadFailed ? said + ", not current: reading again" : said
     }
 
     function gpuText() {
         const g = coreReady && snapshot ? snapshot.gpu : null
         if (!g || !g.measured)
             return "GPU —"
-        return "GPU " + Format.percent(g.util_pct) + " · " + Format.oneDecimal(g.vram_used_mib / 1024) + "/"
-               + Format.oneDecimal(g.vram_total_mib / 1024) + " GiB · " + g.temp_c + " °C"
+        return "GPU " + Format.percent(g.util_pct) + " · " + Format.gibOf(g.vram_used_mib, g.vram_total_mib)
+               + " · " + g.temp_c + " °C"
     }
 
     function connectionText() {
@@ -138,6 +163,8 @@ Rectangle {
         case "connecting": return "Connecting…"
         case "reconnecting": return "Reconnecting…"
         case "incompatible": return "Core incompatible"
+        // The core words its own states (runtime.rs `unavailable_json`), the bar's and the banner's alike.
+        case "unavailable": return core.unavailable && core.unavailable.label ? core.unavailable.label : "Core unavailable"
         default: return "Core unavailable"
         }
     }
@@ -146,7 +173,9 @@ Rectangle {
     // once, so without that a double-click pauses and then resumes, withdrawing the prompts on the
     // way (as the Jobs panel's own control). The button stays enabled, so it keeps the focus.
     function togglePause() {
-        if (_pauseCall || Date.now() - _pauseAnswered < Qt.styleHints.mouseDoubleClickInterval)
+        // A clock set back makes the last answer later than now: that is no double-click.
+        const since = Date.now() - _pauseAnswered
+        if (_pauseCall || (since >= 0 && since < Qt.styleHints.mouseDoubleClickInterval))
             return
         if (!coreReady || !jobs.current) {
             showNotice(coreReady ? "Wait a moment: the state of GPU work is still loading."
@@ -171,6 +200,7 @@ Rectangle {
                                 + root.core.shownText(e && e.message ? String(e.message) : "the core didn't answer.", 300),
                                 "danger")
                 root._pauseNotice = "refusal"
+                root._refusedPause = root.pauseState()
             },
             pending: () => {
                 root._pauseCall = null
@@ -179,8 +209,14 @@ Rectangle {
         })
     }
 
+    // The GPU lane's pause, as a string to compare.
+    function pauseState() {
+        return gpuLane ? String(!!gpuLane.paused) + ":" + (gpuLane.reasons || []).join(",") : ""
+    }
+
     function showNotice(text, kind) {
         _pauseNotice = ""
+        _defaultNotice = false
         notice.kind = kind
         notice.show(text)
     }
@@ -190,10 +226,27 @@ Rectangle {
         return parts.length > 0 ? parts[parts.length - 1] : String(path || "")
     }
 
+    function refuse(text) {
+        _refusals++
+        movedReason = text
+    }
+
     // A read was refused with `workspace.unsupported`, while this switcher isn't moving the default.
+    // While a refusal already stands its words stay (another client's move says which folder; the
+    // core's own say to run a command): a later read refused only counts, so that a read made before
+    // it can't end the refusal.
     function noteRefused(message) {
-        if (!workspaceSwitcher.changingDefault())
-            movedReason = core.shownText(message, 300)
+        if (workspaceSwitcher.changingDefault())
+            return
+        if (movedReason !== "")
+            _refusals++
+        else
+            refuse(core.shownText(message, 300))
+    }
+
+    function movedWords(folder) {
+        return core.shownText(folder, 60)
+               + " became the default workspace, and this core serves only the default, so it refuses this one's calls."
     }
 
     function onWorkspaceEvent(kind, data) {
@@ -202,8 +255,28 @@ Rectangle {
         if (String(data.id) === String(core.workspace.id))
             movedReason = ""
         else if (!workspaceSwitcher.changingDefault())
-            movedReason = core.shownText(folderName(data.path), 60)
-                          + " became the default workspace, and this core serves only the default, so it refuses this one's calls."
+            refuse(movedWords(folderName(data.path)))
+    }
+
+    // The hello that follows "Make this the default" failed: the core serves only the new default
+    // now and refuses this session's calls, and the connection banner's way out must show, as it
+    // does for any other refusal. Its notice (the switcher's `noticed`, which came first) goes
+    // when the refusal does.
+    function onDefaultSwitchFailed(name) {
+        refuse(movedWords(name))
+        _defaultNotice = notice.visible
+    }
+
+    // A read made after the last refusal was served: the core serves this workspace again.
+    function served(epoch) {
+        if (movedReason !== "" && epoch === _refusals && !workspaceSwitcher.changingDefault())
+            movedReason = ""
+    }
+
+    function askCapsAgain() {
+        _capsRetryMs = _capsRetryMs === 0 ? 1000 : Math.min(_capsRetryMs * 2, 30000)
+        capsRetry.interval = _capsRetryMs
+        capsRetry.restart()
     }
 
     function readCaps() {
@@ -217,23 +290,30 @@ Rectangle {
         }
         _capsReading = true
         const asked = core.workspace ? String(core.workspace.id) : ""
+        const epoch = _refusals
         CoreCall.call(core, "caps.get", {}, {
             owner: root,
             ok: r => {
                 root.capsView = r.structured || null
                 root._capsFailed = false
+                root._capsReadFailed = false
                 root._capsRetryMs = 0
+                if (asked === (root.core.workspace ? String(root.core.workspace.id) : ""))
+                    root.served(epoch)
+                // Still refused: the read was from before the refusal, and nothing else will ask.
+                if (root.movedReason !== "" && root.coreReady)
+                    root.askCapsAgain()
                 root.capsRead()
             },
             error: e => {
                 root._capsFailed = true
+                // A call cut by the connection is not a failed read: `ready` reads again.
+                if (root.coreReady && !(e && e.code === "core.unreachable"))
+                    root._capsReadFailed = true
                 if (e && e.code === "workspace.unsupported" && asked === (root.core.workspace ? String(root.core.workspace.id) : ""))
                     root.noteRefused(String(e.message))
-                if (root.coreReady) {
-                    root._capsRetryMs = root._capsRetryMs === 0 ? 1000 : Math.min(root._capsRetryMs * 2, 30000)
-                    capsRetry.interval = root._capsRetryMs
-                    capsRetry.restart()
-                }
+                if (root.coreReady)
+                    root.askCapsAgain()
                 root.capsRead()
             }
         })
@@ -292,10 +372,28 @@ Rectangle {
         }
     }
 
+    // Nothing else asks while a refusal stands that no read of its own has made: ask, with a backoff.
+    onMovedReasonChanged: {
+        if (movedReason !== "" && coreReady && !_capsReading && !capsRetry.running)
+            askCapsAgain()
+        if (movedReason === "" && _defaultNotice) {
+            _defaultNotice = false
+            notice.close()
+        }
+    }
+
     Connections {
         target: jobs
         function onCurrentChanged() {
             if (jobs.current && root._pauseNotice === "wait") {
+                root._pauseNotice = ""
+                notice.close()
+            }
+        }
+        // A refusal of the pause control says what the pause was; once the GPU lane's pause is
+        // something else, it describes a state that is gone.
+        function onLaneUpdatesChanged() {
+            if (root._pauseNotice === "refusal" && root.pauseState() !== root._refusedPause) {
                 root._pauseNotice = ""
                 notice.close()
             }
@@ -305,8 +403,10 @@ Rectangle {
     TopBarJobs {
         id: jobs
         core: root.core
+        refusalEpoch: root._refusals
         onJobEnded: root.requestCapsRead()
         onWorkspaceRefused: message => root.noteRefused(message)
+        onServed: epoch => root.served(epoch)
     }
 
     Timer {
@@ -359,6 +459,7 @@ Rectangle {
                 ready: root.coreReady
                 movedReason: root.movedReason
                 onNoticed: (text, kind) => root.showNotice(text, kind)
+                onDefaultSwitchFailed: name => root.onDefaultSwitchFailed(name)
                 onWorkspaceRefused: message => root.noteRefused(message)
             }
 
@@ -410,9 +511,9 @@ Rectangle {
                 id: spendIndicator
                 visible: root.spendText() !== ""
                 text: root.spendText()
-                name: root.capInvalid ? "Spend this month: a cap's value can't be read, so calls are refused"
-                                      : "Spend this month: " + text
-                kind: !root.coreReady || root.movedReason !== "" ? "muted" : root.capInvalid ? "danger" : ""
+                name: root.spendName()
+                kind: !root.coreReady || root.movedReason !== "" ? "muted" : root.capInvalid ? "danger"
+                      : root._capsReadFailed ? "muted" : ""
             }
 
             StatusIndicator {

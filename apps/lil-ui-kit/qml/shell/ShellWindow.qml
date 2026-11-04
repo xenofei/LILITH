@@ -85,6 +85,7 @@ Window {
     signal gpuPauseToggleRequested()
 
     property alias topBar: topBar
+    property alias shortcuts: shortcuts
     property alias connectionBanner: connectionBanner
     property alias noWorkspaceBanner: noWorkspaceBanner
     property alias firstStartCard: firstStartCard
@@ -170,9 +171,9 @@ Window {
     width: 1280
     height: 800
     visible: false
-    // The project calls would really use: the chosen one, else what the core says it falls back to.
-    readonly property string _titleProject: core && core.project ? core.project
-                                            : topBar.projectSwitcher.effectiveProject
+    // The project the bar shows, by the bar's own rule and name (ProjectSwitcher.currentName).
+    readonly property string _titleProject: topBar.projectSwitcher.hasWorkspace && topBar.projectSwitcher.current !== ""
+                                            ? topBar.projectSwitcher.currentName : ""
     title: _titleProject !== "" ? "LILITH — " + _titleProject : "LILITH"
     color: Theme.bg
 
@@ -258,6 +259,7 @@ Window {
     }
 
     Instantiator {
+        id: shortcuts
         model: root.bindings
         delegate: Shortcut {
             required property var modelData
@@ -265,6 +267,8 @@ Window {
             context: Qt.ApplicationShortcut
             // App-wide shortcuts fire under a modal popup: they wait while a confirmation is open.
             enabled: OpenPrompts.count === 0
+            // A held Ctrl+Shift+P would pause GPU work and then resume it.
+            autoRepeat: modelData.action !== "gpu.toggle_pause"
             onActivated: root.runAction(modelData.action)
         }
     }
@@ -604,6 +608,12 @@ Window {
     }
 
     function runAction(action) {
+        // A switcher's list stays where it is when a panel takes the focus, and Escape no longer
+        // reaches it: close both (SwitcherPopup closes for presses, not for keys).
+        if (action !== "gpu.toggle_pause") {
+            topBar.workspaceSwitcher.popup.close()
+            topBar.projectSwitcher.popup.close()
+        }
         if (action === "panel.next")
             cyclePanel(1)
         else if (action === "panel.previous")

@@ -142,19 +142,45 @@ TestCase {
     }
 
     function test_incompatible_says_restart_the_core_when_it_is_idle() { // spec: APP-036, ARCH-023
+        // The core is older than this app (the app drains and replaces an older core itself, so this
+        // is a start that failed). After `lil core stop` nothing reconnects by itself; the way is
+        // Core.retryNow, whose attempt may start a core and so replaces the older one when it is idle.
+        const t = load()
+        const banner = t.shell.connectionBanner
+        t.core.applyState({connection: "incompatible", coreProtocol: "0.9"})
+        verify(banner.visible)
+        verify(banner.text.indexOf("Restart the core when it's idle") >= 0, banner.text)
+        verify(banner.text.indexOf("Try again") >= 0, "it says how: " + banner.text)
+        verify(banner.text.indexOf("reconnects by itself") < 0, "that is false here: " + banner.text)
+        verify(banner.text.indexOf("protocol 0.9") >= 0, banner.text)
+        compare(banner.kind, "danger")
+        verify(banner.retryButton.visible, "Try again is the way")
+        compare(banner.retryButton.text, "Try again")
+        for (const a of actionsOf(t.shell.contentItem))
+            verify(!a.enabled, "disabled: " + a.text)
+        compare(t.shell.topBar.connectionIndicator.text, "Core incompatible")
+        compare(walk.report(banner), [])
+        // Try again asks the session to attempt again, this time allowed to start a core.
+        compare(t.core.retries, 0)
+        waitForItemPolished(banner.retryButton.parent)
+        wait(50)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 1, "Core.retryNow")
+    }
+
+    function test_incompatible_with_a_newer_core_says_to_restart_the_app() { // spec: APP-036, ARCH-023
+        // The core is newer: this app's own `lil` can't drain it (an older client never does), so
+        // `lil core stop` would not help. What helps is restarting LILITH on its newer build (PROTO-4).
         const t = load()
         const banner = t.shell.connectionBanner
         t.core.applyState({connection: "incompatible", coreProtocol: "2.0"})
         verify(banner.visible)
-        verify(banner.text.indexOf("Restart the core when it's idle") >= 0, banner.text)
-        verify(banner.text.indexOf("lil core stop") >= 0, "it says how: " + banner.text)
-        verify(banner.text.indexOf("reconnects by itself") >= 0, banner.text)
+        verify(banner.text.indexOf("This app is older than the running core") >= 0, banner.text)
         verify(banner.text.indexOf("protocol 2.0") >= 0, banner.text)
+        verify(banner.text.indexOf("restart LILITH") >= 0 || banner.text.indexOf("Restart LILITH") >= 0, banner.text)
+        verify(banner.text.indexOf("lil core stop") < 0, "that can't help here: " + banner.text)
+        verify(!banner.retryButton.visible, "a newer core stays newer")
         compare(banner.kind, "danger")
-        verify(!banner.retryButton.visible, "the session goes on trying by itself")
-        for (const a of actionsOf(t.shell.contentItem))
-            verify(!a.enabled, "disabled: " + a.text)
-        compare(t.shell.topBar.connectionIndicator.text, "Core incompatible")
         compare(walk.report(banner), [])
     }
 
@@ -204,7 +230,8 @@ TestCase {
         verify(!banner.visible)
 
         // A refusal marked `never` can't be retried.
-        t.core.applyState({connection: "unavailable", unavailable: {reason: "No.", cause: "refused", code: "core.refused", retry: "never"}})
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "No.", cause: "refused", code: "core.refused", retry: "never",
+                                                                        label: "Core unavailable", lead: "The core isn't available"}})
         verify(!banner.retryButton.visible)
 
         // A failed proof, in `ClientError::Untrusted`'s words: the cut at 300 only costs the path.
@@ -276,6 +303,193 @@ TestCase {
         t.core.respond(hello[0].id, Shapes.refusal("core.unreachable", "No core answered."))
         compare(banner.text, "Couldn't use the default workspace: No core answered.")
         verify(banner.defaultButton.visible)
+    }
+
+    function test_an_old_failed_use_of_the_default_is_not_shown_for_a_new_refusal() { // spec: ARCH-100, ARCH-090
+        const t = load()
+        const banner = t.shell.connectionBanner
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/quay"))
+        verify(banner.text.startsWith("The core refused this workspace: quay became the default workspace"), banner.text)
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.refusal("core.unreachable", "No core answered."))
+        compare(banner.text, "Couldn't use the default workspace: No core answered.")
+
+        // The default moves back, so the refusal ends; the failed try belongs to it.
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws1", "D:/art/harbor"))
+        verify(!banner.visible)
+        // Days later, no reconnect between: a new refusal says its own words.
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws3", "D:/art/other"))
+        verify(banner.text.startsWith("The core refused this workspace: other became the default workspace"), banner.text)
+    }
+
+    function test_a_no_workspace_answer_that_lands_before_ready_is_not_lost() { // spec: APP-016
+        // Core.useDefaultWorkspace's hello answers before the state reaches `ready` again (SH-05).
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        const lost = {workspaces: [{id: "ws1", path: "E:/art/harbor", name: "Harbor", default: true, served: false, missing: true}]}
+        answer(t.core, named("workspaces.list"), Shapes.tool(lost))
+        verify(banner.defaultButton.visible)
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        compare(hello.length, 1)
+        t.core.applyState({connection: "connecting"})
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.hello(null))
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(banner.visible)
+        answer(t.core, named("workspaces.list"), Shapes.tool(lost), "read again")
+        verify(banner.text.endsWith("It still can't be found."), banner.text)
+
+        // It is said once: a later reconnect starts clean.
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(!banner.text.endsWith("It still can't be found."), banner.text)
+    }
+
+    function test_a_folder_chosen_while_the_core_restarts_says_so_on_the_bar() { // spec: APP-016
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        banner.folderChosen("file:///D:/art/gone")
+        t.core.applyState({connection: "reconnecting"})
+        verify(!banner.visible)
+        answer(t.core, named("workspace.create"), Shapes.refusal("workspace.path_invalid", "Not here."))
+        verify(t.shell.topBar.notice.visible, "the banner is away, so the bar says it")
+        compare(t.shell.topBar.notice.text, "That folder couldn't be used: Not here.")
+        compare(t.shell.topBar.notice.kind, "danger")
+    }
+
+    function test_a_default_that_was_made_but_could_not_be_opened_says_so() { // spec: APP-016, P4a-R34
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: []}))
+        banner.folderChosen("file:///D:/art/quay")
+        answer(t.core, named("workspace.create"), Shapes.tool({id: "ws2", path: "D:/art/quay", created: true, default: true, warnings: []}))
+        const hello = open(t.core, c => c.kind === "setWorkspace")[0]
+        answered[hello.id] = true
+        t.core.respond(hello.id, Shapes.refusal("workspace.unsupported", "This core serves another one."))
+        verify(banner.visible)
+        verify(banner.text.indexOf("That folder couldn't be used") < 0, "it was used: " + banner.text)
+        verify(banner.text.indexOf("quay is now your default workspace, but this session couldn't open it: "
+                                   + "This core serves another one. Use the default workspace to try again.") >= 0, banner.text)
+        compare(banner.kind, "danger")
+
+        // The default is read again, so "Use the default workspace" is there to try again.
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: [
+            {id: "ws2", path: "D:/art/quay", name: "Quay", default: true, served: true, missing: false}]}), "read again")
+        verify(banner.defaultButton.visible)
+        verify(banner.text.indexOf("couldn't open it") >= 0, "the refusal stays after the read: " + banner.text)
+    }
+
+    function test_a_refusal_keeps_its_words_when_a_read_is_refused_too() { // spec: ARCH-100, APP-033
+        // The bar asks again while the refusal stands. The core's refusal of that read is the same
+        // news in other words (a command line to run): it must not replace the words, or announce
+        // them again.
+        const t = load()
+        const banner = t.shell.connectionBanner
+        const heard = createTemporaryObject(spyComponent, tc, {target: banner, signalName: "announced"})
+        t.core.emit("workspace", "event", Shapes.defaultChanged("ws2", "D:/art/quay"))
+        const said = banner.text
+        verify(said.startsWith("The core refused this workspace: quay became the default workspace"), said)
+        compare(heard.count, 1)
+        // Every caps.get out (panels read it too) and the bar's probe, a second later, is refused.
+        tryVerify(() => open(t.core, named("caps.get")).length > 0, 2000, "the probe")
+        wait(1300)
+        for (const c of open(t.core, named("caps.get"))) {
+            answered[c.id] = true
+            t.core.respond(c.id, Shapes.notServed("D:/art/quay", "D:/art/harbor"))
+        }
+        wait(100)
+        compare(banner.text, said)
+        compare(heard.count, 1, "announced once")
+    }
+
+    function test_a_no_workspace_answer_that_lands_before_ready_does_not_outlive_its_hello() { // spec: APP-016
+        const t = load(null)
+        const banner = t.shell.noWorkspaceBanner
+        const lost = {workspaces: [{id: "ws1", path: "E:/art/harbor", name: "Harbor", default: true, served: false, missing: true}]}
+        answer(t.core, named("workspaces.list"), Shapes.tool(lost))
+        waitForItemPolished(banner.defaultButton.parent)
+        wait(50)
+        mouseClick(banner.defaultButton)
+        const hello = open(t.core, c => c.kind === "useDefaultWorkspace")
+        t.core.applyState({connection: "connecting"})
+        answered[hello[0].id] = true
+        t.core.respond(hello[0].id, Shapes.hello(null))
+        // The next hello finds the default (the drive is back), so the banner is never wanted.
+        t.core.applyState({connection: "ready", workspace: {id: "ws1", path: "E:/art/harbor"}})
+        verify(!banner.visible)
+        // Later, an unrelated no-workspace state.
+        t.core.applyState({connection: "reconnecting"})
+        t.core.applyState({connection: "ready", workspace: null})
+        verify(banner.visible)
+        answer(t.core, named("workspaces.list"), Shapes.tool({workspaces: []}), "read again")
+        verify(banner.text.indexOf("It still can't be found.") < 0, banner.text)
+    }
+
+    function test_the_banner_leads_with_the_cores_own_words() { // spec: ARCH-100, APP-034
+        // The core says how to name its refusal (`lead`), as it does for the bar (`label`): the
+        // banner holds none of its own for a state that has them.
+        const t = load()
+        const banner = t.shell.connectionBanner
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "Nope.", cause: "other", label: "L1", lead: "Lead one"}})
+        compare(banner.text, "Lead one: Nope.")
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "", cause: "other", label: "L1", lead: "Lead one"}})
+        compare(banner.text, "Lead one.")
+        t.core.applyState({connection: "unavailable", unavailable: {reason: "Gone.", cause: "refused", code: "workspace.unknown",
+                                                                    retry: "after_resolve", label: "L2", lead: "Lead two"}})
+        compare(banner.text, "Lead two: Gone.")
+        compare(t.shell.topBar.connectionIndicator.text, "L2")
+    }
+
+    function test_try_again_on_an_older_core_shows_that_it_is_working() { // spec: APP-036, ARCH-023
+        const t = load()
+        const banner = t.shell.connectionBanner
+        banner.retryShownMs = 400
+        t.core.applyState({connection: "incompatible", coreProtocol: "0.9"})
+        waitForItemPolished(banner.retryButton.parent)
+        wait(50)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 1)
+        verify(banner.text.indexOf("Trying again") >= 0, banner.text)
+        // The button keeps the focus (the words are the cue), and one attempt runs at a time.
+        verify(banner.retryButton.enabled)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 1, "a click during the attempt starts no second one")
+        // It may end where it began (still incompatible): the words come back.
+        tryVerify(() => banner.text.indexOf("Trying again") < 0, 3000, banner.text)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 2)
+        verify(banner.text.indexOf("Trying again") >= 0, banner.text)
+        // A state change ends it at once, and the incompatible state that follows is idle again.
+        t.core.applyState({connection: "connecting"})
+        t.core.applyState({connection: "incompatible", coreProtocol: "0.9"})
+        verify(banner.text.indexOf("Trying again") < 0, banner.text)
+        verify(banner.text.indexOf("Try again replaces it") >= 0, banner.text)
+        mouseClick(banner.retryButton)
+        compare(t.core.retries, 3, "a new attempt")
+        verify(banner.text.indexOf("Trying again") >= 0, banner.text)
+    }
+
+    function test_a_core_protocol_that_cant_be_read_offers_no_try_again() { // spec: APP-036, ARCH-023
+        // The client treats it as not older and would only be incompatible again.
+        const t = load()
+        const banner = t.shell.connectionBanner
+        for (const protocol of ["", "abc"]) {
+            t.core.applyState({connection: "incompatible", coreProtocol: protocol})
+            verify(banner.visible)
+            verify(!banner.retryButton.visible, "no button for protocol '" + protocol + "'")
+            verify(banner.text.indexOf("Try again") < 0, banner.text)
+            verify(banner.text.indexOf("This app can't use the running core") >= 0, banner.text)
+            // An empty protocol is no number to show.
+            verify(protocol !== "" || banner.text.indexOf("(protocol") < 0, banner.text)
+        }
     }
 
     function test_connecting_shows_no_banner() { // spec: APP-033

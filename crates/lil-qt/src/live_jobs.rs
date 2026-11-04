@@ -40,10 +40,11 @@
 //! - **A read cut at [`MAX_PAGES`]** lists that many pages and says so ([`LiveJobs::capped`]): a
 //!   guard against a cursor that never ends.
 //! - **Counts only** ([`LiveJobs::counts_only`], the top bar's): the same rules for what is live, but
-//!   no rows. Each job is kept as its id, status and `updated`, and nothing is sorted or worked out,
-//!   so a job's event costs a map lookup; [`LiveJobs::counts`] says how many run and how many wait.
+//!   no rows. Each job is kept as its id, status, substatus and `updated`, and nothing is sorted or worked
+//!   out, so a job's event costs a map lookup; [`LiveJobs::counts`] says how many run and how many wait,
+//!   leaving out a `running` job whose substatus is `interrupted_unknown` (nothing runs it).
 //!   Every queued job is in `jobs.list {status: "queued"}`, so its pages are all this reader needs of
-//!   the queued ones, and a job's event asks for a read only when its status changed.
+//!   the queued ones, and a job's event asks for a read only when its status (or that unknown outcome) changed.
 //! - **Cost:** every read, pass of events and tick sorts, works out and compares all the live rows,
 //!   so it grows linearly with them: about 0.6 to 0.8 ms at 300, and about 15 to 18 ms at 3,000,
 //!   past a frame. The panel applies the events of a frame in one pass, so a burst costs one of
@@ -158,10 +159,16 @@ pub struct LiveJobs {
     no_rows: bool,
 }
 
-/// What a counts-only reader keeps of a job.
+/// What a counts-only reader keeps of a job. The substatus stays, for [`outcome_unknown`].
 fn slim(job: &Value) -> Value {
     serde_json::json!({"job_id": job.get("job_id"), "status": job.get("status"),
-                       "updated": job.get("updated")})
+                       "substatus": job.get("substatus"), "updated": job.get("updated")})
+}
+
+/// A crash left it `running` and nothing is running it: its outcome is unknown. The top bar counts
+/// it as neither running nor waiting.
+fn outcome_unknown(job: &Value) -> bool {
+    text(job, "status") == "running" && text(job, "substatus") == "interrupted_unknown"
 }
 
 fn text<'a>(job: &'a Value, key: &str) -> &'a str {
@@ -299,14 +306,21 @@ impl LiveJobs {
     }
 
     /// How many live jobs are running, and how many aren't (queued, or of a status this build
-    /// doesn't know, P4a-R40).
+    /// doesn't know, P4a-R40). A job whose outcome is unknown is in neither count.
     pub fn counts(&self) -> (usize, usize) {
-        let running = self
-            .jobs
-            .values()
-            .filter(|j| text(j, "status") == "running")
-            .count();
-        (running, self.jobs.len() - running)
+        let mut running = 0;
+        let mut waiting = 0;
+        for job in self.jobs.values() {
+            if outcome_unknown(job) {
+                continue;
+            }
+            if text(job, "status") == "running" {
+                running += 1;
+            } else {
+                waiting += 1;
+            }
+        }
+        (running, waiting)
     }
 
     /// The rows, in order.
@@ -467,7 +481,7 @@ impl LiveJobs {
                 continue;
             };
             let job = if self.no_rows { slim(&job) } else { job };
-            let before = self.status_of(&id);
+            let before = self.change_key(&id);
             if let Some(read) = self.read.as_mut() {
                 read.events.insert(id.clone(), job.clone());
             }
@@ -477,7 +491,7 @@ impl LiveJobs {
                 self.jobs.insert(id.clone(), Arc::new(job));
                 touched = true;
             }
-            let after = self.status_of(&id);
+            let after = self.change_key(&id);
             let queued = |s: &Option<String>| s.as_deref() == Some("queued");
             change = change.max(if before.is_none() && after.is_none() {
                 JobChange::None
@@ -514,6 +528,16 @@ impl LiveJobs {
     /// A live job's status, `None` for one that isn't live.
     pub fn status_of(&self, id: &str) -> Option<String> {
         self.jobs.get(id).map(|j| text(j, "status").to_string())
+    }
+
+    /// What a change of this job is noticed by: its status, and for a counts-only reader also
+    /// whether its outcome is unknown, which moves it between the counts.
+    fn change_key(&self, id: &str) -> Option<String> {
+        let job = self.jobs.get(id)?;
+        if self.no_rows && outcome_unknown(job) {
+            return Some("running/interrupted_unknown".to_string());
+        }
+        Some(text(job, "status").to_string())
     }
 
     /// What the lane headers and the panel's own controls need: `{lanes}` (as
@@ -922,6 +946,37 @@ mod tests {
 
     /// The top bar's reader: the same rules for what is live, and nothing kept of a job but what
     /// a count needs.
+    /// A crash leaves a job `running` with substatus `interrupted_unknown`: nothing runs it, so the
+    /// bar counts it neither as running nor as waiting (HM-03, owner decision OD-3 A).
+    #[test] // spec: APP-006, APP-114
+    fn a_job_whose_outcome_is_unknown_is_in_neither_count() {
+        let mut unknown = running("u", "gpu-heavy", None, 7200);
+        unknown["substatus"] = json!("interrupted_unknown");
+        for mut live in [LiveJobs::counts_only(), LiveJobs::new()] {
+            read(
+                &mut live,
+                &[running("r", "gpu-heavy", None, 5), unknown.clone()],
+                &[vec![queued("q", Some(0), None)]],
+            );
+            assert_eq!(live.counts(), (1, 1), "counts_only: {}", live.no_rows);
+        }
+        // An event that turns a running job into one of unknown outcome changes the counts, so it
+        // asks for a read like any other change the counts show.
+        let mut live = LiveJobs::counts_only();
+        read(
+            &mut live,
+            &[running("r", "gpu-heavy", None, 5)],
+            &[vec![queued("q", Some(0), None)]],
+        );
+        assert_eq!(live.counts(), (1, 1));
+        let mut flipped = running("r", "gpu-heavy", None, 5);
+        flipped["substatus"] = json!("interrupted_unknown");
+        flipped["updated"] = json!(at(0));
+        let applied = live.apply_jobs(vec![flipped], NOW);
+        assert_eq!(live.counts(), (0, 1));
+        assert_eq!(applied.change, JobChange::ReadAgain);
+    }
+
     #[test] // spec: APP-006, APP-139
     fn a_counts_only_reader_counts_as_the_rows_would_and_keeps_no_rows() {
         let mut live = LiveJobs::counts_only();
@@ -939,8 +994,8 @@ mod tests {
         assert!(live.rows().is_empty(), "no rows are kept");
         assert_eq!(
             live.jobs["q1"].as_object().map(serde_json::Map::len),
-            Some(3),
-            "only the id, status and updated"
+            Some(4),
+            "only the id, status, substatus and updated"
         );
         // Unknown statuses count as queued and stay through a read; a job that ends leaves; an
         // event as new as the read wins over it.

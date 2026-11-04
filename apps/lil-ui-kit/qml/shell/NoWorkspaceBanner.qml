@@ -27,6 +27,8 @@ LBanner {
     property alias defaultButton: defaultButton
     property var _call: null
     property string _refusal
+    // The default is still missing, and the hello's answer came before `ready` (see useDefault).
+    property bool _stillMissing: false
     // The default row, or null; "ok" or "failed" once the list is read.
     property var _defaultRow: null
     property string _listRead
@@ -65,6 +67,9 @@ LBanner {
         _defaultRow = null
         _listRead = ""
         if (wanted) {
+            if (_stillMissing)
+                _refusal = "It still can't be found."
+            _stillMissing = false
             announce()
             readDefault()
         }
@@ -103,13 +108,20 @@ LBanner {
         if (_call)
             return
         _refusal = ""
+        _stillMissing = false
         _call = CoreCall.useDefaultWorkspace(core, {
             owner: root,
             ok: hello => {
                 root._call = null
-                if (!hello.workspace) {
+                if (hello.workspace)
+                    return
+                // The state goes through `connecting` for the new hello, and its answer may land
+                // before `ready`: the banner isn't wanted yet, and says it when it is.
+                if (root.wanted) {
                     root._refusal = "It still can't be found."
                     root.announce()
+                } else {
+                    root._stillMissing = true
                 }
             },
             error: e => {
@@ -121,11 +133,23 @@ LBanner {
         })
     }
 
-    function refused(error) {
+    // `made` is the folder's name when `workspace.create` already made it the default.
+    function refused(error, made) {
         _call = null
-        _refusal = "That folder couldn't be used: "
-                   + core.shownText(error && error.message ? String(error.message) : "the core didn't answer.", 300)
+        const message = core.shownText(error && error.message ? String(error.message) : "the core didn't answer.", 300)
+        const text = made !== undefined
+                     ? made + " is now your default workspace, but this session couldn't open it: "
+                       + message.replace(/\.+$/, "") + ". Use the default workspace to try again."
+                     : "That folder couldn't be used: " + message
+        // The banner is away (the core is restarting): the bar says it, or it would be lost.
+        if (!wanted) {
+            noticed(text, "danger")
+            return
+        }
+        _refusal = text
         announce()
+        if (made !== undefined)
+            readDefault()
     }
 
     function chooseFolder() {
@@ -168,7 +192,7 @@ LBanner {
                 root._call = CoreCall.setWorkspace(root.core, String(made.id), {
                     owner: root,
                     ok: () => { root._call = null },
-                    error: e => root.refused(e)
+                    error: e => root.refused(e, made.default ? name : undefined)
                 })
             },
             error: e => root.refused(e)
@@ -192,6 +216,16 @@ LBanner {
             onClicked: root.useDefault()
         }
     ]
+
+    // The hello that left it behind found a workspace after all.
+    Connections {
+        target: root.core
+        ignoreUnknownSignals: true
+        function onWorkspaceChanged() {
+            if (root.core.workspace)
+                root._stillMissing = false
+        }
+    }
 
     Loader {
         id: dialogLoader

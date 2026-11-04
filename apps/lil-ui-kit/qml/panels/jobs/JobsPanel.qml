@@ -423,7 +423,7 @@ Rectangle {
         if (!writable || !lanesCurrent || busyLanes[params.lane])
             return
         const answered = _laneAnswered[params.lane]
-        if (answered !== undefined && Date.now() - answered < Qt.styleHints.mouseDoubleClickInterval)
+        if (answered !== undefined && Date.now() >= answered && Date.now() - answered < Qt.styleHints.mouseDoubleClickInterval)
             return
         const done = () => {
             const busy = Object.assign({}, root.busyLanes)
