@@ -7,8 +7,9 @@
 // the caps at open, then again on `caps` and `usage` events and when a job ends (`jobs`). Each
 // kind of read happens at most once a second: the first of a burst at once, the rest as one
 // read when the second has passed. A `resync_required` or a snapshot on a topic reads what it
-// moves again; the connection's own state never does. Nothing here adds money up: the totals
-// are the core's.
+// moves again; the connection's own state reads again only a part whose last read failed or never
+// landed, when it is `ready` (a read made while the core was starting fails at once, and a first
+// connection has no mark). Nothing here adds money up: the totals are the core's.
 //
 // The export writes the rows of the tab shown (UsageText.exportTable) to the file you pick,
 // through the CsvExport bridge, off the GUI thread; a failed write says why in the banner, and
@@ -135,6 +136,26 @@ Rectangle {
         })
         summariesGate.request()
         capsGate.request()
+    }
+
+    // `ready` reads again only what hasn't landed: a read made while the core was starting
+    // failed at once, and a first connection brings no `resync_required` to say so (SHELL-1).
+    // A reconnect with every part in reads nothing; the topics' own marks do the rest.
+    Connections {
+        target: root.core
+        ignoreUnknownSignals: true
+        function onConnectionChanged() {
+            if (root.core.connection !== "ready")
+                return
+            for (const breakdown of [monthBreakdown, dayBreakdown]) {
+                if (!breakdown.loaded || breakdown.error)
+                    breakdown.reload()
+            }
+            if (!accountsList.summary || accountsList.error)
+                accountsList.read()
+            if (!capGauges.view || capGauges.error)
+                capGauges.read()
+        }
     }
 
     CsvExport {

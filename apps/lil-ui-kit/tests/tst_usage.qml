@@ -492,6 +492,63 @@ TestCase {
         tryVerify(() => capsReads() === 3, 2000, "a snapshot reads the caps again")
     }
 
+    // The error a read gets while the connection isn't up yet (SHELL-1).
+    function unreachable() {
+        return {status: "error", error: {code: "core.unreachable", category: "transient",
+                                         message: "No core yet.", trace_id: "t", retry: "after_backoff"}}
+    }
+
+    function test_reads_that_failed_before_ready_are_read_again_on_ready() { // spec: APP-028, APP-116, APP-121, APP-122
+        // The panel is made while the core starts: every read fails at once, and `ready` comes
+        // with no `resync_required` (a first connection has no mark).
+        const core = fakeComponent.createObject(tc, {connection: "connecting"})
+        const panel = makePanel(core)
+        answer(core, isSummary("month", ["provider"]), unreachable())
+        answer(core, isSummary("day", ["provider"]), unreachable())
+        answer(core, isSummary("month", ["provider", "account"]), unreachable())
+        answer(core, isCaps, unreachable())
+        tryVerify(() => panel.month.error && panel.day.error && panel.accounts.error && panel.gauges.error,
+                  5000, "each part says it couldn't read")
+        verify(!panel.exportButton.enabled, "nothing to export yet")
+        const calls = core.calls.length
+
+        core.applyState({connection: "ready", workspace: null})
+        // Each part whose read failed is read again, without waiting for an event.
+        answer(core, isSummary("month", ["provider"]), ok(summary()))
+        answer(core, isSummary("day", ["provider"]), ok(summary()))
+        answer(core, isSummary("month", ["provider", "account"]), ok(summary()))
+        answer(core, isCaps, ok(capsView()))
+        compare(core.calls.length, calls + 4, "one read for each part, no more")
+        tryVerify(() => !panel.month.error && !panel.day.error && !panel.accounts.error && !panel.gauges.error,
+                  5000, "the words go")
+        verify(panel.month.loaded && panel.day.loaded)
+        tryVerify(() => panel.exportButton.enabled, 5000, "and the export is back")
+    }
+
+    function test_ready_reads_again_only_the_parts_that_failed() { // spec: APP-028, APP-116, APP-121
+        const core = fakeComponent.createObject(tc, {connection: "connecting"})
+        const panel = makePanel(core)
+        // The month and the accounts landed; the day and the caps failed.
+        answer(core, isSummary("month", ["provider"]), ok(summary()))
+        answer(core, isSummary("day", ["provider"]), unreachable())
+        answer(core, isSummary("month", ["provider", "account"]), ok(summary()))
+        answer(core, isCaps, unreachable())
+        tryVerify(() => panel.day.error && panel.gauges.error, 5000)
+        const calls = core.calls.length
+
+        core.applyState({connection: "ready", workspace: null})
+        answer(core, isSummary("day", ["provider"]), ok(summary()))
+        answer(core, isCaps, ok(capsView()))
+        wait(200)
+        compare(core.calls.length, calls + 2, "the parts that landed aren't read again")
+
+        // A reconnect with everything in reads nothing (test_resyncs_reload_and_ready_does_not).
+        core.applyState({connection: "reconnecting"})
+        core.applyState({connection: "ready", workspace: null})
+        wait(200)
+        compare(core.calls.length, calls + 2)
+    }
+
     function test_accounts_say_tracked_only() { // spec: APP-122
         const core = makeCore()
         const panel = makePanel(core)
