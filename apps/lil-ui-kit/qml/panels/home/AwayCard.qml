@@ -24,10 +24,13 @@ LCard {
             return panel.noteFor("jobs", "the jobs")
         return panel.isStale("confirmations") ? panel.noteFor("confirmations", "the confirmations") : ""
     }
-    // Where the rows it doesn't show are, by what they are. Pages its read didn't take in are jobs.
+    // The reads stopped short: pages of jobs it didn't take in, or a full list of confirmations.
+    readonly property bool cut: panel.awayCut || panel.pendingCut
+    // Where the rows it doesn't show are, by what they are. Pages its read didn't take in are jobs,
+    // and a confirmations list that came back full may have more of them.
     readonly property string whereHidden: {
         const hidden = panel.awayItems.slice(maxLines)
-        const confirmations = hidden.some(item => item.kind === "confirmation")
+        const confirmations = panel.pendingCut || hidden.some(item => item.kind === "confirmation")
         const jobs = panel.awayCut || hidden.some(item => item.kind !== "confirmation")
         return jobs && confirmations ? "Jobs and Confirmations list them."
                                      : confirmations ? "Confirmations lists them." : "Jobs lists them."
@@ -36,7 +39,7 @@ LCard {
         if (moreLines <= 0 && !panel.awayCut)
             return ""
         if (moreLines > 0)
-            return "and " + MoneyText.count(String(moreLines)) + (panel.awayCut ? " or more. " : " more. ") + whereHidden
+            return "and " + MoneyText.count(String(moreLines)) + (cut ? " or more. " : " more. ") + whereHidden
         return lines.length > 0 ? "and more. " + whereHidden
                                 : "More jobs changed while you were away than this card reads. Jobs lists them."
     }

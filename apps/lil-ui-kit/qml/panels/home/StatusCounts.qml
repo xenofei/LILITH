@@ -28,10 +28,15 @@ LCard {
         }
         return panel.noteFor("status", "the counts")
     }
+    // The project's name as the Projects card has it; its slug when the list doesn't hold it.
+    readonly property string projectName: {
+        const p = panel.projects.find(x => x.project === panel.statusProject)
+        return (p && p.name) || panel.statusProject
+    }
     readonly property alias countsLabel: countsLabel
     readonly property alias noteText: noteText
 
-    title: panel.statusProject !== "" ? "Assets in " + panel.shown(panel.statusProject) : "Assets by status"
+    title: panel.statusProject !== "" ? "Assets in " + panel.shown(projectName) : "Assets by status"
     visible: panel.hasWorkspace
 
     Column {

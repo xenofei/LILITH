@@ -54,8 +54,11 @@
 // failing it moves neither, and the usual write follows once a read has landed. There is no card on
 // the first run. A kept time ahead of now (the clock was ahead) can't say when you last looked: the
 // card counts from `aheadLookBackMs` before now, so lines may show twice but none is lost, and the
-// usual write mends the kept time. A kept time the core's `since` wouldn't take counts as none
-// (`ShellState.lastSeen`).
+// usual write mends the kept time. So does a state file that couldn't be read at the start
+// (`ShellState.stateUnreadable`): it isn't a first run. A kept time the core's `since` wouldn't take
+// counts as none (`ShellState.lastSeen`). A card of 500 or more jobs (`awayPages`) or confirmations
+// (`confirmationsMax`) says "or more": the kept time holds until Dismiss for the jobs, and Dismiss
+// moves past rows it never showed.
 //
 // Everything from outside is plain text through `core.shownText` (P4a-R8), and every count goes
 // through MoneyText.count.
@@ -96,8 +99,12 @@ Rectangle {
 
     // How long Home must show before the time moves.
     readonly property int seenAfterMs: 3000
-    // The most pages of `{since}` one read follows; past them the card says there is more.
-    readonly property int awayPages: 20
+    // The most pages of `{since}` one read follows; past them the card says there is more. Each
+    // job end works the pages over again, so 5 (500 jobs) keeps that work short.
+    readonly property int awayPages: 5
+    // The most pending confirmations `app/confirmations.list` gives (lil_protocol::app::LIST_LIMIT_MAX):
+    // asked for in full, and when that many come back there may be more.
+    readonly property int confirmationsMax: 500
     // The least time between two reads of the counts after job ends.
     property int statusGapMs: 30000
     // How far back the card counts when the kept time is ahead of now: a week.
@@ -147,6 +154,8 @@ Rectangle {
     // The last pages holding the card's jobs, the pending confirmations, and the lines known so far.
     property string _awayPages: "[]"
     property var _pending: []
+    // The last confirmations read came back full: there may be more pending than it lists.
+    property bool pendingCut: false
     property var _known: ({})
     property var _dismissed: ({})
     // The card's reads have landed for this time.
@@ -427,10 +436,11 @@ Rectangle {
     }
 
     function readConfirmations() {
-        track("confirmations", CoreCall.appCall(core, "app/confirmations.list", {state: "pending"}, {
+        track("confirmations", CoreCall.appCall(core, "app/confirmations.list", {state: "pending", limit: confirmationsMax}, {
             owner: root,
             ok: r => {
                 root._pending = r.confirmations || []
+                root.pendingCut = root._pending.length >= root.confirmationsMax
                 root.setRead("confirmations", "ok")
                 root.landed("confirmations")
             },
@@ -640,9 +650,13 @@ Rectangle {
         updateAway()
     }
 
-    // The time to count from in this workspace: see the header for one ahead of now.
+    // The time to count from in this workspace: see the header for one ahead of now. A state that
+    // couldn't be read says nothing of the time, which isn't a first run: it counts from the same
+    // look-back, so no line is lost.
     function keptSince(workspace) {
         const kept = ShellState.lastSeen(stateDir, workspace)
+        if (kept === "" && ShellState.stateUnreadable(stateDir))
+            return seenStamp(Date.now() - aheadLookBackMs)
         return kept !== "" && ShellState.timeMs(kept) > Date.now() ? seenStamp(Date.now() - aheadLookBackMs) : kept
     }
 
@@ -650,10 +664,12 @@ Rectangle {
     function moveCardTime() {
         _moveTime = false
         _wroteSeen = false
-        // One that can't be read just now leaves the card's own: as a first run it would lose lines.
-        const kept = keptSince(workspaceNow())
-        if (kept !== "")
-            lastSeen = kept
+        // One that can't be read just now leaves the card's own, which a look-back would only widen.
+        if (!ShellState.stateUnreadable(stateDir)) {
+            const kept = keptSince(workspaceNow())
+            if (kept !== "")
+                lastSeen = kept
+        }
         _unseen = true
         _awayLoaded = false
         due({jobs: true, confirmations: true})
@@ -742,6 +758,7 @@ Rectangle {
             root.awayItems = []
             root.awayCut = false
             root._pending = []
+            root.pendingCut = false
             root._awayPages = "[]"
             root._pendingJobs = []
             root.readState = {}

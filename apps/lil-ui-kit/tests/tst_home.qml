@@ -167,7 +167,8 @@ TestCase {
             else if (c.name === "jobs.list")
                 outcome = core.jobsListAnswer(c.args, s.jobs, [Shapes.lane(), Shapes.lane({lane: "cpu"})])
             else if (c.name === "app/confirmations.list")
-                outcome = Shapes.confirmations(s.pending)
+                // The core's own range (lil_protocol::app): 1 to 500, 100 when none is asked for.
+                outcome = Shapes.confirmations(s.pending.slice(0, c.args.limit || 100))
             if (outcome) {
                 answered[c.id] = true
                 core.respond(c.id, outcome)
@@ -280,6 +281,20 @@ TestCase {
         compare(panel.statusCounts.countsLabel.text, "Takes waiting 1,234 · In review 0 · Stale 0 · Blocked 0")
         for (const t of ownTexts(panel))
             verify(!/candidate/i.test(t.text), "copy says takes: " + t.text)
+    }
+
+    function test_the_counts_card_names_the_project_as_the_projects_card_does() { // spec: APP-111
+        const core = makeCore()
+        const panel = makeHome(core)
+        settle(core, panel, scene({projects: [{project: "harbor", name: "Harbor Town", status: "active", assets: 3}],
+                                   status: Shapes.projectStatus("harbor", {candidate: 1})}))
+        compare(panel.statusCounts.title, "Assets in Harbor Town")
+        compare(rowTexts(panel.projectsCard.rows), ["Harbor Town · 3 assets"])
+        // A project the list doesn't hold (or one without a name) stays as its slug.
+        core.emit("jobs", "resync_required", {})
+        settle(core, panel, scene({projects: [{project: "quay", name: "Quay", status: "active", assets: 3}],
+                                   status: Shapes.projectStatus("harbor", {candidate: 1})}))
+        compare(panel.statusCounts.title, "Assets in harbor")
     }
 
     function test_counts_have_their_separators_and_one_asset_is_one() { // spec: APP-111
@@ -1905,6 +1920,51 @@ TestCase {
         panel._moveTime = true
         panel.moveCardTime()
         compare(panel.lastSeen, seen, "not as a first run, which would lose lines")
+    }
+
+    function pendingRows(n) {
+        const rows = []
+        for (let i = 0; i < n; ++i)
+            rows.push(Shapes.confirmation("cf_00000000000" + String(10000 + i), "comfy.run", "2026-10-30T13:00:01Z"))
+        return rows
+    }
+
+    function test_confirmations_are_asked_for_the_most_the_core_lists_and_all_are_counted() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        // An agent with its own keys queued more than the default 100.
+        settle(core, panel, scene({pending: pendingRows(101)}))
+        compare(callsOf(core, "app/confirmations.list")[0].args, {state: "pending", limit: 500})
+        compare(panel.awayCard.lineRepeater.count, 20)
+        compare(panel.awayCard.moreLabel.text, "and 81 more. Confirmations lists them.")
+    }
+
+    function test_500_confirmations_may_be_more_and_the_card_says_so() { // spec: APP-111
+        const dir = stateWith("ws1", seen)
+        const core = makeCore()
+        const panel = makeHome(core, dir)
+        // The core lists 500 at most: that many back may be all of them or not.
+        settle(core, panel, scene({pending: pendingRows(501)}))
+        compare(panel.awayCard.moreLabel.text, "and 480 or more. Confirmations lists them.")
+        // 499 is all of them.
+        core.emit("confirmations", "resync_required", {})
+        settle(core, panel, scene({pending: pendingRows(499)}))
+        compare(panel.awayCard.moreLabel.text, "and 479 more. Confirmations lists them.")
+    }
+
+    function test_a_state_that_cannot_be_read_at_the_start_still_shows_what_finished() { // spec: P4a-R16
+        // A state.json that gives PermissionDenied, not NotFound: a folder of that name.
+        const bad = TestFiles.newDir("home-bad")
+        verify(TestFiles.mkpath(bad + "/state.json"))
+        const core = makeCore()
+        const panel = makeHome(core, bad)
+        const hourAgo = isoAgo(3600 * 1000)
+        settle(core, panel, scene({jobs: [Shapes.job("j_00000000000000a1", "succeeded",
+                                                      {created: hourAgo, updated: hourAgo, project: "sketchbook"})]}))
+        verify(panel.awayOn, "the card counts from somewhere")
+        verify(panel.awayCard.visible, "and shows")
+        compare(lineTexts(panel.awayCard), ["Finished · ComfyUI prompt · sketchbook · " + stamp(hourAgo)])
     }
 
     function test_a11y_walk_passes() { // spec: APP-156
