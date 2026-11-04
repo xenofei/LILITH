@@ -19,9 +19,19 @@
      it was; after the cancel the file and the folder are unchanged. Real keys go only while the
      app's window is in front; otherwise the check fails and sends nothing.
   On a failure, the app's UIA tree and the test channel's logs go to -DiagDir first.
-  4. lil-image is closed, the test core stopped, the temporary root and the test channel's Qt cache
+  4. lil-image is closed, the test core stopped (only by the PIDs recorded here, waited for until it
+     has exited), the test channel's registry keys, the temporary root and the test channel's Qt cache
      folder (%LOCALAPPDATA%\LILITH-test-usagecheck) removed, and the pop-up told it is done. Exit 0
-     only when every check passed and that folder is gone.
+     only when every check passed and everything is gone: each thing left behind is a failure.
+
+  It refuses to start if a pipe of the test channel is there (a core or an app already serves it,
+  whichever deploy's), and then starts and stops nothing. Every `lil` call is limited to 30 s
+  (sandbox-common.ps1's Invoke-LilTimed), and no input or wait goes on past the pop-up's cap less
+  30 s: the run stops with "out of the stretch's time" and cleans up.
+
+  One trace stays outside the test channel, and it is left alone: the save dialog's own history
+  (ComDlg32 OpenSavePidlMRU, under the user's registry) gains an entry for the saved file. Windows
+  writes it, and this script doesn't clean the user's registry.
   -DryRun does step 3's seeding and the disk checks' self-test only: no pop-up, no window.
 #>
 param(
@@ -40,9 +50,11 @@ $lil = Join-Path $Deploy 'lil.exe'
 $image = Join-Path $Deploy 'lil-image.exe'
 $results = [System.Collections.Generic.List[string]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
-function Pass([string]$what) { $results.Add("PASS $what"); Write-Host "PASS $what" }
-function Fail([string]$what) { $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
+function Pass([string]$what) { $what = Hide-Paths $what; $results.Add("PASS $what"); Write-Host "PASS $what" }
+function Fail([string]$what) { $what = Hide-Paths $what; $failures.Add($what); $results.Add("FAIL $what"); Write-Host "FAIL $what" }
 function Check([bool]$ok, [string]$what) { if ($ok) { Pass $what } else { Fail $what } }
+# Invoke-LilTimed, the stretch's deadline, Retry-Walk and the masked log copy.
+. (Join-Path $PSScriptRoot 'sandbox-common.ps1')
 
 # --- The disk checks -------------------------------------------------------------------------
 function Get-Listing([string]$dir) {
@@ -89,45 +101,109 @@ function Self-Test {
 # --- The test channel ------------------------------------------------------------------------
 $channel = 'test-usagecheck'
 $root = Join-Path ([IO.Path]::GetTempPath()) ("lil-usagecheck-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+# Every core PID seen on this test channel: the only core processes this script may stop.
+$corePids = [System.Collections.Generic.HashSet[int]]::new()
+# A pipe of the channel was there when the run came: not this run's, so nothing here stops it.
+$script:channelTaken = $false
 function Enter-TestChannel {
     # First, before anything that can throw: every `lil` from here on is on the test channel.
     $env:LIL_CHANNEL = $channel
     $env:LIL_TEST_ROOT = $root
     New-Item -ItemType Directory $root | Out-Null
     foreach ($s in 'roaming', 'local', 'profile', 'out') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
+    # The pipe's name comes from the channel alone, so a core left by a crashed run would serve this run
+    # from its old root. The pipes are listed, not asked: another deploy's core makes `lil --no-start
+    # status` fail as if there were none, and cleanup's `lil core stop` could then drain it.
+    if ((Get-ChannelPipes $channel).Count -gt 0) {
+        $script:channelTaken = $true
+        throw "a core or an app already serves $channel, from this deploy or another. It isn't this run's, so nothing was started and it wasn't stopped: end it, then run this again"
+    }
     # The core finds no workspace from this folder: usage is loose.
     Set-Location -LiteralPath $root
 }
 function Invoke-Lil([string[]]$a) {
-    $o = & $lil @a 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "lil $($a -join ' ') exited $LASTEXITCODE`: $($o -join ' ')" }
-    return ($o -join "`n")
+    $r = Invoke-LilTimed $a
+    if ($r.ExitCode -ne 0) { throw "lil $($a -join ' ') exited $($r.ExitCode): $($r.Output -join ' ')" }
+    return ($r.Output -join "`n")
+}
+# The running test core's PID, from its own hello (recorded), or 0 with none.
+function Get-CorePid {
+    $r = Invoke-LilTimed @('--no-start', 'status')
+    if ($r.ExitCode -ne 0) { return 0 }
+    $m = [regex]::Match(($r.Output -join "`n"), 'pid (\d+), channel (\S+?)\)')
+    if (-not $m.Success -or $m.Groups[2].Value -cne $channel) { return 0 }
+    $id = [int]$m.Groups[1].Value
+    [void]$corePids.Add($id)
+    return $id
+}
+# The recorded process `id`, if it is still a core run from this deploy folder (a PID can be reused).
+function Get-RecordedCore([int]$id) {
+    $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+    if ($p -and $p.ProcessName -eq 'lil-core' -and $p.Path -and $p.Path.StartsWith($Deploy, [StringComparison]::OrdinalIgnoreCase)) { return $p }
+    return $null
 }
 function Seed([string]$provider, [string]$amount) {
     $json = '{"provider":"' + $provider + '","amount":"' + $amount + '"}'
     [void](Invoke-Lil @('call', 'test.meter_external', $json))
+    [void](Get-CorePid)
 }
 function Exit-TestChannel {
     # Never off the test channel: `lil core stop` would reach the channel this shell defaults to.
     if ($env:LIL_CHANNEL -ne $channel) { Write-Host 'the test channel was never entered: nothing to clean up'; return }
-    try { [void](& $lil core stop 2>&1) } catch { }
-    Set-Location -LiteralPath $Repo
+    if ($script:channelTaken) {
+        Write-Host 'the test channel is not this run''s: its core, its keys and its cache stay'
+    } else {
+        try { [void](Get-CorePid) } catch { }
+        try { [void](Invoke-LilTimed @('core', 'stop', '--timeout-secs', '20')) } catch { }
+        Start-Sleep -Milliseconds 500
+        foreach ($id in $corePids) {
+            $p = Get-RecordedCore $id
+            if ($p -and -not $p.WaitForExit(5000)) {
+                Write-Host "stopping the test core, pid $id"
+                try { Stop-Process -Id $id -Force } catch { Fail "cleanup: stopping the test core: $_" }
+                if (-not $p.WaitForExit(5000)) { Fail "cleanup: the test core, pid $id, is still running" }
+            }
+        }
+    }
+    try { Set-Location -LiteralPath $Repo } catch { }
     Remove-Item Env:LIL_CHANNEL, Env:LIL_TEST_ROOT -ErrorAction SilentlyContinue
-    foreach ($k in "HKCU:\Software\LILITH-$channel", "HKCU:\Software\Classes\lil-$channel") {
-        if (Test-Path $k) { Write-Host "removing the test channel's $k"; Remove-Item -Recurse -Force $k }
+    if (-not $script:channelTaken) {
+        # Each exactly the test channel's: its registry root, its scheme, and Windows' notification
+        # settings entry, which a toast would make.
+        $capitalised = $channel.Substring(0, 1).ToUpperInvariant() + $channel.Substring(1)
+        $keys = "HKCU:\Software\LILITH-$channel", "HKCU:\Software\Classes\lil-$channel",
+                "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\LILITH.Suite.$capitalised"
+        foreach ($k in $keys) {
+            if (Test-Path $k) {
+                Write-Host "removing the test channel's $k"
+                try { Remove-Item -Recurse -Force $k } catch { Write-Host "note: $_" }
+            }
+            if (Test-Path $k) { Fail "cleanup: $k is still there" }
+        }
     }
     for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $root); ++$i) {
         try { Remove-Item -Recurse -Force -LiteralPath $root } catch { Start-Sleep -Milliseconds 500 }
     }
-    if (Test-Path -LiteralPath $root) { Write-Host "note: $root could not be removed yet" }
+    if (Test-Path -LiteralPath $root) { Fail "cleanup: $root is still there" }
     # The organisation name is the channel's (apps/lil-image/main.cpp), so Qt's qmlcache goes to the
     # real local data folder, outside the test root. Exactly this channel's folder: on any other
-    # channel this function has returned above.
-    $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
-    for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
-        try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+    # channel this function has returned above. A core this run didn't start can be using it.
+    if (-not $script:channelTaken) {
+        if (-not $env:LOCALAPPDATA) {
+            Fail 'cleanup: LOCALAPPDATA is not set, so the test channel''s Qt cache folder could not be looked for'
+        } else {
+            $cache = Join-Path $env:LOCALAPPDATA "LILITH-$channel"
+            for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $cache); ++$i) {
+                try { Remove-Item -Recurse -Force -LiteralPath $cache } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (Test-Path -LiteralPath $cache) { Fail "cleanup: $cache is still there" }
+        }
     }
-    if (Test-Path -LiteralPath $cache) { Fail "cleanup: $cache is still there" }
+    foreach ($id in $corePids) {
+        if (Get-RecordedCore $id) { Fail "cleanup: the test core, pid $id, is still running" }
+    }
+    # A core that hung before any status answered was never recorded: its pipe is the last trace.
+    if (-not $script:channelTaken) { Assert-PipeFree $channel }
 }
 
 if (-not ('LilUsageCheck.Win' -as [type])) {
@@ -144,6 +220,7 @@ function Get-WindowProcessId([System.IntPtr]$hwnd) {
     return [int]$owner
 }
 function Assert-AppInFront {
+    Assert-InStretch
     for ($i = 0; $i -lt 5; ++$i) {
         if ((Get-WindowProcessId ([LilUsageCheck.Win]::GetForegroundWindow())) -eq $script:app.Id) { return }
         Start-Sleep -Milliseconds 200
@@ -161,17 +238,25 @@ if ($DryRun) {
     $script:app = [pscustomobject]@{ Id = -1 }
     $refused = $false
     try { Assert-AppInFront } catch { $refused = "$_" -like 'no keys sent*' }
+    # Past the stretch's deadline, the guard stops before it looks at any window.
+    $script:stopAt = [DateTime]::UtcNow.AddSeconds(-1)
+    $late = $false
+    try { Assert-AppInFront } catch { $late = "$_" -like "out of the stretch's time*" }
+    $script:stopAt = $null
     $script:app = $null
     Check $refused 'self-test: the guard refuses a window that isn''t the app''s'
-    Enter-TestChannel
+    Check $late 'self-test: past the stretch''s deadline the guard stops'
     try {
+        Enter-TestChannel
         Seed 'openrouter' '1.25'
         Start-Sleep -Milliseconds 500
         $s = Invoke-Lil @('call', 'usage.summary', '{"period":"month","group_by":["provider"]}')
         Check ($s -match '"provider": "openrouter"' -and $s -match '"basis": "money"') 'dry run: the test core has the seeded record'
         Check (Test-Path -LiteralPath $image) "dry run: $image is deployed"
         Check (Test-Path -LiteralPath (Join-Path $Deploy 'qml\QtQuick\Dialogs')) 'dry run: QtQuick\Dialogs is deployed'
-    } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
+    } catch { Fail "dry run: $_" } finally {
+        try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    }
     Write-Host ("{0} passed, {1} failed" -f ($results.Count - $failures.Count), $failures.Count)
     exit ([int]($failures.Count -gt 0))
 }
@@ -188,10 +273,11 @@ if (-not $SkipDeployTests) {
 
 # --- 2. The pop-up -------------------------------------------------------------------------------
 $state = Join-Path ([IO.Path]::GetTempPath()) ("lil-usagecheck-{0}.state" -f $PID)
+$capSec = 300
 $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 foreach ($a in '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'tools\sandbox\hands-off.ps1'),
                '-What', 'checks the usage CSV export (a window and a save dialog open)', '-WarnSec', '10', '-RunSec', '90',
-               '-CapSec', '300', '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
+               '-CapSec', [string]$capSec, '-StateFile', $state, '-ParentPid', ([string]$PID)) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 [void][System.Diagnostics.Process]::Start($psi)
@@ -201,6 +287,8 @@ while (-not (Test-Path -LiteralPath "$state.shown")) {
     if ((Get-Date) -gt $deadline) { throw 'the hands-off pop-up was not on screen within 30 s, so nothing ran' }
     Start-Sleep -Milliseconds 250
 }
+# From here no input goes after the pop-up's cap less 30 s.
+Start-Stretch $capSec
 Start-Sleep -Seconds 10
 
 # --- 3. The export check -------------------------------------------------------------------------
@@ -212,6 +300,7 @@ function And($a, $b) { [System.Windows.Automation.AndCondition]::new($a, $b) }
 function Wait-For([scriptblock]$find, [int]$sec, [string]$what) {
     $end = (Get-Date).AddSeconds($sec)
     while ((Get-Date) -lt $end) {
+        Assert-InStretch
         $e = & $find
         if ($e) { return $e }
         Start-Sleep -Milliseconds 250
@@ -227,13 +316,16 @@ function Find-Window([int]$procId, [string]$name) {
     return $e
 }
 function Invoke-Element($e) {
+    Assert-InStretch
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
+    Assert-InStretch
     try { $e.SetFocus() } catch { Show-App }
     Send-Checked ' '
 }
 # The app's window in front, through Win32 (UIA's SetFocus is refused on a top-level window).
 function Show-App {
+    Assert-InStretch
     try { [void][LilUsageCheck.Win]::SetForegroundWindow([System.IntPtr]$script:main.Current.NativeWindowHandle) } catch { }
     Start-Sleep -Milliseconds 300
 }
@@ -243,6 +335,7 @@ function Open-UsagePanel {
     $how = ''
     $tab = $script:main.FindFirst($TS::Descendants, (And (Prop $AE::NameProperty 'Usage & spend') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::TabItem))))
     if ($tab) {
+        Assert-InStretch
         $p = $null
         if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); $how = 'its dock tab (select)' }
         elseif ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); $how = 'its dock tab (invoke)' }
@@ -252,6 +345,7 @@ function Open-UsagePanel {
     try {
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
     } catch {
+        Rethrow-Stretch $_
         if ($how -eq 'Ctrl+5') { throw }
         Show-App; Send-Checked '^5'; $how = "Ctrl+5 (after $how did nothing)"
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
@@ -261,21 +355,22 @@ function Open-UsagePanel {
 
 # The app's top-level windows (the main window, a floating dock, a dialog).
 function App-Windows {
-    @($AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)))
+    @(Retry-Walk { $AE::RootElement.FindAll($TS::Children, (Prop $AE::ProcessIdProperty $script:app.Id)) })
 }
-# The first element named `name`, under `in` or else under any window of the app.
+# The first element named `name`, under `in` or else under any window of the app. A walk UI Automation
+# throws for is walked again.
 function Find-Named($in, [string]$name) {
     $c = Prop $AE::NameProperty $name
-    $e = $in.FindFirst($TS::Descendants, $c)
+    $e = Retry-Walk { $in.FindFirst($TS::Descendants, $c) }
     if ($e) { return $e }
-    foreach ($w in App-Windows) { $e = $w.FindFirst($TS::Descendants, $c); if ($e) { return $e } }
+    foreach ($w in App-Windows) { $e = Retry-Walk { $w.FindFirst($TS::Descendants, $c) }; if ($e) { return $e } }
     return $null
 }
 # The first element whose name starts with `prefix`, under `in` or else under any window of
 # the app.
 function Find-NameStarting($in, [string]$prefix) {
     foreach ($root in @($in) + (App-Windows)) {
-        $all = $root.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        $all = Retry-Walk { $root.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) }
         foreach ($e in $all) { try { if ($e.Current.Name.StartsWith($prefix)) { return $e } } catch { } }
     }
     return $null
@@ -294,7 +389,8 @@ function Save-UiaTree([string]$path) {
             # Names only for the app's own Qt elements (their ids start "QGuiApplication"):
             # nothing of the system dialogs, whose lists show the PC's own folders and files.
             $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
-            $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
+            $shown = Hide-Paths $c.Name
+            $name = if (-not $ours) { '' } elseif ($shown.Length -gt 100) { $shown.Substring(0, 100) + '…' } else { $shown }
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
             # The save dialog's file list, navigation pane and address bar or breadcrumb: the
             # node alone, nothing under it.
@@ -322,6 +418,7 @@ function Open-SaveDialog {
 }
 # `e`'s window in front (Win32).
 function Show-Element($e) {
+    Assert-InStretch
     try { [void][LilUsageCheck.Win]::SetForegroundWindow([System.IntPtr]$e.Current.NativeWindowHandle) } catch { }
     Start-Sleep -Milliseconds 300
 }
@@ -330,6 +427,7 @@ function Escape-Keys([string]$s) { [regex]::Replace($s, '[+^%~(){}\[\]]', '{$0}'
 # A child of the dialog with automation id `id`, any control type, invoked; false when it has
 # no Invoke pattern.
 function Invoke-DialogId($dlg, [string]$id) {
+    Assert-InStretch
     $e = $dlg.FindFirst($TS::Children, (Prop $AE::AutomationIdProperty $id))
     if (-not $e) { $e = $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $id)) }
     $p = $null
@@ -345,6 +443,7 @@ function Save-As($dlg, [string]$path) {
     $vp = $null
     $typed = $false
     if ($box.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+        Assert-InStretch
         try { $vp.SetValue($path); $typed = $true; Write-Host 'file name: set through its value pattern' } catch { }
     }
     if (-not $typed) {
@@ -352,7 +451,8 @@ function Save-As($dlg, [string]$path) {
         Show-Element $dlg
         try { $box.SetFocus() } catch { }
         Send-Checked '^a'
-        Send-Checked (Escape-Keys $path)
+        # Each character after its own check: a window taking the focus gets none of the rest.
+        foreach ($key in [regex]::Matches((Escape-Keys $path), '\{.\}|.')) { Send-Checked $key.Value }
         Write-Host 'file name: typed'
         Start-Sleep -Milliseconds 300
         Send-Checked '{ENTER}'
@@ -370,7 +470,7 @@ function Cancel-Dialog($dlg) {
 # The replace prompt: its Yes, any control type, else Alt+Y.
 function Confirm-Replace($dlg) {
     $yes = $null
-    try { $yes = Wait-For { Find-Yes $dlg } 5 'the replace prompt''s Yes' } catch { }
+    try { $yes = Wait-For { Find-Yes $dlg } 5 'the replace prompt''s Yes' } catch { Rethrow-Stretch $_ }
     if ($yes) { Invoke-Element $yes; Write-Host 'replace prompt: Yes'; return }
     Send-Checked '%y'
     Write-Host 'replace prompt: Alt+Y'
@@ -384,6 +484,7 @@ try {
     $outDir = Join-Path $root 'out'
     Set-Content -LiteralPath (Join-Path $outDir 'usage.csv.bak') -Value 'mine' -NoNewline
     Seed 'openrouter' '1.25'
+    Assert-InStretch
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
     # The shell's window is titled "LILITH" (or "LILITH — <project>"); else the first one.
@@ -437,8 +538,8 @@ try {
         New-Item -ItemType Directory -Force $DiagDir | Out-Null
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
-        if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $DiagDir 'logs') -Recurse -Force }
-        Write-Host "diagnostics in $DiagDir"
+        if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
+        Write-Host "diagnostics in $(Hide-Paths $DiagDir)"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
     if ($script:app -and -not $script:app.HasExited) {
@@ -449,8 +550,8 @@ try {
         } catch { Stop-Process -Id $script:app.Id -Force -ErrorAction SilentlyContinue }
     }
     if ($outDir -and (Test-Path -LiteralPath $outDir)) { Write-Host "the folder at the end: $((Get-Listing $outDir) -join ', ')" }
-    Exit-TestChannel
-    Set-Content -LiteralPath $state -Value 'done'
+    try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    try { Set-Content -LiteralPath $state -Value 'done' } catch { Fail "cleanup: the pop-up wasn't told: $_" }
 }
 
 Write-Host ''
