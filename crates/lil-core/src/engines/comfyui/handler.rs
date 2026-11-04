@@ -1824,8 +1824,8 @@ impl Attempt<'_> {
             ComfyEvent::Executed { .. } => {}
             ComfyEvent::Success { .. } => {
                 // Every node the prompt executes but the nodes whose `filename_prefix` the
-                // suite sets served from the cache: nothing changed (CORE-117; plan 4a ruling,
-                // 2026-10-24: only those run again).
+                // suite sets served from the cache: every judged node was reused (CORE-117; plan
+                // 4a ruling, 2026-10-24: only those run again).
                 let info = self.comfy.graph_info(&self.client).await.ok();
                 let judged = judged_nodes(&self.graph, info.as_ref().map(|i| &*i.object_info));
                 if !judged.is_empty() && judged.iter().all(|n| self.cached.contains(n)) {

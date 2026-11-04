@@ -5,6 +5,7 @@
 import QtQuick
 import QtTest
 import Lilith.UiKit
+import "CoreShapes.js" as Shapes
 
 TestCase {
     id: tc
@@ -494,8 +495,7 @@ TestCase {
 
     // The error a read gets while the connection isn't up yet (SHELL-1).
     function unreachable() {
-        return {status: "error", error: {code: "core.unreachable", category: "transient",
-                                         message: "No core yet.", trace_id: "t", retry: "after_backoff"}}
+        return Shapes.refusal("core.unreachable", "No core yet.")
     }
 
     function test_reads_that_failed_before_ready_are_read_again_on_ready() { // spec: APP-028, APP-116, APP-121, APP-122

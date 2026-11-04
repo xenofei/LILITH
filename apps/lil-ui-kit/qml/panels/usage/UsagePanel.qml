@@ -8,8 +8,10 @@
 // kind of read happens at most once a second: the first of a burst at once, the rest as one
 // read when the second has passed. A `resync_required` or a snapshot on a topic reads what it
 // moves again; the connection's own state reads again only a part whose last read failed or never
-// landed, when it is `ready` (a read made while the core was starting fails at once, and a first
-// connection has no mark). Nothing here adds money up: the totals are the core's.
+// landed, when it is `ready`, at once and outside that gate (a read made while the core was
+// starting fails at once, and a first connection has no mark; a part keeps one read out at a
+// time, so a gate run that follows is one more read after it, not two together). Nothing here
+// adds money up: the totals are the core's.
 //
 // The export writes the rows of the tab shown (UsageText.exportTable) to the file you pick,
 // through the CsvExport bridge, off the GUI thread; a failed write says why in the banner, and
