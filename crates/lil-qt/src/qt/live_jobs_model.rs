@@ -11,7 +11,10 @@
 //! - `applyJobs(jobsJson, nowMs)` for a JSON array of `jobs` events' jobs, in one pass with one
 //!   set of model changes: 0 when none is or was a live row, 1 when one is and the queue stayed,
 //!   2 when the queue may have changed ([`JobChange`]); `applyJob(jobJson, nowMs)` for one;
-//! - `tick(nowMs)`: the clock, which updates only the rows whose times read differently.
+//! - `tick(nowMs)`: the clock, which updates only the rows whose times read differently;
+//! - `setOutside(running, queued, nowMs)`: ComfyUI's prompts the suite didn't submit, which the
+//!   queued ETAs count as jobs with no estimate ([`LiveJobs::set_outside`]); the rows' ETAs follow
+//!   at once.
 //!
 //! With `countsOnly` set before the first read (the top bar's reader) it keeps no rows, only
 //! [`LiveJobs::counts`] as `runningCount` and `queuedCount`, and `cappedCount` (how many queued
@@ -121,6 +124,8 @@ pub mod qobject {
         fn apply_jobs(self: Pin<&mut LiveJobsModel>, jobs_json: &QString, now_ms: f64) -> i32;
         #[qinvokable]
         fn tick(self: Pin<&mut LiveJobsModel>, now_ms: f64);
+        #[qinvokable]
+        fn set_outside(self: Pin<&mut LiveJobsModel>, running: i32, queued: i32, now_ms: f64);
         #[qinvokable]
         fn lanes_json(self: &LiveJobsModel) -> QString;
         #[qinvokable]
@@ -334,6 +339,18 @@ impl qobject::LiveJobsModel {
             JobChange::None => 0,
             JobChange::Shown => 1,
             JobChange::ReadAgain => 2,
+        }
+    }
+
+    fn set_outside(mut self: Pin<&mut Self>, running: i32, queued: i32, now_ms: f64) {
+        let count = |n: i32| usize::try_from(n).unwrap_or(0);
+        let changed = self
+            .as_mut()
+            .rust_mut()
+            .live
+            .set_outside(count(running), count(queued));
+        if changed {
+            self.tick(now_ms);
         }
     }
 
