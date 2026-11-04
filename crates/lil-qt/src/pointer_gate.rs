@@ -798,7 +798,8 @@ mod tests {
     }
 
     /// The bypass the source alone would leave: a posted press and release that the source calls
-    /// hardware, with a real rest and the cursor on the button. No message moves the physical button.
+    /// hardware, with a real rest and the cursor on the button. No posted message moves the button
+    /// state Windows' input keeps (`GetAsyncKeyState`), though injected input does.
     #[test] // spec: P4a-R10
     fn refuses_a_posted_pair_that_reads_as_hardware_by_the_physical_button() {
         let mut r = Replay::new();

@@ -318,9 +318,11 @@ mod tests {
         }
     }
 
-    /// A posted press doesn't move what the thread believes of the button, nor the physical button
-    /// (Windows' documented second factor, measured here on the thread that read the message). The
-    /// physical button is the person's: a press of theirs during the test only makes it try again.
+    /// A posted press doesn't move what the thread believes of the button, nor the button state
+    /// Windows' input keeps (`GetAsyncKeyState`, Windows' documented second factor, measured here on
+    /// the thread that read the message), which real and injected input move and no message does.
+    /// That state follows the person's mouse: a press of theirs during the test only makes it try
+    /// again.
     #[test] // spec: P4a-R10
     fn a_posted_press_moves_no_button_state() {
         let window = hidden_window();
