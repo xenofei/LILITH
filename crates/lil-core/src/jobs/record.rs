@@ -35,7 +35,7 @@ pub struct RunReport {
     pub last_progress_ms: Option<i64>,
     /// The nodes the engine served from its cache.
     pub cache_hit_nodes: Option<Vec<String>>,
-    /// Every node of the prompt was cached: nothing changed.
+    /// Every judged node of the prompt was cached; the suite's save steps always run again.
     pub all_cached: bool,
 }
 
