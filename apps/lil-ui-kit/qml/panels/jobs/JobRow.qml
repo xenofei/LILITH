@@ -17,7 +17,9 @@
 //   says), its place from the queue read ("#3 in queue"; a job a restart holds has none), its ETA,
 //   Run next, Run last and Cancel.
 // - **A status this build doesn't know:** its name and substatus, with the live ones, and Cancel.
-// - **Ended:** done (and "Nothing changed" when every node was cached), failed with its message
+// - **Ended:** done (and "Reused from cache" when every node the core judges was cached: the Save
+//   nodes the suite prefixes always run again, so a run that changed only what they save reads the
+//   same, which "Nothing changed" would have got wrong, CP-16), failed with its message
 //   and its fix (`retry_job`: the Retry button, labelled by the fix, with the cost and time chip
 //   from the job's own estimate; `show_job`: "Show the job", which selects it; any other: its
 //   label, which does nothing), or cancelled, with Retry.
@@ -111,7 +113,7 @@ Rectangle {
         } else if (status === "succeeded") {
             parts.push("Done")
             if (model.all_cached)
-                parts.push("Nothing changed")
+                parts.push("Reused from cache")
             const took = (Date.parse(model.finished) - firstRun()) / 1000
             if (!isNaN(took))
                 parts.push("in " + JobText.elapsedText(took))

@@ -31,7 +31,10 @@
 //!   job's from the time left of its lane's running job, the `wall_s` of its lane's dispatched job
 //!   (it has run none of it yet) and of each job listed ahead of it in its lane, one job with no
 //!   estimate for each place ahead the read doesn't list (another scope's) and for the earlier
-//!   prompt a dispatched retry waits on (it has no estimate here), and its own. A job a lane reason
+//!   prompt a dispatched retry waits on (it has no estimate here), and its own. ComfyUI's outside
+//!   prompts ([`LiveJobs::set_outside`], plan 4a OD-4) are jobs with no estimate ahead of the
+//!   `gpu-heavy` lane: all of them before a queued or `submitting` job, only the running ones (a
+//!   lower bound) before a `queued_in_engine` one. A job a lane reason
 //!   holds (`queue_paused`) has no finish time while it is held, and an `interrupted_unknown` job
 //!   neither an ETA nor a running clock.
 //! - **Changes** come as [`Op`]s, ranges where they can, that a list model applies in order with
@@ -157,6 +160,8 @@ pub struct LiveJobs {
     lanes: Vec<Value>,
     capped: Option<usize>,
     no_rows: bool,
+    /// ComfyUI's prompts the suite didn't submit, running and queued ([`LiveJobs::set_outside`]).
+    outside: (usize, usize),
 }
 
 /// What a counts-only reader keeps of a job. The substatus stays, for [`outcome_unknown`].
@@ -284,9 +289,12 @@ fn order_key<'a>(
     (class, lane_rank(lane), lane, place, text(job, "created"))
 }
 
+/// The lane ComfyUI's prompts run in.
+const GPU_LANE: &str = "gpu-heavy";
+
 fn lane_rank(lane: &str) -> u8 {
     match lane {
-        "gpu-heavy" => 0,
+        GPU_LANE => 0,
         "cpu" => 1,
         _ => 2,
     }
@@ -570,7 +578,7 @@ impl LiveJobs {
     /// The clock moved on: the rows whose times read differently.
     pub fn tick(&mut self, now_ms: i64) -> Vec<Op> {
         let mut rows = self.rows.clone();
-        derive(&mut rows, now_ms);
+        derive(&mut rows, now_ms, self.outside);
         let ops = rows
             .iter()
             .enumerate()
@@ -582,6 +590,18 @@ impl LiveJobs {
             .collect();
         self.rows = rows;
         ops
+    }
+
+    /// ComfyUI's prompts the suite didn't submit (`engines.status`' `outside_jobs`), `running` and
+    /// `queued` (plan 4a, OD-4): each is a job with no estimate ahead of the `gpu-heavy` lane's
+    /// queued jobs. A queued or `submitting` job counts all of them; a `queued_in_engine` one, behind
+    /// the prompt running, only the running ones (a lower bound: the client can't tell which queued
+    /// ones came earlier). Says whether it changed; the rows' ETAs follow at the next
+    /// [`LiveJobs::tick`].
+    pub fn set_outside(&mut self, running: usize, queued: usize) -> bool {
+        let changed = self.outside != (running, queued);
+        self.outside = (running, queued);
+        changed
     }
 
     fn refresh(&mut self, now_ms: i64) -> Vec<Op> {
@@ -607,15 +627,28 @@ impl LiveJobs {
                 batch_size: 0,
             })
             .collect();
-        derive(&mut rows, now_ms);
+        derive(&mut rows, now_ms, self.outside);
         let ops = diff(&self.rows, &rows);
         self.rows = rows;
         ops
     }
 }
 
+/// How many of ComfyUI's outside prompts (`outside`: running, queued) are ahead of a job of
+/// `lane`, each a job with no estimate ([`LiveJobs::set_outside`]): only the `gpu-heavy` lane is
+/// ComfyUI's. `in_engine`: the job is already in ComfyUI's queue (`queued_in_engine`), behind the
+/// prompt running, and the queued ones that came earlier can't be told from those after it, so it
+/// counts the running ones only, a lower bound. Any other job is behind them all.
+fn outside_ahead(lane: &str, outside: (usize, usize), in_engine: bool) -> usize {
+    match (lane, in_engine) {
+        (GPU_LANE, true) => outside.0,
+        (GPU_LANE, false) => outside.0 + outside.1,
+        _ => 0,
+    }
+}
+
 /// Works out each row's ETA, elapsed time and batch size, the rows being in order.
-fn derive(rows: &mut [LiveRow], now_ms: i64) {
+fn derive(rows: &mut [LiveRow], now_ms: i64, outside: (usize, usize)) {
     let mut batches: HashMap<String, u32> = HashMap::new();
     for r in rows.iter() {
         *batches
@@ -676,6 +709,12 @@ fn derive(rows: &mut [LiveRow], now_ms: i64) {
                 let mut before: Vec<Option<&Spread>> = Vec::with_capacity(lane_sent.len() + 1);
                 let left = running_left(lane, &mut before);
                 before.extend(lane_sent.iter().map(Option::as_ref));
+                // Posted, it is behind the outside prompt running; a `submitting` job isn't posted yet,
+                // and is behind them all.
+                before.extend(std::iter::repeat_n(
+                    None,
+                    outside_ahead(lane, outside, substatus == "queued_in_engine"),
+                ));
                 r.eta_text = format::queued_eta_text(left, &before, own.as_ref());
                 lane_sent.push(own);
             }
@@ -695,6 +734,10 @@ fn derive(rows: &mut [LiveRow], now_ms: i64) {
                     before.extend(listed.iter().map(Option::as_ref));
                     let unseen = (place as usize).saturating_sub(listed.len());
                     before.extend(std::iter::repeat_n(None, unseen));
+                    before.extend(std::iter::repeat_n(
+                        None,
+                        outside_ahead(lane, outside, false),
+                    ));
                     r.eta_text = format::queued_eta_text(left, &before, own.as_ref());
                 }
                 listed.push(own);
@@ -1335,6 +1378,109 @@ mod tests {
         assert_eq!(
             row(&live, "b").eta_text,
             "about 50 s, after 1 job with no estimate"
+        );
+    }
+
+    #[test] // spec: APP-114, CORE-161
+    fn outside_jobs_count_as_jobs_with_no_estimate_ahead_of_the_gpu_queue() {
+        let mut live = LiveJobs::new();
+        let b = queued("b", Some(0), Some(20.0));
+        let c = queued("c", Some(1), Some(10.0));
+        let mut cpu = job("p", "queued", "waiting", "cpu");
+        cpu["queue_position"] = json!(0);
+        cpu["estimate"] = wall(5.0);
+        read_as_the_core(&mut live, &[], &[b, c, cpu]);
+        assert_eq!(row(&live, "b").eta_text, "about 20 s");
+        assert_eq!(row(&live, "c").eta_text, "about 30 s");
+
+        // ComfyUI has 1 outside prompt running and 2 queued: three jobs with no estimate come
+        // before each queued gpu-heavy job, and no promise is made that the scheduler can't keep.
+        assert!(live.set_outside(1, 2));
+        assert!(!live.set_outside(1, 2), "the same figures change nothing");
+        let ops = live.tick(NOW);
+        assert_eq!(ops.len(), 2, "the two gpu-heavy rows update: {ops:?}");
+        assert_eq!(
+            row(&live, "b").eta_text,
+            "about 20 s, after 3 jobs with no estimate"
+        );
+        assert_eq!(
+            row(&live, "c").eta_text,
+            "about 30 s, after 3 jobs with no estimate"
+        );
+        assert_eq!(row(&live, "p").eta_text, "about 5 s", "ComfyUI's lane only");
+
+        // A read doesn't forget them.
+        let (b, c) = (
+            queued("b", Some(0), Some(20.0)),
+            queued("c", Some(1), Some(10.0)),
+        );
+        read_as_the_core(&mut live, &[], &[b, c]);
+        assert_eq!(
+            row(&live, "b").eta_text,
+            "about 20 s, after 3 jobs with no estimate"
+        );
+
+        // They leave: the ETAs are the queue's own again.
+        assert!(live.set_outside(0, 0));
+        live.tick(NOW);
+        assert_eq!(row(&live, "b").eta_text, "about 20 s");
+        assert_eq!(row(&live, "c").eta_text, "about 30 s");
+    }
+
+    #[test] // spec: APP-114, CORE-161
+    fn a_dispatched_job_counts_only_the_outside_jobs_running() {
+        let mut live = LiveJobs::new();
+        let a = dispatched_job("a", "queued_in_engine", Some(30.0));
+        let b = queued("b", Some(0), Some(20.0));
+        read_as_the_core(&mut live, &[], &[a, b]);
+        live.set_outside(1, 2);
+        live.tick(NOW);
+        // It is in ComfyUI's queue already: the outside prompt running is ahead of it, the queued
+        // ones are not known to be.
+        assert_eq!(
+            row(&live, "a").eta_text,
+            "about 30 s, after 1 job with no estimate"
+        );
+        // The queued job waits for it and for all three.
+        assert_eq!(
+            row(&live, "b").eta_text,
+            "about 50 s, after 3 jobs with no estimate"
+        );
+        // A job a restart holds has no finish time while it is held, outside jobs or not.
+        let mut held = job("h", "queued", "queue_paused", "gpu-heavy");
+        held["queue_position"] = json!(1);
+        let b = queued("b", Some(0), Some(20.0));
+        read_as_the_core(&mut live, &[], &[b, held]);
+        assert_eq!(row(&live, "h").eta_text, "");
+    }
+
+    #[test] // spec: APP-114, CORE-161
+    fn a_submitting_job_is_behind_every_outside_job_but_one_in_the_engine_only_the_running() {
+        // A submitting job isn't posted yet: every outside prompt queued now runs before it.
+        let mut live = LiveJobs::new();
+        let s = dispatched_job("s", "submitting", Some(30.0));
+        read_as_the_core(&mut live, &[], &[s]);
+        live.set_outside(1, 4);
+        live.tick(NOW);
+        assert_eq!(
+            row(&live, "s").eta_text,
+            "about 30 s, after 5 jobs with no estimate"
+        );
+        // A retry waiting on its earlier prompt: that prompt is one more.
+        let mut retry = dispatched_job("s", "submitting", Some(30.0));
+        retry["waiting_for_earlier_prompt"] = json!(true);
+        read_as_the_core(&mut live, &[], &[retry]);
+        assert_eq!(
+            row(&live, "s").eta_text,
+            "about 30 s, after 6 jobs with no estimate"
+        );
+        // Posted, it is behind the prompt running; which queued ones came earlier isn't known, so
+        // this is a lower bound.
+        let posted = dispatched_job("s", "queued_in_engine", Some(30.0));
+        read_as_the_core(&mut live, &[], &[posted]);
+        assert_eq!(
+            row(&live, "s").eta_text,
+            "about 30 s, after 1 job with no estimate"
         );
     }
 

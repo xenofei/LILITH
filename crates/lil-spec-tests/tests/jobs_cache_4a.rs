@@ -1,7 +1,8 @@
 //! A ComfyUI run served from its cache (spec CORE-117; Appendix G "Jobs": `cache_hit_nodes` are
 //! the node ids of ComfyUI's `execution_cached` event, and when every node of the prompt other
 //! than its output nodes was cached the job succeeds with `all_cached: true` and the summary
-//! text "Nothing changed: ComfyUI served every node from its cache."; plan 4a ruling,
+//! text "Reused from cache: ComfyUI ran nothing again except saving." (reworded by owner
+//! decision OD-1, 2026-11-03: the spec's "Nothing changed: ..." can be false); plan 4a ruling,
 //! 2026-10-24: an output node, such as a Save node, always runs again, since the suite gives it
 //! its own `filename_prefix`). Driven through `test.comfy_submit`, `job.wait` and the fake
 //! ComfyUI, whose `cached_nodes` makes it report nodes as cached and runs the Save node left
@@ -18,8 +19,11 @@ use lil_testkit::{CoreFixture, FakeComfy, TestEnv};
 use serde_json::{Value, json};
 use support::*;
 
-/// Appendix G's summary text of a run that changed nothing.
-const NOTHING_CHANGED: &str = "Nothing changed: ComfyUI served every node from its cache.";
+/// The summary text of a run whose judged nodes were all served from the cache (owner decision
+/// OD-1, 2026-11-03, replacing Appendix G's "Nothing changed: ComfyUI served every node from its
+/// cache.", which is false when a Save node's quality, fps or format changed; the spec sentence
+/// follows in plan 4a's last batch).
+const NOTHING_CHANGED: &str = "Reused from cache: ComfyUI ran nothing again except saving.";
 
 /// An `EmptyImage` node `1` and a `SaveImage` node `2` that saves it.
 fn graph() -> Value {

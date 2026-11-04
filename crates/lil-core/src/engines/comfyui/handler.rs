@@ -264,6 +264,11 @@ pub fn prefix_outputs(graph: &mut Value, job: &JobId) -> String {
 /// judged like any other, and a node with no path to an output is left out. Output nodes are
 /// those whose class `object_info` marks `output_node`; for a class it doesn't list (or no
 /// `object_info`), a node with a `filename_prefix` input.
+///
+/// The limit (plan 4a, CP-16): the nodes left out are not looked at, so a run that changes only
+/// what such a node saves (a Save node's quality, fps or format) is still `all_cached`, though it
+/// wrote a new, different file. `all_cached` therefore means "every judged node was reused",
+/// never "nothing changed", and the words shown for it (`NOTHING_CHANGED`) say only that.
 pub fn judged_nodes(graph: &Value, object_info: Option<&Value>) -> HashSet<String> {
     let Some(nodes) = graph.as_object() else {
         return HashSet::new();
@@ -1819,8 +1824,8 @@ impl Attempt<'_> {
             ComfyEvent::Executed { .. } => {}
             ComfyEvent::Success { .. } => {
                 // Every node the prompt executes but the nodes whose `filename_prefix` the
-                // suite sets served from the cache: nothing changed (CORE-117; plan 4a ruling,
-                // 2026-10-24: only those run again).
+                // suite sets served from the cache: every judged node was reused (CORE-117; plan
+                // 4a ruling, 2026-10-24: only those run again).
                 let info = self.comfy.graph_info(&self.client).await.ok();
                 let judged = judged_nodes(&self.graph, info.as_ref().map(|i| &*i.object_info));
                 if !judged.is_empty() && judged.iter().all(|n| self.cached.contains(n)) {

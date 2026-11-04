@@ -1420,6 +1420,116 @@ TestCase {
         verify(!button(t.panel, "Cancel all from this app"), "nothing of this app's to cancel")
     }
 
+    // An emptied list whose read failed doesn't know it is empty (JB-01): the note about the failed
+    // read is there, and the line that says nothing is running isn't.
+    function test_a_failed_read_of_an_emptied_list_does_not_say_nothing_is_running() { // spec: APP-114
+        const t = load({queue: [queued("j2", 0)]})
+        verify(!t.panel.emptyText.visible, "a job is queued")
+        t.core.emit("jobs", "event", {kind: "job", job: queued("j2", 0, {status: "cancelled", substatus: null,
+                                                                          finished: iso(), updated: iso()})})
+        tryCompare(t.panel.liveView, "count", 0)
+        refuseLive(t.core)
+        tryVerify(() => t.panel.staleNote.visible, 2000, "the note")
+        compare(t.panel.liveView.count, 0)
+        verify(!t.panel.emptyText.visible, "not both")
+        // The retry answers: the list is empty, and the core says so.
+        answerLive(t.core, [], [])
+        tryVerify(() => !t.panel.staleNote.visible, 4000, "the note goes")
+        tryVerify(() => t.panel.emptyText.visible, 2000, "and the line comes back")
+    }
+
+    // A fresh read (after a core restart) that fails is asked again as a fresh one (JB-07): the
+    // job of a status this build doesn't know that the new core no longer lists must not stay.
+    function test_a_failed_fresh_read_is_retried_as_a_fresh_one() { // spec: APP-114
+        const odd = job("odd", {status: "paused_by_director", substatus: "waiting_quota", created: iso(1000)})
+        const t = load({jobs: [odd], queue: [queued("q0", 0)]})
+        tryVerify(() => liveOrder(t.panel).indexOf("odd") >= 0, 2000, JSON.stringify(liveOrder(t.panel)))
+        t.core.emit("jobs", "resync_required", null)
+        refuseLive(t.core)
+        tryVerify(() => t.panel.staleNote.visible, 2000, "the fresh read failed")
+        // The history reload lists no such job either (else seeding it would put it back).
+        answer(t.core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}), "the reload")
+        verify(liveOrder(t.panel).indexOf("odd") >= 0, "still there until a read says otherwise")
+        // The retry, 2 s later.
+        answerLive(t.core, [], [queued("q0", 0)])
+        tryVerify(() => liveOrder(t.panel).indexOf("odd") < 0, 2000, "gone: " + JSON.stringify(liveOrder(t.panel)))
+        compare(liveOrder(t.panel), ["q0"])
+    }
+
+    // Reads made while the core was starting fail at once and a first connection brings no mark
+    // (SHELL-1): `ready` reads again what never landed.
+    function test_engines_and_caps_that_failed_before_ready_are_read_again_on_ready() { // spec: APP-114, APP-140
+        const core = createTemporaryObject(fakeComponent, tc, {connection: "connecting"})
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        const no = Shapes.refusal("core.unreachable", "No core.")
+        answer(core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}), "page")
+        answerLive(core, [], [], [lane()])
+        answer(core, c => c.name === "engines.status", no, "engines")
+        answer(core, c => c.name === "caps.get", no, "caps")
+        tryVerify(() => w.panel.model.loaded && w.panel.live.loaded)
+        compare(w.panel.caps, null)
+        const engineReads = () => callsOf(core, c => c.name === "engines.status").length
+        const capsReads = () => callsOf(core, c => c.name === "caps.get").length
+        compare(engineReads(), 1)
+        compare(capsReads(), 1)
+
+        core.applyState({connection: "ready", workspace: null})
+        answer(core, c => c.name === "engines.status", ok({engines: [comfy(1, 2)]}), "engines again")
+        answer(core, c => c.name === "caps.get", ok({display_currency: "USD", period: "2026-10", caps: []}), "caps again")
+        tryVerify(() => w.panel.caps !== null, 2000, "the caps")
+        compare(w.panel.outsideJobs.running, 1)
+        compare(w.panel.outsideJobs.queued, 2)
+        verify(w.panel.laneHeader("gpu-heavy").text.indexOf("ComfyUI: 1 outside job running, 2 queued") >= 0,
+               w.panel.laneHeader("gpu-heavy").text)
+
+        // What landed isn't read again by the next reconnect.
+        core.applyState({connection: "reconnecting"})
+        core.applyState({connection: "ready", workspace: null})
+        answerLive(core, [], [], [lane()])
+        wait(200)
+        compare(engineReads(), 2)
+        compare(capsReads(), 2)
+    }
+
+    // The caps read of the start is still out when `ready` comes, and its failure is delivered
+    // after: `ready` found the read open and asked for nothing, so the failure must ask again.
+    function test_a_caps_read_failing_after_ready_is_read_again() { // spec: APP-114, APP-140
+        const core = createTemporaryObject(fakeComponent, tc, {connection: "connecting"})
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        answer(core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}), "page")
+        answerLive(core, [], [], [lane()])
+        answer(core, c => c.name === "engines.status", ok({engines: [comfy(0, 0)]}), "engines")
+        tryVerify(() => w.panel.model.loaded && w.panel.live.loaded)
+        const capsReads = () => callsOf(core, c => c.name === "caps.get").length
+        compare(capsReads(), 1, "the start's read, still out")
+
+        core.applyState({connection: "ready", workspace: null})
+        compare(capsReads(), 1, "it is out, so `ready` makes no second one")
+        // Its failure lands now.
+        answer(core, c => c.name === "caps.get", Shapes.refusal("core.unreachable", "No core."), "caps")
+        answer(core, c => c.name === "caps.get", ok({display_currency: "USD", period: "2026-10", caps: []}), "caps again")
+        tryVerify(() => w.panel.caps !== null, 2000, "the caps")
+        compare(capsReads(), 2)
+    }
+
+    // ComfyUI's jobs started outside LILITH are jobs with no estimate ahead of the GPU queue
+    // (JB-05, owner decision OD-4): the ETA doesn't promise a finish the scheduler can't keep.
+    function test_queued_etas_count_outside_jobs_as_jobs_with_no_estimate() { // spec: APP-114, CORE-161
+        const a = queued("j2", 0, {estimate: wallEstimate(20)})
+        const t = load({jobs: [a], queue: [a], engines: [comfy(1, 2)]})
+        tryVerify(() => row(t.panel, "j2").statusText.indexOf("about 20 s, after 3 jobs with no estimate") >= 0, 3000,
+                  row(t.panel, "j2").statusText)
+        // The engines topic keeps it current.
+        t.core.emit("engines", "event", {kind: "outside_job", engine: comfy(0, 0)})
+        tryVerify(() => row(t.panel, "j2").statusText.indexOf("no estimate") < 0, 3000, row(t.panel, "j2").statusText)
+        verify(row(t.panel, "j2").statusText.indexOf("about 20 s") >= 0, row(t.panel, "j2").statusText)
+        t.core.emit("engines", "event", {kind: "outside_job", engine: comfy(0, 1)})
+        tryVerify(() => row(t.panel, "j2").statusText.indexOf("after 1 job with no estimate") >= 0, 3000,
+                  row(t.panel, "j2").statusText)
+    }
+
     function test_a_long_queue_shows_its_running_job_and_its_front() { // spec: APP-114, CORE-160
         // 150 queued jobs and a running one older than them all: the history page holds only the
         // newest 100 queued, the queue read has them all in two pages, the CPU lane after them.

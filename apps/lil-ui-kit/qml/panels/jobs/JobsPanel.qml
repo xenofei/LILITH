@@ -26,8 +26,12 @@
 // Each row is a JobRow. The lanes come from the read and from the `{kind: "queue", state}` events
 // on `jobs`, applied as full states, at most one header update per frame; a read's lanes don't undo
 // a state of that lane that came after the read began. Outside jobs come from `engines.status` and
-// the `engines` topic. `caps.get` is read at load and again, at most once a second, on `caps` and
-// `usage` events and when a job ends, for the retry's cost chip. Writes wait until both lists have
+// the `engines` topic, and go to the live rows, whose ETAs count each as a job with no estimate
+// ahead of the GPU lane's queue (OD-4). `ready` reads `engines.status` and `caps.get` again when
+// their last read failed or never landed: one made while the core was starting fails at once, and
+// a first connection brings no mark (SHELL-1). `caps.get` is read at load and again, at most once a
+// second, on `caps` and `usage` events and when a job ends, for the retry's cost chip. A fresh live
+// read that fails is retried as a fresh one (`_freshDue`). Writes wait until both lists have
 // loaded, and refusals show in the banner; Pause, Resume and Retry also wait for their own call,
 // so a double-click can't undo itself. A snapshot or a `resync_required` of `jobs` reads everything
 // again. `ready` reloads no model, but a read of the live rows follows it, since a same-core reconnect
@@ -161,7 +165,16 @@ Rectangle {
     property bool _liveAgain: false
     // The read asked for again must carry nothing over (a snapshot or a resync came).
     property bool _liveFreshAgain: false
+    // A fresh read failed: the next one, the retry's included, is fresh too, until one lands (a job
+    // of a status this build doesn't know must not outlive a core restart).
+    property bool _freshDue: false
     property bool _capsReading: false
+    // A caps read was asked for while one was out.
+    property bool _capsDue: false
+    // The last engines.status and caps.get landed. A read made while the core was starting fails at
+    // once and a first connection brings no mark, so `ready` reads again what hasn't landed.
+    property bool _enginesRead: false
+    property bool _capsRead: false
     // Request id -> {ok, fail}: the calls whose answer goes to Rust as it came.
     property var _raw: ({})
 
@@ -513,9 +526,11 @@ Rectangle {
         }
         applyPendingJobs()
         const losses = _losses
+        const asFresh = !!fresh || _freshDue
+        _freshDue = false
         _liveReading = true
         _newerLanes = {}
-        live.beginRead(!!fresh)
+        live.beginRead(asFresh)
         let open = 3
         let gone = false
         const done = () => {
@@ -550,6 +565,9 @@ Rectangle {
             gone = true
             root._liveReading = false
             root._liveReadFailed = true
+            // Nothing was carried over, nothing was learned: the retry starts afresh too.
+            if (asFresh)
+                root._freshDue = true
             // One was asked for meanwhile (`ready`, a mark): it needn't wait out the retry.
             if (root._liveAgain) {
                 const again = root._liveFreshAgain
@@ -591,26 +609,49 @@ Rectangle {
 
     function readEngines() {
         CoreCall.call(core, "engines.status", {}, {owner: root,
-            ok: r => root.applyEngines((r.structured || {}).engines)})
+            ok: r => {
+                root._enginesRead = true
+                root.applyEngines((r.structured || {}).engines)
+            },
+            error: () => { root._enginesRead = false }})
     }
 
+    // ComfyUI's outside jobs go to the live rows too: their ETAs count them (OD-4).
     function applyEngines(engines) {
         for (const e of engines || []) {
-            if (e && e.engine === "comfyui" && e.outside_jobs)
+            if (e && e.engine === "comfyui" && e.outside_jobs) {
                 outsideJobs = e.outside_jobs
+                live.setOutside(e.outside_jobs.running | 0, e.outside_jobs.queued | 0, Date.now())
+            }
         }
     }
 
+    // One read at a time: a call made while one is out (`ready`, a mark) is owed, and made when
+    // that one settles, as CapGauges does, since the one out may be an old connection's failing.
     function readCaps() {
-        if (_capsReading)
+        if (_capsReading) {
+            _capsDue = true
             return
+        }
         _capsReading = true
+        _capsDue = false
         CoreCall.call(core, "caps.get", {}, {owner: root,
             ok: r => {
                 root._capsReading = false
+                root._capsRead = true
                 root.caps = r.structured || null
+                root.capsSettled()
             },
-            error: () => { root._capsReading = false }})
+            error: () => {
+                root._capsReading = false
+                root._capsRead = false
+                root.capsSettled()
+            }})
+    }
+
+    function capsSettled() {
+        if (_capsDue)
+            readCaps()
     }
 
     function requestCapsRead() {
@@ -664,12 +705,14 @@ Rectangle {
             return
         CoreCall.subscribe(core, "jobs", root, (kind, seq, data) => root.onJobsEvent(kind, data))
         CoreCall.subscribe(core, "engines", root, (kind, seq, data) => {
-            if (kind === "snapshot")
+            if (kind === "snapshot") {
+                root._enginesRead = true
                 root.applyEngines(data && data.engines)
-            else if (kind === "resync_required")
+            } else if (kind === "resync_required") {
                 root.readEngines()
-            else if (data && data.engine)
+            } else if (data && data.engine) {
                 root.applyEngines([data.engine])
+            }
         })
         CoreCall.subscribe(core, "caps", root, () => root.requestCapsRead())
         CoreCall.subscribe(core, "usage", root, () => root.requestCapsRead())
@@ -701,6 +744,10 @@ Rectangle {
                 retryLive.stop()
                 if (!root.lanesCurrent || !live.loaded)
                     root.readLive()
+                if (!root._enginesRead)
+                    root.readEngines()
+                if (!root._capsRead)
+                    root.readCaps()
             } else {
                 root.lanesCurrent = false
                 root._losses++
@@ -1010,7 +1057,8 @@ Rectangle {
 
                 Text {
                     id: liveEmptyText
-                    visible: live.loaded && live.count === 0
+                    // Not while the last read failed: an empty list may only be an old one.
+                    visible: live.loaded && live.count === 0 && !root._liveReadFailed
                     width: parent.width
                     horizontalAlignment: Text.AlignHCenter
                     wrapMode: Text.Wrap
@@ -1038,6 +1086,10 @@ Rectangle {
             model: history
             spacing: 4
             onMovementStarted: root.personMoved()
+            // No rows made ahead off the frame's path, as the live list's: a list reloaded under
+            // one being made cancels it by an index past its end, and Qt warns ("DelegateModel::cancel:
+            // index out range"), into the log and the diagnostics bundle after a core restart.
+            cacheBuffer: 0
             activeFocusOnTab: true
             currentIndex: -1
             boundsBehavior: Flickable.StopAtBounds
