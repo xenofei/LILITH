@@ -26,7 +26,7 @@
 //! so a job whose retry would need your confirmation is refused there (retry it alone).
 //!
 //! `job.wait`'s summary text for a job whose every node the engine served from its cache is
-//! "Nothing changed: ComfyUI served every node from its cache." (CORE-117).
+//! "Reused from cache: ComfyUI ran nothing again except saving." (CORE-117; plan 4a OD-1).
 
 use std::time::Duration;
 

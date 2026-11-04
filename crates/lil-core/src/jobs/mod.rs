@@ -555,8 +555,10 @@ pub struct JobSummary {
     pub waiting_for_earlier_prompt: bool,
 }
 
-/// The summary text of a job whose every node the engine served from its cache (CORE-117).
-pub const NOTHING_CHANGED: &str = "Nothing changed: ComfyUI served every node from its cache.";
+/// The summary text of a job whose every judged node the engine served from its cache (CORE-117;
+/// plan 4a OD-1): the nodes whose `filename_prefix` the suite sets always run again, so the words
+/// don't claim that nothing did. (The constant keeps the name of the old words.)
+pub const NOTHING_CHANGED: &str = "Reused from cache: ComfyUI ran nothing again except saving.";
 
 /// One entry of a job's `status_seq`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -956,8 +958,8 @@ impl JobCtx {
         });
     }
 
-    /// Every node of the job's prompt was served from the cache: it succeeds saying nothing
-    /// changed (`all_cached`, [`NOTHING_CHANGED`]).
+    /// Every node of the job's prompt that is judged was served from the cache: it succeeds saying it
+    /// was reused (`all_cached`, [`NOTHING_CHANGED`]).
     pub fn set_all_cached(&self) {
         self.jobs.report(&self.id, |r| r.all_cached = true);
     }
