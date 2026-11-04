@@ -110,6 +110,10 @@ TestCase {
     property var answered: ({})
     // At each frame: (frame time) => nothing.
     property var onFrame: null
+    // The test's shell (makeShell's result) and its feed (startFeed's), until cleanup() ends them: a
+    // check that fails mid-test returns at once, and the next test's init() needs the shell gone.
+    property var current: null
+    property var currentFeed: null
 
     Connections {
         id: frames
@@ -145,6 +149,7 @@ TestCase {
     function makeShell() {
         const core = fakeComponent.createObject(tc)
         const shell = shellComponent.createObject(tc, {core: core, stateDir: "", setup: fakeSetupComponent.createObject(tc)})
+        current = {core: core, shell: shell}
         shell.visible = true
         tryVerify(() => shell.layoutSettled, 5000, "the docks are laid out")
         const jobs = []
@@ -165,7 +170,9 @@ TestCase {
         spinner.createObject(shell.contentItem)
         frames.target = shell
         wait(300)
-        return {core: core, shell: shell, jobs: jobs, scene: s}
+        current.jobs = jobs
+        current.scene = s
+        return current
     }
 
     // A new FakeCore numbers its calls from 1 again; the shell before deletes its docks later
@@ -179,9 +186,19 @@ TestCase {
         }, 5000, "the earlier shell's docks are gone")
     }
 
+    // Whether the test passed or a check failed part-way: the feed stops, the probe stops and the
+    // shell goes, so the next test's init() finds no docks left.
     function cleanup() {
         onFrame = null
         frames.target = null
+        if (currentFeed)
+            currentFeed.end()
+        BenchProbe.stop()
+        if (current) {
+            current.shell.destroy()
+            current = null
+            wait(100)
+        }
     }
 
     // The feed, through the pump: each 25 ms, two jobs' progress (a value one up) and preview. With
@@ -218,12 +235,18 @@ TestCase {
             ++tick
         })
         feed.start()
-        return {timer: feed, end: () => {
+        let ended = false
+        currentFeed = {timer: feed, end: () => {
+            if (ended)
+                return
+            ended = true
+            currentFeed = null
             feed.stop()
             wait(300)
             BenchPump.delivered.disconnect(deliver)
             feed.destroy()
         }}
+        return currentFeed
     }
 
     function test_job_progress_reaches_the_screen_within_the_budget() { // spec: APP-139
@@ -281,8 +304,6 @@ TestCase {
         verify(latencies.length >= measureS * measured.length * 9, "the events were measured: " + latencies.length)
         compare(left, 0, "every event was shown")
         verify(p99 < budgetMs, "job progress p99 " + p99.toFixed(1) + " ms, budget " + budgetMs + " ms")
-        r.shell.destroy()
-        wait(100)
     }
 
     function test_a_confirmation_shows_in_the_frame_after_it_arrives() { // spec: APP-139, APP-115
@@ -319,7 +340,5 @@ TestCase {
         verify(worst < budgetMs, "a confirmation took " + worst.toFixed(1) + " ms to a frame")
         verify(worst < 2 * pace + 5, "each showed in the frame after it arrived: " + worst.toFixed(1)
                                       + " ms against a frame pace of " + pace.toFixed(1) + " ms")
-        r.shell.destroy()
-        wait(100)
     }
 }
