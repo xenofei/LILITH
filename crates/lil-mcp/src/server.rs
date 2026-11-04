@@ -34,7 +34,9 @@ incompatible or unreachable), the caller kind the core gave this session (mcp, o
 this server was not started by Claude Code itself), the protocol and build, the session's \
 workspace and the core's process, and, when it is not connected, the error saying what to do: \
 protocol.incompatible (update the older of the two) or core.unreachable (no core could be \
-reached or started: wait, then call again). Call it first. Takes no arguments.";
+reached or started: wait, then call again); core.bug or params.invalid there means the core \
+faulted this server's own hello or tool list, which calling again won't fix. Call it first. \
+Takes no arguments.";
 
 pub struct LilServer {
     link: CoreLink,
