@@ -1492,6 +1492,28 @@ TestCase {
         compare(capsReads(), 2)
     }
 
+    // The caps read of the start is still out when `ready` comes, and its failure is delivered
+    // after: `ready` found the read open and asked for nothing, so the failure must ask again.
+    function test_a_caps_read_failing_after_ready_is_read_again() { // spec: APP-114, APP-140
+        const core = createTemporaryObject(fakeComponent, tc, {connection: "connecting"})
+        const w = createTemporaryObject(panelWindow, tc, {core: core})
+        windows.push(w)
+        answer(core, isPage, ok({jobs: [], next_cursor: null, lanes: [lane()]}), "page")
+        answerLive(core, [], [], [lane()])
+        answer(core, c => c.name === "engines.status", ok({engines: [comfy(0, 0)]}), "engines")
+        tryVerify(() => w.panel.model.loaded && w.panel.live.loaded)
+        const capsReads = () => callsOf(core, c => c.name === "caps.get").length
+        compare(capsReads(), 1, "the start's read, still out")
+
+        core.applyState({connection: "ready", workspace: null})
+        compare(capsReads(), 1, "it is out, so `ready` makes no second one")
+        // Its failure lands now.
+        answer(core, c => c.name === "caps.get", Shapes.refusal("core.unreachable", "No core."), "caps")
+        answer(core, c => c.name === "caps.get", ok({display_currency: "USD", period: "2026-10", caps: []}), "caps again")
+        tryVerify(() => w.panel.caps !== null, 2000, "the caps")
+        compare(capsReads(), 2)
+    }
+
     // ComfyUI's jobs started outside LILITH are jobs with no estimate ahead of the GPU queue
     // (JB-05, owner decision OD-4): the ETA doesn't promise a finish the scheduler can't keep.
     function test_queued_etas_count_outside_jobs_as_jobs_with_no_estimate() { // spec: APP-114, CORE-161

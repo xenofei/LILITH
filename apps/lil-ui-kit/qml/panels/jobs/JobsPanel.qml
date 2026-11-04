@@ -169,6 +169,8 @@ Rectangle {
     // of a status this build doesn't know must not outlive a core restart).
     property bool _freshDue: false
     property bool _capsReading: false
+    // A caps read was asked for while one was out.
+    property bool _capsDue: false
     // The last engines.status and caps.get landed. A read made while the core was starting fails at
     // once and a first connection brings no mark, so `ready` reads again what hasn't landed.
     property bool _enginesRead: false
@@ -624,20 +626,32 @@ Rectangle {
         }
     }
 
+    // One read at a time: a call made while one is out (`ready`, a mark) is owed, and made when
+    // that one settles, as CapGauges does, since the one out may be an old connection's failing.
     function readCaps() {
-        if (_capsReading)
+        if (_capsReading) {
+            _capsDue = true
             return
+        }
         _capsReading = true
+        _capsDue = false
         CoreCall.call(core, "caps.get", {}, {owner: root,
             ok: r => {
                 root._capsReading = false
                 root._capsRead = true
                 root.caps = r.structured || null
+                root.capsSettled()
             },
             error: () => {
                 root._capsReading = false
                 root._capsRead = false
+                root.capsSettled()
             }})
+    }
+
+    function capsSettled() {
+        if (_capsDue)
+            readCaps()
     }
 
     function requestCapsRead() {
@@ -691,12 +705,14 @@ Rectangle {
             return
         CoreCall.subscribe(core, "jobs", root, (kind, seq, data) => root.onJobsEvent(kind, data))
         CoreCall.subscribe(core, "engines", root, (kind, seq, data) => {
-            if (kind === "snapshot")
+            if (kind === "snapshot") {
+                root._enginesRead = true
                 root.applyEngines(data && data.engines)
-            else if (kind === "resync_required")
+            } else if (kind === "resync_required") {
                 root.readEngines()
-            else if (data && data.engine)
+            } else if (data && data.engine) {
                 root.applyEngines([data.engine])
+            }
         })
         CoreCall.subscribe(core, "caps", root, () => root.requestCapsRead())
         CoreCall.subscribe(core, "usage", root, () => root.requestCapsRead())
