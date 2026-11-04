@@ -63,6 +63,10 @@ function Start-Stretch([int]$capSec) { $script:stopAt = [DateTime]::UtcNow.AddSe
 function Assert-InStretch {
     if ($null -ne $script:stopAt -and [DateTime]::UtcNow -gt $script:stopAt) { throw "out of the stretch's time" }
 }
+# First thing in a catch that goes on after a failed wait: the stretch error is not a failed wait.
+function Rethrow-Stretch($err) {
+    if ("$err" -like "out of the stretch's time*") { throw "out of the stretch's time" }
+}
 
 # UI Automation can throw for a whole walk while the tree moves: walk again, a few times.
 function Retry-Walk([scriptblock]$walk) {

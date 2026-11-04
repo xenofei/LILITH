@@ -163,8 +163,9 @@ function Get-WorkspaceId {
 # nothing.
 function Assert-ChannelFree {
     $taken = ''
-    $r = Invoke-LilTimed @('--no-start', 'status')
-    if ($r.ExitCode -eq 0 -and [regex]::IsMatch(($r.Output -join "`n"), 'pid \d+, channel ')) { $taken = 'a core already runs on it' }
+    # The pipes are listed, not asked: another deploy's core makes `lil --no-start status` fail as if there
+    # were none.
+    if ((Get-ChannelPipes $channel).Count -gt 0) { $taken = 'a core or an app already serves it' }
     $apps = @(Get-Process -Name 'lil-image' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Deploy, [StringComparison]::OrdinalIgnoreCase) })
     if ($apps.Count -gt 0) { $taken = "a lil-image from this deploy runs (pid $($apps[0].Id))" }
     if ($taken) {
@@ -465,12 +466,15 @@ function Find-TabItem([string]$name) {
     return $null
 }
 function Invoke-Element($e) {
+    Assert-InStretch
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
     if ($e.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); return }
     throw "nothing to invoke on $($e.Current.Name)"
 }
 function Set-WindowState($state) {
+    # Restoring brings the window to the front.
+    Assert-InStretch
     $p = $null
     if (-not $script:main.TryGetCurrentPattern($WP::Pattern, [ref]$p)) { throw 'the main window has no WindowPattern' }
     $p.SetWindowVisualState($state)
@@ -498,6 +502,7 @@ function Show-App {
 # A window of this script's, in front: what another program would be. It waits for the front as
 # Show-App does. Its messages are pumped only as far as it needs to stay a window.
 function Show-Cover {
+    Assert-InStretch
     $form = [System.Windows.Forms.Form]::new()
     $form.Text = 'home-check: another program'
     $form.Width = 320
@@ -627,6 +632,7 @@ try {
     Set-Kept $wsId $seed
 
     # (a) Minimized as soon as the window is there.
+    Assert-InStretch
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     $script:main = Wait-For { Find-Window '' } 40 'the lil-image window'
     Set-WindowState ([System.Windows.Automation.WindowVisualState]::Minimized)
@@ -708,7 +714,7 @@ try {
     Write-Host "(d) dragging from $([int]$fromX),$([int]$fromY) to $([int]$toX),$([int]$toY)"
     Drag-From $fromX $fromY $toX $toY
     $homeTab = $null
-    try { $homeTab = Wait-For { Find-TabItem 'Home' } 10 'the Home tab' } catch { }
+    try { $homeTab = Wait-For { Find-TabItem 'Home' } 10 'the Home tab' } catch { Rethrow-Stretch $_ }
     Write-Host "(d) tabs after: $(Get-TabNames); a window of Home's own: $([bool](Find-Window 'Home'))"
     if (-not $homeTab) {
         Fail '(d) the drag didn''t put Home in the Jobs tabs, so the tab case did not run here (tst_home''s test_last_seen_waits_until_really_on_screen covers it offscreen)'
@@ -760,11 +766,13 @@ try {
     [void](Wait-For { if (-not (Find-Named 'Close Home')) { $true } } 10 'Home to close')
     $target = 'C:\art\crane.png'
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($target)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    Assert-InStretch
     $second = Start-Process -FilePath $image -ArgumentList @('--intent', 'edit', "lil-$channel`:open/$b64") -WorkingDirectory $root -PassThru
     Check ($second.WaitForExit(30000) -and $second.ExitCode -eq 0) '(e) the second launch hands over and exits 0'
     [void](Wait-For { Find-Named $target } 15 'the Opened card''s target')
     Pass '(e) the Opened card shows the target'
     Check ($null -ne (Find-Named 'Close Home')) '(e) the launch opened Home'
+    Assert-InStretch
     $refused = Start-Process -FilePath $image -ArgumentList @('--no-activate', 'lil-test-nope:open/x') -WorkingDirectory $root -PassThru
     Check ($refused.WaitForExit(30000) -and $refused.ExitCode -eq 0) '(e) a refused link''s launch hands over and exits 0'
     [void](Wait-For { Find-NameStarting "This link isn't one LILITH opens" } 15 'the refusal')
@@ -776,7 +784,7 @@ try {
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
         if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
-        Write-Host "diagnostics in $DiagDir"
+        Write-Host "diagnostics in $(Hide-Paths $DiagDir)"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
     foreach ($p in $second, $refused) {

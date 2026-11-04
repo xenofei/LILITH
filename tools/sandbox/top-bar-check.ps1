@@ -319,6 +319,7 @@ function Press-Center($e) {
     Press-At ($r.X + $r.Width / 2) ($r.Y + $r.Height / 2)
 }
 function Invoke-Element($e) {
+    Assert-InStretch
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
     Assert-InStretch
@@ -372,6 +373,7 @@ function Save-UiaTree([string]$path) {
     Set-Content -LiteralPath $path -Value $lines -Encoding utf8
 }
 function Invoke-DialogId($dlg, [string]$id) {
+    Assert-InStretch
     $e = $dlg.FindFirst($TS::Children, (Prop $AE::AutomationIdProperty $id))
     if (-not $e) { $e = $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $id)) }
     $p = $null
@@ -379,6 +381,7 @@ function Invoke-DialogId($dlg, [string]$id) {
     return $false
 }
 function Start-App {
+    Assert-InStretch
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     $script:main = $null
     [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
@@ -418,7 +421,7 @@ try {
     Start-Sleep -Seconds 1
     Check ((Get-DiskState) -eq $before) '(a) cancelled: suite.toml and the folders are as they were'
     # The window has only just got the front back from the dialog: a few looks, not one.
-    $stays = try { [void](Wait-For { Find-Named 'Create or choose a workspace' } 5 'the banner'); $true } catch { $false }
+    $stays = try { [void](Wait-For { Find-Named 'Create or choose a workspace' } 5 'the banner'); $true } catch { Rethrow-Stretch $_; $false }
     Check $stays '(a) cancelled: the banner stays'
     Close-App
 
@@ -513,7 +516,7 @@ try {
         try {
             [void](Wait-For { if (-not (Find-List 'Workspaces')) { $true } } 5 'a press on the floating dock to close the list')
             Pass '(c) a press on a floating dock window closed the list'
-        } catch { Fail "(c) $_" }
+        } catch { Rethrow-Stretch $_; Fail "(c) $_" }
         if (Find-List 'Workspaces') { Show-App; Send-Keys '{ESC}' }
     }
 
@@ -589,7 +592,7 @@ try {
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
         if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
-        Write-Host "diagnostics in $DiagDir"
+        Write-Host "diagnostics in $(Hide-Paths $DiagDir)"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
     try { Close-App } catch { Fail "cleanup: closing lil-image: $_" }

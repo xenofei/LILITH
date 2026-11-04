@@ -130,9 +130,9 @@ function Enter-TestChannel {
     New-Item -ItemType Directory $root | Out-Null
     foreach ($s in 'roaming', 'local', 'profile', 'places') { New-Item -ItemType Directory (Join-Path $root $s) | Out-Null }
     Set-Location -LiteralPath $root
-    # With a fresh root no core of ours can answer; one that does isn't ours to touch.
-    $r = Invoke-LilTimed @('--no-start', 'status')
-    if ($r.ExitCode -eq 0 -and ($r.Output -join "`n") -match 'pid \d+') { throw "$channel already has a core running: not touching it" }
+    # With a fresh root no core of ours can answer; one that does isn't ours to touch. The pipes are
+    # listed, not asked: another deploy's core makes `lil --no-start status` fail as if there were none.
+    if ((Get-ChannelPipes $channel).Count -gt 0) { throw "$channel already has a core or an app serving it: not touching it" }
     $script:channelMine = $true
 }
 function Invoke-Lil([string[]]$a) {
@@ -378,7 +378,7 @@ function Save-Evidence([string]$what) {
         Save-UiaTree (Join-Path $DiagDir "failure-$stamp-uia.txt")
         $logs = Get-LogFolder
         if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$stamp-logs") }
-        Write-Host "evidence in $DiagDir"
+        Write-Host "evidence in $(Hide-Paths $DiagDir)"
     } catch { Write-Host "the evidence wasn't saved: $_" }
 }
 # The app's log, from the test root only.
@@ -658,6 +658,7 @@ function Save-UiaTree([string]$path) {
 # The confirm window on `id`. One confirmation at a time: it is closed and started again for each.
 function Open-Window([string]$id, [string]$button = 'Approve') {
     Close-App
+    Assert-InStretch
     $script:app = Start-Process -FilePath $image -ArgumentList @('--confirm', $id) -WorkingDirectory $root -PassThru
     # A window: another top-level element of the app's process can't stand in for it.
     $findMain = {
@@ -713,6 +714,7 @@ function Close-App {
     $script:main = $null
 }
 function Invoke-Uia($e) {
+    Assert-InStretch
     $p = $null
     if (-not $e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { throw 'it has no Invoke pattern' }
     $p.Invoke()
@@ -811,6 +813,7 @@ function Find-InShell([string]$name) {
 }
 # Invokes the first element of that name that can be invoked, if any.
 function Invoke-AnyNamed([string]$name) {
+    Assert-InStretch
     $all = Retry-Walk { $script:main.FindAll($TS::Descendants, (Prop $AE::NameProperty $name)) }
     foreach ($e in $all) {
         $pattern = $null
@@ -1009,19 +1012,20 @@ try {
         # every click on a dialog in it. Read only.
         Step '(p)' {
             Close-App
+            Assert-InStretch
             $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
             [void](Wait-For { Find-Shell } 40 'the shell')
             $float = $null
-            try { $float = Wait-For { Find-InShell 'Float Confirmations' } 15 'its Float button' } catch { }
+            try { $float = Wait-For { Find-InShell 'Float Confirmations' } 15 'its Float button' } catch { Rethrow-Stretch $_ }
             if (-not $float) {
                 # Tabbed with Jobs: its tab first.
                 Invoke-AnyNamed 'Confirmations'
-                try { $float = Wait-For { Find-InShell 'Float Confirmations' } 5 'its Float button' } catch { }
+                try { $float = Wait-For { Find-InShell 'Float Confirmations' } 5 'its Float button' } catch { Rethrow-Stretch $_ }
             }
             $window = $null
             if ($float) {
                 Invoke-Uia $float
-                try { $window = Wait-For { Find-FloatingWindow 'Confirmations' } 10 'the floating window' } catch { }
+                try { $window = Wait-For { Find-FloatingWindow 'Confirmations' } 10 'the floating window' } catch { Rethrow-Stretch $_ }
             }
             if (-not $window) {
                 $note = "(p) not checked: the panel didn't float (Float button found: $([bool]$float))"
@@ -1398,6 +1402,7 @@ try {
             # The window has settled, so a too-soon now comes from the change alone.
             Start-Sleep -Milliseconds 700
             Start-Step
+            Assert-InStretch
             $vp.SetValue('25')
             Invoke-Uia $script:deny
             Check (@(Get-RefusalNames) -contains 'too_soon') "(d) right after the change the gate had re-armed: Cancel was too soon: [$((Get-RefusalNames) -join ', ')]"

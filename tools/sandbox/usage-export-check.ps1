@@ -316,6 +316,7 @@ function Find-Window([int]$procId, [string]$name) {
     return $e
 }
 function Invoke-Element($e) {
+    Assert-InStretch
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
     Assert-InStretch
@@ -334,6 +335,7 @@ function Open-UsagePanel {
     $how = ''
     $tab = $script:main.FindFirst($TS::Descendants, (And (Prop $AE::NameProperty 'Usage & spend') (Prop $AE::ControlTypeProperty ([System.Windows.Automation.ControlType]::TabItem))))
     if ($tab) {
+        Assert-InStretch
         $p = $null
         if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); $how = 'its dock tab (select)' }
         elseif ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); $how = 'its dock tab (invoke)' }
@@ -343,6 +345,7 @@ function Open-UsagePanel {
     try {
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
     } catch {
+        Rethrow-Stretch $_
         if ($how -eq 'Ctrl+5') { throw }
         Show-App; Send-Checked '^5'; $how = "Ctrl+5 (after $how did nothing)"
         [void](Wait-For { Find-NameStarting $script:main 'Spend this month: ' } 15 'the month total in Usage & spend')
@@ -424,6 +427,7 @@ function Escape-Keys([string]$s) { [regex]::Replace($s, '[+^%~(){}\[\]]', '{$0}'
 # A child of the dialog with automation id `id`, any control type, invoked; false when it has
 # no Invoke pattern.
 function Invoke-DialogId($dlg, [string]$id) {
+    Assert-InStretch
     $e = $dlg.FindFirst($TS::Children, (Prop $AE::AutomationIdProperty $id))
     if (-not $e) { $e = $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $id)) }
     $p = $null
@@ -439,6 +443,7 @@ function Save-As($dlg, [string]$path) {
     $vp = $null
     $typed = $false
     if ($box.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+        Assert-InStretch
         try { $vp.SetValue($path); $typed = $true; Write-Host 'file name: set through its value pattern' } catch { }
     }
     if (-not $typed) {
@@ -465,7 +470,7 @@ function Cancel-Dialog($dlg) {
 # The replace prompt: its Yes, any control type, else Alt+Y.
 function Confirm-Replace($dlg) {
     $yes = $null
-    try { $yes = Wait-For { Find-Yes $dlg } 5 'the replace prompt''s Yes' } catch { }
+    try { $yes = Wait-For { Find-Yes $dlg } 5 'the replace prompt''s Yes' } catch { Rethrow-Stretch $_ }
     if ($yes) { Invoke-Element $yes; Write-Host 'replace prompt: Yes'; return }
     Send-Checked '%y'
     Write-Host 'replace prompt: Alt+Y'
@@ -479,6 +484,7 @@ try {
     $outDir = Join-Path $root 'out'
     Set-Content -LiteralPath (Join-Path $outDir 'usage.csv.bak') -Value 'mine' -NoNewline
     Seed 'openrouter' '1.25'
+    Assert-InStretch
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
     # The shell's window is titled "LILITH" (or "LILITH — <project>"); else the first one.
@@ -533,7 +539,7 @@ try {
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
         if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
-        Write-Host "diagnostics in $DiagDir"
+        Write-Host "diagnostics in $(Hide-Paths $DiagDir)"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
     if ($script:app -and -not $script:app.HasExited) {

@@ -333,6 +333,7 @@ function Show-Element($e) {
 function Show-App { Show-Element $script:main }
 function Send-Keys([string]$keys) { Show-App; Send-Checked $keys; Start-Sleep -Milliseconds 200 }
 function Invoke-Element($e) {
+    Assert-InStretch
     $p = $null
     if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); return }
     if ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$p)) { $p.Toggle(); return }
@@ -389,6 +390,7 @@ function Save-UiaTree([string]$path) {
     Set-Content -LiteralPath $path -Value $lines -Encoding utf8
 }
 function Start-App {
+    Assert-InStretch
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     $script:main = $null
     [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
@@ -493,7 +495,14 @@ try {
             $opened = Wait-For { Get-Process -Name SystemSettings -ErrorAction SilentlyContinue | Select-Object -First 1 } 15 'Windows'' Settings'
             Pass "(e) the button, pressed through Invoke, opened Windows' Settings"
             Stop-Process -Id $opened.Id -Force
-        } catch { Fail "(e) $_" }
+        } catch {
+            if ("$_" -like "out of the stretch's time*") {
+                # No Settings process ran before this one, so any that runs now is the one this run opened.
+                Get-Process -Name SystemSettings -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                Rethrow-Stretch $_
+            }
+            Fail "(e) $_"
+        }
     }
 } catch {
     Fail "the settings check stopped: $_"
@@ -502,7 +511,7 @@ try {
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
         if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
-        Write-Host "diagnostics in $DiagDir"
+        Write-Host "diagnostics in $(Hide-Paths $DiagDir)"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
     try { Close-App } catch { Fail "cleanup: closing lil-image: $_" }

@@ -341,7 +341,9 @@ if ($DryRun) {
         Pass 'dry run: UI Automation loads'
         $count = (New-Object -ComObject Shell.Application).Windows().Count
         Check ($count -ge 0) 'dry run: the shell window list can be read'
-    } catch { Fail "dry run: $_" } finally { Exit-TestChannel }
+    } catch { Fail "dry run: $_" } finally {
+        try { Exit-TestChannel } catch { Fail "cleanup: $_" }
+    }
     Write-Summary
     exit ([int]($failures.Count -gt 0))
 }
@@ -507,8 +509,9 @@ function Open-DiagnosticsPanel {
             $script:main = Find-Main
             if ($script:main) { Retry-Walk { $script:main.FindFirst($TS::Descendants, $tabName) } }
         } 20 'the Diagnostics tab'
-    } catch { }
+    } catch { Rethrow-Stretch $_ }
     if ($tab) {
+        Assert-InStretch
         $p = $null
         if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); $how = 'its dock tab (select)' }
         elseif ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); $how = 'its dock tab (invoke)' }
@@ -521,6 +524,7 @@ function Open-DiagnosticsPanel {
     try {
         [void](Wait-For $found 15 'the keep-awake line')
     } catch {
+        Rethrow-Stretch $_
         if ($how -eq 'Ctrl+6') { throw }
         Show-App; Send-Keys '^6' $script:main $script:main 'Ctrl+6'; $how = "Ctrl+6 (after $how did nothing)"
         [void](Wait-For $found 15 'the keep-awake line')
@@ -541,9 +545,9 @@ function Save-UiaTree([string]$path) {
             # Names only for the app's own Qt elements (their ids start "QGuiApplication"):
             # nothing of the system dialogs, whose lists show the PC's own folders and files.
             $ours = $c.AutomationId.StartsWith('QGuiApplication') -or ($depth -eq 0 -and $c.Name -like 'LILITH*')
-            $name = if (-not $ours) { '' } elseif ($c.Name.Length -gt 100) { $c.Name.Substring(0, 100) + '…' } else { $c.Name }
-            # The panel's own banner can name the temporary folder, which names the account.
-            $name = Hide-Paths $name
+            # The panel's own banner can name the temporary folder, which names the account: masked before the cut.
+            $shown = Hide-Paths $c.Name
+            $name = if (-not $ours) { '' } elseif ($shown.Length -gt 100) { $shown.Substring(0, 100) + '…' } else { $shown }
             $lines.Add(('{0}{1} "{2}" id={3} offscreen={4} enabled={5}' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, $c.AutomationId, $c.IsOffscreen, $c.IsEnabled))
             # The save dialog's file list, navigation pane and address bar or breadcrumb: the
             # node alone, nothing under it.
@@ -590,7 +594,7 @@ function Get-NameBox($dlg) {
 # be $null.
 function Find-HostedControl($dlg, [string]$hostId, [string]$id) {
     $hostPane = $null
-    try { $hostPane = Wait-For { $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $hostId)) } 10 "the host $hostId" } catch { }
+    try { $hostPane = Wait-For { $dlg.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $hostId)) } 10 "the host $hostId" } catch { Rethrow-Stretch $_ }
     $control = if ($hostPane) { $hostPane.FindFirst($TS::Descendants, (Prop $AE::AutomationIdProperty $id)) } else { $null }
     return [pscustomobject]@{ hostPane = $hostPane; control = $control }
 }
@@ -649,7 +653,7 @@ function Read-FileTypeBox($dlg) {
         if ($hostWindow -eq [System.IntPtr]::Zero) { return '' }
         $native = Get-NativeText ([LilDiagCheck.Win]::FindUnder($hostWindow, 'ComboBox'))
         if ($native.ok) { return $native.text }
-    } catch { Write-Host 'the file type box''s host went away or was not there' }
+    } catch { Rethrow-Stretch $_; Write-Host 'the file type box''s host went away or was not there' }
     return ''
 }
 # A dialog control's shape for the fix: control types, ids, classes, whether it has a window, and its
@@ -729,6 +733,7 @@ $script:app = $null
 $script:main = $null
 try {
     Enter-TestChannel
+    Assert-InStretch
     $script:app = Start-Process -FilePath $image -WorkingDirectory $root -PassThru
     [void](Wait-For { Find-Window $script:app.Id '' } 40 'the lil-image window')
     [void](Wait-For { if ((Get-CorePid) -ne 0) { $true } } 30 'a core on the test channel')
@@ -786,6 +791,7 @@ try {
     try {
         [void](Wait-For $closed 3 'the dialog to close')
     } catch {
+        Rethrow-Stretch $_
         # A first Escape can only close the box's suggestions.
         Cancel-Dialog $dlg
         [void](Wait-For $closed 10 'the dialog to close')
@@ -811,7 +817,7 @@ try {
     $shellWindows = (New-Object -ComObject Shell.Application).Windows().Count
     Invoke-Element $show 'Show in Explorer'
     $window = $null
-    try { $window = Wait-For { Find-ExplorerWindow $outDir } 20 'an Explorer window on the temporary folder' } catch { }
+    try { $window = Wait-For { Find-ExplorerWindow $outDir } 20 'an Explorer window on the temporary folder' } catch { Rethrow-Stretch $_ }
     if (-not $window) {
         Fail '(c) no Explorer window on the temporary folder could be told apart: nothing was closed. Look for one, and close it by hand'
     } else {
@@ -831,7 +837,7 @@ try {
             Pass '(c) Quit went to that window, and no window is on the folder now'
             $nowOpen = (New-Object -ComObject Shell.Application).Windows().Count
             Check ($nowOpen -eq $shellWindows) "(c) the shell lists as many windows as before Show in Explorer ($shellWindows, then $nowOpen)"
-        } catch { Fail "(c) that Explorer window didn't close: close it by hand ($_)" }
+        } catch { Rethrow-Stretch $_; Fail "(c) that Explorer window didn't close: close it by hand ($_)" }
     }
 
     # (d) Open Backups: the status line's words, and the panel's own beside them.
@@ -852,7 +858,7 @@ try {
         if ($script:app -and -not $script:app.HasExited) { Save-UiaTree (Join-Path $DiagDir 'uia-tree.txt') }
         $logs = Join-Path $root "local\LILITH-$channel\logs"
         if (Test-Path -LiteralPath $logs) { Copy-MaskedLogs $logs (Join-Path $DiagDir "failure-$script:runStamp-logs") }
-        Write-Host "diagnostics in $DiagDir"
+        Write-Host "diagnostics in $(Hide-Paths $DiagDir)"
     } catch { Write-Host "the diagnostics weren't saved: $_" }
 } finally {
     if ($script:app -and -not $script:app.HasExited) {
