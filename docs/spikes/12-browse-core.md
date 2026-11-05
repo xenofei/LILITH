@@ -24,7 +24,7 @@ Plan 4b, Task 0. Four measurements that later tasks build on (Tasks 1, 5, 12 and
 | Crates | `windows` =0.62.2, `image` =0.25.10 (`png`, `jpeg`, `webp`), `rusqlite` =0.40.2 (`bundled`, the workspace's version), `serde_json` =1.0.154; `spikes/browse-core/Cargo.lock` committed |
 | PowerShell | 7.6.9 |
 | ComfyUI | 0.42.1 (S0.4 only; install folder and Python passed as parameters, never recorded) |
-| Spike code | `spikes/browse-core/`, in the commit that adds it (recorded in §5) |
+| Spike code | `spikes/browse-core/` at commit `27d580a3` |
 
 ## 3. Method
 
@@ -81,16 +81,90 @@ Copied from the plan (Task 0) before anything ran.
 
 ## 5. Measurements
 
-Not run yet.
+Step 2 ran on 2026-11-05 from a normal, non-elevated shell: `pwsh -NoProfile -File spikes/browse-core/run-spike.ps1 -Only pdh-read,decode,facets` (254 s with the build already done). `facets` then ran once more (`-Only facets`, 227 s) after the recorded 64 MiB-cache rows were added; its figures below are from that second run, and the first run's agree (10,000-asset p95 26.4 and 68.4 ms, 50,000-asset p95 643 and 640 ms). The code is the commit in §2. Nothing else was started on the GPU for the run; the desktop was in normal use. Raw data: written to `spikes/browse-core/results/` (raw output kept privately).
+
+S0.1's load part and S0.4 are **pending**: they run in Step 3, after the owner says go.
+
+### S0.1 PDH, the readability part (Step 2)
+
+The token was not elevated (`TokenElevation` 0). All three counters added with `PdhAddEnglishCounterW` (status 0), and the first collect returned 0.
+
+| Metric | n | p50 | p95 | p99 | max | Unit |
+|---|---|---|---|---|---|---|
+| `PdhCollectQueryData`, the three wildcard counters, 100 ms apart | 300 | 1.016 | 1.242 | **1.463** | 1.71 | ms |
+| `PdhGetFormattedCounterArrayW`, the three counters after each collect | 300 | 1.152 | 1.523 | 1.716 | 2.027 | ms |
+
+- **Values arrive:** every one of the 300 collects returned a valid value for the discrete GPU's LUID from all three counters, with no collect error.
+- **Instance names** (LUIDs, PIDs and numbers replaced):
+  - `GPU Adapter Memory`: `luid_<luid>_phys_<n>`, one instance per adapter. PDH listed 3 adapters; DXGI counted 2 hardware adapters (the third is presumably Windows' own software adapter; not checked).
+  - `GPU Engine`: `pid_<pid>_luid_<luid>_phys_<n>_eng_<n>_engtype_<type>`, one instance per process and engine: about 1,285 instances in all, 768 of them on the discrete GPU (48 processes × 16 engines).
+  - The discrete GPU's engine types: `3D`, `Copy` (6 engines), `VideoDecode` (2), `VideoEncode` (2), `JPEG_Decode_1`, `OFA_0`, `Security`, `Security_1`, `VR`. It showed **no `Compute` engine type**, so compute work on it is expected under `3D`; Step 3's compute loop will show which.
+  - The other GPU's types contain spaces (`High Priority 3D`, `Compute 0`, `Video Codec 0`), so a parser must take everything after `engtype_` as the type.
+
+Verdict against the bar: **PASS** (values for all three; collect p99 1.463 ms < 5 ms).
+
+### S0.2 Decode cost
+
+One thread. Each run reads the file, decodes under P4b-R36's limits (256 MiB allocation, 16,384 px a side), resizes (Lanczos3) and PNG-encodes in memory. Inputs: 1024² PNG 2.56 MiB, 2048² JPEG 1.50 MiB, 1024² WebP (lossless) 1.16 MiB, 4096² PNG 40.97 MiB.
+
+| Input → px | n | p50 | p95 | p99 | max | Unit |
+|---|---|---|---|---|---|---|
+| 1024² PNG → 160 | 30 | 12.0 | 12.6 | 12.7 | 12.7 | ms |
+| **1024² PNG → 256** | 100 | 12.6 | **13.5** | 13.9 | 15.1 | ms |
+| 1024² PNG → 512 | 30 | 16.1 | 17.9 | 18.4 | 18.4 | ms |
+| 2048² JPEG → 160 | 30 | 51.5 | 67.4 | 67.4 | 67.4 | ms |
+| 2048² JPEG → 512 | 30 | 76.0 | 78.3 | 80.8 | 80.8 | ms |
+| 1024² WebP → 160 | 30 | 25.6 | 26.4 | 29.0 | 29.0 | ms |
+| 1024² WebP → 512 | 30 | 31.6 | 32.0 | 33.5 | 33.5 | ms |
+| 4096² PNG → 160 | 30 | 325.4 | 330.0 | 330.6 | 330.6 | ms |
+| 4096² PNG → 512 | 30 | 335.2 | 342.8 | 343.0 | 343.0 | ms |
+
+- **The stages** (p50): decode is 5 ms for the 1024² PNG, 14 ms for the WebP, 20–24 ms for the 2048² JPEG and 98 ms for the 4096² PNG; the Lanczos3 resize is the larger part from 2048² up (30–50 ms for the JPEG, 213–219 ms for the 4096² PNG); the PNG encode is 0.1–1.7 ms.
+- **60,000 × 60,000 header:** refused (`Image size exceeds limit`) in 0.05 ms; peak working set **+0.1 MiB** above the baseline (8.4 MiB). Recorded: with only the 256 MiB allocation limit, and with the crate's default limits, it is refused too (`Memory limit exceeded`), and the peak stays at +0.2 MiB.
+- **Broken files**, each under `catch_unwind`; **no panic** in any:
+  - the empty file: an error (`The image format could not be determined`);
+  - the JPEG cut to 200 bytes (inside its headers): an error (`Not enough bytes`);
+  - **the JPEG cut to half its length (inside the scan): no error.** The decoder returned a whole 2048 × 2048 image (`Ok`), the missing half filled in.
+- **Four concurrent 4096² renders** (decode under the 256 MiB limit, resize to 512, encode; released together by a barrier): all four decoded, 79–81 ms each, 270 ms wall; peak working set **+487.5 MiB** above the baseline.
+- **Recorded, the cold cache:** 10,000 generated 512² JPEGs (818 MiB) at 160 px with `min(4, 32/2)` = 4 workers: **13.6 s** in all (735 a second; per item p50 5.5 ms, p95 6.3 ms, max 71 ms), no failures. The inputs had just been written, so they were in the OS file cache.
+
+Verdict against the bar: **FAIL**, on one item: the JPEG truncated inside its scan decodes without an error. Every other item passes: the 1024² PNG → 256 px p95 is 13.5 ms (< 60 ms); the header is refused at +0.1 MiB (< 64 MiB); the empty file and the JPEG truncated in its headers return errors; nothing panics; four concurrent 4096² decodes stay at +487.5 MiB (< 1.5 GiB).
+
+### S0.3 Facets
+
+`index.db` as in §3 (SQLite 3.53.2, `ANALYZE` run after the build). 10,000 assets: 30,000 tag rows, 20,016 runs, 80,064 takes, 6.5 MiB. 50,000 assets: 150,000 tag rows, 99,943 runs, 399,772 takes, 33.1 MiB. One read transaction holds the page, the total and the six facets; 100 timed runs after 5 warm-up runs, on one read-only connection.
+
+| Assets, filters, page cache | n | p50 | p95 | p99 | max | Unit |
+|---|---|---|---|---|---|---|
+| 10,000, none, default | 100 | 22.8 | 24.9 | 26.8 | 27.0 | ms |
+| **10,000, five filters, default** | 100 | 59.7 | **64.0** | 65.6 | 66.1 | ms |
+| 50,000, none, default | 100 | 610.1 | **654.0** | 692.7 | 697.4 | ms |
+| 50,000, five filters, default | 100 | 576.4 | 606.3 | 616.3 | 617.8 | ms |
+| 10,000, none, 64 MiB (recorded) | 100 | 37.3 | 38.4 | 38.9 | 39.2 | ms |
+| 10,000, five filters, 64 MiB (recorded) | 100 | 30.2 | 32.5 | 33.4 | 33.4 | ms |
+| 50,000, none, 64 MiB (recorded) | 100 | 238.7 | 251.2 | 256.0 | 259.1 | ms |
+| 50,000, five filters, 64 MiB (recorded) | 100 | 238.7 | 300.5 | 308.6 | 312.2 | ms |
+
+"Default" is SQLite's default page cache (2 MiB), which today's index uses (`schema.rs` sets no `cache_size`). The 64 MiB rows set `PRAGMA cache_size` on the reading connection and are recorded only.
+
+- **Where the time goes** (each statement alone, p50 of 20, default cache): at 10,000 with no filter, `flag` 11.9 ms, `tags` 3.9 ms, the page 3.0 ms, the rest under 2 ms; with five filters, `rating` 12.3, `status` 11.2, `tags` 10.9, the page 8.0, the others 2–8 ms. At 50,000 with no filter, `tags` (401 ms) and `flag` (95 ms) take almost all of it; with five filters, `tags` 196 ms, `rating` 72, `status` 67. With 64 MiB, the 50,000 `tags` facet drops to 39–47 ms and `flag` becomes the largest (149 ms with no filter). The time grows far faster than the row count from 10,000 to 50,000, mostly in `tags`, which reads `assets` by rowid once per tag row.
+- **Query plans** (`EXPLAIN QUERY PLAN`, the same at both sizes): the page scans `assets` and sorts with a temporary B-tree (there is no index on `asset_id` alone, as today), with the tags and open runs as correlated lookups by primary key; `status` and `type` use their `COALESCE` indexes only without a filter; `rating` and `label` scan their covering indexes; `tags` scans the covering index `asset_tags_by_tag`, looks each asset up by rowid and sorts by count with a temporary B-tree; `flag` runs two correlated `EXISTS` per asset through `takes_flagged` and the runs' primary key. Every plan is in the raw output.
+- **The budgets (P4b-R23: twice the p95, rounded up to 10 ms):** at 10,000, 2 × 64.0 → **130 ms**; at 50,000, 2 × 654.0 → **1,310 ms**. 130 ms is over 100 ms, so P4b-R23 has the owner hear of it before Task 1.
+
+Verdict against the bar: **PASS** (p95 at 10,000: 64.0 ms with five filters, 24.9 ms with none; both < 100 ms).
+
+### S0.1's load part and S0.4 (pending, Step 3)
+
+Not run yet. Command and parameters: §3.
 
 ## 6. Verdict
 
-Not run yet.
+Written after Step 3.
 
 ## 7. Decision
 
-Not run yet.
+Written after Step 3.
 
 ## 8. Follow-ups
 
-Not run yet.
+Written after Step 3.
