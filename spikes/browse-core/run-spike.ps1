@@ -548,8 +548,15 @@ function Invoke-Spill {
             $proc.Kill($true)
             [void]$proc.WaitForExit(30000)
         }
-        $left = @(Get-SpillRefusals $plan | Where-Object { $_ -notlike '*lacks the flag*' })
-        if ($left.Count -gt 0) { Say "After the stop: $($left -join '; ')" 'Red' }
+        # The port can still answer for a moment while its socket closes (Step 3 saw that once), so
+        # the check after the stop retries for up to 10 s before it reports anything left.
+        $left = @()
+        foreach ($try in 1..5) {
+            $left = @(Get-SpillRefusals $plan | Where-Object { $_ -notlike '*lacks the flag*' })
+            if ($left.Count -eq 0) { break }
+            Start-Sleep -Seconds 2
+        }
+        if ($left.Count -gt 0) { Say "After the stop (checked 5 times over 10 s): $($left -join '; ')" 'Red' }
     }
     $phasesFile = Join-Path $runDir 'phases.json'
     ConvertTo-Json -InputObject @($phases) -Depth 4 | Set-Content -Encoding utf8 $phasesFile
@@ -561,7 +568,7 @@ function Invoke-Spill {
         "INVALID (not every run succeeded: $($states -join ', '))"
     } else { $r.verdict }
     Set-Check 'spill' $verdict ([ordered]@{
-            analysis_verdict = $r.verdict; idle_mib = $r.idle_mib; fit = $r.fit; spill = $r.spill; gap = $r.gap; margin_mib = $r.margin_mib; why = $r.why
+            analysis_verdict = $r.verdict; idle_mib = $r.idle_mib; fit = $r.fit; spill = $r.spill; gap = $r.gap; margin_mib = $r.margin_mib; margin_midpoint_mib = (Get-Prop $r 'margin_midpoint_mib'); why = $r.why
             warm_idle_mib = (Get-Prop $r 'warm_idle_mib'); margin_vs_warm_idle_mib = (Get-Prop $r 'margin_vs_warm_idle_mib')
             runs = $phases; graphs = [ordered]@{ fit = "$FitWidth x $FitHeight b$FitBatch s$FitSteps"; spill = "$SpillWidth x $SpillHeight b$SpillBatch s$SpillSteps" }
             adapter_shared = $r.adapter_shared; process_dedicated = $r.process_dedicated

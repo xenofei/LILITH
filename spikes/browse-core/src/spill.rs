@@ -35,19 +35,36 @@ pub fn sustained(values: &[f64], window: usize) -> Option<f64> {
         .max_by(|a, b| a.total_cmp(b))
 }
 
-/// The margin for the gap `(low, high)`: a multiple of 128 MiB strictly inside it, the
-/// midpoint rounded down when that is above `low`, else the smallest multiple above `low`;
-/// `None` when no multiple of 128 lies strictly inside.
-pub fn margin(low: f64, high: f64) -> Option<f64> {
+/// The smallest multiple of 128 MiB (at least 128) strictly inside the gap `(low, high)`, or
+/// `None` when there is none: the bar's PASS condition.
+fn smallest_inside(low: f64, high: f64) -> Option<f64> {
     if low >= high {
         return None;
     }
+    let first = (((low / 128.0).floor() + 1.0) * 128.0).max(128.0);
+    (first < high).then_some(first)
+}
+
+/// The margin (controller ruling PF-26, 2026-11-05): among the multiples of 128 MiB strictly
+/// inside the gap `(low, high)`, the smallest that is at least twice the fitting runs' maximum
+/// `low`. Returns `(margin, doubled)`; when no multiple inside the gap reaches `2 × low`, the
+/// smallest multiple inside it, with `doubled` false. `None` when no multiple lies inside.
+pub fn margin(low: f64, high: f64) -> Option<(f64, bool)> {
+    let first = smallest_inside(low, high)?;
+    let doubled = first.max((2.0 * low / 128.0).ceil() * 128.0);
+    Some(if doubled < high {
+        (doubled, true)
+    } else {
+        (first, false)
+    })
+}
+
+/// The first rule (recorded beside PF-26's): the middle of the gap rounded down to 128 MiB when
+/// that is above `low`, else the smallest multiple inside the gap.
+pub fn midpoint_margin(low: f64, high: f64) -> Option<f64> {
+    let first = smallest_inside(low, high)?;
     let down = ((low + high) / 2.0 / 128.0).floor() * 128.0;
-    if down > low {
-        return Some(down);
-    }
-    let up = ((low / 128.0).floor() + 1.0) * 128.0;
-    (up < high).then_some(up)
+    Some(if down > low { down } else { first })
 }
 
 /// The levels above `idle`: each fitting run's maximum and each spilling run's sustained level.
@@ -108,7 +125,9 @@ fn measure(samples: &[(u64, f64)], phases: &[Phase], window: usize, idle: f64) -
         "fit_max_mib": if low.is_finite() { json!(low) } else { Value::Null },
         "spill_min_mib": if high.is_finite() { json!(high) } else { Value::Null },
         "gap": gap,
-        "margin_mib": m,
+        "margin_mib": m.map(|m| m.0),
+        "margin_is_twice_fit_max": m.map(|m| m.1),
+        "margin_midpoint_mib": if complete { midpoint_margin(low, high) } else { None },
         "why": why,
         "verdict": verdict,
     })
@@ -139,6 +158,7 @@ pub fn analyse(samples: &[(u64, f64)], phases: &[Phase], window: usize) -> Value
         let w = measure(samples, phases, window, warm);
         r["warm_idle_mib"] = json!(warm);
         r["margin_vs_warm_idle_mib"] = w["margin_mib"].clone();
+        r["margin_midpoint_vs_warm_idle_mib"] = w["margin_midpoint_mib"].clone();
         r["gap_vs_warm_idle"] = w["gap"].clone();
         r["verdict_vs_warm_idle"] = w["verdict"].clone();
     }
@@ -169,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_gap_gives_the_margin_rounded_down() {
+    fn a_clean_gap_gives_twice_the_fit_max_and_records_the_midpoint() {
         // idle 100; fits peak 300 above idle; spills hold 1100 above idle for 3 samples.
         let mut s = vec![(0, 120.0), (1, 100.0), (2, 110.0)];
         s.extend([(10, 150.0), (11, 400.0), (12, 200.0)]);
@@ -186,21 +206,36 @@ mod tests {
         assert_eq!(r["idle_mib"], 100.0);
         assert_eq!(r["fit_max_mib"], 300.0);
         assert_eq!(r["spill_min_mib"], 1100.0);
-        // the middle is 700, rounded down to 640
+        // twice 300 is 600, so 640; the middle is 700, rounded down to 640 too
         assert_eq!(r["margin_mib"], 640.0);
-        // warm idle 160: fit 240, spill 1040, middle 640
+        assert_eq!(r["margin_is_twice_fit_max"], true);
+        assert_eq!(r["margin_midpoint_mib"], 640.0);
+        // warm idle 160: fit 240 (twice: 480, so 512), spill 1040 (middle 640)
         assert_eq!(r["warm_idle_mib"], 160.0);
-        assert_eq!(r["margin_vs_warm_idle_mib"], 640.0);
+        assert_eq!(r["margin_vs_warm_idle_mib"], 512.0);
+        assert_eq!(r["margin_midpoint_vs_warm_idle_mib"], 640.0);
+    }
+
+    #[test]
+    fn pf26_takes_the_smallest_multiple_at_least_twice_the_fit_max() {
+        // Step 3's figures: fits 202 MiB above idle, spills 4,987.9.
+        assert_eq!(margin(202.0, 4987.9), Some((512.0, true)));
+        assert_eq!(midpoint_margin(202.0, 4987.9), Some(2560.0));
+        // Exactly twice a multiple: 256 → 512.
+        assert_eq!(margin(256.0, 4000.0), Some((512.0, true)));
+        // A fit max at or below idle still needs a margin of at least 128.
+        assert_eq!(margin(0.0, 4785.9), Some((128.0, true)));
+        assert_eq!(margin(-10.0, 4785.9), Some((128.0, true)));
     }
 
     #[test]
     fn a_narrow_gap_needs_a_multiple_of_128_inside_it() {
-        // 300..310: no multiple of 128 inside, so FAIL (the midpoint rounds down to 256).
+        // 300..310: no multiple of 128 inside, so FAIL.
         assert_eq!(margin(300.0, 310.0), None);
-        // 250..260: the midpoint rounds down to 128, below the gap; 256 is inside.
-        assert_eq!(margin(250.0, 260.0), Some(256.0));
+        assert_eq!(midpoint_margin(300.0, 310.0), None);
+        // 250..260: 256 is inside but below twice 250, so 256 with `doubled` false.
+        assert_eq!(margin(250.0, 260.0), Some((256.0, false)));
         assert_eq!(margin(256.0, 384.0), None, "both ends are excluded");
-        assert_eq!(margin(300.0, 1100.0), Some(640.0));
         let s = vec![(0, 0.0), (10, 300.0), (20, 310.0), (21, 310.0)];
         let phases = [
             ph("idle", 0, 0, 0),
@@ -212,7 +247,6 @@ mod tests {
         assert_eq!(r["why"], "gap narrower than the 128 MiB step");
         assert_eq!(r["gap"]["low"], 300.0);
     }
-
     #[test]
     fn overlap_fails_and_a_short_spill_is_invalid() {
         let s = vec![(0, 0.0), (10, 500.0), (20, 400.0), (21, 400.0)];
