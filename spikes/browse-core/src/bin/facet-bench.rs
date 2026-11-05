@@ -273,9 +273,19 @@ impl Filters {
     }
 }
 
-/// The assets with a take flagged `flag` (trashed runs aren't mirrored, P4b-R40).
+/// The assets with a take flagged `flag` (trashed runs aren't mirrored, P4b-R40): the filter's
+/// form, one pass over the `flag` index.
 fn flagged(flag: &str) -> String {
     format!("SELECT project, asset_id FROM take_marks WHERE flag = {flag}")
+}
+
+/// Whether asset `a` has a take flagged `flag`: the facet's form, by the primary key. (A row-value
+/// `IN (SELECT …)` in a result column took about 2 s at 10,000 assets: SQLite 3.53 searched its
+/// list per row.)
+fn has_take(flag: &str) -> String {
+    format!(
+        "SELECT 1 FROM take_marks k WHERE k.project = a.project AND k.asset_id = a.asset_id AND k.flag = {flag}"
+    )
 }
 
 const PAGE_COLUMNS: &str = "a.project, a.asset_id, a.asset_type, a.status, a.version, a.approved_version, a.manifest, a.creation_uuid, a.updated, a.needs_repair, \
@@ -326,9 +336,9 @@ fn statements(f: &Filters) -> Vec<(&'static str, String, Vec<Sql>)> {
         (
             "flag",
             format!(
-                "SELECT sum(p), sum(j), sum(NOT p AND NOT j) FROM (SELECT (a.project, a.asset_id) IN ({}) AS p, (a.project, a.asset_id) IN ({}) AS j FROM assets a{wf})",
-                flagged("'pick'"),
-                flagged("'reject'")
+                "SELECT sum(p), sum(j), sum(NOT p AND NOT j) FROM (SELECT EXISTS ({}) AS p, EXISTS ({}) AS j FROM assets a{wf})",
+                has_take("'pick'"),
+                has_take("'reject'")
             ),
             af,
         ),
