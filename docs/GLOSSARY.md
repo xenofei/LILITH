@@ -37,15 +37,15 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Asset | A tracked deliverable in a project, with a manifest, a status and sealed versions. | file, item (a library item is different) | CORE-023, CORE-048 |
 | Version (sealed version) | An immutable `v<semver>/` folder of an asset, made by sign-off; in copy, "version" means only this. | revision, take, snapshot (a snapshot is an autosave) | CORE-026, ARCH-087, APP-163 |
 | Candidate | The spec's and the code's word for one output of a candidate run, waiting for review; user-facing copy calls it a take. | draft, proposal (a proposal belongs to a document) | CORE-023, APP-057 |
-| Take | The user-facing name for one candidate: Take 1, Take 2 and so on, grouped by revision round. | version (only a sealed result), candidate (in copy) | APP-163 |
+| Take | One output of a run, its primary file plus any companions; Take 1, Take 2… | version, candidate (in copy) | APP-163, CORE-023 |
 | Candidate run | One generation for an asset, writing its outputs to `candidates/<run_id>/` and going through QA and repair. | job (the work that makes it), run (alone) | CORE-023, CORE-025 |
 | Sign-off | Choosing a candidate and sealing it as a new version; ungated for you, gated for agents by failed technical QA. | approve, accept, publish | CORE-026, CORE-051, CORE-132 |
 | Seal | The step of sign-off that moves the chosen files into a read-only version folder with a frozen manifest snapshot. | lock, freeze, commit | CORE-026 |
 | Human edit | An outside change to a candidate or sealed file, recorded and offered as a new version. | manual edit, drift | CORE-034, ARCH-079 |
-| Agent edit | A change an AI agent made to a candidate or sealed file, recorded as AI work and never as a human edit. | human edit, hand edit | CORE-034, roadmap row 4b (attribution) |
+| Agent edit | A change an AI agent made, reported with its `by`; recorded in `human_edits[]` with its actor, never counted as yours. | human edit, hand edit | CORE-034 |
 | Claim | Your hold on an asset or document you opened to edit: the director doesn't write to it, and it lasts until you hand it back. | lock, lease (a checkout lease is another thing), hold (a document hold is APP-103's) | roadmap N31 |
 | Hand back | Your action that ends a claim, so the director may work on that asset again. | release, unlock | roadmap N31 |
-| Redirect | The record a renamed or moved asset leaves, so old references still resolve. | alias, symlink | ARCH-125, CORE-153 |
+| Redirect | A record that an asset's old name now lives elsewhere; refs to the old name follow it. | alias, symlink | ARCH-125 |
 | Recipe | What a candidate records about how it was made: profile, model hashes, seed, prompt and settings. | provenance (the dropped C2PA sense), workflow | IMG-140, CORE-018 |
 | QA gate | A technical, data-driven check per asset type; it blocks only automatic and agent sign-off. | licence gate, content filter (neither exists) | CORE-132, CORE-172 |
 | Repair | A logged deterministic or model-driven fix applied to a candidate, always with a reason. | auto-fix | CORE-172, CORE-025 |
@@ -54,7 +54,15 @@ The one home for the suite's settled terms. Each row gives a term one meaning an
 | Proposal run | One generation for a document, kept under the document's `proposals/<run_id>/`, separate from candidate runs. | candidate run | CORE-043 |
 | Library resource | A typed reusable resource (swatch, palette, preset, model profile, workflow) in the workspace or personal scope. | library item, asset | APP-078, APP-079, APP-080 |
 | Library item | A promoted asset in `library/<kind>/`, referenced with `lib:` links (Later). | library resource | Appendix E, workspace format I7 |
-| Inbox | The workspace's `inbox/` quarantine where outside files wait for review; from plan 4b it receives the owned ComfyUI's new images. Nothing in it is an asset until you keep it. | staging, candidates | CORE-179, workspace format I1 |
+| Inbox | Where new ComfyUI outputs wait, untrusted, until you keep or dismiss them. | downloads, staging (`.lilith\staging\` is another thing) | CORE-179 |
+| Organising marks | Tags, a 0–5 rating and a colour label on an asset, and a pick or reject flag and rating on a take. | metadata (alone), stars | CORE-152 |
+| Saved search | A named `assets.query` filter set in `registry/collections.yaml`. | smart folder, view | CORE-155 |
+| Collection | A named, hand-picked list of assets in `registry/collections.yaml`. | album, folder | CORE-155 |
+| Quick collection | The built-in collection the B key adds to and removes from. | clipboard, basket | CORE-155, APP-143 |
+| Status log | An asset's newest 50 status changes, with who made each. | history (alone: version history is another thing) | CORE-156 |
+| Trust record | Whether a file brought in from outside is still untrusted, and where it came from. | taint (alone), quarantine | ARCH-060 |
+| Pick log | The machine-local record of your picks, rejects and sign-offs in Review. | history, ratings log | CORE-176 |
+| Renderer | The core's drawer of thumbnails for one media kind, with an id and version. | decoder, previewer | APP-038 |
 
 ## Tools, callers and safety
 
