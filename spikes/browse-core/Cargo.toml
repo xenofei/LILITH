@@ -1,0 +1,36 @@
+[package]
+name = "browse-core"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Spike 12 (plan 4b Task 0): PDH adapter and engine counters, decode cost, facet queries and the
+# spill margin. Standalone: not a workspace member (the root excludes `spikes`). Console binaries
+# only; none opens a window.
+
+[dependencies]
+serde_json = "=1.0.154"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+# The workspace's version and feature (CORE-004).
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+
+[dependencies.windows]
+version = "=0.62.2"
+features = [
+    "Win32_Foundation",                    # HANDLE, CloseHandle, HMODULE
+    "Win32_Security",                      # TOKEN_ELEVATION, GetTokenInformation
+    "Win32_System_Threading",              # OpenProcessToken, GetCurrentProcess
+    "Win32_System_Performance",            # PdhOpenQueryW, PdhAddEnglishCounterW, PdhCollectQueryData
+    "Win32_System_ProcessStatus",          # GetProcessMemoryInfo (peak working set)
+    "Win32_System_Diagnostics_ToolHelp",   # CreateToolhelp32Snapshot (S0.4's process tree)
+    "Win32_System_LibraryLoader",          # LoadLibraryW, GetProcAddress (nvml.dll)
+    "Win32_Graphics_Dxgi",                 # CreateDXGIFactory1, the adapters' LUIDs
+    "Win32_Graphics_Dxgi_Common",          # DXGI_FORMAT
+    "Win32_Graphics_Direct3D",             # D3D_DRIVER_TYPE_UNKNOWN, ID3DBlob
+    "Win32_Graphics_Direct3D11",           # the STAGING buffers and the compute loop
+    "Win32_Graphics_Direct3D_Fxc",         # D3DCompile
+]
+
+[profile.release]
+debug = "line-tables-only"

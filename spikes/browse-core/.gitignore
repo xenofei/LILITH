@@ -1,0 +1,7 @@
+/target/
+# Generated inputs (images, index.db): regenerated per run, removed at the end.
+/work/
+# ComfyUI's outputs and every image a run writes stay local.
+/results/**/*.png
+/results/**/*.db
+/results/**/*.db-*
