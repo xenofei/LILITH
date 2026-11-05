@@ -19,12 +19,12 @@ Plan 4b, Task 0. Four measurements that later tasks build on (Tasks 1, 5, 12 and
 |---|---|
 | OS | Windows 11 Pro 10.0.26300 (26H2, UBR 9818) |
 | GPU | a 16 GB consumer GPU (one discrete adapter), driver 617.42 |
-| CPU and memory | a desktop CPU with 32 logical processors (so `min(4, cores/2)` = 4), 128 GB RAM |
+| CPU and memory | a desktop CPU with 32 logical processors (so `min(4, cores/2)` = 4), and enough RAM that the 1.5 GiB bar isn't near it |
 | Rust | rustc / cargo 1.99.0, `stable-x86_64-pc-windows-msvc`, edition 2024 |
 | Crates | `windows` =0.62.2, `image` =0.25.10 (`png`, `jpeg`, `webp`), `rusqlite` =0.40.2 (`bundled`, the workspace's version), `serde_json` =1.0.154; `spikes/browse-core/Cargo.lock` committed |
 | PowerShell | 7.6.9 |
 | ComfyUI | 0.42.1 (S0.4 only; install folder and Python passed as parameters, never recorded) |
-| Spike code | `spikes/browse-core/` at commit `27d580a3` |
+| Spike code | `spikes/browse-core/`: S0.1 and S0.2 ran at commit `27d580a3`; S0.3 at `7a8a2464` (fix round 1) |
 
 ## 3. Method
 
@@ -40,7 +40,7 @@ pwsh -NoProfile -File spikes/browse-core/run-spike.ps1 -Only spill -ComfyRoot ..
 ### S0.1 PDH (`pdh-probe`)
 
 - **`read` (Step 2):** records whether the process token is elevated (`GetTokenInformation(TokenElevation)`), then finds the discrete GPU's LUID through DXGI (the hardware adapter with the most dedicated video memory). One PDH query holds the three counters, added with `PdhAddEnglishCounterW` and the wildcard instance: `\GPU Adapter Memory(*)\Dedicated Usage`, `\GPU Adapter Memory(*)\Shared Usage`, `\GPU Engine(*)\Utilization Percentage`. After a first collect, 300 collects run 100 ms apart in the one process; each `PdhCollectQueryData` call is timed alone, and the formatted arrays (`PdhGetFormattedCounterArrayW`) are read after each collect and timed separately. "Values arrive" means: at least one instance of each counter whose name holds the discrete GPU's `luid_0x…_0x…` and whose status is valid. The instance names are recorded with the LUIDs, PIDs and numbers replaced by placeholders.
-- **`load` (Step 3):** a D3D11 device on the discrete adapter. The adapter's `Shared Usage` is sampled at 4 Hz for 10 s idle, then while 1 GiB of D3D11 `STAGING` buffers (16 × 64 MiB, each mapped and written once) is held for 10 s, then for 10 s after they are released. Then a 30 s compute loop (a long ALU loop in a compute shader, compiled at run time with `D3DCompile`, dispatched continuously with a query wait every few dispatches so the queue doesn't run away) runs while, at 1 Hz, the busiest engine type is read (per engine, `pid_*…eng_<n>_engtype_<type>` instances summed over processes; per type, its busiest engine; then the busiest type) and NVML's utilisation (`nvml.dll`, loaded in process, `nvmlDeviceGetUtilizationRates` on device 0) is read. The medians of the two 1 Hz series are compared.
+- **`load` (Step 3):** a D3D11 device on the discrete adapter. The adapter's `Shared Usage` is sampled at 4 Hz for 10 s idle, then while 1 GiB of D3D11 `STAGING` buffers (16 × 64 MiB, each mapped and written once) is held for 10 s, then for 10 s after they are released. Then a 30 s compute loop (a long ALU loop in a compute shader, compiled at run time with `D3DCompile`, dispatched continuously with a query wait every few dispatches so the queue doesn't run away) runs while, at 1 Hz, the busiest engine type is read (per engine, `pid_*…eng_<n>_engtype_<type>` instances summed over processes; per type, its busiest engine; then the busiest type) and NVML's utilisation (`nvml.dll`, loaded in process from `System32` only, `nvmlDeviceGetUtilizationRates` on device 0, whose PCI device id is checked against the DXGI adapter's) is read. The medians of the two 1 Hz series are compared.
 
 ### S0.2 Decode cost (`decode-bench`)
 
@@ -53,22 +53,34 @@ pwsh -NoProfile -File spikes/browse-core/run-spike.ps1 -Only spill -ComfyRoot ..
 
 ### S0.3 Facets (`facet-bench`)
 
-A synthetic `index.db` in `work/` (WAL, `synchronous=NORMAL`, as the index today) with today's `assets` table plus a draft of Task 5's additions, built from the plan's Global Constraints (`assets.query`, Takes, Manifest fields) and today's `crates/lil-core/src/index/schema.rs`. The draft is a guess, Task 5 owns the real one:
+A synthetic `index.db` in `work/` (WAL, `synchronous=NORMAL`, as the index today) with Task 5's draft schema: today's `assets` table (`crates/lil-core/src/index/schema.rs`) with the "schema 2 adds" of the plan's Task 5 Interfaces block (fix round 1, I1; the first runs used an invented schema, and their figures are replaced):
 
-- `assets` gains `rating INTEGER NOT NULL DEFAULT 0` and `label TEXT` (NULL for none), with indexes on each;
-- `asset_tags (asset INTEGER, tag_key TEXT, tag TEXT, PRIMARY KEY (asset, tag_key)) WITHOUT ROWID` with an index on `(tag_key, asset)`; `tag_key` is the lowercased tag, for "any of, case-insensitive";
-- `runs (asset INTEGER, run_id TEXT, state TEXT, PRIMARY KEY (asset, run_id)) WITHOUT ROWID` (`state` `open`, `signed_off` or `trashed`);
-- `takes (asset INTEGER, run_id TEXT, take INTEGER, flag TEXT, rating INTEGER, PRIMARY KEY (asset, run_id, take)) WITHOUT ROWID` with a partial index on `(flag, asset) WHERE flag IS NOT NULL`.
+- `assets` gains `rating INTEGER NOT NULL DEFAULT 0`, `label TEXT`, `runs_waiting INTEGER NOT NULL DEFAULT 0`, `external INTEGER NOT NULL DEFAULT 0`, `working_doc INTEGER NOT NULL DEFAULT 0`, `display TEXT`, `last_change TEXT` and `repair TEXT`; today's three indexes stay, and none is added on `rating` or `label` (the plan names none);
+- `asset_tags (project, asset_id, tag, tag_fold)` with an index on `tag_fold`;
+- `take_marks (project, asset_id, run_id, take, flag, rating)` with an index on `flag`.
 
-Data: 10 projects; 10,000 and 50,000 assets; the ten statuses and 8 types spread unevenly; 3 distinct tags each from 200; ratings 0–5 and labels (five, or none) spread; 1–3 runs each with 4 takes, about 10 % of takes flagged `pick` and 5 % `reject`, about 10 % of runs trashed (their flags don't count, P4b-R40).
+What the plan leaves open, and this spike chose:
+- the primary keys: `asset_tags` `PRIMARY KEY (project, asset_id, tag_fold) WITHOUT ROWID` (a tag once per asset, case-insensitively), `take_marks` `PRIMARY KEY (project, asset_id, run_id, take) WITHOUT ROWID`; the page's per-row tag lookup uses the first;
+- `tag_fold` is the lowercased tag; the facet shows `min(tag)` for each `tag_fold`;
+- P4b-R40: the mirror leaves a trashed run's takes out of `take_marks`, so the flag queries need no run state;
+- the JSON columns' contents: `display` about 150 bytes (`{path, sha256, media_kind}`, on 90 % of assets), `last_change` about 60 bytes (`{to, by, utc}`, 95 %), `repair` on 1 %; `external` on 5 %, `working_doc` on 10 %;
+- `files.kind` and the `files_sha` index are left out: no facet or filter measured here reads `files` (`duplicates` isn't measured).
 
-The measured unit is one read transaction holding: the page (`SELECT … ORDER BY asset_id, project LIMIT 201` with each row's tags and open-run count by correlated subquery), `count(*)` with the same filters, and the six facet counts, each disjunctive (P4b-R10: every filter except its own): `status`, `type`, `rating`, `label` by `GROUP BY`; `tags` by a join on `asset_tags` grouped by tag, the 100 largest (ties by value) plus whether more exist; `flag` as three counts (`pick`, `reject`, none). Two filter sets: **none** (the opening view) and **five filters** (`status` any of 2, `tags` any of 2, `label` any of `red` and none, `rating_min` 2, `flag` `pick`), so each facet has its own WHERE. 5 warm-up runs, then 100 timed runs of each set at each size, on one connection opened read-only. `EXPLAIN QUERY PLAN` of every statement is recorded. The verdict takes the slower filter set at 10,000.
+Data: 10 projects; 10,000 and 50,000 assets; the ten statuses and 8 types spread unevenly; 3 distinct tags each from 200; ratings 0–5 and labels (five, or none) spread; 1–3 runs each with 4 takes, about 10 % of takes flagged `pick` and 5 % `reject`, about 10 % of runs trashed (not mirrored); `runs_waiting` counts the open runs (about 30 % of runs).
+
+The measured unit is one read transaction holding: the page (`SELECT … ORDER BY asset_id, project LIMIT 201` with every `assets` column the summary needs, including `runs_waiting` and the JSON columns, and each row's tags by correlated subquery), `count(*)` with the same filters, and the six facet counts, each disjunctive (P4b-R10: every filter except its own): `status`, `type`, `rating`, `label` by `GROUP BY`; `tags` grouped by `tag_fold`, the 100 largest (ties by value) plus whether more exist, joined to `assets` only when another filter applies; `flag` as three counts (`pick`, `reject`, none). The `tags` and `flag` filters are `(project, asset_id) IN (SELECT project, asset_id FROM … WHERE tag_fold IN (…) / flag = …)`, which use the two named indexes. Two filter sets: **none** (the opening view) and **five filters** (`status` any of 2, `tags` any of 2, `label` any of `red` and none, `rating_min` 2, `flag` `pick`), so each facet has its own WHERE. 5 warm-up runs, then 100 timed runs of each set at each size, on one connection opened read-only. `EXPLAIN QUERY PLAN` of every statement is recorded. The verdict takes the slower filter set at 10,000.
 
 ### S0.4 Spill margin (`spill-probe`, Step 3 only)
 
-- **Safety:** the script takes the ComfyUI folder (`-ComfyRoot`) and its Python (`-Python`) as parameters, and refuses to start if anything listens on the chosen port (default 8199, not ComfyUI's 8188) or if any process runs from that folder, names it on its command line, or is that Python running a `main.py`. It starts `main.py --listen 127.0.0.1 --port <port> --disable-auto-launch --disable-all-custom-nodes` with `--user-directory`, `--input-directory`, `--output-directory` and `--temp-directory` all in the run's own folder (`results/raw/spill/comfy/`), and `PYTHONDONTWRITEBYTECODE=1`, so the install's settings, custom nodes and models are only read. Its console output goes to a file in the run folder; no window opens. A `try`/`finally` stops the whole process tree it started (`Process.Kill($true)`), also after an error or Ctrl+C. `-DryRun` prints the refusal checks' result and the exact command line, and starts nothing.
-- **Graphs:** the spike's own, written as API-format JSON into the run folder: `CheckpointLoaderSimple` (an SDXL checkpoint named by `-Checkpoint`), two `CLIPTextEncode`, `EmptyLatentImage`, `KSampler`, `VAEDecode`, `SaveImage`. The fitting graph is 1024 × 1024, batch 1, 20 steps; the spilling graph defaults to 2048 × 2048, batch 4, 10 steps (parameters `-SpillWidth`, `-SpillHeight`, `-SpillBatch`, `-SpillSteps`). That this graph spills on a 16 GB card is a guess; the run records whether it did.
-- **Sampling:** `spill-probe` reads `\GPU Process Memory(*)\Shared Usage` and `Dedicated Usage` at 1 Hz and sums the instances of the discrete GPU's LUID whose PID is ComfyUI's process or one of its descendants (re-listed each second), as P4b-R37 defines the engine; it also records the adapter's `Shared Usage`. Phases: 60 s idle after ComfyUI answers `/system_stats`, then 3 fitting runs, then 3 spilling runs, one at a time (each until `/history` has it, or a 900 s timeout and `/interrupt`). Idle level: the minimum over the idle 60 s (P4b-R37's minimum). Per fitting run: the maximum above idle. Per spilling run: the 10 s sustained level above idle, the largest minimum over any 10 consecutive 1 Hz samples. M: the largest multiple of 128 MiB at or below the middle of the gap; PASS needs it strictly inside the gap.
+- **Safety** (with fix round 1's changes):
+  - The script takes the ComfyUI folder (`-ComfyRoot`) and its Python (`-Python`) as parameters.
+  - It refuses to start if anything listens on the chosen port (default 8199) or on ComfyUI's default `127.0.0.1:8188` (another ComfyUI would share the GPU), if any process runs from that folder, names it on its command line, or is a `python*.exe` running a `main.py`, or if the install's `comfy/cli_args.py` lacks any flag the script passes.
+  - It starts `main.py --listen 127.0.0.1 --port <port> --disable-auto-launch --disable-all-custom-nodes --disable-assets` with `--user-directory`, `--input-directory`, `--output-directory`, `--temp-directory` and `--previews-directory` all in the run's own folder (`results/raw/spill/comfy/`), and `PYTHONDONTWRITEBYTECODE=1`, so the install's settings, custom nodes and models are only read. Its console output goes to a file in the run folder; no window opens.
+  - ComfyUI and the probe run in a kill-on-close job object that only the script's pwsh holds. Each is created suspended, assigned to the job and then resumed, so every process it starts is in the job too. When pwsh ends for any reason (an error, Ctrl+C, a closed console, a killed process), Windows ends them. The orderly path still stops them in a `try`/`finally` (`Process.Kill($true)`), and the probe also stops when ComfyUI's process exits. `-SelfTestJob` checks the job with a `ping -t 127.0.0.1` stand-in: the stand-in ended when its pwsh was killed.
+  - Every REST call has a timeout (10 s; 30 s for `/prompt` and `/object_info`); 30 failed polls in a row end a run as `unreachable`. After a timed-out run the script interrupts it and waits (at most 60 s) for ComfyUI's queue to empty. Any run that doesn't end in `success` makes the verdict INVALID.
+  - `-DryRun` prints the refusal checks' result and the exact command line, and starts nothing.
+- **Graphs:** the spike's own, written as API-format JSON into the run folder: `CheckpointLoaderSimple` (an SDXL checkpoint named by `-Checkpoint`), two `CLIPTextEncode`, `EmptyLatentImage`, `KSampler`, `VAEDecode`, `SaveImage`. The fitting graph is 1024 × 1024, batch 1, 20 steps; the spilling graph defaults to 2048 × 2048, batch 4, 10 steps (parameters `-SpillWidth`, `-SpillHeight`, `-SpillBatch`, `-SpillSteps`). Whether this graph spills on a 16 GB card is unknown until it runs; the run records whether it did.
+- **Sampling:** `spill-probe` reads `\GPU Process Memory(*)\Shared Usage` and `Dedicated Usage` at 1 Hz and sums the instances of the discrete GPU's LUID whose PID is ComfyUI's process or one of its descendants (re-listed each second), as P4b-R37 defines the engine; it also records the adapter's `Shared Usage`. Phases: 60 s idle after ComfyUI answers `/system_stats` (idle 0), then 3 fitting runs, then a second 60 s idle with the model resident (idle 1, recorded), then 3 spilling runs, one at a time (each until `/history` has it, or a 900 s timeout and `/interrupt`). Idle level: the minimum over idle 0 (P4b-R37's minimum). Per fitting run: the maximum above idle. Per spilling run: the 10 s sustained level above idle, the largest minimum over any 10 consecutive 1 Hz samples. M (fix round 1, I2): the middle of the gap rounded down to a multiple of 128 MiB if that is above the fitting maximum, else the smallest multiple of 128 MiB above the fitting maximum; PASS needs M strictly inside the gap, else FAIL ("gap narrower than the 128 MiB step"). Recorded beside it: the same margin against idle 1, which is closer to P4b-R37's idle in production.
 
 ## 4. Pass criteria
 
@@ -81,7 +93,7 @@ Copied from the plan (Task 0) before anything ran.
 
 ## 5. Measurements
 
-Step 2 ran on 2026-11-05 from a normal, non-elevated shell: `pwsh -NoProfile -File spikes/browse-core/run-spike.ps1 -Only pdh-read,decode,facets` (254 s with the build already done). `facets` then ran once more (`-Only facets`, 227 s) after the recorded 64 MiB-cache rows were added; its figures below are from that second run, and the first run's agree (10,000-asset p95 26.4 and 68.4 ms, 50,000-asset p95 643 and 640 ms). The code is the commit in §2. Nothing else was started on the GPU for the run; the desktop was in normal use. Raw data: written to `spikes/browse-core/results/` (raw output kept privately).
+Step 2 ran on 2026-11-05 from a normal, non-elevated shell: `pwsh -NoProfile -File spikes/browse-core/run-spike.ps1 -Only pdh-read,decode,facets` (254 s with the build already done). `facets` ran twice more: once with the 64 MiB-cache rows added, and once in fix round 1 on Task 5's draft schema, whose figures replace both earlier runs (§5's S0.3). The code of each is the commit in §2. Nothing else was started on the GPU for the run; the desktop was in normal use. Raw data: written to `spikes/browse-core/results/` (raw output kept privately).
 
 S0.1's load part and S0.4 are **pending**: they run in Step 3, after the owner says go.
 
@@ -132,26 +144,37 @@ Verdict against the bar: **FAIL**, on one item: the JPEG truncated inside its sc
 
 ### S0.3 Facets
 
-`index.db` as in §3 (SQLite 3.53.2, `ANALYZE` run after the build). 10,000 assets: 30,000 tag rows, 20,016 runs, 80,064 takes, 6.5 MiB. 50,000 assets: 150,000 tag rows, 99,943 runs, 399,772 takes, 33.1 MiB. One read transaction holds the page, the total and the six facets; 100 timed runs after 5 warm-up runs, on one read-only connection.
+Measured again in fix round 1 on Task 5's draft schema (§3), with `-Only facets` (207 s); these figures replace the first runs' on the invented schema. `index.db` as in §3 (SQLite 3.53.2, `ANALYZE` run after the build). 10,000 assets: 30,000 tag rows, 72,312 mirrored takes, 6,033 open runs, 14.0 MiB. 50,000 assets: 150,000 tag rows, 360,196 mirrored takes, 30,019 open runs, 71.1 MiB. One read transaction holds the page, the total and the six facets; 100 timed runs after 5 warm-up runs, on one read-only connection.
 
 | Assets, filters, page cache | n | p50 | p95 | p99 | max | Unit |
 |---|---|---|---|---|---|---|
-| 10,000, none, default | 100 | 22.8 | 24.9 | 26.8 | 27.0 | ms |
-| **10,000, five filters, default** | 100 | 59.7 | **64.0** | 65.6 | 66.1 | ms |
-| 50,000, none, default | 100 | 610.1 | **654.0** | 692.7 | 697.4 | ms |
-| 50,000, five filters, default | 100 | 576.4 | 606.3 | 616.3 | 617.8 | ms |
-| 10,000, none, 64 MiB (recorded) | 100 | 37.3 | 38.4 | 38.9 | 39.2 | ms |
-| 10,000, five filters, 64 MiB (recorded) | 100 | 30.2 | 32.5 | 33.4 | 33.4 | ms |
-| 50,000, none, 64 MiB (recorded) | 100 | 238.7 | 251.2 | 256.0 | 259.1 | ms |
-| 50,000, five filters, 64 MiB (recorded) | 100 | 238.7 | 300.5 | 308.6 | 312.2 | ms |
+| **10,000, none, default** | 100 | 50.6 | **69.8** | 72.4 | 73.3 | ms |
+| 10,000, five filters, default | 100 | 32.4 | 50.7 | 52.3 | 52.6 | ms |
+| 50,000, none, default | 100 | 820.8 | **980.1** | 1,036.3 | 1,059.2 | ms |
+| 50,000, five filters, default | 100 | 246.0 | 340.9 | 360.8 | 363.3 | ms |
+| **10,000, none, 64 MiB** | 100 | 30.8 | **52.4** | 52.6 | 53.4 | ms |
+| 10,000, five filters, 64 MiB | 100 | 24.0 | 34.4 | 34.8 | 36.2 | ms |
+| **50,000, none, 64 MiB** | 100 | 196.6 | **301.3** | 326.8 | 340.5 | ms |
+| 50,000, five filters, 64 MiB | 100 | 160.8 | 200.1 | 202.2 | 204.7 | ms |
 
-"Default" is SQLite's default page cache (2 MiB), which today's index uses (`schema.rs` sets no `cache_size`). The 64 MiB rows set `PRAGMA cache_size` on the reading connection and are recorded only.
+"Default" is SQLite's default page cache (2 MiB), which today's index uses (`schema.rs` sets no `cache_size`); the bar's verdict uses it, as §3 fixed before the first run. The 64 MiB rows set `PRAGMA cache_size` on the reading connection: the cache the owner chose (§7).
 
-- **Where the time goes** (each statement alone, p50 of 20, default cache): at 10,000 with no filter, `flag` 11.9 ms, `tags` 3.9 ms, the page 3.0 ms, the rest under 2 ms; with five filters, `rating` 12.3, `status` 11.2, `tags` 10.9, the page 8.0, the others 2–8 ms. At 50,000 with no filter, `tags` (401 ms) and `flag` (95 ms) take almost all of it; with five filters, `tags` 196 ms, `rating` 72, `status` 67. With 64 MiB, the 50,000 `tags` facet drops to 39–47 ms and `flag` becomes the largest (149 ms with no filter). The time grows far faster than the row count from 10,000 to 50,000, mostly in `tags`, which reads `assets` by rowid once per tag row.
-- **Query plans** (`EXPLAIN QUERY PLAN`, the same at both sizes): the page scans `assets` and sorts with a temporary B-tree (there is no index on `asset_id` alone, as today), with the tags and open runs as correlated lookups by primary key; `status` and `type` use their `COALESCE` indexes only without a filter; `rating` and `label` scan their covering indexes; `tags` scans the covering index `asset_tags_by_tag`, looks each asset up by rowid and sorts by count with a temporary B-tree; `flag` runs two correlated `EXISTS` per asset through `takes_flagged` and the runs' primary key. Every plan is in the raw output.
-- **The budgets (P4b-R23: twice the p95, rounded up to 10 ms):** at 10,000, 2 × 64.0 → **130 ms**; at 50,000, 2 × 654.0 → **1,310 ms**. 130 ms is over 100 ms, so P4b-R23 has the owner hear of it before Task 1.
+- **Spread between runs:** a 10,000-asset check of the same code just before the measured run gave p95 40.1 ms (none) and 29.5 ms (five) at the default cache, against 69.8 and 50.7 here, so the run-to-run spread on this desktop is large (it was in normal use).
+- **Where the time goes** (each statement alone, p50 of 20):
+  - At 10,000, default cache, no filter: `flag` 19.3 ms, `tags` 17.6 ms, the page 5.7 ms, the other facets 3–5 ms. With five filters, `tags` 13.1 ms and everything else under 5 ms (`flag` 0.3 ms).
+  - At 50,000, default cache, no filter: `tags` 471 ms and `flag` 144 ms take most of it; the other facets and the page are 16–28 ms each. With five filters: `tags` 100 ms, the rest 10–26 ms.
+  - With 64 MiB at 50,000, no filter: `flag` 81 ms, `tags` 59 ms, the rest under 9 ms.
+- **Query plans** (`EXPLAIN QUERY PLAN`, the same at both sizes):
+  - No filter: the page scans `assets` and sorts with a temporary B-tree (no index on `asset_id` alone, as today), each row's tags by `asset_tags`' primary key. `status`, `type`, `rating` and `label` scan `assets` and group with a temporary B-tree. `tags` scans the `tag_fold` index, which doesn't hold `tag`, so `min(tag)` looks every tag row up by the primary key: that is most of the 471 ms. `flag` runs two correlated `EXISTS` per asset through `take_marks_flag` (`flag`, then the key columns in the index).
+  - Five filters: SQLite drives from the `tags` and `flag` lists (`tag_fold` and `flag` indexes) into `assets` by its `(project, asset_id)` unique index, for the page, the total and every facet.
+  - The first form of the flag facet, a row-value `(project, asset_id) IN (SELECT …)` in the result columns, took about 2 s at 10,000 assets (SQLite searched its list per row); the measured form uses `EXISTS` on the key, and the filter keeps the `IN` form in `WHERE`, where SQLite plans it well.
+  - Every plan is in the raw output.
+- **The budgets (P4b-R23: twice the p95, rounded up to 10 ms):**
+  - default cache: at 10,000, 2 × 69.8 → **140 ms**; at 50,000, 2 × 980.1 → **1,970 ms**;
+  - 64 MiB: at 10,000, 2 × 52.4 → **110 ms**; at 50,000, 2 × 301.3 → **610 ms**.
+  - Both 10,000 budgets are over 100 ms.
 
-Verdict against the bar: **PASS** (p95 at 10,000: 64.0 ms with five filters, 24.9 ms with none; both < 100 ms).
+Verdict against the bar: **PASS** (p95 at 10,000 with the default cache: 69.8 ms with no filter, 50.7 ms with five; both < 100 ms).
 
 ### S0.1's load part and S0.4 (pending, Step 3)
 
@@ -163,7 +186,10 @@ Written after Step 3.
 
 ## 7. Decision
 
-Written after Step 3.
+Recorded so far (the rest is written after Step 3):
+
+- **Owner decision, 2026-11-05, under P4b-R23's "owner hears":** the index gets a **64 MiB SQLite page cache**. Task 5 sets `assets_query_facets_10000_ms` from a fresh measurement with that cache (here: p95 52.4 ms at 10,000, so twice it rounded up to 10 ms is 110 ms; at 50,000, 301.3 ms and 610 ms).
+- **Controller ruling on S0.2's cut JPEG (APP-038, P4b-R12):** the item stays **FAIL** as measured, but P4b-R12's **in-process route stands**, because the helper-process FAIL path would return the same image. Task 12 refuses a JPEG with no EOI marker and gives it the `icon@1` state.
 
 ## 8. Follow-ups
 
