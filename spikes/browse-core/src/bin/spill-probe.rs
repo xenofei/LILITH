@@ -37,13 +37,25 @@ fn sample() {
         .expect("adapter Shared Usage");
     q.collect();
     let mut file = std::fs::File::create(&out).expect("samples file");
-    let watched = win::Watched::open(root);
+    let Some(watched) = win::Watched::open(root) else {
+        eprintln!(
+            "spill-probe: cannot open process {root} for SYNCHRONIZE ({}); no samples taken",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(3);
+    };
     let start = Instant::now();
     let mut i = 0u32;
-    while !stop.exists()
-        && start.elapsed() < max
-        && !watched.as_ref().is_none_or(|w| w.has_exited())
-    {
+    let why = loop {
+        if stop.exists() {
+            break "the stop file exists";
+        }
+        if start.elapsed() >= max {
+            break "--max-seconds reached";
+        }
+        if watched.has_exited() {
+            break "the root process exited";
+        }
         i += 1;
         if let Some(w) = (interval * i).checked_sub(start.elapsed()) {
             std::thread::sleep(w);
@@ -75,7 +87,8 @@ fn sample() {
         let line = json!({"t_ms": unix_ms(), "shared_mib": shared, "dedicated_mib": dedicated, "adapter_shared_mib": adapter, "instances": instances, "tree": tree.len(), "collect": status});
         writeln!(file, "{line}").expect("write sample");
         file.flush().ok();
-    }
+    };
+    eprintln!("spill-probe: stopped after {i} ticks: {why}");
 }
 
 fn analyze() {

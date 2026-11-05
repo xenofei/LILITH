@@ -50,8 +50,10 @@ refuses to start if anything listens on it.
 spill only: the SDXL checkpoint name, as ComfyUI's CheckpointLoaderSimple lists it.
 
 .PARAMETER SelfTestJob
-The job object's own check, with no ComfyUI: starts `ping -t 127.0.0.1` in the job as ComfyUI
-would be started, writes its PID to -SelfTestPidFile and waits to be killed.
+The job object's own check, with no ComfyUI: starts a stand-in in the job as ComfyUI would be
+started, writes its PID to -SelfTestPidFile and waits to be killed. The stand-in is
+`ping -t 127.0.0.1`, or with -Python that python.exe running a one-line script that starts a
+grandchild python (standard library only; nothing of ComfyUI is imported or opened).
 #>
 param(
     [string[]]$Only = @(),
@@ -156,6 +158,7 @@ function Read-Json([string]$Path) { Get-Content -Raw $Path | ConvertFrom-Json }
 $JobSource = @'
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -181,6 +184,8 @@ public static class SpikeJob {
         public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
     }
     [StructLayout(LayoutKind.Sequential)]
+    struct StartupInfoEx { public StartupInfo StartupInfo; public IntPtr lpAttributeList; }
+    [StructLayout(LayoutKind.Sequential)]
     struct ProcessInformation { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -191,7 +196,14 @@ public static class SpikeJob {
     static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool CreateProcessW(string app, StringBuilder commandLine, IntPtr pa, IntPtr ta, bool inherit,
-        uint flags, IntPtr environment, string cwd, ref StartupInfo si, out ProcessInformation pi);
+        uint flags, IntPtr environment, string cwd, ref StartupInfoEx si, out ProcessInformation pi);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size,
+        IntPtr previous, IntPtr returnSize);
+    [DllImport("kernel32.dll")]
+    static extern void DeleteProcThreadAttributeList(IntPtr list);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern uint ResumeThread(IntPtr thread);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -204,6 +216,9 @@ public static class SpikeJob {
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
     const int JobObjectExtendedLimitInformation = 9;
     const uint CREATE_SUSPENDED = 0x4;
+    const uint CREATE_NO_WINDOW = 0x08000000;
+    const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    const int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
     const int STARTF_USESTDHANDLES = 0x100;
     const uint HANDLE_FLAG_INHERIT = 1;
 
@@ -227,37 +242,64 @@ public static class SpikeJob {
         return h;
     }
 
-    // Starts commandLine in cwd, suspended; assigns it to the job, then resumes it. Its stdin is
-    // NUL, its stdout and stderr go to the two files. It shares this console (no new window).
-    public static int Start(string commandLine, string cwd, string outPath, string errPath) {
+    // Starts commandLine in cwd, suspended, with CREATE_NO_WINDOW (a windowless console that its
+    // own console children share, so nothing opens a window whatever the host); assigns it to the
+    // job, then resumes it. Its stdin is NUL, its stdout and stderr go to the two files, and those
+    // three handles are the only ones it inherits (PROC_THREAD_ATTRIBUTE_HANDLE_LIST). Returns the
+    // Process, opened before the resume, so a child that exits at once still has its exit code.
+    public static Process Start(string commandLine, string cwd, string outPath, string errPath) {
         if (job == IntPtr.Zero) throw new InvalidOperationException("Create the job first.");
         using (FileStream nul = new FileStream("NUL", FileMode.Open, FileAccess.Read))
         using (FileStream o = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
         using (FileStream e = new FileStream(errPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite)) {
-            StartupInfo si = new StartupInfo();
-            si.cb = Marshal.SizeOf(typeof(StartupInfo));
-            si.dwFlags = STARTF_USESTDHANDLES;
-            si.hStdInput = Inheritable(nul);
-            si.hStdOutput = Inheritable(o);
-            si.hStdError = Inheritable(e);
-            ProcessInformation pi;
-            if (!CreateProcessW(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true, CREATE_SUSPENDED,
-                    IntPtr.Zero, cwd, ref si, out pi)) throw new Win32Exception();
+            IntPtr[] handles = new IntPtr[] { Inheritable(nul), Inheritable(o), Inheritable(e) };
+            IntPtr size = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+            IntPtr list = Marshal.AllocHGlobal(size);
+            IntPtr handleArray = Marshal.AllocHGlobal(IntPtr.Size * handles.Length);
+            bool listReady = false;
             try {
-                if (!AssignProcessToJobObject(job, pi.hProcess)) {
-                    int err = Marshal.GetLastWin32Error();
-                    TerminateProcess(pi.hProcess, 1);
-                    throw new Win32Exception(err);
+                if (!InitializeProcThreadAttributeList(list, 1, 0, ref size)) throw new Win32Exception();
+                listReady = true;
+                Marshal.Copy(handles, 0, handleArray, handles.Length);
+                if (!UpdateProcThreadAttribute(list, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArray,
+                        (IntPtr)(IntPtr.Size * handles.Length), IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
+                StartupInfoEx si = new StartupInfoEx();
+                si.StartupInfo.cb = Marshal.SizeOf(typeof(StartupInfoEx));
+                si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                si.StartupInfo.hStdInput = handles[0];
+                si.StartupInfo.hStdOutput = handles[1];
+                si.StartupInfo.hStdError = handles[2];
+                si.lpAttributeList = list;
+                ProcessInformation pi;
+                if (!CreateProcessW(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true,
+                        CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, cwd, ref si, out pi))
+                    throw new Win32Exception();
+                try {
+                    if (!AssignProcessToJobObject(job, pi.hProcess)) {
+                        int err = Marshal.GetLastWin32Error();
+                        TerminateProcess(pi.hProcess, 1);
+                        throw new Win32Exception(err);
+                    }
+                    Process p = Process.GetProcessById(pi.dwProcessId);
+                    IntPtr keep = p.Handle; // opened now, while the child can't have exited
+                    if (ResumeThread(pi.hThread) == 0xFFFFFFFF) {
+                        int err = Marshal.GetLastWin32Error();
+                        TerminateProcess(pi.hProcess, 1);
+                        throw new Win32Exception(err, "ResumeThread failed; the child was terminated");
+                    }
+                    return p;
+                } finally {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
                 }
-                ResumeThread(pi.hThread);
-                return pi.dwProcessId;
             } finally {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                if (listReady) DeleteProcThreadAttributeList(list);
+                Marshal.FreeHGlobal(list);
+                Marshal.FreeHGlobal(handleArray);
             }
         }
-    }
-}
+    }}
 '@
 
 function Initialize-SpikeJob {
@@ -265,11 +307,15 @@ function Initialize-SpikeJob {
     [SpikeJob]::Create()
 }
 
-# Starts an executable in the job (see above) and returns its Process object.
+# Starts an executable in the job (see above) and returns its Process object. A child that has
+# already exited a second later is an error, with its exit code and its stderr log named.
 function Start-InJob([string]$Exe, [string[]]$Arguments, [string]$Cwd, [string]$OutLog, [string]$ErrLog) {
     $line = "$(Format-CommandLine @($Exe)) $(Format-CommandLine $Arguments)"
-    $childPid = [SpikeJob]::Start($line, $Cwd, $OutLog, $ErrLog)
-    [Diagnostics.Process]::GetProcessById($childPid)
+    $p = [SpikeJob]::Start($line, $Cwd, $OutLog, $ErrLog)
+    if ($p.WaitForExit(1000)) {
+        throw "$(Split-Path -Leaf $Exe) exited at once with code $($p.ExitCode); see $ErrLog."
+    }
+    $p
 }
 
 # The flags the owned ComfyUI gets; each must exist in the install's comfy/cli_args.py, so a
@@ -459,6 +505,15 @@ function Invoke-Spill {
         }
         $probe = Start-InJob (Exe 'spill-probe') @('sample', '--root-pid', "$($proc.Id)", '--out', $samples, '--stop-file', $stopFile) $runDir `
             (Join-Path $runDir 'probe-out.log') (Join-Path $runDir 'probe-err.log')
+        # The probe samples once a second from its start; no sample within 15 s fails the run now
+        # rather than as INVALID after half an hour.
+        $sampleDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        while (-not ((Test-Path -LiteralPath $samples) -and (Get-Item -LiteralPath $samples).Length -gt 0)) {
+            if ($probe.HasExited -or [DateTime]::UtcNow -ge $sampleDeadline) {
+                throw "spill-probe wrote no sample within 15 s (exited: $($probe.HasExited)); see results\raw\spill\probe-err.log."
+            }
+            Start-Sleep -Milliseconds 500
+        }
         $ready = $false
         $deadline = [DateTime]::UtcNow.AddSeconds(300)
         while ([DateTime]::UtcNow -lt $deadline) {
@@ -513,14 +568,28 @@ function Invoke-Spill {
         })
 }
 
-# The job object's own check (no ComfyUI): starts `ping -t 127.0.0.1` in the job exactly as
-# ComfyUI is started, writes its PID to $SelfTestPidFile and waits to be killed. Whoever runs
-# it kills this pwsh and checks that the ping is gone.
+# The job object's own check (no ComfyUI): starts a stand-in in the job exactly as ComfyUI is
+# started, writes its PID to $SelfTestPidFile and waits to be killed. Whoever runs it kills this
+# pwsh and checks that the stand-in and everything it started are gone.
+# - Without -Python: `ping -t 127.0.0.1`.
+# - With -Python (the launcher's shape): that python.exe runs a one-line script that starts a
+#   grandchild `python -c` sleeping 600 s. Both write their PID and their console window's handle
+#   and visibility (GetConsoleWindow, IsWindowVisible) to child.txt and grandchild.txt beside the
+#   PID file. Nothing is imported but the standard library, and the working folder is the PID
+#   file's folder.
 function Invoke-JobSelfTest {
     Initialize-SpikeJob
     $dir = Split-Path -Parent $SelfTestPidFile
-    $ping = Start-InJob (Join-Path $env:SystemRoot 'System32\PING.EXE') @('-t', '127.0.0.1') $dir (Join-Path $dir 'ping-out.log') (Join-Path $dir 'ping-err.log')
-    Set-Content -LiteralPath $SelfTestPidFile -Value $ping.Id
+    if ($Python) {
+        $py = (Resolve-Path -LiteralPath $Python).Path
+        $report = "import ctypes, os; h = ctypes.windll.kernel32.GetConsoleWindow(); v = ctypes.windll.user32.IsWindowVisible(h) if h else 0"
+        $grand = "$report; open(r'$(Join-Path $dir 'grandchild.txt')', 'w').write('%d %d %d' % (os.getpid(), h, v)); import time; time.sleep(600)"
+        $code = "$report; import subprocess, sys, time; c = subprocess.Popen([sys.executable, '-c', r`"$grand`"]); open(r'$(Join-Path $dir 'child.txt')', 'w').write('%d %d %d %d' % (os.getpid(), h, v, c.pid)); time.sleep(600)"
+        $stand = Start-InJob $py @('-c', $code) $dir (Join-Path $dir 'python-out.log') (Join-Path $dir 'python-err.log')
+    } else {
+        $stand = Start-InJob (Join-Path $env:SystemRoot 'System32\PING.EXE') @('-t', '127.0.0.1') $dir (Join-Path $dir 'ping-out.log') (Join-Path $dir 'ping-err.log')
+    }
+    Set-Content -LiteralPath $SelfTestPidFile -Value $stand.Id
     Start-Sleep -Seconds 300
 }
 
