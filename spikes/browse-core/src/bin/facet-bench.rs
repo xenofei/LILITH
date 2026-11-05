@@ -3,8 +3,9 @@
 //!
 //! `facet-bench --work <dir> --out <json> [--sizes 10000,50000] [--runs 100]`
 //!
-//! The schema is today's `assets` table (crates/lil-core/src/index/schema.rs) plus a draft of
-//! Task 5's additions; the draft is this spike's guess (docs/spikes/12-browse-core.md §3).
+//! The schema is today's `assets` table (crates/lil-core/src/index/schema.rs) with the "schema 2
+//! adds" of the plan's Task 5 Interfaces block. The keys the plan leaves open are noted in
+//! docs/spikes/12-browse-core.md §3.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,35 +32,35 @@ CREATE TABLE assets (
     needs_repair INTEGER NOT NULL,
     rating INTEGER NOT NULL DEFAULT 0,
     label TEXT,
+    runs_waiting INTEGER NOT NULL DEFAULT 0,
+    external INTEGER NOT NULL DEFAULT 0,
+    working_doc INTEGER NOT NULL DEFAULT 0,
+    display TEXT,
+    last_change TEXT,
+    repair TEXT,
     UNIQUE (project, asset_id)
 );
 CREATE INDEX assets_by_status ON assets(COALESCE(status, ''), project, asset_id);
 CREATE INDEX assets_by_type ON assets(COALESCE(asset_type, ''), project, asset_id);
 CREATE INDEX assets_by_updated ON assets(updated, project, asset_id);
-CREATE INDEX assets_by_rating ON assets(rating);
-CREATE INDEX assets_by_label ON assets(label);
 CREATE TABLE asset_tags (
-    asset INTEGER NOT NULL,
-    tag_key TEXT NOT NULL,
+    project TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
     tag TEXT NOT NULL,
-    PRIMARY KEY (asset, tag_key)
+    tag_fold TEXT NOT NULL,
+    PRIMARY KEY (project, asset_id, tag_fold)
 ) WITHOUT ROWID;
-CREATE INDEX asset_tags_by_tag ON asset_tags(tag_key, asset);
-CREATE TABLE runs (
-    asset INTEGER NOT NULL,
-    run_id TEXT NOT NULL,
-    state TEXT NOT NULL,
-    PRIMARY KEY (asset, run_id)
-) WITHOUT ROWID;
-CREATE TABLE takes (
-    asset INTEGER NOT NULL,
+CREATE INDEX asset_tags_fold ON asset_tags(tag_fold);
+CREATE TABLE take_marks (
+    project TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     take INTEGER NOT NULL,
     flag TEXT,
     rating INTEGER,
-    PRIMARY KEY (asset, run_id, take)
+    PRIMARY KEY (project, asset_id, run_id, take)
 ) WITHOUT ROWID;
-CREATE INDEX takes_flagged ON takes(flag, asset) WHERE flag IS NOT NULL;
+CREATE INDEX take_marks_flag ON take_marks(flag);
 ";
 
 const STATUSES: [(&str, u64); 10] = [
@@ -92,6 +93,7 @@ const LABELS: [Option<&str>; 6] = [
     Some("blue"),
     Some("purple"),
 ];
+const BY: [&str; 4] = ["user", "assistant", "claude-code", "core"];
 
 fn weighted<'a>(rng: &mut Rng, table: &[(&'a str, u64)]) -> &'a str {
     let total: u64 = table.iter().map(|t| t.1).sum();
@@ -103,6 +105,10 @@ fn weighted<'a>(rng: &mut Rng, table: &[(&'a str, u64)]) -> &'a str {
         r -= w;
     }
     table[0].0
+}
+
+fn hex64(rng: &mut Rng) -> String {
+    (0..4).map(|_| format!("{:016x}", rng.next_u64())).collect()
 }
 
 fn build(path: &Path, n: usize) -> f64 {
@@ -120,17 +126,14 @@ fn build(path: &Path, n: usize) -> f64 {
     let mut rng = Rng::new(n as u64);
     let tx = conn.transaction().unwrap();
     {
-        let mut a = tx.prepare("INSERT INTO assets (id, project, asset_id, asset_type, status, version, approved_version, manifest, creation_uuid, updated, needs_repair, rating, label) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12)").unwrap();
+        let mut a = tx.prepare("INSERT INTO assets (id, project, asset_id, asset_type, status, version, approved_version, manifest, creation_uuid, updated, needs_repair, rating, label, runs_waiting, external, working_doc, display, last_change, repair) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)").unwrap();
         let mut tg = tx
-            .prepare("INSERT INTO asset_tags (asset, tag_key, tag) VALUES (?1, ?2, ?3)")
-            .unwrap();
-        let mut r = tx
-            .prepare("INSERT INTO runs (asset, run_id, state) VALUES (?1, ?2, ?3)")
+            .prepare(
+                "INSERT INTO asset_tags (project, asset_id, tag, tag_fold) VALUES (?1, ?2, ?3, ?4)",
+            )
             .unwrap();
         let mut k = tx
-            .prepare(
-                "INSERT INTO takes (asset, run_id, take, flag, rating) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
+            .prepare("INSERT INTO take_marks (project, asset_id, run_id, take, flag, rating) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
             .unwrap();
         for i in 0..n {
             let id = i as i64 + 1;
@@ -146,6 +149,55 @@ fn build(path: &Path, n: usize) -> f64 {
                 None
             };
             let manifest = format!("projects/{project}/assets/{asset_id}/manifest.yaml");
+
+            let mut tags = std::collections::BTreeSet::new();
+            while tags.len() < 3 {
+                tags.insert(rng.below(200));
+            }
+            for t in tags {
+                let tag = format!("Tag{t:03}");
+                tg.execute(params![project, asset_id, tag, tag.to_lowercase()])
+                    .unwrap();
+            }
+            // Runs: 1-3, 4 takes each. A trashed run's takes are not mirrored (P4b-R40).
+            let mut open_runs = 0i64;
+            for run in 0..(1 + rng.below(3)) {
+                let run_id = format!("r{run}");
+                let state = match rng.below(10) {
+                    0 => "trashed",
+                    1..=3 => "open",
+                    _ => "signed_off",
+                };
+                if state == "open" {
+                    open_runs += 1;
+                }
+                for take in 1..=4i64 {
+                    let flag = match rng.below(100) {
+                        0..=9 => Some("pick"),
+                        10..=14 => Some("reject"),
+                        _ => None,
+                    };
+                    let tr = if rng.below(4) == 0 {
+                        Some(rng.below(6) as i64)
+                    } else {
+                        None
+                    };
+                    if state != "trashed" {
+                        k.execute(params![project, asset_id, run_id, take, flag, tr])
+                            .unwrap();
+                    }
+                }
+            }
+            // The tile fields (P4b-R30): `display` about 150 bytes, `last_change` about 60.
+            let display = (rng.below(10) != 0).then(|| {
+                json!({"path": format!("projects/{project}/assets/{asset_id}/candidates/r0/take-1.png"), "sha256": hex64(&mut rng), "media_kind": "image"}).to_string()
+            });
+            let last_change = (rng.below(20) != 0).then(|| {
+                json!({"to": status, "by": BY[rng.below(4) as usize], "utc": format!("2026-{:02}-{:02}T{:02}:{:02}:{:02}Z", 1 + rng.below(10), 1 + rng.below(28), rng.below(24), rng.below(60), rng.below(60))}).to_string()
+            });
+            let repair = (rng.below(100) == 0).then(|| {
+                json!({"kind": "moved", "from": format!("{project}/old-{asset_id}"), "to": format!("{project}/{asset_id}")}).to_string()
+            });
             a.execute(params![
                 id,
                 project,
@@ -162,39 +214,15 @@ fn build(path: &Path, n: usize) -> f64 {
                 format!("{:032x}", rng.next_u64()),
                 1_700_000_000_000i64 + rng.below(100_000_000_000) as i64,
                 rating,
-                label
+                label,
+                open_runs,
+                i64::from(rng.below(20) == 0),
+                i64::from(rng.below(10) == 0),
+                display,
+                last_change,
+                repair
             ])
             .unwrap();
-            let mut tags = std::collections::BTreeSet::new();
-            while tags.len() < 3 {
-                tags.insert(rng.below(200));
-            }
-            for t in tags {
-                let tag = format!("Tag{t:03}");
-                tg.execute(params![id, tag.to_lowercase(), tag]).unwrap();
-            }
-            for run in 0..(1 + rng.below(3)) {
-                let run_id = format!("r{run}");
-                let state = match rng.below(10) {
-                    0 => "trashed",
-                    1..=3 => "open",
-                    _ => "signed_off",
-                };
-                r.execute(params![id, run_id, state]).unwrap();
-                for take in 1..=4i64 {
-                    let flag = match rng.below(100) {
-                        0..=9 => Some("pick"),
-                        10..=14 => Some("reject"),
-                        _ => None,
-                    };
-                    let tr = if rng.below(4) == 0 {
-                        Some(rng.below(6) as i64)
-                    } else {
-                        None
-                    };
-                    k.execute(params![id, run_id, take, flag, tr]).unwrap();
-                }
-            }
         }
     }
     tx.commit().unwrap();
@@ -218,10 +246,10 @@ impl Filters {
         Filters {
             parts: vec![
                 ("status", "a.status IN (?, ?)".into(), vec![t("approved"), t("in_review")]),
-                ("tags", "EXISTS (SELECT 1 FROM asset_tags t WHERE t.asset = a.id AND t.tag_key IN (?, ?))".into(), vec![t("tag007"), t("tag042")]),
+                ("tags", "(a.project, a.asset_id) IN (SELECT project, asset_id FROM asset_tags WHERE tag_fold IN (?, ?))".into(), vec![t("tag007"), t("tag042")]),
                 ("label", "(a.label IN (?) OR a.label IS NULL)".into(), vec![t("red")]),
                 ("rating", "a.rating >= ?".into(), vec![Sql::Integer(2)]),
-                ("flag", format!("EXISTS ({})", flagged("?")), vec![t("pick")]),
+                ("flag", format!("(a.project, a.asset_id) IN ({})", flagged("?")), vec![t("pick")]),
             ],
         }
     }
@@ -245,16 +273,14 @@ impl Filters {
     }
 }
 
-/// A take of `a` with flag `flag` in a run that isn't trashed (P4b-R40).
+/// The assets with a take flagged `flag` (trashed runs aren't mirrored, P4b-R40).
 fn flagged(flag: &str) -> String {
-    format!(
-        "SELECT 1 FROM takes k JOIN runs r ON r.asset = k.asset AND r.run_id = k.run_id WHERE k.asset = a.id AND k.flag = {flag} AND r.state <> 'trashed'"
-    )
+    format!("SELECT project, asset_id FROM take_marks WHERE flag = {flag}")
 }
 
-const PAGE_COLUMNS: &str = "a.project, a.asset_id, a.asset_type, a.status, a.version, a.approved_version, a.manifest, a.creation_uuid, a.updated, a.needs_repair, a.rating, a.label, \
-    (SELECT group_concat(t.tag, char(31)) FROM asset_tags t WHERE t.asset = a.id), \
-    (SELECT count(*) FROM runs r WHERE r.asset = a.id AND r.state = 'open')";
+const PAGE_COLUMNS: &str = "a.project, a.asset_id, a.asset_type, a.status, a.version, a.approved_version, a.manifest, a.creation_uuid, a.updated, a.needs_repair, \
+    a.rating, a.label, a.runs_waiting, a.external, a.working_doc, a.display, a.last_change, a.repair, \
+    (SELECT group_concat(t.tag, char(31)) FROM asset_tags t WHERE t.project = a.project AND t.asset_id = a.asset_id)";
 
 /// The statements of one `assets.query {limit: 200, facets: true}`: (name, SQL, args).
 fn statements(f: &Filters) -> Vec<(&'static str, String, Vec<Sql>)> {
@@ -271,6 +297,14 @@ fn statements(f: &Filters) -> Vec<(&'static str, String, Vec<Sql>)> {
     };
     let (wt, at) = f.clause(Some("tags"));
     let (wf, af) = f.clause(Some("flag"));
+    // With no other filter the tags facet needs no join to `assets`.
+    let tags = if wt.is_empty() {
+        "SELECT tag_fold, min(tag), count(*) AS c FROM asset_tags GROUP BY tag_fold ORDER BY c DESC, tag_fold ASC LIMIT 101".to_string()
+    } else {
+        format!(
+            "SELECT t.tag_fold, min(t.tag), count(*) AS c FROM asset_tags t JOIN assets a ON a.project = t.project AND a.asset_id = t.asset_id{wt} GROUP BY t.tag_fold ORDER BY c DESC, t.tag_fold ASC LIMIT 101"
+        )
+    };
     vec![
         (
             "page",
@@ -288,17 +322,11 @@ fn statements(f: &Filters) -> Vec<(&'static str, String, Vec<Sql>)> {
         group("type", "a.asset_type"),
         group("rating", "a.rating"),
         group("label", "a.label"),
-        (
-            "tags",
-            format!(
-                "SELECT t.tag_key, count(*) AS c FROM asset_tags t JOIN assets a ON a.id = t.asset{wt} GROUP BY t.tag_key ORDER BY c DESC, t.tag_key ASC LIMIT 101"
-            ),
-            at,
-        ),
+        ("tags", tags, at),
         (
             "flag",
             format!(
-                "SELECT sum(p), sum(j), sum(NOT p AND NOT j) FROM (SELECT EXISTS ({}) AS p, EXISTS ({}) AS j FROM assets a{wf})",
+                "SELECT sum(p), sum(j), sum(NOT p AND NOT j) FROM (SELECT (a.project, a.asset_id) IN ({}) AS p, (a.project, a.asset_id) IN ({}) AS j FROM assets a{wf})",
                 flagged("'pick'"),
                 flagged("'reject'")
             ),
@@ -363,8 +391,8 @@ fn main() {
         .collect();
     std::fs::create_dir_all(&work).unwrap();
     let mut results = Vec::new();
-    let mut p95_10000_worst: Option<f64> = None;
-    let mut p95_50000_worst: Option<f64> = None;
+    // The worst filter set's p95 per (assets, cache MiB; 0 = SQLite's default).
+    let mut worst: BTreeMap<(usize, i64), f64> = BTreeMap::new();
     for &n in &sizes {
         let db = work.join(format!("index-{n}.db"));
         let build_s = build(&db, n);
@@ -376,14 +404,14 @@ fn main() {
             .unwrap()
         };
         let conn = open();
-        let counts: (i64, i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM asset_tags), (SELECT count(*) FROM runs), (SELECT count(*) FROM takes)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let counts: (i64, i64, f64) = conn.query_row("SELECT (SELECT count(*) FROM asset_tags), (SELECT count(*) FROM take_marks), (SELECT total(runs_waiting) FROM assets)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         let db_mib = std::fs::metadata(&db)
             .map(|m| m.len() as f64 / 1048576.0)
             .unwrap_or(0.0);
         drop(conn);
         let mut sets = Vec::new();
-        // The verdict uses SQLite's default page cache (today's index sets none); a 64 MiB
-        // cache is recorded beside it.
+        // The bar's verdict uses SQLite's default page cache (today's index sets none, and §3 fixed
+        // it before the run); the 64 MiB cache the owner chose (2026-11-05) is measured beside it.
         for cache_mib in [0i64, 64] {
             let mut conn = open();
             if cache_mib > 0 {
@@ -416,14 +444,8 @@ fn main() {
                 }
                 let sum = summary(&total);
                 let p95 = sum["p95"].as_f64().unwrap_or(f64::INFINITY);
-                let worst = match (n, cache_mib) {
-                    (10_000, 0) => Some(&mut p95_10000_worst),
-                    (50_000, 0) => Some(&mut p95_50000_worst),
-                    _ => None,
-                };
-                if let Some(w) = worst {
-                    *w = Some(w.map_or(p95, |v: f64| v.max(p95)));
-                }
+                let w = worst.entry((n, cache_mib)).or_insert(0.0);
+                *w = w.max(p95);
                 println!(
                     "facets n={n} cache={} set={set}: p50 {} p95 {} ms",
                     if cache_mib == 0 {
@@ -437,15 +459,20 @@ fn main() {
                 sets.push(json!({"filters": set, "cache_mib": if cache_mib == 0 { Value::Null } else { json!(cache_mib) }, "runs": runs, "total_ms": sum, "rows": rows, "per_statement_ms": per_statement, "plans": plans(&conn, &stmts), "total_ms_raw": total}));
             }
         }
-        results.push(json!({"assets": n, "asset_tags": counts.0, "runs": counts.1, "takes": counts.2, "db_mib": db_mib, "build_s": build_s, "sets": sets}));
+        results.push(json!({"assets": n, "asset_tags": counts.0, "take_marks": counts.1, "open_runs": counts.2, "db_mib": db_mib, "build_s": build_s, "sets": sets}));
     }
-    let pass = p95_10000_worst.is_some_and(|p| p < 100.0);
+    let get = |n: usize, c: i64| worst.get(&(n, c)).copied();
+    let pass = get(10_000, 0).is_some_and(|p| p < 100.0);
     // P4b-R23: twice the p95, rounded up to 10 ms.
     let budget = |p: Option<f64>| p.map(|p| ((2.0 * p) / 10.0).ceil() * 10.0);
+    let (p10, p50) = (get(10_000, 0), get(50_000, 0));
+    let (c10, c50) = (get(10_000, 64), get(50_000, 64));
     write_json(
         &out,
         &json!({"sqlite": rusqlite::version(), "sizes": results,
-        "p95_10000_worst_ms": p95_10000_worst, "budget_10000_ms": budget(p95_10000_worst),
-        "p95_50000_worst_ms": p95_50000_worst, "budget_50000_ms": budget(p95_50000_worst), "pass": pass}),
+        "p95_10000_worst_ms": p10, "budget_10000_ms": budget(p10),
+        "p95_50000_worst_ms": p50, "budget_50000_ms": budget(p50),
+        "cache_64_mib": {"p95_10000_worst_ms": c10, "budget_10000_ms": budget(c10), "p95_50000_worst_ms": c50, "budget_50000_ms": budget(c50)},
+        "pass": pass}),
     );
 }

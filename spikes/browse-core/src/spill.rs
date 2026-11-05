@@ -4,6 +4,8 @@
 use serde_json::{Value, json};
 
 /// One phase of the run: `idle`, `fit` or `spill`, from `start_ms` to `end_ms` (Unix ms).
+/// `idle` 0 is the cold idle after start (the verdict's); `idle` 1, after the fitting runs, is
+/// the warm idle (recorded).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Phase {
     pub kind: String,
@@ -33,16 +35,24 @@ pub fn sustained(values: &[f64], window: usize) -> Option<f64> {
         .max_by(|a, b| a.total_cmp(b))
 }
 
-/// The analysis: `{idle_mib, fit: [{index, max_above_idle_mib}], spill: [{index,
-/// sustained_above_idle_mib}], gap: {low, high} | null, margin_mib | null, value_inside_gap,
-/// verdict}`. `window` is the number of consecutive samples that make 10 s.
-pub fn analyse(samples: &[(u64, f64)], phases: &[Phase], window: usize) -> Value {
-    let of = |kind: &'static str| phases.iter().filter(move |p| p.kind == kind);
-    let idle_values: Vec<f64> = of("idle").flat_map(|p| inside(samples, p)).collect();
-    let idle = idle_values.iter().copied().fold(f64::INFINITY, f64::min);
-    if !idle.is_finite() {
-        return json!({"verdict": "INVALID", "why": "no idle samples"});
+/// The margin for the gap `(low, high)`: a multiple of 128 MiB strictly inside it, the
+/// midpoint rounded down when that is above `low`, else the smallest multiple above `low`;
+/// `None` when no multiple of 128 lies strictly inside.
+pub fn margin(low: f64, high: f64) -> Option<f64> {
+    if low >= high {
+        return None;
     }
+    let down = ((low + high) / 2.0 / 128.0).floor() * 128.0;
+    if down > low {
+        return Some(down);
+    }
+    let up = ((low / 128.0).floor() + 1.0) * 128.0;
+    (up < high).then_some(up)
+}
+
+/// The levels above `idle`: each fitting run's maximum and each spilling run's sustained level.
+fn measure(samples: &[(u64, f64)], phases: &[Phase], window: usize, idle: f64) -> Value {
+    let of = |kind: &'static str| phases.iter().filter(move |p| p.kind == kind);
     let fit: Vec<(u32, Option<f64>)> = of("fit")
         .map(|p| {
             let v = inside(samples, p);
@@ -70,32 +80,69 @@ pub fn analyse(samples: &[(u64, f64)], phases: &[Phase], window: usize) -> Value
         .iter()
         .filter_map(|s| s.1)
         .fold(f64::INFINITY, f64::min);
-    let (verdict, gap, margin, inside_gap) = if !complete {
-        ("INVALID", Value::Null, Value::Null, Value::Null)
-    } else if low < high {
-        let m = ((low + high) / 2.0 / 128.0).floor() * 128.0;
+    let (verdict, why, gap, m) = if !complete {
         (
-            "PASS",
-            json!({"low": low, "high": high}),
-            json!(m),
-            json!(m > low && m < high),
+            "INVALID",
+            Some("a run has too few samples"),
+            Value::Null,
+            None,
         )
+    } else if low >= high {
+        ("FAIL", Some("no gap: the runs overlap"), Value::Null, None)
     } else {
-        ("FAIL", Value::Null, Value::Null, Value::Null)
+        let gap = json!({"low": low, "high": high});
+        match margin(low, high) {
+            Some(m) => ("PASS", None, gap, Some(m)),
+            None => (
+                "FAIL",
+                Some("gap narrower than the 128 MiB step"),
+                gap,
+                None,
+            ),
+        }
     };
     json!({
         "idle_mib": idle,
-        "idle_samples": idle_values.len(),
         "fit": fit.iter().map(|(i, v)| json!({"index": i, "max_above_idle_mib": v})).collect::<Vec<_>>(),
         "spill": spill.iter().map(|(i, v)| json!({"index": i, "sustained_above_idle_mib": v})).collect::<Vec<_>>(),
         "fit_max_mib": if low.is_finite() { json!(low) } else { Value::Null },
         "spill_min_mib": if high.is_finite() { json!(high) } else { Value::Null },
         "gap": gap,
-        "margin_mib": margin,
-        "value_inside_gap": inside_gap,
-        "window_samples": window,
+        "margin_mib": m,
+        "why": why,
         "verdict": verdict,
     })
+}
+
+/// The minimum over the samples of the `idle` phases with `index`.
+fn idle_level(samples: &[(u64, f64)], phases: &[Phase], index: u32) -> Option<(f64, usize)> {
+    let v: Vec<f64> = phases
+        .iter()
+        .filter(|p| p.kind == "idle" && p.index == index)
+        .flat_map(|p| inside(samples, p))
+        .collect();
+    let min = v.iter().copied().fold(f64::INFINITY, f64::min);
+    min.is_finite().then_some((min, v.len()))
+}
+
+/// The analysis against the cold idle (`idle` 0; the verdict), with the warm idle's margin
+/// (`idle` 1) recorded beside it when that phase exists. `window` is the number of consecutive
+/// samples that make 10 s.
+pub fn analyse(samples: &[(u64, f64)], phases: &[Phase], window: usize) -> Value {
+    let Some((idle, n)) = idle_level(samples, phases, 0) else {
+        return json!({"verdict": "INVALID", "why": "no idle samples"});
+    };
+    let mut r = measure(samples, phases, window, idle);
+    r["idle_samples"] = json!(n);
+    r["window_samples"] = json!(window);
+    if let Some((warm, _)) = idle_level(samples, phases, 1) {
+        let w = measure(samples, phases, window, warm);
+        r["warm_idle_mib"] = json!(warm);
+        r["margin_vs_warm_idle_mib"] = w["margin_mib"].clone();
+        r["gap_vs_warm_idle"] = w["gap"].clone();
+        r["verdict_vs_warm_idle"] = w["verdict"].clone();
+    }
+    r
 }
 
 #[cfg(test)]
@@ -126,10 +173,12 @@ mod tests {
         // idle 100; fits peak 300 above idle; spills hold 1100 above idle for 3 samples.
         let mut s = vec![(0, 120.0), (1, 100.0), (2, 110.0)];
         s.extend([(10, 150.0), (11, 400.0), (12, 200.0)]);
+        s.extend([(15, 180.0), (16, 160.0)]);
         s.extend([(20, 1300.0), (21, 1200.0), (22, 1250.0), (23, 1400.0)]);
         let phases = [
             ph("idle", 0, 0, 2),
             ph("fit", 1, 10, 12),
+            ph("idle", 1, 15, 16),
             ph("spill", 1, 20, 23),
         ];
         let r = analyse(&s, &phases, 3);
@@ -139,7 +188,29 @@ mod tests {
         assert_eq!(r["spill_min_mib"], 1100.0);
         // the middle is 700, rounded down to 640
         assert_eq!(r["margin_mib"], 640.0);
-        assert_eq!(r["value_inside_gap"], true);
+        // warm idle 160: fit 240, spill 1040, middle 640
+        assert_eq!(r["warm_idle_mib"], 160.0);
+        assert_eq!(r["margin_vs_warm_idle_mib"], 640.0);
+    }
+
+    #[test]
+    fn a_narrow_gap_needs_a_multiple_of_128_inside_it() {
+        // 300..310: no multiple of 128 inside, so FAIL (the midpoint rounds down to 256).
+        assert_eq!(margin(300.0, 310.0), None);
+        // 250..260: the midpoint rounds down to 128, below the gap; 256 is inside.
+        assert_eq!(margin(250.0, 260.0), Some(256.0));
+        assert_eq!(margin(256.0, 384.0), None, "both ends are excluded");
+        assert_eq!(margin(300.0, 1100.0), Some(640.0));
+        let s = vec![(0, 0.0), (10, 300.0), (20, 310.0), (21, 310.0)];
+        let phases = [
+            ph("idle", 0, 0, 0),
+            ph("fit", 1, 10, 10),
+            ph("spill", 1, 20, 21),
+        ];
+        let r = analyse(&s, &phases, 2);
+        assert_eq!(r["verdict"], "FAIL");
+        assert_eq!(r["why"], "gap narrower than the 128 MiB step");
+        assert_eq!(r["gap"]["low"], 300.0);
     }
 
     #[test]

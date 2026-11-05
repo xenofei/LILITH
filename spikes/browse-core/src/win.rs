@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
@@ -11,14 +12,18 @@ use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows::Win32::System::Performance::{
     PDH_FMT, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
     PdhOpenQueryW,
 };
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
 use windows::core::{HSTRING, PCSTR, PCWSTR};
 
 /// Whether this process's token is elevated, or `None` when it can't be read.
@@ -62,6 +67,8 @@ pub struct Adapter {
     pub luid_low: u32,
     pub dedicated_mib: f64,
     pub hardware_adapters: usize,
+    /// `(DeviceId << 16) | VendorId`, NVML's `pciDeviceId` form.
+    pub pci_id: u32,
 }
 
 impl Adapter {
@@ -93,6 +100,7 @@ pub fn discrete_adapter() -> Result<Adapter, String> {
                     luid_low: d.AdapterLuid.LowPart,
                     dedicated_mib: mib,
                     hardware_adapters: 0,
+                    pci_id: (d.DeviceId << 16) | (d.VendorId & 0xFFFF),
                 });
             }
         }
@@ -184,6 +192,31 @@ impl Drop for Query {
     }
 }
 
+/// A process opened for `SYNCHRONIZE`, to see when it exits (closed on drop).
+pub struct Watched(HANDLE);
+
+impl Watched {
+    pub fn open(pid: u32) -> Option<Watched> {
+        unsafe {
+            OpenProcess(PROCESS_SYNCHRONIZE, false, pid)
+                .ok()
+                .map(Watched)
+        }
+    }
+
+    pub fn has_exited(&self) -> bool {
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 /// `root` and every live descendant of it (by parent PID, from one Toolhelp snapshot).
 pub fn process_tree(root: u32) -> BTreeSet<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -233,21 +266,40 @@ type NvmlCount = unsafe extern "system" fn(*mut u32) -> i32;
 type NvmlHandle = unsafe extern "system" fn(u32, *mut *mut core::ffi::c_void) -> i32;
 type NvmlUtil = unsafe extern "system" fn(*mut core::ffi::c_void, *mut NvmlUtilization) -> i32;
 type NvmlShutdown = unsafe extern "system" fn() -> i32;
+type NvmlPci = unsafe extern "system" fn(*mut core::ffi::c_void, *mut NvmlPciInfo) -> i32;
 
-/// NVML loaded in process (`nvml.dll` from the driver), device 0.
+#[repr(C)]
+struct NvmlPciInfo {
+    bus_id_legacy: [u8; 16],
+    domain: u32,
+    bus: u32,
+    device: u32,
+    pci_device_id: u32,
+    pci_sub_system_id: u32,
+    bus_id: [u8; 32],
+}
+
+/// NVML loaded in process (`nvml.dll` from `System32` only), device 0.
 pub struct Nvml {
     _lib: HMODULE,
     util: NvmlUtil,
     shutdown: NvmlShutdown,
     device: *mut core::ffi::c_void,
     pub devices: u32,
+    /// Device 0's `pciDeviceId` and bus id, to check it is the DXGI adapter.
+    pub pci_device_id: Option<u32>,
+    pub bus_id: Option<String>,
 }
 
 impl Nvml {
     pub fn open() -> Result<Nvml, String> {
         unsafe {
-            let lib =
-                LoadLibraryW(&HSTRING::from("nvml.dll")).map_err(|e| format!("nvml.dll: {e}"))?;
+            let lib = LoadLibraryExW(
+                &HSTRING::from("nvml.dll"),
+                None,
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+            .map_err(|e| format!("nvml.dll: {e}"))?;
             let get = |name: &[u8]| {
                 GetProcAddress(lib, PCSTR(name.as_ptr())).ok_or("missing NVML export")
             };
@@ -256,6 +308,9 @@ impl Nvml {
             let handle: NvmlHandle = std::mem::transmute(get(b"nvmlDeviceGetHandleByIndex_v2\0")?);
             let util: NvmlUtil = std::mem::transmute(get(b"nvmlDeviceGetUtilizationRates\0")?);
             let shutdown: NvmlShutdown = std::mem::transmute(get(b"nvmlShutdown\0")?);
+            let pci: Option<NvmlPci> = get(b"nvmlDeviceGetPciInfo_v3\0")
+                .ok()
+                .map(|f| std::mem::transmute(f));
             let r = init();
             if r != 0 {
                 return Err(format!("nvmlInit_v2: {r}"));
@@ -268,12 +323,24 @@ impl Nvml {
                 shutdown();
                 return Err(format!("nvmlDeviceGetHandleByIndex_v2: {r}"));
             }
+            let mut info: NvmlPciInfo = std::mem::zeroed();
+            let read = pci.is_some_and(|f| f(device, &mut info) == 0);
+            let bus_id = read.then(|| {
+                let end = info
+                    .bus_id
+                    .iter()
+                    .position(|b| *b == 0)
+                    .unwrap_or(info.bus_id.len());
+                String::from_utf8_lossy(&info.bus_id[..end]).into_owned()
+            });
             Ok(Nvml {
                 _lib: lib,
                 util,
                 shutdown,
                 device,
                 devices,
+                pci_device_id: read.then_some(info.pci_device_id),
+                bus_id,
             })
         }
     }

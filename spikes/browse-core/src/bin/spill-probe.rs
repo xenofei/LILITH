@@ -3,7 +3,8 @@
 //! `spill-probe sample --root-pid <pid> --out <jsonl> --stop-file <path> [--interval-ms 1000]
 //! [--max-seconds 7200]`: once per interval, the sum of `\GPU Process Memory(*)\Shared Usage`
 //! (and `Dedicated Usage`) over the discrete GPU's instances whose PID is `root` or one of its
-//! descendants, plus the adapter's `Shared Usage`. Stops when the stop file exists.
+//! descendants, plus the adapter's `Shared Usage`. Stops when the stop file exists or the root
+//! process exits.
 //! `spill-probe analyze --samples <jsonl> --phases <json> --out <json> [--window 10]`.
 
 use std::collections::BTreeSet;
@@ -36,9 +37,13 @@ fn sample() {
         .expect("adapter Shared Usage");
     q.collect();
     let mut file = std::fs::File::create(&out).expect("samples file");
+    let watched = win::Watched::open(root);
     let start = Instant::now();
     let mut i = 0u32;
-    while !stop.exists() && start.elapsed() < max {
+    while !stop.exists()
+        && start.elapsed() < max
+        && !watched.as_ref().is_none_or(|w| w.has_exited())
+    {
         i += 1;
         if let Some(w) = (interval * i).checked_sub(start.elapsed()) {
             std::thread::sleep(w);

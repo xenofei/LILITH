@@ -448,7 +448,7 @@ fn load(out: &std::path::Path) {
             "nvml_percent": summary(&nvml_series),
             "median_busiest_engine_percent": median(&engine_series),
             "median_nvml_percent": median(&nvml_series),
-            "nvml": match &nvml { Ok(n) => json!({"devices": n.devices}), Err(e) => json!({"error": e}) },
+            "nvml": match &nvml { Ok(n) => json!({"devices": n.devices, "device0_is_dxgi_adapter": n.pci_device_id.map(|p| p == ad.pci_id), "device0_bus_id": if n.devices > 1 { n.bus_id.clone() } else { None }}), Err(e) => json!({"error": e}) },
             "batches": batches.load(Ordering::Relaxed),
             "series": compute,
         },
