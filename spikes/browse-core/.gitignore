@@ -1,0 +1,11 @@
+/target/
+# Generated inputs (images, index.db): regenerated per run, removed at the end.
+/work/
+# Raw output (ComfyUI's folders, logs, the probe's stop file, images) stays local: only
+# results/checks.json's verdicts are summarised in the doc, and that file is ignored by
+# spikes/.gitignore.
+/results/raw/
+/results/run-*/
+/results/**/*.png
+/results/**/*.db
+/results/**/*.db-*
