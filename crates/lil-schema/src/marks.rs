@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test] // spec: CORE-152, ARCH-076
-    fn set_marks_cleans_hand_written_marks() {
+    fn set_marks_keeps_untouched_marks_as_written() {
         let text = json!({"schema_version": 1, "asset_id": "img_dock", "project": "sketchbook",
                           "x_before": 1, "tags": ["x", 5], "rating": 7, "label": "orange",
                           "x_after": 2})
@@ -343,10 +343,21 @@ mod tests {
                 label: None
             }
         );
-        // Setting what the view shows writes clean values, each in place.
-        let mut cleaned = m.clone();
-        cleaned.set_marks(&read).unwrap();
-        let keys: Vec<&str> = cleaned.as_map().keys().map(String::as_str).collect();
+        let raw = |m: &Manifest, key: &str| m.get(key).cloned();
+
+        // Only the rating changes: it is written in place, and the hand-written tags and label
+        // stay exactly as written.
+        let mut rated = m.clone();
+        rated
+            .set_marks(&Marks {
+                rating: 3,
+                ..read.clone()
+            })
+            .unwrap();
+        assert_eq!(raw(&rated, "rating"), Some(json!(3)));
+        assert_eq!(raw(&rated, "tags"), Some(json!(["x", 5])));
+        assert_eq!(raw(&rated, "label"), Some(json!("orange")));
+        let keys: Vec<&str> = rated.as_map().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
             [
@@ -356,21 +367,28 @@ mod tests {
                 "x_before",
                 "tags",
                 "rating",
+                "label",
                 "x_after"
             ]
         );
-        assert_eq!(cleaned.get("tags"), Some(&json!(["x"])));
-        assert_eq!(cleaned.get("rating"), Some(&json!(5)));
-        let (_, warnings) = Manifest::parse(&cleaned.to_text()).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
 
-        // A set equal to the raw values writes nothing; absent and `null` both equal "none".
-        let text = json!({"schema_version": 1, "asset_id": "img_dock", "project": "sketchbook",
-                          "tags": ["x"], "rating": 5, "label": null})
-        .to_string();
-        let (m, _) = Manifest::parse(&text).unwrap();
+        // Only the tags change: written normalised (P4b-R26), and the hand-written rating and
+        // label stay exactly as written.
+        let mut tagged = m.clone();
+        let tags = normalise_tags(&s(&["x", " Pier ", "pier"])).unwrap();
+        tagged
+            .set_marks(&Marks {
+                tags,
+                ..read.clone()
+            })
+            .unwrap();
+        assert_eq!(raw(&tagged, "tags"), Some(json!(["x", "Pier"])));
+        assert_eq!(raw(&tagged, "rating"), Some(json!(7)));
+        assert_eq!(raw(&tagged, "label"), Some(json!("orange")));
+
+        // Setting what the view shows changes nothing.
         let mut same = m.clone();
-        same.set_marks(&same.marks()).unwrap();
+        same.set_marks(&read).unwrap();
         assert_eq!(same.to_text(), m.to_text());
     }
 }

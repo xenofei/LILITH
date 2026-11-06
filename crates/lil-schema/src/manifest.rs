@@ -237,14 +237,6 @@ pub(crate) fn set_utc_object(map: &mut Map<String, Value>, key: &str, utc: Optio
     }
 }
 
-/// [`set_opt`], unless `key` already holds exactly `value` (absent or `null` for `None`), when
-/// nothing changes.
-fn set_if_changed(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
-    if map.get(key).filter(|v| !v.is_null()) != value.as_ref() {
-        set_opt(map, key, value);
-    }
-}
-
 /// Sets `key` in place (a new key is appended), or removes it by shifting when `value` is
 /// `None`.
 pub(crate) fn set_opt(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
@@ -394,20 +386,27 @@ impl Manifest {
         marks::read_marks(&mut Reader::new(), self.root())
     }
 
-    /// Writes the asset's marks, each key in place; no tags, a rating of 0 and no label remove
-    /// their key by shifting (Appendix E). A key is compared with the raw value it would get,
-    /// not with the lenient read: one that already holds exactly that value (absent or `null`
-    /// for a removal) is left alone, and any other is rewritten, so a hand-written `rating: 7`,
-    /// an unknown label or a tag list with a non-string item is cleaned by a mark edit. Tags
-    /// are written as given: the caller normalises them first ([`marks::normalise_tags`]). A
-    /// rating above 5 is an error and changes nothing.
+    /// Writes the marks whose value differs from [`Manifest::marks`] (the lenient read), each
+    /// key in place; no tags, a rating of 0 and no label remove their key by shifting
+    /// (Appendix E). A mark whose read value doesn't change is left as written, so a
+    /// hand-written value that breaks the rules stays until that mark is edited (P4b-R26: tags
+    /// are normalised only when a mark next writes `tags`). Tags are written as given: the
+    /// caller normalises them first ([`marks::normalise_tags`]). A rating above 5 is an error
+    /// and changes nothing.
     pub fn set_marks(&mut self, m: &Marks) -> Result<(), String> {
         check_rating(m.rating)?;
-        let tags = (!m.tags.is_empty()).then(|| Value::from(m.tags.clone()));
-        set_if_changed(&mut self.map, "tags", tags);
-        set_if_changed(&mut self.map, "rating", marks::rating_value(m.rating));
-        let label = m.label.map(|l| Value::from(l.as_str()));
-        set_if_changed(&mut self.map, "label", label);
+        let now = self.marks();
+        if now.tags != m.tags {
+            let tags = (!m.tags.is_empty()).then(|| Value::from(m.tags.clone()));
+            set_opt(&mut self.map, "tags", tags);
+        }
+        if now.rating != m.rating {
+            set_opt(&mut self.map, "rating", marks::rating_value(m.rating));
+        }
+        if now.label != m.label {
+            let label = m.label.map(|l| Value::from(l.as_str()));
+            set_opt(&mut self.map, "label", label);
+        }
         Ok(())
     }
 
