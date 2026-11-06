@@ -67,12 +67,16 @@
 //!   asset's `tags` (`tags` replaces; `add_tags`/`remove_tags` edit, compared by
 //!   `lil_schema::fold_tag`; either way normalised when written), `rating` and `label`, and,
 //!   with `run_id` and one of `take` or `file` ([`resolve_take`]: a companion addresses its
-//!   take), the take's `flag` and `rating` on its primary file entry. `null` clears `label` and
-//!   `flag`. A take's marks need an open run, else `status.invalid_transition`. Holding the
+//!   take; a path picks its entry, a bare name must lead to one take), the take's `flag` and
+//!   `rating` on its primary file entry. `null` clears `label` and `flag`. Like `set_marks`, a
+//!   take mark is written only when its view value changes. A take's marks need an open run,
+//!   else `status.invalid_transition`. Holding the
 //!   asset's version lock, it edits the manifest (the store's change sink refreshes the index),
 //!   then publishes `{kind: "mark", asset, run_id?, take?, previous}` on the asset's topic and
-//!   `project:<slug>`, `previous` holding the view's value before (a hand-written rating of 7
-//!   reads as 5) of each mark that changed; nothing changed publishes nothing. No jobs log
+//!   `project:<slug>` (`asset` is the bare asset id), `previous` holding the view's value
+//!   before (a hand-written rating of 7 reads as 5) of each mark that changed: `tags` and
+//!   `label` are the asset's, `flag` is the take's, and `rating` is the take's when the call
+//!   names a run, else the asset's. Nothing changed writes and publishes nothing. No jobs log
 //!   line, no `progress.md` entry, no status change. `review_view` is validated and stored
 //!   nowhere until the pick log.
 //!
@@ -96,8 +100,8 @@ use lil_protocol::codes::{
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
     AssetRef, Bump, CandidateRun, Flag, Label, LinkRef, Manifest, SCHEME, Status, StatusEvent,
-    Take, YamlEdit, bare_sha256, change_status, fold_tag, hash_value, is_asset_id, is_slug,
-    normalise_tags, takes_of,
+    Take, YamlEdit, bare_sha256, change_status, file_takes, fold_tag, hash_value, is_asset_id,
+    is_slug, normalise_tags, takes_of,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1472,14 +1476,17 @@ fn mark_request(ctx: &CallCtx, args: MarkArgs) -> Result<MarkRequest, ErrorBody>
     })
 }
 
-/// The take of `run` that `take` (its number) or `file` (any of its files, named by its bare
-/// name without regard to case, as `lil_schema::takes_of` compares names) addresses (P4b-R3):
-/// a companion addresses its take, whose primary holds the marks. The errors carry an empty
-/// trace id.
+/// The take of `run` that `take` (its number) or `file` (one of its files) addresses (P4b-R3):
+/// a companion addresses its take, whose primary holds the marks. Names are compared after
+/// `to_lowercase`, as `lil_schema::takes_of` compares them. A `file` with a `/` (or `\`) is a
+/// path: the file entry's asset-relative `path`, or that path inside the run folder. A bare
+/// name matches any entry of that name, and must lead to exactly one take. The errors carry an
+/// empty trace id.
 ///
 /// # Errors
-/// `params.invalid` unless exactly one of `take` and `file` is given; `asset.unknown` for a
-/// take the run doesn't have or a file in none of its takes.
+/// `params.invalid` unless exactly one of `take` and `file` is given, or for a `file` whose
+/// entries are in more than one take; `asset.unknown` for a take the run doesn't have or a
+/// file in none of its takes.
 pub(crate) fn resolve_take(
     run: &CandidateRun,
     take: Option<u32>,
@@ -1499,15 +1506,45 @@ pub(crate) fn resolve_take(
             .find(|t| t.n == n)
             .ok_or_else(|| unknown(format!("take {n}"))),
         (None, Some(file)) => {
-            let key = file.rsplit('/').next().unwrap_or(file).to_lowercase();
-            takes
-                .into_iter()
-                .find(|t| {
-                    std::iter::once(&t.primary)
-                        .chain(&t.companions)
-                        .any(|name| name.to_lowercase() == key)
-                })
-                .ok_or_else(|| unknown(format!("file `{file}` in a take")))
+            let given = file.replace('\\', "/").to_lowercase();
+            let mut run_dir = run
+                .path
+                .clone()
+                .unwrap_or_else(|| format!("candidates/{}/", run.run_id))
+                .to_lowercase();
+            if !run_dir.ends_with('/') {
+                run_dir.push('/');
+            }
+            let bare = !given.contains('/');
+            let mut found = BTreeSet::new();
+            for (f, n) in run.files.iter().zip(file_takes(run)) {
+                let path = f.path.to_lowercase();
+                let hit = if bare {
+                    path.rsplit('/').next() == Some(given.as_str())
+                } else {
+                    path == given || path.strip_prefix(&run_dir) == Some(given.as_str())
+                };
+                if let (true, Some(n)) = (hit, n) {
+                    found.insert(n);
+                }
+            }
+            let mut found = found.into_iter();
+            match (found.next(), found.next()) {
+                (None, _) => Err(unknown(format!("file `{file}` in a take"))),
+                (Some(n), None) => takes
+                    .into_iter()
+                    .find(|t| t.n == n)
+                    .ok_or_else(|| unknown(format!("take {n}"))),
+                (Some(_), Some(_)) => Err(ErrorBody::new(
+                    &PARAMS_INVALID,
+                    format!(
+                        "`{file}` names files in more than one take of the run `{}`: name the \
+                         take, or the file's path in the run folder.",
+                        run.run_id
+                    ),
+                    "",
+                )),
+            }
         }
         _ => Err(ErrorBody::new(
             &PARAMS_INVALID,
@@ -1589,8 +1626,14 @@ fn apply_mark(m: &mut Manifest, req: &MarkRequest) -> Result<Applied, ErrorBody>
                 ));
             }
             let t = resolve_take(run, addr.take, addr.file.as_deref())?;
-            m.set_take_mark(&run.run_id, t.n, req.flag, req.rating)
-                .map_err(|why| ErrorBody::new(&MANIFEST_NEEDS_REPAIR, why, ""))?;
+            // Only what changes the view is written, as `set_marks` does: a hand-written value
+            // the view already shows (a rating of 7 read as 5) stays until that mark changes.
+            let flag = req.flag.filter(|f| *f != t.flag);
+            let rating = req.rating.filter(|r| *r != t.rating);
+            if flag.is_some() || rating.is_some() {
+                m.set_take_mark(&run.run_id, t.n, flag, rating)
+                    .map_err(|why| ErrorBody::new(&MANIFEST_NEEDS_REPAIR, why, ""))?;
+            }
             let run_id = run.run_id.clone();
             let now = m
                 .view()

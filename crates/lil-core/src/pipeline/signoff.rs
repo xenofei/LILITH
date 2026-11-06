@@ -64,7 +64,8 @@ pub struct ChosenFiles {
 /// numbers are sorted and deduplicated. The errors carry an empty trace id.
 ///
 /// # Errors
-/// `params.invalid` for no take; `asset.unknown` for a take the run doesn't have.
+/// `params.invalid` for no take or take 0 (takes are 1-based); `asset.unknown` for a take the
+/// run doesn't have.
 pub fn chosen_files(run: &CandidateRun, chosen: &Chosen) -> Result<ChosenFiles, ErrorBody> {
     let wanted = match chosen {
         Chosen::Files(names) => {
@@ -80,6 +81,12 @@ pub fn chosen_files(run: &CandidateRun, chosen: &Chosen) -> Result<ChosenFiles, 
         return Err(fail(
             &PARAMS_INVALID,
             "A sign-off by takes chooses at least one take of the run.".to_string(),
+        ));
+    }
+    if wanted.contains(&0) {
+        return Err(fail(
+            &PARAMS_INVALID,
+            "Takes are numbered from 1.".to_string(),
         ));
     }
     let mut numbers = wanted.clone();

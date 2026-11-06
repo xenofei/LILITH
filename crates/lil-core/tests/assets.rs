@@ -2503,10 +2503,14 @@ async fn null_clears_flag_and_label() {
 #[tokio::test] // spec: CORE-152
 async fn mark_event_carries_previous() {
     let fx = Fx::with(|ws| {
-        // Hand-written: a rating above 5 reads as 5.
+        // Hand-written: a rating above 5 reads as 5, an unknown flag as none; the open run's
+        // take 1 primary (`crane_c.png`) has both.
         edit_fixture_manifest(ws, CRANE, |m| {
             m["rating"] = json!(7);
             m["label"] = json!("red");
+            let primary = &mut m["candidate_runs"][1]["files"][0];
+            primary["rating"] = json!(7);
+            primary["flag"] = json!("maybe");
         });
     });
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -2525,6 +2529,25 @@ async fn mark_event_carries_previous() {
     )
     .await;
     assert_eq!(std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap(), bytes);
+    // The same for a take: the hand-written 7 and "maybe" stay on disk.
+    for same in [
+        json!({"rating": 5}),
+        json!({"flag": null}),
+        json!({"rating": 5, "flag": null}),
+    ] {
+        let args = with_keys(&json!({"run_id": CRANE_OPEN_RUN, "take": 1}), &same);
+        let r = fx.ok("asset.mark", mark_args(CRANE, args)).await;
+        assert_eq!(
+            r["take"],
+            json!({"run_id": CRANE_OPEN_RUN, "take": 1, "flag": null, "rating": 5}),
+            "{same}"
+        );
+        assert_eq!(
+            std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap(),
+            bytes,
+            "{same}"
+        );
+    }
 
     fx.ok(
         "asset.mark",
@@ -2548,7 +2571,7 @@ async fn mark_event_carries_previous() {
     let asset_marks = json!({"kind": "mark", "asset": CRANE,
                              "previous": {"rating": 5, "tags": []}});
     let take_marks = json!({"kind": "mark", "asset": CRANE, "run_id": CRANE_OPEN_RUN,
-                            "take": 1, "previous": {"flag": null, "rating": 0}});
+                            "take": 1, "previous": {"flag": null, "rating": 5}});
     assert_eq!(
         seen,
         [
@@ -2557,6 +2580,13 @@ async fn mark_event_carries_previous() {
             (asset.clone(), take_marks.clone()),
             (project.clone(), take_marks),
         ]
+    );
+    let m = fx.manifest(CRANE);
+    let primary = run_file(&m, CRANE_OPEN_RUN, "crane_c.png");
+    assert_eq!(
+        (&primary["flag"], &primary["rating"]),
+        (&json!("pick"), &json!(3)),
+        "{primary}"
     );
     fx.shutdown().await;
 }
@@ -2646,6 +2676,9 @@ async fn files_and_takes_together_is_params_invalid() {
         (json!({"files": ["a.png"], "takes": [1]}), "params.invalid"),
         (json!({}), "params.invalid"),
         (json!({"takes": []}), "params.invalid"),
+        // Takes are 1-based: 0 is a malformed argument, as in asset.mark.
+        (json!({"takes": [0]}), "params.invalid"),
+        (json!({"takes": [1, 0]}), "params.invalid"),
         (
             json!({"takes": [1], "review_view": "carousel"}),
             "params.invalid",
@@ -2669,5 +2702,99 @@ async fn files_and_takes_together_is_params_invalid() {
         signed.get("takes").is_none() && signed.get("companions").is_none(),
         "{signed}"
     );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152, CORE-023 (P4b-R3)
+async fn a_file_path_picks_its_take_and_a_shared_name_is_params_invalid() {
+    // The kite's open run, read by the legacy rule: `left/a.png` is take 1 and `right/a.png`
+    // take 2; one bare name, two takes.
+    let fx = Fx::with(|ws| {
+        let files: Vec<Value> = ["left/a.png", "right/a.png"]
+            .iter()
+            .map(|p| {
+                json!({"path": format!("candidates/{TAKE_RUN}/{p}"), "role": "candidate",
+                       "sha256": sha256_bytes(p.as_bytes())})
+            })
+            .collect();
+        let m = json!({
+            "schema_version": 1, "asset_id": KITE, "project": "sketchbook", "type": "image",
+            "creation_uuid": "0d6c1a52-3b1e-4f7a-9c2d-5e8f1a2b3c4d",
+            "version": "1.0.0", "approved_version": null, "status": "candidate",
+            "inputs": [], "pinned_inputs": [],
+            "candidate_runs": [{
+                "run_id": TAKE_RUN, "path": format!("candidates/{TAKE_RUN}/"), "status": "open",
+                "created": "2026-11-01T09:00:00Z", "target_version": "1.0.0", "files": files,
+                "selected": null, "signed_off": null,
+            }],
+            "hashes": {},
+        });
+        write_file(
+            &manifest_file(ws, KITE),
+            format!("{}\n", serde_json::to_string_pretty(&m).unwrap()).as_bytes(),
+        );
+    });
+    let entry = |m: &Value, p: &str| {
+        run_of(m, TAKE_RUN)["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == format!("candidates/{TAKE_RUN}/{p}"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no {p}: {m}"))
+    };
+
+    // A path in the run folder picks its entry's take, in any case.
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(
+                KITE,
+                json!({"run_id": TAKE_RUN, "file": "RIGHT/A.png", "flag": "reject"}),
+            ),
+        )
+        .await;
+    assert_eq!(r["take"]["take"], 2, "{r}");
+    // So does the asset-relative path.
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(
+                KITE,
+                json!({"run_id": TAKE_RUN, "file": format!("candidates/{TAKE_RUN}/left/a.png"),
+                       "flag": "pick"}),
+            ),
+        )
+        .await;
+    assert_eq!(r["take"]["take"], 1, "{r}");
+    let m = fx.manifest(KITE);
+    assert_eq!(entry(&m, "left/a.png")["flag"], "pick", "{m}");
+    assert_eq!(entry(&m, "right/a.png")["flag"], "reject", "{m}");
+
+    // The bare name is in two takes: refused, nothing changes.
+    let bytes = std::fs::read(manifest_file(&fx.ws, KITE)).unwrap();
+    let e = fx
+        .err(
+            "asset.mark",
+            mark_args(
+                KITE,
+                json!({"run_id": TAKE_RUN, "file": "a.png", "flag": null}),
+            ),
+        )
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(e.message.contains("more than one take"), "{e:?}");
+    assert_eq!(std::fs::read(manifest_file(&fx.ws, KITE)).unwrap(), bytes);
+    // A path that names no entry is unknown.
+    let e = fx
+        .err(
+            "asset.mark",
+            mark_args(
+                KITE,
+                json!({"run_id": TAKE_RUN, "file": "middle/a.png", "flag": "pick"}),
+            ),
+        )
+        .await;
+    assert_eq!(e.code, "asset.unknown", "{e:?}");
     fx.shutdown().await;
 }

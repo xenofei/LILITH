@@ -117,7 +117,23 @@ pub(crate) fn grouped(files: &[CandidateFile]) -> (Vec<(Take, usize)>, Vec<Strin
         return (takes, warnings);
     }
 
-    // The legacy rule. `owner[i]` is the index into `primaries` of file i's take.
+    let (primaries, owner) = legacy_owners(files);
+    let takes = primaries
+        .iter()
+        .enumerate()
+        .map(|(t, &p)| {
+            let companions: Vec<usize> = (0..files.len())
+                .filter(|&i| i != p && owner[i] == Some(t))
+                .collect();
+            take(t as u32 + 1, p, &companions)
+        })
+        .collect();
+    (takes, warnings)
+}
+
+/// The legacy rule (a run in which no file has `take`): the indices of the `candidate`-role
+/// files, one take each in file order, and for each file the index into those of its take.
+fn legacy_owners(files: &[CandidateFile]) -> (Vec<usize>, Vec<Option<usize>>) {
     let key = |name: &str| file_name(name).to_lowercase();
     let primaries: Vec<usize> = (0..files.len())
         .filter(|&i| files[i].role == "candidate")
@@ -145,17 +161,19 @@ pub(crate) fn grouped(files: &[CandidateFile]) -> (Vec<(Take, usize)>, Vec<Strin
             break;
         }
     }
-    let takes = primaries
-        .iter()
-        .enumerate()
-        .map(|(t, &p)| {
-            let companions: Vec<usize> = (0..files.len())
-                .filter(|&i| i != p && owner[i] == Some(t))
-                .collect();
-            take(t as u32 + 1, p, &companions)
-        })
-        .collect();
-    (takes, warnings)
+    (primaries, owner)
+}
+
+/// The take number of each of `run.files`, in the same order, as [`takes_of`] groups them
+/// (P4b-R3): a file's own `take` when any file of the run has one, else the legacy rule's.
+/// `None` for a file in no take.
+pub fn file_takes(run: &CandidateRun) -> Vec<Option<u32>> {
+    let files = &run.files;
+    if files.iter().any(|f| f.take.is_some()) {
+        return files.iter().map(|f| f.take).collect();
+    }
+    let (_, owner) = legacy_owners(files);
+    owner.into_iter().map(|t| t.map(|t| t as u32 + 1)).collect()
 }
 
 /// A take's hash (P4b-R13): the SHA-256 of the lines `<sha256>  <file name>\n` of the take's
