@@ -7,7 +7,8 @@
 //! - [`refs`], [`version`], [`content_hash`]: links, `lil://` refs and content hashes (ARCH-042,
 //!   CORE-031, CORE-047);
 //! - [`lilref`]: `.lilref` pointer files (APP-021, CORE-047);
-//! - [`status`]: the status machine (CORE-048) and the status log (CORE-156);
+//! - [`status`]: the status machine (CORE-048) and the status log (CORE-156), changed together
+//!   by [`change_status`];
 //! - [`marks`], [`takes`], [`attribution`]: marks and tags, takes, actors and trust records
 //!   (Appendix H; CORE-023, CORE-152, ARCH-060);
 //! - [`paths`]: workspace-relative path rules (CORE-040);
@@ -49,6 +50,7 @@ pub use paths::{PATH_BUDGET, PathProblem, check_rel_path};
 pub use refs::{AssetRef, LEGACY_SCHEME, LinkRef, SCHEME, is_asset_id, is_run_id, is_slug};
 pub use status::{
     Reason, STATUS_LOG_MAX, Status, StatusBy, StatusEvent, StatusLogEntry, Transition, Via,
+    change_status, transition,
 };
 pub use suite::{
     DesktopToml, NOTIFICATION_CATEGORIES, PowerToml, SUITE_STATE_SCHEMA, SuiteToml,
@@ -60,16 +62,3 @@ pub use takes::{
 };
 pub use version::{Bump, Version};
 pub use yaml_edit::{YamlEdit, YamlEditError, YamlValue};
-
-/// [`status::transition`] for callers that pass only `status_before_stale` and
-/// `status_before_blocked`: no `status_before_deprecated`, no status log and no approved
-/// version, so `Undeprecate` returns to `in_progress`. Every other event behaves as in
-/// [`status::transition`].
-pub fn transition(
-    from: Status,
-    before_stale: Option<Status>,
-    before_blocked: Option<Status>,
-    ev: &StatusEvent,
-) -> Result<Transition, String> {
-    status::transition(from, before_stale, before_blocked, None, &[], false, ev)
-}

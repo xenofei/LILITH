@@ -11,6 +11,7 @@
 //! | `asset.signoff` | write | `{project?, asset_id, run_id, files: [name], bump?, keep_runs?}` | `{ref, version, handoff}` |
 //! | `asset.request_signoff` | write | `{project?, asset_id}` | `{status}` |
 //! | `asset.pin_input` | write | `{project?, asset_id, ref, reason}` | `{pinned_inputs}` |
+//! | `asset.deprecate` | write | `{project?, asset_id, deprecated}` | `{status}` |
 //!
 //! - **`asset.import`, `copy`**: an asset without a manifest gets `Manifest::new` with a fresh
 //!   `creation_uuid` (CORE-047). Each file (an absolute path) is copied into a staging handle
@@ -49,6 +50,17 @@
 //!   input), whose target need not exist on this machine. It pushes `{ref, reason, by, date}`
 //!   to `pinned_inputs` (once per ref) and, for a `proj:` or `lib:` source the project's
 //!   `links` lack, appends it there with the comment-keeping YAML edit, in Execute (CORE-019).
+//! - **`asset.deprecate`** (CORE-170; P4b-R4) sets the status `deprecated` with a manifest
+//!   edit (`status_before_deprecated` = the status it had), or with `deprecated: false` returns
+//!   it to the status `lil_schema::status::transition`'s fallback order gives. An asset already
+//!   deprecated (or, for `false`, not deprecated) is left as it is. The asset's files and
+//!   dependents are untouched; no `progress.md` entry. The edit holds the asset's version lock,
+//!   as a sign-off does. A change publishes `{kind: "deprecated", deprecated, status,
+//!   previous}` and `{kind: "status", status}` on the asset's topic, and
+//!   `{kind: "deprecated", asset_id, deprecated, status, previous}` on `project:<slug>`.
+//!
+//! Every status change goes through `lil_schema::change_status`, which logs one status-log
+//! entry in the same manifest edit, `by` the caller (`pipeline::status_by`).
 //!
 //! Imported file names are untrusted (ARCH-060): results list them as
 //! `files: [{name, untrusted: true}]`, and summaries never repeat them. A name must be one path
@@ -66,7 +78,7 @@ use lil_protocol::codes::{
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
     AssetRef, Bump, LinkRef, Manifest, SCHEME, Status, StatusEvent, YamlEdit, bare_sha256,
-    hash_value, is_asset_id, is_slug, transition,
+    change_status, hash_value, is_asset_id, is_slug,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -75,8 +87,8 @@ use serde_json::{Map, Value, json};
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::{
-    HandOff, RecordBranch, RecordPlan, asset_topic, plan_signoff, reopened, signed_off_by,
-    start_candidate_run,
+    HandOff, RecordBranch, RecordPlan, asset_topic, plan_signoff, signed_off_by,
+    start_candidate_run, status_by,
 };
 use crate::projects::{ProjectFile, project_yaml_path, read_project, unknown_project};
 use crate::store::{
@@ -107,6 +119,10 @@ const SIGNOFF_DESCRIPTION: &str = "Sign off files of an open candidate run: they
 
 const REQUEST_SIGNOFF_DESCRIPTION: &str = "Flag an asset for sign-off: its status becomes \
     in_review.";
+
+const DEPRECATE_DESCRIPTION: &str = "Deprecate an asset (deprecated: true): its status \
+    becomes deprecated, every file stays and its dependents keep working. deprecated: false \
+    returns it to the status it had before. Reversible; the change is in its status log.";
 
 const PIN_INPUT_DESCRIPTION: &str = "Pin an input of an asset, so a newer version of it \
     doesn't make the asset stale: ref is a link (<asset_id>@<v>, proj:<slug>/<asset_id>@<v>, \
@@ -221,6 +237,16 @@ struct SignoffResult {
 #[derive(Debug, Serialize, JsonSchema)]
 struct StatusResult {
     status: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DeprecateArgs {
+    /// A project slug; omitted: the call's project.
+    project: Option<String>,
+    asset_id: String,
+    /// true deprecates; false returns to the status before.
+    deprecated: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -486,6 +512,7 @@ async fn stage_candidate_run(
         a.asset_id.clone(),
         asset_type.to_string(),
     );
+    let by = status_by(&ctx.session.caller);
     let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&project, &asset_id, &asset_type, &uuid);
@@ -493,7 +520,7 @@ async fn stage_candidate_run(
         let Value::Object(run) = run.clone() else {
             unreachable!("the run is an object");
         };
-        start_candidate_run(m, run, now)?;
+        start_candidate_run(m, run, &by, now)?;
         if remove_external {
             m.remove("external");
         }
@@ -591,6 +618,8 @@ async fn link_external(
         a.asset_id.clone(),
         asset_type.to_string(),
     );
+    let by = status_by(&ctx.session.caller);
+    let utc = lil_schema::time::rfc3339(store.now_utc());
     let edit = move |m: &mut Manifest| {
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&project, &asset_id, &asset_type, &uuid);
@@ -617,9 +646,8 @@ async fn link_external(
         }
         m.set("external", Value::Array(list));
         if m.view().status.unwrap_or(Status::Planned) == Status::Planned {
-            let moved = transition(Status::Planned, None, None, &StatusEvent::StartWork)
+            change_status(m, &StatusEvent::StartWork, by.clone(), None, None, &utc)
                 .map_err(StoreError::InvalidTransition)?;
-            m.set("status", Value::from(moved.to.as_str()));
         }
         Ok(())
     };
@@ -858,7 +886,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         &args.files,
         bump,
         &args.keep_runs,
-        by,
+        &by,
         now,
     )
     .map_err(|e| traced(ctx, e))?;
@@ -957,7 +985,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
             &files,
             bump,
             &keep,
-            by,
+            &by,
             now,
         )
         .map_err(|e| replanned_error(&rel, &e))?;
@@ -1073,39 +1101,26 @@ async fn request_signoff(
         return Err(unknown_asset(ctx, &a));
     }
     let rel = a.manifest.clone();
+    let by = status_by(&ctx.session.caller);
+    let utc = lil_schema::time::rfc3339(a.store().now_utc());
     let edit = move |m: &mut Manifest| {
         if m.get("asset_id").is_none() {
             return Err(StoreError::NeedsRepair(rel.clone()));
         }
-        let parse = |key: &str| {
-            m.get(key)
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<Status>().ok())
-        };
-        let view = m.view();
-        let mut from = view.status.unwrap_or(Status::Planned);
-        if from == Status::InReview {
+        if m.view().status == Some(Status::InReview) {
             return Ok(());
         }
-        let (before_stale, before_blocked) =
-            (parse("status_before_stale"), parse("status_before_blocked"));
-        // Ruling Q23: an approved asset with an open (kept) run is new work.
-        let open_run = view
-            .candidate_runs
-            .iter()
-            .any(|r| matches!(r.status.as_deref(), None | Some("open")) && r.trashed_utc.is_none());
-        if open_run {
-            from = reopened(from, before_stale, before_blocked)
-                .map_err(StoreError::InvalidTransition)?;
-        }
-        let moved = transition(
-            from,
-            before_stale,
-            before_blocked,
+        // Ruling Q23 (an approved asset with an open, kept run is new work) is
+        // `change_status`'s.
+        change_status(
+            m,
             &StatusEvent::RequestSignoff,
+            by.clone(),
+            None,
+            None,
+            &utc,
         )
         .map_err(StoreError::InvalidTransition)?;
-        m.set("status", Value::from(moved.to.as_str()));
         Ok(())
     };
     let (after, _) = a
@@ -1121,6 +1136,85 @@ async fn request_signoff(
         .to_string();
     ctx.events
         .publish(&a.topic(), json!({"kind": "status", "status": status}));
+    let summary = format!("{} is {status}", a.asset_id);
+    Ok((StatusResult { status }, summary))
+}
+
+async fn deprecate(
+    ctx: &CallCtx,
+    args: DeprecateArgs,
+) -> Result<(StatusResult, String), ErrorBody> {
+    let a = asset_of(ctx, args.project, &args.asset_id).await?;
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    if read_manifest(a.store(), &a.manifest)
+        .await
+        .map_err(error)?
+        .is_none()
+    {
+        return Err(unknown_asset(ctx, &a));
+    }
+    let rel = a.manifest.clone();
+    let by = status_by(&ctx.session.caller);
+    let utc = lil_schema::time::rfc3339(a.store().now_utc());
+    let ev = if args.deprecated {
+        StatusEvent::Deprecate
+    } else {
+        StatusEvent::Undeprecate
+    };
+    // The status before this call's change, when it made one.
+    let previous: Arc<std::sync::Mutex<Option<Option<Status>>>> = Arc::default();
+    let seen = previous.clone();
+    let edit = move |m: &mut Manifest| {
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if m.get("asset_id").is_none() {
+            return Err(StoreError::NeedsRepair(rel.clone()));
+        }
+        let from = m.view().status;
+        if (from == Some(Status::Deprecated)) == args.deprecated {
+            return Ok(());
+        }
+        change_status(m, &ev, by.clone(), None, None, &utc)
+            .map_err(StoreError::InvalidTransition)?;
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(from);
+        Ok(())
+    };
+    // The asset's version lock, as `asset.signoff` holds it from its seal to its manifest
+    // edit: a deprecation never lands between the two.
+    let guard = a
+        .store()
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
+    let (after, _) = a
+        .store()
+        .edit_manifest(&a.manifest, &edit)
+        .await
+        .map_err(error)?;
+    drop(guard);
+    let status = after.view().status.unwrap_or(Status::Planned).as_str();
+    let previous = *previous
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(from) = previous {
+        let previous = from.map(Status::as_str);
+        ctx.events.publish(
+            &a.topic(),
+            json!({"kind": "deprecated", "deprecated": args.deprecated, "status": status,
+                   "previous": previous}),
+        );
+        ctx.events
+            .publish(&a.topic(), json!({"kind": "status", "status": status}));
+        ctx.events.publish(
+            &format!("project:{}", a.project),
+            json!({"kind": "deprecated", "asset_id": a.asset_id, "deprecated": args.deprecated,
+                   "status": status, "previous": previous}),
+        );
+    }
+    let status = status.to_string();
     let summary = format!("{} is {status}", a.asset_id);
     Ok((StatusResult { status }, summary))
 }
@@ -1221,8 +1315,8 @@ async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), 
     Ok((PinResult { pinned_inputs }, summary))
 }
 
-/// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff` and
-/// `asset.pin_input` (module `workspace`).
+/// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,
+/// `asset.pin_input` and `asset.deprecate` (module `workspace`).
 pub fn register_asset_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "asset.import",
@@ -1258,5 +1352,12 @@ pub fn register_asset_tools(reg: &mut Registry) {
         EffectClass::Write,
         WORKSPACE_MODULE,
         |ctx, args: PinArgs| Box::pin(pin_input(ctx, args)),
+    ));
+    reg.register(typed_tool(
+        "asset.deprecate",
+        DEPRECATE_DESCRIPTION,
+        EffectClass::Write,
+        WORKSPACE_MODULE,
+        |ctx, args: DeprecateArgs| Box::pin(deprecate(ctx, args)),
     ));
 }

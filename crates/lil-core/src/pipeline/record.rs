@@ -33,7 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lil_schema::{
-    Bump, LinkRef, Manifest, ManifestView, SCHEME, Status, StatusEvent, Version, transition,
+    Bump, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy, StatusEvent, Version,
+    change_status,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -319,7 +320,8 @@ async fn hand_off_dependents(
         let view = manifest.view();
         match view.status {
             Some(Status::Approved | Status::Exported | Status::Released) => {
-                let stale_through = view.inputs.iter().any(|input| {
+                // The input through which the new version makes the dependent stale.
+                let stale_through = view.inputs.iter().find(|input| {
                     input
                         .r#ref
                         .parse::<LinkRef>()
@@ -330,10 +332,11 @@ async fn hand_off_dependents(
                                 && is_stale(&named, Some(&version), pins(&project, &view, &t))
                         })
                 });
-                if !stale_through {
+                let Some(input) = stale_through else {
                     continue;
-                }
-                match mark_stale(store, &project, &asset_id, sealed.1, version).await {
+                };
+                let changed = (sealed.1, version, input.r#ref.as_str());
+                match mark_stale(store, &project, &asset_id, changed).await {
                     Ok(Some(after)) => {
                         let r = stale_ref(
                             store,
@@ -395,43 +398,36 @@ async fn hand_off_dependents(
     }
 }
 
-/// `MarkStale` on the dependent `project`/`asset_id`, re-checked on the manifest as it is
-/// written; `Some(manifest)` when this call marked it.
+/// `MarkStale` by the core on the dependent `project`/`asset_id`, re-checked on the manifest
+/// as it is written; `Some(manifest)` when this call marked it. `changed` is the input asset,
+/// its new version and the dependent's input ref that names it: the status-log entry's reason
+/// is `{code: "input_changed", ref: <that ref>}`.
 async fn mark_stale(
     store: &Store,
     project: &str,
     asset_id: &str,
-    input: &str,
-    version: Version,
+    changed: (&str, Version, &str),
 ) -> Result<Option<Manifest>, StoreError> {
     let rel = manifest_rel(project, asset_id)?;
-    let reason = format!("input {input} {version} signed off");
+    let (input, version, input_ref) = changed;
+    let note = format!("input {input} {version} signed off");
+    let reason = Reason {
+        code: "input_changed".to_string(),
+        r#ref: Some(input_ref.to_string()),
+        note: None,
+    };
+    let utc = lil_schema::time::rfc3339(store.now_utc());
     let marked = Arc::new(AtomicBool::new(false));
     let did = marked.clone();
     let (after, _) = store
         .edit_manifest(&rel, &move |m: &mut Manifest| {
             did.store(false, Ordering::SeqCst);
-            let parse = |key: &str| {
-                m.get(key)
-                    .and_then(Value::as_str)
-                    .and_then(|s| s.parse::<Status>().ok())
-            };
-            let Some(from) = m.view().status else {
+            let ev = StatusEvent::MarkStale;
+            let by = StatusBy::Core;
+            if change_status(m, &ev, by, None, Some(reason.clone()), &utc).is_err() {
                 return Ok(());
-            };
-            let Ok(moved) = transition(
-                from,
-                parse("status_before_stale"),
-                parse("status_before_blocked"),
-                &StatusEvent::MarkStale,
-            ) else {
-                return Ok(());
-            };
-            m.set("status", Value::from(moved.to.as_str()));
-            if let Some(before) = moved.set_before_stale {
-                m.set("status_before_stale", Value::from(before.as_str()));
             }
-            m.set("status_reason", Value::from(reason.as_str()));
+            m.set("status_reason", Value::from(note.as_str()));
             did.store(true, Ordering::SeqCst);
             Ok(())
         })
@@ -447,7 +443,7 @@ fn manifest_rel_of(view: &ManifestView) -> WsPath {
 
 /// Starts a candidate run on `m` (CORE-023, CORE-027; I5 "Version fields"): appends `run`
 /// (its `created` filled from `now_utc` when it has none) and moves the status by
-/// `transition(…, CandidateRun)`.
+/// `change_status(…, CandidateRun)`, logged as changed `by`.
 ///
 /// The run's `target_version` (set in place when `run` has the key, else appended): when the
 /// manifest has an `approved_version` and no open run targets a newer one, new work starts,
@@ -462,22 +458,12 @@ fn manifest_rel_of(view: &ManifestView) -> WsPath {
 pub fn start_candidate_run(
     m: &mut Manifest,
     mut run: Map<String, Value>,
+    by: &StatusBy,
     now_utc: i64,
 ) -> Result<(), StoreError> {
     let view = m.view();
-    let parse = |key: &str| {
-        m.get(key)
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<Status>().ok())
-    };
-    let moved = transition(
-        view.status.unwrap_or(Status::Planned),
-        parse("status_before_stale"),
-        parse("status_before_blocked"),
-        &StatusEvent::CandidateRun,
-    )
-    .map_err(StoreError::InvalidTransition)?;
-    let target = match view.approved_version {
+    // New work after an approval sets `version` (written below, once nothing is refused).
+    let (target, bumped) = match view.approved_version {
         Some(approved)
             if !view.candidate_runs.iter().any(|r| {
                 r.status.as_deref() == Some("open")
@@ -486,10 +472,9 @@ pub fn start_candidate_run(
             }) =>
         {
             let next = approved.bump(Bump::Minor);
-            m.set("version", Value::from(next.to_string()));
-            next
+            (next, true)
         }
-        _ => view.version.unwrap_or(Version::new(1, 0, 0)),
+        _ => (view.version.unwrap_or(Version::new(1, 0, 0)), false),
     };
     let id = run
         .get("run_id")
@@ -507,6 +492,12 @@ pub fn start_candidate_run(
             kept: Vec::new(),
         });
     }
+    let utc = lil_schema::time::rfc3339(now_utc);
+    change_status(m, &StatusEvent::CandidateRun, by.clone(), None, None, &utc)
+        .map_err(StoreError::InvalidTransition)?;
+    if bumped {
+        m.set("version", Value::from(target.to_string()));
+    }
     run.insert("target_version".into(), Value::from(target.to_string()));
     if !run.contains_key("created") {
         run.insert(
@@ -516,7 +507,6 @@ pub fn start_candidate_run(
     }
     m.push("candidate_runs", Value::Object(run))
         .map_err(|e| StoreError::manifest_edit(&manifest_rel_of(&view), &e))?;
-    m.set("status", Value::from(moved.to.as_str()));
     Ok(())
 }
 
@@ -537,7 +527,7 @@ mod tests {
     #[test] // spec: CORE-023, CORE-027
     fn a_new_asset_targets_its_version_and_becomes_candidate() {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
-        start_candidate_run(&mut m, run("r_20261016_1200"), 0).unwrap();
+        start_candidate_run(&mut m, run("r_20261016_1200"), &StatusBy::Cli, 0).unwrap();
         let v = m.view();
         assert_eq!(v.status, Some(Status::Candidate));
         assert_eq!(v.version, Some(Version::new(1, 0, 0)));
@@ -560,10 +550,10 @@ mod tests {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
         m.set("approved_version", json!("1.0.0"));
         m.set("status", json!("approved"));
-        start_candidate_run(&mut m, run("r_1"), 0).unwrap();
+        start_candidate_run(&mut m, run("r_1"), &StatusBy::Cli, 0).unwrap();
         assert_eq!(m.view().version, Some(Version::new(1, 1, 0)));
         // A second run while the first still targets 1.1.0 doesn't bump again.
-        start_candidate_run(&mut m, run("r_2"), 0).unwrap();
+        start_candidate_run(&mut m, run("r_2"), &StatusBy::Cli, 0).unwrap();
         let v = m.view();
         assert_eq!(v.version, Some(Version::new(1, 1, 0)));
         assert_eq!(
@@ -575,22 +565,29 @@ mod tests {
     #[test] // spec: CORE-047
     fn a_duplicate_run_id_is_refused() {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
-        start_candidate_run(&mut m, run("r_20261016_1200"), 0).unwrap();
+        start_candidate_run(&mut m, run("r_20261016_1200"), &StatusBy::Cli, 0).unwrap();
+        let before = m.clone();
         assert!(matches!(
-            start_candidate_run(&mut m, run("R_20261016_1200"), 0),
+            start_candidate_run(&mut m, run("R_20261016_1200"), &StatusBy::Cli, 0),
             Err(StoreError::HashConflict { .. })
         ));
         assert_eq!(m.view().candidate_runs.len(), 1);
+        // Refused before anything changed: no status change, no log entry.
+        assert_eq!(m.status_log().len(), 1);
+        assert_eq!(m, before);
     }
 
     #[test] // spec: CORE-048
     fn a_blocked_asset_takes_no_run() {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
         m.set("status", json!("blocked"));
+        m.set("approved_version", json!("1.0.0"));
+        let before = m.clone();
         assert!(matches!(
-            start_candidate_run(&mut m, run("r_1"), 0),
+            start_candidate_run(&mut m, run("r_1"), &StatusBy::Cli, 0),
             Err(StoreError::InvalidTransition(_))
         ));
         assert!(m.view().candidate_runs.is_empty());
+        assert_eq!(m, before, "no version bump, no status change, no log entry");
     }
 }

@@ -6,6 +6,8 @@
 //! before the move (step 4) already holds them:
 //! - an open run on an `approved`, `exported` or `released` asset (one kept open at an earlier
 //!   sign-off) takes `CandidateRun` first, then `Signoff` (ruling Q23); `stale` is refused;
+//!   `lil_schema::change_status` does both and logs one entry, from the stored status to
+//!   `approved` (ruling PF-5);
 //! - the version is `approved_version` bumped by the confirmed `bump`; without one (ruling
 //!   Q22: omitting `bump` accepts the proposal), the
 //!   manifest's `version` when it is past `approved_version` (new work set it by the bump
@@ -27,42 +29,17 @@ use lil_protocol::codes::{
 };
 use lil_protocol::{CallerKind, CodeSpec, ErrorBody};
 use lil_schema::{
-    Bump, CandidateFile, Manifest, Status, StatusEvent, Version, hash_value, transition,
+    Bump, CandidateFile, Manifest, StatusBy, StatusEvent, Version, change_status, hash_value,
 };
 use serde_json::{Map, Value, json};
 
-/// The `signed_off.by` value of a sign-off by `caller` (CORE-051): `user` for an app
-/// (`ui:*`), `assistant`, `claude-code` (`mcp`) or `cli`.
-pub fn signed_off_by(caller: &CallerKind) -> &'static str {
-    match caller {
-        CallerKind::Ui(_) => "user",
-        CallerKind::Assistant => "assistant",
-        CallerKind::Mcp => "claude-code",
-        CallerKind::Cli => "cli",
-    }
-}
+use super::status::status_by;
 
-/// The status an asset with an open run is in for a sign-off or a sign-off request (ruling
-/// Q23): `approved`, `exported` and `released` take `CandidateRun` first (the open run, kept
-/// at an earlier sign-off, is new work); every other status, `stale` included, is as it is.
-///
-/// # Errors
-/// The status machine's refusal.
-pub fn reopened(
-    from: Status,
-    before_stale: Option<Status>,
-    before_blocked: Option<Status>,
-) -> Result<Status, String> {
-    match from {
-        Status::Approved | Status::Exported | Status::Released => transition(
-            from,
-            before_stale,
-            before_blocked,
-            &StatusEvent::CandidateRun,
-        )
-        .map(|t| t.to),
-        other => Ok(other),
-    }
+/// The `signed_off.by` value of a sign-off by `caller` (CORE-051): the status log's `by` for
+/// that caller ([`status_by`], the one table): `user` for an app (`ui:*`), `assistant`,
+/// `claude-code` (`mcp`) or `cli`.
+pub fn signed_off_by(caller: &CallerKind) -> String {
+    status_by(caller).as_str().to_string()
 }
 
 fn fail(spec: &CodeSpec, message: String) -> ErrorBody {
@@ -166,24 +143,18 @@ pub fn plan_signoff(
             ),
         ));
     }
-    let parse = |key: &str| {
-        m.get(key)
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<Status>().ok())
-    };
-    let (before_stale, before_blocked) =
-        (parse("status_before_stale"), parse("status_before_blocked"));
-    // Ruling Q23: an open run on an approved asset is new work, so it can be signed off.
-    let from = reopened(
-        view.status.unwrap_or(Status::Planned),
-        before_stale,
-        before_blocked,
+    // Ruling Q23: an open run on an approved asset is new work, so it can be signed off; the
+    // status log gets one entry for the sign-off (ruling PF-5).
+    let mut out = m.clone();
+    change_status(
+        &mut out,
+        &StatusEvent::Signoff,
+        StatusBy::from_wire(by),
+        None,
+        None,
+        &lil_schema::time::rfc3339(now_utc),
     )
     .map_err(|why| fail(&STATUS_INVALID_TRANSITION, why))?;
-    let moved = transition(from, before_stale, before_blocked, &StatusEvent::Signoff)
-        .map_err(|why| fail(&STATUS_INVALID_TRANSITION, why))?;
-
-    let mut out = m.clone();
     let needs_repair = |why: String| fail(&MANIFEST_NEEDS_REPAIR, why);
     let mut hashes: Map<String, Value> = match out.get("hashes") {
         None | Some(Value::Null) => Map::new(),
@@ -208,7 +179,6 @@ pub fn plan_signoff(
     out.set("hashes", Value::Object(hashes));
     out.set("version", Value::from(version.to_string()));
     out.set("approved_version", Value::from(version.to_string()));
-    out.set("status", Value::from(moved.to.as_str()));
 
     let names: Vec<Value> = chosen.iter().map(|(n, _)| Value::from(*n)).collect();
     let date = lil_schema::time::date(now_utc);
@@ -289,6 +259,7 @@ pub fn auto_pick(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lil_schema::Status;
 
     fn manifest() -> Manifest {
         let text = json!({
@@ -394,11 +365,6 @@ mod tests {
         stale.set("status_before_stale", json!("approved"));
         let e = plan_signoff(&stale, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap_err();
         assert_eq!(e.code, "status.invalid_transition");
-        assert_eq!(
-            reopened(Status::Exported, None, None),
-            Ok(Status::Candidate)
-        );
-        assert_eq!(reopened(Status::InReview, None, None), Ok(Status::InReview));
     }
 
     #[test] // spec: CORE-026

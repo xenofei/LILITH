@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use serde_json::{Map, Value};
 
-use crate::manifest::{Obj, Reader};
+use crate::manifest::{Manifest, Obj, Reader};
 
 /// A manifest `status` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -231,6 +231,138 @@ pub fn transition(
         }
         _ => refuse(),
     }
+}
+
+/// The status an asset with an open run is in for a sign-off or a sign-off request (ruling
+/// Q23): `approved`, `exported` and `released` take `CandidateRun` first (the open run, kept
+/// at an earlier sign-off, is new work); every other status, `stale` included, is as it is.
+///
+/// # Errors
+/// The status machine's refusal.
+pub fn reopened(
+    from: Status,
+    before_stale: Option<Status>,
+    before_blocked: Option<Status>,
+) -> Result<Status, String> {
+    match from {
+        Status::Approved | Status::Exported | Status::Released => transition(
+            from,
+            before_stale,
+            before_blocked,
+            None,
+            &[],
+            false,
+            &StatusEvent::CandidateRun,
+        )
+        .map(|t| t.to),
+        other => Ok(other),
+    }
+}
+
+/// Every status change (CORE-048, CORE-156; P4b-R4, P4b-R41): applies `ev` to the manifest's
+/// `status` through [`transition`] and, in the same edit, writes the fields the transition
+/// sets (`status`, `status_before_stale`, `status_before_blocked`, `status_before_deprecated`,
+/// and `status_reason` on `Block`), removes by shifting the one a return used
+/// (`status_before_stale` on `Restore`, `status_before_blocked` on `Unblock`,
+/// `status_before_deprecated` on `Undeprecate`), and appends one status-log entry `{from, to, by, utc, via?,
+/// reason?}` ([`Manifest::push_status`] keeps the newest 50). `from` is the stored status
+/// (`null` when the manifest has none, which the machine reads as `planned`).
+///
+/// - `Signoff` and `RequestSignoff` on an `approved`, `exported` or `released` asset with an
+///   open run take [`reopened`]'s `CandidateRun` first; that inner step isn't logged, so the
+///   entry goes from the stored status to the final one (ruling PF-5).
+/// - `Block(note)` logs `{code: "blocked", note}`; a separate `reason` with it is refused
+///   (ruling PF-22). Any other event logs `reason` as given (`{code: "input_changed", ref}`
+///   when the core sets `stale`).
+/// - `Deprecate` of an asset that is already `deprecated`, and `CandidateRun` on an asset
+///   already `candidate`, aren't status changes: nothing is written and no entry is logged.
+///   Sign-off events always log their entry, `approved → approved` included (ruling PF-5).
+///
+/// # Errors
+/// The status machine's refusal, or a `reason` given with `Block`; the manifest is unchanged.
+pub fn change_status(
+    m: &mut Manifest,
+    ev: &StatusEvent,
+    by: StatusBy,
+    via: Option<Via>,
+    reason: Option<Reason>,
+    utc: &str,
+) -> Result<Transition, String> {
+    let reason = match ev {
+        StatusEvent::Block(note) => {
+            if reason.is_some() {
+                return Err("blocking takes its reason from the event, not a separate one".into());
+            }
+            Some(Reason {
+                code: "blocked".into(),
+                r#ref: None,
+                note: Some(note.clone()),
+            })
+        }
+        _ => reason,
+    };
+    let view = m.view();
+    let stored = |key: &str| {
+        m.get(key)
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<Status>().ok())
+    };
+    let before_stale = stored("status_before_stale");
+    let before_blocked = stored("status_before_blocked");
+    let before_deprecated = stored("status_before_deprecated");
+    let mut from = view.status.unwrap_or(Status::Planned);
+    let open_run = view
+        .candidate_runs
+        .iter()
+        .any(|r| matches!(r.status.as_deref(), None | Some("open")) && r.trashed_utc.is_none());
+    if matches!(ev, StatusEvent::Signoff | StatusEvent::RequestSignoff) && open_run {
+        from = reopened(from, before_stale, before_blocked)?;
+    }
+    let moved = transition(
+        from,
+        before_stale,
+        before_blocked,
+        before_deprecated,
+        &m.status_log(),
+        view.approved_version.is_some(),
+        ev,
+    )?;
+    let unchanged = view.status == Some(moved.to);
+    if unchanged && matches!(ev, StatusEvent::Deprecate | StatusEvent::CandidateRun) {
+        return Ok(moved);
+    }
+    m.set("status", Value::from(moved.to.as_str()));
+    for (key, value) in [
+        ("status_before_stale", moved.set_before_stale),
+        ("status_before_blocked", moved.set_before_blocked),
+        ("status_before_deprecated", moved.set_before_deprecated),
+    ] {
+        if let Some(s) = value {
+            m.set(key, Value::from(s.as_str()));
+        }
+    }
+    if let Some(why) = &moved.reason {
+        m.set("status_reason", Value::from(why.as_str()));
+    }
+    // The key a return used is removed by shifting (Appendix E's key-order rule).
+    let used = match ev {
+        StatusEvent::Restore => Some("status_before_stale"),
+        StatusEvent::Unblock => Some("status_before_blocked"),
+        StatusEvent::Undeprecate => Some("status_before_deprecated"),
+        _ => None,
+    };
+    if let Some(key) = used {
+        m.remove(key);
+    }
+    m.push_status(StatusLogEntry {
+        from: view.status,
+        to: moved.to,
+        by,
+        utc: utc.to_string(),
+        via,
+        reason,
+    });
+    Ok(moved)
 }
 
 /// The most entries the status log keeps (CORE-156); beyond it the oldest drops.
@@ -656,6 +788,194 @@ mod tests {
             );
             assert_eq!(got.is_ok(), from == Deprecated, "{from}");
         }
+    }
+
+    fn approved_manifest() -> crate::manifest::Manifest {
+        let mut m = crate::manifest::Manifest::new(
+            "sketchbook",
+            "img_dock",
+            "image",
+            "0b8e5c1a-2f3d-4e6a-8b9c-0d1e2f3a4b5c",
+        );
+        m.set("status", serde_json::json!("approved"));
+        m.set("approved_version", serde_json::json!("1.0.0"));
+        m
+    }
+
+    /// One `change_status` call: its result, and the one entry it appended.
+    fn change(
+        m: &mut crate::manifest::Manifest,
+        ev: &StatusEvent,
+        reason: Option<Reason>,
+    ) -> StatusLogEntry {
+        let before = m.status_log().len();
+        change_status(m, ev, StatusBy::Cli, None, reason, "2026-11-05T08:00:00Z")
+            .unwrap_or_else(|e| panic!("{ev:?}: {e}"));
+        let log = m.status_log();
+        assert_eq!(log.len(), before + 1, "{ev:?} appends one entry");
+        log.last().cloned().unwrap()
+    }
+
+    #[test] // spec: CORE-156, CORE-048
+    fn change_status_covers_the_events_with_no_tool() {
+        use serde_json::json;
+        let mut m = approved_manifest();
+
+        let e = change(&mut m, &E::Export, None);
+        assert_eq!((e.from, e.to), (Some(Approved), Exported));
+        assert_eq!(e.by, StatusBy::Cli);
+        assert_eq!(e.utc, "2026-11-05T08:00:00Z");
+        let e = change(&mut m, &E::Release, None);
+        assert_eq!((e.from, e.to), (Some(Exported), Released));
+
+        // Restore (from stale) has no tool; it returns to `status_before_stale`.
+        let input = Reason {
+            code: "input_changed".into(),
+            r#ref: Some("prop_kite@1.0.0".into()),
+            note: None,
+        };
+        let e = change(&mut m, &E::MarkStale, Some(input.clone()));
+        assert_eq!((e.from, e.to), (Some(Released), Stale));
+        assert_eq!(e.reason, Some(input));
+        assert_eq!(m.get("status_before_stale"), Some(&json!("released")));
+        let e = change(&mut m, &E::Restore, None);
+        assert_eq!((e.from, e.to, e.reason), (Some(Stale), Released, None));
+        assert_eq!(m.get("status_before_stale"), None, "removed by the restore");
+
+        let e = change(&mut m, &E::Block("waiting for a palette".into()), None);
+        assert_eq!((e.from, e.to), (Some(Released), Blocked));
+        assert_eq!(
+            e.reason,
+            Some(Reason {
+                code: "blocked".into(),
+                r#ref: None,
+                note: Some("waiting for a palette".into()),
+            })
+        );
+        assert_eq!(
+            m.get("status_reason"),
+            Some(&json!("waiting for a palette"))
+        );
+        assert_eq!(m.get("status_before_blocked"), Some(&json!("released")));
+        let e = change(&mut m, &E::Unblock, None);
+        assert_eq!((e.from, e.to), (Some(Blocked), Released));
+        assert_eq!(m.view().status, Some(Released));
+        assert_eq!(
+            m.get("status_before_blocked"),
+            None,
+            "removed by the unblock"
+        );
+
+        // Deprecating a deprecated asset again is no status change (no entry, nothing written).
+        change(&mut m, &E::Deprecate, None);
+        let text = m.to_text();
+        let again = change_status(&mut m, &E::Deprecate, StatusBy::Cli, None, None, "x");
+        assert_eq!(again.map(|t| t.to), Ok(Deprecated));
+        assert_eq!(m.to_text(), text);
+        assert_eq!(m.get("status_before_deprecated"), Some(&json!("released")));
+        let e = change(&mut m, &E::Undeprecate, None);
+        assert_eq!((e.from, e.to), (Some(Deprecated), Released));
+        assert_eq!(
+            m.get("status_before_deprecated"),
+            None,
+            "removed by the return"
+        );
+        // Each removal shifted the keys after it: the other keys keep their order.
+        let keys: Vec<&String> = m.as_map().keys().collect();
+        let fresh = approved_manifest();
+        let mut want: Vec<&String> = fresh.as_map().keys().collect();
+        let (reason, log) = ("status_reason".to_string(), "status_log".to_string());
+        want.extend([&log, &reason]);
+        assert_eq!(keys, want);
+
+        // A manifest without a status logs `from: null`.
+        m.remove("status");
+        let e = change(&mut m, &E::StartWork, None);
+        assert_eq!((e.from, e.to), (None, InProgress));
+        assert_eq!(
+            m.get("status_log").unwrap().as_array().unwrap()[8]["from"],
+            json!(null)
+        );
+    }
+
+    #[test] // spec: CORE-048, CORE-156 (ruling PF-22)
+    fn change_status_refuses_block_without_a_reason() {
+        let mut m = approved_manifest();
+        let text = m.to_text();
+        let block = |m: &mut crate::manifest::Manifest, ev: &StatusEvent, r: Option<Reason>| {
+            change_status(m, ev, StatusBy::User, None, r, "2026-11-05T08:00:00Z")
+        };
+        assert!(block(&mut m, &E::Block(String::new()), None).is_err());
+        assert!(block(&mut m, &E::Block(" \t".into()), None).is_err());
+        let separate = Reason {
+            code: "blocked".into(),
+            r#ref: None,
+            note: Some("a second reason".into()),
+        };
+        assert!(block(&mut m, &E::Block("why".into()), Some(separate)).is_err());
+        // A refused transition writes nothing either.
+        assert!(block(&mut m, &E::StartWork, None).is_err());
+        assert_eq!(m.to_text(), text, "a refusal leaves the manifest as it was");
+        assert!(m.get("status_log").is_none());
+    }
+
+    #[test] // spec: CORE-156, CORE-048
+    fn a_candidate_run_on_a_candidate_asset_logs_nothing() {
+        use serde_json::json;
+        let mut m = approved_manifest();
+        let e = change(&mut m, &E::CandidateRun, None);
+        assert_eq!((e.from, e.to), (Some(Approved), Candidate));
+        // A second run keeps the status: no status change, nothing written.
+        let text = m.to_text();
+        let again = change_status(&mut m, &E::CandidateRun, StatusBy::Cli, None, None, "x");
+        assert_eq!(again.map(|t| t.to), Ok(Candidate));
+        assert_eq!(m.to_text(), text);
+        assert_eq!(m.status_log().len(), 1);
+        // A manifest without a status still logs its first run (`from: null`).
+        m.remove("status");
+        let e = change(&mut m, &E::CandidateRun, None);
+        assert_eq!((e.from, e.to), (None, Candidate));
+        // The skip is the run's only: a sign-off from `approved` to `approved` (an open run,
+        // ruling Q23) still logs.
+        m.set("status", json!("approved"));
+        m.push(
+            "candidate_runs",
+            json!({"run_id": "r_2", "status": "open", "files": []}),
+        )
+        .unwrap();
+        let e = change(&mut m, &E::Signoff, None);
+        assert_eq!((e.from, e.to), (Some(Approved), Approved));
+    }
+
+    #[test] // spec: CORE-053, CORE-048 (ruling Q23)
+    fn reopened_takes_candidate_run_only_after_approval() {
+        assert_eq!(reopened(Exported, None, None), Ok(Candidate));
+        assert_eq!(reopened(InReview, None, None), Ok(InReview));
+        for from in [Approved, Exported, Released] {
+            assert_eq!(reopened(from, None, None), Ok(Candidate), "{from}");
+        }
+        assert_eq!(reopened(Stale, Some(Approved), None), Ok(Stale));
+    }
+
+    #[test] // spec: CORE-156, CORE-053 (rulings Q23, PF-5)
+    fn change_status_logs_one_entry_for_a_reopened_signoff() {
+        use serde_json::json;
+        let mut m = approved_manifest();
+        m.push(
+            "candidate_runs",
+            json!({"run_id": "r_2", "status": "open", "files": []}),
+        )
+        .unwrap();
+        let e = change(&mut m, &E::RequestSignoff, None);
+        assert_eq!((e.from, e.to), (Some(Approved), InReview));
+        m.set("status", json!("approved"));
+        let e = change(&mut m, &E::Signoff, None);
+        assert_eq!((e.from, e.to), (Some(Approved), Approved));
+        // Without an open run, an approved asset can't be signed off again.
+        m.set("candidate_runs", json!([]));
+        let refused = change_status(&mut m, &E::Signoff, StatusBy::Cli, None, None, "x");
+        assert!(refused.is_err());
+        assert_eq!(m.status_log().len(), 2);
     }
 
     #[test] // spec: CORE-156, CORE-051

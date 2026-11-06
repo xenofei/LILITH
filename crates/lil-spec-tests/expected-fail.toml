@@ -6,11 +6,6 @@
 # Plan 4b (Task 2): the spec tests that Tasks 4-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 4
-    # CORE-156
-    { name = "lil-spec-tests::status_log_4b::every_status_change_appends_one_entry", rule = "CORE-156", file = "tests/status_log_4b.rs" },
-    # CORE-170
-    { name = "lil-spec-tests::status_log_4b::deprecate_and_back_restores_the_previous_status", rule = "CORE-170", file = "tests/status_log_4b.rs" },
     # Task 5
     # CORE-152, APP-147
     { name = "lil-spec-tests::marks_4b::facets_are_counted_with_the_page", rule = "CORE-152", file = "tests/marks_4b.rs" },
