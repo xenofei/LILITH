@@ -112,6 +112,15 @@ impl Fx {
 
     /// [`Fx::with`], with the probe `probe` makes for the test's env.
     fn build(setup: impl FnOnce(&Path), probe: impl FnOnce(&TestEnv) -> Arc<dyn Probe>) -> Fx {
+        Fx::build_with(setup, probe, lil_core::store::FailPoints::none())
+    }
+
+    /// [`Fx::build`], with the store's fail points `fp` (hooks only).
+    fn build_with(
+        setup: impl FnOnce(&Path),
+        probe: impl FnOnce(&TestEnv) -> Arc<dyn Probe>,
+        fp: Arc<lil_core::store::FailPoints>,
+    ) -> Fx {
         let env = TestEnv::new();
         let probe = probe(&env);
         let ws = env.copy_fixture_workspace("assets");
@@ -133,7 +142,7 @@ impl Fx {
             events.clone(),
             clock.clone(),
             ids.clone(),
-            lil_core::store::FailPoints::none(),
+            fp,
             probe.clone(),
             lil_core::watch::WatchConfig::default(),
         );
@@ -2318,6 +2327,20 @@ async fn flag_needs_a_run_and_a_take_or_file() {
         let e = fx.err("asset.mark", mark_args(KITE, args.clone())).await;
         assert_eq!(e.code, code, "{args}: {e:?}");
     }
+    // A take address with only asset marks (on an open run): it picks a take to mark nothing.
+    for args in [
+        json!({"run_id": run, "take": 1, "label": "red"}),
+        json!({"run_id": run, "file": "kite_a.png", "tags": ["x"]}),
+        json!({"run_id": run, "take": 1}),
+        json!({"take": 1, "add_tags": ["x"]}),
+    ] {
+        let e = fx.err("asset.mark", mark_args(KITE, args.clone())).await;
+        assert_eq!(e.code, "params.invalid", "{args}: {e:?}");
+        assert_eq!(
+            e.message, "run_id, take and file pick a take; give flag or rating to mark it",
+            "{args}"
+        );
+    }
     assert_eq!(fx.manifest(KITE), before);
 
     // The run id matches without regard to case and is answered as the manifest spells it;
@@ -2438,6 +2461,17 @@ async fn closed_runs_refuse_marks() {
                 "{e:?}"
             );
         }
+        // Naming a closed run with only asset marks isn't a closed-run refusal: the take
+        // address is the mistake.
+        for extra in [json!({"label": "red"}), json!({"tags": ["x"]})] {
+            let args = with_keys(&json!({"run_id": run, "take": 1}), &extra);
+            let e = fx.err("asset.mark", mark_args(asset, args.clone())).await;
+            assert_eq!(e.code, "params.invalid", "{asset} {args}: {e:?}");
+            assert_eq!(
+                e.message, "run_id, take and file pick a take; give flag or rating to mark it",
+                "{e:?}"
+            );
+        }
     }
     assert_eq!(
         std::fs::read(manifest_file(&fx.ws, KITE)).unwrap(),
@@ -2474,6 +2508,20 @@ async fn null_clears_flag_and_label() {
     let m = fx.manifest(CRANE);
     assert_eq!(m["label"], "red", "{m}");
     assert_eq!(run_file(&m, CRANE_OPEN_RUN, "crane_c.png")["flag"], "pick");
+
+    // `rating: null` isn't a clear (0 is unrated), at asset or take level.
+    let bytes = std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap();
+    for args in [
+        mark_args(CRANE, json!({"rating": null})),
+        mark_args(CRANE, json!({"label": null, "rating": null})),
+        take(json!({"rating": null})),
+        take(json!({"flag": null, "rating": null})),
+    ] {
+        let e = fx.err("asset.mark", args.clone()).await;
+        assert_eq!(e.code, "params.invalid", "{args}: {e:?}");
+        assert!(e.message.contains("use 0 for unrated"), "{args}: {e:?}");
+    }
+    assert_eq!(std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap(), bytes);
 
     let r = fx
         .ok(
@@ -2796,5 +2844,175 @@ async fn a_file_path_picks_its_take_and_a_shared_name_is_params_invalid() {
         )
         .await;
     assert_eq!(e.code, "asset.unknown", "{e:?}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152 (P4b-R26)
+async fn hand_written_tags_that_break_the_rules_are_named_not_dropped() {
+    let long = "x".repeat(70);
+    let many: Vec<String> = (0..65).map(|i| format!("t{i}")).collect();
+    let fx = Fx::with(|ws| {
+        edit_fixture_manifest(ws, LAMP, |m| m["tags"] = json!(["ok", long]));
+        edit_fixture_manifest(ws, CRANE, |m| m["tags"] = json!(many));
+    });
+
+    // An add or a remove that leaves the hand-written 70-character tag: refused, naming it.
+    let lamp = std::fs::read(manifest_file(&fx.ws, LAMP)).unwrap();
+    for args in [json!({"add_tags": ["new"]}), json!({"remove_tags": ["ok"]})] {
+        let e = fx.err("asset.mark", mark_args(LAMP, args.clone())).await;
+        assert_eq!(e.code, "params.invalid", "{args}: {e:?}");
+        assert!(e.message.contains(&long), "{args}: {e:?}");
+        assert!(
+            e.message.contains("replace the list with tags"),
+            "{args}: {e:?}"
+        );
+    }
+    assert_eq!(std::fs::read(manifest_file(&fx.ws, LAMP)).unwrap(), lamp);
+    // The caller's own bad tag is the caller's error.
+    let e = fx
+        .err("asset.mark", mark_args(LAMP, json!({"add_tags": ["a\nb"]})))
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(!e.message.contains("hand-written"), "{e:?}");
+    // Removing the hand-written tag itself works.
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(LAMP, json!({"remove_tags": [long]})),
+        )
+        .await;
+    assert_eq!(r["tags"], json!(["ok"]), "{r}");
+    assert_eq!(fx.manifest(LAMP)["tags"], json!(["ok"]));
+
+    // 65 hand-written tags: an add is refused and nothing is dropped; a remove to 64 works.
+    let crane = std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap();
+    let e = fx
+        .err("asset.mark", mark_args(CRANE, json!({"add_tags": ["new"]})))
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(
+        e.message.contains("hand-written") && e.message.contains("replace the list with tags"),
+        "{e:?}"
+    );
+    assert_eq!(std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap(), crane);
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(CRANE, json!({"remove_tags": ["t64"]})),
+        )
+        .await;
+    assert_eq!(r["tags"].as_array().map(Vec::len), Some(64), "{r}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152, CORE-026
+async fn mark_waits_for_the_asset_version_lock() {
+    // A hook in every atomic write (`store.write_temp`, so the manifest's too) notes whether
+    // the crane's version lock is held at that moment, while `armed` names the lock.
+    type VersionLock = Arc<tokio::sync::Mutex<()>>;
+    let armed: Arc<Mutex<Option<VersionLock>>> = Arc::default();
+    let held_at_write: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let fp = lil_core::store::FailPoints::none();
+    let (hook_armed, hook_seen) = (armed.clone(), held_at_write.clone());
+    fp.on(
+        "store.write_temp",
+        Box::new(move || {
+            if let Some(lock) = hook_armed.lock().unwrap().clone() {
+                hook_seen.lock().unwrap().push(lock.try_lock().is_err());
+            }
+            Ok(())
+        }),
+    );
+    let fx = Fx::build_with(|_| {}, |_| Arc::new(SystemProbe), fp);
+    let open = fx.open().await;
+    let lock = open.store.version_lock("sketchbook", CRANE);
+
+    // Deterministic: the mark's manifest write (the call's first write) happens with the
+    // version lock held (by the mark itself; nothing else holds it here), so it can't land
+    // between a sign-off's seal and its manifest edit. The call's later write, after the tool
+    // returned and released the lock, isn't the mark's. A mark without the lock shows
+    // `[false, false]`; as built it is `[true, false]`.
+    *armed.lock().unwrap() = Some(lock.clone());
+    fx.ok("asset.mark", mark_args(CRANE, json!({"rating": 3})))
+        .await;
+    *armed.lock().unwrap() = None;
+    let seen = held_at_write.lock().unwrap().clone();
+    assert_eq!(
+        seen.first(),
+        Some(&true),
+        "the manifest write wasn't under the version lock: {seen:?}"
+    );
+
+    // While another holder has the lock, the mark doesn't finish or write; once it is
+    // released the mark completes. (Driven a bounded number of times: this half shows the
+    // wait, the hook above is what proves the lock is taken.)
+    let guard = lock.clone().lock_owned().await;
+    let bytes = std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap();
+    let r = {
+        let mark = fx.ok("asset.mark", mark_args(CRANE, json!({"rating": 2})));
+        tokio::pin!(mark);
+        for _ in 0..200 {
+            tokio::select! {
+                biased;
+                r = &mut mark => panic!("the mark finished while the version lock was held: {r}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap(), bytes);
+        drop(guard);
+        mark.await
+    };
+    assert_eq!(r["rating"], 2, "{r}");
+    assert_eq!(fx.manifest(CRANE)["rating"], 2);
+    drop((lock, open));
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-023, CORE-026, CORE-033 (P4b-R3)
+async fn signoff_by_takes_hashes_a_pre_2b_run() {
+    // The crane's open run as a pre-2b run: no recorded hashes. Take 1 is `crane_c.png` and
+    // its derived `crane_c_cutout.png`.
+    let fx = Fx::with(|ws| {
+        edit_fixture_manifest(ws, CRANE, |m| {
+            for f in m["candidate_runs"][1]["files"].as_array_mut().unwrap() {
+                f.as_object_mut().unwrap().shift_remove("sha256");
+            }
+        });
+    });
+    let dir = format!("projects/sketchbook/assets/{CRANE}");
+    let names = ["crane_c.png", "crane_c_cutout.png"];
+    let want: Vec<String> = names
+        .iter()
+        .map(|n| {
+            let bytes =
+                std::fs::read(fx.path(&format!("{dir}/candidates/{CRANE_OPEN_RUN}/{n}"))).unwrap();
+            sha256_bytes(&bytes)
+        })
+        .collect();
+    let r = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": CRANE, "run_id": CRANE_OPEN_RUN,
+                   "takes": [1]}),
+        )
+        .await;
+    let version = r["version"].as_str().unwrap().to_string();
+    let m = fx.manifest(CRANE);
+    let run = run_of(&m, CRANE_OPEN_RUN);
+    assert_eq!(run["selected"], json!(names), "{run}");
+    assert_eq!(
+        run["signed_off"]["companions"],
+        json!(["crane_c_cutout.png"]),
+        "{run}"
+    );
+    for (n, sha) in names.iter().zip(&want) {
+        assert_eq!(
+            m["hashes"][format!("v{version}/{n}")],
+            format!("sha256:{sha}"),
+            "{n}: {m}"
+        );
+        let sealed = fx.path(&format!("{dir}/v{version}/{n}"));
+        assert_eq!(sha256_bytes(&std::fs::read(&sealed).unwrap()), *sha, "{n}");
+    }
     fx.shutdown().await;
 }

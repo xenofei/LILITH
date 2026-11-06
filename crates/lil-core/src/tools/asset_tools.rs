@@ -70,7 +70,10 @@
 //!   take; a path picks its entry, a bare name must lead to one take), the take's `flag` and
 //!   `rating` on its primary file entry. `null` clears `label` and `flag`. Like `set_marks`, a
 //!   take mark is written only when its view value changes. A take's marks need an open run,
-//!   else `status.invalid_transition`. Holding the
+//!   else `status.invalid_transition`. `params.invalid`: `run_id`, `take` or `file` without
+//!   `flag` or `rating`; `rating: null` (0 is unrated); `add_tags`/`remove_tags` while a
+//!   hand-written tag left on the asset breaks P4b-R26 (named in the message; never dropped).
+//!   Holding the
 //!   asset's version lock, it edits the manifest (the store's change sink refreshes the index),
 //!   then publishes `{kind: "mark", asset, run_id?, take?, previous}` on the asset's topic and
 //!   `project:<slug>` (`asset` is the bare asset id), `previous` holding the view's value
@@ -336,8 +339,9 @@ struct MarkArgs {
     add_tags: Vec<String>,
     #[serde(default)]
     remove_tags: Vec<String>,
-    /// 0-5, 0 unrated: the take's with run_id, else the asset's.
-    rating: Option<u8>,
+    /// 0-5, 0 unrated: the take's with run_id, else the asset's. Not null.
+    #[serde(default, deserialize_with = "present")]
+    rating: Option<Option<u8>>,
     /// null clears.
     #[serde(default, deserialize_with = "present")]
     label: Option<Option<LabelArg>>,
@@ -1428,11 +1432,27 @@ fn mark_request(ctx: &CallCtx, args: MarkArgs) -> Result<MarkRequest, ErrorBody>
             "tags replaces the tags; give it or add_tags/remove_tags, not both".to_string(),
         ));
     }
-    if args
-        .rating
-        .is_some_and(|r| r > lil_schema::marks::MAX_RATING)
-    {
-        return Err(invalid(ctx, "a rating is 0 to 5".to_string()));
+    let rating = match args.rating {
+        None => None,
+        Some(None) => {
+            return Err(invalid(
+                ctx,
+                "rating can't be null: use 0 for unrated".to_string(),
+            ));
+        }
+        Some(Some(r)) if r > lil_schema::marks::MAX_RATING => {
+            return Err(invalid(ctx, "a rating is 0 to 5".to_string()));
+        }
+        Some(Some(r)) => Some(r),
+    };
+    // A take address is only for a take's own marks: a call that names a run and marks only
+    // the asset is refused here, not as a closed run.
+    let addresses = args.run_id.is_some() || args.take.is_some() || args.file.is_some();
+    if addresses && args.flag.is_none() && rating.is_none() {
+        return Err(invalid(
+            ctx,
+            "run_id, take and file pick a take; give flag or rating to mark it".to_string(),
+        ));
     }
     let take = match args.run_id {
         None if args.take.is_some() || args.file.is_some() || args.flag.is_some() => {
@@ -1469,7 +1489,7 @@ fn mark_request(ctx: &CallCtx, args: MarkArgs) -> Result<MarkRequest, ErrorBody>
     };
     Ok(MarkRequest {
         tags,
-        rating: args.rating,
+        rating,
         label: args.label.map(|l| l.map(Label::from)),
         flag: args.flag.map(|f| f.map(Flag::from)),
         take,
@@ -1567,6 +1587,8 @@ fn apply_mark(m: &mut Manifest, req: &MarkRequest) -> Result<Applied, ErrorBody>
         TagsChange::Keep => {}
         TagsChange::Replace(tags) => marks.tags = normalise_tags(tags).map_err(bad)?,
         TagsChange::Edit { add, remove } => {
+            // The caller's own tags: their error is the caller's.
+            normalise_tags(add).map_err(bad)?;
             let gone: BTreeSet<String> = remove.iter().map(|t| fold_tag(t.trim())).collect();
             let mut tags: Vec<String> = before
                 .tags
@@ -1574,6 +1596,21 @@ fn apply_mark(m: &mut Manifest, req: &MarkRequest) -> Result<Applied, ErrorBody>
                 .filter(|t| !gone.contains(&fold_tag(t.trim())))
                 .cloned()
                 .collect();
+            // A hand-written tag that breaks P4b-R26 is named, never dropped or cut.
+            for tag in &tags {
+                if let Err(why) = normalise_tags(std::slice::from_ref(tag)) {
+                    return Err(bad(format!(
+                        "the asset's hand-written tag {tag:?} breaks the tag rules ({why}); \
+                         remove it with remove_tags or replace the list with tags"
+                    )));
+                }
+            }
+            if let Err(why) = normalise_tags(&tags) {
+                return Err(bad(format!(
+                    "the asset's hand-written tags break the tag rules ({why}); replace the \
+                     list with tags"
+                )));
+            }
             tags.extend(add.iter().cloned());
             marks.tags = normalise_tags(&tags).map_err(bad)?;
         }

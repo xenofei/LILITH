@@ -621,4 +621,65 @@ mod tests {
         assert_eq!(files[1].get("flag"), None);
         assert_eq!(files[2]["flag"], json!("reject"));
     }
+
+    /// Every file with a take number is named by that take of `takes_of`, as its primary or a
+    /// companion, and a file in no take is named by none.
+    fn assert_file_takes_agree(run: &CandidateRun) {
+        let takes = takes_of(run);
+        let numbers = file_takes(run);
+        assert_eq!(numbers.len(), run.files.len());
+        for (f, n) in run.files.iter().zip(&numbers) {
+            let name = file_name(&f.path);
+            let holders: Vec<u32> = takes
+                .iter()
+                .filter(|t| t.primary == name || t.companions.iter().any(|c| c == name))
+                .map(|t| t.n)
+                .collect();
+            match n {
+                Some(n) => assert_eq!(holders, [*n], "{name}"),
+                None => assert!(holders.is_empty(), "{name}: {holders:?}"),
+            }
+        }
+    }
+
+    #[test] // spec: CORE-023, CORE-152
+    fn file_takes_agree_with_takes_of() {
+        // A legacy run with companions (a repair from a derived file, a preview) and a stray.
+        let a = file("a.png", "candidate");
+        let mut big = file("a_big.png", "repair");
+        big.from = Some("candidates/r_20261101_0900/a_cut.png".into());
+        let mut cut = file("a_cut.png", "derived");
+        cut.from = Some("a.png".into());
+        let b = file("b.png", "candidate");
+        let mut prev = file("b_prev.jpg", "preview");
+        prev.from = Some("B.png".into());
+        let stray = file("stray.png", "derived");
+        let legacy = run(vec![a, big, cut, b, prev, stray]);
+        assert_eq!(
+            file_takes(&legacy),
+            [Some(1), Some(1), Some(1), Some(2), Some(2), None]
+        );
+        assert_file_takes_agree(&legacy);
+
+        // A run with `take` fields, listed out of take order.
+        let mut x2 = file("x2.png", "candidate");
+        x2.take = Some(2);
+        let mut p2 = file("p2.png", "candidate");
+        p2.take = Some(2);
+        p2.primary = true;
+        let mut p1 = file("p1.exr", "candidate");
+        p1.take = Some(1);
+        p1.primary = true;
+        let mut c1 = file("p1_cut.exr", "derived");
+        c1.take = Some(1);
+        c1.from = Some("p1.exr".into());
+        let mut pv1 = file("p1_prev.png", "preview");
+        pv1.take = Some(1);
+        let explicit = run(vec![x2, p2, p1, c1, pv1]);
+        assert_eq!(
+            file_takes(&explicit),
+            [Some(2), Some(2), Some(1), Some(1), Some(1)]
+        );
+        assert_file_takes_agree(&explicit);
+    }
 }
