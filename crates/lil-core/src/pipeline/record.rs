@@ -462,10 +462,8 @@ pub fn start_candidate_run(
     now_utc: i64,
 ) -> Result<(), StoreError> {
     let view = m.view();
-    let utc = lil_schema::time::rfc3339(now_utc);
-    change_status(m, &StatusEvent::CandidateRun, by.clone(), None, None, &utc)
-        .map_err(StoreError::InvalidTransition)?;
-    let target = match view.approved_version {
+    // New work after an approval sets `version` (written below, once nothing is refused).
+    let (target, bumped) = match view.approved_version {
         Some(approved)
             if !view.candidate_runs.iter().any(|r| {
                 r.status.as_deref() == Some("open")
@@ -474,10 +472,9 @@ pub fn start_candidate_run(
             }) =>
         {
             let next = approved.bump(Bump::Minor);
-            m.set("version", Value::from(next.to_string()));
-            next
+            (next, true)
         }
-        _ => view.version.unwrap_or(Version::new(1, 0, 0)),
+        _ => (view.version.unwrap_or(Version::new(1, 0, 0)), false),
     };
     let id = run
         .get("run_id")
@@ -494,6 +491,12 @@ pub fn start_candidate_run(
             cloud_only: false,
             kept: Vec::new(),
         });
+    }
+    let utc = lil_schema::time::rfc3339(now_utc);
+    change_status(m, &StatusEvent::CandidateRun, by.clone(), None, None, &utc)
+        .map_err(StoreError::InvalidTransition)?;
+    if bumped {
+        m.set("version", Value::from(target.to_string()));
     }
     run.insert("target_version".into(), Value::from(target.to_string()));
     if !run.contains_key("created") {
@@ -563,21 +566,28 @@ mod tests {
     fn a_duplicate_run_id_is_refused() {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
         start_candidate_run(&mut m, run("r_20261016_1200"), &StatusBy::Cli, 0).unwrap();
+        let before = m.clone();
         assert!(matches!(
             start_candidate_run(&mut m, run("R_20261016_1200"), &StatusBy::Cli, 0),
             Err(StoreError::HashConflict { .. })
         ));
         assert_eq!(m.view().candidate_runs.len(), 1);
+        // Refused before anything changed: no status change, no log entry.
+        assert_eq!(m.status_log().len(), 1);
+        assert_eq!(m, before);
     }
 
     #[test] // spec: CORE-048
     fn a_blocked_asset_takes_no_run() {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
         m.set("status", json!("blocked"));
+        m.set("approved_version", json!("1.0.0"));
+        let before = m.clone();
         assert!(matches!(
             start_candidate_run(&mut m, run("r_1"), &StatusBy::Cli, 0),
             Err(StoreError::InvalidTransition(_))
         ));
         assert!(m.view().candidate_runs.is_empty());
+        assert_eq!(m, before, "no version bump, no status change, no log entry");
     }
 }

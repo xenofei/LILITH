@@ -54,8 +54,10 @@
 //!   edit (`status_before_deprecated` = the status it had), or with `deprecated: false` returns
 //!   it to the status `lil_schema::status::transition`'s fallback order gives. An asset already
 //!   deprecated (or, for `false`, not deprecated) is left as it is. The asset's files and
-//!   dependents are untouched; no `progress.md` entry. A change publishes
-//!   `{kind: "deprecated", deprecated, status, previous}`.
+//!   dependents are untouched; no `progress.md` entry. The edit holds the asset's version lock,
+//!   as a sign-off does. A change publishes `{kind: "deprecated", deprecated, status,
+//!   previous}` and `{kind: "status", status}` on the asset's topic, and
+//!   `{kind: "deprecated", asset_id, deprecated, status, previous}` on `project:<slug>`.
 //!
 //! Every status change goes through `lil_schema::change_status`, which logs one status-log
 //! entry in the same manifest edit, `by` the caller (`pipeline::status_by`).
@@ -884,7 +886,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         &args.files,
         bump,
         &args.keep_runs,
-        by,
+        &by,
         now,
     )
     .map_err(|e| traced(ctx, e))?;
@@ -983,7 +985,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
             &files,
             bump,
             &keep,
-            by,
+            &by,
             now,
         )
         .map_err(|e| replanned_error(&rel, &e))?;
@@ -1180,23 +1182,39 @@ async fn deprecate(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(from);
         Ok(())
     };
+    // The asset's version lock, as `asset.signoff` holds it from its seal to its manifest
+    // edit: a deprecation never lands between the two.
+    let guard = a
+        .store()
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
     let (after, _) = a
         .store()
         .edit_manifest(&a.manifest, &edit)
         .await
         .map_err(error)?;
-    let status = after.view().status.map(Status::as_str);
+    drop(guard);
+    let status = after.view().status.unwrap_or(Status::Planned).as_str();
     let previous = *previous
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(from) = previous {
+        let previous = from.map(Status::as_str);
         ctx.events.publish(
             &a.topic(),
             json!({"kind": "deprecated", "deprecated": args.deprecated, "status": status,
-                   "previous": from.map(Status::as_str)}),
+                   "previous": previous}),
+        );
+        ctx.events
+            .publish(&a.topic(), json!({"kind": "status", "status": status}));
+        ctx.events.publish(
+            &format!("project:{}", a.project),
+            json!({"kind": "deprecated", "asset_id": a.asset_id, "deprecated": args.deprecated,
+                   "status": status, "previous": previous}),
         );
     }
-    let status = status.unwrap_or_default().to_string();
+    let status = status.to_string();
     let summary = format!("{} is {status}", a.asset_id);
     Ok((StatusResult { status }, summary))
 }

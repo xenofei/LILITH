@@ -1522,6 +1522,11 @@ async fn every_status_path_writes_one_log_entry() {
     let back = fx.ok("asset.deprecate", deprecate(false)).await;
     assert_eq!(back, json!({"status": "approved"}));
     let e = assert_newest(&fx, KITE, 8, "deprecated", "approved", "cli");
+    let m = fx.manifest(KITE);
+    assert!(
+        m.get("status_before_deprecated").is_none(),
+        "removed by the return: {m}"
+    );
     let utc = e["utc"].as_str().unwrap();
     assert!(utc.ends_with('Z') && utc.contains('T'), "{e}");
     fx.shutdown().await;
@@ -1544,6 +1549,23 @@ async fn undeprecate_without_history_follows_the_fallback_order() {
         .await;
     assert_eq!(r["status"], "approved", "{r}");
     assert_newest(&fx, CRANE, 1, "deprecated", "approved", "cli");
+    let m = fx.manifest(CRANE);
+    assert!(m.get("status_before_deprecated").is_none(), "{m}");
+    // A deprecation records the status before, and the return removes it again.
+    for (deprecated, before) in [(true, Some("approved")), (false, None)] {
+        fx.ok(
+            "asset.deprecate",
+            json!({"project": "sketchbook", "asset_id": CRANE, "deprecated": deprecated}),
+        )
+        .await;
+        let m = fx.manifest(CRANE);
+        assert_eq!(
+            m.get("status_before_deprecated").and_then(Value::as_str),
+            before,
+            "{m}"
+        );
+    }
+    assert_newest(&fx, CRANE, 3, "deprecated", "approved", "cli");
     fx.shutdown().await;
 }
 
@@ -1624,5 +1646,51 @@ async fn deprecate_keeps_files_and_dependents() {
     }
     // Back where it was: the open run's work goes on.
     assert_eq!(fx.manifest(KITE)["status"], "candidate");
+    fx.shutdown().await;
+}
+
+/// The last status-log entry of the snapshot sealed as `version` of the kite.
+fn snapshot_newest(fx: &Fx, version: &str) -> Value {
+    let snapshot = read_json(&fx.path(&format!("{KITE_DIR}/v{version}/manifest.snapshot.json")));
+    status_log(&snapshot).last().cloned().unwrap()
+}
+
+#[tokio::test] // spec: CORE-156, CORE-053, CORE-032 (rulings Q23, PF-5)
+async fn a_kept_run_on_an_approved_asset_logs_one_entry_per_action() {
+    let fx = Fx::new();
+    let first = fx.import_run(KITE, "a.png", b"a").await;
+    let kept = fx.import_run(KITE, "b.png", b"b").await;
+    let later = fx.import_run(KITE, "c.png", b"c").await;
+    fx.signoff(
+        KITE,
+        &first,
+        &["a.png"],
+        json!({"keep_runs": [kept, later]}),
+    )
+    .await;
+    let e = assert_newest(&fx, KITE, 4, "candidate", "approved", "cli");
+    assert_eq!(snapshot_newest(&fx, "1.0.0"), e);
+
+    // Signing off a kept run: the inner reopening isn't logged, one entry approved → approved.
+    let r = fx
+        .signoff(KITE, &kept, &["b.png"], json!({"keep_runs": [later]}))
+        .await;
+    assert_eq!(r["version"], "1.1.0", "{r}");
+    let e = assert_newest(&fx, KITE, 5, "approved", "approved", "cli");
+    assert_eq!(
+        snapshot_newest(&fx, "1.1.0"),
+        e,
+        "the snapshot holds the same entry"
+    );
+
+    // A sign-off request on the approved asset with a kept run: one entry approved → in_review.
+    let r = fx
+        .ok(
+            "asset.request_signoff",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    assert_eq!(r["status"], "in_review", "{r}");
+    assert_newest(&fx, KITE, 6, "approved", "in_review", "cli");
     fx.shutdown().await;
 }

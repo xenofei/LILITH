@@ -1341,9 +1341,10 @@ async fn deprecate_publishes_previous() {
     let fx = Fx::plain();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     fx.events.attach(7, tx);
-    let topic = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_ref.id);
+    let asset = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_ref.id);
+    let project = "project:sketchbook".to_string();
     fx.events
-        .subscribe(7, std::slice::from_ref(&topic), &Default::default())
+        .subscribe(7, &[asset.clone(), project.clone()], &Default::default())
         .await;
     fx.import_run(KITE, "kite.png", b"kite").await;
     let deprecate = |deprecated: bool| json!({"project": "sketchbook", "asset_id": KITE, "deprecated": deprecated});
@@ -1357,31 +1358,46 @@ async fn deprecate_publishes_previous() {
     let log = fx.manifest(KITE)["status_log"].as_array().unwrap().len();
     assert_eq!(log, 3, "the import, the deprecation and the return");
 
+    // The deprecation's events: `deprecated` and `status` on the asset's topic, `deprecated`
+    // on the project's (nothing else here publishes those kinds).
+    let ours = |e: &Value| {
+        let kind = e["data"]["kind"].as_str().unwrap_or_default();
+        kind == "deprecated" || (kind == "status" && e["topic"] == asset.as_str())
+    };
     let deadline = tokio::time::Instant::now() + DEADLINE;
     let mut seen = Vec::new();
-    while seen.len() < 2 && tokio::time::Instant::now() < deadline {
-        seen.extend(
-            drain_events(&mut rx)
-                .into_iter()
-                .filter(|e| e["data"]["kind"] == "deprecated"),
-        );
+    while seen.len() < 6 && tokio::time::Instant::now() < deadline {
+        seen.extend(drain_events(&mut rx).into_iter().filter(|e| ours(e)));
         tokio::task::yield_now().await;
     }
-    seen.extend(
-        drain_events(&mut rx)
-            .into_iter()
-            .filter(|e| e["data"]["kind"] == "deprecated"),
-    );
-    let data: Vec<&Value> = seen.iter().map(|e| &e["data"]).collect();
-    assert_eq!(
-        data,
+    seen.extend(drain_events(&mut rx).into_iter().filter(|e| ours(e)));
+    let got: Vec<(&str, &Value)> = seen
+        .iter()
+        .map(|e| (e["topic"].as_str().unwrap(), &e["data"]))
+        .collect();
+    let on = |deprecated: bool, status: &str, previous: &str| {
         [
-            &json!({"kind": "deprecated", "deprecated": true, "status": "deprecated",
-                    "previous": "candidate"}),
-            &json!({"kind": "deprecated", "deprecated": false, "status": "candidate",
-                    "previous": "deprecated"}),
-        ],
-        "{seen:?}"
+            json!({"kind": "deprecated", "deprecated": deprecated, "status": status,
+                   "previous": previous}),
+            json!({"kind": "status", "status": status}),
+            json!({"kind": "deprecated", "asset_id": KITE, "deprecated": deprecated,
+                   "status": status, "previous": previous}),
+        ]
+    };
+    let (down, up) = (
+        on(true, "deprecated", "candidate"),
+        on(false, "candidate", "deprecated"),
     );
+    let want: Vec<(&str, &Value)> = [&down, &up]
+        .into_iter()
+        .flat_map(|events| {
+            [
+                (asset.as_str(), &events[0]),
+                (asset.as_str(), &events[1]),
+                (project.as_str(), &events[2]),
+            ]
+        })
+        .collect();
+    assert_eq!(got, want, "{seen:?}");
     fx.shutdown().await;
 }

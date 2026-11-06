@@ -262,7 +262,9 @@ pub fn reopened(
 /// Every status change (CORE-048, CORE-156; P4b-R4, P4b-R41): applies `ev` to the manifest's
 /// `status` through [`transition`] and, in the same edit, writes the fields the transition
 /// sets (`status`, `status_before_stale`, `status_before_blocked`, `status_before_deprecated`,
-/// and `status_reason` on `Block`) and appends one status-log entry `{from, to, by, utc, via?,
+/// and `status_reason` on `Block`), removes by shifting the one a return used
+/// (`status_before_stale` on `Restore`, `status_before_blocked` on `Unblock`,
+/// `status_before_deprecated` on `Undeprecate`), and appends one status-log entry `{from, to, by, utc, via?,
 /// reason?}` ([`Manifest::push_status`] keeps the newest 50). `from` is the stored status
 /// (`null` when the manifest has none, which the machine reads as `planned`).
 ///
@@ -339,6 +341,16 @@ pub fn change_status(
     }
     if let Some(why) = &moved.reason {
         m.set("status_reason", Value::from(why.as_str()));
+    }
+    // The key a return used is removed by shifting (Appendix E's key-order rule).
+    let used = match ev {
+        StatusEvent::Restore => Some("status_before_stale"),
+        StatusEvent::Unblock => Some("status_before_blocked"),
+        StatusEvent::Undeprecate => Some("status_before_deprecated"),
+        _ => None,
+    };
+    if let Some(key) = used {
+        m.remove(key);
     }
     m.push_status(StatusLogEntry {
         from: view.status,
@@ -826,6 +838,7 @@ mod tests {
         assert_eq!(m.get("status_before_stale"), Some(&json!("released")));
         let e = change(&mut m, &E::Restore, None);
         assert_eq!((e.from, e.to, e.reason), (Some(Stale), Released, None));
+        assert_eq!(m.get("status_before_stale"), None, "removed by the restore");
 
         let e = change(&mut m, &E::Block("waiting for a palette".into()), None);
         assert_eq!((e.from, e.to), (Some(Released), Blocked));
@@ -845,6 +858,11 @@ mod tests {
         let e = change(&mut m, &E::Unblock, None);
         assert_eq!((e.from, e.to), (Some(Blocked), Released));
         assert_eq!(m.view().status, Some(Released));
+        assert_eq!(
+            m.get("status_before_blocked"),
+            None,
+            "removed by the unblock"
+        );
 
         // Deprecating a deprecated asset again is no status change (no entry, nothing written).
         change(&mut m, &E::Deprecate, None);
@@ -852,8 +870,21 @@ mod tests {
         let again = change_status(&mut m, &E::Deprecate, StatusBy::Cli, None, None, "x");
         assert_eq!(again.map(|t| t.to), Ok(Deprecated));
         assert_eq!(m.to_text(), text);
+        assert_eq!(m.get("status_before_deprecated"), Some(&json!("released")));
         let e = change(&mut m, &E::Undeprecate, None);
         assert_eq!((e.from, e.to), (Some(Deprecated), Released));
+        assert_eq!(
+            m.get("status_before_deprecated"),
+            None,
+            "removed by the return"
+        );
+        // Each removal shifted the keys after it: the other keys keep their order.
+        let keys: Vec<&String> = m.as_map().keys().collect();
+        let fresh = approved_manifest();
+        let mut want: Vec<&String> = fresh.as_map().keys().collect();
+        let (reason, log) = ("status_reason".to_string(), "status_log".to_string());
+        want.extend([&log, &reason]);
+        assert_eq!(keys, want);
 
         // A manifest without a status logs `from: null`.
         m.remove("status");
@@ -884,6 +915,16 @@ mod tests {
         assert!(block(&mut m, &E::StartWork, None).is_err());
         assert_eq!(m.to_text(), text, "a refusal leaves the manifest as it was");
         assert!(m.get("status_log").is_none());
+    }
+
+    #[test] // spec: CORE-053, CORE-048 (ruling Q23)
+    fn reopened_takes_candidate_run_only_after_approval() {
+        assert_eq!(reopened(Exported, None, None), Ok(Candidate));
+        assert_eq!(reopened(InReview, None, None), Ok(InReview));
+        for from in [Approved, Exported, Released] {
+            assert_eq!(reopened(from, None, None), Ok(Candidate), "{from}");
+        }
+        assert_eq!(reopened(Stale, Some(Approved), None), Ok(Stale));
     }
 
     #[test] // spec: CORE-156, CORE-053 (rulings Q23, PF-5)

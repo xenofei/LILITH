@@ -33,15 +33,13 @@ use lil_schema::{
 };
 use serde_json::{Map, Value, json};
 
-/// The `signed_off.by` value of a sign-off by `caller` (CORE-051): `user` for an app
-/// (`ui:*`), `assistant`, `claude-code` (`mcp`) or `cli`.
-pub fn signed_off_by(caller: &CallerKind) -> &'static str {
-    match caller {
-        CallerKind::Ui(_) => "user",
-        CallerKind::Assistant => "assistant",
-        CallerKind::Mcp => "claude-code",
-        CallerKind::Cli => "cli",
-    }
+use super::status::status_by;
+
+/// The `signed_off.by` value of a sign-off by `caller` (CORE-051): the status log's `by` for
+/// that caller ([`status_by`], the one table): `user` for an app (`ui:*`), `assistant`,
+/// `claude-code` (`mcp`) or `cli`.
+pub fn signed_off_by(caller: &CallerKind) -> String {
+    status_by(caller).as_str().to_string()
 }
 
 fn fail(spec: &CodeSpec, message: String) -> ErrorBody {
@@ -262,7 +260,6 @@ pub fn auto_pick(
 mod tests {
     use super::*;
     use lil_schema::Status;
-    use lil_schema::status::reopened;
 
     fn manifest() -> Manifest {
         let text = json!({
@@ -368,11 +365,6 @@ mod tests {
         stale.set("status_before_stale", json!("approved"));
         let e = plan_signoff(&stale, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap_err();
         assert_eq!(e.code, "status.invalid_transition");
-        assert_eq!(
-            reopened(Status::Exported, None, None),
-            Ok(Status::Candidate)
-        );
-        assert_eq!(reopened(Status::InReview, None, None), Ok(Status::InReview));
     }
 
     #[test] // spec: CORE-026
