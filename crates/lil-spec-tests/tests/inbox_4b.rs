@@ -230,11 +230,14 @@ fn keep_imports_and_dismiss_only_marks() {
 #[test] // spec: CORE-179, CORE-130
 fn suite_job_outputs_are_not_inboxed() {
     let mut inbox = Inboxed::start();
+    // The suite's own output first, then a ComfyUI file, inboxed; then a second ComfyUI file
+    // written after that, inboxed too: by then the first file has had more than one chance.
     inbox.write_output("lil_0123456789abcdef_00001_.png", &comfy_png(40));
     inbox.write_output("ComfyUI_00003_.png", &comfy_png(80));
-
-    // The second file is inboxed, so the first had its chance.
     inbox.until_listed("ComfyUI_00003_.png");
+    inbox.write_output("ComfyUI_00004_.png", &comfy_png(120));
+    inbox.until_listed("ComfyUI_00004_.png");
+
     let names: Vec<Value> = inbox.entries().iter().map(|e| e["name"].clone()).collect();
     assert!(
         !names.contains(&json!("lil_0123456789abcdef_00001_.png")),

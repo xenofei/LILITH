@@ -1,8 +1,9 @@
 //! Plan 4b's pick log: a review decision from the app (a `ui:*` call that carries
-//! `review_view`) appends one line to `<local dir>\picks.jsonl` and copies the 96 px thumbnail to
-//! `<local dir>\picks\thumbs\`; the same mark from elsewhere appends nothing (spec CORE-176;
-//! Appendix H "Pick log"). Images are made with `lil_testkit::png`. Driven through `asset.mark`
-//! from the `ui:test` app and a `cli` connection, and the local files (QA-018).
+//! `review_view`) appends one line to `picks.jsonl` in the workspace's local folder (ARCH-097,
+//! `TestEnv::workspace_local_dir`) and copies the 96 px thumbnail to its `picks\thumbs\`; the same
+//! mark from elsewhere appends nothing (spec CORE-176; Appendix H "Pick log"). Images are made
+//! with `lil_testkit::png`. Driven through `asset.mark` from the `ui:test` app and a `cli`
+//! connection, and the local files (QA-018).
 
 mod p4b;
 mod support;
@@ -22,7 +23,9 @@ fn review_picks_from_the_app_are_logged() {
     let bytes = png::rgba(200, 100, &pixels);
     let sha = sha256_bytes(&bytes);
     let run_id = run_id_of(&import(&mut s.pipe, &s.env, KITE, &[("kite.png", &bytes)]));
-    let log = s.env.env.local_dir().join("picks.jsonl");
+    // The workspace's local folder (Appendix H's `<local dir>` here; ARCH-097, CORE-176).
+    let local = s.env.workspace_local_dir(&s.ws);
+    let log = local.join("picks.jsonl");
 
     write_ok(
         &mut app,
@@ -63,12 +66,7 @@ fn review_picks_from_the_app_are_logged() {
                "flag": "reject", "review_view": "loupe"}),
     );
 
-    let thumb = s
-        .env
-        .env
-        .local_dir()
-        .join(r"picks\thumbs")
-        .join(format!("{sha}.png"));
+    let thumb = local.join(r"picks\thumbs").join(format!("{sha}.png"));
     let cached = poll(&format!("{}", thumb.display()), || {
         std::fs::read(&thumb).ok()
     });

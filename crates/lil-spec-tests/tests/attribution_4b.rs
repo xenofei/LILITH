@@ -15,10 +15,15 @@ use p4b::*;
 use serde_json::{Value, json};
 use support::*;
 
-/// The fixture served by a core whose watcher can't start.
+/// The fixture served by a core whose watcher can't start, once its first reconcile has
+/// finished: `asset.get` answers only after the first reconcile at open (Appendix E), so that
+/// reconcile ran before any edit the test makes and cannot record it. Without a watcher, only
+/// `lil notify` finds an edit after that.
 fn served_without_watcher() -> Served {
     let points = failpoints::spec(&[("watch.start", "unsupported")]);
-    Served::start_with(|_, _| {}, &[(failpoints::ENV, &points)])
+    let mut s = Served::start_with(|_, _| {}, &[(failpoints::ENV, &points)]);
+    asset_get(&mut s.pipe, CRANE);
+    s
 }
 
 /// The crane's sealed file.

@@ -69,8 +69,9 @@ fn ready_file(app: &mut TestApp, thumb: &Value) -> PathBuf {
     )
 }
 
-/// Checks that `file` is the cache entry `<local dir>\thumbs\<sha256[0..2]>\<sha256>.….<px>.png`.
-fn assert_cache_entry(env_local: &Path, file: &Path, sha256: &str, px: u32) {
+/// Checks that `file` is the cache entry `<ws local>\thumbs\<sha256[0..2]>\<sha256>.….<px>.png`,
+/// `<ws local>` being the workspace's local folder (ARCH-097, APP-038; Appendix H's `<local dir>`).
+fn assert_cache_entry(ws_local: &Path, file: &Path, sha256: &str, px: u32) {
     let name = file.file_name().unwrap_or_default().to_string_lossy();
     assert!(
         name.starts_with(&format!("{sha256}.")) && name.ends_with(&format!(".{px}.png")),
@@ -91,15 +92,16 @@ fn assert_cache_entry(env_local: &Path, file: &Path, sha256: &str, px: u32) {
         .unwrap_or_else(|| panic!("{}", file.display()));
     assert_eq!(
         std::fs::canonicalize(thumbs).ok(),
-        std::fs::canonicalize(env_local.join("thumbs")).ok(),
-        "{} is not under <local dir>\\thumbs",
+        std::fs::canonicalize(ws_local.join("thumbs")).ok(),
+        "{} is not under the workspace's local thumbs folder",
         file.display()
     );
 }
 
 #[test] // spec: APP-038
 fn thumbs_request_returns_ready_or_pending_then_ready() {
-    let mut s = Served::start();
+    // Each render is delayed (the test-channel override), so the first answer is `pending`.
+    let mut s = Served::start_with(|_, _| {}, &[("LIL_TEST_THUMB_SLOW_MS", "2000")]);
     let mut app = app_4b(&s.env, Some(&s.ws), &["thumbs"]);
     let bytes = picture(1024, 512);
     let sha = sha256_bytes(&bytes);
@@ -122,11 +124,37 @@ fn thumbs_request_returns_ready_or_pending_then_ready() {
         "{thumb}"
     );
     assert_eq!(thumb["px"], 384, "round(256 x 1.5): {thumb}");
+    assert_eq!(
+        thumb["state"], "pending",
+        "a slow render answers pending: {thumb}"
+    );
 
-    let file = ready_file(&mut app, thumb);
-    assert_cache_entry(&s.env.env.local_dir(), &file, &sha, 384);
+    // The pending item is announced on `thumbs` as {kind: "ready", sha256, renderer, px, file}.
+    let ready = thumbs_event(&mut app, "ready", &thumb["sha256"]);
+    assert!(
+        ready["renderer"]
+            .as_str()
+            .is_some_and(|r| matches!(r, "image" | "image@1")),
+        "{ready}"
+    );
+    assert_eq!(ready["px"], 384, "{ready}");
+    let file = PathBuf::from(
+        ready["file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the ready event names no file: {ready}")),
+    );
+    assert_cache_entry(&s.env.workspace_local_dir(&s.ws), &file, &sha, 384);
     let cached = std::fs::read(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
     assert_eq!(png::long_side(&cached), 384, "{}", file.display());
+
+    // Asked again, it is ready at once, from the same cache entry.
+    let again = request(
+        &mut app,
+        std::slice::from_ref(&path),
+        json!({"tier": 256, "scale": 1.5}),
+    );
+    assert_eq!(again[0]["state"], "ready", "{again:?}");
+    assert_eq!(ready_file(&mut app, &again[0]), file);
 }
 
 #[test] // spec: APP-038
@@ -149,7 +177,11 @@ fn same_bytes_share_one_cache_entry() {
     let files: Vec<PathBuf> = thumbs.iter().map(|t| ready_file(&mut app, t)).collect();
     assert_eq!(files[0], first);
     assert_eq!(files[1], first, "same bytes, one cache entry");
-    let shard = s.env.env.local_dir().join("thumbs").join(&sha[..2]);
+    let shard = s
+        .env
+        .workspace_local_dir(&s.ws)
+        .join("thumbs")
+        .join(&sha[..2]);
     let entries = files_named(&shard, &sha, ".96.png");
     assert_eq!(entries.len(), 1, "{entries:?}");
 }

@@ -285,10 +285,41 @@ fn page_through(c: &mut impl Caller, args: &Value) -> Vec<String> {
     }
 }
 
+/// Cursors made before plan 4b, by the core at commit 71af5a3 (main before plan 4b's tests) over
+/// the fixture workspace: each is the `next_cursor` of the first page (`limit: 1`, which holds
+/// the crane) of its query. They were made by running that core once in a throwaway test, not
+/// committed. Each is the hex of
+/// `{"v":1,"q":"<16 hex>","k":{"s":"chr_paper_crane","p":"sketchbook","a":"chr_paper_crane"}}`.
+/// `{status: "candidate"}`, q `4509fce6140511b0`:
+const OLD_CURSOR_CANDIDATE: &str = concat!(
+    "7b2276223a312c2271223a2234353039666365363134303531316230222c226b223a7b2273223a22",
+    "6368725f70617065725f6372616e65222c2270223a22736b65746368626f6f6b222c2261223a2263",
+    "68725f70617065725f6372616e65227d7d",
+);
+/// `{}` (no filters), q `c78b31294f700b74`:
+const OLD_CURSOR_ALL: &str = concat!(
+    "7b2276223a312c2271223a2263373862333132393466373030623734222c226b223a7b2273223a22",
+    "6368725f70617065725f6372616e65222c2270223a22736b65746368626f6f6b222c2261223a2263",
+    "68725f70617065725f6372616e65227d7d",
+);
+
 #[test] // spec: CORE-152, APP-025
 fn old_cursors_stay_valid() {
     let mut s = Served::start();
     let both = vec![CRANE.to_string(), LAMP.to_string()];
+
+    // Cursors a pre-4b core handed out still page on: a string `status` hashes exactly as before,
+    // and an absent new key adds nothing.
+    for (args, cursor) in [
+        (json!({"status": "candidate"}), OLD_CURSOR_CANDIDATE),
+        (json!({}), OLD_CURSOR_ALL),
+    ] {
+        let mut next = args.clone();
+        next["limit"] = json!(1);
+        next["cursor"] = json!(cursor);
+        let page = query(&mut s.pipe, next);
+        assert_eq!(ids_of(&page), [LAMP], "{args}: {page}");
+    }
 
     // A query without the new keys pages on as before.
     assert_eq!(
