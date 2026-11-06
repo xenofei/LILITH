@@ -8,7 +8,8 @@
 //! (QA-066): an in-process ComfyUI ([`FakeComfy`], also served by `lil-fake-comfyui`) and the
 //! ComfyUI shape fixtures it is checked against ([`comfy_shapes`]), fake
 //! hardware ([`FakeHwScript`]), the `ui:test` app ([`TestApp`]), stdio servers under the fake
-//! `claude` ([`McpStdio`]), `lil-fake-comfy-cli` and free loopback ports ([`ports`]).
+//! `claude` ([`McpStdio`]), `lil-fake-comfy-cli` and free loopback ports ([`ports`]); and the
+//! hand-written PNG builder for images made in a test ([`png`]).
 
 pub mod bins;
 pub mod cleanup;
@@ -24,6 +25,7 @@ pub mod gitops;
 pub mod handles;
 pub mod ids;
 pub mod params;
+pub mod png;
 pub mod ports;
 pub mod raw_pipe;
 pub mod test_app;
