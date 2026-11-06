@@ -1984,3 +1984,690 @@ async fn asset_get_has_uses_status_log_and_trust() {
     assert_eq!(lamp["trust"], json!({}), "{lamp}");
     fx.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// asset.mark and sign-off by takes (CORE-152, CORE-023; Appendix H "Takes" and "Organising
+// tools"; P4b-R3, P4b-R26).
+// ---------------------------------------------------------------------------------------------
+
+const LAMP: &str = "prop_signal_lamp";
+/// The crane's open run (read by the legacy rule: take 1 is `crane_c.png` with the derived
+/// `crane_c_cutout.png` as its companion) and its closed (`selected`) run.
+const CRANE_OPEN_RUN: &str = "r_20261003_1400";
+const CRANE_CLOSED_RUN: &str = "r_20261002_0915";
+/// The run [`write_take_run`] writes.
+const TAKE_RUN: &str = "r_20261101_0900";
+
+/// `asset.mark` arguments: `extra` on top of the project and `asset`.
+fn mark_args(asset: &str, extra: Value) -> Value {
+    let mut args = json!({"project": "sketchbook", "asset_id": asset});
+    for (k, v) in extra.as_object().unwrap() {
+        args[k] = v.clone();
+    }
+    args
+}
+
+/// The file record named `name` of run `run` in the manifest `m`.
+fn run_file<'a>(m: &'a Value, run: &str, name: &str) -> &'a Value {
+    let suffix = format!("/{name}");
+    run_of(m, run)["files"]
+        .as_array()
+        .and_then(|f| {
+            f.iter()
+                .find(|f| f["path"].as_str().unwrap_or_default().ends_with(&suffix))
+        })
+        .unwrap_or_else(|| panic!("no {name} in run {run}: {m}"))
+}
+
+/// Every file under the folder `root` with its bytes (empty when it is missing).
+fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for e in entries.map(Result::unwrap) {
+        let path = e.path();
+        if path.is_dir() {
+            out.extend(tree(&path));
+        } else {
+            out.insert(path.clone(), std::fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+/// The kite with one open run, `TAKE_RUN`, whose files carry takes: take 1 is `a.png` with
+/// its `preview` `a_prev.png`, take 2 is `b.png` with its derived `b_cut.png`, take 3 is
+/// `c.png` alone. Each file is on disk with its recorded SHA-256.
+fn write_take_run(ws: &Path) {
+    let names = [
+        ("a.png", "candidate", None, 1, true),
+        ("a_prev.png", "preview", Some("a.png"), 1, false),
+        ("b.png", "candidate", None, 2, true),
+        ("b_cut.png", "derived", Some("b.png"), 2, false),
+        ("c.png", "candidate", None, 3, true),
+    ];
+    let mut files = Vec::new();
+    for (name, role, from, take, primary) in names {
+        write_file(
+            &file(ws, &format!("{KITE_DIR}/candidates/{TAKE_RUN}/{name}")),
+            name.as_bytes(),
+        );
+        let mut f = json!({"path": format!("candidates/{TAKE_RUN}/{name}"), "role": role,
+                           "take": take, "sha256": sha256_bytes(name.as_bytes())});
+        if let Some(from) = from {
+            f["from"] = json!(from);
+        }
+        if primary {
+            f["primary"] = json!(true);
+        }
+        files.push(f);
+    }
+    let m = json!({
+        "schema_version": 1, "asset_id": KITE, "project": "sketchbook", "type": "image",
+        "creation_uuid": "0d6c1a52-3b1e-4f7a-9c2d-5e8f1a2b3c4d",
+        "version": "1.0.0", "approved_version": null, "status": "candidate",
+        "inputs": [], "pinned_inputs": [],
+        "candidate_runs": [{
+            "run_id": TAKE_RUN, "path": format!("candidates/{TAKE_RUN}/"), "status": "open",
+            "created": "2026-11-01T09:00:00Z", "target_version": "1.0.0", "files": files,
+            "selected": null, "signed_off": null,
+        }],
+        "hashes": {},
+    });
+    write_file(
+        &manifest_file(ws, KITE),
+        format!("{}\n", serde_json::to_string_pretty(&m).unwrap()).as_bytes(),
+    );
+}
+
+/// `args` with the keys of `extra` set on top.
+fn with_keys(args: &Value, extra: &Value) -> Value {
+    let mut out = args.clone();
+    for (k, v) in extra.as_object().unwrap() {
+        out[k] = v.clone();
+    }
+    out
+}
+
+/// Collects the `kind: "mark"` events client 9 receives, `(topic, data)`, until `n` arrived
+/// (or 30 s passed).
+async fn mark_events(
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    n: usize,
+) -> Vec<(String, Value)> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen: Vec<(String, Value)> = Vec::new();
+    while seen.len() < n && tokio::time::Instant::now() < deadline {
+        while let Ok(line) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["params"]["data"]["kind"] == "mark" {
+                let topic = v["params"]["topic"].as_str().unwrap().to_string();
+                seen.push((topic, v["params"]["data"].clone()));
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    seen
+}
+
+#[tokio::test] // spec: CORE-152
+async fn mark_sets_asset_marks_and_writes_no_log_line_or_progress() {
+    let fx = Fx::new();
+    let progress = fx.path("projects/sketchbook/progress.md");
+    let progress_before = read_text(&progress);
+    let queue_before = tree(&fx.path("queue"));
+    let before = fx.manifest(CRANE);
+
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(
+                CRANE,
+                json!({"tags": ["Tree", "oak"], "rating": 4, "label": "red"}),
+            ),
+        )
+        .await;
+    assert_eq!(
+        r,
+        json!({"tags": ["Tree", "oak"], "rating": 4, "label": "red"})
+    );
+    let m = fx.manifest(CRANE);
+    assert_eq!(m["tags"], json!(["Tree", "oak"]), "{m}");
+    assert_eq!(m["rating"], 4, "{m}");
+    assert_eq!(m["label"], "red", "{m}");
+    // No status change, no status-log entry, no jobs log line, no progress.md entry.
+    assert_eq!(m["status"], before["status"], "{m}");
+    assert_eq!(m.get("status_log"), before.get("status_log"), "{m}");
+    assert_eq!(read_text(&progress), progress_before);
+    assert_eq!(tree(&fx.path("queue")), queue_before);
+
+    // The index has the marks at once (Task 5's mirror).
+    let trees = fx
+        .ok(
+            "assets.query",
+            json!({"project": "sketchbook", "tags": ["TREE"]}),
+        )
+        .await;
+    let ids: Vec<&str> = trees["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["asset_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [CRANE], "{trees}");
+    let crane = summary_in(&trees, CRANE);
+    assert_eq!(crane["rating"], 4, "{crane}");
+    assert_eq!(crane["label"], "red", "{crane}");
+
+    // Values outside the rules change nothing.
+    for bad in [
+        json!({"rating": 6}),
+        json!({"label": "orange"}),
+        json!({"flag": "maybe"}),
+    ] {
+        let e = fx.err("asset.mark", mark_args(CRANE, bad.clone())).await;
+        assert_eq!(e.code, "params.invalid", "{bad}: {e:?}");
+    }
+    assert_eq!(fx.manifest(CRANE), m);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152 (P4b-R26)
+async fn tags_are_deduplicated_case_insensitively_on_write() {
+    let fx = Fx::with(|ws| {
+        edit_fixture_manifest(ws, LAMP, |m| m["tags"] = json!(["Sky", " sky"]));
+    });
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(
+                CRANE,
+                json!({"tags": [" Harbor ", "harbor", "HARBOR", "Night"]}),
+            ),
+        )
+        .await;
+    assert_eq!(r["tags"], json!(["Harbor", "Night"]), "{r}");
+    assert_eq!(fx.manifest(CRANE)["tags"], json!(["Harbor", "Night"]));
+
+    // A hand-written list is read as it is until a mark writes `tags`.
+    fx.ok("asset.mark", mark_args(LAMP, json!({"rating": 2})))
+        .await;
+    assert_eq!(fx.manifest(LAMP)["tags"], json!(["Sky", " sky"]));
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(LAMP, json!({"add_tags": ["SKY", "moon"]})),
+        )
+        .await;
+    assert_eq!(r["tags"], json!(["Sky", "moon"]), "{r}");
+    assert_eq!(fx.manifest(LAMP)["tags"], json!(["Sky", "moon"]));
+
+    // Tags outside the rules are refused: empty, a control character, over 64 characters,
+    // more than 64 tags.
+    let many: Vec<String> = (0..65).map(|i| format!("t{i}")).collect();
+    for bad in [
+        json!([" "]),
+        json!(["a\nb"]),
+        json!(["x".repeat(65)]),
+        json!(many),
+    ] {
+        let e = fx
+            .err("asset.mark", mark_args(CRANE, json!({"tags": bad})))
+            .await;
+        assert_eq!(e.code, "params.invalid", "{e:?}");
+    }
+    assert_eq!(fx.manifest(CRANE)["tags"], json!(["Harbor", "Night"]));
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152 (P4b-R26)
+async fn add_and_remove_tags_leave_others() {
+    let fx = Fx::new();
+    fx.ok(
+        "asset.mark",
+        mark_args(
+            CRANE,
+            json!({"tags": ["a", "B", "c"], "rating": 3, "label": "green"}),
+        ),
+    )
+    .await;
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(CRANE, json!({"add_tags": ["d", "b"], "remove_tags": ["A"]})),
+        )
+        .await;
+    assert_eq!(
+        r,
+        json!({"tags": ["B", "c", "d"], "rating": 3, "label": "green"})
+    );
+    let m = fx.manifest(CRANE);
+    assert_eq!(m["tags"], json!(["B", "c", "d"]), "{m}");
+    assert_eq!((&m["rating"], &m["label"]), (&json!(3), &json!("green")));
+    // Removing the last tags removes the key; a tag the asset lacks is ignored.
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(CRANE, json!({"remove_tags": ["b", "C", "D", "missing"]})),
+        )
+        .await;
+    assert_eq!(r["tags"], json!([]), "{r}");
+    assert!(fx.manifest(CRANE).get("tags").is_none());
+    // `tags` replaces; with `add_tags` or `remove_tags` too it is refused.
+    for both in [
+        json!({"tags": ["x"], "add_tags": ["y"]}),
+        json!({"tags": ["x"], "remove_tags": ["y"]}),
+    ] {
+        let e = fx.err("asset.mark", mark_args(CRANE, both.clone())).await;
+        assert_eq!(e.code, "params.invalid", "{both}: {e:?}");
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152, CORE-023 (P4b-R3)
+async fn flag_needs_a_run_and_a_take_or_file() {
+    let fx = Fx::new();
+    let r = fx
+        .import(
+            KITE,
+            &[("kite_a.png", b"kite a"), ("kite_b.png", b"kite b")],
+        )
+        .await;
+    let run = r["run_id"].as_str().unwrap().to_string();
+    let before = fx.manifest(KITE);
+
+    for (args, code) in [
+        (json!({"flag": "pick"}), "params.invalid"),
+        (json!({"rating": 2, "take": 1}), "params.invalid"),
+        (json!({"take": 1, "flag": "pick"}), "params.invalid"),
+        (
+            json!({"file": "kite_a.png", "flag": "pick"}),
+            "params.invalid",
+        ),
+        (json!({"run_id": run, "flag": "pick"}), "params.invalid"),
+        (
+            json!({"run_id": run, "take": 1, "file": "kite_a.png", "flag": "pick"}),
+            "params.invalid",
+        ),
+        (
+            json!({"run_id": run, "take": 0, "flag": "pick"}),
+            "params.invalid",
+        ),
+        (
+            json!({"run_id": run, "take": 1, "rating": 6}),
+            "params.invalid",
+        ),
+        (
+            json!({"run_id": run, "take": 1, "flag": "pick", "review_view": "carousel"}),
+            "params.invalid",
+        ),
+        (
+            json!({"run_id": "r_20990101_0000", "take": 1, "flag": "pick"}),
+            "asset.unknown",
+        ),
+        (
+            json!({"run_id": run, "take": 3, "flag": "pick"}),
+            "asset.unknown",
+        ),
+        (
+            json!({"run_id": run, "file": "kite_c.png", "flag": "pick"}),
+            "asset.unknown",
+        ),
+    ] {
+        let e = fx.err("asset.mark", mark_args(KITE, args.clone())).await;
+        assert_eq!(e.code, code, "{args}: {e:?}");
+    }
+    assert_eq!(fx.manifest(KITE), before);
+
+    // The run id matches without regard to case and is answered as the manifest spells it;
+    // `review_view` is accepted.
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(
+                KITE,
+                json!({"run_id": run.to_uppercase(), "take": 2, "flag": "pick", "rating": 3,
+                       "review_view": "loupe"}),
+            ),
+        )
+        .await;
+    assert_eq!(
+        r,
+        json!({"tags": [], "rating": 0, "label": null,
+               "take": {"run_id": run, "take": 2, "flag": "pick", "rating": 3}})
+    );
+    let m = fx.manifest(KITE);
+    let b = run_file(&m, &run, "kite_b.png");
+    assert_eq!(
+        (&b["flag"], &b["rating"]),
+        (&json!("pick"), &json!(3)),
+        "{b}"
+    );
+    let a = run_file(&m, &run, "kite_a.png");
+    assert!(a.get("flag").is_none() && a.get("rating").is_none(), "{a}");
+    // The take's rating isn't the asset's.
+    assert!(m.get("rating").is_none(), "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152, CORE-023 (P4b-R3)
+async fn file_addresses_its_take_primary() {
+    let fx = Fx::with(write_take_run);
+    // A companion names its take: the flag lands on the primary.
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(
+                CRANE,
+                json!({"run_id": CRANE_OPEN_RUN, "file": "crane_c_cutout.png",
+                       "flag": "reject"}),
+            ),
+        )
+        .await;
+    assert_eq!(
+        r["take"],
+        json!({"run_id": CRANE_OPEN_RUN, "take": 1, "flag": "reject", "rating": 0})
+    );
+    // The primary itself, named in another case.
+    fx.ok(
+        "asset.mark",
+        mark_args(
+            CRANE,
+            json!({"run_id": CRANE_OPEN_RUN, "file": "CRANE_C.PNG", "rating": 2}),
+        ),
+    )
+    .await;
+    let m = fx.manifest(CRANE);
+    let primary = run_file(&m, CRANE_OPEN_RUN, "crane_c.png");
+    assert_eq!(
+        (&primary["flag"], &primary["rating"]),
+        (&json!("reject"), &json!(2)),
+        "{primary}"
+    );
+    let companion = run_file(&m, CRANE_OPEN_RUN, "crane_c_cutout.png");
+    assert!(
+        companion.get("flag").is_none() && companion.get("rating").is_none(),
+        "{companion}"
+    );
+
+    // A run with `take` fields: the preview companion addresses take 1's primary.
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(
+                KITE,
+                json!({"run_id": TAKE_RUN, "file": "a_prev.png", "flag": "pick"}),
+            ),
+        )
+        .await;
+    assert_eq!(r["take"]["take"], 1, "{r}");
+    let m = fx.manifest(KITE);
+    assert_eq!(run_file(&m, TAKE_RUN, "a.png")["flag"], "pick", "{m}");
+    assert!(
+        run_file(&m, TAKE_RUN, "a_prev.png").get("flag").is_none(),
+        "{m}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152
+async fn closed_runs_refuse_marks() {
+    let fx = Fx::new();
+    let kite = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let other = fx.import_run(KITE, "other.png", b"kite two").await;
+    fx.signoff(KITE, &kite, &["kite.png"], json!({})).await;
+    let kite_before = std::fs::read(manifest_file(&fx.ws, KITE)).unwrap();
+    let crane_before = std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap();
+    // A run selected here, one rejected here, and the fixture's selected run.
+    for (asset, run) in [
+        (KITE, kite.as_str()),
+        (KITE, &other),
+        (CRANE, CRANE_CLOSED_RUN),
+    ] {
+        for extra in [
+            json!({"flag": "pick"}),
+            json!({"rating": 2}),
+            json!({"flag": null}),
+        ] {
+            let args = with_keys(&json!({"run_id": run, "take": 1}), &extra);
+            let e = fx.err("asset.mark", mark_args(asset, args.clone())).await;
+            assert_eq!(e.code, "status.invalid_transition", "{asset} {args}: {e:?}");
+            assert_eq!(
+                e.message, "This run is closed: its marks don't change after sign-off.",
+                "{e:?}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(manifest_file(&fx.ws, KITE)).unwrap(),
+        kite_before
+    );
+    assert_eq!(
+        std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap(),
+        crane_before
+    );
+    // The asset's own marks still change.
+    let r = fx
+        .ok("asset.mark", mark_args(KITE, json!({"rating": 5})))
+        .await;
+    assert_eq!(r["rating"], 5, "{r}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152
+async fn null_clears_flag_and_label() {
+    let fx = Fx::new();
+    let take = |extra: Value| {
+        mark_args(
+            CRANE,
+            with_keys(&json!({"run_id": CRANE_OPEN_RUN, "take": 1}), &extra),
+        )
+    };
+    fx.ok(
+        "asset.mark",
+        mark_args(CRANE, json!({"label": "red", "rating": 4})),
+    )
+    .await;
+    fx.ok("asset.mark", take(json!({"flag": "pick", "rating": 4})))
+        .await;
+    let m = fx.manifest(CRANE);
+    assert_eq!(m["label"], "red", "{m}");
+    assert_eq!(run_file(&m, CRANE_OPEN_RUN, "crane_c.png")["flag"], "pick");
+
+    let r = fx
+        .ok(
+            "asset.mark",
+            mark_args(CRANE, json!({"label": null, "rating": 0})),
+        )
+        .await;
+    assert_eq!(r, json!({"tags": [], "rating": 0, "label": null}));
+    let r = fx
+        .ok("asset.mark", take(json!({"flag": null, "rating": 0})))
+        .await;
+    assert_eq!(
+        r["take"],
+        json!({"run_id": CRANE_OPEN_RUN, "take": 1, "flag": null, "rating": 0})
+    );
+    let m = fx.manifest(CRANE);
+    for key in ["label", "rating"] {
+        assert!(m.get(key).is_none(), "{key}: {m}");
+    }
+    let primary = run_file(&m, CRANE_OPEN_RUN, "crane_c.png");
+    for key in ["flag", "rating"] {
+        assert!(primary.get(key).is_none(), "{key}: {primary}");
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-152
+async fn mark_event_carries_previous() {
+    let fx = Fx::with(|ws| {
+        // Hand-written: a rating above 5 reads as 5.
+        edit_fixture_manifest(ws, CRANE, |m| {
+            m["rating"] = json!(7);
+            m["label"] = json!("red");
+        });
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(9, tx);
+    let asset = format!("asset:lil://{}/sketchbook/{CRANE}", fx.ws_id());
+    let project = "project:sketchbook".to_string();
+    fx.events
+        .subscribe(9, &[asset.clone(), project.clone()], &Default::default())
+        .await;
+
+    // What the view already shows changes nothing and publishes nothing.
+    let bytes = std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap();
+    fx.ok(
+        "asset.mark",
+        mark_args(CRANE, json!({"rating": 5, "label": "red"})),
+    )
+    .await;
+    assert_eq!(std::fs::read(manifest_file(&fx.ws, CRANE)).unwrap(), bytes);
+
+    fx.ok(
+        "asset.mark",
+        mark_args(
+            CRANE,
+            json!({"rating": 2, "label": "red", "tags": ["tree"]}),
+        ),
+    )
+    .await;
+    fx.ok(
+        "asset.mark",
+        mark_args(
+            CRANE,
+            json!({"run_id": CRANE_OPEN_RUN, "take": 1, "flag": "pick", "rating": 3}),
+        ),
+    )
+    .await;
+
+    let seen = mark_events(&mut rx, 4).await;
+    // The previous rating is the view's: the hand-written 7 reads as 5.
+    let asset_marks = json!({"kind": "mark", "asset": CRANE,
+                             "previous": {"rating": 5, "tags": []}});
+    let take_marks = json!({"kind": "mark", "asset": CRANE, "run_id": CRANE_OPEN_RUN,
+                            "take": 1, "previous": {"flag": null, "rating": 0}});
+    assert_eq!(
+        seen,
+        [
+            (asset.clone(), asset_marks.clone()),
+            (project.clone(), asset_marks),
+            (asset.clone(), take_marks.clone()),
+            (project.clone(), take_marks),
+        ]
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-023, CORE-026, CORE-031 (P4b-R3)
+async fn signoff_by_takes_seals_primaries_with_companions() {
+    let fx = Fx::with(write_take_run);
+    let r = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": KITE, "run_id": TAKE_RUN,
+                   "takes": [2, 1], "review_view": "survey"}),
+        )
+        .await;
+    assert_eq!(r["version"], "1.0.0", "{r}");
+    let m = fx.manifest(KITE);
+    let run = run_of(&m, TAKE_RUN);
+    assert_eq!(run["status"], "selected", "{run}");
+    // The primaries first, in take order, then the companions.
+    assert_eq!(
+        run["selected"],
+        json!(["a.png", "b.png", "a_prev.png", "b_cut.png"]),
+        "{run}"
+    );
+    assert_eq!(run["signed_off"]["takes"], json!([1, 2]), "{run}");
+    assert_eq!(
+        run["signed_off"]["companions"],
+        json!(["a_prev.png", "b_cut.png"]),
+        "{run}"
+    );
+    for name in ["a.png", "a_prev.png", "b.png", "b_cut.png"] {
+        assert_eq!(
+            std::fs::read(fx.path(&format!("{KITE_DIR}/v1.0.0/{name}"))).unwrap(),
+            name.as_bytes(),
+            "{name}"
+        );
+        assert_eq!(
+            m["hashes"][format!("v1.0.0/{name}")],
+            format!("sha256:{}", sha256_bytes(name.as_bytes())),
+            "{m}"
+        );
+    }
+    // Take 3 wasn't chosen: it stays in the run folder.
+    assert!(!fx.path(&format!("{KITE_DIR}/v1.0.0/c.png")).exists());
+    assert!(
+        fx.path(&format!("{KITE_DIR}/candidates/{TAKE_RUN}/c.png"))
+            .exists()
+    );
+
+    // A run read by the legacy rule: take 1 is the primary and its derived companion.
+    let r = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": CRANE, "run_id": CRANE_OPEN_RUN,
+                   "takes": [1]}),
+        )
+        .await;
+    let version = r["version"].as_str().unwrap().to_string();
+    let m = fx.manifest(CRANE);
+    let run = run_of(&m, CRANE_OPEN_RUN);
+    assert_eq!(
+        run["selected"],
+        json!(["crane_c.png", "crane_c_cutout.png"]),
+        "{run}"
+    );
+    assert_eq!(run["signed_off"]["takes"], json!([1]), "{run}");
+    assert_eq!(
+        run["signed_off"]["companions"],
+        json!(["crane_c_cutout.png"]),
+        "{run}"
+    );
+    for name in ["crane_c.png", "crane_c_cutout.png"] {
+        let sealed = fx.path(&format!(
+            "projects/sketchbook/assets/{CRANE}/v{version}/{name}"
+        ));
+        assert!(sealed.exists(), "{}", sealed.display());
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-023, CORE-026
+async fn files_and_takes_together_is_params_invalid() {
+    let fx = Fx::with(write_take_run);
+    let before = std::fs::read(manifest_file(&fx.ws, KITE)).unwrap();
+    let base = json!({"project": "sketchbook", "asset_id": KITE, "run_id": TAKE_RUN});
+    for (extra, code) in [
+        (json!({"files": ["a.png"], "takes": [1]}), "params.invalid"),
+        (json!({}), "params.invalid"),
+        (json!({"takes": []}), "params.invalid"),
+        (
+            json!({"takes": [1], "review_view": "carousel"}),
+            "params.invalid",
+        ),
+        (json!({"takes": [9]}), "asset.unknown"),
+    ] {
+        let e = fx.err("asset.signoff", with_keys(&base, &extra)).await;
+        assert_eq!(e.code, code, "{extra}: {e:?}");
+    }
+    assert_eq!(std::fs::read(manifest_file(&fx.ws, KITE)).unwrap(), before);
+    assert!(!fx.path(&format!("{KITE_DIR}/v1.0.0")).exists());
+    // `files` alone works as before and records no takes.
+    fx.ok(
+        "asset.signoff",
+        with_keys(&base, &json!({"files": ["c.png"]})),
+    )
+    .await;
+    let m = fx.manifest(KITE);
+    let signed = &run_of(&m, TAKE_RUN)["signed_off"];
+    assert!(
+        signed.get("takes").is_none() && signed.get("companions").is_none(),
+        "{signed}"
+    );
+    fx.shutdown().await;
+}

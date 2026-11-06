@@ -8,10 +8,11 @@
 //! |---|---|---|---|
 //! | `asset.import` | write | `{project?, asset_id, type, files: [path], mode: "copy"\|"link_external"}` | `{ref, run_id?, handoff, files}` |
 //! | `asset.collect` | write | `{project?, asset_id}` | `{run_id, handoff, files}` |
-//! | `asset.signoff` | write | `{project?, asset_id, run_id, files: [name], bump?, keep_runs?}` | `{ref, version, handoff}` |
+//! | `asset.signoff` | write | `{project?, asset_id, run_id, files?: [name], takes?: [n], bump?, keep_runs?, review_view?}` | `{ref, version, handoff}` |
 //! | `asset.request_signoff` | write | `{project?, asset_id}` | `{status}` |
 //! | `asset.pin_input` | write | `{project?, asset_id, ref, reason}` | `{pinned_inputs}` |
 //! | `asset.deprecate` | write | `{project?, asset_id, deprecated}` | `{status}` |
+//! | `asset.mark` | write | `{project?, asset_id, run_id?, take?, file?, tags?, add_tags?, remove_tags?, rating?, label?, flag?, review_view?}` | `{tags, rating, label, take?: {run_id, take, flag, rating}}` |
 //!
 //! - **`asset.import`, `copy`**: an asset without a manifest gets `Manifest::new` with a fresh
 //!   `creation_uuid` (CORE-047). Each file (an absolute path) is copied into a staging handle
@@ -41,7 +42,11 @@
 //!   unless the chosen files' hashes agree with the sealed ones and the `v<version>/` keys of
 //!   `hashes` are exactly the sealed files. The sealed files (and the snapshot) reach the index
 //!   through `commit.moved`, after the manifest edit. `ref` carries the version's content hash
-//!   (ARCH-042). Sign-off isn't destructive, so an agent may do it (CORE-051).
+//!   (ARCH-042). Sign-off isn't destructive, so an agent may do it (CORE-051). It takes
+//!   exactly one of `files` and `takes` (`params.invalid` otherwise; Appendix H "Takes"):
+//!   with `takes`, `pipeline::chosen_files` chooses each take's primary, then the takes'
+//!   companions, and `signed_off` records `takes` and `companions`. `review_view` is validated
+//!   and stored nowhere until the pick log.
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
 //!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
@@ -58,6 +63,18 @@
 //!   as a sign-off does. A change publishes `{kind: "deprecated", deprecated, status,
 //!   previous}` and `{kind: "status", status}` on the asset's topic, and
 //!   `{kind: "deprecated", asset_id, deprecated, status, previous}` on `project:<slug>`.
+//! - **`asset.mark`** (CORE-152; Appendix H "Organising tools"; P4b-R3, P4b-R26) sets the
+//!   asset's `tags` (`tags` replaces; `add_tags`/`remove_tags` edit, compared by
+//!   `lil_schema::fold_tag`; either way normalised when written), `rating` and `label`, and,
+//!   with `run_id` and one of `take` or `file` ([`resolve_take`]: a companion addresses its
+//!   take), the take's `flag` and `rating` on its primary file entry. `null` clears `label` and
+//!   `flag`. A take's marks need an open run, else `status.invalid_transition`. Holding the
+//!   asset's version lock, it edits the manifest (the store's change sink refreshes the index),
+//!   then publishes `{kind: "mark", asset, run_id?, take?, previous}` on the asset's topic and
+//!   `project:<slug>`, `previous` holding the view's value before (a hand-written rating of 7
+//!   reads as 5) of each mark that changed; nothing changed publishes nothing. No jobs log
+//!   line, no `progress.md` entry, no status change. `review_view` is validated and stored
+//!   nowhere until the pick log.
 //!
 //! Every status change goes through `lil_schema::change_status`, which logs one status-log
 //! entry in the same manifest edit, `by` the caller (`pipeline::status_by`).
@@ -73,12 +90,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lil_protocol::codes::{
-    ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID,
+    ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, MANIFEST_NEEDS_REPAIR, PARAMS_INVALID, REF_HASH_MISMATCH,
+    REF_INVALID, STATUS_INVALID_TRANSITION,
 };
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
-    AssetRef, Bump, LinkRef, Manifest, SCHEME, Status, StatusEvent, YamlEdit, bare_sha256,
-    change_status, hash_value, is_asset_id, is_slug,
+    AssetRef, Bump, CandidateRun, Flag, Label, LinkRef, Manifest, SCHEME, Status, StatusEvent,
+    Take, YamlEdit, bare_sha256, change_status, fold_tag, hash_value, is_asset_id, is_slug,
+    normalise_tags, takes_of,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -87,8 +106,8 @@ use serde_json::{Map, Value, json};
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::{
-    HandOff, RecordBranch, RecordPlan, asset_topic, plan_signoff, signed_off_by,
-    start_candidate_run, status_by,
+    Chosen, HandOff, RecordBranch, RecordPlan, asset_topic, chosen_files, plan_signoff,
+    signed_off_by, start_candidate_run, status_by,
 };
 use crate::projects::{ProjectFile, project_yaml_path, read_project, unknown_project};
 use crate::store::{
@@ -109,13 +128,20 @@ const COLLECT_DESCRIPTION: &str = "Collect an asset's link-external files into t
     (ref.hash_mismatch otherwise); they are copied in as a new candidate run and the external \
     list is removed.";
 
-const SIGNOFF_DESCRIPTION: &str = "Sign off files of an open candidate run: they (and the \
-    files derived from them) are sealed read-only as a new version folder v<version>/ with a \
-    manifest snapshot, the asset becomes approved, and the other open runs for that version \
-    are rejected unless listed in keep_runs (kept open and pinned). bump (major, minor, patch) \
-    confirms the version bump; without it the version proposed when the work started is used. \
-    The result's ref carries the version's content hash; handoff lists what this unlocks and \
-    what it made stale.";
+const SIGNOFF_DESCRIPTION: &str = "Sign off files of an open candidate run, named by files \
+    or chosen by takes (each take's primary file and its companions; exactly one of the two): \
+    they (and the files derived from them) are sealed read-only as a new version folder \
+    v<version>/ with a manifest snapshot, the asset becomes approved, and the other open runs \
+    for that version are rejected unless listed in keep_runs (kept open and pinned). bump \
+    (major, minor, patch) confirms the version bump; without it the version proposed when the \
+    work started is used. The result's ref carries the version's content hash; handoff lists \
+    what this unlocks and what it made stale.";
+
+const MARK_DESCRIPTION: &str = "Set an asset's marks: tags (replaces them) or add_tags and \
+    remove_tags (compared without regard to case), rating (0-5, 0 unrated) and label (red, \
+    yellow, green, blue, purple; null clears). With run_id and one of take or file, flag (pick \
+    or reject; null clears) and rating are the take's instead; a file addresses its take. A \
+    run's marks change only while it is open. No status change.";
 
 const REQUEST_SIGNOFF_DESCRIPTION: &str = "Flag an asset for sign-off: its status becomes \
     in_review.";
@@ -215,13 +241,126 @@ struct SignoffArgs {
     project: Option<String>,
     asset_id: String,
     run_id: String,
-    /// The chosen file names in the run.
-    files: Vec<String>,
+    /// The chosen file names in the run; exactly one of files and takes.
+    files: Option<Vec<String>>,
+    /// The chosen takes (1-based): each take's primary file and its companions.
+    takes: Option<Vec<u32>>,
     /// The confirmed bump; omitted: the proposed version.
     bump: Option<BumpArg>,
     /// Other open runs to keep open (pinned) instead of rejecting them.
     #[serde(default)]
     keep_runs: Vec<String>,
+    /// The Review view the sign-off came from.
+    #[expect(dead_code, reason = "validated now; the pick log (Task 13) records it")]
+    review_view: Option<ReviewView>,
+}
+
+/// A Review view (Appendix H "Pick log"): validated on `asset.mark` and `asset.signoff`, stored
+/// nowhere until the pick log records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ReviewView {
+    Grid,
+    Loupe,
+    Compare,
+    Survey,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum LabelArg {
+    Red,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+}
+
+impl From<LabelArg> for Label {
+    fn from(l: LabelArg) -> Label {
+        match l {
+            LabelArg::Red => Label::Red,
+            LabelArg::Yellow => Label::Yellow,
+            LabelArg::Green => Label::Green,
+            LabelArg::Blue => Label::Blue,
+            LabelArg::Purple => Label::Purple,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum FlagArg {
+    Pick,
+    Reject,
+}
+
+impl From<FlagArg> for Flag {
+    fn from(f: FlagArg) -> Flag {
+        match f {
+            FlagArg::Pick => Flag::Pick,
+            FlagArg::Reject => Flag::Reject,
+        }
+    }
+}
+
+/// A present field, `null` included: `Some(None)` for `null`, `Some(Some(v))` for a value (an
+/// absent field is `None` through `#[serde(default)]`).
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MarkArgs {
+    /// A project slug; omitted: the call's project.
+    project: Option<String>,
+    asset_id: String,
+    /// The run of the take to mark; needs take or file.
+    run_id: Option<String>,
+    /// The take (1-based).
+    take: Option<u32>,
+    /// A file of the take: it addresses the take's primary file.
+    file: Option<String>,
+    /// Replaces the asset's tags.
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    add_tags: Vec<String>,
+    #[serde(default)]
+    remove_tags: Vec<String>,
+    /// 0-5, 0 unrated: the take's with run_id, else the asset's.
+    rating: Option<u8>,
+    /// null clears.
+    #[serde(default, deserialize_with = "present")]
+    label: Option<Option<LabelArg>>,
+    /// The take's flag; null clears.
+    #[serde(default, deserialize_with = "present")]
+    flag: Option<Option<FlagArg>>,
+    /// The Review view the decision came from.
+    #[expect(dead_code, reason = "validated now; the pick log (Task 13) records it")]
+    review_view: Option<ReviewView>,
+}
+
+/// A take's marks in `asset.mark`'s result.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+struct TakeMarks {
+    run_id: String,
+    take: u32,
+    flag: Option<String>,
+    rating: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+struct MarkResult {
+    tags: Vec<String>,
+    rating: u8,
+    label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take: Option<TakeMarks>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -849,6 +988,17 @@ fn conflict(rel: &WsPath) -> StoreError {
 }
 
 async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, String), ErrorBody> {
+    // Appendix H "Takes": exactly one of `files` and `takes`.
+    let chosen = match (args.files, args.takes) {
+        (Some(files), None) => Chosen::Files(files),
+        (None, Some(takes)) => Chosen::Takes(takes),
+        _ => {
+            return Err(invalid(
+                ctx,
+                "a sign-off names exactly one of files and takes".to_string(),
+            ));
+        }
+    };
     let a = asset_of(ctx, args.project, &args.asset_id).await?;
     let store = a.store().clone();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
@@ -874,7 +1024,17 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
     if let Ok(run_dir) = a.dir.join(&format!("candidates/{}", args.run_id)) {
         store.refuse_links(&run_dir).await.map_err(error)?;
     }
-    let filled = hash_unrecorded(&a, &m, &args.run_id, &args.files)
+    // The names to hash when a pre-2b run recorded none: a bad take is `plan_signoff`'s to
+    // report.
+    let names = m
+        .view()
+        .candidate_runs
+        .iter()
+        .find(|r| r.run_id.eq_ignore_ascii_case(&args.run_id))
+        .and_then(|run| chosen_files(run, &chosen).ok())
+        .map(|c| c.names)
+        .unwrap_or_default();
+    let filled = hash_unrecorded(&a, &m, &args.run_id, &names)
         .await
         .map_err(error)?;
     let by = signed_off_by(&ctx.session.caller);
@@ -883,7 +1043,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
     let (planned, version) = plan_signoff(
         &with_hashes(&m, &args.run_id, &filled),
         &args.run_id,
-        &args.files,
+        &chosen,
         bump,
         &args.keep_runs,
         &by,
@@ -972,17 +1132,16 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
     // An adopted seal was signed off when it was sealed: the manifest takes the snapshot's
     // date (ruling Q34).
     let sealed_on = sealed.signed_off_date.clone().filter(|_| sealed.adopted);
-    let (rel, run_id, files, keep) = (
+    let (rel, run_id, keep) = (
         a.manifest.clone(),
         run.run_id.clone(),
-        args.files.clone(),
         args.keep_runs.clone(),
     );
     let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
         let (mut out, again) = plan_signoff(
             &with_hashes(m, &run_id, &filled),
             &run_id,
-            &files,
+            &chosen,
             bump,
             &keep,
             &by,
@@ -1219,6 +1378,318 @@ async fn deprecate(
     Ok((StatusResult { status }, summary))
 }
 
+/// How an `asset.mark` call changes the asset's tags.
+#[derive(Debug, Clone)]
+enum TagsChange {
+    Keep,
+    Replace(Vec<String>),
+    Edit {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+}
+
+/// The take an `asset.mark` call addresses: `run_id` and one of `take` or `file`.
+#[derive(Debug, Clone)]
+struct TakeAddress {
+    run_id: String,
+    take: Option<u32>,
+    file: Option<String>,
+}
+
+/// An `asset.mark` call, its arguments checked.
+#[derive(Debug, Clone)]
+struct MarkRequest {
+    tags: TagsChange,
+    /// The take's with `take`, else the asset's.
+    rating: Option<u8>,
+    label: Option<Option<Label>>,
+    flag: Option<Option<Flag>>,
+    take: Option<TakeAddress>,
+}
+
+/// What [`apply_mark`] did: the result, and the view's values before for each mark it
+/// changed (the `mark` event's `previous`).
+#[derive(Debug, Clone)]
+struct Applied {
+    result: MarkResult,
+    previous: Map<String, Value>,
+}
+
+/// The checks that need no manifest (params.invalid otherwise).
+fn mark_request(ctx: &CallCtx, args: MarkArgs) -> Result<MarkRequest, ErrorBody> {
+    if args.tags.is_some() && !(args.add_tags.is_empty() && args.remove_tags.is_empty()) {
+        return Err(invalid(
+            ctx,
+            "tags replaces the tags; give it or add_tags/remove_tags, not both".to_string(),
+        ));
+    }
+    if args
+        .rating
+        .is_some_and(|r| r > lil_schema::marks::MAX_RATING)
+    {
+        return Err(invalid(ctx, "a rating is 0 to 5".to_string()));
+    }
+    let take = match args.run_id {
+        None if args.take.is_some() || args.file.is_some() || args.flag.is_some() => {
+            return Err(invalid(
+                ctx,
+                "a take's flag and rating need run_id and one of take or file".to_string(),
+            ));
+        }
+        None => None,
+        Some(run_id) => {
+            if args.take.is_some() == args.file.is_some() {
+                return Err(invalid(
+                    ctx,
+                    "with run_id, name exactly one of take or file".to_string(),
+                ));
+            }
+            if args.take == Some(0) {
+                return Err(invalid(ctx, "takes are numbered from 1".to_string()));
+            }
+            Some(TakeAddress {
+                run_id,
+                take: args.take,
+                file: args.file,
+            })
+        }
+    };
+    let tags = match args.tags {
+        Some(tags) => TagsChange::Replace(tags),
+        None if args.add_tags.is_empty() && args.remove_tags.is_empty() => TagsChange::Keep,
+        None => TagsChange::Edit {
+            add: args.add_tags,
+            remove: args.remove_tags,
+        },
+    };
+    Ok(MarkRequest {
+        tags,
+        rating: args.rating,
+        label: args.label.map(|l| l.map(Label::from)),
+        flag: args.flag.map(|f| f.map(Flag::from)),
+        take,
+    })
+}
+
+/// The take of `run` that `take` (its number) or `file` (any of its files, named by its bare
+/// name without regard to case, as `lil_schema::takes_of` compares names) addresses (P4b-R3):
+/// a companion addresses its take, whose primary holds the marks. The errors carry an empty
+/// trace id.
+///
+/// # Errors
+/// `params.invalid` unless exactly one of `take` and `file` is given; `asset.unknown` for a
+/// take the run doesn't have or a file in none of its takes.
+pub(crate) fn resolve_take(
+    run: &CandidateRun,
+    take: Option<u32>,
+    file: Option<&str>,
+) -> Result<Take, ErrorBody> {
+    let takes = takes_of(run);
+    let unknown = |what: String| {
+        ErrorBody::new(
+            &ASSET_UNKNOWN,
+            format!("The run `{}` has no {what}.", run.run_id),
+            "",
+        )
+    };
+    match (take, file) {
+        (Some(n), None) => takes
+            .into_iter()
+            .find(|t| t.n == n)
+            .ok_or_else(|| unknown(format!("take {n}"))),
+        (None, Some(file)) => {
+            let key = file.rsplit('/').next().unwrap_or(file).to_lowercase();
+            takes
+                .into_iter()
+                .find(|t| {
+                    std::iter::once(&t.primary)
+                        .chain(&t.companions)
+                        .any(|name| name.to_lowercase() == key)
+                })
+                .ok_or_else(|| unknown(format!("file `{file}` in a take")))
+        }
+        _ => Err(ErrorBody::new(
+            &PARAMS_INVALID,
+            "A take is named by exactly one of take or file.",
+            "",
+        )),
+    }
+}
+
+/// Applies `req` to `m` (Appendix H "Organising tools"): the asset's marks through
+/// `Manifest::set_marks` (tags normalised when this call writes them, P4b-R26), then the
+/// take's flag and rating through `Manifest::set_take_mark` on an open run. The errors carry
+/// an empty trace id; on an error `m` may be half-changed, so callers apply it to a copy or
+/// inside a manifest edit that is then not written.
+fn apply_mark(m: &mut Manifest, req: &MarkRequest) -> Result<Applied, ErrorBody> {
+    let bad = |why: String| ErrorBody::new(&PARAMS_INVALID, why, "");
+    let before = m.marks();
+    let mut marks = before.clone();
+    match &req.tags {
+        TagsChange::Keep => {}
+        TagsChange::Replace(tags) => marks.tags = normalise_tags(tags).map_err(bad)?,
+        TagsChange::Edit { add, remove } => {
+            let gone: BTreeSet<String> = remove.iter().map(|t| fold_tag(t.trim())).collect();
+            let mut tags: Vec<String> = before
+                .tags
+                .iter()
+                .filter(|t| !gone.contains(&fold_tag(t.trim())))
+                .cloned()
+                .collect();
+            tags.extend(add.iter().cloned());
+            marks.tags = normalise_tags(&tags).map_err(bad)?;
+        }
+    }
+    if req.take.is_none()
+        && let Some(rating) = req.rating
+    {
+        marks.rating = rating;
+    }
+    if let Some(label) = req.label {
+        marks.label = label;
+    }
+    m.set_marks(&marks).map_err(bad)?;
+    let after = m.marks();
+    let label_value = |l: Option<Label>| l.map_or(Value::Null, |l| Value::from(l.as_str()));
+    let mut previous = Map::new();
+    if after.tags != before.tags {
+        previous.insert("tags".into(), json!(before.tags));
+    }
+    if after.rating != before.rating {
+        previous.insert("rating".into(), json!(before.rating));
+    }
+    if after.label != before.label {
+        previous.insert("label".into(), label_value(before.label));
+    }
+
+    let take = match &req.take {
+        None => None,
+        Some(addr) => {
+            let view = m.view();
+            let Some(run) = view
+                .candidate_runs
+                .iter()
+                .find(|r| r.run_id.eq_ignore_ascii_case(&addr.run_id))
+            else {
+                return Err(ErrorBody::new(
+                    &ASSET_UNKNOWN,
+                    format!(
+                        "The asset `{}` has no candidate run `{}`; asset.get lists its runs.",
+                        view.asset_id, addr.run_id
+                    ),
+                    "",
+                ));
+            };
+            if !matches!(run.status.as_deref(), None | Some("open")) || run.trashed_utc.is_some() {
+                return Err(ErrorBody::new(
+                    &STATUS_INVALID_TRANSITION,
+                    "This run is closed: its marks don't change after sign-off.",
+                    "",
+                ));
+            }
+            let t = resolve_take(run, addr.take, addr.file.as_deref())?;
+            m.set_take_mark(&run.run_id, t.n, req.flag, req.rating)
+                .map_err(|why| ErrorBody::new(&MANIFEST_NEEDS_REPAIR, why, ""))?;
+            let run_id = run.run_id.clone();
+            let now = m
+                .view()
+                .candidate_runs
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .and_then(|r| takes_of(r).into_iter().find(|n| n.n == t.n))
+                .unwrap_or_else(|| t.clone());
+            if now.flag != t.flag {
+                previous.insert("flag".into(), json!(t.flag.map(Flag::as_str)));
+            }
+            if now.rating != t.rating {
+                previous.insert("rating".into(), json!(t.rating));
+            }
+            Some(TakeMarks {
+                run_id,
+                take: t.n,
+                flag: now.flag.map(|f| f.as_str().to_string()),
+                rating: now.rating,
+            })
+        }
+    };
+    Ok(Applied {
+        result: MarkResult {
+            tags: after.tags,
+            rating: after.rating,
+            label: after.label.map(|l| l.as_str().to_string()),
+            take,
+        },
+        previous,
+    })
+}
+
+async fn mark(ctx: &CallCtx, args: MarkArgs) -> Result<(MarkResult, String), ErrorBody> {
+    let project = args.project.clone();
+    let asset_id = args.asset_id.clone();
+    let req = mark_request(ctx, args)?;
+    let a = asset_of(ctx, project, &asset_id).await?;
+    let store = a.store().clone();
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    // The asset's version lock, as `asset.signoff` holds it from its seal to its manifest
+    // edit: a mark never lands between the two.
+    let guard = store
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
+    let Some(m) = read_manifest(&store, &a.manifest).await.map_err(error)? else {
+        return Err(unknown_asset(ctx, &a));
+    };
+    // The refusals, with their own codes, on a copy; the edit applies the same again.
+    apply_mark(&mut m.clone(), &req).map_err(|e| traced(ctx, e))?;
+    let applied: Arc<std::sync::Mutex<Option<Applied>>> = Arc::default();
+    let seen = applied.clone();
+    let rel = a.manifest.clone();
+    let edit = move |m: &mut Manifest| {
+        if m.get("asset_id").is_none() {
+            return Err(StoreError::NeedsRepair(rel.clone()));
+        }
+        // Refused now though the copy passed: the manifest changed meanwhile.
+        let out = apply_mark(m, &req).map_err(|e| {
+            if e.code == STATUS_INVALID_TRANSITION.code {
+                return StoreError::InvalidTransition(e.message);
+            }
+            tracing::warn!(path = %rel, code = %e.code, why = %e.message, "the manifest changed during a mark");
+            conflict(&rel)
+        })?;
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
+        Ok(())
+    };
+    // The manifest, then the index (the store's change sink refreshes it), then the events.
+    store
+        .edit_manifest(&a.manifest, &edit)
+        .await
+        .map_err(error)?;
+    drop(guard);
+    let Applied { result, previous } = applied
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the manifest edit ran");
+    if !previous.is_empty() {
+        let mut event = json!({"kind": "mark", "asset": a.asset_id});
+        if let Some(t) = &result.take {
+            event["run_id"] = json!(t.run_id);
+            event["take"] = json!(t.take);
+        }
+        event["previous"] = Value::Object(previous);
+        ctx.events.publish(&a.topic(), event.clone());
+        ctx.events.publish(&format!("project:{}", a.project), event);
+    }
+    let summary = match &result.take {
+        Some(t) => format!("marked {} take {} of run {}", a.asset_id, t.take, t.run_id),
+        None => format!("marked {}", a.asset_id),
+    };
+    Ok((result, summary))
+}
+
 /// The `links` source a pinned ref names from `project`: `proj:<slug>` for another project's
 /// asset, `lib:<item>` for a library item; `None` otherwise.
 fn link_source(project: &str, r: &str) -> Result<Option<String>, ()> {
@@ -1316,7 +1787,7 @@ async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), 
 }
 
 /// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,
-/// `asset.pin_input` and `asset.deprecate` (module `workspace`).
+/// `asset.pin_input`, `asset.deprecate` and `asset.mark` (module `workspace`).
 pub fn register_asset_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "asset.import",
@@ -1359,5 +1830,12 @@ pub fn register_asset_tools(reg: &mut Registry) {
         EffectClass::Write,
         WORKSPACE_MODULE,
         |ctx, args: DeprecateArgs| Box::pin(deprecate(ctx, args)),
+    ));
+    reg.register(typed_tool(
+        "asset.mark",
+        MARK_DESCRIPTION,
+        EffectClass::Write,
+        WORKSPACE_MODULE,
+        |ctx, args: MarkArgs| Box::pin(mark(ctx, args)),
     ));
 }

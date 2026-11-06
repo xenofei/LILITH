@@ -914,15 +914,18 @@ fn the_listing_tools_are_pinned() {
     assert_eq!(found, expected);
 }
 
-/// The plan-4b organising rows (Appendix H "Organising tools"): `asset.deprecate` writes in
-/// `workspace`.
-#[test] // spec: CORE-170, CORE-146, CORE-058
+/// The plan-4b organising rows (Appendix H "Organising tools"): `asset.deprecate` and
+/// `asset.mark` write in `workspace`.
+#[test] // spec: CORE-170, CORE-152, CORE-146, CORE-058
 fn the_organising_tools_are_pinned() {
     let env = TestEnv::new();
     let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
     let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
     let row = |name: &str, effect, module: &str| (name.to_string(), effect, module.to_string());
-    let expected = vec![row("asset.deprecate", EffectClass::Write, WORKSPACE_MODULE)];
+    let expected = vec![
+        row("asset.deprecate", EffectClass::Write, WORKSPACE_MODULE),
+        row("asset.mark", EffectClass::Write, WORKSPACE_MODULE),
+    ];
     let found: Vec<(String, EffectClass, String)> = reg
         .descriptors()
         .into_iter()
