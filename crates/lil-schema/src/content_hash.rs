@@ -34,7 +34,7 @@ pub fn is_os_metadata(name: &str) -> bool {
 /// The content hash of a version. `files` holds `(path relative to v<version>/ with '/',
 /// sha256 hex)` pairs in any order.
 pub fn version_content_hash(files: &[(String, String)]) -> String {
-    let mut lines: Vec<(&str, &str)> = files
+    let lines: Vec<(&str, &str)> = files
         .iter()
         .filter(|(rel, _)| {
             !rel.starts_with("source/")
@@ -43,10 +43,19 @@ pub fn version_content_hash(files: &[(String, String)]) -> String {
         })
         .map(|(rel, sha)| (rel.as_str(), sha.as_str()))
         .collect();
-    lines.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    lines_sha256(lines)
+}
+
+/// The SHA-256 (lowercase hex) of the lines `<sha256>  <name>\n`, one per `(name, sha256)`
+/// pair, sorted by name and then hash in byte order: the version content-hash form, which a
+/// take hash also uses (P4b-R13).
+pub(crate) fn lines_sha256(mut lines: Vec<(&str, &str)>) -> String {
+    lines.sort_unstable_by(|a, b| {
+        (a.0.as_bytes(), a.1.as_bytes()).cmp(&(b.0.as_bytes(), b.1.as_bytes()))
+    });
     let mut hasher = Sha256::new();
-    for (rel, sha) in lines {
-        hasher.update(format!("{sha}  {rel}\n").as_bytes());
+    for (name, sha) in lines {
+        hasher.update(format!("{sha}  {name}\n").as_bytes());
     }
     hex(&hasher.finalize())
 }

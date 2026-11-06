@@ -520,6 +520,7 @@ fn auto_pick_prefers_vision_score_then_lowest_passing_seed() {
         role: "candidate".into(),
         from: None,
         sha256: None,
+        ..Default::default()
     };
     let files = [
         f("a.png", Some(30)),
