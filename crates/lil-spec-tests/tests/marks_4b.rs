@@ -24,6 +24,13 @@ fn mark(c: &mut impl Caller, asset_id: &str, args: Value) -> Value {
     write_ok(c, "asset.mark", all)
 }
 
+/// The tags of a mark result, manifest or summary, sorted: tag order isn't a contract.
+fn tag_set(v: &Value) -> Vec<String> {
+    let mut tags = strings(&v["tags"]);
+    tags.sort();
+    tags
+}
+
 /// The count of `value` in the facet `name` (`None` when the facet doesn't list it).
 fn facet(page: &Value, name: &str, value: &Value) -> Option<u64> {
     page["facets"][name]
@@ -46,11 +53,11 @@ fn marks_round_trip_and_filter() {
         CRANE,
         json!({"tags": ["Tree", "oak"], "rating": 4, "label": "red"}),
     );
-    assert_eq!(marked["tags"], json!(["Tree", "oak"]), "{marked}");
+    assert_eq!(tag_set(&marked), ["Tree", "oak"], "{marked}");
     assert_eq!(marked["rating"], 4, "{marked}");
     assert_eq!(marked["label"], "red", "{marked}");
     let manifest = s.manifest(CRANE);
-    assert_eq!(manifest["tags"], json!(["Tree", "oak"]), "{manifest}");
+    assert_eq!(tag_set(&manifest), ["Tree", "oak"], "{manifest}");
     assert_eq!(manifest["rating"], 4, "{manifest}");
     assert_eq!(manifest["label"], "red", "{manifest}");
 
@@ -59,7 +66,7 @@ fn marks_round_trip_and_filter() {
         CRANE,
         json!({"add_tags": ["birch"], "remove_tags": ["OAK"]}),
     );
-    assert_eq!(changed["tags"], json!(["Tree", "birch"]), "{changed}");
+    assert_eq!(tag_set(&changed), ["Tree", "birch"], "{changed}");
 
     // A lamp in red rated 2, and a kite in blue rated 5.
     mark(&mut s.pipe, LAMP, json!({"rating": 2, "label": "red"}));
@@ -70,7 +77,7 @@ fn marks_round_trip_and_filter() {
     let trees = query(&mut s.pipe, json!({"tags": ["TREE"]}));
     assert_eq!(ids_of(&trees), [CRANE], "{trees}");
     let crane = summary_of(&trees, CRANE);
-    assert_eq!(crane["tags"], json!(["Tree", "birch"]), "{crane}");
+    assert_eq!(tag_set(crane), ["Tree", "birch"], "{crane}");
     assert_eq!(crane["rating"], 4, "{crane}");
     assert_eq!(crane["label"], "red", "{crane}");
 
@@ -212,8 +219,9 @@ fn facets_are_counted_with_the_page() {
     assert_eq!(facet(&red, "label", &json!("red")), Some(1), "{red}");
     assert_eq!(facet(&red, "label", &json!("blue")), Some(1), "{red}");
     assert_eq!(facet(&red, "tags", &json!("tree")), Some(1), "{red}");
-    assert_eq!(facet(&red, "tags", &json!("lamp")), None, "{red}");
-    assert_eq!(facet(&red, "rating", &json!(2)), None, "{red}");
+    // A value the other filters leave out counts 0, listed or not.
+    assert_eq!(facet(&red, "tags", &json!("lamp")).unwrap_or(0), 0, "{red}");
+    assert_eq!(facet(&red, "rating", &json!(2)).unwrap_or(0), 0, "{red}");
 }
 
 #[test] // spec: CORE-168

@@ -150,9 +150,33 @@ pub fn asset_dir(ws: &Path, asset_id: &str) -> PathBuf {
     ws_path(ws, &format!("projects/{PROJECT}/assets/{asset_id}"))
 }
 
-/// The manifest of the sketchbook asset `asset_id` in `ws`, as JSON.
+/// The manifest file of the sketchbook asset folder `asset_id` in `ws`, found as the index finds
+/// a folder's manifest: `<asset_id>.manifest.json` when it exists, else the folder's one
+/// `*.manifest.json`. A folder moved, copied or restored under another name keeps its manifest's
+/// file name, and no spec text says a repair renames it.
+///
+/// # Panics
+/// If the folder holds no `*.manifest.json`, or several and none named for the folder.
+pub fn manifest_path(ws: &Path, asset_id: &str) -> PathBuf {
+    let dir = asset_dir(ws, asset_id);
+    let named = dir.join(format!("{asset_id}.manifest.json"));
+    if named.is_file() {
+        return named;
+    }
+    let found = files_named(&dir, "", ".manifest.json");
+    match found.as_slice() {
+        [one] => one.clone(),
+        _ => panic!(
+            "{} holds {} *.manifest.json files, not one: {found:?}",
+            dir.display(),
+            found.len()
+        ),
+    }
+}
+
+/// The manifest of the sketchbook asset folder `asset_id` in `ws`, as JSON ([`manifest_path`]).
 pub fn manifest_of(ws: &Path, asset_id: &str) -> Value {
-    let path = asset_dir(ws, asset_id).join(format!("{asset_id}.manifest.json"));
+    let path = manifest_path(ws, asset_id);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()))
 }
@@ -161,7 +185,7 @@ pub fn manifest_of(ws: &Path, asset_id: &str) -> Value {
 /// manifest of `asset_id` in `ws`, as a person editing the file would; the rest of the file is
 /// kept byte for byte.
 pub fn add_manifest_fields(ws: &Path, asset_id: &str, fields: &str) {
-    let path = asset_dir(ws, asset_id).join(format!("{asset_id}.manifest.json"));
+    let path = manifest_path(ws, asset_id);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let at = text
         .find('{')
@@ -176,7 +200,7 @@ pub fn add_manifest_fields(ws: &Path, asset_id: &str, fields: &str) {
 /// Replaces the one occurrence of `from` with `to` in the manifest of `asset_id` in `ws`, as a
 /// person editing the file would.
 pub fn edit_manifest_text(ws: &Path, asset_id: &str, from: &str, to: &str) {
-    let path = asset_dir(ws, asset_id).join(format!("{asset_id}.manifest.json"));
+    let path = manifest_path(ws, asset_id);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     assert_eq!(
         text.matches(from).count(),
@@ -369,12 +393,15 @@ pub fn pending_view(app: &mut TestApp, tool: &str) -> Value {
         .unwrap_or_else(|| panic!("no pending confirmation of {tool}"))
 }
 
-/// The app's own call of `tool`, which asks first (an "asks every caller" tool): the call gets
-/// `pending_confirmation`, the app approves it, and the retry with the same key runs. Returns
-/// the retry's `Outcome`.
+/// The app's own call of `tool`: when it gets `pending_confirmation` (an "asks every caller"
+/// tool), the app approves it and the call is retried with the same key. Returns the last
+/// `Outcome`.
 pub fn app_call_confirmed(app: &mut TestApp, tool: &str, args: Value) -> Value {
     let k = key();
     let first = app.tool(tool, args.clone(), Some(&k));
+    if first["status"] != "pending_confirmation" {
+        return first;
+    }
     let id = pending_id(&first);
     answer(app, &id, json!({"answer": "approve"}));
     app.tool(tool, args, Some(&k))

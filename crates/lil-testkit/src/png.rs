@@ -46,7 +46,8 @@ pub fn rgba(w: u32, h: u32, pixels: &[u8]) -> Vec<u8> {
 ///
 /// # Panics
 /// If `png` doesn't start with the signature and an `IHDR`, if `key` isn't 1–79 Latin-1
-/// printable characters, or if either string holds a character outside Latin-1 or a NUL.
+/// printable characters without leading, trailing or consecutive spaces, or if either string
+/// holds a character outside Latin-1 or a NUL.
 pub fn with_text(png: &[u8], key: &str, value: &str) -> Vec<u8> {
     assert!(
         (1..=79).contains(&key.chars().count())
@@ -54,6 +55,10 @@ pub fn with_text(png: &[u8], key: &str, value: &str) -> Vec<u8> {
                 .chars()
                 .all(|c| matches!(c as u32, 0x20..=0x7e | 0xa1..=0xff)),
         "a tEXt keyword is 1-79 printable Latin-1 characters: {key:?}"
+    );
+    assert!(
+        !key.starts_with(' ') && !key.ends_with(' ') && !key.contains("  "),
+        "a tEXt keyword has no leading, trailing or consecutive spaces: {key:?}"
     );
     let ihdr_end = SIGNATURE.len() + 12 + 13;
     assert!(
@@ -212,13 +217,16 @@ mod tests {
         out
     }
 
-    /// Reads a zlib stream of stored blocks back, checking its header and Adler-32.
-    fn inflate_stored(z: &[u8]) -> Vec<u8> {
+    /// Reads a zlib stream of stored blocks back, checking its header and Adler-32: the data
+    /// and the number of blocks.
+    fn inflate_stored(z: &[u8]) -> (Vec<u8>, usize) {
         assert_eq!(z[0] & 0x0f, 8, "deflate");
         assert_eq!((u16::from(z[0]) << 8 | u16::from(z[1])) % 31, 0, "FCHECK");
         let mut at = 2;
         let mut out = Vec::new();
+        let mut blocks = 0;
         loop {
+            blocks += 1;
             let header = z[at];
             assert_eq!(header >> 1 & 3, 0, "a stored block");
             let len = u16::from_le_bytes([z[at + 1], z[at + 2]]);
@@ -233,7 +241,7 @@ mod tests {
         let adler = u32::from_be_bytes(z[at..at + 4].try_into().unwrap());
         assert_eq!(adler, adler32(&out), "the Adler-32 trailer");
         assert_eq!(at + 4, z.len(), "the trailer ends the stream");
-        out
+        (out, blocks)
     }
 
     fn pattern(w: u32, h: u32) -> Vec<u8> {
@@ -262,7 +270,8 @@ mod tests {
         assert_eq!(chunks[0].1, [0, 0, 0, 200, 0, 0, 0, 100, 8, 6, 0, 0, 0]);
         assert!(png.ends_with(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82]));
 
-        let raw = inflate_stored(&chunks[1].1);
+        let (raw, blocks) = inflate_stored(&chunks[1].1);
+        assert_eq!(blocks, 2, "80,100 bytes need two stored blocks");
         assert_eq!(raw.len(), pixels.len() + h as usize);
         for (y, line) in raw.chunks(w as usize * 4 + 1).enumerate() {
             assert_eq!(line[0], 0, "row {y}'s filter byte");
@@ -306,10 +315,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "no leading, trailing or consecutive spaces")]
+    fn with_text_refuses_a_keyword_with_double_spaces() {
+        with_text(&rgba(1, 1, &[0; 4]), "two  spaces", "x");
+    }
+
+    #[test]
     fn a_one_pixel_image_is_one_final_block() {
         let png = rgba(1, 1, &[1, 2, 3, 4]);
         let idat = &chunks(&png)[1].1;
         assert_eq!(idat[2], 1, "BFINAL set, BTYPE stored");
-        assert_eq!(inflate_stored(idat), [0, 1, 2, 3, 4]);
+        let (raw, blocks) = inflate_stored(idat);
+        assert_eq!((raw.as_slice(), blocks), ([0, 1, 2, 3, 4].as_slice(), 1));
     }
 }

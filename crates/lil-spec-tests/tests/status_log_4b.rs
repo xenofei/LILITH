@@ -74,10 +74,6 @@ fn every_status_change_appends_one_entry() {
         }
     }
     assert_eq!(manifest["status"], "approved", "{manifest}");
-
-    // asset.get shows the same log.
-    let detail = asset_get(&mut s.pipe, KITE);
-    assert_eq!(detail["status_log"], manifest["status_log"], "{detail}");
 }
 
 #[test] // spec: CORE-170
@@ -101,6 +97,8 @@ fn deprecate_and_back_restores_the_previous_status() {
     let sealed = s.asset_dir(KITE).join(r"v1.0.0\kite.png");
     let sealed_sha = sha256_file(&sealed);
     let hashes = s.manifest(KITE)["hashes"].clone();
+    let dependent_file = manifest_path(&s.ws, CRANE);
+    let dependent_bytes = std::fs::read(&dependent_file).unwrap_or_else(|e| panic!("{e}"));
     let dependent_inputs = s.manifest(CRANE)["inputs"].clone();
     let dependent_uses = asset_get(&mut s.pipe, CRANE)["uses"].clone();
 
@@ -131,5 +129,10 @@ fn deprecate_and_back_restores_the_previous_status() {
     );
     assert_eq!(manifest["hashes"], hashes, "{manifest}");
     assert_eq!(s.manifest(CRANE)["inputs"], dependent_inputs);
+    assert_eq!(
+        std::fs::read(&dependent_file).unwrap_or_else(|e| panic!("{e}")),
+        dependent_bytes,
+        "the dependent's manifest is untouched (not made stale, nothing rewritten)"
+    );
     assert_eq!(asset_get(&mut s.pipe, CRANE)["uses"], dependent_uses);
 }

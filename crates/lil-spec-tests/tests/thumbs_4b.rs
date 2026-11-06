@@ -118,7 +118,7 @@ fn thumbs_request_returns_ready_or_pending_then_ready() {
     assert!(
         thumb["renderer"]
             .as_str()
-            .is_some_and(|r| r.starts_with("image")),
+            .is_some_and(|r| matches!(r, "image" | "image@1")),
         "{thumb}"
     );
     assert_eq!(thumb["px"], 384, "round(256 x 1.5): {thumb}");
@@ -188,7 +188,7 @@ fn non_images_get_the_icon_state() {
             assert!(
                 thumb["renderer"]
                     .as_str()
-                    .is_some_and(|r| r.starts_with("icon")),
+                    .is_some_and(|r| matches!(r, "icon" | "icon@1")),
                 "{thumb}"
             );
         }

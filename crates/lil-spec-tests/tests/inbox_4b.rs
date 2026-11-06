@@ -17,7 +17,10 @@ use serde_json::{Value, json};
 use support::*;
 
 /// A ComfyUI API-format `prompt`: a sampler with seed 4242, a checkpoint loader and the two
-/// text encoders its `positive` and `negative` links reach.
+/// text encoders its `positive` and `negative` links reach, decoded and saved. Appendix H takes
+/// `model` from "the first `CheckpointLoader`- or `UNETLoader`-class node"; the loader here is
+/// `CheckpointLoaderSimple`, the class real ComfyUI graphs use, read as a `class_type` that
+/// starts with `CheckpointLoader`.
 const PROMPT: &str = r#"{
   "3": {"class_type": "KSampler", "inputs": {"seed": 4242, "steps": 20, "model": ["4", 0],
         "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0]}},
@@ -25,6 +28,7 @@ const PROMPT: &str = r#"{
   "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 8, "height": 8, "batch_size": 1}},
   "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a paper crane at dawn", "clip": ["4", 1]}},
   "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry", "clip": ["4", 1]}},
+  "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
   "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": "ComfyUI"}}
 }"#;
 

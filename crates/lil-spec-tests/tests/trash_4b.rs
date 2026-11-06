@@ -24,8 +24,7 @@ fn trash_args() -> Value {
     json!({"project": PROJECT, "asset_id": CRANE})
 }
 
-/// The app trashes the crane: it asks, the app approves and the retry runs. Returns the
-/// `entry_id`.
+/// The app trashes the crane, approving it when it asks. Returns the `entry_id`.
 fn trash_crane(app: &mut TestApp) -> String {
     let ran = app_call_confirmed(app, "asset.trash", trash_args());
     assert_eq!(ran["status"], "ok", "{ran}");
@@ -33,18 +32,6 @@ fn trash_crane(app: &mut TestApp) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("no entry_id: {ran}"))
         .to_string()
-}
-
-/// The app's `asset.trash` of the crane, approved if it asks: the last `Outcome`.
-fn try_trash_crane(app: &mut TestApp) -> Value {
-    let k = key();
-    let first = app.tool("asset.trash", trash_args(), Some(&k));
-    if first["status"] != "pending_confirmation" {
-        return first;
-    }
-    let id = pending_id(&first);
-    answer(app, &id, json!({"answer": "approve"}));
-    app.tool("asset.trash", trash_args(), Some(&k))
 }
 
 /// The sealed ref of the crane's first version, without the hash.
@@ -224,7 +211,7 @@ fn trash_refused_while_in_use() {
         "test.job",
         json!({"lane": "cpu", "gated": true, "asset": {"project": PROJECT, "asset_id": CRANE}}),
     );
-    let refused = try_trash_crane(&mut app);
+    let refused = app_call_confirmed(&mut app, "asset.trash", trash_args());
     assert_eq!(error_code(&refused), "asset.in_use", "{refused}");
     assert!(s.asset_dir(CRANE).is_dir(), "nothing moved");
     assert!(asset_trash_entries(&mut s.pipe).is_empty());
@@ -238,7 +225,7 @@ fn trash_refused_while_in_use() {
         "test.hold",
         json!({"doc_id": "doc_crane", "path": format!("{CRANE_DIR}work/sketch.lil")}),
     );
-    let refused = try_trash_crane(&mut app);
+    let refused = app_call_confirmed(&mut app, "asset.trash", trash_args());
     assert_eq!(error_code(&refused), "asset.in_use", "{refused}");
     assert!(s.asset_dir(CRANE).is_dir(), "nothing moved");
     assert!(asset_trash_entries(&mut s.pipe).is_empty());
