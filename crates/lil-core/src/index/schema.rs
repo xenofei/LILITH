@@ -5,10 +5,17 @@
 //! `-wal` and `-shm` (through `store::fsops::remove_file`), and created afresh; the caller then
 //! runs a cold rebuild. WAL, `synchronous=NORMAL`.
 //!
-//! Tables: `files` (one row per file, keyed by the path's case-folded key), `assets` (one row
-//! per asset folder), `edges` (manifest inputs), `assets_fts` (FTS5 over each asset's text), and
-//! two of the index's own: `expected` (the hash each manifest records for a file, and whether
-//! the suite still expects that file on disk) and `meta` (the last scan's start).
+//! Tables: `files` (one row per file, keyed by the path's case-folded key, with its `kind`:
+//! `sealed`, `candidate`, `work` or `other`), `assets` (one row per asset folder, with its marks
+//! and tile fields), `asset_tags` (each asset's tags, their fold and their place in the
+//! manifest's list), `take_marks` (the takes of
+//! every run not trashed, with their flag and rating), `edges` (manifest inputs), `assets_fts`
+//! (FTS5 over each asset's text), and two of the index's own: `expected` (the hash each manifest
+//! records for a file, and whether the suite still expects that file on disk) and `meta` (the
+//! last scan's start).
+//!
+//! The connection's page cache is 64 MiB (`cache_size = -65536`; owner decision 2026-11-05,
+//! APP-138, P4b-R23).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,10 +43,12 @@ CREATE TABLE files (
     attributes INTEGER NOT NULL,
     sha256 TEXT,
     state TEXT NOT NULL,
-    verified INTEGER NOT NULL
+    verified INTEGER NOT NULL,
+    kind TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX files_asset ON files(project, asset_id);
 CREATE INDEX files_unverified ON files(verified) WHERE verified = 0;
+CREATE INDEX files_sha ON files(sha256) WHERE sha256 IS NOT NULL;
 CREATE TABLE assets (
     id INTEGER PRIMARY KEY,
     project TEXT NOT NULL,
@@ -52,11 +61,38 @@ CREATE TABLE assets (
     creation_uuid TEXT,
     updated INTEGER NOT NULL,
     needs_repair INTEGER NOT NULL,
+    rating INTEGER NOT NULL DEFAULT 0,
+    label TEXT,
+    runs_waiting INTEGER NOT NULL DEFAULT 0,
+    external INTEGER NOT NULL DEFAULT 0,
+    working_doc INTEGER NOT NULL DEFAULT 0,
+    display TEXT,
+    last_change TEXT,
+    repair TEXT,
     UNIQUE (project, asset_id)
 );
 CREATE INDEX assets_by_status ON assets(COALESCE(status, ''), project, asset_id);
 CREATE INDEX assets_by_type ON assets(COALESCE(asset_type, ''), project, asset_id);
 CREATE INDEX assets_by_updated ON assets(updated, project, asset_id);
+CREATE TABLE asset_tags (
+    project TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    tag_fold TEXT NOT NULL,
+    pos INTEGER NOT NULL,
+    PRIMARY KEY (project, asset_id, tag_fold)
+) WITHOUT ROWID;
+CREATE INDEX asset_tags_fold ON asset_tags(tag_fold, tag);
+CREATE TABLE take_marks (
+    project TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    take INTEGER NOT NULL,
+    flag TEXT,
+    rating INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project, asset_id, run_id, take)
+) WITHOUT ROWID;
+CREATE INDEX take_marks_flag ON take_marks(flag);
 CREATE TABLE edges (
     from_project TEXT NOT NULL,
     from_asset TEXT NOT NULL,
@@ -87,7 +123,23 @@ fn sql(e: &rusqlite::Error) -> IndexError {
     IndexError::Sql(e.to_string())
 }
 
-/// `busy_timeout`, then WAL (file databases only) and `synchronous=NORMAL`.
+/// `PRAGMA cache_size`: 64 MiB, as KiB (negative).
+const CACHE_KIB: i64 = -65_536;
+
+/// The tables [`open_existing`] checks for.
+const TABLES: [&str; 8] = [
+    "files",
+    "assets",
+    "asset_tags",
+    "take_marks",
+    "edges",
+    "assets_fts",
+    "expected",
+    "meta",
+];
+
+/// `busy_timeout`, then WAL (file databases only), `synchronous=NORMAL` and the 64 MiB page
+/// cache.
 fn configure(conn: &Connection, wal: bool) -> rusqlite::Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     if wal {
@@ -97,7 +149,8 @@ fn configure(conn: &Connection, wal: bool) -> rusqlite::Result<()> {
             return Err(rusqlite::Error::InvalidQuery);
         }
     }
-    conn.pragma_update(None, "synchronous", "NORMAL")
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "cache_size", CACHE_KIB)
 }
 
 /// Creates the tables and sets `user_version`.
@@ -175,10 +228,13 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     if report != ["ok"] {
         return Err(format!("quick_check: {}", report.join("; ")));
     }
-    for table in ["files", "assets", "edges", "assets_fts", "expected", "meta"] {
+    for table in TABLES {
         conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
             .map_err(|e| format!("table {table}: {e}"))?;
     }
+    // A schema-2 file made before `asset_tags.pos` existed (never released) is rebuilt too.
+    conn.prepare("SELECT pos FROM asset_tags LIMIT 0")
+        .map_err(|e| format!("asset_tags.pos: {e}"))?;
     configure(&conn, true).map_err(|e| e.to_string())?;
     Ok(conn)
 }
@@ -223,7 +279,11 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, INDEX_SCHEMA_VERSION);
-        for table in ["files", "assets", "edges", "assets_fts", "expected", "meta"] {
+        let cache: i64 = conn
+            .pragma_query_value(None, "cache_size", |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache, CACHE_KIB);
+        for table in TABLES {
             conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
                 .unwrap_or_else(|e| panic!("{table}: {e}"));
         }

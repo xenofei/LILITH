@@ -5,7 +5,11 @@
 //! - [`reconcile`]: the walk, the per-file decision (size, last write, FileId, ChangeTime),
 //!   stable-snapshot hashing, parked reads, manifests parsed into `assets` and `edges`,
 //!   `missing` files, the cold rebuild and the store's change events;
-//! - [`query`]: `assets.query`'s keyset paging and its opaque cursor.
+//! - [`query`]: `assets.query`'s keyset paging, filters and facets, and its opaque cursor.
+//!
+//! Schema 2 (plan 4b) adds the marks and tile fields of each asset, its tags (`asset_tags`), the
+//! takes of every run not trashed (`take_marks`), and each file's `kind` with an index on its
+//! SHA-256 (duplicates, CORE-168).
 //!
 //! One SQLite connection lives on its own thread (`lil-index-<id>`); callers send it jobs and
 //! await the answer, as `state` does. Walking and hashing run on blocking threads, never on
@@ -40,11 +44,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::store::{ChangeSink, StoreEvent, WsPath, path_key};
 
 pub use query::{
-    AssetPage, AssetQuery, Keyset, SortDir, SortField, decode_cursor, encode_cursor, query_hash,
+    AssetPage, AssetQuery, Choice, CollectionFilter, DeprecatedFilter, FacetCount, Facets, Keyset,
+    SortDir, SortField, TAGS_FACET_MAX, decode_cursor, encode_cursor, query_hash,
 };
 
-/// `PRAGMA user_version` of `index.db`.
-pub const INDEX_SCHEMA_VERSION: i64 = 1;
+/// `PRAGMA user_version` of `index.db`: 2 since plan 4b (marks, tags, takes, file kinds, tile
+/// fields). An index of another version is removed and rebuilt.
+pub const INDEX_SCHEMA_VERSION: i64 = 2;
 
 /// Paths parked after an unstable or locked read, at most (beyond that, the next rescan picks
 /// them up).
@@ -154,6 +160,18 @@ pub enum FileKind {
     Other,
 }
 
+impl FileKind {
+    /// The `files.kind` column: `candidate`, `sealed`, `work`, or `other` (a manifest too).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileKind::Candidate => "candidate",
+            FileKind::Sealed => "sealed",
+            FileKind::Work => "work",
+            FileKind::Manifest | FileKind::Other => "other",
+        }
+    }
+}
+
 /// The asset folder a path is in: `projects/<p>/assets/<a>/…` → `(p, a)`.
 pub(crate) fn asset_of(path: &str) -> Option<(&str, &str)> {
     let mut parts = path.split('/');
@@ -225,6 +243,36 @@ pub struct AssetRow {
     pub updated: i64,
     /// The manifest doesn't parse, or its `asset_id` or `project` disagrees with the folder.
     pub needs_repair: bool,
+    /// The asset's tags as written (by their fold).
+    pub tags: Vec<String>,
+    /// 0–5; 0 is unrated.
+    pub rating: u8,
+    /// `red`, `yellow`, `green`, `blue` or `purple`.
+    pub label: Option<String>,
+    /// Open runs (not trashed).
+    pub runs_waiting: u32,
+    /// The manifest lists a link-external file.
+    pub external: bool,
+    /// `has_working_doc`.
+    pub working_doc: bool,
+    /// `{path, sha256, media_kind}`, `path` workspace-relative (P4b-R30).
+    pub display: Option<serde_json::Value>,
+    /// The newest status-log entry: `{to, by, utc}`.
+    pub last_change: Option<serde_json::Value>,
+    /// `{kind, from?, to?, other?}` (Task 8 fills it).
+    pub repair: Option<serde_json::Value>,
+}
+
+/// An `edges` row: `from` names `to` as an input (`input`) or a pin (`pinned`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeRow {
+    pub from_project: String,
+    pub from_asset: String,
+    pub to_project: String,
+    pub to_asset: String,
+    pub to_version: Option<String>,
+    /// `input` or `pinned`.
+    pub kind: String,
 }
 
 /// What a reconcile did.
@@ -647,7 +695,8 @@ impl Index {
         reconcile::verify(self, max_files).await
     }
 
-    /// One page of assets, and the exact total, read in one transaction.
+    /// One page of assets, the exact total and, with `q.facets`, the facets, read in one
+    /// transaction.
     ///
     /// # Errors
     /// [`IndexError::Sql`] when the database fails.
@@ -671,7 +720,7 @@ impl Index {
             .call(move |conn| {
                 conn.query_row(
                     &format!(
-                        "SELECT {} FROM assets WHERE project = ?1 AND asset_id = ?2",
+                        "SELECT {} FROM assets a WHERE a.project = ?1 AND a.asset_id = ?2",
                         query::ASSET_COLUMNS
                     ),
                     params![project, asset_id],
@@ -721,7 +770,7 @@ impl Index {
             .call(move |conn| {
                 let mut stmt = conn
                     .prepare(&format!(
-                        "SELECT {} FROM assets WHERE project = ?1 ORDER BY asset_id",
+                        "SELECT {} FROM assets a WHERE a.project = ?1 ORDER BY a.asset_id",
                         query::ASSET_COLUMNS
                     ))
                     .map_err(|e| sql(&e))?;
@@ -931,6 +980,47 @@ impl Index {
                 stmt.query_map(params![project, asset_id], |r| Ok((r.get(0)?, r.get(1)?)))
                     .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
                     .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
+    /// The edges whose target is one of `names` (`(project, asset_id)`), by source then
+    /// target: what uses those assets, depth 1 (`asset.get`'s `used_by`; Task 7 passes every
+    /// name that resolves to an asset through redirects).
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn edges_to_any(
+        &self,
+        names: &[(String, String)],
+    ) -> Result<Vec<EdgeRow>, IndexError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = names.to_vec();
+        self.db
+            .call(move |conn| {
+                let values = vec!["(?, ?)"; names.len()].join(", ");
+                let args: Vec<&String> = names.iter().flat_map(|(p, a)| [p, a]).collect();
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT from_project, from_asset, to_project, to_asset, to_version, kind
+                         FROM edges WHERE (to_project, to_asset) IN (VALUES {values})
+                         ORDER BY from_project, from_asset, to_project, to_asset, kind"
+                    ))
+                    .map_err(|e| sql(&e))?;
+                stmt.query_map(rusqlite::params_from_iter(args), |r| {
+                    Ok(EdgeRow {
+                        from_project: r.get(0)?,
+                        from_asset: r.get(1)?,
+                        to_project: r.get(2)?,
+                        to_asset: r.get(3)?,
+                        to_version: r.get(4)?,
+                        kind: r.get(5)?,
+                    })
+                })
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                .map_err(|e| sql(&e))
             })
             .await
     }

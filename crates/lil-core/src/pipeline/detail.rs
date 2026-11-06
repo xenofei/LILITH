@@ -2,16 +2,24 @@
 //! CORE-027, CORE-033, CORE-047, ARCH-079).
 //!
 //! - `AssetSummary` is `{ref, project, asset_id, type, status, version, approved_version,
-//!   updated, needs_repair}`; `updated` is the RFC 3339 UTC last write of the manifest as last
+//!   updated, needs_repair, tags, rating, label, runs_waiting, external, working_doc, display,
+//!   last_change, repair}`; `updated` is the RFC 3339 UTC last write of the manifest as last
 //!   indexed. `ref` names the approved version (`lil://<ws>/<project>/<asset_id>@<version>`),
-//!   or the asset without a version when none is approved.
+//!   or the asset without a version when none is approved. The marks and tile fields come from
+//!   the index (Appendix H "`assets.query`"; APP-147, P4b-R30): `runs_waiting` counts the open
+//!   runs, `display` is `{path, sha256, media_kind}` with a workspace-relative `path`,
+//!   `last_change` is the newest status-log entry's `{to, by, utc}`, and `repair` is
+//!   `{kind, from?, to?, other?}`.
 //! - `AssetDetail` adds `versions` (from `Store::versions`, with `legacy`, each ref carrying
 //!   its content hash, computed from the manifest's `hashes` without opening a sealed file;
 //!   a legacy version holding a cloud-only file has a ref without `#sha256` and
 //!   `cloud_only: true`, ruling Q32), `next_versions` (bumps of `approved_version`, or `1.0.0` when there is
 //!   none), `proposed_bump` (`patch` when the open run's `target_version` is the patch bump,
-//!   else `minor`), the manifest's own `candidate_runs`, `human_edits` and `external`, and the
-//!   index's file states (paths relative to the asset folder).
+//!   else `minor`), the manifest's own `candidate_runs`, `human_edits`, `external`,
+//!   `status_log` and `trust` (as written), the index's file states (paths relative to the
+//!   asset folder), `uses` (the manifest's and its open runs' inputs, `{ref, role}`; APP-148)
+//!   and `used_by` (depth 1, from the index's edges: `{ref: "<project>/<asset_id>", kind:
+//!   "input"}`, a pin counting as an input).
 //!
 //! An asset whose manifest is `missing` fails with `manifest.needs_repair`, `data.missing`
 //! naming the manifest; one whose manifest doesn't parse is answered with `needs_repair: true`
@@ -21,7 +29,7 @@ use lil_protocol::ErrorBody;
 use lil_protocol::codes::{ASSET_UNKNOWN, MANIFEST_NEEDS_REPAIR};
 use lil_schema::{AssetRef, Bump, Manifest, SCHEME, Version};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::index::{AssetRow, FileState, Index};
@@ -42,6 +50,62 @@ pub struct AssetSummary {
     /// RFC 3339 UTC.
     pub updated: String,
     pub needs_repair: bool,
+    pub tags: Vec<String>,
+    /// 0–5; 0 is unrated.
+    pub rating: u8,
+    /// `red`, `yellow`, `green`, `blue` or `purple`.
+    pub label: Option<String>,
+    /// Open runs.
+    pub runs_waiting: u32,
+    /// The asset has a link-external file. Left out of `asset.get`, whose `external` is the
+    /// manifest's list (Appendix E), non-empty exactly when this is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<bool>,
+    /// The asset has a working document.
+    pub working_doc: bool,
+    /// The file that shows the asset (P4b-R30).
+    pub display: Option<DisplayEntry>,
+    /// The newest status-log entry.
+    pub last_change: Option<LastChange>,
+    /// `{kind: "moved" | "copy" | "duplicate_uuid" | "invalid", from?, to?, other?}`.
+    pub repair: Option<Value>,
+}
+
+/// `AssetSummary.display`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DisplayEntry {
+    /// Workspace-relative.
+    pub path: String,
+    pub sha256: Option<String>,
+    /// `image`, `video`, `audio`, `model_3d`, `document`, `text`, `archive`, `font` or `other`.
+    pub media_kind: String,
+}
+
+/// `AssetSummary.last_change`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LastChange {
+    pub to: String,
+    pub by: String,
+    pub utc: String,
+}
+
+/// An input the asset uses (`asset.get`'s `uses`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct UseEntry {
+    /// As the manifest writes it.
+    #[serde(rename = "ref")]
+    pub r#ref: String,
+    pub role: Option<String>,
+}
+
+/// An asset that uses this one (`asset.get`'s `used_by`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct UsedByEntry {
+    /// `<project>/<asset_id>`.
+    #[serde(rename = "ref")]
+    pub r#ref: String,
+    /// `input` (`local` is a working document's, APP-075).
+    pub kind: String,
 }
 
 /// A sealed version of the asset.
@@ -92,7 +156,15 @@ pub struct AssetDetail {
     pub human_edits: Value,
     /// The manifest's `external`, as written.
     pub external: Value,
+    /// The manifest's `status_log`, as written (newest last).
+    pub status_log: Value,
+    /// The manifest's `trust`, as written (`{}` when it has none).
+    pub trust: Value,
     pub files: Vec<FileEntry>,
+    /// The manifest's and its open runs' inputs, once each.
+    pub uses: Vec<UseEntry>,
+    /// Depth 1, by ref.
+    pub used_by: Vec<UsedByEntry>,
 }
 
 /// The wire form of a file state.
@@ -127,6 +199,21 @@ pub fn asset_summary(ws_id: &str, row: &AssetRow) -> AssetSummary {
         approved_version: row.approved_version.clone(),
         updated: lil_schema::time::rfc3339(row.updated),
         needs_repair: row.needs_repair,
+        tags: row.tags.clone(),
+        rating: row.rating,
+        label: row.label.clone(),
+        runs_waiting: row.runs_waiting,
+        external: Some(row.external),
+        working_doc: row.working_doc,
+        display: row
+            .display
+            .clone()
+            .and_then(|v| serde_json::from_value(v).ok()),
+        last_change: row
+            .last_change
+            .clone()
+            .and_then(|v| serde_json::from_value(v).ok()),
+        repair: row.repair.clone(),
     }
 }
 
@@ -263,8 +350,52 @@ pub async fn asset_detail(
         })
         .collect();
 
+    let mut uses: Vec<UseEntry> = Vec::new();
+    let run_inputs = view
+        .candidate_runs
+        .iter()
+        .filter(|run| run.status.as_deref() == Some("open") && run.trashed_utc.is_none())
+        .flat_map(|run| run.inputs.iter().map(|i| (&i.r#ref, &i.role)));
+    for (r#ref, role) in view
+        .inputs
+        .iter()
+        .map(|i| (&i.r#ref, &i.role))
+        .chain(run_inputs)
+    {
+        let entry = UseEntry {
+            r#ref: r#ref.clone(),
+            role: role.clone(),
+        };
+        if !uses.contains(&entry) {
+            uses.push(entry);
+        }
+    }
+    let mut used_by: Vec<UsedByEntry> = Vec::new();
+    for edge in index
+        .edges_to_any(&[(project.to_string(), asset_id.to_string())])
+        .await
+        .map_err(|e| e.to_error(""))?
+    {
+        let entry = UsedByEntry {
+            r#ref: format!("{}/{}", edge.from_project, edge.from_asset),
+            kind: "input".to_string(),
+        };
+        if !used_by.contains(&entry) {
+            used_by.push(entry);
+        }
+    }
+    used_by.sort_by(|a, b| (&a.r#ref, &a.kind).cmp(&(&b.r#ref, &b.kind)));
+    let trust = manifest
+        .as_ref()
+        .and_then(|m| m.get("trust"))
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
     let mut summary = asset_summary(ws_id, &row);
     summary.needs_repair = row.needs_repair || manifest.is_none();
+    // `asset.get`'s `external` is the manifest's list.
+    summary.external = None;
     Ok(AssetDetail {
         summary,
         versions,
@@ -273,6 +404,10 @@ pub async fn asset_detail(
         candidate_runs: list("candidate_runs"),
         human_edits: list("human_edits"),
         external: list("external"),
+        status_log: list("status_log"),
+        trust,
         files,
+        uses,
+        used_by,
     })
 }

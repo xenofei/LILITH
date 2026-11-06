@@ -1,7 +1,8 @@
 //! The asset write tools (CORE-019, CORE-023, CORE-026, CORE-027, CORE-028, CORE-029, CORE-031,
 //! CORE-032, CORE-047, CORE-051, CORE-052, CORE-053, ARCH-042, ARCH-060, ARCH-075, QA-005):
 //! `asset.import` (copy and link-external), `asset.collect`, `asset.signoff`,
-//! `asset.request_signoff` and `asset.pin_input`, through the dispatcher of an in-process core
+//! `asset.request_signoff` and `asset.pin_input`, and the read side of plan 4b's tile fields, Uses
+//! and Used by (APP-147, APP-148), through the dispatcher of an in-process core
 //! with the fake clock and ids (QA-031), on a copy of the spec fixture workspace under the
 //! test's `TestEnv` root. Fixture files are written with `lil_testkit::files::write_file`.
 
@@ -1759,5 +1760,227 @@ async fn a_kept_run_on_an_approved_asset_logs_one_entry_per_action() {
         .await;
     assert_eq!(r["status"], "in_review", "{r}");
     assert_newest(&fx, KITE, 4, "approved", "in_review", "cli");
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tile fields, Uses and Used by (plan 4b; APP-147, APP-148; P4b-R30).
+// ---------------------------------------------------------------------------------------------
+
+/// Edits the fixture manifest of `asset` (in `sketchbook`) in the workspace folder `ws`.
+fn edit_manifest(ws: &Path, asset: &str, edit: impl FnOnce(&mut Value)) {
+    let path = file(
+        ws,
+        &format!("projects/sketchbook/assets/{asset}/{asset}.manifest.json"),
+    );
+    let mut m = read_json(&path);
+    edit(&mut m);
+    write_file(&path, serde_json::to_string_pretty(&m).unwrap().as_bytes());
+}
+
+/// The summary of `asset` in an `assets.query` page.
+fn summary_in<'a>(page: &'a Value, asset: &str) -> &'a Value {
+    page["assets"]
+        .as_array()
+        .and_then(|a| a.iter().find(|s| s["asset_id"] == asset))
+        .unwrap_or_else(|| panic!("no {asset} in {page}"))
+}
+
+const STATUS_LOG: &str = r#"[
+    {"from": "planned", "to": "candidate", "by": "cli", "utc": "2026-10-01T09:00:00Z"},
+    {"from": "candidate", "to": "in_review", "by": "user", "utc": "2026-10-02T10:30:00Z"}
+]"#;
+
+#[tokio::test] // spec: APP-147, CORE-049
+async fn tile_fields_follow_the_manifest() {
+    let ext_sha = "11".repeat(32);
+    let fx = Fx::with(|ws| {
+        edit_manifest(ws, "prop_signal_lamp", |m| {
+            m["has_working_doc"] = json!(true);
+            m["external"] = json!([{"path": "C:/outside/lamp.psd", "sha256": ext_sha}]);
+            m["status_log"] = serde_json::from_str(STATUS_LOG).unwrap();
+        });
+    });
+    let page = fx.ok("assets.query", json!({})).await;
+
+    // The crane: one open run, its approved version's primary shows it.
+    let crane = summary_in(&page, "chr_paper_crane");
+    assert_eq!(crane["runs_waiting"], 1, "{crane}");
+    assert_eq!(crane["external"], false, "{crane}");
+    assert_eq!(crane["working_doc"], false, "{crane}");
+    assert_eq!(
+        crane["display"],
+        json!({
+            "path": "projects/sketchbook/assets/chr_paper_crane/v1.0.0/crane_b.png",
+            "sha256": "aaae4dbdb0e697350dac691b26928d34a69061cf320b175c257c103fcaa32766",
+            "media_kind": "image",
+        }),
+        "{crane}"
+    );
+    assert!(crane["last_change"].is_null(), "{crane}");
+    assert!(crane["repair"].is_null(), "{crane}");
+    assert_eq!(crane["tags"], json!([]));
+    assert_eq!(crane["rating"], 0);
+    assert!(crane["label"].is_null());
+
+    // The lamp: a working document, a linked outside file, a status log; no run, no approved
+    // version, so nothing shows it.
+    let lamp = summary_in(&page, "prop_signal_lamp");
+    assert_eq!(lamp["runs_waiting"], 0, "{lamp}");
+    assert_eq!(lamp["external"], true, "{lamp}");
+    assert_eq!(lamp["working_doc"], true, "{lamp}");
+    assert!(lamp["display"].is_null(), "{lamp}");
+    assert_eq!(
+        lamp["last_change"],
+        json!({"to": "in_review", "by": "user", "utc": "2026-10-02T10:30:00Z"}),
+        "the newest entry: {lamp}"
+    );
+
+    // A new asset: its open run's first take shows it, with the hash the run records.
+    let imported = fx.import(KITE, &[("kite.png", b"kite one")]).await;
+    let run = imported["run_id"].as_str().unwrap();
+    let page = fx.ok("assets.query", json!({})).await;
+    let kite = summary_in(&page, KITE);
+    assert_eq!(kite["runs_waiting"], 1, "{kite}");
+    assert_eq!(
+        kite["display"],
+        json!({
+            "path": format!("{KITE_DIR}/candidates/{run}/kite.png"),
+            "sha256": sha256_bytes(b"kite one"),
+            "media_kind": "image",
+        }),
+        "{kite}"
+    );
+
+    // Signed off: no open run waits, and the new version's primary shows it.
+    fx.signoff(KITE, run, &["kite.png"], json!({})).await;
+    let page = fx.ok("assets.query", json!({})).await;
+    let kite = summary_in(&page, KITE);
+    assert_eq!(kite["runs_waiting"], 0, "{kite}");
+    assert_eq!(
+        kite["display"]["path"],
+        format!("{KITE_DIR}/v1.0.0/kite.png"),
+        "{kite}"
+    );
+    assert_eq!(kite["last_change"]["to"], "approved", "{kite}");
+
+    // `asset.get` has the summary's fields, but its `external` stays the manifest's list.
+    let lamp = fx
+        .ok("asset.get", json!({"asset_id": "prop_signal_lamp"}))
+        .await;
+    assert_eq!(lamp["working_doc"], true, "{lamp}");
+    assert_eq!(lamp["external"][0]["sha256"], ext_sha, "{lamp}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-148, CORE-047
+async fn used_by_lists_depth_one_edges() {
+    let fx = Fx::with(|ws| {
+        // The lamp uses the crane (an input) and pins it; a third asset uses the lamp.
+        edit_manifest(ws, "prop_signal_lamp", |m| {
+            m["inputs"] = json!([{"ref": "chr_paper_crane@1.0.0", "role": "reference"}]);
+            m["pinned_inputs"] = json!([{"ref": "chr_paper_crane@1.0.0", "reason": "kept"}]);
+        });
+        let kite = json!({
+            "schema_version": 1, "asset_id": "prop_kite", "project": "sketchbook",
+            "type": "image", "status": "planned",
+            "inputs": [{"ref": "prop_signal_lamp@1.0.0", "role": "reference"}],
+        });
+        write_file(
+            &file(ws, &format!("{KITE_DIR}/prop_kite.manifest.json")),
+            serde_json::to_string_pretty(&kite).unwrap().as_bytes(),
+        );
+    });
+    let crane = fx
+        .ok("asset.get", json!({"asset_id": "chr_paper_crane"}))
+        .await;
+    assert_eq!(
+        crane["used_by"],
+        json!([{"ref": "sketchbook/prop_signal_lamp", "kind": "input"}]),
+        "depth 1, once: {crane}"
+    );
+    let lamp = fx
+        .ok("asset.get", json!({"asset_id": "prop_signal_lamp"}))
+        .await;
+    assert_eq!(
+        lamp["used_by"],
+        json!([{"ref": "sketchbook/prop_kite", "kind": "input"}]),
+        "{lamp}"
+    );
+    let kite = fx.ok("asset.get", json!({"asset_id": KITE})).await;
+    assert_eq!(kite["used_by"], json!([]), "{kite}");
+
+    // The index's edges, asked for several names at once.
+    let open = fx.open().await;
+    let edges = open
+        .index
+        .edges_to_any(&[
+            ("sketchbook".into(), "chr_paper_crane".into()),
+            ("sketchbook".into(), "prop_signal_lamp".into()),
+        ])
+        .await
+        .unwrap();
+    let pairs: Vec<(&str, &str, &str)> = edges
+        .iter()
+        .map(|e| (e.from_asset.as_str(), e.to_asset.as_str(), e.kind.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("prop_kite", "prop_signal_lamp", "input"),
+            ("prop_signal_lamp", "chr_paper_crane", "input"),
+            ("prop_signal_lamp", "chr_paper_crane", "pinned"),
+        ]
+    );
+    drop(open);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-148, CORE-156, ARCH-060
+async fn asset_get_has_uses_status_log_and_trust() {
+    let trust = json!({"v1.0.0/crane_b.png": {
+        "state": "untrusted",
+        "sources": [{"kind": "import", "ref": "C:/outside/crane_b.png"}],
+    }});
+    let fx = Fx::with(|ws| {
+        edit_manifest(ws, "chr_paper_crane", |m| {
+            m["status_log"] = serde_json::from_str(STATUS_LOG).unwrap();
+            m["trust"] = trust.clone();
+            // The open run's inputs: the lamp, and the manifest's own input again (listed once).
+            let runs = m["candidate_runs"].as_array_mut().unwrap();
+            runs[1]["inputs"] = json!([
+                {"ref": "prop_signal_lamp@1.0.0", "role": "style"},
+                {"ref": "proj:harbor/env_harbor_wall@1.0.0", "role": "reference"},
+            ]);
+            // A closed run's inputs aren't listed.
+            runs[0]["inputs"] = json!([{"ref": "old_input@1.0.0", "role": "reference"}]);
+        });
+    });
+    let crane = fx
+        .ok("asset.get", json!({"asset_id": "chr_paper_crane"}))
+        .await;
+    assert_eq!(
+        crane["uses"],
+        json!([
+            {"ref": "proj:harbor/env_harbor_wall@1.0.0", "role": "reference"},
+            {"ref": "prop_signal_lamp@1.0.0", "role": "style"},
+        ]),
+        "{crane}"
+    );
+    assert_eq!(
+        crane["status_log"],
+        serde_json::from_str::<Value>(STATUS_LOG).unwrap()
+    );
+    assert_eq!(crane["trust"], trust);
+    assert_eq!(crane["last_change"]["to"], "in_review", "{crane}");
+    assert_eq!(crane["used_by"], json!([]));
+
+    // Without any: empty.
+    let lamp = fx
+        .ok("asset.get", json!({"asset_id": "prop_signal_lamp"}))
+        .await;
+    assert_eq!(lamp["uses"], json!([]), "{lamp}");
+    assert_eq!(lamp["status_log"], json!([]), "{lamp}");
+    assert_eq!(lamp["trust"], json!({}), "{lamp}");
     fx.shutdown().await;
 }

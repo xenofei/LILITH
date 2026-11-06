@@ -11,6 +11,7 @@
 //!   by [`change_status`];
 //! - [`marks`], [`takes`], [`attribution`]: marks and tags, takes, actors and trust records
 //!   (Appendix H; CORE-023, CORE-152, ARCH-060);
+//! - [`display`]: the display file of an asset and the media kinds (P4b-R30, APP-038);
 //! - [`paths`]: workspace-relative path rules (CORE-040);
 //! - [`yaml_edit`], [`workspace_yaml`], [`suite_edit`]: comment-preserving YAML and TOML edits;
 //! - [`logs`]: append-log lines (ARCH-081); [`time`]: UTC dates;
@@ -19,6 +20,7 @@
 
 pub mod attribution;
 pub mod content_hash;
+pub mod display;
 pub mod engine_files;
 pub mod lilref;
 pub mod logs;
@@ -39,6 +41,7 @@ pub mod yaml_edit;
 
 pub use attribution::{Actor, ActorKind, TrustRecord, TrustSource, TrustSourceKind, TrustState};
 pub use content_hash::{is_os_metadata, sha256_hex, version_content_hash};
+pub use display::{DisplayFile, MediaKind, display_file, media_kind_of, renderable};
 pub use lilref::{LilRef, parse_lilref, write_lilref};
 pub use manifest::{
     CandidateFile, CandidateRun, EditError, ExternalFile, HumanEdit, Input, Manifest, ManifestView,

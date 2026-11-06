@@ -31,6 +31,12 @@ index_rebuild_2000_assets_s = 30
 # Windows runner's figure (printed in the PR's CI log) and adjusts it, if needed, when
 # approving the PR.
 index_warm_reconcile_10000_assets_s = 6
+# APP-138 and CORE-042 (P4b-R23, PF-25): `assets.query {limit: 200, facets: true}` at 10,000 and
+# 50,000 assets, checked by the ignored facet benches in index_bench.rs. Each is twice the median of
+# three p95 measurements (50.2 ms and 292.9 ms, plan 4b Task 5), rounded up to 10 ms; the owner
+# accepted the 10,000-asset value over 100 ms (PF-28).
+assets_query_facets_10000_ms = 110
+assets_query_facets_50000_ms = 590
 # Plan 4a's app budgets (APP-135, APP-136, APP-139), which apps/lil-ui-kit/CMakeLists.txt passes to
 # the benches (CTest label bench) as LIL_BUDGET_<NAME>.
 # bench_gui_stalls: the p99 of the GUI thread's 4 ms heartbeat lateness, in ms. Its frame interval's
