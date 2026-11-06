@@ -2300,7 +2300,11 @@ async fn marks_and_takes_are_mirrored() {
     let row = index.asset("p", "a").await.unwrap().unwrap();
     assert_eq!(row.rating, 4);
     assert_eq!(row.label.as_deref(), Some("red"));
-    assert_eq!(row.tags.len(), 2, "{:?}", row.tags);
+    assert_eq!(
+        row.tags,
+        ["Tree", "oak"],
+        "manifest order, one spelling per fold"
+    );
     assert_eq!(row.runs_waiting, 1, "the trashed open run doesn't count");
 
     // A manifest edit replaces the mirror.
@@ -2308,7 +2312,7 @@ async fn marks_and_takes_are_mirrored() {
         &fx,
         "p",
         "a",
-        json!({"tags": ["birch"], "candidate_runs": [run_json(
+        json!({"tags": ["zebra", "apple"], "candidate_runs": [run_json(
             "r_open",
             "open",
             &[json!({"path": "one.png", "role": "candidate", "take": 1, "primary": true})],
@@ -2316,9 +2320,19 @@ async fn marks_and_takes_are_mirrored() {
         )]}),
     );
     index.reconcile(Scope::All).await.unwrap();
-    assert_eq!(tags(&db), [(s("birch"), s("birch"))]);
+    assert_eq!(
+        tags(&db),
+        [(s("apple"), s("apple")), (s("zebra"), s("zebra"))]
+    );
     assert_eq!(takes(&db), [(s("r_open"), 1, None, 0)]);
     let row = index.asset("p", "a").await.unwrap().unwrap();
+    assert_eq!(
+        row.tags,
+        ["zebra", "apple"],
+        "the manifest's order, not the fold's"
+    );
+    let page = index.assets(query()).await.unwrap();
+    assert_eq!(page.rows[0].tags, ["zebra", "apple"]);
     assert_eq!((row.rating, row.label.as_deref()), (0, None));
 
     // The store moving the folder away takes its tags and takes along.
@@ -2559,6 +2573,36 @@ async fn facets_are_disjunctive_and_in_the_page_transaction() {
         f.tags
     );
 
+    // A later page (after a cursor) has the first page's facets and total: the cursor narrows
+    // the page only.
+    for first_q in [
+        query(),
+        AssetQuery {
+            status: Some(Choice::AnyOf(vec!["candidate".into(), "approved".into()])),
+            ..query()
+        },
+    ] {
+        let first = index
+            .assets(with_facets(AssetQuery {
+                limit: 2,
+                ..first_q.clone()
+            }))
+            .await
+            .unwrap();
+        let second = index
+            .assets(with_facets(AssetQuery {
+                limit: 2,
+                after: first.next.clone(),
+                ..first_q
+            }))
+            .await
+            .unwrap();
+        assert!(first.next.is_some());
+        assert_ne!(page_ids(&first), page_ids(&second));
+        assert_eq!(second.total, first.total);
+        assert_eq!(second.facets, first.facets);
+    }
+
     // Disjunctive: the label facet ignores the label filter; every other facet, the page and
     // the total use it.
     let red = index
@@ -2768,7 +2812,18 @@ async fn duplicates_ignore_work_files() {
     fx.write("projects/p/assets/a/v1.0.0/x.png", shared);
     put_manifest(&fx, "p", "a", json!({}));
     fx.write("projects/p/assets/b/candidates/r1/y.png", shared);
-    put_manifest(&fx, "p", "b", json!({}));
+    // b's open run lists it, so when it vanishes its row stays as `missing`.
+    put_manifest(
+        &fx,
+        "p",
+        "b",
+        json!({"candidate_runs": [run_json(
+            "r1",
+            "open",
+            &[json!({"path": "y.png", "role": "candidate"})],
+            false
+        )]}),
+    );
     // A working document with the bytes doesn't count.
     fx.write("projects/p/assets/c/work/doc.png", shared);
     put_manifest(&fx, "p", "c", json!({}));
@@ -2802,9 +2857,18 @@ async fn duplicates_ignore_work_files() {
     assert_eq!(kind("projects/p/assets/c/work/doc.png"), "work");
     assert_eq!(kind("notes/copy.png"), "other");
 
-    // The candidate goes: a shares its bytes with no other asset any more.
+    // The candidate goes missing (its row keeps its hash): a shares its bytes with no other
+    // asset any more.
     outside_remove(&fx.file("projects/p/assets/b/candidates/r1/y.png"));
     index.reconcile(Scope::All).await.unwrap();
+    let state: String = db
+        .query_row(
+            "SELECT state FROM files WHERE path = 'projects/p/assets/b/candidates/r1/y.png'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "missing");
     assert!(ids_of(&index, dup(true)).await.is_empty());
 }
 
@@ -2820,7 +2884,30 @@ async fn duplicates_ignore_source_and_empty_files() {
         );
         // An empty sealed file in each.
         fx.write(&format!("projects/p/assets/{asset}/v1.0.0/empty.txt"), b"");
-        put_manifest(&fx, "p", asset, json!({}));
+        // And an open run each, whose `source/` holds the same document chunk.
+        fx.write(
+            &format!("projects/p/assets/{asset}/candidates/r1/{asset}_take.png"),
+            bytes,
+        );
+        fx.write(
+            &format!("projects/p/assets/{asset}/candidates/r1/source/chunk.bin"),
+            b"the same layer chunk",
+        );
+        put_manifest(
+            &fx,
+            "p",
+            asset,
+            json!({"candidate_runs": [run_json(
+                "r1",
+                "open",
+                &[
+                    json!({"path": format!("{asset}_take.png"), "role": "candidate"}),
+                    json!({"path": "source/chunk.bin", "role": "derived",
+                           "from": format!("{asset}_take.png")}),
+                ],
+                false
+            )]}),
+        );
     }
     // A deliverable named like a source folder elsewhere still counts.
     fx.write("projects/p/assets/c/v1.0.0/x.png", b"shared deliverable");
@@ -2837,6 +2924,18 @@ async fn duplicates_ignore_source_and_empty_files() {
         ..query()
     };
     assert_eq!(ids_of(&index, dup).await, ["p/c", "p/d"]);
+    let db = Connection::open(&fx.db).unwrap();
+    let kind: String = db
+        .query_row(
+            "SELECT kind FROM files WHERE path = 'projects/p/assets/a/candidates/r1/source/chunk.bin'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kind, "candidate",
+        "excluded as a run's source, not by its kind"
+    );
 }
 
 #[tokio::test] // spec: CORE-170
@@ -3029,6 +3128,33 @@ async fn status_and_type_take_lists() {
         let refused = call(&c, "assets.query", bad.clone()).await.unwrap_err();
         assert_eq!(refused.code, "params.invalid", "{bad}: {refused:?}");
     }
+    // Each list argument takes at most 256 values.
+    let many = |v: Value| vec![v; 257];
+    for (name, values) in [
+        ("status", many(json!("candidate"))),
+        ("type", many(json!("image"))),
+        ("tags", many(json!("tree"))),
+        ("label", many(json!("red"))),
+        ("flag", many(json!("pick"))),
+    ] {
+        let mut ok = json!({});
+        ok[name] = json!(values[..256]);
+        call_ok(&c, "assets.query", ok).await;
+        let mut bad = json!({});
+        bad[name] = json!(values);
+        let refused = call(&c, "assets.query", bad.clone()).await.unwrap_err();
+        assert_eq!(refused.code, "params.invalid", "{name}: {refused:?}");
+    }
+    // The published input schema says `rating_min` is at most 5.
+    let mut reg = Registry::new();
+    register_asset_read_tools(&mut reg);
+    let tool = reg.get("assets.query").unwrap();
+    let schema = &tool.descriptor().input_schema;
+    assert_eq!(
+        schema["properties"]["rating_min"]["maximum"], 5,
+        "{}",
+        schema["properties"]["rating_min"]
+    );
     drop(open);
     hub.close_all().await;
 }

@@ -36,6 +36,8 @@ use crate::pipeline::{AssetDetail, AssetSummary, asset_detail, asset_summary};
 pub const DEFAULT_LIMIT: usize = 200;
 /// The largest page.
 pub const MAX_LIMIT: usize = 1000;
+/// The most values a list argument (`status`, `type`, `tags`, `label`, `flag`) takes.
+pub const MAX_LIST: usize = 256;
 
 const QUERY_DESCRIPTION: &str = "List the workspace's assets, a page at a time. Every argument \
     is an optional filter, and different filters combine with AND: project (omitted: every \
@@ -84,7 +86,16 @@ struct SortArg {
 #[serde(untagged)]
 enum OneOrList {
     One(String),
-    List(Vec<String>),
+    List(#[schemars(length(max = 256))] Vec<String>),
+}
+
+impl OneOrList {
+    fn len(&self) -> usize {
+        match self {
+            OneOrList::One(_) => 1,
+            OneOrList::List(l) => l.len(),
+        }
+    }
 }
 
 impl From<OneOrList> for Choice {
@@ -147,12 +158,16 @@ struct QueryArgs {
     asset_type: Option<OneOrList>,
     text: Option<String>,
     /// Any of these tags, case-insensitive.
+    #[schemars(length(max = 256))]
     tags: Option<Vec<String>>,
     /// 0-5.
+    #[schemars(range(max = 5))]
     rating_min: Option<u8>,
     /// Any of these labels; `none` matches an unlabelled asset.
+    #[schemars(length(max = 256))]
     label: Option<Vec<LabelArg>>,
     /// Assets with a take so flagged in any run not trashed.
+    #[schemars(length(max = 256))]
     flag: Option<Vec<FlagArg>>,
     /// `true`: assets sharing a sealed or candidate file's bytes with another asset.
     duplicates: Option<bool>,
@@ -251,6 +266,22 @@ async fn query(ctx: &CallCtx, args: QueryArgs) -> Result<(QueryResult, String), 
             ctx,
             format!("rating_min is 0 to 5; {r} is outside that"),
         ));
+    }
+    for (name, len) in [
+        ("status", args.status.as_ref().map(OneOrList::len)),
+        ("type", args.asset_type.as_ref().map(OneOrList::len)),
+        ("tags", args.tags.as_ref().map(Vec::len)),
+        ("label", args.label.as_ref().map(Vec::len)),
+        ("flag", args.flag.as_ref().map(Vec::len)),
+    ] {
+        if let Some(len) = len
+            && len > MAX_LIST
+        {
+            return Err(invalid(
+                ctx,
+                format!("{name} takes at most {MAX_LIST} values; {len} were given"),
+            ));
+        }
     }
     let sort = args.sort.map_or((SortField::AssetId, SortDir::Asc), |s| {
         let field = match s.field {

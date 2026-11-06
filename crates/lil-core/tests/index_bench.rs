@@ -7,6 +7,9 @@
 //! are performance gates, not correctness assertions. Each prints its measured time. The facet
 //! benches are `#[ignore = "bench"]` (their workspaces take minutes to build): run them with
 //! `cargo nextest run -p lil-core --run-ignored only -E 'binary(index_bench) & test(/facets/)'`.
+//! They time the index read (`Index::assets`: the page, `total` and the facets in one read
+//! transaction), which is what the facet budgets cover; the tool layer (argument parsing, the
+//! cursor, the summaries and the result's JSON) is outside them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

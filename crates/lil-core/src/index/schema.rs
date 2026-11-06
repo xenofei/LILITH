@@ -7,7 +7,8 @@
 //!
 //! Tables: `files` (one row per file, keyed by the path's case-folded key, with its `kind`:
 //! `sealed`, `candidate`, `work` or `other`), `assets` (one row per asset folder, with its marks
-//! and tile fields), `asset_tags` (each asset's tags and their fold), `take_marks` (the takes of
+//! and tile fields), `asset_tags` (each asset's tags, their fold and their place in the
+//! manifest's list), `take_marks` (the takes of
 //! every run not trashed, with their flag and rating), `edges` (manifest inputs), `assets_fts`
 //! (FTS5 over each asset's text), and two of the index's own: `expected` (the hash each manifest
 //! records for a file, and whether the suite still expects that file on disk) and `meta` (the
@@ -78,6 +79,7 @@ CREATE TABLE asset_tags (
     asset_id TEXT NOT NULL,
     tag TEXT NOT NULL,
     tag_fold TEXT NOT NULL,
+    pos INTEGER NOT NULL,
     PRIMARY KEY (project, asset_id, tag_fold)
 ) WITHOUT ROWID;
 CREATE INDEX asset_tags_fold ON asset_tags(tag_fold, tag);
@@ -230,6 +232,9 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
         conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
             .map_err(|e| format!("table {table}: {e}"))?;
     }
+    // A schema-2 file made before `asset_tags.pos` existed (never released) is rebuilt too.
+    conn.prepare("SELECT pos FROM asset_tags LIMIT 0")
+        .map_err(|e| format!("asset_tags.pos: {e}"))?;
     configure(&conn, true).map_err(|e| e.to_string())?;
     Ok(conn)
 }

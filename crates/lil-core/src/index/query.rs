@@ -368,11 +368,12 @@ pub fn decode_cursor(q: &AssetQuery, cursor: &str) -> Result<Keyset, String> {
     })
 }
 
-/// The columns [`asset_row`] reads, in order, over `assets a` (the tags as a JSON list).
+/// The columns [`asset_row`] reads, in order, over `assets a` (the tags as a JSON list, in the
+/// manifest's order).
 pub(super) const ASSET_COLUMNS: &str = "a.project, a.asset_id, a.asset_type, a.status, \
     a.version, a.approved_version, a.manifest, a.creation_uuid, a.updated, a.needs_repair, \
     a.rating, a.label, a.runs_waiting, a.external, a.working_doc, a.display, a.last_change, \
-    a.repair, (SELECT json_group_array(t.tag) FROM asset_tags t \
+    a.repair, (SELECT json_group_array(t.tag ORDER BY t.pos) FROM asset_tags t \
     WHERE t.project = a.project AND t.asset_id = a.asset_id)";
 
 /// A JSON column: `None` for NULL or text that isn't JSON.
@@ -498,18 +499,21 @@ fn any_of(key: Key, column: &str, values: &[String]) -> Option<Cond> {
 }
 
 /// Whether the `files` row `t` is a deliverable for `duplicates` (CORE-168): a sealed or
-/// candidate file, not `missing`, not empty, and not under a version's `source/` folder
-/// (`v<ver>/source/…`, compared without regard to case).
+/// candidate file, not `missing`, not empty, and not under a version's or a run's `source/`
+/// folder (`v<ver>/source/…`, `candidates/<run>/source/…`, compared without regard to case).
 fn deliverable(t: &str) -> String {
-    // The path inside the asset folder: `v1.0.0/source/x.json`.
+    // The path inside the asset folder (`v1.0.0/source/x.json`), then after its first and its
+    // second component.
     let inside = format!(
         "substr({t}.path, length('projects/' || {t}.project || '/assets/' || {t}.asset_id \
          || '/') + 1)"
     );
+    let after_one = format!("substr({inside}, instr({inside}, '/') + 1)");
+    let after_two = format!("substr({after_one}, instr({after_one}, '/') + 1)");
     format!(
         "{t}.kind IN ('sealed', 'candidate') AND {t}.state <> 'missing' AND {t}.size > 0 \
-         AND NOT ({t}.kind = 'sealed' \
-         AND substr({inside}, instr({inside}, '/') + 1) LIKE 'source/%')"
+         AND NOT ({t}.kind = 'sealed' AND {after_one} LIKE 'source/%') \
+         AND NOT ({t}.kind = 'candidate' AND {after_two} LIKE 'source/%')"
     )
 }
 

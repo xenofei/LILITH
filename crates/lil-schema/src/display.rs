@@ -138,7 +138,9 @@ pub struct DisplayFile {
 ///
 /// The approved version's primary is the first `selected` name of the run whose
 /// `signed_off.version` is `approved_version`, at `v<version>/<name>`; its preview is used
-/// only when it was sealed there too (in `hashes`). "Newest" is the open
+/// only when it was sealed there too (in `hashes`). A legacy approved version, which no run
+/// signed off, shows its first renderable file directly in `v<version>/` by name (`hashes`);
+/// without one, the open runs are looked at. "Newest" is the open
 /// run (not trashed, with at least one take) with the latest `created`, the later one in the
 /// list on a tie or when neither has one.
 pub fn display_file(m: &Manifest) -> Option<DisplayFile> {
@@ -161,7 +163,7 @@ pub fn display_file(m: &Manifest) -> Option<DisplayFile> {
             } else {
                 takes_of(run)
                     .into_iter()
-                    .find(|t| t.primary.eq_ignore_ascii_case(name))
+                    .find(|t| t.primary.to_lowercase() == name.to_lowercase())
                     .and_then(|t| t.preview)
                     .filter(|p| view.hashes.contains_key(&sealed_path(p)))
             };
@@ -172,6 +174,20 @@ pub fn display_file(m: &Manifest) -> Option<DisplayFile> {
                 media_kind: media_kind_of(shown),
                 path,
                 sha256,
+            });
+        }
+        // A legacy version (no run signed it off): its first renderable file directly in
+        // `v<version>/`, by name, from `hashes`.
+        let prefix = format!("v{approved}/");
+        let legacy = view.hashes.iter().find(|(path, _)| {
+            path.strip_prefix(&prefix)
+                .is_some_and(|name| !name.contains('/') && renderable(name))
+        });
+        if let Some((path, sha256)) = legacy {
+            return Some(DisplayFile {
+                path: path.clone(),
+                sha256: Some(sha256.clone()),
+                media_kind: media_kind_of(path),
             });
         }
     }
@@ -305,6 +321,40 @@ mod tests {
                 media_kind: MediaKind::Image,
             })
         );
+        // The newest by `created` in the middle of the list (neither the first nor the last
+        // open run), and on a tie the later run in the list.
+        let one = |id: &str, created: &str| {
+            run(
+                id,
+                "open",
+                created,
+                &json!([{"path": format!("candidates/{id}/{id}.png"), "role": "candidate"}]),
+            )
+        };
+        let shown = |runs: Value| {
+            display_file(&manifest(&json!({"asset_id": "a", "project": "p",
+                                           "candidate_runs": runs})))
+            .unwrap()
+            .path
+        };
+        assert_eq!(
+            shown(json!([
+                one("r_a", "2026-10-01T00:00:00Z"),
+                one("r_b", "2026-10-07T00:00:00Z"),
+                one("r_c", "2026-10-03T00:00:00Z"),
+            ])),
+            "candidates/r_b/r_b.png"
+        );
+        assert_eq!(
+            shown(json!([
+                one("r_a", "2026-10-01T00:00:00Z"),
+                one("r_b", "2026-10-05T00:00:00Z"),
+                one("r_c", "2026-10-05T00:00:00Z"),
+                one("r_d", "2026-10-02T00:00:00Z"),
+            ])),
+            "candidates/r_c/r_c.png",
+            "a tie goes to the later run in the list"
+        );
 
         // A primary without a renderer shows its preview; without a preview, itself.
         let model = |files: Value| {
@@ -384,9 +434,29 @@ mod tests {
             display_file(&manifest(&json!({"asset_id": "a", "project": "p"}))),
             None
         );
-        // An approved version no run signed off (a legacy manifest) falls through.
-        let legacy = manifest(&json!({"asset_id": "a", "project": "p",
-            "approved_version": "1.0.0", "candidate_runs": []}));
-        assert_eq!(display_file(&legacy), None);
+        // An approved version no run signed off (a legacy manifest): its first renderable
+        // file directly in v<version>/ by name; with none, nothing.
+        let legacy = |hashes: Value| {
+            manifest(&json!({"asset_id": "a", "project": "p",
+                "approved_version": "1.0.0", "candidate_runs": [], "hashes": hashes}))
+        };
+        let with_image = legacy(json!({
+            "v1.0.0/notes.txt": SHA_A,
+            "v1.0.0/source/a.png": SHA_A,
+            "v1.0.0/z_art.psd": SHA_A,
+            "v1.0.0/lamp_b.png": SHA_A,
+            "v1.0.0/lamp_a.PNG": SHA_B,
+            "v0.9.0/old.png": SHA_A,
+        }));
+        assert_eq!(
+            display_file(&with_image),
+            Some(DisplayFile {
+                path: "v1.0.0/lamp_a.PNG".into(),
+                sha256: Some(SHA_B.into()),
+                media_kind: MediaKind::Image,
+            })
+        );
+        let without = legacy(json!({"v1.0.0/notes.txt": SHA_A, "v1.0.0/art.psd": SHA_A}));
+        assert_eq!(display_file(&without), None);
     }
 }
