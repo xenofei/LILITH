@@ -750,10 +750,11 @@ async fn restore_marks_unpinned_dependents_stale_with_status_before_stale() {
         golem["has_working_doc"], true,
         "has_working_doc survives the edit"
     );
-    // Existing keys keep their order; the new one is appended.
+    // Existing keys keep their order; the new ones are appended (the status log, CORE-156).
     let keys = |m: &Value| m.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
     let mut expected = keys(&golem_before);
     expected.push("status_before_stale".into());
+    expected.push("status_log".into());
     assert_eq!(keys(&golem), expected);
     let troll = read_manifest(&ws, "sketchbook", "chr_troll");
     assert_eq!(

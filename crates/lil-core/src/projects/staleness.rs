@@ -5,8 +5,10 @@
 //! not marked stale when their inputs move on. Whenever it is set to anything but `archived`,
 //! [`restore_staleness`] catches up: each of its assets with an input whose
 //! `approved_version` is now higher than the version in the input's ref, and which isn't
-//! pinned, takes `MarkStale` (status `stale`, `status_before_stale` = the status it had, and a
-//! `status_reason` naming the input). Only `approved`, `exported` and `released` assets can go
+//! pinned, takes `MarkStale` through `lil_schema::change_status` by `core` (status `stale`,
+//! `status_before_stale` = the status it had, a `status_reason` naming the input, and a
+//! status-log entry with the reason `{code: "input_changed", ref: <the input's ref>}`). Only
+//! `approved`, `exported` and `released` assets can go
 //! stale (CORE-048); others, and assets already `stale`, are left as they are, so the check
 //! can run again at any time (a retry after it failed midway finishes it).
 
@@ -15,7 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lil_schema::{
-    AssetRef, LinkRef, Manifest, ManifestView, SCHEME, Status, StatusEvent, Version, transition,
+    AssetRef, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy, StatusEvent,
+    Version, change_status,
 };
 use serde_json::Value;
 
@@ -103,14 +106,14 @@ fn target_of(project: &str, link: &LinkRef) -> Option<((String, String), Version
     }
 }
 
-/// The first input of `view` that makes it stale, as `(asset_id, approved version)`, looking
-/// targets' approved versions up in `approved` (read once per target).
+/// The first input of `view` that makes it stale, as `(asset_id, approved version, the
+/// input's ref)`, looking targets' approved versions up in `approved` (read once per target).
 async fn stale_input(
     store: &Store,
     project: &str,
     view: &ManifestView,
     approved: &mut HashMap<(String, String), Option<Version>>,
-) -> Option<(String, Version)> {
+) -> Option<(String, Version, String)> {
     let pinned: Vec<(String, String)> = view
         .pinned_inputs
         .iter()
@@ -135,7 +138,7 @@ async fn stale_input(
             }
         };
         if is_stale(&version, now.as_ref(), pinned.contains(&target)) {
-            return now.map(|v| (target.1.clone(), v));
+            return now.map(|v| (target.1.clone(), v, input.r#ref.clone()));
         }
     }
     None
@@ -175,41 +178,33 @@ pub async fn restore_staleness(
         ) {
             continue;
         }
-        let Some((input, version)) = stale_input(&ws.store, project, &view, &mut approved).await
+        let Some((input, version, input_ref)) =
+            stale_input(&ws.store, project, &view, &mut approved).await
         else {
             continue;
         };
         let Some(rel) = manifest_path(project, &asset.asset_id) else {
             continue;
         };
-        let reason = format!("input {input} {version} signed off");
+        let note = format!("input {input} {version} signed off");
+        let reason = Reason {
+            code: "input_changed".to_string(),
+            r#ref: Some(input_ref),
+            note: None,
+        };
+        let utc = lil_schema::time::rfc3339(ws.store.now_utc());
         let marked = Arc::new(AtomicBool::new(false));
         let did = marked.clone();
         let (after, _written) = ws
             .store
             .edit_manifest(&rel, &move |m: &mut Manifest| {
                 did.store(false, Ordering::SeqCst);
-                let parse = |key: &str| {
-                    m.get(key)
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<Status>().ok())
-                };
-                let Some(from) = m.view().status else {
+                let ev = StatusEvent::MarkStale;
+                let by = StatusBy::Core;
+                if change_status(m, &ev, by, None, Some(reason.clone()), &utc).is_err() {
                     return Ok(());
-                };
-                let Ok(moved) = transition(
-                    from,
-                    parse("status_before_stale"),
-                    parse("status_before_blocked"),
-                    &StatusEvent::MarkStale,
-                ) else {
-                    return Ok(());
-                };
-                m.set("status", Value::from(moved.to.as_str()));
-                if let Some(before) = moved.set_before_stale {
-                    m.set("status_before_stale", Value::from(before.as_str()));
                 }
-                m.set("status_reason", Value::from(reason.as_str()));
+                m.set("status_reason", Value::from(note.as_str()));
                 did.store(true, Ordering::SeqCst);
                 Ok(())
             })

@@ -914,6 +914,24 @@ fn the_listing_tools_are_pinned() {
     assert_eq!(found, expected);
 }
 
+/// The plan-4b organising rows (Appendix H "Organising tools"): `asset.deprecate` writes in
+/// `workspace`.
+#[test] // spec: CORE-170, CORE-146, CORE-058
+fn the_organising_tools_are_pinned() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
+    let row = |name: &str, effect, module: &str| (name.to_string(), effect, module.to_string());
+    let expected = vec![row("asset.deprecate", EffectClass::Write, WORKSPACE_MODULE)];
+    let found: Vec<(String, EffectClass, String)> = reg
+        .descriptors()
+        .into_iter()
+        .map(|d| (d.name, d.effect, d.module))
+        .filter(|(name, _, _)| expected.iter().any(|e| &e.0 == name))
+        .collect();
+    assert_eq!(found, expected);
+}
+
 #[test] // spec: CORE-014
 fn registry_and_dispatcher_live_in_the_tools_module() {
     let _: fn() -> crate::tools::Registry = crate::tools::Registry::new;

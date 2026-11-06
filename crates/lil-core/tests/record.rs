@@ -1227,3 +1227,161 @@ async fn an_adopted_signoff_keeps_the_snapshots_date() {
     );
     fx.shutdown().await;
 }
+
+/// The newest status-log entry of the manifest `m`.
+fn newest_entry(m: &Value) -> Value {
+    m["status_log"]
+        .as_array()
+        .and_then(|log| log.last())
+        .cloned()
+        .unwrap_or_else(|| panic!("no status_log entry: {m}"))
+}
+
+#[tokio::test] // spec: CORE-156, CORE-048, I6
+async fn core_set_stale_names_the_changed_input() {
+    let fx = Fx::new(
+        |ws| {
+            let put = |project: &str, asset: &str, bytes: Vec<u8>| {
+                let dir = format!("projects/{project}/assets/{asset}");
+                write_file(&file(ws, &format!("{dir}/{asset}.manifest.json")), &bytes);
+                write_file(&file(ws, &format!("{dir}/v1.0.0/d.png")), asset.as_bytes());
+            };
+            put(
+                "sketchbook",
+                "dep_stale",
+                dependent(
+                    "dep_stale",
+                    "sketchbook",
+                    "approved",
+                    "prop_kite@1.0.0",
+                    false,
+                ),
+            );
+            write_file(
+                &file(ws, "projects/harbor/project.yaml"),
+                b"# A made-up archived project.\nname: Harbor\nslug: harbor\nstatus: archived\nlinks: []\n",
+            );
+            put(
+                "harbor",
+                "dep_archived",
+                dependent(
+                    "dep_archived",
+                    "harbor",
+                    "exported",
+                    "proj:sketchbook/prop_kite@1.0.0",
+                    false,
+                ),
+            );
+        },
+        |h| h,
+        FailPoints::none(),
+    );
+    let first = fx.import_run(KITE, "kite.png", b"one").await;
+    fx.ok(
+        "asset.signoff",
+        Fx::signoff_args(KITE, &first, "kite.png", json!({})),
+    )
+    .await;
+    let second = fx.import_run(KITE, "kite_two.png", b"two").await;
+    fx.ok(
+        "asset.signoff",
+        Fx::signoff_args(KITE, &second, "kite_two.png", json!({"bump": "major"})),
+    )
+    .await;
+    // The sign-off's pass: the dependent's one entry names the input it took the change from.
+    let stale = fx.manifest("dep_stale");
+    assert_eq!(
+        stale["status_log"].as_array().map(Vec::len),
+        Some(1),
+        "{stale}"
+    );
+    let e = newest_entry(&stale);
+    assert_eq!(
+        (&e["from"], &e["to"], &e["by"]),
+        (&json!("approved"), &json!("stale"), &json!("core")),
+        "{e}"
+    );
+    assert_eq!(
+        e["reason"],
+        json!({"code": "input_changed", "ref": "prop_kite@1.0.0"})
+    );
+    assert_eq!(stale["status_reason"], "input prop_kite 2.0.0 signed off");
+
+    // The restore pass (`projects/staleness.rs`): the archived project catches up.
+    let archived = || -> Value {
+        serde_json::from_str(&read_text(
+            &fx.path("projects/harbor/assets/dep_archived/dep_archived.manifest.json"),
+        ))
+        .unwrap()
+    };
+    assert!(archived().get("status_log").is_none());
+    fx.ok(
+        "project.set_status",
+        json!({"project": "harbor", "status": "active"}),
+    )
+    .await;
+    let m = archived();
+    assert_eq!(m["status_log"].as_array().map(Vec::len), Some(1), "{m}");
+    let e = newest_entry(&m);
+    assert_eq!(
+        (&e["from"], &e["to"], &e["by"]),
+        (&json!("exported"), &json!("stale"), &json!("core")),
+        "{e}"
+    );
+    assert_eq!(
+        e["reason"],
+        json!({"code": "input_changed", "ref": "proj:sketchbook/prop_kite@1.0.0"})
+    );
+    assert_eq!(m["status_reason"], "input prop_kite 2.0.0 signed off");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-170
+async fn deprecate_publishes_previous() {
+    let fx = Fx::plain();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(7, tx);
+    let topic = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_ref.id);
+    fx.events
+        .subscribe(7, std::slice::from_ref(&topic), &Default::default())
+        .await;
+    fx.import_run(KITE, "kite.png", b"kite").await;
+    let deprecate = |deprecated: bool| json!({"project": "sketchbook", "asset_id": KITE, "deprecated": deprecated});
+    let r = fx.ok("asset.deprecate", deprecate(true)).await;
+    assert_eq!(r, json!({"status": "deprecated"}));
+    // Deprecating again is no change: no event, no entry.
+    let r = fx.ok("asset.deprecate", deprecate(true)).await;
+    assert_eq!(r, json!({"status": "deprecated"}));
+    let r = fx.ok("asset.deprecate", deprecate(false)).await;
+    assert_eq!(r, json!({"status": "candidate"}));
+    let log = fx.manifest(KITE)["status_log"].as_array().unwrap().len();
+    assert_eq!(log, 3, "the import, the deprecation and the return");
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut seen = Vec::new();
+    while seen.len() < 2 && tokio::time::Instant::now() < deadline {
+        seen.extend(
+            drain_events(&mut rx)
+                .into_iter()
+                .filter(|e| e["data"]["kind"] == "deprecated"),
+        );
+        tokio::task::yield_now().await;
+    }
+    seen.extend(
+        drain_events(&mut rx)
+            .into_iter()
+            .filter(|e| e["data"]["kind"] == "deprecated"),
+    );
+    let data: Vec<&Value> = seen.iter().map(|e| &e["data"]).collect();
+    assert_eq!(
+        data,
+        [
+            &json!({"kind": "deprecated", "deprecated": true, "status": "deprecated",
+                    "previous": "candidate"}),
+            &json!({"kind": "deprecated", "deprecated": false, "status": "candidate",
+                    "previous": "deprecated"}),
+        ],
+        "{seen:?}"
+    );
+    fx.shutdown().await;
+}

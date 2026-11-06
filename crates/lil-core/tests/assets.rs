@@ -936,7 +936,12 @@ async fn collect_removes_external_without_reordering_keys() {
         .await;
     assert_handoff(&r);
     let after = fx.manifest("prop_ext");
-    let expected: Vec<String> = before.into_iter().filter(|k| k != "external").collect();
+    // The status change appends its status log, a new key, at the end (CORE-156).
+    let expected: Vec<String> = before
+        .into_iter()
+        .filter(|k| k != "external")
+        .chain(["status_log".to_string()])
+        .collect();
     assert_eq!(keys(&after), expected, "{after}");
     assert_eq!(after["status"], "candidate");
     let run = r["run_id"].as_str().unwrap();
@@ -1382,5 +1387,242 @@ async fn the_seal_reports_the_run_files_it_moved_as_removals() {
             .any(|p| p.starts_with(&format!("candidates/{run}/"))),
         "{detail}"
     );
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The status log and asset.deprecate (CORE-048, CORE-156, CORE-170; P4b-R4).
+// ---------------------------------------------------------------------------------------------
+
+const CRANE: &str = "chr_paper_crane";
+
+/// The manifest file of `asset` in the workspace at `ws`.
+fn manifest_file(ws: &Path, asset: &str) -> PathBuf {
+    file(
+        ws,
+        &format!("projects/sketchbook/assets/{asset}/{asset}.manifest.json"),
+    )
+}
+
+/// Rewrites the manifest of `asset` in the workspace at `ws` with `edit`, before the core
+/// starts.
+fn edit_fixture_manifest(ws: &Path, asset: &str, edit: impl FnOnce(&mut Value)) {
+    let path = manifest_file(ws, asset);
+    let mut m = read_json(&path);
+    edit(&mut m);
+    write_file(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&m).unwrap()).as_bytes(),
+    );
+}
+
+/// An approved asset `asset` of `sketchbook` whose one input is `input`, with its sealed
+/// `v1.0.0/d.png`.
+fn write_dependent(ws: &Path, asset: &str, input: &str) {
+    let m = json!({
+        "schema_version": 1, "asset_id": asset, "project": "sketchbook", "type": "image",
+        "version": "1.0.0", "approved_version": "1.0.0", "status": "approved",
+        "inputs": [{"ref": input, "role": "reference"}], "pinned_inputs": [],
+        "candidate_runs": [],
+        "hashes": {"v1.0.0/d.png": format!("sha256:{}", sha256_bytes(asset.as_bytes()))},
+    });
+    write_file(
+        &manifest_file(ws, asset),
+        format!("{}\n", serde_json::to_string_pretty(&m).unwrap()).as_bytes(),
+    );
+    write_file(
+        &file(
+            ws,
+            &format!("projects/sketchbook/assets/{asset}/v1.0.0/d.png"),
+        ),
+        asset.as_bytes(),
+    );
+}
+
+/// The manifest's `status_log`.
+fn status_log(m: &Value) -> Vec<Value> {
+    m["status_log"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no status_log: {m}"))
+        .clone()
+}
+
+/// Asserts that `asset`'s log has `len` entries and that the newest goes `from` → `to` by `by`.
+fn assert_newest(fx: &Fx, asset: &str, len: usize, from: &str, to: &str, by: &str) -> Value {
+    let m = fx.manifest(asset);
+    let log = status_log(&m);
+    assert_eq!(log.len(), len, "{asset}: {m}");
+    let e = log.last().unwrap().clone();
+    assert_eq!(
+        (&e["from"], &e["to"], &e["by"]),
+        (&json!(from), &json!(to), &json!(by)),
+        "{asset}: {e}"
+    );
+    assert_eq!(m["status"], to, "{m}");
+    e
+}
+
+#[tokio::test] // spec: CORE-156, CORE-048, CORE-170
+async fn every_status_path_writes_one_log_entry() {
+    let fx = Fx::with(|ws| write_dependent(ws, "prop_kite_stand", "prop_kite@1.0.0"));
+    let deprecate = |deprecated: bool| json!({"project": "sketchbook", "asset_id": KITE, "deprecated": deprecated});
+    // StartWork: link-external on a new asset.
+    let source = fx.outside("kite_ext.png", b"external kite");
+    fx.ok(
+        "asset.import",
+        json!({"project": "sketchbook", "asset_id": KITE, "type": "image",
+               "files": [source.to_string_lossy()], "mode": "link_external"}),
+    )
+    .await;
+    let e = assert_newest(&fx, KITE, 1, "planned", "in_progress", "cli");
+    assert!(e.get("reason").is_none(), "{e}");
+    // CandidateRun: collect.
+    let r = fx
+        .ok(
+            "asset.collect",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    let first = r["run_id"].as_str().unwrap().to_string();
+    assert_newest(&fx, KITE, 2, "in_progress", "candidate", "cli");
+    // RequestSignoff.
+    fx.ok(
+        "asset.request_signoff",
+        json!({"project": "sketchbook", "asset_id": KITE}),
+    )
+    .await;
+    assert_newest(&fx, KITE, 3, "candidate", "in_review", "cli");
+    // Signoff.
+    fx.signoff(KITE, &first, &["kite_ext.png"], json!({})).await;
+    assert_newest(&fx, KITE, 4, "in_review", "approved", "cli");
+    // CandidateRun on an approved asset, then a Signoff that makes the dependent stale: the
+    // core's MarkStale names the input.
+    let second = fx.import_run(KITE, "kite.png", b"kite two").await;
+    assert_newest(&fx, KITE, 5, "approved", "candidate", "cli");
+    fx.signoff(KITE, &second, &["kite.png"], json!({})).await;
+    assert_newest(&fx, KITE, 6, "candidate", "approved", "cli");
+    let stale = assert_newest(&fx, "prop_kite_stand", 1, "approved", "stale", "core");
+    assert_eq!(
+        stale["reason"],
+        json!({"code": "input_changed", "ref": "prop_kite@1.0.0"}),
+        "{stale}"
+    );
+    // Deprecate from an app (by `user`), then Undeprecate from the CLI.
+    let out = fx
+        .call_as(
+            CallerKind::Ui("image".into()),
+            true,
+            "asset.deprecate",
+            deprecate(true),
+        )
+        .await;
+    assert!(matches!(out, Outcome::Ok(_)), "{out:?}");
+    assert_newest(&fx, KITE, 7, "approved", "deprecated", "user");
+    assert_eq!(fx.manifest(KITE)["status_before_deprecated"], "approved");
+    let back = fx.ok("asset.deprecate", deprecate(false)).await;
+    assert_eq!(back, json!({"status": "approved"}));
+    let e = assert_newest(&fx, KITE, 8, "deprecated", "approved", "cli");
+    let utc = e["utc"].as_str().unwrap();
+    assert!(utc.ends_with('Z') && utc.contains('T'), "{e}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-170, CORE-156 (ruling PF-21)
+async fn undeprecate_without_history_follows_the_fallback_order() {
+    // An older deprecated asset: no `status_before_deprecated`, no status log, but an
+    // `approved_version`.
+    let fx = Fx::with(|ws| edit_fixture_manifest(ws, CRANE, |m| m["status"] = json!("deprecated")));
+    let before = fx.manifest(CRANE);
+    assert!(before.get("status_before_deprecated").is_none());
+    assert!(before.get("status_log").is_none());
+    assert_eq!(before["approved_version"], "1.0.0");
+    let r = fx
+        .ok(
+            "asset.deprecate",
+            json!({"project": "sketchbook", "asset_id": CRANE, "deprecated": false}),
+        )
+        .await;
+    assert_eq!(r["status"], "approved", "{r}");
+    assert_newest(&fx, CRANE, 1, "deprecated", "approved", "cli");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-156
+async fn a_long_hand_written_log_is_trimmed_on_the_next_change() {
+    let statuses = ["candidate", "in_review"];
+    let hand_written: Vec<Value> = (0..200)
+        .map(|i| {
+            json!({"from": statuses[i % 2], "to": statuses[(i + 1) % 2], "by": "user",
+                   "utc": format!("2026-10-{:02}T{:02}:00:00Z", 1 + i / 24, i % 24),
+                   "x_note": i})
+        })
+        .collect();
+    let log = hand_written.clone();
+    let fx = Fx::with(move |ws| edit_fixture_manifest(ws, CRANE, |m| m["status_log"] = json!(log)));
+    let before = fx.manifest(CRANE);
+    fx.ok(
+        "asset.deprecate",
+        json!({"project": "sketchbook", "asset_id": CRANE, "deprecated": true}),
+    )
+    .await;
+    let after = fx.manifest(CRANE);
+    let log = status_log(&after);
+    assert_eq!(log.len(), 50);
+    // The oldest dropped; the 49 newest hand-written entries stay as written, then the change.
+    assert_eq!(log[..49], hand_written[151..]);
+    assert_eq!(
+        (&log[49]["from"], &log[49]["to"]),
+        (&json!("candidate"), &json!("deprecated"))
+    );
+    // A minimal diff: the other keys keep their values and order; only `status` changed and
+    // `status_before_deprecated` was added at the end.
+    let keys = |m: &Value| -> Vec<String> { m.as_object().unwrap().keys().cloned().collect() };
+    let mut want = keys(&before);
+    want.push("status_before_deprecated".into());
+    assert_eq!(keys(&after), want);
+    for key in keys(&before) {
+        if !["status", "status_log"].contains(&key.as_str()) {
+            assert_eq!(after[&key], before[&key], "{key}");
+        }
+    }
+    assert_eq!(after["status"], "deprecated");
+    assert_eq!(after["status_before_deprecated"], "candidate");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-170
+async fn deprecate_keeps_files_and_dependents() {
+    let fx = Fx::with(|ws| write_dependent(ws, "prop_kite_stand", "prop_kite@1.0.0"));
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    fx.signoff(KITE, &run, &["kite.png"], json!({})).await;
+    let kept = fx.import_run(KITE, "kite_two.png", b"kite two").await;
+    let sealed = fx.path(&format!("{KITE_DIR}/v1.0.0/kite.png"));
+    let candidate = fx.path(&format!("{KITE_DIR}/candidates/{kept}/kite_two.png"));
+    let dependent = manifest_file(&fx.ws, "prop_kite_stand");
+    let dependent_bytes = std::fs::read(&dependent).unwrap();
+    let hashes = fx.manifest(KITE)["hashes"].clone();
+    let get = |asset: &str| json!({"project": "sketchbook", "asset_id": asset});
+    let dependent_detail = fx.ok("asset.get", get("prop_kite_stand")).await;
+
+    for deprecated in [true, false] {
+        fx.ok(
+            "asset.deprecate",
+            json!({"project": "sketchbook", "asset_id": KITE, "deprecated": deprecated}),
+        )
+        .await;
+        assert_eq!(std::fs::read(&sealed).unwrap(), b"kite one");
+        assert!(std::fs::metadata(&sealed).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"kite two");
+        let m = fx.manifest(KITE);
+        assert_eq!(m["hashes"], hashes, "{m}");
+        assert_eq!(run_of(&m, &kept)["status"], "open", "{m}");
+        assert_eq!(std::fs::read(&dependent).unwrap(), dependent_bytes);
+        assert_eq!(
+            fx.ok("asset.get", get("prop_kite_stand")).await,
+            dependent_detail
+        );
+    }
+    // Back where it was: the open run's work goes on.
+    assert_eq!(fx.manifest(KITE)["status"], "candidate");
     fx.shutdown().await;
 }

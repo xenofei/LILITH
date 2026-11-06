@@ -269,7 +269,7 @@ fn record_plan() -> RecordPlan {
         }) else {
             unreachable!()
         };
-        start_candidate_run(m, run, 0)
+        start_candidate_run(m, run, &lil_schema::StatusBy::Cli, 0)
     });
     RecordPlan {
         branch: RecordBranch::CandidateRun {

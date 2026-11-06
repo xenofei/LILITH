@@ -45,7 +45,7 @@
 //! (`workspace.required` without one). `test.ingest_run` does what an engine and the core do
 //! for a candidate run: it writes the files into a staging handle with `fsops::write_temp`,
 //! takes a run id from `Store::next_run_id`, and commits one candidate run in the ARCH-075
-//! order (a new manifest if there is none, status by `transition(…, CandidateRun)`, each run
+//! order (a new manifest if there is none, status by `change_status(…, CandidateRun)`, each run
 //! file with its `sha256`, and a jobs log line when `job_line` is true). An omitted `project`
 //! is the call's resolved project (`CallCtx::project`: the session's active project, else the
 //! workspace's hint, else `sketchbook`).
@@ -69,7 +69,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use lil_protocol::{EffectClass, ErrorBody, codes, is_valid_topic};
-use lil_schema::{Manifest, Status, StatusEvent, is_asset_id, is_slug, sha256_hex, transition};
+use lil_schema::{Manifest, StatusEvent, change_status, is_asset_id, is_slug, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -672,28 +672,24 @@ async fn ingest_run(ctx: &CallCtx, args: IngestArgs) -> Result<(IngestResult, St
     let ids = store.ids().clone();
     let (edit_project, edit_asset, edit_run) = (project.clone(), asset_id.clone(), run_id.clone());
     let (edit_rel, created) = (manifest_rel.clone(), lil_schema::time::rfc3339(now));
+    let by = crate::pipeline::status_by(&ctx.session.caller);
     let manifest: ManifestEdit = Arc::new(move |m: &mut Manifest| {
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&edit_project, &edit_asset, "image", &ids.uuid());
         }
         let view = m.view();
-        let parse = |key: &str| {
-            m.get(key)
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<Status>().ok())
-        };
-        let from = view.status.unwrap_or(Status::Planned);
-        let moved = transition(
-            from,
-            parse("status_before_stale"),
-            parse("status_before_blocked"),
+        change_status(
+            m,
             &StatusEvent::CandidateRun,
+            by.clone(),
+            None,
+            None,
+            &created,
         )
         .map_err(StoreError::InvalidTransition)?;
         let target = view
             .version
             .map_or_else(|| "1.0.0".to_string(), |v| v.to_string());
-        m.set("status", Value::from(moved.to.as_str()));
         m.push(
             "candidate_runs",
             json!({

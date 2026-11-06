@@ -427,8 +427,14 @@ async fn auto_candidate_on_save_defaults_off_and_has_working_doc_survives_edits(
     assert_eq!(after["has_working_doc"], true);
     assert_eq!(after["status"], "candidate");
     let keys: Vec<&String> = after.as_object().unwrap().keys().collect();
-    let before: Vec<&String> = manifest.as_object().unwrap().keys().collect();
-    assert_eq!(keys, before, "no key moved or was added");
+    let mut before: Vec<&String> = manifest.as_object().unwrap().keys().collect();
+    // The status change's log entry is the one key added, at the end (CORE-156).
+    let log = "status_log".to_string();
+    before.push(&log);
+    assert_eq!(
+        keys, before,
+        "no key moved, and only the status log was added"
+    );
     fx.shutdown().await;
     assert_removed(env);
 }
