@@ -497,14 +497,34 @@ fn any_of(key: Key, column: &str, values: &[String]) -> Option<Cond> {
     })
 }
 
-/// `duplicates`: the asset holds a sealed or candidate file (not `missing`) whose SHA-256
-/// another asset's sealed or candidate file has (CORE-168), through `files_asset` and
-/// `files_sha`.
-const DUPLICATES: &str = "EXISTS (SELECT 1 FROM files f WHERE f.project = a.project \
-    AND f.asset_id = a.asset_id AND f.kind IN ('sealed', 'candidate') AND f.state <> 'missing' \
-    AND f.sha256 IS NOT NULL AND EXISTS (SELECT 1 FROM files g WHERE g.sha256 = f.sha256 \
-    AND g.kind IN ('sealed', 'candidate') AND g.state <> 'missing' \
-    AND (g.project IS NOT f.project OR g.asset_id IS NOT f.asset_id)))";
+/// Whether the `files` row `t` is a deliverable for `duplicates` (CORE-168): a sealed or
+/// candidate file, not `missing`, not empty, and not under a version's `source/` folder
+/// (`v<ver>/source/…`, compared without regard to case).
+fn deliverable(t: &str) -> String {
+    // The path inside the asset folder: `v1.0.0/source/x.json`.
+    let inside = format!(
+        "substr({t}.path, length('projects/' || {t}.project || '/assets/' || {t}.asset_id \
+         || '/') + 1)"
+    );
+    format!(
+        "{t}.kind IN ('sealed', 'candidate') AND {t}.state <> 'missing' AND {t}.size > 0 \
+         AND NOT ({t}.kind = 'sealed' \
+         AND substr({inside}, instr({inside}, '/') + 1) LIKE 'source/%')"
+    )
+}
+
+/// `duplicates`: the asset holds a deliverable ([`deliverable`]) whose SHA-256 another asset's
+/// deliverable has, through `files_asset` and `files_sha`.
+fn duplicates() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM files f WHERE f.project = a.project \
+         AND f.asset_id = a.asset_id AND {} AND f.sha256 IS NOT NULL \
+         AND EXISTS (SELECT 1 FROM files g WHERE g.sha256 = f.sha256 AND {} \
+         AND (g.project IS NOT f.project OR g.asset_id IS NOT f.asset_id)))",
+        deliverable("f"),
+        deliverable("g")
+    )
+}
 
 /// The conditions of `q`'s filters (not its keyset).
 fn conditions(q: &AssetQuery) -> Vec<Cond> {
@@ -603,7 +623,7 @@ fn conditions(q: &AssetQuery) -> Vec<Cond> {
         }
     }
     if q.duplicates == Some(true) {
-        c.push(Cond::other(DUPLICATES));
+        c.push(Cond::other(&duplicates()));
     }
     match q.deprecated {
         None | Some(DeprecatedFilter::Show) => {}
@@ -660,20 +680,20 @@ fn grouped(
     .collect()
 }
 
-/// The tags facet: the [`TAGS_FACET_MAX`] largest counts by fold (ties by fold), each shown as
-/// its smallest spelling, and whether more exist.
+/// The tags facet: the [`TAGS_FACET_MAX`] largest counts by fold, each shown as its smallest
+/// spelling, ties by that value (Appendix H), and whether more exist.
 fn tags_facet(tx: &Transaction<'_>, conds: &[Cond]) -> rusqlite::Result<(Vec<FacetCount>, bool)> {
     let (w, mut args) = clause(conds, Some(Key::Tags));
     // With no other filter the tags alone answer, from the (tag_fold, tag) index.
     let sql = if w.is_empty() {
-        "SELECT min(tag), count(*) AS c FROM asset_tags GROUP BY tag_fold \
-         ORDER BY c DESC, tag_fold ASC LIMIT ?"
+        "SELECT min(tag) AS v, count(*) AS c FROM asset_tags GROUP BY tag_fold \
+         ORDER BY c DESC, v ASC LIMIT ?"
             .to_string()
     } else {
         format!(
-            "SELECT min(t.tag), count(*) AS c FROM asset_tags t JOIN assets a \
+            "SELECT min(t.tag) AS v, count(*) AS c FROM asset_tags t JOIN assets a \
              ON a.project = t.project AND a.asset_id = t.asset_id{w} GROUP BY t.tag_fold \
-             ORDER BY c DESC, t.tag_fold ASC LIMIT ?"
+             ORDER BY c DESC, v ASC LIMIT ?"
         )
     };
     args.push(Sql::Integer(

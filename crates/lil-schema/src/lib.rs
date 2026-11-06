@@ -41,7 +41,7 @@ pub mod yaml_edit;
 
 pub use attribution::{Actor, ActorKind, TrustRecord, TrustSource, TrustSourceKind, TrustState};
 pub use content_hash::{is_os_metadata, sha256_hex, version_content_hash};
-pub use display::{DisplayFile, MediaKind, display_file, media_kind_of};
+pub use display::{DisplayFile, MediaKind, display_file, media_kind_of, renderable};
 pub use lilref::{LilRef, parse_lilref, write_lilref};
 pub use manifest::{
     CandidateFile, CandidateRun, EditError, ExternalFile, HumanEdit, Input, Manifest, ManifestView,

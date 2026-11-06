@@ -2343,21 +2343,42 @@ fn remove_tree(path: &Path) {
         .unwrap_or_else(|e| panic!("cannot remove {}: {e}", path.display()));
 }
 
-/// An asset of [`marked_index`]: (asset, status, tags, rating, label).
-type Marked<'a> = (&'a str, &'a str, &'a [&'a str], u8, Option<&'a str>);
+/// An asset of [`marked_index`]: (asset, status, type, tags, rating, label).
+type Marked<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a [&'a str],
+    u8,
+    Option<&'a str>,
+);
 
-/// The assets of the filter tests.
+/// The assets of the filter tests. The rock's tag is hand-written untrimmed.
 const MARKED: [Marked<'static>; 5] = [
-    ("crane", "candidate", &["Tree", "paper"], 4, Some("red")),
-    ("lamp", "approved", &["tree", "light"], 2, Some("blue")),
-    ("kite", "candidate", &["Birch"], 5, None),
-    ("wall", "in_review", &[], 0, Some("red")),
-    ("rock", "approved", &["stone"], 3, None),
+    (
+        "crane",
+        "candidate",
+        "image",
+        &["Tree", "paper"],
+        4,
+        Some("red"),
+    ),
+    (
+        "lamp",
+        "approved",
+        "image",
+        &["tree", "light"],
+        2,
+        Some("blue"),
+    ),
+    ("kite", "candidate", "image", &["Birch"], 5, None),
+    ("wall", "in_review", "prop_2d", &[], 0, Some("red")),
+    ("rock", "approved", "audio", &[" stone"], 3, None),
 ];
 
 async fn marked_index(fx: &Fx) -> Arc<Index> {
-    for (asset, status, tags, rating, label) in MARKED {
-        let mut extra = json!({"status": status, "tags": tags, "rating": rating});
+    for (asset, status, kind, tags, rating, label) in MARKED {
+        let mut extra = json!({"status": status, "type": kind, "tags": tags, "rating": rating});
         if let Some(label) = label {
             extra["label"] = json!(label);
         }
@@ -2383,6 +2404,11 @@ async fn tag_filter_is_case_insensitive_any_of() {
         "any of"
     );
     assert_eq!(ids_of(&index, tags(&[" Stone "])).await, ["p/rock"]);
+    // The hand-written `" stone"` is found by the value its facet shows, and by `stone`.
+    assert_eq!(ids_of(&index, tags(&[" stone"])).await, ["p/rock"]);
+    assert_eq!(ids_of(&index, tags(&["stone"])).await, ["p/rock"]);
+    let rock = index.assets(tags(&["stone"])).await.unwrap();
+    assert_eq!(rock.rows[0].tags, [" stone"], "kept as written");
     assert!(ids_of(&index, tags(&["oak"])).await.is_empty());
     assert_eq!(
         ids_of(&index, tags(&[])).await.len(),
@@ -2525,7 +2551,7 @@ async fn facets_are_disjunctive_and_in_the_page_transaction() {
     assert_eq!(count_of(&f.tags, &json!("Tree")), 2, "{:?}", f.tags);
     assert_eq!(count_of(&f.rating, &json!(0)), 1);
     assert_eq!(count_of(&f.status, &json!("approved")), 2);
-    assert_eq!(count_of(&f.asset_type, &json!("image")), 5);
+    assert_eq!(count_of(&f.asset_type, &json!("image")), 3);
     assert!(!f.tags_more);
     assert!(
         f.tags.windows(2).all(|w| w[0].count >= w[1].count),
@@ -2579,6 +2605,47 @@ async fn facets_are_disjunctive_and_in_the_page_transaction() {
         f.label
     );
 
+    // The rating facet leaves out `rating_min`; the other facets use it.
+    let rated = index
+        .assets(with_facets(AssetQuery {
+            rating_min: Some(4),
+            ..query()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&rated), ["p/crane", "p/kite"]);
+    let f = rated.facets.as_ref().unwrap();
+    for (rating, n) in [(0, 1), (2, 1), (3, 1), (4, 1), (5, 1)] {
+        assert_eq!(count_of(&f.rating, &json!(rating)), n, "{:?}", f.rating);
+    }
+    assert_eq!(count_of(&f.label, &json!("blue")), 0, "{:?}", f.label);
+    assert_eq!(count_of(&f.asset_type, &json!("audio")), 0);
+
+    // The type facet leaves out `type`; the other facets use it.
+    let images = index
+        .assets(with_facets(AssetQuery {
+            asset_type: Some(Choice::One("image".into())),
+            ..query()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&images), ["p/crane", "p/kite", "p/lamp"]);
+    let f = images.facets.as_ref().unwrap();
+    assert_eq!(count_of(&f.asset_type, &json!("image")), 3);
+    assert_eq!(
+        count_of(&f.asset_type, &json!("prop_2d")),
+        1,
+        "{:?}",
+        f.asset_type
+    );
+    assert_eq!(count_of(&f.asset_type, &json!("audio")), 1);
+    assert_eq!(
+        count_of(&f.label, &json!("red")),
+        1,
+        "the wall isn't an image"
+    );
+    assert_eq!(count_of(&f.rating, &json!(3)), 0, "the rock isn't an image");
+
     // While assets are added, every answer's facets agree with its own total and rows: a
     // write between the page and its facets can't show, since all are read in one
     // transaction.
@@ -2614,6 +2681,8 @@ async fn facets_are_disjunctive_and_in_the_page_transaction() {
         })
     };
     let mut answers = 0;
+    // This catches the facets moving to a separate index call only when a reconcile happens
+    // to run between the two; it can't see a missing `transaction()` on the one connection.
     while !writer.is_finished() {
         assert_facets_add_up(&index.assets(everything()).await.unwrap());
         answers += 1;
@@ -2628,14 +2697,22 @@ async fn facets_are_disjunctive_and_in_the_page_transaction() {
 #[tokio::test] // spec: CORE-152, APP-147
 async fn tags_facet_is_capped_at_100_with_more() {
     let fx = fx();
-    // 102 assets, each with its own tag and the shared `every`; project `few` holds 3 of them.
+    // 102 assets, each with its own tag and the shared `every`; project `few` holds 3 of them,
+    // and its first also has `apple` and `Zeta` (a fold order and a value order that differ).
+    let tags_of = |i: usize| {
+        let mut tags = vec![format!("t{i:03}"), "every".to_string()];
+        if i == 0 {
+            tags.extend(["apple".to_string(), "Zeta".to_string()]);
+        }
+        tags
+    };
     for i in 0..102 {
         let project = if i < 3 { "few" } else { "many" };
         put_manifest(
             &fx,
             project,
             &format!("a{i:03}"),
-            json!({"tags": [format!("t{i:03}"), "every"]}),
+            json!({"tags": tags_of(i)}),
         );
     }
     let index = fx.open(Arc::new(SystemProbe));
@@ -2661,9 +2738,11 @@ async fn tags_facet_is_capped_at_100_with_more() {
             count: 102
         }
     );
-    // Ties by value: t000 … t098.
-    assert_eq!(all.tags[1].value, json!("t000"));
-    assert_eq!(all.tags[99].value, json!("t098"));
+    // Ties by value, in byte order: `Zeta`, `apple`, then t000 … t096.
+    assert_eq!(all.tags[1].value, json!("Zeta"));
+    assert_eq!(all.tags[2].value, json!("apple"));
+    assert_eq!(all.tags[3].value, json!("t000"));
+    assert_eq!(all.tags[99].value, json!("t096"));
     // The tags filter doesn't narrow its own facet.
     let one = facets(AssetQuery {
         tags: Some(vec!["t101".into()]),
@@ -2677,7 +2756,7 @@ async fn tags_facet_is_capped_at_100_with_more() {
         ..query()
     })
     .await;
-    assert_eq!(few.tags.len(), 4, "{:?}", few.tags);
+    assert_eq!(few.tags.len(), 6, "{:?}", few.tags);
     assert!(!few.tags_more);
 }
 
@@ -2727,6 +2806,37 @@ async fn duplicates_ignore_work_files() {
     outside_remove(&fx.file("projects/p/assets/b/candidates/r1/y.png"));
     index.reconcile(Scope::All).await.unwrap();
     assert!(ids_of(&index, dup(true)).await.is_empty());
+}
+
+#[tokio::test] // spec: CORE-168
+async fn duplicates_ignore_source_and_empty_files() {
+    let fx = fx();
+    // The same workflow under each version's `source/`, different deliverables.
+    for (asset, bytes) in [("a", b"a deliverable".as_slice()), ("b", b"b deliverable")] {
+        fx.write(&format!("projects/p/assets/{asset}/v1.0.0/x.png"), bytes);
+        fx.write(
+            &format!("projects/p/assets/{asset}/v1.0.0/source/workflow.json"),
+            b"{\"nodes\": []}",
+        );
+        // An empty sealed file in each.
+        fx.write(&format!("projects/p/assets/{asset}/v1.0.0/empty.txt"), b"");
+        put_manifest(&fx, "p", asset, json!({}));
+    }
+    // A deliverable named like a source folder elsewhere still counts.
+    fx.write("projects/p/assets/c/v1.0.0/x.png", b"shared deliverable");
+    fx.write(
+        "projects/p/assets/d/v1.0.0/art/source/x.png",
+        b"shared deliverable",
+    );
+    put_manifest(&fx, "p", "c", json!({}));
+    put_manifest(&fx, "p", "d", json!({}));
+    let index = fx.open(Arc::new(SystemProbe));
+    index.reconcile(Scope::All).await.unwrap();
+    let dup = AssetQuery {
+        duplicates: Some(true),
+        ..query()
+    };
+    assert_eq!(ids_of(&index, dup).await, ["p/c", "p/d"]);
 }
 
 #[tokio::test] // spec: CORE-170

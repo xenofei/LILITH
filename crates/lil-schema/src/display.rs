@@ -107,6 +107,21 @@ pub fn media_kind_of(name: &str) -> MediaKind {
         .map_or(MediaKind::Other, |(kind, _)| *kind)
 }
 
+/// The extensions the `image@1` renderer decodes (PNG, JPEG, WebP).
+const RENDERED: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+
+/// Whether a renderer draws this file itself: an `Image` whose extension `image@1` decodes
+/// (`png`, `jpg`, `jpeg`, `webp`, compared without regard to case). Other raster formats
+/// (`psd`, `tif`, `exr`, …) are `Image` for icons and facets but aren't rendered, so
+/// [`display_file`] shows their take's `preview` instead. Task 12 pins this against the
+/// renderer registry.
+pub fn renderable(name: &str) -> bool {
+    media_kind_of(name) == MediaKind::Image
+        && file_name(name)
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| RENDERED.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// The file that shows an asset (P4b-R30).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayFile {
@@ -118,11 +133,12 @@ pub struct DisplayFile {
 }
 
 /// The display file of `m` (P4b-R30): the approved version's primary file; else the newest
-/// open run's lowest-numbered take's primary, or its `preview` companion when the primary's
-/// media kind has no renderer; else `None`.
+/// open run's lowest-numbered take's primary; in both, the take's `preview` companion instead
+/// when the primary isn't [`renderable`] (Appendix H "Takes"); else `None`.
 ///
 /// The approved version's primary is the first `selected` name of the run whose
-/// `signed_off.version` is `approved_version`, at `v<version>/<name>`. "Newest" is the open
+/// `signed_off.version` is `approved_version`, at `v<version>/<name>`; its preview is used
+/// only when it was sealed there too (in `hashes`). "Newest" is the open
 /// run (not trashed, with at least one take) with the latest `created`, the later one in the
 /// list on a tie or when neither has one.
 pub fn display_file(m: &Manifest) -> Option<DisplayFile> {
@@ -137,13 +153,23 @@ pub fn display_file(m: &Manifest) -> Option<DisplayFile> {
                     .as_ref()
                     .is_some_and(|s| &s.version == approved)
             })
-            .find_map(|r| r.selected.first());
-        if let Some(name) = primary {
-            let name = file_name(name);
-            let path = format!("v{approved}/{name}");
+            .find_map(|r| r.selected.first().map(|name| (r, file_name(name))));
+        if let Some((run, name)) = primary {
+            let sealed_path = |name: &str| format!("v{approved}/{name}");
+            let preview = if renderable(name) {
+                None
+            } else {
+                takes_of(run)
+                    .into_iter()
+                    .find(|t| t.primary.eq_ignore_ascii_case(name))
+                    .and_then(|t| t.preview)
+                    .filter(|p| view.hashes.contains_key(&sealed_path(p)))
+            };
+            let shown = preview.as_deref().unwrap_or(name);
+            let path = sealed_path(shown);
             let sha256 = view.hashes.get(&path).cloned();
             return Some(DisplayFile {
-                media_kind: media_kind_of(name),
+                media_kind: media_kind_of(shown),
                 path,
                 sha256,
             });
@@ -161,7 +187,7 @@ pub fn display_file(m: &Manifest) -> Option<DisplayFile> {
         })?;
     let take = takes_of(newest).into_iter().min_by_key(|t| t.n)?;
     let name = match &take.preview {
-        Some(preview) if !media_kind_of(&take.primary).has_renderer() => preview.clone(),
+        Some(preview) if !renderable(&take.primary) => preview.clone(),
         _ => take.primary,
     };
     let file = newest.files.iter().find(|f| file_name(&f.path) == name)?;
@@ -219,6 +245,13 @@ mod tests {
         .filter(|k| k.has_renderer())
         .collect();
         assert_eq!(with_renderer, [MediaKind::Image], "only images in plan 4b");
+        // Only the image@1 formats are renderable.
+        for name in ["a.png", "b.JPG", "c.jpeg", "v1.0.0/d.WebP"] {
+            assert!(renderable(name), "{name}");
+        }
+        for name in ["a.psd", "b.tif", "c.exr", "d.gif", "e.glb", "f.txt", "png"] {
+            assert!(!renderable(name), "{name}");
+        }
     }
 
     #[test] // spec: APP-147
@@ -293,12 +326,54 @@ mod tests {
             (d.path.as_str(), d.media_kind),
             ("candidates/r/m.glb", MediaKind::Model3d)
         );
+        // A raster primary `image@1` can't decode shows its PNG preview too.
+        let psd = model(json!([
+            {"path": "candidates/r/art.psd", "role": "candidate"},
+            {"path": "candidates/r/art.png", "role": "preview", "from": "art.psd"},
+        ]));
+        let d = display_file(&psd).unwrap();
+        assert_eq!(
+            (d.path.as_str(), d.media_kind),
+            ("candidates/r/art.png", MediaKind::Image)
+        );
         // An image primary ignores its preview.
         let image = model(json!([
             {"path": "candidates/r/i.png", "role": "candidate"},
             {"path": "candidates/r/i_small.png", "role": "preview", "from": "i.png"},
         ]));
         assert_eq!(display_file(&image).unwrap().path, "candidates/r/i.png");
+
+        // An approved `.glb` whose preview was sealed beside it shows the sealed PNG; without
+        // the sealed preview, the `.glb` itself.
+        let approved_model = |hashes: Value| {
+            manifest(&json!({
+                "asset_id": "a", "project": "p", "approved_version": "1.0.0",
+                "candidate_runs": [
+                    {"run_id": "r1", "status": "selected", "created": "2026-10-01T00:00:00Z",
+                     "files": [{"path": "candidates/r1/m.glb", "role": "candidate"},
+                               {"path": "candidates/r1/m.png", "role": "preview",
+                                "from": "m.glb"}],
+                     "selected": ["m.glb"],
+                     "signed_off": {"by": "user", "date": "2026-10-01", "version": "1.0.0",
+                                    "companions": ["m.png"]}},
+                ],
+                "hashes": hashes,
+            }))
+        };
+        let sealed = approved_model(json!({
+            "v1.0.0/m.glb": format!("sha256:{SHA_A}"),
+            "v1.0.0/m.png": format!("sha256:{SHA_B}"),
+        }));
+        assert_eq!(
+            display_file(&sealed),
+            Some(DisplayFile {
+                path: "v1.0.0/m.png".into(),
+                sha256: Some(SHA_B.into()),
+                media_kind: MediaKind::Image,
+            })
+        );
+        let unsealed = approved_model(json!({"v1.0.0/m.glb": format!("sha256:{SHA_A}")}));
+        assert_eq!(display_file(&unsealed).unwrap().path, "v1.0.0/m.glb");
 
         // A trashed open run, or no run at all: none.
         let trashed = manifest(&json!({"asset_id": "a", "project": "p", "candidate_runs": [

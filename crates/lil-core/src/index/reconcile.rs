@@ -1006,12 +1006,19 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
     tx.prepare_cached("DELETE FROM asset_tags WHERE project = ?1 AND asset_id = ?2")?
         .execute(params![parsed.project, parsed.asset_id])?;
     for tag in &fields.tags {
-        // A hand-written case-insensitive duplicate keeps the first spelling.
+        // The tag is kept as written; its fold is of the trimmed tag, as the filter folds
+        // (a hand-written `" stone"` is found by `stone`). A hand-written case-insensitive
+        // duplicate keeps the first spelling.
         tx.prepare_cached(
             "INSERT OR IGNORE INTO asset_tags (project, asset_id, tag, tag_fold)
              VALUES (?1, ?2, ?3, ?4)",
         )?
-        .execute(params![parsed.project, parsed.asset_id, tag, fold_tag(tag)])?;
+        .execute(params![
+            parsed.project,
+            parsed.asset_id,
+            tag,
+            fold_tag(tag.trim())
+        ])?;
     }
     tx.prepare_cached("DELETE FROM take_marks WHERE project = ?1 AND asset_id = ?2")?
         .execute(params![parsed.project, parsed.asset_id])?;
