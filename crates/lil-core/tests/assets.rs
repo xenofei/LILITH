@@ -71,6 +71,7 @@ fn done_entries(text: &str) -> Vec<String> {
 struct Fx {
     dispatcher: Dispatcher,
     hub: Arc<WorkspaceHub>,
+    events: Arc<EventBus>,
     ws_ref: WorkspaceRef,
     ws: PathBuf,
     _states: Arc<StateRegistry>,
@@ -151,7 +152,7 @@ impl Fx {
             reg,
             PipelineHooks::plan2(),
             states.clone(),
-            events,
+            events.clone(),
             hub.clone(),
             ids,
             clock,
@@ -160,6 +161,7 @@ impl Fx {
         Fx {
             dispatcher,
             hub,
+            events,
             ws_ref: ws_ref(&ws),
             ws,
             _states: states,
@@ -1646,6 +1648,69 @@ async fn deprecate_keeps_files_and_dependents() {
     }
     // Back where it was: the open run's work goes on.
     assert_eq!(fx.manifest(KITE)["status"], "candidate");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-170, CORE-156 (PR #91 audit L3)
+async fn undeprecate_of_an_asset_that_is_not_deprecated_changes_nothing() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    fx.signoff(KITE, &run, &["kite.png"], json!({})).await;
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    let entries = status_log(&fx.manifest(KITE)).len();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(9, tx);
+    let asset = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_id());
+    let project = "project:sketchbook".to_string();
+    fx.events
+        .subscribe(9, &[asset.clone(), project.clone()], &Default::default())
+        .await;
+    let deprecate = |deprecated: bool| json!({"project": "sketchbook", "asset_id": KITE, "deprecated": deprecated});
+    let r = fx.ok("asset.deprecate", deprecate(false)).await;
+    assert_eq!(r, json!({"status": "approved"}));
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "byte-identical");
+    assert_eq!(status_log(&fx.manifest(KITE)).len(), entries);
+
+    // A later marker change: its events are the first of their kinds on either topic, so
+    // the no-op published none.
+    fx.ok("asset.deprecate", deprecate(true)).await;
+    let ours = |e: &Value| {
+        let kind = e["data"]["kind"].as_str().unwrap_or_default();
+        kind == "deprecated" || kind == "status"
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen: Vec<(String, Value)> = Vec::new();
+    while seen.len() < 3 && tokio::time::Instant::now() < deadline {
+        while let Ok(line) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if ours(&v["params"]) {
+                let topic = v["params"]["topic"].as_str().unwrap().to_string();
+                seen.push((topic, v["params"]["data"].clone()));
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        seen,
+        [
+            (
+                asset.clone(),
+                json!({"kind": "deprecated", "deprecated": true, "status": "deprecated",
+                       "previous": "approved"})
+            ),
+            (
+                asset.clone(),
+                json!({"kind": "status", "status": "deprecated"})
+            ),
+            (
+                project.clone(),
+                json!({"kind": "deprecated", "asset_id": KITE, "deprecated": true,
+                       "status": "deprecated", "previous": "approved"})
+            ),
+        ]
+    );
     fx.shutdown().await;
 }
 
