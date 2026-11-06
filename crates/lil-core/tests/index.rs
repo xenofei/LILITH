@@ -1,8 +1,9 @@
 //! The index and the asset read tools (ARCH-079, ARCH-089, ARCH-096, ARCH-097, CORE-005,
 //! CORE-006, CORE-038, CORE-041, CORE-047; APP-025 paging): a disposable `index.db` (WAL,
-//! `user_version` 1, rebuilt when damaged), reconciled by size, last write, FileId and
+//! `user_version` 2, rebuilt when damaged), reconciled by size, last write, FileId and
 //! ChangeTime where they are stable, cloud-safe, with stable-snapshot hashing, parked reads,
-//! `missing` files, manifests parsed first, edges, and `assets.query`/`asset.get`.
+//! `missing` files, manifests parsed first, edges, and `assets.query`/`asset.get`; schema 2's
+//! marks, takes, filters, disjunctive facets and duplicates (CORE-152, CORE-168, CORE-170).
 //!
 //! Fixture files are made with `lil_testkit::files::write_file`; the outside steps (a remove, a
 //! junction, a set modification time) carry their own allowance. Time-dependent rules run on a
@@ -21,8 +22,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use lil_core::events::EventBus;
 use lil_core::index::{
-    AssetQuery, FileKind, FileState, Index, ReconcileOrder, Scope, SortDir, SortField,
-    decode_cursor, encode_cursor, kind_of,
+    AssetPage, AssetQuery, Choice, DeprecatedFilter, FacetCount, FileKind, FileState, Index,
+    ReconcileOrder, Scope, SortDir, SortField, TAGS_FACET_MAX, decode_cursor, encode_cursor,
+    kind_of, query_hash,
 };
 use lil_core::session::Session;
 use lil_core::state::{StateDb, StateRegistry, StateScope};
@@ -32,6 +34,7 @@ use lil_core::workspace::{Access, OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{FileIdentity, Probe, SystemProbe, VolumeInfo};
 use lil_platform::{Clock, Env};
 use lil_protocol::{CallerKind, ErrorBody, codes};
+use lil_schema::{Flag, Label};
 use lil_testkit::files::write_file;
 use lil_testkit::{FakeClock, SeqIds, TestEnv, sha256_bytes};
 use rusqlite::Connection;
@@ -469,13 +472,9 @@ fn ids(page: &Value) -> Vec<String> {
 
 fn query() -> AssetQuery {
     AssetQuery {
-        project: None,
-        status: None,
-        asset_type: None,
-        text: None,
         sort: (SortField::AssetId, SortDir::Asc),
         limit: 200,
-        after: None,
+        ..AssetQuery::default()
     }
 }
 
@@ -501,7 +500,7 @@ async fn fresh_index_is_wal_and_versioned() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(version, lil_core::index::INDEX_SCHEMA_VERSION);
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     drop(db);
     drop(index);
 
@@ -564,7 +563,7 @@ async fn version_mismatch_or_failed_quick_check_rebuilds() {
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     // A damaged page: quick_check fails (or SQLite refuses the file).
     {
@@ -1870,9 +1869,9 @@ async fn assets_query_cursor_of_another_query_is_params_invalid() {
     }
     // The pure check agrees.
     let mut q = query();
-    q.status = Some("candidate".into());
+    q.status = Some(Choice::One("candidate".into()));
     assert!(decode_cursor(&q, &cursor).is_ok());
-    q.status = Some("planned".into());
+    q.status = Some(Choice::One("planned".into()));
     assert!(decode_cursor(&q, &cursor).is_err());
     drop(open);
     hub.close_all().await;
@@ -2130,4 +2129,796 @@ async fn verify_pending_examines_at_most_max_files_and_moves_on() {
         (1, 1),
         "the reported file isn't read again, and y is verified"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Schema 2 (plan 4b): marks, takes, filters, facets, duplicates (CORE-152, CORE-168, CORE-170,
+// APP-147; P4b-R10, P4b-R11, P4b-R40).
+// ---------------------------------------------------------------------------------------------
+
+/// A run of `files` (`[{path, role, take?, primary?, flag?, rating?}]`, each `path` a name in
+/// `candidates/<id>/`).
+fn run_json(id: &str, status: &str, files: &[Value], trashed: bool) -> Value {
+    let files: Vec<Value> = files
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            f["path"] = json!(format!("candidates/{id}/{}", f["path"].as_str().unwrap()));
+            f
+        })
+        .collect();
+    let mut run = json!({"run_id": id, "path": format!("candidates/{id}/"), "status": status,
+                         "created": "2026-10-01T00:00:00Z", "files": files});
+    if trashed {
+        run["trashed_utc"] = json!("2026-10-02T00:00:00Z");
+    }
+    run
+}
+
+/// Writes `projects/<project>/assets/<asset>/<asset>.manifest.json` with `extra`.
+fn put_manifest(fx: &Fx, project: &str, asset: &str, extra: Value) {
+    fx.write(
+        &format!("projects/{project}/assets/{asset}/{asset}.manifest.json"),
+        &manifest_json(project, asset, extra),
+    );
+}
+
+/// The `project/asset` ids of a page.
+fn page_ids(page: &AssetPage) -> Vec<String> {
+    page.rows
+        .iter()
+        .map(|r| format!("{}/{}", r.project, r.asset_id))
+        .collect()
+}
+
+async fn ids_of(index: &Index, q: AssetQuery) -> Vec<String> {
+    page_ids(&index.assets(q).await.unwrap())
+}
+
+/// The count of `value` in a facet, 0 when it isn't listed.
+fn count_of(facet: &[FacetCount], value: &Value) -> u64 {
+    facet
+        .iter()
+        .find(|f| &f.value == value)
+        .map_or(0, |f| f.count)
+}
+
+#[tokio::test] // spec: ARCH-089, CORE-005
+async fn schema_1_index_is_rebuilt_as_2() {
+    let fx = fx();
+    indexed_once(&fx).await;
+    // An index.db of schema 1: user_version 1, without the new tables.
+    {
+        let db = Connection::open(&fx.db).unwrap();
+        db.execute_batch("DROP TABLE asset_tags; DROP TABLE take_marks;")
+            .unwrap();
+        db.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(index.needs_rebuild(), "a schema-1 index.db is rebuilt");
+    index.rebuild().await.unwrap();
+    assert!(index.asset("p", "a").await.unwrap().is_some());
+    let db = Connection::open(&fx.db).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    for table in ["asset_tags", "take_marks"] {
+        db.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+            .unwrap_or_else(|e| panic!("{table}: {e}"));
+    }
+    let kind: String = db
+        .query_row(
+            "SELECT kind FROM files WHERE path = 'projects/p/assets/a/a.manifest.json'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "other");
+}
+
+#[tokio::test] // spec: CORE-152, CORE-023
+async fn marks_and_takes_are_mirrored() {
+    let fx = fx();
+    let runs = json!([
+        run_json(
+            "r_open",
+            "open",
+            &[
+                json!({"path": "one.png", "role": "candidate", "take": 1, "primary": true,
+                       "flag": "pick", "rating": 3}),
+                json!({"path": "one_mask.png", "role": "derived", "take": 1}),
+                json!({"path": "two.png", "role": "candidate", "take": 2, "primary": true,
+                       "flag": "reject"}),
+            ],
+            false
+        ),
+        // A closed run, read by the legacy rule (each candidate its own take).
+        run_json(
+            "r_closed",
+            "selected",
+            &[json!({"path": "old.png", "role": "candidate", "flag": "pick"})],
+            false
+        ),
+        run_json(
+            "r_trashed",
+            "open",
+            &[json!({"path": "gone.png", "role": "candidate", "flag": "pick"})],
+            true
+        ),
+    ]);
+    put_manifest(
+        &fx,
+        "p",
+        "a",
+        json!({"tags": ["Tree", "oak", "TREE"], "rating": 4, "label": "red",
+               "candidate_runs": runs}),
+    );
+    let index = fx.open(Arc::new(SystemProbe));
+    index.reconcile(Scope::All).await.unwrap();
+
+    let db = Connection::open(&fx.db).unwrap();
+    let tags = |db: &Connection| -> Vec<(String, String)> {
+        let mut stmt = db
+            .prepare(
+                "SELECT tag, tag_fold FROM asset_tags WHERE project = 'p' AND asset_id = 'a' \
+                 ORDER BY tag_fold",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let takes = |db: &Connection| -> Vec<(String, i64, Option<String>, i64)> {
+        let mut stmt = db
+            .prepare(
+                "SELECT run_id, take, flag, rating FROM take_marks \
+                 WHERE project = 'p' AND asset_id = 'a' ORDER BY run_id, take",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        tags(&db),
+        [(s("oak"), s("oak")), (s("Tree"), s("tree"))],
+        "a case-insensitive duplicate keeps the first spelling"
+    );
+    assert_eq!(
+        takes(&db),
+        [
+            (s("r_closed"), 1, Some(s("pick")), 0),
+            (s("r_open"), 1, Some(s("pick")), 3),
+            (s("r_open"), 2, Some(s("reject")), 0),
+        ],
+        "every run's takes but the trashed run's"
+    );
+    let row = index.asset("p", "a").await.unwrap().unwrap();
+    assert_eq!(row.rating, 4);
+    assert_eq!(row.label.as_deref(), Some("red"));
+    assert_eq!(row.tags.len(), 2, "{:?}", row.tags);
+    assert_eq!(row.runs_waiting, 1, "the trashed open run doesn't count");
+
+    // A manifest edit replaces the mirror.
+    put_manifest(
+        &fx,
+        "p",
+        "a",
+        json!({"tags": ["birch"], "candidate_runs": [run_json(
+            "r_open",
+            "open",
+            &[json!({"path": "one.png", "role": "candidate", "take": 1, "primary": true})],
+            false
+        )]}),
+    );
+    index.reconcile(Scope::All).await.unwrap();
+    assert_eq!(tags(&db), [(s("birch"), s("birch"))]);
+    assert_eq!(takes(&db), [(s("r_open"), 1, None, 0)]);
+    let row = index.asset("p", "a").await.unwrap().unwrap();
+    assert_eq!((row.rating, row.label.as_deref()), (0, None));
+
+    // The store moving the folder away takes its tags and takes along.
+    remove_tree(&fx.file("projects/p/assets/a"));
+    index
+        .applied(&[StoreEvent {
+            path: p("projects/p/assets/a"),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        }])
+        .await;
+    assert!(index.asset("p", "a").await.unwrap().is_none());
+    assert!(tags(&db).is_empty());
+    assert!(takes(&db).is_empty());
+}
+
+/// Removes a folder as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn remove_tree(path: &Path) {
+    std::fs::remove_dir_all(path)
+        .unwrap_or_else(|e| panic!("cannot remove {}: {e}", path.display()));
+}
+
+/// An asset of [`marked_index`]: (asset, status, tags, rating, label).
+type Marked<'a> = (&'a str, &'a str, &'a [&'a str], u8, Option<&'a str>);
+
+/// The assets of the filter tests.
+const MARKED: [Marked<'static>; 5] = [
+    ("crane", "candidate", &["Tree", "paper"], 4, Some("red")),
+    ("lamp", "approved", &["tree", "light"], 2, Some("blue")),
+    ("kite", "candidate", &["Birch"], 5, None),
+    ("wall", "in_review", &[], 0, Some("red")),
+    ("rock", "approved", &["stone"], 3, None),
+];
+
+async fn marked_index(fx: &Fx) -> Arc<Index> {
+    for (asset, status, tags, rating, label) in MARKED {
+        let mut extra = json!({"status": status, "tags": tags, "rating": rating});
+        if let Some(label) = label {
+            extra["label"] = json!(label);
+        }
+        put_manifest(fx, "p", asset, extra);
+    }
+    let index = fx.open(Arc::new(SystemProbe));
+    index.reconcile(Scope::All).await.unwrap();
+    index
+}
+
+#[tokio::test] // spec: CORE-152
+async fn tag_filter_is_case_insensitive_any_of() {
+    let fx = fx();
+    let index = marked_index(&fx).await;
+    let tags = |t: &[&str]| AssetQuery {
+        tags: Some(t.iter().map(|s| (*s).to_string()).collect()),
+        ..query()
+    };
+    assert_eq!(ids_of(&index, tags(&["TREE"])).await, ["p/crane", "p/lamp"]);
+    assert_eq!(
+        ids_of(&index, tags(&["tree", "BIRCH"])).await,
+        ["p/crane", "p/kite", "p/lamp"],
+        "any of"
+    );
+    assert_eq!(ids_of(&index, tags(&[" Stone "])).await, ["p/rock"]);
+    assert!(ids_of(&index, tags(&["oak"])).await.is_empty());
+    assert_eq!(
+        ids_of(&index, tags(&[])).await.len(),
+        5,
+        "an empty list is no filter"
+    );
+    // The row carries the tags as written.
+    let page = index.assets(tags(&["paper"])).await.unwrap();
+    let mut written = page.rows[0].tags.clone();
+    written.sort();
+    assert_eq!(written, ["Tree", "paper"]);
+}
+
+#[tokio::test] // spec: CORE-152
+async fn filters_combine_with_and() {
+    let fx = fx();
+    let index = marked_index(&fx).await;
+    let both = AssetQuery {
+        rating_min: Some(4),
+        label: Some(vec![Some(Label::Red)]),
+        ..query()
+    };
+    let page = index.assets(both).await.unwrap();
+    assert_eq!(page_ids(&page), ["p/crane"]);
+    assert_eq!(page.total, 1);
+    let three = AssetQuery {
+        status: Some(Choice::AnyOf(vec!["candidate".into(), "approved".into()])),
+        tags: Some(vec!["tree".into(), "stone".into()]),
+        rating_min: Some(3),
+        ..query()
+    };
+    assert_eq!(ids_of(&index, three).await, ["p/crane", "p/rock"]);
+    let none = AssetQuery {
+        status: Some(Choice::One("in_review".into())),
+        rating_min: Some(1),
+        ..query()
+    };
+    assert!(ids_of(&index, none).await.is_empty());
+}
+
+#[tokio::test] // spec: CORE-152
+async fn label_none_matches_unlabelled() {
+    let fx = fx();
+    let index = marked_index(&fx).await;
+    let labels = |l: Vec<Option<Label>>| AssetQuery {
+        label: Some(l),
+        ..query()
+    };
+    assert_eq!(
+        ids_of(&index, labels(vec![None])).await,
+        ["p/kite", "p/rock"]
+    );
+    assert_eq!(
+        ids_of(&index, labels(vec![None, Some(Label::Blue)])).await,
+        ["p/kite", "p/lamp", "p/rock"]
+    );
+    assert_eq!(
+        ids_of(&index, labels(vec![Some(Label::Red)])).await,
+        ["p/crane", "p/wall"]
+    );
+}
+
+#[tokio::test] // spec: CORE-152, CORE-023
+async fn flag_filter_counts_every_run_not_trashed() {
+    let fx = fx();
+    let flagged = |flag: &str| json!({"path": "a.png", "role": "candidate", "flag": flag});
+    let runs = |status: &str, flag: &str, trashed: bool| json!({"candidate_runs": [run_json("r1", status, &[flagged(flag)], trashed)]});
+    put_manifest(&fx, "p", "open_pick", runs("open", "pick", false));
+    put_manifest(&fx, "p", "closed_pick", runs("selected", "pick", false));
+    put_manifest(&fx, "p", "trashed_pick", runs("open", "pick", true));
+    put_manifest(&fx, "p", "reject", runs("rejected", "reject", false));
+    put_manifest(&fx, "p", "unflagged", json!({}));
+    let index = fx.open(Arc::new(SystemProbe));
+    index.reconcile(Scope::All).await.unwrap();
+    let flags = |f: Vec<Flag>| AssetQuery {
+        flag: Some(f),
+        facets: true,
+        ..query()
+    };
+    let picked = index.assets(flags(vec![Flag::Pick])).await.unwrap();
+    assert_eq!(page_ids(&picked), ["p/closed_pick", "p/open_pick"]);
+    assert_eq!(
+        ids_of(&index, flags(vec![Flag::Pick, Flag::Reject])).await,
+        ["p/closed_pick", "p/open_pick", "p/reject"]
+    );
+    // The flag facet ignores the flag filter and counts the same runs.
+    let facets = picked.facets.unwrap();
+    assert_eq!(
+        count_of(&facets.flag, &json!("pick")),
+        2,
+        "{:?}",
+        facets.flag
+    );
+    assert_eq!(count_of(&facets.flag, &json!("reject")), 1);
+    assert_eq!(
+        count_of(&facets.flag, &Value::Null),
+        2,
+        "the trashed pick and the unflagged asset: {:?}",
+        facets.flag
+    );
+}
+
+/// Checks a page's facets against its own total and rows: with no filter on a facet's key,
+/// every asset is counted once in it.
+fn assert_facets_add_up(page: &AssetPage) {
+    let f = page.facets.as_ref().expect("facets");
+    let sum = |facet: &[FacetCount]| facet.iter().map(|c| c.count).sum::<u64>();
+    for (name, facet) in [
+        ("status", &f.status),
+        ("type", &f.asset_type),
+        ("rating", &f.rating),
+        ("label", &f.label),
+    ] {
+        assert_eq!(sum(facet), page.total, "{name}: {facet:?}");
+    }
+    assert_eq!(
+        count_of(&f.flag, &Value::Null),
+        page.total,
+        "no asset here has a flagged take: {:?}",
+        f.flag
+    );
+    assert_eq!(
+        u64::try_from(page.rows.len()).unwrap(),
+        page.total,
+        "the page holds every asset"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-152, APP-147
+async fn facets_are_disjunctive_and_in_the_page_transaction() {
+    let fx = fx();
+    let index = marked_index(&fx).await;
+    let with_facets = |q: AssetQuery| AssetQuery { facets: true, ..q };
+
+    let all = index.assets(with_facets(query())).await.unwrap();
+    assert_facets_add_up(&all);
+    let f = all.facets.as_ref().unwrap();
+    assert_eq!(count_of(&f.label, &json!("red")), 2);
+    assert_eq!(count_of(&f.label, &Value::Null), 2, "none is null");
+    assert_eq!(count_of(&f.tags, &json!("Tree")), 2, "{:?}", f.tags);
+    assert_eq!(count_of(&f.rating, &json!(0)), 1);
+    assert_eq!(count_of(&f.status, &json!("approved")), 2);
+    assert_eq!(count_of(&f.asset_type, &json!("image")), 5);
+    assert!(!f.tags_more);
+    assert!(
+        f.tags.windows(2).all(|w| w[0].count >= w[1].count),
+        "largest first: {:?}",
+        f.tags
+    );
+
+    // Disjunctive: the label facet ignores the label filter; every other facet, the page and
+    // the total use it.
+    let red = index
+        .assets(with_facets(AssetQuery {
+            label: Some(vec![Some(Label::Red)]),
+            ..query()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&red), ["p/crane", "p/wall"]);
+    assert_eq!(red.total, 2);
+    let f = red.facets.as_ref().unwrap();
+    assert_eq!(count_of(&f.label, &json!("red")), 2);
+    assert_eq!(count_of(&f.label, &json!("blue")), 1);
+    assert_eq!(count_of(&f.label, &Value::Null), 2);
+    assert_eq!(count_of(&f.status, &json!("approved")), 0, "{:?}", f.status);
+    assert_eq!(count_of(&f.status, &json!("in_review")), 1);
+    assert_eq!(count_of(&f.tags, &json!("Tree")), 1);
+    assert_eq!(count_of(&f.tags, &json!("light")), 0);
+
+    // Two filters: each facet leaves out only its own.
+    let both = index
+        .assets(with_facets(AssetQuery {
+            label: Some(vec![Some(Label::Red)]),
+            status: Some(Choice::One("candidate".into())),
+            ..query()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&both), ["p/crane"]);
+    let f = both.facets.as_ref().unwrap();
+    assert_eq!(count_of(&f.status, &json!("candidate")), 1);
+    assert_eq!(
+        count_of(&f.status, &json!("in_review")),
+        1,
+        "{:?}",
+        f.status
+    );
+    assert_eq!(count_of(&f.label, &json!("red")), 1);
+    assert_eq!(
+        count_of(&f.label, &Value::Null),
+        1,
+        "the kite: {:?}",
+        f.label
+    );
+
+    // While assets are added, every answer's facets agree with its own total and rows: a
+    // write between the page and its facets can't show, since all are read in one
+    // transaction.
+    let writer = {
+        let index = index.clone();
+        let root = fx.root.clone();
+        tokio::spawn(async move {
+            for i in 0..40 {
+                let asset = format!("new_{i:02}");
+                let label = ["red", "blue", "green"][i % 3];
+                write_file(
+                    &native(
+                        &root,
+                        &format!("projects/p/assets/{asset}/{asset}.manifest.json"),
+                    ),
+                    &manifest_json(
+                        "p",
+                        &asset,
+                        json!({"label": label, "rating": i % 6, "tags": [format!("t{}", i % 4)]}),
+                    ),
+                );
+                index
+                    .reconcile(Scope::Paths(vec![p(&format!("projects/p/assets/{asset}"))]))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let everything = || {
+        with_facets(AssetQuery {
+            limit: 1000,
+            ..query()
+        })
+    };
+    let mut answers = 0;
+    while !writer.is_finished() {
+        assert_facets_add_up(&index.assets(everything()).await.unwrap());
+        answers += 1;
+    }
+    writer.await.unwrap();
+    let last = index.assets(everything()).await.unwrap();
+    assert_facets_add_up(&last);
+    assert_eq!(last.total, 45);
+    assert!(answers > 0);
+}
+
+#[tokio::test] // spec: CORE-152, APP-147
+async fn tags_facet_is_capped_at_100_with_more() {
+    let fx = fx();
+    // 102 assets, each with its own tag and the shared `every`; project `few` holds 3 of them.
+    for i in 0..102 {
+        let project = if i < 3 { "few" } else { "many" };
+        put_manifest(
+            &fx,
+            project,
+            &format!("a{i:03}"),
+            json!({"tags": [format!("t{i:03}"), "every"]}),
+        );
+    }
+    let index = fx.open(Arc::new(SystemProbe));
+    index.reconcile(Scope::All).await.unwrap();
+    let facets = |q: AssetQuery| {
+        let index = index.clone();
+        async move {
+            index
+                .assets(AssetQuery { facets: true, ..q })
+                .await
+                .unwrap()
+                .facets
+                .unwrap()
+        }
+    };
+    let all = facets(query()).await;
+    assert_eq!(all.tags.len(), TAGS_FACET_MAX);
+    assert!(all.tags_more);
+    assert_eq!(
+        all.tags[0],
+        FacetCount {
+            value: json!("every"),
+            count: 102
+        }
+    );
+    // Ties by value: t000 … t098.
+    assert_eq!(all.tags[1].value, json!("t000"));
+    assert_eq!(all.tags[99].value, json!("t098"));
+    // The tags filter doesn't narrow its own facet.
+    let one = facets(AssetQuery {
+        tags: Some(vec!["t101".into()]),
+        ..query()
+    })
+    .await;
+    assert!(one.tags_more);
+    // Another filter does.
+    let few = facets(AssetQuery {
+        project: Some("few".into()),
+        ..query()
+    })
+    .await;
+    assert_eq!(few.tags.len(), 4, "{:?}", few.tags);
+    assert!(!few.tags_more);
+}
+
+#[tokio::test] // spec: CORE-168
+async fn duplicates_ignore_work_files() {
+    let fx = fx();
+    let shared = b"the same bytes".as_slice();
+    // Sealed in a, a candidate in b: both are duplicates.
+    fx.write("projects/p/assets/a/v1.0.0/x.png", shared);
+    put_manifest(&fx, "p", "a", json!({}));
+    fx.write("projects/p/assets/b/candidates/r1/y.png", shared);
+    put_manifest(&fx, "p", "b", json!({}));
+    // A working document with the bytes doesn't count.
+    fx.write("projects/p/assets/c/work/doc.png", shared);
+    put_manifest(&fx, "p", "c", json!({}));
+    // Two files with the same bytes inside one asset aren't a duplicate.
+    fx.write("projects/p/assets/d/v1.0.0/one.png", b"d bytes");
+    fx.write("projects/p/assets/d/v1.0.0/two.png", b"d bytes");
+    put_manifest(&fx, "p", "d", json!({}));
+    // Outside any asset: not counted.
+    fx.write("notes/copy.png", shared);
+    let index = fx.open(Arc::new(SystemProbe));
+    index.reconcile(Scope::All).await.unwrap();
+    let dup = |d: bool| AssetQuery {
+        duplicates: Some(d),
+        ..query()
+    };
+    assert_eq!(ids_of(&index, dup(true)).await, ["p/a", "p/b"]);
+    assert_eq!(
+        ids_of(&index, dup(false)).await.len(),
+        4,
+        "false is no filter"
+    );
+    let db = Connection::open(&fx.db).unwrap();
+    let kind = |path: &str| -> String {
+        db.query_row("SELECT kind FROM files WHERE path = ?1", [path], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(kind("projects/p/assets/a/v1.0.0/x.png"), "sealed");
+    assert_eq!(kind("projects/p/assets/b/candidates/r1/y.png"), "candidate");
+    assert_eq!(kind("projects/p/assets/c/work/doc.png"), "work");
+    assert_eq!(kind("notes/copy.png"), "other");
+
+    // The candidate goes: a shares its bytes with no other asset any more.
+    outside_remove(&fx.file("projects/p/assets/b/candidates/r1/y.png"));
+    index.reconcile(Scope::All).await.unwrap();
+    assert!(ids_of(&index, dup(true)).await.is_empty());
+}
+
+#[tokio::test] // spec: CORE-170
+async fn deprecated_hide_show_only() {
+    let fx = fx();
+    put_manifest(&fx, "p", "old", json!({"status": "deprecated"}));
+    put_manifest(&fx, "p", "live", json!({"status": "approved"}));
+    let mut bare: Value = serde_json::from_slice(&manifest_json("p", "bare", json!({}))).unwrap();
+    lil_schema::remove_key(bare.as_object_mut().unwrap(), "status");
+    fx.write(
+        "projects/p/assets/bare/bare.manifest.json",
+        bare.to_string().as_bytes(),
+    );
+    let index = fx.open(Arc::new(SystemProbe));
+    index.reconcile(Scope::All).await.unwrap();
+    let with = |d: Option<DeprecatedFilter>| AssetQuery {
+        deprecated: d,
+        ..query()
+    };
+    assert_eq!(
+        ids_of(&index, with(None)).await,
+        ["p/bare", "p/live", "p/old"]
+    );
+    assert_eq!(
+        ids_of(&index, with(Some(DeprecatedFilter::Show))).await,
+        ["p/bare", "p/live", "p/old"]
+    );
+    assert_eq!(
+        ids_of(&index, with(Some(DeprecatedFilter::Hide))).await,
+        ["p/bare", "p/live"],
+        "an asset without a status isn't deprecated"
+    );
+    assert_eq!(
+        ids_of(&index, with(Some(DeprecatedFilter::Only))).await,
+        ["p/old"]
+    );
+    // The status facet follows the deprecated filter.
+    let hidden = index
+        .assets(AssetQuery {
+            deprecated: Some(DeprecatedFilter::Hide),
+            facets: true,
+            ..query()
+        })
+        .await
+        .unwrap();
+    let f = hidden.facets.unwrap();
+    assert_eq!(
+        count_of(&f.status, &json!("deprecated")),
+        0,
+        "{:?}",
+        f.status
+    );
+    assert_eq!(count_of(&f.status, &Value::Null), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: APP-025, CORE-152
+async fn cursor_without_new_keys_matches_the_old_hash() {
+    // The hashes a plan-2b core gave these queries (the spec fixture's old cursors).
+    let mut q = query();
+    assert_eq!(query_hash(&q), "c78b31294f700b74");
+    q.status = Some(Choice::One("candidate".into()));
+    assert_eq!(query_hash(&q), "4509fce6140511b0");
+    // A list, or a new key that is present, is another query.
+    let mut list = q.clone();
+    list.status = Some(Choice::AnyOf(vec!["candidate".into()]));
+    assert_ne!(query_hash(&list), "4509fce6140511b0");
+    let mut shown = q.clone();
+    shown.deprecated = Some(DeprecatedFilter::Show);
+    assert_ne!(query_hash(&shown), "4509fce6140511b0");
+    // `facets` and `limit` aren't part of it.
+    let mut faceted = q.clone();
+    faceted.facets = true;
+    faceted.limit = 7;
+    assert_eq!(query_hash(&faceted), "4509fce6140511b0");
+
+    // A literal cursor in plan 2b's form (`{v, q, k}` as lowercase hex) pages on.
+    let old = r#"{"v":1,"q":"4509fce6140511b0","k":{"s":"crane","p":"alpha","a":"crane"}}"#;
+    let cursor: String = old.bytes().map(|b| format!("{b:02x}")).collect();
+    let env = TestEnv::new();
+    let ws = small_workspace(
+        &env,
+        &[
+            ("alpha", "crane", Some("candidate"), Some("image"), ""),
+            ("alpha", "lamp", Some("candidate"), Some("image"), ""),
+            ("alpha", "wall", Some("approved"), Some("image"), ""),
+        ],
+    );
+    let hub = hub(&env, Arc::new(SystemProbe));
+    let open = hub.open(&ws).await.unwrap();
+    let c = ctx(&open, &hub);
+    let next = call_ok(
+        &c,
+        "assets.query",
+        json!({"status": "candidate", "limit": 1, "cursor": cursor}),
+    )
+    .await;
+    assert_eq!(ids(&next), ["alpha/lamp"], "{next}");
+    let refused = call(
+        &c,
+        "assets.query",
+        json!({"status": ["candidate"], "limit": 1, "cursor": cursor}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, "params.invalid");
+    drop(open);
+    hub.close_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-152, APP-025
+async fn status_and_type_take_lists() {
+    let env = TestEnv::new();
+    let ws = small_workspace(
+        &env,
+        &[
+            ("alpha", "crane", Some("candidate"), Some("image"), ""),
+            ("alpha", "lamp", Some("approved"), Some("prop_2d"), ""),
+            ("beta", "knight", Some("in_review"), Some("image"), ""),
+            ("beta", "wall", None, None, ""),
+        ],
+    );
+    let hub = hub(&env, Arc::new(SystemProbe));
+    let open = hub.open(&ws).await.unwrap();
+    let c = ctx(&open, &hub);
+    let q = |args: Value| {
+        let c = c.clone();
+        async move { ids(&call_ok(&c, "assets.query", args).await) }
+    };
+    assert_eq!(
+        q(json!({"status": ["candidate", "in_review"]})).await,
+        ["alpha/crane", "beta/knight"]
+    );
+    assert_eq!(q(json!({"status": "candidate"})).await, ["alpha/crane"]);
+    assert_eq!(
+        q(json!({"type": ["prop_2d", "image"], "status": ["approved", "in_review"]})).await,
+        ["beta/knight", "alpha/lamp"]
+    );
+    assert_eq!(q(json!({"type": "prop_2d"})).await, ["alpha/lamp"]);
+    assert_eq!(
+        q(json!({"status": []})).await.len(),
+        4,
+        "an empty list is no filter"
+    );
+    // A list query pages with its own cursor.
+    let first = call_ok(
+        &c,
+        "assets.query",
+        json!({"status": ["candidate", "in_review"], "limit": 1}),
+    )
+    .await;
+    assert_eq!(ids(&first), ["alpha/crane"]);
+    let next = call_ok(
+        &c,
+        "assets.query",
+        json!({"status": ["candidate", "in_review"], "limit": 1,
+               "cursor": first["next_cursor"]}),
+    )
+    .await;
+    assert_eq!(ids(&next), ["beta/knight"]);
+    // The facets of a list query; `tags_more` sits beside `facets`, not in it.
+    let faceted = call_ok(
+        &c,
+        "assets.query",
+        json!({"status": ["candidate"], "facets": true}),
+    )
+    .await;
+    assert_eq!(faceted["tags_more"], false, "{faceted}");
+    assert!(faceted["facets"].get("tags_more").is_none(), "{faceted}");
+    assert_eq!(
+        faceted["facets"]["status"].as_array().unwrap().len(),
+        4,
+        "the status facet leaves out the status filter: {faceted}"
+    );
+    for name in ["type", "tags", "rating", "label", "flag"] {
+        assert!(faceted["facets"][name].is_array(), "{name}: {faceted}");
+    }
+    let plain = call_ok(&c, "assets.query", json!({})).await;
+    assert!(
+        plain.get("facets").is_none() && plain.get("tags_more").is_none(),
+        "{plain}"
+    );
+    for bad in [
+        json!({"status": 3}),
+        json!({"status": [1]}),
+        json!({"rating_min": 6}),
+        json!({"label": ["pink"]}),
+        json!({"flag": ["keep"]}),
+        json!({"deprecated": "maybe"}),
+    ] {
+        let refused = call(&c, "assets.query", bad.clone()).await.unwrap_err();
+        assert_eq!(refused.code, "params.invalid", "{bad}: {refused:?}");
+    }
+    drop(open);
+    hub.close_all().await;
 }

@@ -22,8 +22,11 @@
 //!    digest counts only when size, last write and ChangeTime are unchanged. An unstable read,
 //!    or a read that fails with error 32 or 33, parks the path: its row is kept as it was.
 //!
-//! **Manifests** (`projects/<p>/assets/<a>/<name>.manifest.json`) are parsed into `assets`,
-//! `edges`, `assets_fts` and `expected`. The folder is authoritative: one that doesn't parse,
+//! **Manifests** (`projects/<p>/assets/<a>/<name>.manifest.json`) are parsed into `assets`
+//! (with the marks and the tile fields: `runs_waiting`, `external`, `working_doc`, `display`
+//! from [`lil_schema::display_file`], `last_change` from the newest status-log entry),
+//! `asset_tags`, `take_marks` (the takes of every run not trashed, P4b-R40), `edges`,
+//! `assets_fts` and `expected`. The folder is authoritative: one that doesn't parse,
 //! or whose `asset_id` or `project` disagrees with its folder, is `needs_repair` and its asset
 //! row is flagged; the manifest is never rewritten. With [`ReconcileOrder::ManifestsFirst`]
 //! every manifest is looked at, and its results written, before any other file.
@@ -48,7 +51,7 @@ use lil_platform::names::{
     BAK_MARKER, CONFLICT_MARKER, LEGACY_BAK_MARKER, LEGACY_CONFLICT_MARKER, LEGACY_TMP_MARKER,
     TMP_MARKER, is_workspace_dir,
 };
-use lil_schema::{LinkRef, Manifest};
+use lil_schema::{LinkRef, Manifest, display_file, fold_tag, takes_of};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -207,10 +210,11 @@ fn upsert_file(tx: &Transaction<'_>, row: &DbFile) -> rusqlite::Result<()> {
         Some((p, a)) => (Some(p), Some(a)),
         None => (None, None),
     };
+    let kind = kind_of(&WsPath::from_disk(row.path.clone())).as_str();
     tx.prepare_cached(
         "INSERT OR REPLACE INTO files (key, path, project, asset_id, size, last_write,
-             change_time, file_id, volume_serial, attributes, sha256, state, verified)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             change_time, file_id, volume_serial, attributes, sha256, state, verified, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?
     .execute(params![
         row.key,
@@ -226,6 +230,7 @@ fn upsert_file(tx: &Transaction<'_>, row: &DbFile) -> rusqlite::Result<()> {
         row.sha256,
         row.state.as_str(),
         i64::from(row.verified),
+        kind,
     ])?;
     Ok(())
 }
@@ -705,6 +710,9 @@ pub(super) struct Expected {
     from_run: bool,
 }
 
+/// A take of a run not trashed: (run id, take number, flag, rating).
+type TakeMark = (String, u32, Option<&'static str>, u8);
+
 /// What a manifest says, read leniently.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Fields {
@@ -716,6 +724,19 @@ struct Fields {
     edges: Vec<Edge>,
     expected: Vec<Expected>,
     body: String,
+    /// As written.
+    tags: Vec<String>,
+    rating: u8,
+    label: Option<&'static str>,
+    /// Open runs, not trashed.
+    runs_waiting: u32,
+    external: bool,
+    working_doc: bool,
+    /// JSON `{path, sha256, media_kind}`, `path` workspace-relative.
+    display: Option<String>,
+    /// JSON `{to, by, utc}`.
+    last_change: Option<String>,
+    takes: Vec<TakeMark>,
 }
 
 /// A parsed manifest, keyed by its folder.
@@ -800,6 +821,40 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
     }
 
     let base = format!("projects/{project}/assets/{asset_id}");
+    let marks = manifest.marks();
+    let live = |run: &&lil_schema::CandidateRun| run.trashed_utc.is_none();
+    let runs_waiting = view
+        .candidate_runs
+        .iter()
+        .filter(live)
+        .filter(|run| run.status.as_deref() == Some("open"))
+        .count();
+    let takes: Vec<TakeMark> = view
+        .candidate_runs
+        .iter()
+        .filter(live)
+        .flat_map(|run| {
+            takes_of(run).into_iter().map(|t| {
+                (
+                    run.run_id.clone(),
+                    t.n,
+                    t.flag.map(|f| f.as_str()),
+                    t.rating,
+                )
+            })
+        })
+        .collect();
+    let display = display_file(&manifest).map(|d| {
+        serde_json::json!({
+            "path": format!("{base}/{}", d.path),
+            "sha256": d.sha256,
+            "media_kind": d.media_kind.as_str(),
+        })
+        .to_string()
+    });
+    let last_change = manifest.status_log().last().map(|e| {
+        serde_json::json!({"to": e.to.as_str(), "by": e.by.as_str(), "utc": e.utc}).to_string()
+    });
     let mut expected: HashMap<String, Expected> = HashMap::new();
     for (inside, sha) in &view.hashes {
         let path = format!("{base}/{inside}");
@@ -860,6 +915,15 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
             edges,
             expected,
             body: body.join(" "),
+            tags: marks.tags,
+            rating: marks.rating,
+            label: marks.label.map(lil_schema::Label::as_str),
+            runs_waiting: u32::try_from(runs_waiting).unwrap_or(u32::MAX),
+            external: !view.external.is_empty(),
+            working_doc: view.has_working_doc,
+            display,
+            last_change,
+            takes,
         }),
         needs_repair,
     })
@@ -899,13 +963,18 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
     let id: i64 = tx
         .prepare_cached(
             "INSERT INTO assets (project, asset_id, asset_type, status, version, approved_version,
-                 manifest, creation_uuid, updated, needs_repair)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 manifest, creation_uuid, updated, needs_repair, rating, label, runs_waiting,
+                 external, working_doc, display, last_change)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT (project, asset_id) DO UPDATE SET
                  asset_type = excluded.asset_type, status = excluded.status,
                  version = excluded.version, approved_version = excluded.approved_version,
                  manifest = excluded.manifest, creation_uuid = excluded.creation_uuid,
-                 updated = excluded.updated, needs_repair = excluded.needs_repair
+                 updated = excluded.updated, needs_repair = excluded.needs_repair,
+                 rating = excluded.rating, label = excluded.label,
+                 runs_waiting = excluded.runs_waiting, external = excluded.external,
+                 working_doc = excluded.working_doc, display = excluded.display,
+                 last_change = excluded.last_change
              RETURNING id",
         )?
         .query_row(
@@ -920,6 +989,13 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
                 fields.creation_uuid,
                 parsed.updated,
                 i64::from(parsed.needs_repair),
+                i64::from(fields.rating),
+                fields.label,
+                i64::from(fields.runs_waiting),
+                i64::from(fields.external),
+                i64::from(fields.working_doc),
+                fields.display,
+                fields.last_change,
             ],
             |r| r.get(0),
         )?;
@@ -927,6 +1003,32 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
         .execute(params![id])?;
     tx.prepare_cached("INSERT INTO assets_fts (rowid, body) VALUES (?1, ?2)")?
         .execute(params![id, fields.body])?;
+    tx.prepare_cached("DELETE FROM asset_tags WHERE project = ?1 AND asset_id = ?2")?
+        .execute(params![parsed.project, parsed.asset_id])?;
+    for tag in &fields.tags {
+        // A hand-written case-insensitive duplicate keeps the first spelling.
+        tx.prepare_cached(
+            "INSERT OR IGNORE INTO asset_tags (project, asset_id, tag, tag_fold)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![parsed.project, parsed.asset_id, tag, fold_tag(tag)])?;
+    }
+    tx.prepare_cached("DELETE FROM take_marks WHERE project = ?1 AND asset_id = ?2")?
+        .execute(params![parsed.project, parsed.asset_id])?;
+    for (run_id, take, flag, rating) in &fields.takes {
+        tx.prepare_cached(
+            "INSERT OR IGNORE INTO take_marks (project, asset_id, run_id, take, flag, rating)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?
+        .execute(params![
+            parsed.project,
+            parsed.asset_id,
+            run_id,
+            take,
+            flag,
+            rating
+        ])?;
+    }
     tx.prepare_cached("DELETE FROM edges WHERE from_project = ?1 AND from_asset = ?2")?
         .execute(params![parsed.project, parsed.asset_id])?;
     for edge in &fields.edges {
@@ -1005,8 +1107,8 @@ async fn runs_elsewhere(index: &Index, parsed: &[Parsed]) -> Result<HashSet<Stri
     .await
 }
 
-/// Removes the asset rows whose manifest is `key` or under it, with their edges, text and
-/// expected files (the store moved the folder or the manifest away).
+/// Removes the asset rows whose manifest is `key` or under it, with their tags, takes, edges,
+/// text and expected files (the store moved the folder or the manifest away).
 fn delete_assets_under(tx: &Transaction<'_>, key: &str) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare_cached("SELECT id, project, asset_id, manifest FROM assets")?;
     let doomed: Vec<(i64, String, String)> = stmt
@@ -1021,6 +1123,12 @@ fn delete_assets_under(tx: &Transaction<'_>, key: &str) -> rusqlite::Result<()> 
     for (id, project, asset_id) in doomed {
         tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
         tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id])?;
+        for table in ["asset_tags", "take_marks"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE project = ?1 AND asset_id = ?2"),
+                params![project, asset_id],
+            )?;
+        }
         tx.execute(
             "DELETE FROM edges WHERE from_project = ?1 AND from_asset = ?2",
             params![project, asset_id],
@@ -1430,6 +1538,7 @@ fn finish(
     if mode == Mode::Cold {
         tx.execute_batch(
             "DELETE FROM files; DELETE FROM assets; DELETE FROM assets_fts;
+             DELETE FROM asset_tags; DELETE FROM take_marks;
              DELETE FROM edges; DELETE FROM expected;",
         )?;
         write_rows(tx, rows, parsed, false)?;
@@ -1449,12 +1558,14 @@ fn finish(
             if seen.contains(&key) || elsewhere.contains(&key) {
                 continue;
             }
+            let kind = kind_of(&WsPath::from_disk(path.clone())).as_str();
             tx.execute(
                 "INSERT INTO files (key, path, project, asset_id, size, last_write, change_time,
-                     file_id, volume_serial, attributes, sha256, state, verified)
-                 SELECT key, path, project, asset_id, 0, 0, NULL, NULL, 0, 0, sha256, 'missing', 1
+                     file_id, volume_serial, attributes, sha256, state, verified, kind)
+                 SELECT key, path, project, asset_id, 0, 0, NULL, NULL, 0, 0, sha256, 'missing', 1,
+                     ?2
                  FROM expected WHERE key = ?1",
-                params![key],
+                params![key, kind],
             )?;
             missing.push(WsPath::from_disk(path));
         }
