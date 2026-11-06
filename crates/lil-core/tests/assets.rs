@@ -1661,6 +1661,8 @@ async fn a_kept_run_on_an_approved_asset_logs_one_entry_per_action() {
     let first = fx.import_run(KITE, "a.png", b"a").await;
     let kept = fx.import_run(KITE, "b.png", b"b").await;
     let later = fx.import_run(KITE, "c.png", b"c").await;
+    // The second and third runs keep the status `candidate`: no entry (one for the first).
+    assert_newest(&fx, KITE, 1, "planned", "candidate", "cli");
     fx.signoff(
         KITE,
         &first,
@@ -1668,7 +1670,7 @@ async fn a_kept_run_on_an_approved_asset_logs_one_entry_per_action() {
         json!({"keep_runs": [kept, later]}),
     )
     .await;
-    let e = assert_newest(&fx, KITE, 4, "candidate", "approved", "cli");
+    let e = assert_newest(&fx, KITE, 2, "candidate", "approved", "cli");
     assert_eq!(snapshot_newest(&fx, "1.0.0"), e);
 
     // Signing off a kept run: the inner reopening isn't logged, one entry approved → approved.
@@ -1676,7 +1678,7 @@ async fn a_kept_run_on_an_approved_asset_logs_one_entry_per_action() {
         .signoff(KITE, &kept, &["b.png"], json!({"keep_runs": [later]}))
         .await;
     assert_eq!(r["version"], "1.1.0", "{r}");
-    let e = assert_newest(&fx, KITE, 5, "approved", "approved", "cli");
+    let e = assert_newest(&fx, KITE, 3, "approved", "approved", "cli");
     assert_eq!(
         snapshot_newest(&fx, "1.1.0"),
         e,
@@ -1691,6 +1693,6 @@ async fn a_kept_run_on_an_approved_asset_logs_one_entry_per_action() {
         )
         .await;
     assert_eq!(r["status"], "in_review", "{r}");
-    assert_newest(&fx, KITE, 6, "approved", "in_review", "cli");
+    assert_newest(&fx, KITE, 4, "approved", "in_review", "cli");
     fx.shutdown().await;
 }

@@ -274,8 +274,9 @@ pub fn reopened(
 /// - `Block(note)` logs `{code: "blocked", note}`; a separate `reason` with it is refused
 ///   (ruling PF-22). Any other event logs `reason` as given (`{code: "input_changed", ref}`
 ///   when the core sets `stale`).
-/// - `Deprecate` of an asset that is already `deprecated` isn't a status change: nothing is
-///   written and no entry is logged.
+/// - `Deprecate` of an asset that is already `deprecated`, and `CandidateRun` on an asset
+///   already `candidate`, aren't status changes: nothing is written and no entry is logged.
+///   Sign-off events always log their entry, `approved → approved` included (ruling PF-5).
 ///
 /// # Errors
 /// The status machine's refusal, or a `reason` given with `Block`; the manifest is unchanged.
@@ -326,7 +327,8 @@ pub fn change_status(
         view.approved_version.is_some(),
         ev,
     )?;
-    if *ev == StatusEvent::Deprecate && view.status == Some(Status::Deprecated) {
+    let unchanged = view.status == Some(moved.to);
+    if unchanged && matches!(ev, StatusEvent::Deprecate | StatusEvent::CandidateRun) {
         return Ok(moved);
     }
     m.set("status", Value::from(moved.to.as_str()));
@@ -915,6 +917,34 @@ mod tests {
         assert!(block(&mut m, &E::StartWork, None).is_err());
         assert_eq!(m.to_text(), text, "a refusal leaves the manifest as it was");
         assert!(m.get("status_log").is_none());
+    }
+
+    #[test] // spec: CORE-156, CORE-048
+    fn a_candidate_run_on_a_candidate_asset_logs_nothing() {
+        use serde_json::json;
+        let mut m = approved_manifest();
+        let e = change(&mut m, &E::CandidateRun, None);
+        assert_eq!((e.from, e.to), (Some(Approved), Candidate));
+        // A second run keeps the status: no status change, nothing written.
+        let text = m.to_text();
+        let again = change_status(&mut m, &E::CandidateRun, StatusBy::Cli, None, None, "x");
+        assert_eq!(again.map(|t| t.to), Ok(Candidate));
+        assert_eq!(m.to_text(), text);
+        assert_eq!(m.status_log().len(), 1);
+        // A manifest without a status still logs its first run (`from: null`).
+        m.remove("status");
+        let e = change(&mut m, &E::CandidateRun, None);
+        assert_eq!((e.from, e.to), (None, Candidate));
+        // The skip is the run's only: a sign-off from `approved` to `approved` (an open run,
+        // ruling Q23) still logs.
+        m.set("status", json!("approved"));
+        m.push(
+            "candidate_runs",
+            json!({"run_id": "r_2", "status": "open", "files": []}),
+        )
+        .unwrap();
+        let e = change(&mut m, &E::Signoff, None);
+        assert_eq!((e.from, e.to), (Some(Approved), Approved));
     }
 
     #[test] // spec: CORE-053, CORE-048 (ruling Q23)
