@@ -20,7 +20,7 @@ use serde_json::{Map, Value};
 use crate::attribution::{self, Actor, TrustRecord};
 use crate::marks::{self, Flag, Marks};
 use crate::status::{self, STATUS_LOG_MAX, Status, StatusLogEntry, Via};
-use crate::takes::{self, AutoPick, OverridesAutoPick, file_name, takes_of};
+use crate::takes::{self, AutoPick, OverridesAutoPick};
 use crate::version::Version;
 
 /// A schema violation: a JSON pointer into the manifest and what is wrong there.
@@ -237,6 +237,14 @@ pub(crate) fn set_utc_object(map: &mut Map<String, Value>, key: &str, utc: Optio
     }
 }
 
+/// [`set_opt`], unless `key` already holds exactly `value` (absent or `null` for `None`), when
+/// nothing changes.
+fn set_if_changed(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if map.get(key).filter(|v| !v.is_null()) != value.as_ref() {
+        set_opt(map, key, value);
+    }
+}
+
 /// Sets `key` in place (a new key is appended), or removes it by shifting when `value` is
 /// `None`.
 pub(crate) fn set_opt(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
@@ -386,24 +394,20 @@ impl Manifest {
         marks::read_marks(&mut Reader::new(), self.root())
     }
 
-    /// Writes the marks that differ from [`Manifest::marks`], each key in place; no tags, a
-    /// rating of 0 and no label remove their key by shifting (Appendix E). Tags are written as
-    /// given: the caller normalises them first ([`marks::normalise_tags`]). A rating above 5 is
-    /// an error and changes nothing.
+    /// Writes the asset's marks, each key in place; no tags, a rating of 0 and no label remove
+    /// their key by shifting (Appendix E). A key is compared with the raw value it would get,
+    /// not with the lenient read: one that already holds exactly that value (absent or `null`
+    /// for a removal) is left alone, and any other is rewritten, so a hand-written `rating: 7`,
+    /// an unknown label or a tag list with a non-string item is cleaned by a mark edit. Tags
+    /// are written as given: the caller normalises them first ([`marks::normalise_tags`]). A
+    /// rating above 5 is an error and changes nothing.
     pub fn set_marks(&mut self, m: &Marks) -> Result<(), String> {
         check_rating(m.rating)?;
-        let now = self.marks();
-        if now.tags != m.tags {
-            let tags = (!m.tags.is_empty()).then(|| Value::from(m.tags.clone()));
-            set_opt(&mut self.map, "tags", tags);
-        }
-        if now.rating != m.rating {
-            set_opt(&mut self.map, "rating", marks::rating_value(m.rating));
-        }
-        if now.label != m.label {
-            let label = m.label.map(|l| Value::from(l.as_str()));
-            set_opt(&mut self.map, "label", label);
-        }
+        let tags = (!m.tags.is_empty()).then(|| Value::from(m.tags.clone()));
+        set_if_changed(&mut self.map, "tags", tags);
+        set_if_changed(&mut self.map, "rating", marks::rating_value(m.rating));
+        let label = m.label.map(|l| Value::from(l.as_str()));
+        set_if_changed(&mut self.map, "label", label);
         Ok(())
     }
 
@@ -479,8 +483,10 @@ impl Manifest {
 
     /// Sets the flag and rating of take `take` of run `run_id` on the take's primary file
     /// entry (P4b-R3), each key in place: `flag: Some(None)` and `rating: Some(0)` remove the
-    /// key by shifting, `None` leaves it. An unknown run or take, or a rating above 5, is an
-    /// error and changes nothing. Whether the run is open is the caller's check.
+    /// key by shifting, `None` leaves it. The entry written is the one the view read as the
+    /// primary, found by its position among the entries the read keeps, never by its name. An
+    /// unknown run or take, a rating above 5, or an entry that can't be identified exactly is
+    /// an error and changes nothing. Whether the run is open is the caller's check.
     pub fn set_take_mark(
         &mut self,
         run_id: &str,
@@ -492,16 +498,26 @@ impl Manifest {
             check_rating(r)?;
         }
         let view = self.view();
+        // The view keeps every object run with a string `run_id`, in order, so the first such
+        // run in the view and the first such raw object are the same entry.
         let run = view
             .candidate_runs
             .iter()
             .find(|r| r.run_id == run_id)
             .ok_or_else(|| format!("the asset has no run `{run_id}`"))?;
-        let primary = takes_of(run)
+        let (t, kept_index) = takes::grouped(&run.files)
+            .0
             .into_iter()
-            .find(|t| t.n == take)
-            .map(|t| t.primary)
+            .find(|(t, _)| t.n == take)
             .ok_or_else(|| format!("run `{run_id}` has no take {take}"))?;
+        let want_path = run.files[kept_index].path.clone();
+        let unclear = || {
+            format!(
+                "run `{run_id}`: the file entry of take {take}'s primary, `{}`, can't be found \
+                 exactly; nothing was changed",
+                t.primary
+            )
+        };
         let entry = self
             .runs_mut()
             .into_iter()
@@ -509,11 +525,18 @@ impl Manifest {
             .and_then(|r| r.get_mut("files"))
             .and_then(Value::as_array_mut)
             .and_then(|files| {
-                files.iter_mut().filter_map(Value::as_object_mut).find(|f| {
-                    f.get("path").and_then(Value::as_str).map(file_name) == Some(primary.as_str())
-                })
+                // The entries `read_run` keeps: objects with a string `path` and `role`.
+                files
+                    .iter_mut()
+                    .filter_map(Value::as_object_mut)
+                    .filter(|f| {
+                        let s = |k: &str| f.get(k).is_some_and(Value::is_string);
+                        s("path") && s("role")
+                    })
+                    .nth(kept_index)
             })
-            .ok_or_else(|| format!("run `{run_id}` has no file entry for `{primary}`"))?;
+            .filter(|f| f.get("path").and_then(Value::as_str) == Some(want_path.as_str()))
+            .ok_or_else(unclear)?;
         if let Some(flag) = flag {
             set_opt(entry, "flag", flag.map(|f| Value::from(f.as_str())));
         }

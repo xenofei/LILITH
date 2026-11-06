@@ -51,62 +51,67 @@ pub fn takes_of(run: &CandidateRun) -> Vec<Take> {
 
 /// The takes of a run's files, and a warning for each problem in the grouping.
 pub(crate) fn group(files: &[CandidateFile]) -> (Vec<Take>, Vec<String>) {
+    let (takes, warnings) = grouped(files);
+    (takes.into_iter().map(|(t, _)| t).collect(), warnings)
+}
+
+/// As [`group`], with the index in `files` of each take's primary file.
+pub(crate) fn grouped(files: &[CandidateFile]) -> (Vec<(Take, usize)>, Vec<String>) {
     let mut warnings = Vec::new();
-    let take = |n: u32, primary: &CandidateFile, companions: &[&CandidateFile]| Take {
-        n,
-        primary: file_name(&primary.path).to_string(),
-        companions: companions
-            .iter()
-            .map(|f| file_name(&f.path).to_string())
-            .collect(),
-        preview: companions
-            .iter()
-            .find(|f| f.role == "preview")
-            .map(|f| file_name(&f.path).to_string()),
-        flag: primary.flag,
-        rating: primary.rating,
+    let name = |i: usize| file_name(&files[i].path).to_string();
+    let take = |n: u32, p: usize, companions: &[usize]| {
+        let t = Take {
+            n,
+            primary: name(p),
+            companions: companions.iter().map(|&i| name(i)).collect(),
+            preview: companions
+                .iter()
+                .find(|&&i| files[i].role == "preview")
+                .map(|&i| name(i)),
+            flag: files[p].flag,
+            rating: files[p].rating,
+        };
+        (t, p)
     };
 
     if files.iter().any(|f| f.take.is_some()) {
-        let mut by_n: BTreeMap<u32, Vec<&CandidateFile>> = BTreeMap::new();
-        for f in files {
+        let mut by_n: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (i, f) in files.iter().enumerate() {
             match f.take {
-                Some(n) => by_n.entry(n).or_default().push(f),
+                Some(n) => by_n.entry(n).or_default().push(i),
                 None => warnings.push(format!(
                     "`{}` has no `take` in a run whose other files have one: it is in no take",
-                    file_name(&f.path)
+                    name(i)
                 )),
             }
         }
         let takes = by_n
             .into_iter()
             .map(|(n, members)| {
-                let primaries: Vec<usize> =
-                    (0..members.len()).filter(|&i| members[i].primary).collect();
+                let primaries: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|&i| files[i].primary)
+                    .collect();
                 let p = match primaries.as_slice() {
                     [] => {
                         warnings.push(format!(
                             "take {n} has no primary file: its first file, `{}`, is used",
-                            file_name(&members[0].path)
+                            name(members[0])
                         ));
-                        0
+                        members[0]
                     }
                     [one] => *one,
                     [first, ..] => {
                         warnings.push(format!(
                             "take {n} has more than one primary file: the first, `{}`, is used",
-                            file_name(&members[*first].path)
+                            name(*first)
                         ));
                         *first
                     }
                 };
-                let companions: Vec<&CandidateFile> = members
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, _)| i != p)
-                    .map(|(_, f)| *f)
-                    .collect();
-                take(n, members[p], &companions)
+                let companions: Vec<usize> = members.into_iter().filter(|&i| i != p).collect();
+                take(n, p, &companions)
             })
             .collect();
         return (takes, warnings);
@@ -144,11 +149,10 @@ pub(crate) fn group(files: &[CandidateFile]) -> (Vec<Take>, Vec<String>) {
         .iter()
         .enumerate()
         .map(|(t, &p)| {
-            let companions: Vec<&CandidateFile> = (0..files.len())
+            let companions: Vec<usize> = (0..files.len())
                 .filter(|&i| i != p && owner[i] == Some(t))
-                .map(|i| &files[i])
                 .collect();
-            take(t as u32 + 1, &files[p], &companions)
+            take(t as u32 + 1, p, &companions)
         })
         .collect();
     (takes, warnings)
@@ -551,5 +555,52 @@ mod tests {
                 picked: "a.png".into(),
             })
         );
+    }
+
+    #[test] // spec: CORE-152, ARCH-076
+    fn set_take_mark_writes_the_entry_the_view_read() {
+        // (a) A malformed earlier entry with the same name (no `role`: the read skips it).
+        let text = json!({
+            "schema_version": 1, "asset_id": "img_dock", "project": "sketchbook",
+            "candidate_runs": [{"run_id": "r_20261101_0900", "status": "open", "files": [
+                {"path": "candidates/r_20261101_0900/a.png"},
+                {"path": "candidates/r_20261101_0900/a.png", "role": "candidate"}
+            ]}]
+        })
+        .to_string();
+        let (mut m, _) = Manifest::parse(&text).unwrap();
+        m.set_take_mark("r_20261101_0900", 1, Some(Some(Flag::Pick)), Some(3))
+            .unwrap();
+        let files = &m.get("candidate_runs").unwrap()[0]["files"];
+        assert_eq!(
+            files[0],
+            json!({"path": "candidates/r_20261101_0900/a.png"}),
+            "the skipped entry is untouched"
+        );
+        assert_eq!(files[1]["flag"], json!("pick"));
+        let takes = takes_of(&m.view().candidate_runs[0]);
+        assert_eq!((takes[0].flag, takes[0].rating), (Some(Flag::Pick), 3));
+
+        // (b) One bare name in two subfolders: take 2's flag lands on take 2, never on take 1.
+        let text = json!({
+            "schema_version": 1, "asset_id": "img_dock", "project": "sketchbook",
+            "candidate_runs": [{"run_id": "r_20261101_0900", "status": "open", "files": [
+                "not an entry",
+                {"path": "candidates/r_20261101_0900/left/a.png", "role": "candidate"},
+                {"path": "candidates/r_20261101_0900/right/a.png", "role": "candidate"}
+            ]}]
+        })
+        .to_string();
+        let (mut m, _) = Manifest::parse(&text).unwrap();
+        m.set_take_mark("r_20261101_0900", 2, Some(Some(Flag::Reject)), None)
+            .unwrap();
+        let marks: Vec<(u32, Option<Flag>)> = takes_of(&m.view().candidate_runs[0])
+            .iter()
+            .map(|t| (t.n, t.flag))
+            .collect();
+        assert_eq!(marks, [(1, None), (2, Some(Flag::Reject))]);
+        let files = &m.get("candidate_runs").unwrap()[0]["files"];
+        assert_eq!(files[1].get("flag"), None);
+        assert_eq!(files[2]["flag"], json!("reject"));
     }
 }

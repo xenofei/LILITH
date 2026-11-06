@@ -147,10 +147,10 @@ impl StatusEvent {
 /// | any | `Deprecate` | `deprecated` (`status_before_deprecated` = from, unless from is `deprecated`) |
 /// | `deprecated` | `Undeprecate` | the fallback order below |
 ///
-/// `Undeprecate` returns to, in order (P4b-R4): `status_before_deprecated`; else the `from` of
-/// the newest log entry whose `to` is `deprecated`; else `approved` when `approved`; else
-/// `in_progress`. A candidate that is itself `deprecated`, or a newest entry without a
-/// `from`, passes to the next step.
+/// `Undeprecate` returns to, in order (P4b-R4): `status_before_deprecated`, unless it is
+/// itself `deprecated`; else the `from` of the newest log entry whose `to` is `deprecated` and
+/// whose `from` is a status other than `deprecated` (an entry for a repeated deprecation, or
+/// without a `from`, is passed over); else `approved` when `approved`; else `in_progress`.
 pub fn transition(
     from: Status,
     before_stale: Option<Status>,
@@ -223,9 +223,8 @@ pub fn transition(
                 .or_else(|| {
                     log.iter()
                         .rev()
-                        .find(|e| e.to == Deprecated)
-                        .and_then(|e| e.from)
-                        .filter(not_deprecated)
+                        .filter(|e| e.to == Deprecated)
+                        .find_map(|e| e.from.filter(not_deprecated))
                 })
                 .unwrap_or(if approved { Approved } else { InProgress });
             Ok(plain(to))
@@ -632,6 +631,15 @@ mod tests {
             undeprecate(None, &[entry(None, Deprecated)], true),
             Ok(Approved)
         );
+        // A repeated deprecation (or an entry without a `from`) is passed over for the older
+        // entry that recorded the real status.
+        let twice = [
+            entry(Some(InReview), Deprecated),
+            entry(Some(Deprecated), Deprecated),
+        ];
+        assert_eq!(undeprecate(None, &twice, false), Ok(InReview));
+        let no_from = [entry(Some(Exported), Deprecated), entry(None, Deprecated)];
+        assert_eq!(undeprecate(None, &no_from, true), Ok(Exported));
         // 4. Else `in_progress`.
         assert_eq!(undeprecate(None, &[], false), Ok(InProgress));
         assert_eq!(undeprecate(None, &no_deprecation, false), Ok(InProgress));
