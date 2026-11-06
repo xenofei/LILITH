@@ -3,7 +3,99 @@
 # A listed test is tolerated while it fails; once it passes it must be removed from this list.
 # An entry that matches no test is stale and fails the run.
 #
-# Plan 4a (Task 3): the spec tests that Tasks 4-13 turn green, grouped under the task that
+# Plan 4b (Task 2): the spec tests that Tasks 4-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
+    # Task 4
+    # CORE-156
+    { name = "lil-spec-tests::status_log_4b::every_status_change_appends_one_entry", rule = "CORE-156", file = "tests/status_log_4b.rs" },
+    # CORE-170
+    { name = "lil-spec-tests::status_log_4b::deprecate_and_back_restores_the_previous_status", rule = "CORE-170", file = "tests/status_log_4b.rs" },
+    # Task 5
+    # CORE-152, APP-147
+    { name = "lil-spec-tests::marks_4b::facets_are_counted_with_the_page", rule = "CORE-152", file = "tests/marks_4b.rs" },
+    # CORE-170
+    { name = "lil-spec-tests::marks_4b::deprecated_filter_hides_and_shows", rule = "CORE-170", file = "tests/marks_4b.rs" },
+    # CORE-152, APP-025
+    { name = "lil-spec-tests::marks_4b::old_cursors_stay_valid", rule = "CORE-152", file = "tests/marks_4b.rs" },
+    # Task 6
+    # CORE-152
+    { name = "lil-spec-tests::marks_4b::marks_round_trip_and_filter", rule = "CORE-152", file = "tests/marks_4b.rs" },
+    # CORE-152, CORE-023
+    { name = "lil-spec-tests::marks_4b::flags_are_per_take_and_only_on_open_runs", rule = "CORE-152", file = "tests/marks_4b.rs" },
+    # Task 7
+    # ARCH-125
+    { name = "lil-spec-tests::redirects_4b::a_redirect_cycle_is_broken_and_needs_repair", rule = "ARCH-125", file = "tests/redirects_4b.rs" },
+    # Task 8
+    # CORE-154, ARCH-125
+    { name = "lil-spec-tests::redirects_4b::accept_move_records_a_redirect_and_old_refs_resolve", rule = "CORE-154", file = "tests/redirects_4b.rs" },
+    # CORE-154, CORE-047
+    { name = "lil-spec-tests::redirects_4b::make_independent_gives_a_copy_a_new_uuid", rule = "CORE-154", file = "tests/redirects_4b.rs" },
+    # CORE-154
+    { name = "lil-spec-tests::redirects_4b::repairs_never_run_by_themselves", rule = "CORE-154", file = "tests/redirects_4b.rs" },
+    # Task 9
+    # CORE-155
+    { name = "lil-spec-tests::collections_4b::save_list_query_delete_restore", rule = "CORE-155", file = "tests/collections_4b.rs" },
+    # CORE-155
+    { name = "lil-spec-tests::collections_4b::quick_collection_is_always_listed_and_never_deleted", rule = "CORE-155", file = "tests/collections_4b.rs" },
+    # Task 11
+    # CORE-157, APP-115
+    { name = "lil-spec-tests::trash_4b::asset_trash_asks_even_the_app", rule = "CORE-157", file = "tests/trash_4b.rs" },
+    # CORE-157, CORE-037
+    { name = "lil-spec-tests::trash_4b::trash_moves_the_whole_asset_and_restores_it_read_only", rule = "CORE-157", file = "tests/trash_4b.rs" },
+    # CORE-157, ARCH-125
+    { name = "lil-spec-tests::trash_4b::refs_to_a_trashed_asset_are_asset_trashed", rule = "CORE-157", file = "tests/trash_4b.rs" },
+    # CORE-157
+    { name = "lil-spec-tests::trash_4b::trash_refused_while_in_use", rule = "CORE-157", file = "tests/trash_4b.rs" },
+    # CORE-037, ARCH-125
+    { name = "lil-spec-tests::trash_4b::restore_to_a_free_name", rule = "CORE-037", file = "tests/trash_4b.rs" },
+    # Task 12
+    # APP-038
+    { name = "lil-spec-tests::thumbs_4b::thumbs_request_returns_ready_or_pending_then_ready", rule = "APP-038", file = "tests/thumbs_4b.rs" },
+    # APP-038
+    { name = "lil-spec-tests::thumbs_4b::same_bytes_share_one_cache_entry", rule = "APP-038", file = "tests/thumbs_4b.rs" },
+    # APP-038
+    { name = "lil-spec-tests::thumbs_4b::non_images_get_the_icon_state", rule = "APP-038", file = "tests/thumbs_4b.rs" },
+    # APP-038, APP-039
+    { name = "lil-spec-tests::thumbs_4b::thumbs_need_assets_v1", rule = "APP-038", file = "tests/thumbs_4b.rs" },
+    # APP-038
+    { name = "lil-spec-tests::thumbs_4b::handlers_for_says_no_studio_opens_this_yet", rule = "APP-038", file = "tests/thumbs_4b.rs" },
+    # Task 13
+    # CORE-176
+    { name = "lil-spec-tests::picks_4b::review_picks_from_the_app_are_logged", rule = "CORE-176", file = "tests/picks_4b.rs" },
+    # Task 14
+    # CORE-177
+    { name = "lil-spec-tests::versions_4b::restore_version_seals_a_copy_as_the_next_version", rule = "CORE-177", file = "tests/versions_4b.rs" },
+    # CORE-177, APP-141
+    { name = "lil-spec-tests::versions_4b::get_version_reads_the_snapshot", rule = "CORE-177", file = "tests/versions_4b.rs" },
+    # Task 15
+    # CORE-034, ARCH-103
+    { name = "lil-spec-tests::attribution_4b::notify_with_by_is_an_agent_edit", rule = "CORE-034", file = "tests/attribution_4b.rs" },
+    # CORE-034
+    { name = "lil-spec-tests::attribution_4b::notify_without_by_stays_a_human_edit", rule = "CORE-034", file = "tests/attribution_4b.rs" },
+    # CORE-034, APP-039
+    { name = "lil-spec-tests::attribution_4b::ai_edit_relabels_one_entry_from_the_app_only", rule = "CORE-034", file = "tests/attribution_4b.rs" },
+    # Task 16
+    # CORE-168
+    { name = "lil-spec-tests::marks_4b::duplicates_finds_assets_sharing_bytes", rule = "CORE-168", file = "tests/marks_4b.rs" },
+    # ARCH-060
+    { name = "lil-spec-tests::workspace_4b::import_marks_files_untrusted_and_only_the_app_clears_it", rule = "ARCH-060", file = "tests/workspace_4b.rs" },
+    # CORE-025
+    { name = "lil-spec-tests::workspace_4b::style_input_is_added_to_every_run", rule = "CORE-025", file = "tests/workspace_4b.rs" },
+    # Task 17
+    # CORE-040
+    { name = "lil-spec-tests::workspace_4b::agents_cannot_write_instruction_files", rule = "CORE-040", file = "tests/workspace_4b.rs" },
+    # Task 17b
+    # ARCH-086
+    { name = "lil-spec-tests::workspace_4b::workspace_create_writes_the_lfs_baseline", rule = "ARCH-086", file = "tests/workspace_4b.rs" },
+    # Task 18
+    # CORE-179, ARCH-060
+    { name = "lil-spec-tests::inbox_4b::a_new_comfyui_output_lands_in_the_inbox_untrusted", rule = "CORE-179", file = "tests/inbox_4b.rs" },
+    # CORE-179, ARCH-060
+    { name = "lil-spec-tests::inbox_4b::keep_imports_and_dismiss_only_marks", rule = "CORE-179", file = "tests/inbox_4b.rs" },
+    # CORE-179, CORE-130
+    { name = "lil-spec-tests::inbox_4b::suite_job_outputs_are_not_inboxed", rule = "CORE-179", file = "tests/inbox_4b.rs" },
+    # Task 20
+    # APP-114, CORE-160
+    { name = "lil-spec-tests::jobs_4b::jobs_list_filters_by_status_list_origin_and_dispatch", rule = "APP-114", file = "tests/jobs_4b.rs" },
 ]
