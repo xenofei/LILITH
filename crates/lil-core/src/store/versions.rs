@@ -1128,6 +1128,7 @@ mod tests {
             role: role.to_string(),
             from: from.map(str::to_string),
             sha256: None,
+            ..Default::default()
         }
     }
 

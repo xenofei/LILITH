@@ -17,7 +17,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::status::Status;
+use crate::attribution::{self, Actor, TrustRecord};
+use crate::marks::{self, Flag, Marks};
+use crate::status::{self, STATUS_LOG_MAX, Status, StatusLogEntry, Via};
+use crate::takes::{self, AutoPick, OverridesAutoPick, file_name, takes_of};
 use crate::version::Version;
 
 /// A schema violation: a JSON pointer into the manifest and what is wrong there.
@@ -103,7 +106,7 @@ pub struct PinnedInput {
 }
 
 /// A `candidate_runs` entry (I5).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CandidateRun {
     pub run_id: String,
     pub path: Option<String>,
@@ -119,32 +122,66 @@ pub struct CandidateRun {
     /// The version whose sign-off rejected the run (`rejected_at_version`): its 90 days
     /// start at that sign-off (CORE-032).
     pub rejected_at_version: Option<Version>,
+    /// Who made the run (CORE-023).
+    pub actor: Option<Actor>,
+    /// The run's `inputs` (CORE-025).
+    pub inputs: Vec<RunInput>,
+    /// The version a restore as new version copied (`restored_from`; CORE-177).
+    pub restored_from: Option<Version>,
+}
+
+/// A `candidate_runs[].inputs` entry: `{ref, role, sections?}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunInput {
+    pub r#ref: String,
+    pub role: Option<String>,
+    /// Kept as written: its shape is reserved (CORE-025).
+    pub sections: Option<Value>,
 }
 
 /// A `candidate_runs[].files` entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CandidateFile {
     /// Asset-relative (I5).
     pub path: String,
     pub seed: Option<i64>,
-    /// `candidate`, `derived` or `repair`.
+    /// `candidate`, `derived`, `repair` or `preview`.
     pub role: String,
     pub from: Option<String>,
     /// Bare hex; absent in pre-2b runs.
     pub sha256: Option<String>,
+    /// The take the file belongs to (1-based); none in a run read by the legacy rule (P4b-R3).
+    pub take: Option<u32>,
+    /// `primary: true`: the file is its take's primary, which holds the take's flag and rating.
+    pub primary: bool,
+    /// The take's flag, on its primary file.
+    pub flag: Option<Flag>,
+    /// The take's rating (0–5, 0 unrated), on its primary file.
+    pub rating: u8,
+    /// Who made the file (CORE-023).
+    pub actor: Option<Actor>,
 }
 
 /// `candidate_runs[].signed_off`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SignedOff {
+    /// `user`, `assistant`, `claude-code`, `cli` or `auto`.
     pub by: String,
     pub date: String,
     pub version: Version,
+    pub via: Option<Via>,
+    /// The take numbers signed off (`takes`), when the sign-off named takes.
+    pub takes: Vec<u32>,
+    /// The names of the chosen takes' other files.
+    pub companions: Vec<String>,
+    pub auto_pick: Option<AutoPick>,
+    pub overrides_auto_pick: Option<OverridesAutoPick>,
 }
 
 /// A `human_edits` entry. I5's `author` and `note` are read when present and otherwise
-/// ignored; the core writes `path`, `sha256`, `previous_sha256` and `date`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// ignored; the core writes `path`, `sha256`, `previous_sha256` and `date`, and `actor` for an
+/// agent edit (CORE-034).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HumanEdit {
     pub path: String,
     /// Bare hex.
@@ -152,6 +189,9 @@ pub struct HumanEdit {
     /// Bare hex.
     pub previous_sha256: Option<String>,
     pub date: Option<String>,
+    pub actor: Option<Actor>,
+    /// `relabelled.utc`: when you marked the entry as an AI edit.
+    pub relabelled: Option<String>,
 }
 
 /// An `external` entry (a link-external file).
@@ -176,6 +216,19 @@ pub fn hash_value(hex: &str) -> String {
 /// Removes `key` from a nested map by shifting the keys after it (never `swap_remove`).
 pub fn remove_key(map: &mut Map<String, Value>, key: &str) -> Option<Value> {
     map.shift_remove(key)
+}
+
+/// Sets `key` in place (a new key is appended), or removes it by shifting when `value` is
+/// `None`.
+pub(crate) fn set_opt(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    match value {
+        Some(v) => {
+            map.insert(key.to_string(), v);
+        }
+        None => {
+            map.shift_remove(key);
+        }
+    }
 }
 
 impl Manifest {
@@ -301,6 +354,203 @@ impl Manifest {
     pub fn remove(&mut self, key: &str) -> Option<Value> {
         self.map.shift_remove(key)
     }
+
+    fn root(&self) -> Obj<'_> {
+        Obj {
+            map: &self.map,
+            at: "",
+        }
+    }
+
+    /// The asset's `tags`, `rating` and `label`, read leniently (see [`marks`]).
+    pub fn marks(&self) -> Marks {
+        marks::read_marks(&mut Reader::new(), self.root())
+    }
+
+    /// Writes the marks that differ from [`Manifest::marks`], each key in place; no tags, a
+    /// rating of 0 and no label remove their key by shifting (Appendix E). Tags are written as
+    /// given: the caller normalises them first ([`marks::normalise_tags`]).
+    pub fn set_marks(&mut self, m: &Marks) {
+        let now = self.marks();
+        if now.tags != m.tags {
+            let tags = (!m.tags.is_empty()).then(|| Value::from(m.tags.clone()));
+            set_opt(&mut self.map, "tags", tags);
+        }
+        if now.rating != m.rating.min(marks::MAX_RATING) {
+            set_opt(&mut self.map, "rating", marks::rating_value(m.rating));
+        }
+        if now.label != m.label {
+            let label = m.label.map(|l| Value::from(l.as_str()));
+            set_opt(&mut self.map, "label", label);
+        }
+    }
+
+    /// The `status_log` entries the view can read, newest last.
+    pub fn status_log(&self) -> Vec<StatusLogEntry> {
+        status::read_status_log(&mut Reader::new(), self.root())
+    }
+
+    /// Appends `e` to `status_log` and drops the oldest entries beyond 50 (CORE-156). A
+    /// missing key gets a one-entry list at the end; `null`, or a value that isn't a list
+    /// (which the read warns of), becomes a one-entry list in place.
+    pub fn push_status(&mut self, e: StatusLogEntry) {
+        let entry = e.to_value();
+        match self.map.get_mut("status_log") {
+            Some(Value::Array(list)) => {
+                list.push(entry);
+                let over = list.len().saturating_sub(STATUS_LOG_MAX);
+                list.drain(..over);
+            }
+            Some(other) => *other = Value::Array(vec![entry]),
+            None => {
+                self.map
+                    .insert("status_log".into(), Value::Array(vec![entry]));
+            }
+        }
+    }
+
+    /// The trust record of the asset-relative `path`. `None` when it has none: the suite made
+    /// the file and it counts as trusted (P4b-R28). A malformed record reads as untrusted.
+    pub fn trust(&self, path: &str) -> Option<TrustRecord> {
+        let Some(Value::Object(trust)) = self.map.get("trust") else {
+            return None;
+        };
+        let value = trust.get(path).filter(|v| !v.is_null())?;
+        Some(TrustRecord::read(
+            &mut Reader::new(),
+            &attribution::trust_ptr(path),
+            value,
+        ))
+    }
+
+    /// Sets the trust record of `path`: in place when it has one (its unknown keys stay), else
+    /// appended to the `trust` map, which is made at the end when missing. `None` removes the
+    /// record by shifting, and the `trust` map with it when that leaves it empty.
+    pub fn set_trust(&mut self, path: &str, rec: Option<&TrustRecord>) {
+        let Some(rec) = rec else {
+            if let Some(Value::Object(trust)) = self.map.get_mut("trust")
+                && trust.shift_remove(path).is_some()
+                && trust.is_empty()
+            {
+                self.map.shift_remove("trust");
+            }
+            return;
+        };
+        let slot = self
+            .map
+            .entry("trust")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !slot.is_object() {
+            // `null` or a malformed value (which the read warns of): replaced in place.
+            *slot = Value::Object(Map::new());
+        }
+        let Value::Object(trust) = slot else {
+            unreachable!("made an object above")
+        };
+        match trust.get_mut(path) {
+            Some(Value::Object(existing)) => rec.write_into(existing),
+            _ => {
+                trust.insert(path.to_string(), rec.to_value());
+            }
+        }
+    }
+
+    /// Sets the flag and rating of take `take` of run `run_id` on the take's primary file
+    /// entry (P4b-R3), each key in place: `flag: Some(None)` and `rating: Some(0)` remove the
+    /// key by shifting, `None` leaves it. An unknown run or take, or a rating above 5, is an
+    /// error and changes nothing. Whether the run is open is the caller's check.
+    pub fn set_take_mark(
+        &mut self,
+        run_id: &str,
+        take: u32,
+        flag: Option<Option<Flag>>,
+        rating: Option<u8>,
+    ) -> Result<(), String> {
+        if let Some(r) = rating
+            && r > marks::MAX_RATING
+        {
+            return Err(format!("a rating is 0 to 5, not {r}"));
+        }
+        let view = self.view();
+        let run = view
+            .candidate_runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .ok_or_else(|| format!("the asset has no run `{run_id}`"))?;
+        let primary = takes_of(run)
+            .into_iter()
+            .find(|t| t.n == take)
+            .map(|t| t.primary)
+            .ok_or_else(|| format!("run `{run_id}` has no take {take}"))?;
+        let entry = self
+            .runs_mut()
+            .into_iter()
+            .find(|r| r.get("run_id").and_then(Value::as_str) == Some(run_id))
+            .and_then(|r| r.get_mut("files"))
+            .and_then(Value::as_array_mut)
+            .and_then(|files| {
+                files.iter_mut().filter_map(Value::as_object_mut).find(|f| {
+                    f.get("path").and_then(Value::as_str).map(file_name) == Some(primary.as_str())
+                })
+            })
+            .ok_or_else(|| format!("run `{run_id}` has no file entry for `{primary}`"))?;
+        if let Some(flag) = flag {
+            set_opt(entry, "flag", flag.map(|f| Value::from(f.as_str())));
+        }
+        if let Some(r) = rating {
+            set_opt(entry, "rating", marks::rating_value(r));
+        }
+        Ok(())
+    }
+
+    /// Sets `actor` and `relabelled: {utc}` on the newest `human_edits` entry with this `path`
+    /// and SHA-256 (with or without the `sha256:` prefix), each in place: an existing actor
+    /// keeps its unknown keys. `false`, and nothing changes, when no entry matches.
+    pub fn set_human_edit_actor(
+        &mut self,
+        path: &str,
+        sha256: &str,
+        actor: &Actor,
+        utc: &str,
+    ) -> bool {
+        let Some(want) = bare_sha256(sha256) else {
+            return false;
+        };
+        let Some(Value::Array(edits)) = self.map.get_mut("human_edits") else {
+            return false;
+        };
+        let Some(entry) = edits
+            .iter_mut()
+            .rev()
+            .filter_map(Value::as_object_mut)
+            .find(|e| {
+                e.get("path").and_then(Value::as_str) == Some(path)
+                    && e.get("sha256")
+                        .and_then(Value::as_str)
+                        .and_then(bare_sha256)
+                        == Some(want)
+            })
+        else {
+            return false;
+        };
+        match entry.get_mut("actor") {
+            Some(Value::Object(existing)) => actor.write_into(existing),
+            _ => {
+                entry.insert("actor".into(), actor.to_value());
+            }
+        }
+        match entry.get_mut("relabelled") {
+            Some(Value::Object(existing)) => {
+                existing.insert("utc".into(), Value::from(utc));
+            }
+            _ => {
+                let mut m = Map::new();
+                m.insert("utc".into(), Value::from(utc));
+                entry.insert("relabelled".into(), Value::Object(m));
+            }
+        }
+        true
+    }
 }
 
 /// A warning for every key that appears more than once in one object of `text`, which
@@ -402,24 +652,30 @@ impl<'de> serde::de::Visitor<'de> for Walk<'_> {
 }
 
 /// `key` escaped for a JSON pointer (RFC 6901).
-fn esc(key: &str) -> String {
+pub(crate) fn esc(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
 /// Collects warnings while the view is read.
-struct Reader {
+pub(crate) struct Reader {
     warnings: Vec<SchemaWarning>,
 }
 
 /// A JSON object and its pointer.
 #[derive(Clone, Copy)]
-struct Obj<'a> {
-    map: &'a Map<String, Value>,
-    at: &'a str,
+pub(crate) struct Obj<'a> {
+    pub(crate) map: &'a Map<String, Value>,
+    pub(crate) at: &'a str,
 }
 
 impl Reader {
-    fn warn(&mut self, pointer: String, message: impl Into<String>) {
+    pub(crate) fn new() -> Reader {
+        Reader {
+            warnings: Vec::new(),
+        }
+    }
+
+    pub(crate) fn warn(&mut self, pointer: String, message: impl Into<String>) {
         self.warnings.push(SchemaWarning {
             pointer,
             message: message.into(),
@@ -427,15 +683,15 @@ impl Reader {
     }
 
     /// The value of `key`, treating `null` as absent.
-    fn field<'a>(o: Obj<'a>, key: &str) -> Option<&'a Value> {
+    pub(crate) fn field<'a>(o: Obj<'a>, key: &str) -> Option<&'a Value> {
         o.map.get(key).filter(|v| !v.is_null())
     }
 
-    fn ptr(o: Obj<'_>, key: &str) -> String {
+    pub(crate) fn ptr(o: Obj<'_>, key: &str) -> String {
         format!("{}/{}", o.at, esc(key))
     }
 
-    fn opt_str(&mut self, o: Obj<'_>, key: &str) -> Option<String> {
+    pub(crate) fn opt_str(&mut self, o: Obj<'_>, key: &str) -> Option<String> {
         match Self::field(o, key)? {
             Value::String(s) => Some(s.clone()),
             _ => {
@@ -447,11 +703,11 @@ impl Reader {
 
     /// A string field an element can't do without: `None` without a warning, so the caller
     /// warns once for the element it skips.
-    fn req_str(o: Obj<'_>, key: &str) -> Option<String> {
+    pub(crate) fn req_str(o: Obj<'_>, key: &str) -> Option<String> {
         Self::field(o, key)?.as_str().map(str::to_string)
     }
 
-    fn opt_version(&mut self, o: Obj<'_>, key: &str) -> Option<Version> {
+    pub(crate) fn opt_version(&mut self, o: Obj<'_>, key: &str) -> Option<Version> {
         let s = self.opt_str(o, key)?;
         match s.parse() {
             Ok(v) => Some(v),
@@ -462,7 +718,7 @@ impl Reader {
         }
     }
 
-    fn opt_sha(&mut self, o: Obj<'_>, key: &str) -> Option<String> {
+    pub(crate) fn opt_sha(&mut self, o: Obj<'_>, key: &str) -> Option<String> {
         let value = Self::field(o, key)?;
         match value.as_str().and_then(bare_sha256) {
             Some(hex) => Some(hex.to_string()),
@@ -476,7 +732,7 @@ impl Reader {
         }
     }
 
-    fn opt_bool(&mut self, o: Obj<'_>, key: &str) -> bool {
+    pub(crate) fn opt_bool(&mut self, o: Obj<'_>, key: &str) -> bool {
         match Self::field(o, key) {
             None => false,
             Some(Value::Bool(b)) => *b,
@@ -487,7 +743,7 @@ impl Reader {
         }
     }
 
-    fn opt_i64(&mut self, o: Obj<'_>, key: &str) -> Option<i64> {
+    pub(crate) fn opt_i64(&mut self, o: Obj<'_>, key: &str) -> Option<i64> {
         let n = Self::field(o, key)?.as_i64();
         if n.is_none() {
             self.warn(Self::ptr(o, key), "expected an integer");
@@ -496,7 +752,7 @@ impl Reader {
     }
 
     /// The elements of the list `key` (absent or null: none).
-    fn list<'a>(&mut self, o: Obj<'a>, key: &str) -> &'a [Value] {
+    pub(crate) fn list<'a>(&mut self, o: Obj<'a>, key: &str) -> &'a [Value] {
         match Self::field(o, key) {
             None => &[],
             Some(Value::Array(items)) => items,
@@ -508,7 +764,11 @@ impl Reader {
     }
 
     /// Each element of the list `key` that is an object, with its pointer.
-    fn objects<'a>(&mut self, o: Obj<'a>, key: &str) -> Vec<(String, &'a Map<String, Value>)> {
+    pub(crate) fn objects<'a>(
+        &mut self,
+        o: Obj<'a>,
+        key: &str,
+    ) -> Vec<(String, &'a Map<String, Value>)> {
         let base = Self::ptr(o, key);
         let mut out = Vec::new();
         for (i, item) in self.list(o, key).iter().enumerate() {
@@ -520,7 +780,7 @@ impl Reader {
         out
     }
 
-    fn strings(&mut self, o: Obj<'_>, key: &str) -> Vec<String> {
+    pub(crate) fn strings(&mut self, o: Obj<'_>, key: &str) -> Vec<String> {
         let base = Self::ptr(o, key);
         let mut out = Vec::new();
         for (i, item) in self.list(o, key).iter().enumerate() {
@@ -532,16 +792,14 @@ impl Reader {
         out
     }
 
-    fn skipped(&mut self, at: &str, needs: &str) {
+    pub(crate) fn skipped(&mut self, at: &str, needs: &str) {
         self.warn(at.to_string(), format!("skipped: {needs}"));
     }
 }
 
 /// Reads the typed view, leniently: every problem is a warning and the field's default.
 fn read_view(map: &Map<String, Value>) -> (ManifestView, Vec<SchemaWarning>) {
-    let mut r = Reader {
-        warnings: Vec::new(),
-    };
+    let mut r = Reader::new();
     let root = Obj { map, at: "" };
     let mut v = ManifestView::default();
 
@@ -642,11 +900,28 @@ fn read_view(map: &Map<String, Value>) -> (ManifestView, Vec<SchemaWarning>) {
             continue;
         };
         let sha256 = sha256.to_string();
+        let relabelled = match Reader::field(o, "relabelled") {
+            None => None,
+            Some(Value::Object(m)) => {
+                let at = Reader::ptr(o, "relabelled");
+                let utc = Reader::req_str(Obj { map: m, at: &at }, "utc");
+                if utc.is_none() {
+                    r.warn(at, "ignored: `utc` is required");
+                }
+                utc
+            }
+            Some(_) => {
+                r.warn(Reader::ptr(o, "relabelled"), "expected an object");
+                None
+            }
+        };
         v.human_edits.push(HumanEdit {
             path,
             sha256,
             previous_sha256: r.opt_sha(o, "previous_sha256"),
             date: r.opt_str(o, "date"),
+            actor: Actor::read(&mut r, o, "actor"),
+            relabelled,
         });
     }
     for (at, m) in r.objects(root, "external") {
@@ -663,6 +938,10 @@ fn read_view(map: &Map<String, Value>) -> (ManifestView, Vec<SchemaWarning>) {
         });
     }
     v.has_working_doc = r.opt_bool(root, "has_working_doc");
+    // Read here for their warnings; `Manifest::marks`, `status_log` and `trust` give the values.
+    marks::read_marks(&mut r, root);
+    status::read_status_log(&mut r, root);
+    attribution::read_trust(&mut r, root);
     (v, r.warnings)
 }
 
@@ -689,13 +968,37 @@ fn read_run(r: &mut Reader, o: Obj<'_>) -> Option<CandidateRun> {
             r.skipped(&at, "`path` and `role` are required strings");
             continue;
         };
+        let take = match Reader::field(f, "take") {
+            None => None,
+            Some(n) => {
+                let n = n
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n >= 1);
+                if n.is_none() {
+                    r.warn(
+                        Reader::ptr(f, "take"),
+                        "expected a take number from 1: read as no take",
+                    );
+                }
+                n
+            }
+        };
         files.push(CandidateFile {
             path,
             seed: r.opt_i64(f, "seed"),
             role,
             from: r.opt_str(f, "from"),
             sha256: r.opt_sha(f, "sha256"),
+            take,
+            primary: r.opt_bool(f, "primary"),
+            flag: marks::read_flag(r, f, "flag"),
+            rating: marks::read_rating(r, f, "rating"),
+            actor: Actor::read(r, f, "actor"),
         });
+    }
+    for message in takes::group(&files).1 {
+        r.warn(Reader::ptr(o, "files"), message);
     }
     let signed_off = match Reader::field(o, "signed_off") {
         None => None,
@@ -708,7 +1011,16 @@ fn read_run(r: &mut Reader, o: Obj<'_>) -> Option<CandidateRun> {
                 Reader::req_str(s, "date"),
                 version,
             ) {
-                (Some(by), Some(date), Some(version)) => Some(SignedOff { by, date, version }),
+                (Some(by), Some(date), Some(version)) => Some(SignedOff {
+                    by,
+                    date,
+                    version,
+                    via: Via::read(r, s, "via"),
+                    takes: read_take_numbers(r, s, "takes"),
+                    companions: r.strings(s, "companions"),
+                    auto_pick: takes::read_auto_pick(r, s),
+                    overrides_auto_pick: takes::read_overrides(r, s),
+                }),
                 _ => {
                     r.warn(
                         at,
@@ -735,12 +1047,52 @@ fn read_run(r: &mut Reader, o: Obj<'_>) -> Option<CandidateRun> {
         pinned: r.opt_bool(o, "pinned"),
         trashed_utc: r.opt_str(o, "trashed_utc"),
         rejected_at_version: r.opt_version(o, "rejected_at_version"),
+        actor: Actor::read(r, o, "actor"),
+        inputs: read_run_inputs(r, o),
+        restored_from: r.opt_version(o, "restored_from"),
     })
+}
+
+/// A list of take numbers (each a whole number from 1); others are skipped with a warning.
+fn read_take_numbers(r: &mut Reader, o: Obj<'_>, key: &str) -> Vec<u32> {
+    let base = Reader::ptr(o, key);
+    let mut out = Vec::new();
+    for (i, item) in r.list(o, key).iter().enumerate() {
+        match item.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) if n >= 1 => out.push(n),
+            _ => r.warn(
+                format!("{base}/{i}"),
+                "skipped: expected a take number from 1",
+            ),
+        }
+    }
+    out
+}
+
+/// A run's `inputs`: `{ref, role, sections?}`; an entry without a string `ref` is skipped.
+fn read_run_inputs(r: &mut Reader, o: Obj<'_>) -> Vec<RunInput> {
+    let mut out = Vec::new();
+    for (at, m) in r.objects(o, "inputs") {
+        let i = Obj { map: m, at: &at };
+        let Some(r#ref) = Reader::req_str(i, "ref") else {
+            r.skipped(&at, "`ref` is missing or not a string");
+            continue;
+        };
+        out.push(RunInput {
+            r#ref,
+            role: r.opt_str(i, "role"),
+            sections: Reader::field(i, "sections").cloned(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::{ActorKind, TrustSource, TrustSourceKind, TrustState};
+    use crate::marks::Label;
+    use crate::status::StatusBy;
     use serde_json::json;
 
     const CRANE: &str = include_str!(
@@ -843,6 +1195,11 @@ mod tests {
                 by: "user".into(),
                 date: "2026-10-02".into(),
                 version: Version::new(1, 0, 0),
+                via: None,
+                takes: Vec::new(),
+                companions: Vec::new(),
+                auto_pick: None,
+                overrides_auto_pick: None,
             })
         );
         assert!(!sel.pinned);
@@ -904,12 +1261,14 @@ mod tests {
                     sha256: HEX.into(),
                     previous_sha256: None,
                     date: Some("2026-10-04".into()),
+                    ..Default::default()
                 },
                 HumanEdit {
                     path: "prompts/crane.txt".into(),
                     sha256: HEX.into(),
                     previous_sha256: Some(HEX.into()),
                     date: Some("2026-10-05".into()),
+                    ..Default::default()
                 },
             ]
         );
@@ -1073,5 +1432,239 @@ mod tests {
         assert_eq!(keys[0], "schema_version");
         assert_eq!(m.eol(), "\n");
         assert!(m.to_text().ends_with("}\n"));
+    }
+
+    fn log_entry(utc: &str) -> StatusLogEntry {
+        StatusLogEntry {
+            from: Some(Status::Candidate),
+            to: Status::InReview,
+            by: StatusBy::User,
+            utc: utc.into(),
+            via: None,
+            reason: None,
+        }
+    }
+
+    #[test] // spec: CORE-156
+    fn status_log_keeps_the_newest_50() {
+        let mut m = Manifest::new(
+            "sketchbook",
+            "img_dock",
+            "image",
+            "0b8e5c1a-2f3d-4e6a-8b9c-0d1e2f3a4b5c",
+        );
+        assert!(m.status_log().is_empty());
+        for i in 0..60 {
+            m.push_status(log_entry(&format!("2026-11-01T00:{i:02}:00Z")));
+        }
+        let log = m.status_log();
+        assert_eq!(log.len(), 50);
+        assert_eq!(log[0].utc, "2026-11-01T00:10:00Z", "the oldest drop");
+        assert_eq!(log[49].utc, "2026-11-01T00:59:00Z", "newest last");
+        assert_eq!(
+            m.get("status_log").and_then(Value::as_array).map(Vec::len),
+            Some(50)
+        );
+
+        // `null` becomes a list in place; an entry the view skips still counts and drops first.
+        let text = json!({"schema_version": 1, "asset_id": "a", "project": "p",
+                          "status_log": null, "x_after": 1})
+        .to_string();
+        let (mut m, _) = Manifest::parse(&text).unwrap();
+        m.push_status(log_entry("2026-11-01T00:00:00Z"));
+        let keys: Vec<&str> = m.as_map().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "schema_version",
+                "asset_id",
+                "project",
+                "status_log",
+                "x_after"
+            ]
+        );
+        let mut raw = vec![json!("hand-written")];
+        raw.extend((0..49).map(|i| log_entry(&format!("2026-11-01T01:{i:02}:00Z")).to_value()));
+        m.set("status_log", Value::Array(raw));
+        assert_eq!(m.status_log().len(), 49);
+        m.push_status(log_entry("2026-11-01T02:00:00Z"));
+        let list = m.get("status_log").and_then(Value::as_array).unwrap();
+        assert_eq!(list.len(), 50);
+        assert!(list[0].is_object(), "the hand-written entry was the oldest");
+    }
+
+    /// `before` and `after` as text, for an exact comparison that includes key order (the
+    /// map's own `==` ignores order).
+    fn text_of(map: &Map<String, Value>) -> String {
+        serde_json::to_string_pretty(map).unwrap()
+    }
+
+    #[test] // spec: ARCH-076, CORE-148
+    fn unknown_fields_round_trip_through_every_new_setter() {
+        const RUN: &str = "r_20261101_0900";
+        let a_png = format!("candidates/{RUN}/a.png");
+        let b_png = format!("candidates/{RUN}/b.png");
+        let base = json!({
+            "schema_version": 1, "asset_id": "img_dock", "project": "sketchbook",
+            "x_before_tags": "a", "tags": ["dock"], "x_after_tags": {"k": 1},
+            "rating": 2, "x_after_rating": [1], "label": "blue", "x_after_label": true,
+            "status_log": [{"x_entry": 1, "from": "planned", "to": "in_progress", "by": "user",
+                            "utc": "2026-11-01T08:00:00Z"}],
+            "x_after_log": null,
+            "candidate_runs": [{"x_run": 1, "run_id": RUN, "status": "open", "files": [
+                {"x_file_before": 1, "path": a_png, "role": "candidate", "flag": "pick",
+                 "x_file_mid": 2, "rating": 3, "x_file_after": 3},
+                {"path": b_png, "role": "candidate"}
+            ], "x_run_after": 2}],
+            "human_edits": [{"x_edit": 1, "path": "work/a.psd", "sha256": HEX,
+                             "actor": {"kind": "owner", "x_actor": 1}, "x_edit_after": 2}],
+            "x_before_trust": 1,
+            "trust": {
+                a_png.clone(): {"x_rec": 1, "state": "untrusted",
+                                "sources": [{"kind": "import", "ref": "a.png"}], "x_rec_after": 2},
+                "work/a.psd": {"state": "untrusted", "sources": [{"kind": "collect", "ref": "a.psd"}]}
+            },
+            "x_last": "end"
+        });
+        let (m, warnings) = Manifest::parse(&base.to_string()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let edit = |f: &dyn Fn(&mut Map<String, Value>)| {
+            let mut map = m.as_map().clone();
+            f(&mut map);
+            text_of(&map)
+        };
+        fn file_at(map: &mut Map<String, Value>, i: usize) -> &mut Map<String, Value> {
+            map["candidate_runs"][0]["files"][i]
+                .as_object_mut()
+                .unwrap()
+        }
+
+        // set_marks: a changed key in place, an absent one removed by shifting, an unchanged
+        // one untouched.
+        let mut got = m.clone();
+        let mut marks = got.marks();
+        marks.rating = 4;
+        marks.label = None;
+        got.set_marks(&marks);
+        let want = edit(&|map| {
+            map.insert("rating".into(), json!(4));
+            map.shift_remove("label");
+        });
+        assert_eq!(text_of(got.as_map()), want);
+        // A key that wasn't there is appended.
+        let mut fresh = Manifest::new("sketchbook", "img_new", "image", "u");
+        fresh.set_marks(&Marks {
+            tags: vec!["Dock".into()],
+            rating: 1,
+            label: Some(Label::Red),
+        });
+        let keys: Vec<&str> = fresh.as_map().keys().map(String::as_str).collect();
+        assert_eq!(keys[keys.len() - 3..], ["tags", "rating", "label"]);
+
+        // push_status: one entry appended to the list in place.
+        let mut got = m.clone();
+        got.push_status(log_entry("2026-11-01T09:00:00Z"));
+        let want = edit(&|map| {
+            map["status_log"]
+                .as_array_mut()
+                .unwrap()
+                .push(log_entry("2026-11-01T09:00:00Z").to_value());
+        });
+        assert_eq!(text_of(got.as_map()), want);
+
+        // set_take_mark: the primary file's flag cleared by shifting, its rating in place.
+        let mut got = m.clone();
+        got.set_take_mark(RUN, 1, Some(None), Some(5)).unwrap();
+        let want = edit(&|map| {
+            let f = file_at(map, 0);
+            f.shift_remove("flag");
+            f.insert("rating".into(), json!(5));
+        });
+        assert_eq!(text_of(got.as_map()), want);
+        // Take 2 (no keys yet): appended to its file entry; a rating of 0 removes the key.
+        let mut got = m.clone();
+        got.set_take_mark(RUN, 2, Some(Some(Flag::Reject)), Some(0))
+            .unwrap();
+        let want = edit(&|map| {
+            let f = file_at(map, 1);
+            f.insert("flag".into(), json!("reject"));
+        });
+        assert_eq!(text_of(got.as_map()), want);
+        let mut same = m.clone();
+        assert!(same.set_take_mark(RUN, 3, Some(None), None).is_err());
+        assert!(
+            same.set_take_mark("r_20261101_0901", 1, None, Some(1))
+                .is_err()
+        );
+        assert!(same.set_take_mark(RUN, 1, None, Some(6)).is_err());
+        assert_eq!(same, m, "a refused mark changes nothing");
+
+        // set_human_edit_actor: the actor edited in place (its unknown key kept), `relabelled`
+        // appended to the entry.
+        let mut got = m.clone();
+        let agent = Actor {
+            kind: ActorKind::ClaudeCode,
+            task_id: None,
+            conversation_id: None,
+            session_id: None,
+        };
+        assert!(got.set_human_edit_actor(
+            "work/a.psd",
+            &hash_value(HEX),
+            &agent,
+            "2026-11-02T00:00:00Z"
+        ));
+        let want = edit(&|map| {
+            let e = map["human_edits"][0].as_object_mut().unwrap();
+            e["actor"]["kind"] = json!("claude_code");
+            e.insert("relabelled".into(), json!({"utc": "2026-11-02T00:00:00Z"}));
+        });
+        assert_eq!(text_of(got.as_map()), want);
+
+        // set_trust: a record edited in place, a new one appended, one removed by shifting.
+        let mut got = m.clone();
+        let mut rec = got.trust(&a_png).unwrap();
+        rec.state = TrustState::Trusted;
+        rec.marked_trusted = Some("2026-11-02T00:00:00Z".into());
+        got.set_trust(&a_png, Some(&rec));
+        let derived = TrustRecord {
+            state: TrustState::Untrusted,
+            sources: vec![TrustSource {
+                kind: TrustSourceKind::Derived,
+                r#ref: "a.png".into(),
+            }],
+            marked_trusted: None,
+        };
+        got.set_trust("candidates/r_20261101_0900/a_cut.png", Some(&derived));
+        got.set_trust("work/a.psd", None);
+        let want = edit(&|map| {
+            let t = map["trust"].as_object_mut().unwrap();
+            let r = t[a_png.as_str()].as_object_mut().unwrap();
+            r["state"] = json!("trusted");
+            r.insert(
+                "marked_trusted".into(),
+                json!({"utc": "2026-11-02T00:00:00Z"}),
+            );
+            t.shift_remove("work/a.psd");
+            t.insert(
+                "candidates/r_20261101_0900/a_cut.png".into(),
+                json!({"state": "untrusted", "sources": [{"kind": "derived", "ref": "a.png"}]}),
+            );
+        });
+        assert_eq!(text_of(got.as_map()), want);
+
+        // Every setter's result reads back with no warning, and the text keeps its line ending.
+        let crlf = m.to_text().replace('\n', "\r\n");
+        let (mut m, _) = Manifest::parse(&crlf).unwrap();
+        m.set_marks(&Marks::default());
+        m.push_status(log_entry("2026-11-01T09:00:00Z"));
+        m.set_take_mark(RUN, 1, Some(Some(Flag::Reject)), Some(1))
+            .unwrap();
+        assert!(m.set_human_edit_actor("work/a.psd", HEX, &agent, "2026-11-02T00:00:00Z"));
+        m.set_trust(&a_png, None);
+        let text = m.to_text();
+        assert!(!text.replace("\r\n", "").contains('\n'), "CRLF kept");
+        let (_, warnings) = Manifest::parse(&text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
