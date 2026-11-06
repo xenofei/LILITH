@@ -933,6 +933,48 @@ fn the_organising_tools_are_pinned() {
         .filter(|(name, _, _)| expected.iter().any(|e| &e.0 == name))
         .collect();
     assert_eq!(found, expected);
+
+    // `asset.mark` publishes what it accepts: `null` clears `label` and `flag`, but `rating`
+    // takes 0 for unrated and refuses `null`.
+    fn allows_null(s: &Value) -> bool {
+        let is_null = |t: &Value| t == "null";
+        s.get("type")
+            .is_some_and(|t| is_null(t) || t.as_array().is_some_and(|a| a.iter().any(is_null)))
+            || s.get("const").is_some_and(Value::is_null)
+            || s.get("enum")
+                .and_then(Value::as_array)
+                .is_some_and(|e| e.iter().any(Value::is_null))
+            || ["anyOf", "oneOf"].iter().any(|k| {
+                s.get(*k)
+                    .and_then(Value::as_array)
+                    .is_some_and(|alts| alts.iter().any(allows_null))
+            })
+    }
+    let mark = reg
+        .descriptors()
+        .into_iter()
+        .find(|d| d.name == "asset.mark")
+        .expect("asset.mark is registered");
+    let props = &mark.input_schema["properties"];
+    assert!(
+        !allows_null(&props["rating"]),
+        "rating: {}",
+        props["rating"]
+    );
+    assert_eq!(props["rating"]["type"], "integer", "{}", props["rating"]);
+    assert!(
+        props["rating"].get("default").is_none_or(|d| !d.is_null()),
+        "rating: {}",
+        props["rating"]
+    );
+    for key in ["label", "flag"] {
+        assert!(allows_null(&props[key]), "{key}: {}", props[key]);
+    }
+    let required = mark.input_schema["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!required.contains(&json!("rating")), "{required:?}");
 }
 
 #[test] // spec: CORE-014

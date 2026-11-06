@@ -340,7 +340,14 @@ struct MarkArgs {
     #[serde(default)]
     remove_tags: Vec<String>,
     /// 0-5, 0 unrated: the take's with run_id, else the asset's. Not null.
-    #[serde(default, deserialize_with = "present")]
+    // Read as present-or-null so `null` can be refused; published as a plain integer, with no
+    // `default: null` (schemars leaves out a default that `skip_serializing_if` would skip).
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "u8")]
     rating: Option<Option<u8>>,
     /// null clears.
     #[serde(default, deserialize_with = "present")]
