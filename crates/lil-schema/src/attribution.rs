@@ -7,7 +7,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::manifest::{Obj, Reader, esc, set_opt};
+use crate::manifest::{Obj, Reader, esc, set_opt, set_utc_object};
 
 /// `actor.kind`. The set is open on read: a kind this suite doesn't know is kept, unchanged,
 /// as [`ActorKind::Other`] and written back as it was.
@@ -159,6 +159,26 @@ pub struct TrustSource {
     pub r#ref: String,
 }
 
+impl TrustSource {
+    /// The JSON form.
+    pub fn to_value(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("kind".into(), Value::from(self.kind.as_str()));
+        m.insert("ref".into(), Value::from(self.r#ref.as_str()));
+        Value::Object(m)
+    }
+
+    /// A source element: `None` unless it is an object with a known `kind` and a string `ref`.
+    fn from_value(value: &Value) -> Option<TrustSource> {
+        let kind = value.get("kind")?.as_str()?;
+        let kind = TrustSourceKind::ALL
+            .into_iter()
+            .find(|t| t.as_str() == kind)?;
+        let r#ref = value.get("ref")?.as_str()?.to_string();
+        Some(TrustSource { kind, r#ref })
+    }
+}
+
 /// `{state, sources: [{kind, ref}], marked_trusted?: {utc}}` (ARCH-060; P4b-R28).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustRecord {
@@ -176,26 +196,32 @@ impl TrustRecord {
         Value::Object(map)
     }
 
-    /// Writes the record into an existing object in place (as [`Actor`]'s `write_into`).
+    /// Writes the record into an existing object in place (as [`Actor`]'s `write_into`):
+    /// - `state` keeps its position;
+    /// - in `sources`, an element whose `{kind, ref}` is still in the record stays as it is (its
+    ///   unknown keys too), one the read skipped (an unknown kind) stays, one no longer in the
+    ///   record is removed, and new sources are appended;
+    /// - `utc` is set inside an existing `marked_trusted`, which keeps its unknown keys.
     pub(crate) fn write_into(&self, map: &mut Map<String, Value>) {
         map.insert("state".into(), Value::from(self.state.as_str()));
-        let sources = self
-            .sources
-            .iter()
-            .map(|s| {
-                let mut m = Map::new();
-                m.insert("kind".into(), Value::from(s.kind.as_str()));
-                m.insert("ref".into(), Value::from(s.r#ref.as_str()));
-                Value::Object(m)
-            })
-            .collect();
-        map.insert("sources".into(), Value::Array(sources));
-        let marked = self.marked_trusted.as_deref().map(|utc| {
-            let mut m = Map::new();
-            m.insert("utc".into(), Value::from(utc));
-            Value::Object(m)
+        let mut wanted: Vec<Option<&TrustSource>> = self.sources.iter().map(Some).collect();
+        let mut sources: Vec<Value> = match map.get_mut("sources") {
+            Some(Value::Array(old)) => std::mem::take(old),
+            _ => Vec::new(),
+        };
+        sources.retain(|item| match TrustSource::from_value(item) {
+            None => true,
+            Some(src) => match wanted.iter_mut().find(|w| **w == Some(&src)) {
+                Some(slot) => {
+                    *slot = None;
+                    true
+                }
+                None => false,
+            },
         });
-        set_opt(map, "marked_trusted", marked);
+        sources.extend(wanted.into_iter().flatten().map(TrustSource::to_value));
+        map.insert("sources".into(), Value::Array(sources));
+        set_utc_object(map, "marked_trusted", self.marked_trusted.as_deref());
     }
 
     /// The record `value` at pointer `at`, leniently and on the safe side: a record that isn't
@@ -220,33 +246,17 @@ impl TrustRecord {
                 "expected `trusted` or `untrusted`: read as untrusted",
             ),
         }
-        for (src_at, m) in r.objects(o, "sources") {
-            let s = Obj {
-                map: m,
-                at: &src_at,
-            };
-            let kind = Reader::req_str(s, "kind")
-                .and_then(|k| TrustSourceKind::ALL.into_iter().find(|t| t.as_str() == k));
-            match (kind, Reader::req_str(s, "ref")) {
-                (Some(kind), Some(r#ref)) => rec.sources.push(TrustSource { kind, r#ref }),
-                _ => r.skipped(&src_at, "a known `kind` and a string `ref` are required"),
+        let base = Reader::ptr(o, "sources");
+        for (i, item) in r.list(o, "sources").iter().enumerate() {
+            match TrustSource::from_value(item) {
+                Some(src) => rec.sources.push(src),
+                None => r.skipped(
+                    &format!("{base}/{i}"),
+                    "a source needs a known `kind` and a string `ref`",
+                ),
             }
         }
-        rec.marked_trusted = match Reader::field(o, "marked_trusted") {
-            None => None,
-            Some(Value::Object(m)) => {
-                let at = Reader::ptr(o, "marked_trusted");
-                let utc = Reader::req_str(Obj { map: m, at: &at }, "utc");
-                if utc.is_none() {
-                    r.warn(at, "ignored: `utc` is required");
-                }
-                utc
-            }
-            Some(_) => {
-                r.warn(Reader::ptr(o, "marked_trusted"), "expected an object");
-                None
-            }
-        };
+        rec.marked_trusted = r.opt_utc_object(o, "marked_trusted");
         rec
     }
 }

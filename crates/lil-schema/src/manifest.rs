@@ -218,6 +218,25 @@ pub fn remove_key(map: &mut Map<String, Value>, key: &str) -> Option<Value> {
     map.shift_remove(key)
 }
 
+/// Sets a `{utc}` object at `key`: `utc` is set inside an existing object, which keeps its
+/// other keys; otherwise `{utc}` is written in place (a new key is appended). `None` removes the
+/// key by shifting.
+pub(crate) fn set_utc_object(map: &mut Map<String, Value>, key: &str, utc: Option<&str>) {
+    match (map.get_mut(key), utc) {
+        (Some(Value::Object(existing)), Some(utc)) => {
+            existing.insert("utc".into(), Value::from(utc));
+        }
+        (_, Some(utc)) => {
+            let mut m = Map::new();
+            m.insert("utc".into(), Value::from(utc));
+            map.insert(key.to_string(), Value::Object(m));
+        }
+        (_, None) => {
+            map.shift_remove(key);
+        }
+    }
+}
+
 /// Sets `key` in place (a new key is appended), or removes it by shifting when `value` is
 /// `None`.
 pub(crate) fn set_opt(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
@@ -369,20 +388,23 @@ impl Manifest {
 
     /// Writes the marks that differ from [`Manifest::marks`], each key in place; no tags, a
     /// rating of 0 and no label remove their key by shifting (Appendix E). Tags are written as
-    /// given: the caller normalises them first ([`marks::normalise_tags`]).
-    pub fn set_marks(&mut self, m: &Marks) {
+    /// given: the caller normalises them first ([`marks::normalise_tags`]). A rating above 5 is
+    /// an error and changes nothing.
+    pub fn set_marks(&mut self, m: &Marks) -> Result<(), String> {
+        check_rating(m.rating)?;
         let now = self.marks();
         if now.tags != m.tags {
             let tags = (!m.tags.is_empty()).then(|| Value::from(m.tags.clone()));
             set_opt(&mut self.map, "tags", tags);
         }
-        if now.rating != m.rating.min(marks::MAX_RATING) {
+        if now.rating != m.rating {
             set_opt(&mut self.map, "rating", marks::rating_value(m.rating));
         }
         if now.label != m.label {
             let label = m.label.map(|l| Value::from(l.as_str()));
             set_opt(&mut self.map, "label", label);
         }
+        Ok(())
     }
 
     /// The `status_log` entries the view can read, newest last.
@@ -466,10 +488,8 @@ impl Manifest {
         flag: Option<Option<Flag>>,
         rating: Option<u8>,
     ) -> Result<(), String> {
-        if let Some(r) = rating
-            && r > marks::MAX_RATING
-        {
-            return Err(format!("a rating is 0 to 5, not {r}"));
+        if let Some(r) = rating {
+            check_rating(r)?;
         }
         let view = self.view();
         let run = view
@@ -539,16 +559,7 @@ impl Manifest {
                 entry.insert("actor".into(), actor.to_value());
             }
         }
-        match entry.get_mut("relabelled") {
-            Some(Value::Object(existing)) => {
-                existing.insert("utc".into(), Value::from(utc));
-            }
-            _ => {
-                let mut m = Map::new();
-                m.insert("utc".into(), Value::from(utc));
-                entry.insert("relabelled".into(), Value::Object(m));
-            }
-        }
+        set_utc_object(entry, "relabelled", Some(utc));
         true
     }
 }
@@ -792,6 +803,26 @@ impl Reader {
         out
     }
 
+    /// The `utc` of a `{utc}` object at `key` (`relabelled`, `marked_trusted`): absent or
+    /// `null` is none; not an object, or an object without a string `utc`, is none with a
+    /// warning.
+    pub(crate) fn opt_utc_object(&mut self, o: Obj<'_>, key: &str) -> Option<String> {
+        let at = Self::ptr(o, key);
+        match Self::field(o, key)? {
+            Value::Object(m) => {
+                let utc = Self::req_str(Obj { map: m, at: &at }, "utc");
+                if utc.is_none() {
+                    self.warn(at, "ignored: `utc` is required");
+                }
+                utc
+            }
+            _ => {
+                self.warn(at, "expected an object");
+                None
+            }
+        }
+    }
+
     pub(crate) fn skipped(&mut self, at: &str, needs: &str) {
         self.warn(at.to_string(), format!("skipped: {needs}"));
     }
@@ -900,21 +931,7 @@ fn read_view(map: &Map<String, Value>) -> (ManifestView, Vec<SchemaWarning>) {
             continue;
         };
         let sha256 = sha256.to_string();
-        let relabelled = match Reader::field(o, "relabelled") {
-            None => None,
-            Some(Value::Object(m)) => {
-                let at = Reader::ptr(o, "relabelled");
-                let utc = Reader::req_str(Obj { map: m, at: &at }, "utc");
-                if utc.is_none() {
-                    r.warn(at, "ignored: `utc` is required");
-                }
-                utc
-            }
-            Some(_) => {
-                r.warn(Reader::ptr(o, "relabelled"), "expected an object");
-                None
-            }
-        };
+        let relabelled = r.opt_utc_object(o, "relabelled");
         v.human_edits.push(HumanEdit {
             path,
             sha256,
@@ -1051,6 +1068,14 @@ fn read_run(r: &mut Reader, o: Obj<'_>) -> Option<CandidateRun> {
         inputs: read_run_inputs(r, o),
         restored_from: r.opt_version(o, "restored_from"),
     })
+}
+
+/// A rating a setter writes: 0 to 5, else an error.
+fn check_rating(rating: u8) -> Result<(), String> {
+    if rating > marks::MAX_RATING {
+        return Err(format!("a rating is 0 to 5, not {rating}"));
+    }
+    Ok(())
 }
 
 /// A list of take numbers (each a whole number from 1); others are skipped with a warning.
@@ -1521,13 +1546,21 @@ mod tests {
             "x_before_trust": 1,
             "trust": {
                 a_png.clone(): {"x_rec": 1, "state": "untrusted",
-                                "sources": [{"kind": "import", "ref": "a.png"}], "x_rec_after": 2},
+                                "sources": [{"kind": "import", "ref": "a.png", "x_src": 1},
+                                            {"kind": "smuggled", "ref": "elsewhere"}],
+                                "marked_trusted": {"x_mt": 1, "utc": "2026-11-01T00:00:00Z"},
+                                "x_rec_after": 2},
                 "work/a.psd": {"state": "untrusted", "sources": [{"kind": "collect", "ref": "a.psd"}]}
             },
             "x_last": "end"
         });
         let (m, warnings) = Manifest::parse(&base.to_string()).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
+        let pointers: Vec<&str> = warnings.iter().map(|w| w.pointer.as_str()).collect();
+        assert_eq!(
+            pointers,
+            ["/trust/candidates~1r_20261101_0900~1a.png/sources/1"],
+            "only the source of a kind this suite doesn't know"
+        );
         let edit = |f: &dyn Fn(&mut Map<String, Value>)| {
             let mut map = m.as_map().clone();
             f(&mut map);
@@ -1539,25 +1572,43 @@ mod tests {
                 .unwrap()
         }
 
-        // set_marks: a changed key in place, an absent one removed by shifting, an unchanged
-        // one untouched.
+        // set_marks: changed keys in place, an absent one removed by shifting.
         let mut got = m.clone();
         let mut marks = got.marks();
+        marks.tags = vec!["dock".into(), "pier".into()];
         marks.rating = 4;
         marks.label = None;
-        got.set_marks(&marks);
+        got.set_marks(&marks).unwrap();
         let want = edit(&|map| {
+            map.insert("tags".into(), json!(["dock", "pier"]));
             map.insert("rating".into(), json!(4));
             map.shift_remove("label");
         });
         assert_eq!(text_of(got.as_map()), want);
+        // A rating of 0 removes the key by shifting; the unchanged marks stay untouched.
+        let mut got = m.clone();
+        let mut marks = got.marks();
+        marks.rating = 0;
+        got.set_marks(&marks).unwrap();
+        let want = edit(&|map| {
+            map.shift_remove("rating");
+        });
+        assert_eq!(text_of(got.as_map()), want);
+        // A rating above 5 is refused, and nothing changes.
+        let mut same = m.clone();
+        marks.rating = 6;
+        marks.tags.clear();
+        assert!(same.set_marks(&marks).is_err());
+        assert_eq!(same, m, "a refused mark changes nothing");
         // A key that wasn't there is appended.
         let mut fresh = Manifest::new("sketchbook", "img_new", "image", "u");
-        fresh.set_marks(&Marks {
-            tags: vec!["Dock".into()],
-            rating: 1,
-            label: Some(Label::Red),
-        });
+        fresh
+            .set_marks(&Marks {
+                tags: vec!["Dock".into()],
+                rating: 1,
+                label: Some(Label::Red),
+            })
+            .unwrap();
         let keys: Vec<&str> = fresh.as_map().keys().map(String::as_str).collect();
         assert_eq!(keys[keys.len() - 3..], ["tags", "rating", "label"]);
 
@@ -1621,11 +1672,17 @@ mod tests {
         });
         assert_eq!(text_of(got.as_map()), want);
 
-        // set_trust: a record edited in place, a new one appended, one removed by shifting.
+        // set_trust: a record edited in place (the unknown keys of the record, of a source and
+        // of `marked_trusted` kept, and the source the read skipped kept), a new one appended,
+        // one removed by shifting.
         let mut got = m.clone();
         let mut rec = got.trust(&a_png).unwrap();
         rec.state = TrustState::Trusted;
         rec.marked_trusted = Some("2026-11-02T00:00:00Z".into());
+        rec.sources.push(TrustSource {
+            kind: TrustSourceKind::Derived,
+            r#ref: "b.png".into(),
+        });
         got.set_trust(&a_png, Some(&rec));
         let derived = TrustRecord {
             state: TrustState::Untrusted,
@@ -1641,10 +1698,11 @@ mod tests {
             let t = map["trust"].as_object_mut().unwrap();
             let r = t[a_png.as_str()].as_object_mut().unwrap();
             r["state"] = json!("trusted");
-            r.insert(
-                "marked_trusted".into(),
-                json!({"utc": "2026-11-02T00:00:00Z"}),
-            );
+            r["sources"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"kind": "derived", "ref": "b.png"}));
+            r["marked_trusted"]["utc"] = json!("2026-11-02T00:00:00Z");
             t.shift_remove("work/a.psd");
             t.insert(
                 "candidates/r_20261101_0900/a_cut.png".into(),
@@ -1652,11 +1710,28 @@ mod tests {
             );
         });
         assert_eq!(text_of(got.as_map()), want);
+        // A source no longer in the record is removed by shifting; the skipped one stays.
+        let mut got = m.clone();
+        let mut rec = got.trust(&a_png).unwrap();
+        rec.sources.clear();
+        rec.marked_trusted = None;
+        got.set_trust(&a_png, Some(&rec));
+        let want = edit(&|map| {
+            let r = map["trust"][a_png.as_str()].as_object_mut().unwrap();
+            r["sources"].as_array_mut().unwrap().remove(0);
+            r.shift_remove("marked_trusted");
+        });
+        assert_eq!(text_of(got.as_map()), want);
+        // Unchanged, the record's text doesn't change.
+        let mut got = m.clone();
+        let rec = got.trust(&a_png).unwrap();
+        got.set_trust(&a_png, Some(&rec));
+        assert_eq!(text_of(got.as_map()), text_of(m.as_map()));
 
         // Every setter's result reads back with no warning, and the text keeps its line ending.
         let crlf = m.to_text().replace('\n', "\r\n");
         let (mut m, _) = Manifest::parse(&crlf).unwrap();
-        m.set_marks(&Marks::default());
+        m.set_marks(&Marks::default()).unwrap();
         m.push_status(log_entry("2026-11-01T09:00:00Z"));
         m.set_take_mark(RUN, 1, Some(Some(Flag::Reject)), Some(1))
             .unwrap();

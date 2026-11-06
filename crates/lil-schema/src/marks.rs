@@ -217,9 +217,10 @@ pub(crate) fn read_marks(r: &mut Reader, root: Obj<'_>) -> Marks {
     }
 }
 
-/// The JSON value of a rating, or `None` (the key is removed) for 0.
+/// The JSON value of a rating the caller has checked (0–5), or `None` (the key is removed)
+/// for 0.
 pub(crate) fn rating_value(rating: u8) -> Option<Value> {
-    (rating > 0).then(|| Value::from(rating.min(MAX_RATING)))
+    (rating > 0).then(|| Value::from(rating))
 }
 
 #[cfg(test)]

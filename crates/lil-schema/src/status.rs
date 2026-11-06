@@ -237,8 +237,11 @@ pub fn transition(
 /// The most entries the status log keeps (CORE-156); beyond it the oldest drops.
 pub const STATUS_LOG_MAX: usize = 50;
 
-/// Who changed the status: `user`, `assistant`, `claude-code`, `cli`, `auto` or `core`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Who changed the status: `user`, `assistant`, `claude-code`, `cli`, `auto` or `core`. The
+/// set is open on read, like `signed_off.by`: a value this suite doesn't know is kept,
+/// unchanged, as [`StatusBy::Other`] and written back as it was. The suite never writes
+/// `Other` itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StatusBy {
     User,
     Assistant,
@@ -246,6 +249,7 @@ pub enum StatusBy {
     Cli,
     Auto,
     Core,
+    Other(String),
 }
 
 impl StatusBy {
@@ -258,8 +262,8 @@ impl StatusBy {
         StatusBy::Core,
     ];
 
-    /// The wire value.
-    pub fn as_str(self) -> &'static str {
+    /// The wire value, or the unknown value as read.
+    pub fn as_str(&self) -> &str {
         match self {
             StatusBy::User => "user",
             StatusBy::Assistant => "assistant",
@@ -267,18 +271,16 @@ impl StatusBy {
             StatusBy::Cli => "cli",
             StatusBy::Auto => "auto",
             StatusBy::Core => "core",
+            StatusBy::Other(s) => s,
         }
     }
-}
 
-impl FromStr for StatusBy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<StatusBy, String> {
+    /// Reads a wire value; never fails.
+    pub fn from_wire(s: &str) -> StatusBy {
         StatusBy::ALL
             .into_iter()
             .find(|b| b.as_str() == s)
-            .ok_or_else(|| format!("`{s}` is not a status `by`"))
+            .unwrap_or_else(|| StatusBy::Other(s.to_string()))
     }
 }
 
@@ -371,21 +373,21 @@ impl StatusLogEntry {
         Value::Object(map)
     }
 
-    /// One entry, leniently: without a valid `to`, `by` and `utc` (and a `from` that is a
-    /// status or `null`) it is skipped with a warning.
+    /// One entry, leniently: without a status `to`, a string `by` and `utc` (and a `from` that
+    /// is a status or `null`) it is skipped with a warning.
     fn read(r: &mut Reader, o: Obj<'_>) -> Option<StatusLogEntry> {
         let status = |key: &str| Reader::req_str(o, key).and_then(|s| s.parse::<Status>().ok());
         let from = match Reader::field(o, "from") {
             None => Some(None),
             Some(_) => status("from").map(Some),
         };
-        let by = Reader::req_str(o, "by").and_then(|s| s.parse::<StatusBy>().ok());
+        let by = Reader::req_str(o, "by").map(|s| StatusBy::from_wire(&s));
         let (Some(from), Some(to), Some(by), Some(utc)) =
             (from, status("to"), by, Reader::req_str(o, "utc"))
         else {
             r.skipped(
                 o.at,
-                "a status-log entry needs a status or null `from`, a status `to`, a known `by` \
+                "a status-log entry needs a status or null `from`, a status `to`, a string `by` \
                  and a string `utc`",
             );
             return None;
@@ -654,15 +656,18 @@ mod tests {
         use serde_json::json;
 
         for by in StatusBy::ALL {
-            assert_eq!(by.as_str().parse::<StatusBy>(), Ok(by));
+            assert_eq!(StatusBy::from_wire(by.as_str()), by);
         }
         let wire: Vec<&str> = StatusBy::ALL.iter().map(|b| b.as_str()).collect();
         assert_eq!(
             wire,
             ["user", "assistant", "claude-code", "cli", "auto", "core"]
         );
-        assert!("claude_code".parse::<StatusBy>().is_err());
-        assert!("robot".parse::<StatusBy>().is_err());
+        // `claude_code` is the actor kind's spelling, not the status log's.
+        assert_eq!(
+            StatusBy::from_wire("claude_code"),
+            StatusBy::Other("claude_code".into())
+        );
 
         let mut m = Manifest::new(
             "sketchbook",
@@ -705,11 +710,11 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(again.status_log(), [auto, restored]);
 
-        // A `by` this suite doesn't know is a warning and the entry is left out of the view; a
-        // blocked entry without a reason is read, with a warning.
+        // A blocked entry without a reason is read, with a warning; one without a string `by`
+        // is skipped, with a warning.
         let text = json!({"schema_version": 1, "asset_id": "a", "project": "p",
         "status_log": [
-            {"from": null, "to": "planned", "by": "robot", "utc": "2026-11-01T00:00:00Z"},
+            {"from": null, "to": "planned", "by": 7, "utc": "2026-11-01T00:00:00Z"},
             {"from": "planned", "to": "blocked", "by": "user", "utc": "2026-11-01T00:00:00Z"}
         ]})
         .to_string();
@@ -718,5 +723,43 @@ mod tests {
         let pointers: Vec<&str> = warnings.iter().map(|w| w.pointer.as_str()).collect();
         assert!(pointers.contains(&"/status_log/0"), "{pointers:?}");
         assert!(pointers.contains(&"/status_log/1/reason"), "{pointers:?}");
+    }
+
+    #[test] // spec: CORE-156, CORE-148
+    fn status_log_keeps_an_unknown_by_unchanged() {
+        use crate::manifest::Manifest;
+        use serde_json::json;
+
+        assert_eq!(
+            StatusBy::from_wire("night_shift"),
+            StatusBy::Other("night_shift".into())
+        );
+        assert_eq!(
+            StatusBy::Other("night_shift".into()).as_str(),
+            "night_shift"
+        );
+
+        let robot = json!({"from": "approved", "to": "deprecated", "by": "night_shift",
+                           "utc": "2026-11-01T00:00:00Z", "x_extra": 1});
+        let text = json!({"schema_version": 1, "asset_id": "a", "project": "p",
+                          "status_log": [robot.clone()]})
+        .to_string();
+        let (mut m, warnings) = Manifest::parse(&text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // The entry stays in the view, so the newest deprecation is still found (P4b-R4).
+        let log = m.status_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].by, StatusBy::Other("night_shift".into()));
+        let back = transition(Deprecated, None, None, None, &log, true, &E::Undeprecate);
+        assert_eq!(back.map(|t| t.to), Ok(Approved));
+        // Written back unchanged, also through the view's own form.
+        assert_eq!(log[0].to_value()["by"], json!("night_shift"));
+        m.push_status(entry(Some(Approved), Deprecated));
+        assert_eq!(m.get("status_log").unwrap()[0], robot);
+        let (again, _) = Manifest::parse(&m.to_text()).unwrap();
+        assert_eq!(
+            again.status_log()[0].by,
+            StatusBy::Other("night_shift".into())
+        );
     }
 }

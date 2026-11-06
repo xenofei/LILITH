@@ -13,9 +13,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-use crate::content_hash::hex;
+use crate::content_hash::lines_sha256;
 use crate::manifest::{CandidateFile, CandidateRun, Obj, Reader};
 use crate::marks::Flag;
 use crate::version::Version;
@@ -159,16 +158,12 @@ pub(crate) fn group(files: &[CandidateFile]) -> (Vec<Take>, Vec<String>) {
 /// files, sorted by name in byte order (the version content-hash form). `files` holds
 /// `(file name, sha256 hex)` pairs, in any order.
 pub fn take_sha256(files: &[(String, String)]) -> String {
-    let mut lines: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(name, sha)| (name.as_str(), sha.as_str()))
-        .collect();
-    lines.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut hasher = Sha256::new();
-    for (name, sha) in lines {
-        hasher.update(format!("{sha}  {name}\n").as_bytes());
-    }
-    hex(&hasher.finalize())
+    lines_sha256(
+        files
+            .iter()
+            .map(|(name, sha)| (name.as_str(), sha.as_str()))
+            .collect(),
+    )
 }
 
 /// Why the auto pick chose its take: `vision_score` or `lowest_seed`.
