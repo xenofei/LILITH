@@ -15,8 +15,12 @@
 //!   `minor`. With nothing approved yet it is the manifest's `version` (`1.0.0` when unset);
 //! - `approved_version` and `version` become it, `status` goes `approved` through the status
 //!   machine;
+//! - the chosen files are named ([`Chosen::Files`]) or come from takes ([`Chosen::Takes`];
+//!   Appendix H "Takes", P4b-R3): each take's primary, then the takes' companions, takes in
+//!   ascending order, read through `lil_schema::takes_of` (the legacy rule included);
 //! - the run becomes `selected`, with `selected` (the chosen names) and
-//!   `signed_off: {by, date, version}` (`by` is CORE-051's `approved_by`);
+//!   `signed_off: {by, date, version}` (`by` is CORE-051's `approved_by`), plus `takes` and
+//!   `companions` for a sign-off by takes;
 //! - the other open runs for that version (targeting it or an older one, or nothing) become
 //!   `rejected`, with `rejected_at_version`, so their 90 days start at this sign-off; those in
 //!   `keep_runs` stay open with `pinned: true` instead (CORE-032);
@@ -29,11 +33,85 @@ use lil_protocol::codes::{
 };
 use lil_protocol::{CallerKind, CodeSpec, ErrorBody};
 use lil_schema::{
-    Bump, CandidateFile, Manifest, StatusBy, StatusEvent, Version, change_status, hash_value,
+    Bump, CandidateFile, CandidateRun, Manifest, StatusBy, StatusEvent, Version, change_status,
+    hash_value, takes_of,
 };
 use serde_json::{Map, Value, json};
 
 use super::status::status_by;
+
+/// What a sign-off chooses: the run's files by name (`files`), or takes by number (`takes`;
+/// Appendix H "Takes").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chosen {
+    Files(Vec<String>),
+    Takes(Vec<u32>),
+}
+
+/// The files a [`Chosen`] picks from `run`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenFiles {
+    /// The names to seal, in `selected` order: for takes, the primaries in take order, then
+    /// the companions.
+    pub names: Vec<String>,
+    /// For takes: the take numbers, ascending and each once.
+    pub takes: Option<Vec<u32>>,
+    /// For takes: the chosen takes' other files, take by take, in file order.
+    pub companions: Vec<String>,
+}
+
+/// The files `chosen` picks from `run` (P4b-R3). Names are passed through as given; take
+/// numbers are sorted and deduplicated. The errors carry an empty trace id.
+///
+/// # Errors
+/// `params.invalid` for no take or take 0 (takes are 1-based); `asset.unknown` for a take the
+/// run doesn't have.
+pub fn chosen_files(run: &CandidateRun, chosen: &Chosen) -> Result<ChosenFiles, ErrorBody> {
+    let wanted = match chosen {
+        Chosen::Files(names) => {
+            return Ok(ChosenFiles {
+                names: names.clone(),
+                takes: None,
+                companions: Vec::new(),
+            });
+        }
+        Chosen::Takes(takes) => takes,
+    };
+    if wanted.is_empty() {
+        return Err(fail(
+            &PARAMS_INVALID,
+            "A sign-off by takes chooses at least one take of the run.".to_string(),
+        ));
+    }
+    if wanted.contains(&0) {
+        return Err(fail(
+            &PARAMS_INVALID,
+            "Takes are numbered from 1.".to_string(),
+        ));
+    }
+    let mut numbers = wanted.clone();
+    numbers.sort_unstable();
+    numbers.dedup();
+    let takes = takes_of(run);
+    let mut names = Vec::new();
+    let mut companions = Vec::new();
+    for n in &numbers {
+        let Some(take) = takes.iter().find(|t| t.n == *n) else {
+            return Err(fail(
+                &ASSET_UNKNOWN,
+                format!("The run `{}` has no take {n}.", run.run_id),
+            ));
+        };
+        names.push(take.primary.clone());
+        companions.extend(take.companions.iter().cloned());
+    }
+    names.extend(companions.iter().cloned());
+    Ok(ChosenFiles {
+        names,
+        takes: Some(numbers),
+        companions,
+    })
+}
 
 /// The `signed_off.by` value of a sign-off by `caller` (CORE-051): the status log's `by` for
 /// that caller ([`status_by`], the one table): `user` for an app (`ui:*`), `assistant`,
@@ -51,20 +129,21 @@ fn bare_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The manifest after signing off run `run_id`'s `files` (module docs), and the version it
-/// seals. The errors carry an empty trace id.
+/// The manifest after signing off the files `chosen` picks from run `run_id` (module docs),
+/// and the version it seals. The errors carry an empty trace id.
 ///
 /// # Errors
 /// `asset.unknown` for a run the manifest doesn't have, a run that isn't open, a chosen name
-/// that isn't one of the run's files, or a `keep_runs` id the manifest doesn't have;
-/// `params.invalid` for no chosen file; `manifest.needs_repair` for a chosen file record
+/// that isn't one of the run's files, a take the run doesn't have, or a `keep_runs` id the
+/// manifest doesn't have; `params.invalid` for no chosen file or take;
+/// `manifest.needs_repair` for a chosen file record
 /// without a `sha256` (the caller hashes a pre-2b run's files first) or a `hashes` that isn't
 /// an object; `version.exists` when a run was already signed off as the version;
 /// `status.invalid_transition` when the asset's status can't take a sign-off.
 pub fn plan_signoff(
     m: &Manifest,
     run_id: &str,
-    files: &[String],
+    chosen: &Chosen,
     bump: Option<Bump>,
     keep_runs: &[String],
     by: &str,
@@ -99,8 +178,9 @@ pub fn plan_signoff(
             ));
         }
     }
+    let picked = chosen_files(run, chosen)?;
     let mut chosen: Vec<(&str, &CandidateFile)> = Vec::new();
-    for name in files {
+    for name in &picked.names {
         let Some(record) = run.files.iter().find(|f| same(bare_name(&f.path), name)) else {
             return Err(fail(
                 &ASSET_UNKNOWN,
@@ -182,6 +262,11 @@ pub fn plan_signoff(
 
     let names: Vec<Value> = chosen.iter().map(|(n, _)| Value::from(*n)).collect();
     let date = lil_schema::time::date(now_utc);
+    let mut signed_off = json!({"by": by, "date": date, "version": version.to_string()});
+    if let Some(takes) = &picked.takes {
+        signed_off["takes"] = json!(takes);
+        signed_off["companions"] = json!(picked.companions);
+    }
     let keep = |id: &str| keep_runs.iter().any(|k| same(k, id));
     for r in out.runs_mut() {
         let id = r
@@ -192,10 +277,7 @@ pub fn plan_signoff(
         if same(&id, &run_id) {
             r.insert("status".into(), Value::from("selected"));
             r.insert("selected".into(), Value::Array(names.clone()));
-            r.insert(
-                "signed_off".into(),
-                json!({"by": by, "date": date, "version": version.to_string()}),
-            );
+            r.insert("signed_off".into(), signed_off.clone());
             continue;
         }
         let open = matches!(r.get("status").and_then(Value::as_str), None | Some("open"))
@@ -261,6 +343,10 @@ mod tests {
     use super::*;
     use lil_schema::Status;
 
+    fn files(names: &[&str]) -> Chosen {
+        Chosen::Files(names.iter().map(|n| n.to_string()).collect())
+    }
+
     fn manifest() -> Manifest {
         let text = json!({
             "asset_id": "prop_kite", "project": "sketchbook", "version": "1.0.0",
@@ -291,7 +377,7 @@ mod tests {
         let (m, v) = plan_signoff(
             &manifest(),
             "r_1",
-            &["A.PNG".to_string()],
+            &files(&["A.PNG"]),
             None,
             &["r_3".to_string()],
             "cli",
@@ -332,7 +418,7 @@ mod tests {
         let (_, v) = plan_signoff(
             &m,
             "r_2",
-            &["b.png".into()],
+            &files(&["b.png"]),
             Some(Bump::Major),
             &[],
             "cli",
@@ -340,7 +426,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v, Version::new(2, 0, 0));
-        let (_, v) = plan_signoff(&m, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap();
+        let (_, v) = plan_signoff(&m, "r_2", &files(&["b.png"]), None, &[], "cli", 0).unwrap();
         assert_eq!(v, Version::new(1, 1, 0));
     }
 
@@ -349,7 +435,7 @@ mod tests {
         let (signed, _) = plan_signoff(
             &manifest(),
             "r_1",
-            &["a.png".into()],
+            &files(&["a.png"]),
             None,
             &["r_2".into()],
             "cli",
@@ -357,13 +443,13 @@ mod tests {
         )
         .unwrap();
         let (again, v) =
-            plan_signoff(&signed, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap();
+            plan_signoff(&signed, "r_2", &files(&["b.png"]), None, &[], "cli", 0).unwrap();
         assert_eq!(v, Version::new(1, 1, 0));
         assert_eq!(again.view().status, Some(Status::Approved));
         let mut stale = signed.clone();
         stale.set("status", json!("stale"));
         stale.set("status_before_stale", json!("approved"));
-        let e = plan_signoff(&stale, "r_2", &["b.png".into()], None, &[], "cli", 0).unwrap_err();
+        let e = plan_signoff(&stale, "r_2", &files(&["b.png"]), None, &[], "cli", 0).unwrap_err();
         assert_eq!(e.code, "status.invalid_transition");
     }
 
@@ -375,7 +461,7 @@ mod tests {
             code(plan_signoff(
                 &m,
                 "r_9",
-                &["a.png".into()],
+                &files(&["a.png"]),
                 None,
                 &[],
                 "cli",
@@ -387,7 +473,7 @@ mod tests {
             code(plan_signoff(
                 &m,
                 "r_1",
-                &["x.png".into()],
+                &files(&["x.png"]),
                 None,
                 &[],
                 "cli",
@@ -396,14 +482,14 @@ mod tests {
             "asset.unknown"
         );
         assert_eq!(
-            code(plan_signoff(&m, "r_1", &[], None, &[], "cli", 0)),
+            code(plan_signoff(&m, "r_1", &files(&[]), None, &[], "cli", 0)),
             "params.invalid"
         );
         assert_eq!(
             code(plan_signoff(
                 &m,
                 "r_1",
-                &["a.png".into()],
+                &files(&["a.png"]),
                 None,
                 &["r_9".into()],
                 "cli",
@@ -411,13 +497,13 @@ mod tests {
             )),
             "asset.unknown"
         );
-        let (signed, _) = plan_signoff(&m, "r_1", &["a.png".into()], None, &[], "cli", 0).unwrap();
+        let (signed, _) = plan_signoff(&m, "r_1", &files(&["a.png"]), None, &[], "cli", 0).unwrap();
         // r_1 is selected now, r_2 rejected.
         assert_eq!(
             code(plan_signoff(
                 &signed,
                 "r_1",
-                &["a.png".into()],
+                &files(&["a.png"]),
                 None,
                 &[],
                 "cli",
@@ -431,7 +517,7 @@ mod tests {
             code(plan_signoff(
                 &blocked,
                 "r_1",
-                &["a.png".into()],
+                &files(&["a.png"]),
                 None,
                 &[],
                 "cli",

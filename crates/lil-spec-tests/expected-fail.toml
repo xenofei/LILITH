@@ -6,11 +6,6 @@
 # Plan 4b (Task 2): the spec tests that Tasks 4-20 turn green, grouped under the task that
 # removes them. Each entry's comment lists every rule the test cites; `rule` is the first.
 tests = [
-    # Task 6
-    # CORE-152
-    { name = "lil-spec-tests::marks_4b::marks_round_trip_and_filter", rule = "CORE-152", file = "tests/marks_4b.rs" },
-    # CORE-152, CORE-023
-    { name = "lil-spec-tests::marks_4b::flags_are_per_take_and_only_on_open_runs", rule = "CORE-152", file = "tests/marks_4b.rs" },
     # Task 7
     # ARCH-125
     { name = "lil-spec-tests::redirects_4b::a_redirect_cycle_is_broken_and_needs_repair", rule = "ARCH-125", file = "tests/redirects_4b.rs" },

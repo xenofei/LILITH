@@ -60,8 +60,8 @@ pub use suite::{
     WORKSPACE_STATE_SCHEMA, WorkspaceEntry,
 };
 pub use takes::{
-    AutoPick, AutoPickCandidate, AutoPickReason, Gate, OverridesAutoPick, Take, take_sha256,
-    takes_of,
+    AutoPick, AutoPickCandidate, AutoPickReason, Gate, OverridesAutoPick, Take, file_takes,
+    take_sha256, takes_of,
 };
 pub use version::{Bump, Version};
 pub use yaml_edit::{YamlEdit, YamlEditError, YamlValue};

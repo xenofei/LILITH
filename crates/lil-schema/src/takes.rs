@@ -117,7 +117,23 @@ pub(crate) fn grouped(files: &[CandidateFile]) -> (Vec<(Take, usize)>, Vec<Strin
         return (takes, warnings);
     }
 
-    // The legacy rule. `owner[i]` is the index into `primaries` of file i's take.
+    let (primaries, owner) = legacy_owners(files);
+    let takes = primaries
+        .iter()
+        .enumerate()
+        .map(|(t, &p)| {
+            let companions: Vec<usize> = (0..files.len())
+                .filter(|&i| i != p && owner[i] == Some(t))
+                .collect();
+            take(t as u32 + 1, p, &companions)
+        })
+        .collect();
+    (takes, warnings)
+}
+
+/// The legacy rule (a run in which no file has `take`): the indices of the `candidate`-role
+/// files, one take each in file order, and for each file the index into those of its take.
+fn legacy_owners(files: &[CandidateFile]) -> (Vec<usize>, Vec<Option<usize>>) {
     let key = |name: &str| file_name(name).to_lowercase();
     let primaries: Vec<usize> = (0..files.len())
         .filter(|&i| files[i].role == "candidate")
@@ -145,17 +161,19 @@ pub(crate) fn grouped(files: &[CandidateFile]) -> (Vec<(Take, usize)>, Vec<Strin
             break;
         }
     }
-    let takes = primaries
-        .iter()
-        .enumerate()
-        .map(|(t, &p)| {
-            let companions: Vec<usize> = (0..files.len())
-                .filter(|&i| i != p && owner[i] == Some(t))
-                .collect();
-            take(t as u32 + 1, p, &companions)
-        })
-        .collect();
-    (takes, warnings)
+    (primaries, owner)
+}
+
+/// The take number of each of `run.files`, in the same order, as [`takes_of`] groups them
+/// (P4b-R3): a file's own `take` when any file of the run has one, else the legacy rule's.
+/// `None` for a file in no take.
+pub fn file_takes(run: &CandidateRun) -> Vec<Option<u32>> {
+    let files = &run.files;
+    if files.iter().any(|f| f.take.is_some()) {
+        return files.iter().map(|f| f.take).collect();
+    }
+    let (_, owner) = legacy_owners(files);
+    owner.into_iter().map(|t| t.map(|t| t as u32 + 1)).collect()
 }
 
 /// A take's hash (P4b-R13): the SHA-256 of the lines `<sha256>  <file name>\n` of the take's
@@ -602,5 +620,66 @@ mod tests {
         let files = &m.get("candidate_runs").unwrap()[0]["files"];
         assert_eq!(files[1].get("flag"), None);
         assert_eq!(files[2]["flag"], json!("reject"));
+    }
+
+    /// Every file with a take number is named by that take of `takes_of`, as its primary or a
+    /// companion, and a file in no take is named by none.
+    fn assert_file_takes_agree(run: &CandidateRun) {
+        let takes = takes_of(run);
+        let numbers = file_takes(run);
+        assert_eq!(numbers.len(), run.files.len());
+        for (f, n) in run.files.iter().zip(&numbers) {
+            let name = file_name(&f.path);
+            let holders: Vec<u32> = takes
+                .iter()
+                .filter(|t| t.primary == name || t.companions.iter().any(|c| c == name))
+                .map(|t| t.n)
+                .collect();
+            match n {
+                Some(n) => assert_eq!(holders, [*n], "{name}"),
+                None => assert!(holders.is_empty(), "{name}: {holders:?}"),
+            }
+        }
+    }
+
+    #[test] // spec: CORE-023, CORE-152
+    fn file_takes_agree_with_takes_of() {
+        // A legacy run with companions (a repair from a derived file, a preview) and a stray.
+        let a = file("a.png", "candidate");
+        let mut big = file("a_big.png", "repair");
+        big.from = Some("candidates/r_20261101_0900/a_cut.png".into());
+        let mut cut = file("a_cut.png", "derived");
+        cut.from = Some("a.png".into());
+        let b = file("b.png", "candidate");
+        let mut prev = file("b_prev.jpg", "preview");
+        prev.from = Some("B.png".into());
+        let stray = file("stray.png", "derived");
+        let legacy = run(vec![a, big, cut, b, prev, stray]);
+        assert_eq!(
+            file_takes(&legacy),
+            [Some(1), Some(1), Some(1), Some(2), Some(2), None]
+        );
+        assert_file_takes_agree(&legacy);
+
+        // A run with `take` fields, listed out of take order.
+        let mut x2 = file("x2.png", "candidate");
+        x2.take = Some(2);
+        let mut p2 = file("p2.png", "candidate");
+        p2.take = Some(2);
+        p2.primary = true;
+        let mut p1 = file("p1.exr", "candidate");
+        p1.take = Some(1);
+        p1.primary = true;
+        let mut c1 = file("p1_cut.exr", "derived");
+        c1.take = Some(1);
+        c1.from = Some("p1.exr".into());
+        let mut pv1 = file("p1_prev.png", "preview");
+        pv1.take = Some(1);
+        let explicit = run(vec![x2, p2, p1, c1, pv1]);
+        assert_eq!(
+            file_takes(&explicit),
+            [Some(2), Some(2), Some(1), Some(1), Some(1)]
+        );
+        assert_file_takes_agree(&explicit);
     }
 }
