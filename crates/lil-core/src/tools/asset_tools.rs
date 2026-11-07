@@ -13,7 +13,7 @@
 //! | `asset.pin_input` | write | `{project?, asset_id, ref, reason}` | `{pinned_inputs}` |
 //! | `asset.deprecate` | write | `{project?, asset_id, deprecated}` | `{status}` |
 //! | `asset.mark` | write | `{project?, asset_id, run_id?, take?, file?, tags?, add_tags?, remove_tags?, rating?, label?, flag?, review_view?}` | `{tags, rating, label, take?: {run_id, take, flag, rating}}` |
-//! | `asset.accept_move` | write | `{project?, asset_id}` | `{project, asset_id, redirect: {from, to}}` |
+//! | `asset.accept_move` | write | `{project?, asset_id}` | `{project, asset_id, redirect: {from, to}, warnings}` |
 //! | `asset.make_independent` | write | `{project?, asset_id}` | `{creation_uuid}` |
 //!
 //! - **`asset.import`, `copy`**: an asset without a manifest gets `Manifest::new` with a fresh
@@ -450,6 +450,9 @@ struct AcceptMoveResult {
     project: String,
     asset_id: String,
     redirect: RedirectNames,
+    /// ARCH-125's "Old refs to <name> will now reach this asset" when the folder's name is a
+    /// redirect's `from`.
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -817,8 +820,15 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
     {
         return Ok(Vec::new());
     }
+    Ok(takeover_warnings(a).await)
+}
+
+/// ARCH-125's warning when the asset's name is some redirect's `from` (old refs to it will
+/// now reach this asset), or that it couldn't be checked: for an import that creates the asset
+/// and for an accepted move onto that name.
+async fn takeover_warnings(a: &Asset) -> Vec<String> {
     let name = (a.project.clone(), a.asset_id.clone());
-    Ok(match read_redirects(a.store()).await {
+    match read_redirects(a.store()).await {
         Ok(redirects) if redirects.iter().any(|r| r.from == name) => vec![format!(
             "Old refs to {} will now reach this asset ({REDIRECTS_YAML}).",
             name_of(&name)
@@ -831,7 +841,7 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
                 name_of(&name)
             )]
         }
-    })
+    }
 }
 
 /// `asset.import` with `mode: link_external` (module docs).
@@ -1895,6 +1905,7 @@ async fn accept_move(
     .await
     .map_err(|e| traced(ctx, e))?;
     drop(guard);
+    let warnings = takeover_warnings(&a).await;
     let (from, to) = (name_of(&done.from), name_of(&done.to));
     let event = json!({"kind": "moved", "from": from, "to": to});
     ctx.events.publish(&a.topic(), event.clone());
@@ -1910,6 +1921,7 @@ async fn accept_move(
             project: a.project.clone(),
             asset_id: a.asset_id.clone(),
             redirect: RedirectNames { from, to },
+            warnings,
         },
         summary,
     ))

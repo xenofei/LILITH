@@ -14,7 +14,9 @@
 //!   is no move: CORE-154's "while its old folder is gone"; ruling T8 I1); a place where the
 //!   index still knows a gone asset (its manifest `missing`) with another creation UUID,
 //!   `invalid`: that is another asset's place, and a redirect must never send one asset's refs
-//!   to another (T8 round 2); else, a valid `<project>/<asset_id>`, `moved`, `from` that place
+//!   to another (T8 round 2); another lone disagreeing folder (another UUID, being alone)
+//!   naming the same place, `invalid` for both: two assets can't both have moved from one
+//!   place (ruling T8 A-H1); else, a valid `<project>/<asset_id>`, `moved`, `from` that place
 //!   and `to` the folder; else `invalid`. So `moved` always means no live folder is at `from`
 //!   and the index knows no other asset there. Residuals (parked for the plan's final review):
 //!   an original trashed through the suite leaves no row, so it isn't seen here; and the rule
@@ -176,6 +178,25 @@ pub fn detect_known(rows: &[AssetRow], gone: &[AssetRow]) -> HashMap<(String, St
             groups.entry(uuid).or_default().push(row);
         }
     }
+    // The places the lone disagreeing folders name (each alone with its UUID, so all of them
+    // different assets), by the place without regard to case: how many name each.
+    let mut claims: HashMap<(String, String), usize> = HashMap::new();
+    for row in rows {
+        let lone = uuid_key(row).is_some_and(|u| {
+            let mut members: Vec<(String, String)> = groups[&u].iter().map(|r| folder(r)).collect();
+            members.sort();
+            members.dedup();
+            members.len() == 1
+        });
+        if lone
+            && !agrees(row)
+            && let Some(p) = place(row)
+        {
+            *claims
+                .entry((p.0.to_ascii_lowercase(), p.1.to_ascii_lowercase()))
+                .or_default() += 1;
+        }
+    }
     // The live folders, by their name without regard to case.
     let live: HashMap<(String, String), (String, String)> = rows
         .iter()
@@ -193,7 +214,7 @@ pub fn detect_known(rows: &[AssetRow], gone: &[AssetRow]) -> HashMap<(String, St
                 group.sort_by_key(|r| folder(r));
                 group.dedup_by_key(|r| folder(r));
                 if group.len() == 1 {
-                    alone(row, &live, &held)
+                    alone(row, &live, &held, &claims)
                 } else {
                     Some(in_group(row, &group))
                 }
@@ -207,11 +228,13 @@ pub fn detect_known(rows: &[AssetRow], gone: &[AssetRow]) -> HashMap<(String, St
 }
 
 /// A folder whose UUID is nowhere else; `live` maps each live folder's lowercased name to it,
-/// `held` each gone folder's to the UUIDs the index has there.
+/// `held` each gone folder's to the UUIDs the index has there, `claims` each lowercased place
+/// to how many lone disagreeing folders name it.
 fn alone(
     row: &AssetRow,
     live: &HashMap<(String, String), (String, String)>,
     held: &HashMap<(String, String), Vec<Option<String>>>,
+    claims: &HashMap<(String, String), usize>,
 ) -> Option<RepairKind> {
     if agrees(row) {
         return (!canonical_file(row)).then_some(RepairKind::Invalid);
@@ -233,6 +256,9 @@ fn alone(
         .get(&lowered)
         .is_some_and(|uuids| uuids.iter().any(|u| *u != mine))
     {
+        return Some(RepairKind::Invalid);
+    }
+    if claims.get(&lowered).is_some_and(|n| *n > 1) {
         return Some(RepairKind::Invalid);
     }
     Some(if is_slug(&from.0) && is_asset_id(&from.1) {
@@ -380,6 +406,15 @@ mod tests {
         let mut r = row("s/a", ("s", "a"), Some("u1"));
         r.manifest = WsPath::from_disk("projects/s/assets/a/old.manifest.json".to_string());
         assert_eq!(detect(&[r])[&key("s/a")], RepairKind::Invalid);
+        // Two lone folders with different UUIDs naming one place (any case): neither is moved.
+        for other_place in [("s", "a"), ("s", "A")] {
+            let got = detect(&[
+                row("s/b", ("s", "a"), Some("u1")),
+                row("s/c", other_place, Some("u2")),
+            ]);
+            assert_eq!(got[&key("s/b")], RepairKind::Invalid, "{other_place:?}");
+            assert_eq!(got[&key("s/c")], RepairKind::Invalid, "{other_place:?}");
+        }
         // Wire form round trip.
         for k in [
             RepairKind::Moved {

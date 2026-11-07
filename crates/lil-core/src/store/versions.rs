@@ -305,9 +305,24 @@ impl Store {
     /// `<project>/<asset_id>` can have). The asset repairs take it around their decision and
     /// edit, so two repairs of one group of folders never both run on the same view (CORE-154).
     pub fn creation_uuid_lock(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.keyed_lock(format!("creation_uuid:{}", uuid.to_ascii_lowercase()))
+    }
+
+    /// The lock of the redirects from `<project>/<asset_id>` (compared without regard to
+    /// case), in the same map under its own prefix. `asset.accept_move` takes it last, around
+    /// its check of where old refs to that name lead and its append, so two moves accepted from
+    /// one old place never both pass the check (ruling T8 A-H1).
+    pub fn redirect_from_lock(&self, project: &str, asset_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.keyed_lock(format!(
+            "redirect_from:{}",
+            path_key(&format!("{project}/{asset_id}"))
+        ))
+    }
+
+    /// The shared lock of `key` in the version-lock map.
+    fn keyed_lock(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = lock(&self.version_locks);
         locks.retain(|_, w| w.strong_count() > 0);
-        let key = format!("creation_uuid:{}", uuid.to_ascii_lowercase());
         if let Some(held) = locks.get(&key).and_then(Weak::upgrade) {
             return held;
         }

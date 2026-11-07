@@ -1172,11 +1172,36 @@ pub(super) fn refresh_repairs(tx: &Transaction<'_>, root: &Path) -> rusqlite::Re
         .iter()
         .map(|r| path_key(&format!("projects/{}/assets/{}", r.project, r.asset_id)))
         .collect();
+    // The places live disagreeing folders name, with their UUIDs: a gone row one of them names
+    // with another UUID is evidence that place held another asset (ruling T8 A-H1), so it is
+    // kept, and one disk gives one answer from one refresh to the next.
+    let mut claimed: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    for r in &live {
+        if !repair::agrees(r) && r.manifest_parses {
+            let p = r
+                .manifest_project
+                .clone()
+                .unwrap_or_else(|| r.project.clone());
+            let a = r
+                .manifest_asset_id
+                .clone()
+                .unwrap_or_else(|| r.asset_id.clone());
+            claimed
+                .entry(path_key(&format!("projects/{p}/assets/{a}")))
+                .or_default()
+                .push(repair::uuid_key(r));
+        }
+    }
     let mut kept = Vec::with_capacity(gone.len());
     for row in gone {
         let folder = path_key(&format!("projects/{}/assets/{}", row.project, row.asset_id));
-        let moved_away = repair::uuid_key(&row).is_some_and(|u| live_uuids.contains(&u))
-            && !live_folders.contains(&folder);
+        let mine = repair::uuid_key(&row);
+        let evidence = claimed
+            .get(&folder)
+            .is_some_and(|uuids| uuids.iter().any(|u| *u != mine));
+        let moved_away = mine.as_ref().is_some_and(|u| live_uuids.contains(u))
+            && !live_folders.contains(&folder)
+            && !evidence;
         let all_missing = moved_away
             && tx
                 .prepare_cached(&format!(

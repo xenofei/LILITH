@@ -154,6 +154,19 @@ impl Fx {
         Fx::start_with(env, ws, FailPoints::none(), WatchConfig::default(), probe)
     }
 
+    /// [`Fx::with_probe`], with the idle watcher of [`Fx::with_idle_watcher`].
+    fn with_probe_idle(setup: impl FnOnce(&Path), probe: Arc<dyn Probe>) -> Fx {
+        let env = TestEnv::new();
+        let ws = env.copy_fixture_workspace("repair");
+        setup(&ws);
+        env.register_workspace(&ws, true);
+        let watch = WatchConfig {
+            batch: Duration::from_secs(3600),
+            ..WatchConfig::default()
+        };
+        Fx::start_with(env, ws, FailPoints::none(), watch, probe)
+    }
+
     fn build(setup: impl FnOnce(&Path), fp: Arc<FailPoints>, watch: WatchConfig) -> Fx {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("repair");
@@ -562,7 +575,8 @@ async fn accept_move_edits_only_project_and_asset_id_and_records_a_redirect() {
     assert_eq!(
         r,
         json!({"project": P, "asset_id": ORIGAMI,
-               "redirect": {"from": format!("{P}/{CRANE}"), "to": format!("{P}/{ORIGAMI}")}})
+               "redirect": {"from": format!("{P}/{CRANE}"), "to": format!("{P}/{ORIGAMI}")},
+               "warnings": []})
     );
     // The redirect, by the caller.
     let redirects = fx.redirects().expect("registry/redirects.yaml");
@@ -1602,4 +1616,210 @@ async fn accept_move_says_what_to_do_about_a_file_at_the_old_place() {
 #[allow(clippy::disallowed_methods)]
 fn outside_remove_file(path: &Path) {
     std::fs::remove_file(path).unwrap_or_else(|e| panic!("cannot remove {}: {e}", path.display()));
+}
+
+const XENON: &str = "chr_xenon";
+/// A second creation UUID, for an asset other than the crane.
+const OTHER_UUID: &str = "22222222-3333-4444-8555-666666666666";
+
+/// Asserts that neither folder is `moved`, both are `invalid`, that accept_move refuses each
+/// naming the other claimant, and that no redirect is written.
+async fn two_claimants_are_refused(fx: &Fx, a: &str, b: &str) {
+    let status = fx.status().await;
+    assert_eq!(status["moved"], json!([]), "{status}");
+    for (me, other) in [(a, b), (b, a)] {
+        assert_eq!(fx.get(me).await["repair"]["kind"], "invalid", "{me}");
+        let e = error(fx.accept(me).await);
+        assert_eq!(e.code, "repair.not_needed", "{me}: {e:?}");
+        assert!(
+            e.message.contains(&format!("{P}/{other}")),
+            "{me}: names the other claimant: {}",
+            e.message
+        );
+    }
+    assert!(fx.redirects().is_none(), "no redirect from the crane");
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 A-H1, warm)
+async fn two_folders_claiming_one_old_place_are_neither_moved_warm() {
+    // The crane (its UUID) renamed to chr_origami; a new asset (another UUID) made at the
+    // crane's name, then renamed too, to chr_xenon. Both name the crane's place: neither is a
+    // move, from one refresh to the next and after a restart.
+    let fx = Fx::with(|_| {});
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    assert_eq!(fx.get(ORIGAMI).await["repair"]["kind"], "moved");
+    outside_copy(&asset_dir(&fx.ws, ORIGAMI), &asset_dir(&fx.ws, CRANE));
+    hand_edit(&asset_dir(&fx.ws, CRANE), |m| {
+        m["creation_uuid"] = json!(OTHER_UUID);
+    });
+    fx.reconcile().await;
+    assert_eq!(fx.get(ORIGAMI).await["repair"]["kind"], "copy");
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, XENON));
+    fx.reconcile().await;
+    two_claimants_are_refused(&fx, ORIGAMI, XENON).await;
+    fx.reconcile().await;
+    two_claimants_are_refused(&fx, ORIGAMI, XENON).await;
+    let fx = fx.restart().await;
+    fx.reconcile().await;
+    two_claimants_are_refused(&fx, ORIGAMI, XENON).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 A-H1, cold)
+async fn two_folders_claiming_one_old_place_are_neither_moved_cold() {
+    // Both renames happened while no core ran: a cold rebuild has no gone row at all.
+    let fx = Fx::with(|ws| {
+        crane_renamed(ws);
+        outside_copy(&asset_dir(ws, ORIGAMI), &asset_dir(ws, XENON));
+        hand_edit(&asset_dir(ws, XENON), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+    });
+    two_claimants_are_refused(&fx, ORIGAMI, XENON).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 A-H1, part 3)
+async fn accept_move_never_redirects_an_old_place_to_another_asset() {
+    // The crane is renamed to chr_xenon and the move accepted (crane -> xenon). Then a folder
+    // of another asset that names the crane's place appears (restored from a backup, say): the
+    // index reads it `moved` (no folder, no row at the crane's place any more), but old refs to
+    // the crane already lead to xenon, a live asset with another creation UUID: refused.
+    let fx = Fx::with(|ws| {
+        outside_copy(&asset_dir(ws, CRANE), &file(ws, "backup_crane"));
+        hand_edit(&file(ws, "backup_crane"), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+    });
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, XENON));
+    fx.reconcile().await;
+    structured(fx.accept(XENON).await);
+    assert_eq!(entries(&fx.redirects().unwrap()), 1);
+    outside_rename(&file(&fx.ws, "backup_crane"), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    let e = error(fx.accept(ORIGAMI).await);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(
+        e.message.contains(&format!("{P}/{XENON}"))
+            && e.message.contains("rename this folder back"),
+        "names the asset the old refs reach and the way out: {}",
+        e.message
+    );
+    assert_eq!(
+        entries(&fx.redirects().unwrap()),
+        1,
+        "no second redirect from the crane"
+    );
+    let manifest = read_json(&manifest_in(&asset_dir(&fx.ws, ORIGAMI)));
+    assert_eq!(manifest["asset_id"], CRANE, "nothing written");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 A-L2)
+async fn accept_move_warns_when_the_folder_takes_a_redirected_name() {
+    // crane -> origami accepted; the folder renamed back to the crane's name: accepting that
+    // makes old refs to the crane reach it again, and the call says so (ARCH-125).
+    let fx = Fx::with(crane_renamed);
+    let first = structured(fx.accept(ORIGAMI).await);
+    assert_eq!(first["warnings"], json!([]), "{first}");
+    outside_rename(&asset_dir(&fx.ws, ORIGAMI), &asset_dir(&fx.ws, CRANE));
+    fx.reconcile().await;
+    let r = structured(fx.accept(CRANE).await);
+    assert_eq!(
+        r["warnings"],
+        json!([format!(
+            "Old refs to {P}/{CRANE} will now reach this asset (registry/redirects.yaml)."
+        )]),
+        "{r}"
+    );
+    fx.shutdown().await;
+}
+
+/// Whether [`FlipProbe`] rewrites the creation UUID of [`COPY`]'s manifest on each listing.
+static FLIP: AtomicBool = AtomicBool::new(false);
+static FLIPS: AtomicU64 = AtomicU64::new(0);
+
+/// [`SystemProbe`], except that while [`FLIP`] is set, every listing of the copy's folder first
+/// gives its manifest a new creation UUID, as an outside editor would between two looks.
+#[derive(Debug)]
+struct FlipProbe;
+
+impl Probe for FlipProbe {
+    fn identity(&self, p: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        SystemProbe.identity(p)
+    }
+    fn volume_info(&self, p: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(p)
+    }
+    fn open_read(&self, p: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(p)
+    }
+    fn long_name(&self, p: &Path) -> std::io::Result<PathBuf> {
+        SystemProbe.long_name(p)
+    }
+    fn reparse_tag(&self, p: &Path) -> std::io::Result<Option<u32>> {
+        SystemProbe.reparse_tag(p)
+    }
+    fn read_dir(&self, dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+        if FLIP.load(Ordering::SeqCst)
+            && dir.file_name().is_some_and(|n| n.to_string_lossy() == COPY)
+        {
+            let n = FLIPS.fetch_add(1, Ordering::SeqCst);
+            hand_edit(dir, |m| {
+                m["creation_uuid"] = json!(format!("33333333-4444-4555-8666-{n:012}"));
+            });
+        }
+        SystemProbe.read_dir(dir)
+    }
+}
+
+#[tokio::test] // spec: CORE-154 (T8 A-L3)
+async fn a_repair_never_decides_under_the_lock_of_a_uuid_the_folder_no_longer_has() {
+    // The copy's creation UUID changes between every two looks (an outside editor that never
+    // stops): the lock taken for the first look's UUID never covers the second look, so the
+    // call retries under the new UUID's lock at most twice, then refuses; nothing is written.
+    FLIP.store(false, Ordering::SeqCst);
+    let fx = Fx::with_probe_idle(crane_copied, Arc::new(FlipProbe));
+    fx.open().await.index.ready().await;
+    FLIP.store(true, Ordering::SeqCst);
+    let made = fx.independent(COPY).await;
+    FLIP.store(false, Ordering::SeqCst);
+    let e = error(made);
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    let uuid = read_json(&manifest_in(&asset_dir(&fx.ws, COPY)))["creation_uuid"].clone();
+    assert!(
+        uuid.as_str().is_some_and(|u| u.starts_with("33333333-")),
+        "only the outside editor wrote it: {uuid}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 A-H1, part 2)
+async fn the_evidence_of_another_asset_at_an_old_place_is_kept() {
+    // As in the warm case, then chr_xenon (the second asset that lived at the crane's name)
+    // leaves the workspace. chr_origami is the only folder naming the crane's place now, but the
+    // index still knows another asset held it (the crane's gone row, with xenon's UUID): kept
+    // while origami (another UUID) names it, so origami is never `moved` from there.
+    let fx = Fx::with(|_| {});
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    outside_copy(&asset_dir(&fx.ws, ORIGAMI), &asset_dir(&fx.ws, CRANE));
+    hand_edit(&asset_dir(&fx.ws, CRANE), |m| {
+        m["creation_uuid"] = json!(OTHER_UUID);
+    });
+    fx.reconcile().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, XENON));
+    fx.reconcile().await;
+    outside_rename(&asset_dir(&fx.ws, XENON), &file(&fx.ws, "elsewhere_xenon"));
+    fx.reconcile().await;
+    let fx = fx.restart().await;
+    fx.reconcile().await;
+    assert_eq!(fx.get(ORIGAMI).await["repair"]["kind"], "invalid");
+    assert_eq!(error(fx.accept(ORIGAMI).await).code, "repair.not_needed");
+    assert!(fx.redirects().is_none(), "no redirect from the crane");
+    fx.shutdown().await;
 }

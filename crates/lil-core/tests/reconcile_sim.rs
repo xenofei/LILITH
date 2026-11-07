@@ -970,6 +970,7 @@ fn split(name: &str) -> (String, String) {
 /// - `duplicate_uuid {other}`: `other` is another folder with its UUID, and it agrees or its
 ///   group hasn't exactly one agreeing member;
 /// - legacy or unparsed: never `moved`, `copy` or `duplicate_uuid`;
+/// - no two `moved` folders with different creation UUIDs share a `from` (case-insensitively);
 /// - and every folder that is healthy by CORE-047 and alone with its UUID needs nothing, every
 ///   folder sharing its UUID needs a repair, and a lone disagreeing folder whose manifest names
 ///   another valid place with no live folder is `moved` when the index knows no other asset
@@ -1062,7 +1063,22 @@ fn check_kinds(rows: &[AssetRow], gone: &[AssetRow], got: &HashMap<(String, Stri
             && !same_name(&p, &here)
             && !live(&p)
         {
-            if other_gone(&p, &uuid_of(r)) {
+            // Another lone folder (another asset) naming the same place: neither moved.
+            let lone = |o: &AssetRow| {
+                uuid_of(o).is_some_and(|u| {
+                    rows.iter()
+                        .filter(|x| uuid_of(x).as_ref() == Some(&u))
+                        .count()
+                        == 1
+                })
+            };
+            let other_claimant = rows.iter().any(|o| {
+                key_of(o) != here
+                    && lone(o)
+                    && !agrees(o)
+                    && place_of(o).is_some_and(|q| same_name(&q, &p))
+            });
+            if other_gone(&p, &uuid_of(r)) || other_claimant {
                 assert_eq!(kind, Some(&RepairKind::Invalid), "{r:?} {gone:?}");
             } else {
                 assert!(
@@ -1072,6 +1088,25 @@ fn check_kinds(rows: &[AssetRow], gone: &[AssetRow], got: &HashMap<(String, Stri
             }
         } else {
             assert!(kind.is_some(), "a disagreeing folder needs a repair: {r:?}");
+        }
+    }
+    // No two `moved` folders with different creation UUIDs share a `from` (case-insensitively):
+    // accepting both would send one asset's refs to the other (T8 A-H1, A-L4).
+    let moves: Vec<(String, Option<String>, &AssetRow)> = rows
+        .iter()
+        .filter_map(|r| match got.get(&key_of(r)) {
+            Some(RepairKind::Moved { from, .. }) => {
+                Some((from.to_ascii_lowercase(), uuid_of(r), r))
+            }
+            _ => None,
+        })
+        .collect();
+    for (i, (from, uuid, r)) in moves.iter().enumerate() {
+        for (other_from, other_uuid, o) in &moves[i + 1..] {
+            assert!(
+                from != other_from || uuid == other_uuid,
+                "two assets moved from {from}: {r:?} and {o:?}"
+            );
         }
     }
     let names: BTreeSet<(String, String)> = rows.iter().map(key_of).collect();

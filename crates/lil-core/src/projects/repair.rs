@@ -34,7 +34,17 @@
 //!
 //! Both decide and write under the lock of the folder's creation UUID
 //! ([`Store::creation_uuid_lock`]), taken after a first look and followed by a second one, so
-//! two repairs of one group of folders never both act on the same view (ruling T8 M3). The
+//! two repairs of one group of folders never both act on the same view (ruling T8 M3). When the
+//! second look shows another UUID (an outside edit in between), the lock is released and the
+//! two looks are taken again under the new UUID's lock, at most twice more; then the call is
+//! refused with `store.hash_conflict` (ruling T8 A-L3).
+//!
+//! `accept_move` never sends one asset's refs to another (ruling T8 A-H1): a folder that another
+//! lone folder (another asset) also claims to have moved from is `invalid` in the index, and
+//! the refusal names the other claimant; and before its redirect, holding the lock of the old
+//! name ([`Store::redirect_from_lock`], taken last), it follows where old refs to that name lead
+//! now: a chain that ends at a live asset folder with another creation UUID refuses, naming
+//! that asset (a chain that ends nowhere is fine). The
 //! manifest edit re-checks that the manifest still has the creation UUID (and, for a move, the
 //! place) the decision was made on; one changed meanwhile is `store.hash_conflict`.
 
@@ -42,9 +52,11 @@ use lil_platform::fs::Probe;
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{
     ASSET_UNKNOWN, PARAMS_INVALID, REPAIR_NOT_NEEDED, REPAIR_NOT_NEEDED_MESSAGE,
+    STORE_HASH_CONFLICT,
 };
 use lil_schema::{Actor, Manifest, is_asset_id, is_slug};
 use serde_json::Value;
+use tokio::sync::OwnedMutexGuard;
 
 use super::redirects::{Redirect, append_redirect, parse_name};
 use super::resolve::Resolver;
@@ -230,6 +242,78 @@ async fn settled_row(index: &Index, store: &Store, here: &Name) -> Result<AssetR
     fresh_row(index, &here.0, &here.1, dirs).await
 }
 
+/// How many times a repair takes the UUID lock again when the second look shows another UUID.
+const LOCK_RETRIES: usize = 2;
+
+/// The folder's row decided under the lock of its creation UUID (module docs; rulings T8 M3,
+/// A-L3), with the lock's guard; `None` when the folder has no creation UUID.
+///
+/// # Errors
+/// `store.hash_conflict` when the UUID changes between the two looks every time; the errors
+/// of [`settled_row`].
+async fn locked_row(
+    index: &Index,
+    store: &Store,
+    here: &Name,
+) -> Result<Option<(AssetRow, OwnedMutexGuard<()>)>, ErrorBody> {
+    let mut first = settled_row(index, store, here).await?;
+    for _ in 0..=LOCK_RETRIES {
+        let Some(group) = uuid_key(&first) else {
+            return Ok(None);
+        };
+        let guard = store.creation_uuid_lock(&group).lock_owned().await;
+        let again = settled_row(index, store, here).await?;
+        if uuid_key(&again).as_deref() == Some(group.as_str()) {
+            return Ok(Some((again, guard)));
+        }
+        drop(guard);
+        first = again;
+    }
+    Err(ErrorBody::new(
+        &STORE_HASH_CONFLICT,
+        format!(
+            "The creation UUID of projects/{}/assets/{} kept changing while it was being \
+             repaired (something else edits its manifest); nothing was changed. Try again when \
+             it is left alone.",
+            here.0, here.1
+        ),
+        "",
+    ))
+}
+
+/// `<project>/<asset_id>` the manifest of `row` names (the folder's for a key it lacks).
+fn place_of(row: &AssetRow) -> String {
+    format!(
+        "{}/{}",
+        row.manifest_project.as_deref().unwrap_or(&row.project),
+        row.manifest_asset_id.as_deref().unwrap_or(&row.asset_id)
+    )
+}
+
+/// The other lone disagreeing folders that name the same place as `row` (without regard to
+/// case) with another creation UUID: the other claimants of an `invalid` folder (ruling T8
+/// A-H1).
+async fn claimants(index: &Index, row: &AssetRow) -> Result<Vec<String>, ErrorBody> {
+    if !row.manifest_parses || agrees(row) || uuid_key(row).is_none() {
+        return Ok(Vec::new());
+    }
+    let mine = place_of(row).to_ascii_lowercase();
+    Ok(index
+        .repairs(&["invalid"])
+        .await
+        .map_err(|e| e.to_error(""))?
+        .iter()
+        .filter(|r| {
+            (r.project.as_str(), r.asset_id.as_str())
+                != (row.project.as_str(), row.asset_id.as_str())
+        })
+        .filter(|r| r.manifest_parses && !agrees(r) && uuid_key(r).is_some())
+        .filter(|r| uuid_key(r) != uuid_key(row))
+        .filter(|r| place_of(r).to_ascii_lowercase() == mine)
+        .map(|r| format!("{}/{}", r.project, r.asset_id))
+        .collect())
+}
+
 fn dir_of(name: &Name) -> Result<WsPath, ErrorBody> {
     WsPath::parse(&folder_path(&name.0, &name.1)).map_err(|e| store_error(&e))
 }
@@ -305,15 +389,22 @@ pub async fn accept_move(
              them under moved).",
         )
     };
-    let first = settled_row(index, store, &to).await?;
-    let Some(group) = uuid_key(&first) else {
+    let Some((row, _decided)) = locked_row(index, store, &to).await? else {
         return Err(refuse());
     };
-    let lock = store.creation_uuid_lock(&group);
-    let _decided = lock.lock().await;
-    let row = settled_row(index, store, &to).await?;
     let Some(RepairKind::Moved { from, .. }) = kind_of(&row) else {
-        return Err(refuse());
+        let others = claimants(index, &row).await?;
+        if others.is_empty() {
+            return Err(refuse());
+        }
+        let place = place_of(&row);
+        return Err(not_needed(&format!(
+            "{} also names {place} as the folder it moved from, and it is another asset (its \
+             creation UUID differs), so neither is a move. Rename the folder that is {place}'s \
+             asset back to {place}; the other is then a copy of it, for \
+             asset.make_independent.",
+            others.join(", ")
+        )));
     };
     let from = parse_name(&from).ok_or_else(|| invalid(format!("{from:?} is not a name")))?;
     // Whatever the index believes, the old place must be confirmed empty on disk (its
@@ -344,15 +435,41 @@ pub async fn accept_move(
     }
     let uuid = uuid_key(&row);
 
-    // (1) The redirect, unless the newest one from the old place already leads here.
+    // The old name's lock, last: where old refs to it lead is checked, and the redirect
+    // appended, with no other move from it in between.
+    let from_lock = store.redirect_from_lock(&from.0, &from.1);
+    let _from_held = from_lock.lock().await;
     let resolver = Resolver::load(index, store).await?;
     if let Some(e) = resolver.file_error() {
         return Err(e.clone());
     }
-    let present = resolver
-        .newest_from(&from.0, &from.1)
-        .is_some_and(|r| r.to == to);
+    let newest_to = resolver.newest_from(&from.0, &from.1).map(|r| r.to.clone());
+    let present = newest_to.as_ref() == Some(&to);
+    // Old refs to the old name already lead somewhere else: never to another live asset.
+    if newest_to.is_some()
+        && !present
+        && let Ok(end) = resolver.resolve_name(&from.0, &from.1).await
+    {
+        let same_folder =
+            end.project.eq_ignore_ascii_case(&to.0) && end.asset_id.eq_ignore_ascii_case(&to.1);
+        let end_uuid = index
+            .asset(&end.project, &end.asset_id)
+            .await
+            .map_err(|e| e.to_error(""))?
+            .and_then(|r| uuid_key(&r));
+        if !same_folder && end_uuid != uuid {
+            return Err(not_needed(&format!(
+                "Old refs to {}/{} already lead to {}/{}, another asset (its creation UUID \
+                 differs), so this folder can't take them over by a move. If this folder is the \
+                 asset that name had, rename this folder back to {}/{}'s name ({}); \
+                 asset.make_independent doesn't apply, as it isn't a copy.",
+                from.0, from.1, end.project, end.asset_id, from.0, from.1, from.1
+            )));
+        }
+    }
     drop(resolver);
+
+    // (1) The redirect, unless the newest one from the old place already leads here.
     if !present {
         let r = Redirect {
             from: from.clone(),
@@ -427,13 +544,9 @@ pub async fn make_independent(
              (project.status lists them under duplicates).",
         )
     };
-    let first = settled_row(index, store, &here).await?;
-    let Some(group) = uuid_key(&first) else {
+    let Some((row, _decided)) = locked_row(index, store, &here).await? else {
         return Err(refuse());
     };
-    let lock = store.creation_uuid_lock(&group);
-    let _decided = lock.lock().await;
-    let row = settled_row(index, store, &here).await?;
     if !matches!(
         kind_of(&row),
         Some(RepairKind::Copy { .. } | RepairKind::DuplicateUuid { .. })
