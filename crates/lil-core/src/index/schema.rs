@@ -7,7 +7,7 @@
 //!
 //! Tables: `files` (one row per file, keyed by the path's case-folded key, with its `kind`:
 //! `sealed`, `candidate`, `work` or `other`), `assets` (one row per asset folder, with its marks
-//! and tile fields), `asset_tags` (each asset's tags, their fold and their place in the
+//! and tile fields, its `repair`, and the manifest's own `project` and `asset_id`), `asset_tags` (each asset's tags, their fold and their place in the
 //! manifest's list), `take_marks` (the takes of
 //! every run not trashed, with their flag and rating), `edges` (manifest inputs), `assets_fts`
 //! (FTS5 over each asset's text), and two of the index's own: `expected` (the hash each manifest
@@ -69,6 +69,9 @@ CREATE TABLE assets (
     display TEXT,
     last_change TEXT,
     repair TEXT,
+    manifest_project TEXT,
+    manifest_asset_id TEXT,
+    manifest_parses INTEGER NOT NULL DEFAULT 1,
     UNIQUE (project, asset_id)
 );
 CREATE INDEX assets_by_status ON assets(COALESCE(status, ''), project, asset_id);
@@ -232,9 +235,12 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
         conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
             .map_err(|e| format!("table {table}: {e}"))?;
     }
-    // A schema-2 file made before `asset_tags.pos` existed (never released) is rebuilt too.
+    // A schema-2 file made before `asset_tags.pos` or the repair inputs existed (never
+    // released) is rebuilt too.
     conn.prepare("SELECT pos FROM asset_tags LIMIT 0")
         .map_err(|e| format!("asset_tags.pos: {e}"))?;
+    conn.prepare("SELECT manifest_project, manifest_asset_id, manifest_parses FROM assets LIMIT 0")
+        .map_err(|e| format!("assets' repair inputs: {e}"))?;
     configure(&conn, true).map_err(|e| e.to_string())?;
     Ok(conn)
 }

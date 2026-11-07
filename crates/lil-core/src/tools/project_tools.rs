@@ -6,7 +6,7 @@
 //! |---|---|---|---|
 //! | `project.create` | write | `{project, name, type?}` | `{project, path}` |
 //! | `project.set_status` | write | `{project, status: "active"\|"paused"\|"archived"}` | `{project, status, stale: [ref]}` |
-//! | `project.status` | read | `{project?}` | `{project, status, assets_by_status, orphans: [path], needs_repair: [path], missing: [path]}` |
+//! | `project.status` | read | `{project?}` | `{project, status, assets_by_status, orphans: [path], needs_repair: [path], missing: [path], moved: [{from, to}], duplicates: [[path]]}` |
 //! | `project.context` | read | `{project?}` | `{project, settings, links, suggested_tools: [name]}` |
 //! | `projects.list` | read | `{}` | `{projects: [{project, name, status, assets}]}` (module `projects`) |
 //!

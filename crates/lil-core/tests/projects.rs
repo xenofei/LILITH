@@ -577,7 +577,14 @@ fn approved(asset: &str, status: &str, inputs: Value, pinned: Value) -> Vec<u8> 
         "schema_version": 1,
         "asset_id": asset,
         "project": "sketchbook",
-        "creation_uuid": format!("00000000-0000-4000-8000-{:012}", asset.len()),
+        // One per asset id: assets sharing a creation UUID are copies (CORE-154).
+        "creation_uuid": format!(
+            "00000000-0000-4000-8000-{:012x}",
+            asset
+                .bytes()
+                .fold(0_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+                & 0xffff_ffff_ffff
+        ),
         "type": "image",
         "version": "1.0.0",
         "approved_version": "1.0.0",

@@ -422,6 +422,14 @@ impl<'a> Resolver<'a> {
         &self.redirects
     }
 
+    /// The entry a resolution of `<project>/<asset_id>` follows when it has no live folder:
+    /// the newest whose `from` is that name (module docs, step 2).
+    pub fn newest_from(&self, project: &str, asset_id: &str) -> Option<&Redirect> {
+        self.newest
+            .get(&(project.to_string(), asset_id.to_string()))
+            .map(|&i| &self.redirects[i])
+    }
+
     /// Why the redirects file can't be read or parsed, when it can't (`manifest.needs_repair`
     /// for a file that doesn't parse, else the store's read error).
     pub fn file_error(&self) -> Option<&ErrorBody> {
