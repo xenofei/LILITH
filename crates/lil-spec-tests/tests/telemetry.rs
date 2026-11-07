@@ -210,6 +210,8 @@ fn thermal_throttle_raises_and_clears_an_alert() {
     for _ in 0..6 {
         tick(&mut pipe, 1);
     }
+    // LT-04 (Appendix H): a throttle alert clears after 30 s without its bit.
+    tick(&mut pipe, 31);
     let mut events = session(&env, None);
     let seq = subscribe_replay(&mut events, "telemetry");
     let kinds: Vec<String> = replayed(&mut events, "telemetry", seq)
