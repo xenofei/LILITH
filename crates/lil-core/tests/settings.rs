@@ -100,6 +100,7 @@ fn fx(env: &TestEnv, workspace_defaults: &str, project_extra: &str) -> (Fx, Path
         &env.env,
         &probe,
         Arc::default(),
+        &lil_core::tools::AssetServices::unwired(),
     );
     let lifecycle = lil_core::Lifecycle::new(clock.clone(), lil_core::lifecycle::IDLE_EXIT_AFTER);
     let dispatcher = Dispatcher::new(

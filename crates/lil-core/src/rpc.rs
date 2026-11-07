@@ -32,7 +32,9 @@
 //!   `caller.not_allowed`; a category `desktop.get` doesn't list is -32602; APP-146), as does
 //!   `app/confirmation.answer`'s `toast_token` (a deny from a toast, P4a-R9),
 //!   `app/set_context` goes to the dispatcher, which keeps the sessions' projects (it needs
-//!   `context.v1`, else `caller.not_allowed`; ARCH-088), and any
+//!   `context.v1`, else `caller.not_allowed`; ARCH-088), protocol 1.4's `app/thumbs.request`,
+//!   `app/asset.trust` and `app/asset.ai_edit` need `assets.v1` (else `caller.not_allowed`)
+//!   and are -32601 until their tasks route them, and any
 //!   other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   `app/*` methods are admitted as `tools/call` is (APP-041): a draining core answers them
@@ -466,8 +468,9 @@ impl RpcRouter {
             (ConnState::Ready(session), method::TOOLS_LIST) => {
                 match parse_params::<ToolsListParams>(req.params) {
                     Ok(ToolsListParams {}) => {
-                        let listed = self.dispatcher.registry().list_for(&session.caller);
-                        let tools = self.confirm.annotate(&session.caller, listed);
+                        let reg = self.dispatcher.registry();
+                        let listed = reg.list_for(&session.caller);
+                        let tools = self.confirm.annotate(&session.caller, listed, reg);
                         outcome(id, Outcome::Ok(ToolsListResult { tools }))
                     }
                     Err(error) => Response::Error {
@@ -645,6 +648,23 @@ impl RpcRouter {
                 );
             }
             return outcome(id, into_outcome(store.set(p).await));
+        }
+        // Protocol 1.4's three (APP-039; Appendix D): each needs `assets.v1`, and each is -32601
+        // until its own task routes it (Tasks 12, 15 and 16).
+        if matches!(
+            m,
+            app::THUMBS_REQUEST | app::ASSET_TRUST | app::ASSET_AI_EDIT
+        ) {
+            if !session
+                .capabilities
+                .iter()
+                .any(|c| c == app::ASSETS_CAPABILITY)
+            {
+                return refuse(format!(
+                    "{m} needs the assets.v1 capability, and this session's core/hello did not offer it."
+                ));
+            }
+            return not_found(id);
         }
         if !matches!(m, app::CONFIRMATIONS_LIST | app::CONFIRMATION_ANSWER) {
             return not_found(id);

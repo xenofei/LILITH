@@ -737,7 +737,7 @@ impl Inner {
                                 follow_up: Some(in_flight.follow_up()),
                                 finished: false,
                             },
-                            approval,
+                            *approval,
                         )))
                     }
                     Ok(false) => fail(
@@ -824,7 +824,8 @@ impl Inner {
         };
         let estimate = hooks.estimate.estimate(d, &args, &settings);
         // 5. Confirm and caps. A confirmation you approved for this tool and these arguments
-        // satisfies it (its `allow_once` lets the reservation pass the caps once); one for
+        // satisfies it (its `allow_once` lets the reservation pass the caps once), unless the
+        // tool's facts changed since you saw them (P4b-R9): then the call asks again. One for
         // another call (the call a `job.retry` runs again) goes on to that call.
         let confirm_input = ConfirmInput {
             session,
@@ -836,15 +837,30 @@ impl Inner {
             project: project.as_deref(),
             retry: is_retry,
             always_confirm,
+            meta: self.reg.meta(&d.name),
         };
         let (decision, passed_on) = match approved {
-            Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => (
-                ConfirmDecision::Proceed {
-                    confirmed_via: Some(a.confirmed_via),
-                    cap_override: a.allowed.clone(),
-                },
-                None,
-            ),
+            Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => {
+                match a.facts_changed(&confirm_input).await {
+                    Err(error) => {
+                        return (
+                            refused(ConfirmDecision::Failed(error), &d.name, trace_id),
+                            None,
+                        );
+                    }
+                    Ok(true) => {
+                        tracing::info!(confirmation = %a.confirmation_id, tool = %d.name, "the facts of an approved call changed; it asks again");
+                        (hooks.confirm.check(confirm_input).await, None)
+                    }
+                    Ok(false) => (
+                        ConfirmDecision::Proceed {
+                            confirmed_via: Some(a.confirmed_via),
+                            cap_override: a.allowed.clone(),
+                        },
+                        None,
+                    ),
+                }
+            }
             other => {
                 let decision = hooks.confirm.check(confirm_input).await;
                 (decision, other)

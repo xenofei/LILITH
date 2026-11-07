@@ -31,8 +31,9 @@ pub struct ProtocolVersion {
     pub minor: u16,
 }
 
-/// The protocol this build speaks: 1.3 (Appendix D). 1.0, 1.1 and 1.2 clients keep working.
-pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
+/// The protocol this build speaks: 1.4 (Appendix D; plan 4b, P4b-R7). 1.0 to 1.3 clients keep
+/// working.
+pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 
 /// The capabilities this build offers. A minor version adds features only as new strings:
 /// 1.0 had `events.v1` and `tools.v1`; 1.1 adds `jobs.v1`, `confirmations.v1` and `caps.v1`
@@ -40,7 +41,8 @@ pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 /// adds `queue.v1` (`app/queue.pause` and `app/queue.resume` need it), `desktop.v1`
 /// (`app/desktop.set` needs it) and `context.v1` (`app/set_context` needs it), and plan 4a's
 /// later capabilities follow them; 1.3 adds `proof.v1`, which says the core answers `core/prove`
-/// (no call needs it: `core/prove` comes before a hello can share anything).
+/// (no call needs it: `core/prove` comes before a hello can share anything); 1.4 adds
+/// `assets.v1` (`app/thumbs.request`, `app/asset.trust` and `app/asset.ai_edit` need it).
 pub const CAPABILITIES: &[&str] = &[
     "events.v1",
     "tools.v1",
@@ -51,6 +53,7 @@ pub const CAPABILITIES: &[&str] = &[
     "desktop.v1",
     "context.v1",
     "proof.v1",
+    "assets.v1",
 ];
 
 /// `<CARGO_PKG_VERSION>+<LIL_BUILD_ID or "local">`; the suffix is fixed at compile time by
@@ -180,6 +183,13 @@ pub fn schema_hash() -> String {
             // Protocol 1.3.
             schemars::schema_for!(ProveParams),
             schemars::schema_for!(ProveResult),
+            // Protocol 1.4 (`ConfirmationView` gained `files` and `facts` above).
+            schemars::schema_for!(crate::app::ThumbsRequestParams),
+            schemars::schema_for!(crate::app::ThumbsRequestResult),
+            schemars::schema_for!(crate::app::AssetTrustParams),
+            schemars::schema_for!(crate::app::AssetTrustResult),
+            schemars::schema_for!(crate::app::AiEditParams),
+            schemars::schema_for!(crate::app::AiEditResult),
         ];
         let all = serde_json::Value::Array(
             schemas
@@ -496,12 +506,41 @@ mod tests {
         assert_eq!(serde_json::from_value::<HelloResult>(wire).unwrap(), result);
     }
 
+    /// Protocol 1.4 (Appendix D, P4b-R7): 1.3's list, then `assets.v1`, by content and in
+    /// order; a 1.3 client keeps working and never shares `assets.v1`.
+    #[test] // spec: ARCH-029, APP-039, APP-043
+    fn protocol_is_1_4_and_offers_assets_v1() {
+        assert_eq!(PROTOCOL.to_string(), "1.4");
+        assert_eq!(
+            CAPABILITIES,
+            [
+                "events.v1",
+                "tools.v1",
+                "jobs.v1",
+                "confirmations.v1",
+                "caps.v1",
+                "queue.v1",
+                "desktop.v1",
+                "context.v1",
+                "proof.v1",
+                "assets.v1",
+            ]
+        );
+        let of_1_3: Vec<String> = CAPABILITIES[..9].iter().map(|s| s.to_string()).collect();
+        let shared = shared_capabilities(&of_1_3, CAPABILITIES);
+        assert_eq!(shared, of_1_3, "a 1.3 client shares what it offers");
+        assert!(!shared.iter().any(|c| c == "assets.v1"));
+        assert_eq!(
+            negotiate(v(1, 3), PROTOCOL),
+            Negotiation::Compatible { minor: 3 }
+        );
+    }
+
     /// Protocol 1.3 (Appendix D): the five capabilities of 1.1, then `queue.v1`, `desktop.v1`,
     /// `context.v1` and `proof.v1`, shared in the core's order. Checked by position, so later
     /// capabilities may follow them.
     #[test] // spec: ARCH-029, APP-043
-    fn protocol_is_1_3_with_its_capabilities_in_order() {
-        assert_eq!(PROTOCOL.to_string(), "1.3");
+    fn protocol_1_3_capabilities_keep_their_order() {
         let of_1_1 = [
             "events.v1",
             "tools.v1",
@@ -629,8 +668,12 @@ mod tests {
         // The `HandlersWire` description changed (the scheme only, plan 4a ruling 2026-10-25):
         // no wire value changed, so no protocol bump. `app/set_context`'s result gained the
         // additive `effective_project`, which plan 4a hasn't released. 1.3 added
-        // `core/prove`'s params and result.
-        assert_eq!(h, "1c350fa78048e713");
+        // `core/prove`'s params and result. 1.4 (plan 4b, P4b-R7) added `app/thumbs.request`'s
+        // `ThumbsRequestParams`, `ThumbItem`, `ThumbsRequestResult` and `ThumbView`,
+        // `app/asset.trust`'s `AssetTrustParams` and `AssetTrustResult`, `app/asset.ai_edit`'s
+        // `AiEditParams` and `AiEditResult`, and `ConfirmationView`'s optional `files: [Touch]`
+        // (`Touch`, `TouchAccess`) and `facts: ConfirmFacts`.
+        assert_eq!(h, "236a874b05714a5a");
     }
 
     #[test] // spec: ARCH-029

@@ -19,10 +19,12 @@ use lil_core::identity::TrustedDirs;
 use lil_core::lifecycle::{DrainReason, Lifecycle};
 use lil_core::session::Session;
 use lil_core::state::StateRegistry;
-use lil_core::tools::{Dispatcher, PipelineHooks, TestGates, Tool, core_registry, typed_tool};
+use lil_core::tools::{
+    ConfirmPolicy, Dispatcher, PipelineHooks, TestGates, Tool, core_registry, typed_tool,
+};
 use lil_core::{CoreConfig, CoreThread, start_in_thread};
 use lil_platform::{Clock, IdSource};
-use lil_protocol::app::{Answer, ConfirmationAnswerParams};
+use lil_protocol::app::{Answer, ConfirmFacts, ConfirmationAnswerParams, Touch, TouchAccess};
 use lil_protocol::{CallerKind, Cover, EffectClass, Outcome, ToolCallParams, ToolOutput};
 use lil_testkit::{FakeClock, RawPipe, SeqIds, TestApp, TestEnv, ensure_built};
 use serde_json::{Value, json};
@@ -39,6 +41,8 @@ const LIFETIME: Duration = Duration::from_secs(30 * 60);
 struct Fx {
     confirm: Arc<Confirm>,
     clock: Arc<FakeClock>,
+    /// `test.ask_everyone`'s facts are what the test sets here.
+    gates: Arc<TestGates>,
     dispatcher: Dispatcher,
     /// Last: the dispatcher holds the suite `state.db`, which must close before the folder goes.
     env: TestEnv,
@@ -99,6 +103,7 @@ fn fixture(mcp: McpConfirmation) -> Fx {
         &env.env,
         &probe,
         Arc::default(),
+        &lil_core::tools::AssetServices::unwired(),
     );
     reg.register(exec_tool());
     let confirm = Confirm::new(
@@ -130,6 +135,7 @@ fn fixture(mcp: McpConfirmation) -> Fx {
     Fx {
         confirm,
         clock,
+        gates,
         dispatcher,
         env,
     }
@@ -292,6 +298,262 @@ async fn own_actions_never_ask() {
         .call(&cli(), "test.write", json!({"label": "w"}), &next_key())
         .await;
     ok(&out);
+}
+
+/// `test.ask_everyone`'s arguments: its touch is `projects/harbor/assets/crane/`.
+fn ask_args() -> Value {
+    json!({"project": "harbor", "asset_id": "crane"})
+}
+
+/// Facts with `n` dependents `sketchbook/dep_00`… (sorted as given) and two versions.
+fn facts_with(n: usize) -> ConfirmFacts {
+    ConfirmFacts {
+        dependents: (0..n).map(|i| format!("sketchbook/dep_{i:02}")).collect(),
+        dependents_total: 0,
+        versions: vec!["1.0.0".into(), "1.1.0".into()],
+    }
+}
+
+/// The pending confirmation `id`, as the app lists it.
+async fn pending_view(fx: &Fx, id: &str) -> lil_protocol::app::ConfirmationView {
+    fx.pending()
+        .await
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("{id} is not pending"))
+        .view()
+}
+
+/// CORE-157 (P4b-R9, P4b-R33): a tool whose policy is `EveryCaller` asks your own app's call
+/// too, in the shared dialog, and agents' calls as any destructive tool's; once you approve,
+/// the retry runs it once. Other tools still never ask the app.
+#[tokio::test] // spec: CORE-157, ARCH-052, CORE-109, APP-044
+async fn an_every_caller_tool_asks_the_app_too() {
+    let fx = fixture(McpConfirmation::Core);
+    // While nothing can answer it, the app's own call fails closed like an agent's.
+    let out = fx
+        .call(&app(), "test.ask_everyone", ask_args(), &next_key())
+        .await;
+    assert_eq!(code(&out), "confirm.unavailable");
+    fx.confirm.presence().opened();
+    let k = next_key();
+    let p = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_eq!(p.covers, [Cover::Confirm]);
+    assert_eq!(p.retry_token, k);
+    assert_eq!(
+        pending_view(&fx, &p.confirmation_id).await.caller_kind,
+        "ui:test"
+    );
+    for caller in [CallerKind::Cli, CallerKind::Mcp, CallerKind::Assistant] {
+        let s = session(caller.clone(), "s_agent", false);
+        pending(
+            &fx.call(&s, "test.ask_everyone", ask_args(), &next_key())
+                .await,
+        );
+    }
+    // Still pending: the same confirmation, and nothing ran.
+    let again = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_eq!(again, p);
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    let ran = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&ran)["count"], 1, "{ran:?}");
+    let replay = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&replay)["count"], 1, "it runs once");
+    // Every other tool is as before: your destructive call runs at once.
+    assert_eq!(fx.destructive_runs().await, 0);
+    assert_eq!(fx.pending().await.len(), 3, "the agents' three");
+}
+
+/// A retry with your approval whose facts are what you saw runs the call once; the facts you
+/// saw show 50 of the 60 dependents and count all 60 (P4b-R33).
+#[tokio::test] // spec: CORE-157, CORE-091, APP-115
+async fn a_retry_with_the_same_facts_runs_once() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    // Given out of order: the core sorts them before hashing and showing.
+    let mut facts = facts_with(60);
+    facts.dependents.reverse();
+    facts.dependents_total = 7;
+    fx.gates.set_facts(Ok(Some(facts)));
+    let k = next_key();
+    let p = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    let shown = pending_view(&fx, &p.confirmation_id).await.facts.unwrap();
+    assert_eq!(shown.dependents.len(), 50);
+    assert_eq!(shown.dependents, facts_with(50).dependents);
+    assert_eq!(
+        shown.dependents_total, 60,
+        "the core's count, not the tool's"
+    );
+    assert_eq!(shown.versions, ["1.0.0", "1.1.0"]);
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    let ran = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&ran)["count"], 1, "{ran:?}");
+    let replay = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&replay)["count"], 1, "it runs once");
+    let history = fx.history().await;
+    assert_eq!(history.len(), 1, "no second confirmation");
+    assert_eq!(history[0].facts.as_ref(), Some(&shown));
+    assert_eq!(history[0].facts_sha256.as_ref().map(String::len), Some(64));
+}
+
+/// P4b-R9: the approved retry recomputes the facts, and a different hash makes a new
+/// confirmation instead of running: when a shown dependent changed, and when only one beyond
+/// the 50 shown did (the shown facts are then the same, the hash isn't).
+#[tokio::test] // spec: CORE-157, CORE-091
+async fn a_retry_with_changed_facts_asks_again() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let mut facts = facts_with(60);
+    fx.gates.set_facts(Ok(Some(facts.clone())));
+    let k = next_key();
+    let first = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    fx.answer(&first.confirmation_id, Answer::Approve).await;
+
+    // A shown dependent changed.
+    facts.dependents[3] = "sketchbook/dep_03x".into();
+    fx.gates.set_facts(Ok(Some(facts.clone())));
+    let second = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_ne!(second.confirmation_id, first.confirmation_id);
+    assert_eq!(second.retry_token, k);
+    let shown = pending_view(&fx, &second.confirmation_id)
+        .await
+        .facts
+        .unwrap();
+    assert_eq!(shown.dependents[3], "sketchbook/dep_03x");
+    fx.answer(&second.confirmation_id, Answer::Approve).await;
+
+    // Only the 55th changed: the 50 shown are the same, the hash is not.
+    facts.dependents[54] = "sketchbook/dep_54x".into();
+    fx.gates.set_facts(Ok(Some(facts.clone())));
+    let third = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_ne!(third.confirmation_id, second.confirmation_id);
+    let shown_now = pending_view(&fx, &third.confirmation_id)
+        .await
+        .facts
+        .unwrap();
+    assert_eq!(shown_now, shown, "what the card shows didn't change");
+    let rows = fx.history().await;
+    let hash_of = |id: &str| {
+        rows.iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.facts_sha256.clone())
+            .unwrap()
+    };
+    assert_ne!(
+        hash_of(&second.confirmation_id),
+        hash_of(&first.confirmation_id)
+    );
+    let third_row = fx
+        .pending()
+        .await
+        .into_iter()
+        .find(|r| r.id == third.confirmation_id)
+        .unwrap();
+    assert_ne!(
+        third_row.facts_sha256.unwrap(),
+        hash_of(&second.confirmation_id)
+    );
+
+    // Nothing ran; once you approve what is there now, it runs once.
+    fx.answer(&third.confirmation_id, Answer::Approve).await;
+    let ran = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&ran)["count"], 1, "{ran:?}");
+}
+
+/// P4b-R9: a facts function that fails refuses the call with its error before anything is
+/// asked, and so does one that fails at the approved retry (nothing runs).
+#[tokio::test] // spec: CORE-157
+async fn a_facts_error_refuses_before_asking() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    fx.gates.set_facts(Err("the index isn't ready".into()));
+    let out = fx
+        .call(&app(), "test.ask_everyone", ask_args(), &next_key())
+        .await;
+    assert_eq!(code(&out), "state.unavailable", "{out:?}");
+    assert!(fx.pending().await.is_empty() && fx.history().await.is_empty());
+
+    fx.gates.set_facts(Ok(Some(facts_with(2))));
+    let k = next_key();
+    let p = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    fx.gates.set_facts(Err("the index isn't ready".into()));
+    let out = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(code(&out), "state.unavailable", "{out:?}");
+    // The key was released: a call with it now is a new call, which asks again.
+    fx.gates.set_facts(Ok(Some(facts_with(2))));
+    let again = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_ne!(again.confirmation_id, p.confirmation_id);
+}
+
+/// APP-115 (Appendix H "Confirmations"): a confirmation lists the paths the call touches,
+/// filled from the tool's declaration and the call's arguments.
+#[tokio::test] // spec: APP-115, CORE-157
+async fn confirmation_view_lists_declared_files() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let p = pending(
+        &fx.call(&app(), "test.ask_everyone", ask_args(), &next_key())
+            .await,
+    );
+    let view = pending_view(&fx, &p.confirmation_id).await;
+    assert_eq!(
+        view.files,
+        Some(vec![Touch {
+            path: "projects/harbor/assets/crane/".into(),
+            access: TouchAccess::Delete,
+        }])
+    );
+    let wire = serde_json::to_value(&view).unwrap();
+    assert_eq!(
+        wire["files"],
+        json!([{"path": "projects/harbor/assets/crane/", "access": "delete"}])
+    );
+    assert_eq!(
+        wire["arguments"],
+        ask_args(),
+        "the arguments are still there"
+    );
+    // No facts set: none on the card.
+    assert!(wire.get("facts").is_none(), "{wire}");
+    // Without a `project` argument or a call project (no workspace), the touch can't be filled:
+    // no files, and the card shows the arguments.
+    let q = pending(
+        &fx.call(
+            &app(),
+            "test.ask_everyone",
+            json!({"asset_id": "crane"}),
+            &next_key(),
+        )
+        .await,
+    );
+    assert_eq!(pending_view(&fx, &q.confirmation_id).await.files, None);
+}
+
+/// APP-115 (plan 4a clarification): a tool that declares no touches gets no `files`, and its
+/// card shows the arguments.
+#[tokio::test] // spec: APP-115
+async fn a_tool_without_a_declaration_has_no_files() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let p = pending(
+        &fx.call(
+            &cli(),
+            "test.destructive",
+            json!({"cost": "0"}),
+            &next_key(),
+        )
+        .await,
+    );
+    let view = pending_view(&fx, &p.confirmation_id).await;
+    assert_eq!(view.files, None);
+    assert_eq!(view.facts, None);
+    let wire = serde_json::to_value(&view).unwrap();
+    assert!(
+        wire.get("files").is_none() && wire.get("facts").is_none(),
+        "{wire}"
+    );
+    assert_eq!(wire["arguments"], json!({"cost": "0"}));
 }
 
 #[tokio::test] // spec: QA-016, ARCH-055, APP-051, CORE-113
@@ -717,7 +979,7 @@ async fn mcp_sessions_get_no_marker_and_core_confirmations() {
     let core = fixture(McpConfirmation::Core);
     let reg = core.dispatcher.registry();
     for caller in [CallerKind::Mcp, CallerKind::Cli] {
-        let listed = core.confirm.annotate(&caller, reg.list_for(&caller));
+        let listed = core.confirm.annotate(&caller, reg.list_for(&caller), reg);
         assert!(
             marked(&listed).is_empty(),
             "{caller}: {:?}",
@@ -737,27 +999,29 @@ async fn mcp_sessions_get_no_marker_and_core_confirmations() {
     );
     assert_eq!(core.destructive_runs().await, 0);
 
-    // "claude_code": the mcp session's destructive and exec tools carry it, and its call
-    // proceeds, recorded as Claude Code's confirmation; other sessions are as before.
+    // "claude_code": the mcp session's destructive and exec tools carry it (not one that asks
+    // every caller, whose confirmation is always the core's: P4b-R33), and its call proceeds,
+    // recorded as Claude Code's confirmation; other sessions are as before.
     let cc = fixture(McpConfirmation::ClaudeCode);
     let reg = cc.dispatcher.registry();
     let listed = cc
         .confirm
-        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp));
+        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp), reg);
     let names = marked(&listed);
     assert!(names.contains(&"test.destructive".to_string()), "{names:?}");
     assert!(names.contains(&"x.exec".to_string()), "{names:?}");
     for t in &listed {
         assert_eq!(
             names.contains(&t.name),
-            t.effect.needs_agent_confirmation(),
+            t.effect.needs_agent_confirmation()
+                && reg.meta(&t.name).confirm_policy == ConfirmPolicy::AgentsOnly,
             "{}",
             t.name
         );
     }
     let cli_listed = cc
         .confirm
-        .annotate(&CallerKind::Cli, reg.list_for(&CallerKind::Cli));
+        .annotate(&CallerKind::Cli, reg.list_for(&CallerKind::Cli), reg);
     assert!(marked(&cli_listed).is_empty());
     let out = cc
         .call(&mcp, "test.destructive", json!({}), &next_key())
@@ -797,6 +1061,9 @@ async fn ui_cap_prompts_are_cancelled_when_the_app_closes() {
         project: None,
         covers,
         cap: None,
+        files: None,
+        facts: None,
+        facts_sha256: None,
     };
     let cap = fx
         .confirm
@@ -1098,7 +1365,7 @@ async fn claude_code_marker_lowers_to_the_top_level_of_mcp_meta() {
     let reg = cc.dispatcher.registry();
     let listed = cc
         .confirm
-        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp));
+        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp), reg);
     assert!(listed.iter().any(|t| t.effect.needs_agent_confirmation()));
     for t in &listed {
         let meta = lil_protocol::lowering::mcp_meta(t);
@@ -1110,7 +1377,8 @@ async fn claude_code_marker_lowers_to_the_top_level_of_mcp_meta() {
         let marked = meta.get(MARKER) == Some(&json!(true));
         assert_eq!(
             marked,
-            t.effect.needs_agent_confirmation(),
+            t.effect.needs_agent_confirmation()
+                && reg.meta(&t.name).confirm_policy == ConfirmPolicy::AgentsOnly,
             "{}: {meta:?}",
             t.name
         );
@@ -1120,7 +1388,7 @@ async fn claude_code_marker_lowers_to_the_top_level_of_mcp_meta() {
     let reg = core.dispatcher.registry();
     for t in core
         .confirm
-        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp))
+        .annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp), reg)
     {
         let meta = lil_protocol::lowering::mcp_meta(&t);
         assert!(
@@ -1485,6 +1753,9 @@ async fn a_reconcile_posts_the_missing_toasts_and_clears_stale_ones() {
         project: None,
         covers: vec![Cover::Confirm],
         cap: None,
+        files: None,
+        facts: None,
+        facts_sha256: None,
     };
     let posted = |fake: &lil_platform::desktop_fake::FakeDesktop, tag: &str| {
         fake.records()
@@ -1575,6 +1846,9 @@ async fn a_refused_re_post_removes_the_earlier_runs_toast() {
             project: None,
             covers: vec![Cover::Confirm],
             cap: None,
+            files: None,
+            facts: None,
+            facts_sha256: None,
         })
         .await
         .unwrap();

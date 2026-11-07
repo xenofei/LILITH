@@ -21,6 +21,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 
 use lil_platform::names::{LEGACY_WORKSPACE_FILE, WORKSPACE_FILE};
+use lil_protocol::app::ConfirmFacts;
 use lil_protocol::codes::PARAMS_INVALID;
 use lil_protocol::{ErrorBody, Outcome, PendingConfirmation, ToolDescriptor, ToolOutput};
 use lil_schema::money::Rate;
@@ -31,7 +32,7 @@ use lil_schema::{Currency, Money};
 use serde_json::{Map, Value};
 
 use super::record_stage::WorkspaceRecord;
-use super::registry::CallCtx;
+use super::registry::{CallCtx, ConfirmPolicy, ToolMeta};
 use crate::pipeline::RecordPlan;
 use crate::session::Session;
 use crate::settings::cascade;
@@ -154,16 +155,55 @@ pub struct ConfirmInput<'a> {
     /// job with external side effects that was `interrupted` (ruling P3-R21: it may have run,
     /// so paid work could be paid twice).
     pub always_confirm: bool,
+    /// The tool's core-internal meta (P4b-R33): its confirmation policy, touches and facts.
+    /// Read from the registry, never from the caller.
+    pub meta: &'a ToolMeta,
 }
 
 impl ConfirmInput<'_> {
     /// Whether an agent's confirmation is needed (ARCH-052, CORE-109): an agent caller and a
-    /// `destructive` or `exec` tool, or [`ConfirmInput::always_confirm`]. Your own actions in
-    /// an app never ask.
+    /// `destructive` or `exec` tool, or [`ConfirmInput::always_confirm`].
     pub fn needs_agent_confirmation(&self) -> bool {
         self.session.caller.is_agent()
             && (self.descriptor.effect.needs_agent_confirmation() || self.always_confirm)
     }
+
+    /// Whether the call needs a safety confirmation: an agent's, or any caller's call of a tool
+    /// whose policy is [`ConfirmPolicy::EveryCaller`] (CORE-157). Otherwise your own actions in
+    /// an app never ask.
+    pub fn needs_confirmation(&self) -> bool {
+        self.needs_agent_confirmation() || self.meta.confirm_policy == ConfirmPolicy::EveryCaller
+    }
+
+    /// The tool's facts for this call, sealed ([`seal_facts`]); `None` for a tool without a
+    /// facts function, or when it has none.
+    ///
+    /// # Errors
+    /// The facts function's error: the call is refused with it.
+    pub async fn facts(&self) -> Result<Option<(ConfirmFacts, String)>, ErrorBody> {
+        let Some(facts) = &self.meta.facts else {
+            return Ok(None);
+        };
+        Ok(facts(self).await?.map(seal_facts))
+    }
+}
+
+/// How many dependents a confirmation's facts show (Appendix H "Trash an asset").
+pub const FACTS_SHOWN: usize = 50;
+
+/// `facts` as a confirmation stores them, and their hash (P4b-R9, P4b-R33): the hash is the
+/// SHA-256 of the canonical JSON of `{dependents, versions}` over the full dependents list,
+/// sorted (the retry binding's [`lil_protocol::args_hash`]); only then are the dependents cut
+/// to the first [`FACTS_SHOWN`], with `dependents_total` the full count.
+pub fn seal_facts(mut facts: ConfirmFacts) -> (ConfirmFacts, String) {
+    facts.dependents.sort();
+    let hash = lil_protocol::args_hash(&serde_json::json!({
+        "dependents": facts.dependents,
+        "versions": facts.versions,
+    }));
+    facts.dependents_total = u32::try_from(facts.dependents.len()).unwrap_or(u32::MAX);
+    facts.dependents.truncate(FACTS_SHOWN);
+    (facts, hash)
 }
 
 /// A confirmation you approved, as a retry with its token runs it (CORE-091, Appendix F): the
@@ -183,6 +223,9 @@ pub struct Approval {
     /// With `allow_once`: the caps and the estimate the prompt showed, which the reserve
     /// stage may pass this once.
     pub allowed: Option<AllowOnce>,
+    /// The hash of the facts you saw ([`seal_facts`]); `None` for a confirmation without facts
+    /// (or one stored before they existed), which the retry doesn't check.
+    pub facts_sha256: Option<String>,
 }
 
 /// What a cap confirmation's `allow_once` allowed (CORE-091: bound to what you saw): the caps
@@ -222,14 +265,32 @@ impl Approval {
             && self.project.as_deref() == project
             && lil_protocol::args_hash(&self.arguments) == lil_protocol::args_hash(args)
     }
+
+    /// Whether the facts of the call `i` (which this approval covers) differ now from the ones
+    /// you saw (P4b-R9): the tool's facts function runs again and its sealed hash is compared.
+    /// `false` without a stored hash or a facts function.
+    ///
+    /// # Errors
+    /// The facts function's error.
+    pub async fn facts_changed(&self, i: &ConfirmInput<'_>) -> Result<bool, ErrorBody> {
+        let Some(seen) = &self.facts_sha256 else {
+            return Ok(false);
+        };
+        if i.meta.facts.is_none() {
+            return Ok(false);
+        }
+        let now = i.facts().await?.map(|(_, hash)| hash);
+        Ok(now.as_ref() != Some(seen))
+    }
 }
 
 /// What a retry with the token of a stored `pending_confirmation` gets (Appendix F
 /// "Confirmations"): run the call once, the same pending confirmation, or the end of it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplayDecision {
-    /// Approved: the call runs (once) with stage 5 satisfied for what was approved.
-    Run(Approval),
+    /// Approved: the call runs (once) with stage 5 satisfied for what was approved. Boxed: an
+    /// approval is much larger than the other variants.
+    Run(Box<Approval>),
     /// Not answered yet: the same `pending_confirmation`.
     StillPending(PendingConfirmation),
     /// `confirm.denied`; the key is released.
@@ -642,10 +703,11 @@ impl EstimateStage for Plan2 {
 
 impl ConfirmStage for Plan2 {
     /// An agent (`assistant`, `mcp`, `cli`) calling a `destructive` or `exec` tool needs your
-    /// confirmation (ARCH-052), and plan 2 has no way to ask: [`ConfirmDecision::Unavailable`],
-    /// interactive session or not (QA-016). Your own actions in an app never ask (CORE-109).
+    /// confirmation (ARCH-052), and so does any call of an `EveryCaller` tool, and plan 2 has no
+    /// way to ask: [`ConfirmDecision::Unavailable`], interactive session or not (QA-016).
+    /// Otherwise your own actions in an app never ask (CORE-109).
     fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision> {
-        let decision = if i.needs_agent_confirmation() {
+        let decision = if i.needs_confirmation() {
             ConfirmDecision::Unavailable
         } else {
             ConfirmDecision::Proceed {

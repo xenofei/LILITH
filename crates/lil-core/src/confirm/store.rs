@@ -1,4 +1,6 @@
-//! The `confirmations` table (suite migration 6, workspace migration 5), through a database's actor.
+//! The `confirmations` table (suite migration 6, workspace migration 5; `facts`,
+//! `facts_sha256` and `files` from suite migration 12 and workspace migration 9), through a
+//! database's actor.
 //! Every state change is one `UPDATE … WHERE state = 'pending'`, so of two racing changes to
 //! one confirmation exactly one happens (and only that one publishes its event).
 
@@ -11,7 +13,7 @@ use crate::tools::ConfirmedVia;
 
 const COLUMNS: &str = "id, scope, idem_key, tool, args_hash, arguments, caller_kind, covers, \
                        cap, state, confirmed_via, created_utc, expires_utc, answered_utc, \
-                       cap_action, session_id, project";
+                       cap_action, session_id, project, facts, facts_sha256, files";
 
 fn sql(e: &rusqlite::Error) -> StateError {
     match e.sqlite_error_code() {
@@ -36,6 +38,9 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<ConfirmationRow> {
     let cap: Option<String> = r.get(8)?;
     let state: String = r.get(9)?;
     let via: Option<String> = r.get(10)?;
+    // NULL in a row from before the columns (suite migration 12, workspace migration 9).
+    let facts: Option<String> = r.get(17)?;
+    let files: Option<String> = r.get(19)?;
     Ok(ConfirmationRow {
         id: r.get(0)?,
         scope: r.get(1)?,
@@ -63,6 +68,15 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<ConfirmationRow> {
         cap_action: r.get(14)?,
         session_id: r.get(15)?,
         project: r.get(16)?,
+        facts: facts
+            .map(|f| serde_json::from_str(&f))
+            .transpose()
+            .map_err(|e| text_error(17, e.to_string()))?,
+        facts_sha256: r.get(18)?,
+        files: files
+            .map(|f| serde_json::from_str(&f))
+            .transpose()
+            .map_err(|e| text_error(19, e.to_string()))?,
     })
 }
 
@@ -71,7 +85,8 @@ fn insert(conn: &rusqlite::Connection, row: &ConfirmationRow) -> rusqlite::Resul
     conn.execute(
         &format!(
             "INSERT INTO confirmations ({COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18, ?19, ?20)"
         ),
         params![
             row.id,
@@ -91,6 +106,13 @@ fn insert(conn: &rusqlite::Connection, row: &ConfirmationRow) -> rusqlite::Resul
             row.cap_action,
             row.session_id,
             row.project,
+            row.facts
+                .as_ref()
+                .map(|f| serde_json::to_string(f).expect("facts serialise")),
+            row.facts_sha256,
+            row.files
+                .as_ref()
+                .map(|f| serde_json::to_string(f).expect("files serialise")),
         ],
     )
     .map(drop)

@@ -2088,8 +2088,10 @@ async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), 
 
 /// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,
 /// `asset.pin_input`, `asset.deprecate`, `asset.mark`, `asset.accept_move` and
-/// `asset.make_independent` (module `workspace`).
-pub fn register_asset_tools(reg: &mut Registry) {
+/// `asset.make_independent` (module `workspace`). `services` are the late-bound asset services
+/// (P4b-R32); none of these tools uses them yet (Tasks 11 and 12 do).
+pub fn register_asset_tools(reg: &mut Registry, services: &super::AssetServices) {
+    let _ = services;
     reg.register(typed_tool(
         "asset.import",
         IMPORT_DESCRIPTION,

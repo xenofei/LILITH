@@ -5,7 +5,8 @@
 //! [`QueueState`], and `app/desktop.set` (Appendix G "Notifications"), which needs `desktop.v1`
 //! and returns the [`DesktopSettings`] `desktop.get` returns too, and `app/set_context`
 //! (Appendix G "Session and listing tools"), which needs `context.v1` and sets the session's
-//! project.
+//! project; and of protocol 1.4 (Appendix H), `app/thumbs.request`, `app/asset.trust` and
+//! `app/asset.ai_edit`, which need `assets.v1`, and a confirmation's `files` and `facts`.
 //!
 //! Every `app/*` method is for verified `ui:*` connections only, except the read-only
 //! `app/confirmations.list`, which `cli` may call too; the confirmation methods need
@@ -48,6 +49,15 @@ pub const DESKTOP_CAPABILITY: &str = "desktop.v1";
 pub const SET_CONTEXT: &str = "app/set_context";
 /// The capability `app/set_context` needs.
 pub const CONTEXT_CAPABILITY: &str = "context.v1";
+
+/// `app/thumbs.request` (protocol 1.4).
+pub const THUMBS_REQUEST: &str = "app/thumbs.request";
+/// `app/asset.trust` (protocol 1.4): your Mark as trusted (ARCH-060).
+pub const ASSET_TRUST: &str = "app/asset.trust";
+/// `app/asset.ai_edit` (protocol 1.4): your This was an AI edit (CORE-034).
+pub const ASSET_AI_EDIT: &str = "app/asset.ai_edit";
+/// The capability the three `app/*` methods of protocol 1.4 need.
+pub const ASSETS_CAPABILITY: &str = "assets.v1";
 
 /// The most confirmations one `app/confirmations.list` returns, and its default.
 pub const LIST_LIMIT_MAX: u32 = 500;
@@ -114,6 +124,42 @@ pub struct ConfirmationView {
     pub expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered: Option<String>,
+    /// From 1.4: the paths the call touches, filled from the tool's declaration and the call's
+    /// arguments; absent for a tool that declares none (the card shows the arguments).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<Touch>>,
+    /// From 1.4: what the tool tells you about the call (`asset.trash`: its dependents and
+    /// sealed versions), as the confirmation stored it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<ConfirmFacts>,
+}
+
+/// How a call touches a path (Appendix H "Confirmations"): wire `read`, `write`, `move`,
+/// `delete`, `run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchAccess {
+    Read,
+    Write,
+    Move,
+    Delete,
+    Run,
+}
+
+/// A path a call touches: workspace-relative, or absolute for an outside file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Touch {
+    pub path: String,
+    pub access: TouchAccess,
+}
+
+/// A confirmation's facts (Appendix H "Trash an asset"): the refs of the dependents shown (at
+/// most 50), how many there are in all, and the sealed versions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConfirmFacts {
+    pub dependents: Vec<String>,
+    pub dependents_total: u32,
+    pub versions: Vec<String>,
 }
 
 /// `app/confirmations.list` result.
@@ -380,6 +426,83 @@ pub struct SetContextResult {
     pub project: Option<String>,
     #[serde(default)]
     pub effective_project: Option<String>,
+}
+
+/// One item of `app/thumbs.request`: a workspace-relative path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ThumbItem {
+    pub path: String,
+}
+
+/// `app/thumbs.request {items (1–500), tier: 96 | 160 | 256 | 384 | 512, scale? (1.0–4.0,
+/// default 1), large_px? (513–4096, instead of tier)}` params (Appendix H "Thumbnails").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ThumbsRequestParams {
+    pub items: Vec<ThumbItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large_px: Option<u32>,
+}
+
+/// One thumbnail as `app/thumbs.request` answers it: `state` is `ready`, `pending` or `icon`;
+/// `file` is the cached PNG's absolute path; `px` the size it was rendered at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ThumbView {
+    pub path: String,
+    pub sha256: Option<String>,
+    pub media_kind: String,
+    pub renderer: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    pub px: u32,
+}
+
+/// `app/thumbs.request` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ThumbsRequestResult {
+    pub thumbs: Vec<ThumbView>,
+}
+
+/// `app/asset.trust {project?, asset_id, paths?}` params (Appendix H "Trust"): every untrusted
+/// file of the asset when `paths` is left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssetTrustParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    pub asset_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+}
+
+/// `app/asset.trust` result: the asset-relative paths now trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AssetTrustResult {
+    pub trusted: Vec<String>,
+}
+
+/// `app/asset.ai_edit {project?, asset_id, path, sha256}` params (Appendix H "Attribution"):
+/// the `human_edits[]` entry with that path and SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiEditParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    pub asset_id: String,
+    pub path: String,
+    pub sha256: String,
+}
+
+/// `app/asset.ai_edit` result: the relabelled `human_edits[]` entry, as the manifest holds it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AiEditResult {
+    pub human_edit: serde_json::Value,
 }
 
 #[cfg(test)]

@@ -6,7 +6,14 @@
 //!   tool ([`AgentConfirm`], stage 5). Your own actions in an app never ask (CORE-109), except
 //!   when a cap would be passed: any caller's call that would pass a cap asks about the cap
 //!   (CORE-091, APP-054), and one call that needs both gets one confirmation covering
-//!   `["confirm", "cap"]` (CORE-015 step 5, APP-045).
+//!   `["confirm", "cap"]` (CORE-015 step 5, APP-045). A tool whose policy is `EveryCaller`
+//!   (CORE-157, P4b-R33; `asset.trash`) asks every caller, your own app's calls too, always in
+//!   the core's dialog.
+//! - **Files and facts** (APP-115; Appendix H "Confirmations"). A confirmation lists the paths
+//!   the call touches (`files`, filled from the tool's declaration; none for a tool that
+//!   declares none) and the tool's `facts`, as at most 50 dependents shown; it stores the hash
+//!   of the full facts, and the approved retry recomputes them: a different hash asks again
+//!   instead of running (P4b-R9).
 //! - **Cap answers** ([`Confirm::answer`]). Approving a confirmation that covers a cap takes a
 //!   cap action: `allow_once` lets that one call (or `job.retry`) pass the caps once, and never
 //!   changes them; `raise` sets the cap `raise_to` names through [`Caps::set`] first (your
@@ -46,7 +53,8 @@
 //!   `Core`). With `Core` an `mcp` call is confirmed like any agent call and no tool carries
 //!   `anthropic/requiresUserInteraction` (ruling P3-R10: one prompt); with `ClaudeCode` the
 //!   `destructive` and `exec` tools of an `mcp` session carry it, and such a call proceeds,
-//!   recorded `approved` with `confirmed_via: claude_code` ([`Confirm::annotate`]).
+//!   recorded `approved` with `confirmed_via: claude_code` ([`Confirm::annotate`]); an
+//!   `EveryCaller` tool carries no marker and gets the core's confirmation either way.
 //! - **Events** on the `confirmations` topic: `{kind: "pending" | "answered" | "expired" |
 //!   "cancelled", confirmation}`, each once per confirmation (every change is one
 //!   `UPDATE … WHERE state = 'pending'`).
@@ -68,8 +76,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use lil_platform::{Clock, IdSource};
 use lil_protocol::app::{
-    Answer, CONFIRMATION_CAPABILITIES, CapAction, CapsSetParams, ConfirmationAnswerParams,
-    ConfirmationView, RaiseTo,
+    Answer, CONFIRMATION_CAPABILITIES, CapAction, CapsSetParams, ConfirmFacts,
+    ConfirmationAnswerParams, ConfirmationView, RaiseTo, Touch,
 };
 use lil_protocol::{
     CallerKind, CodeSpec, Cover, EffectClass, ErrorBody, NO_WORKSPACE, PendingConfirmation,
@@ -84,7 +92,7 @@ use crate::session::Session;
 use crate::state::{StateDb, StateError, StateRegistry};
 use crate::store::FailPoints;
 pub use crate::tools::ConfirmedVia;
-use crate::tools::{CapHit, IdemRef, cap_hits_json};
+use crate::tools::{CapHit, ConfirmPolicy, IdemRef, Registry, cap_hits_json};
 
 /// How many ended confirmation ids [`Confirm`] remembers.
 const ENDED_KEPT: usize = 4096;
@@ -193,6 +201,12 @@ pub struct ConfirmationRow {
     pub session_id: String,
     /// The call's resolved project (none without a workspace): the approval is for it.
     pub project: Option<String>,
+    /// The paths the call touches, from the tool's declaration (none declared: `None`).
+    pub files: Option<Vec<Touch>>,
+    /// The tool's facts as you were shown them: at most 50 dependents (P4b-R33).
+    pub facts: Option<ConfirmFacts>,
+    /// The hash of the full facts, which the approved retry checks again (P4b-R9).
+    pub facts_sha256: Option<String>,
 }
 
 impl ConfirmationRow {
@@ -217,6 +231,8 @@ impl ConfirmationRow {
             created: time(self.created_utc),
             expires_at: time(self.expires_utc),
             answered: self.answered_utc.map(time),
+            files: self.files.clone(),
+            facts: self.facts.clone(),
         }
     }
 
@@ -349,6 +365,11 @@ pub struct ConfirmRequest {
     pub covers: Vec<Cover>,
     /// The caps the call would pass (Task 16).
     pub cap: Option<Vec<CapHit>>,
+    /// The paths the call touches (none declared: `None`).
+    pub files: Option<Vec<Touch>>,
+    /// The tool's sealed facts and their hash (`tools::seal_facts`).
+    pub facts: Option<ConfirmFacts>,
+    pub facts_sha256: Option<String>,
 }
 
 /// Which confirmations [`Confirm::list`] gives.
@@ -634,6 +655,9 @@ impl Confirm {
             cap_action: None,
             session_id: r.session_id,
             project: r.project,
+            files: r.files,
+            facts: r.facts,
+            facts_sha256: r.facts_sha256,
         }
     }
 
@@ -1070,20 +1094,31 @@ impl Confirm {
         Ok(rows.len())
     }
 
-    /// `tools` as `caller` sees them in `tools/list`: with [`McpConfirmation::ClaudeCode`] an
-    /// `mcp` session's `destructive` and `exec` tools carry
-    /// `annotations["_meta"]["anthropic/requiresUserInteraction"] = true`; otherwise no tool
-    /// carries it (ruling P3-R10: the core's confirmation is the only prompt).
-    pub fn annotate(&self, caller: &CallerKind, tools: Vec<ToolDescriptor>) -> Vec<ToolDescriptor> {
+    /// `tools` (of `reg`) as `caller` sees them in `tools/list`: with
+    /// [`McpConfirmation::ClaudeCode`] an `mcp` session's `destructive` and `exec` tools carry
+    /// `annotations["_meta"]["anthropic/requiresUserInteraction"] = true`, except the
+    /// `EveryCaller` ones, whose confirmation is always the core's dialog (P4b-R33: Claude
+    /// Code's prompt can't show their facts, so marking them would ask twice); otherwise no
+    /// tool carries it (ruling P3-R10: the core's confirmation is the only prompt).
+    pub fn annotate(
+        &self,
+        caller: &CallerKind,
+        tools: Vec<ToolDescriptor>,
+        reg: &Registry,
+    ) -> Vec<ToolDescriptor> {
         let mark = *caller == CallerKind::Mcp && self.mcp == McpConfirmation::ClaudeCode;
         tools
             .into_iter()
             .map(|mut d| {
+                let every_caller = reg.meta(&d.name).confirm_policy == ConfirmPolicy::EveryCaller;
                 let meta = d
                     .annotations
                     .get_mut("_meta")
                     .and_then(Value::as_object_mut);
-                if mark && matches!(d.effect, EffectClass::Destructive | EffectClass::Exec) {
+                if mark
+                    && !every_caller
+                    && matches!(d.effect, EffectClass::Destructive | EffectClass::Exec)
+                {
                     match meta {
                         Some(meta) => {
                             meta.insert(REQUIRES_USER_INTERACTION.into(), Value::Bool(true));
@@ -1195,6 +1230,125 @@ mod tests {
         (confirm, env)
     }
 
+    /// Ruling P4b-R33 (and the single prompt of P3-R10): under `mcp_confirmation =
+    /// "claude_code"` an `mcp` session's `tools/list` marks its `destructive` tools but not one
+    /// that asks every caller, and that tool's call still gets the core's own
+    /// `pending_confirmation`, with nothing recorded as Claude Code's answer.
+    #[tokio::test] // spec: CORE-112, CORE-157, ARCH-054
+    async fn every_caller_tools_use_the_core_dialog_in_claude_code_mode() {
+        use crate::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
+        use lil_protocol::{Outcome, ToolCallParams};
+        let env = lil_testkit::TestEnv::new();
+        let states = Arc::new(
+            StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap(),
+        );
+        let clock: Arc<dyn Clock> = lil_testkit::FakeClock::new();
+        let ids: Arc<dyn IdSource> = Arc::new(lil_testkit::SeqIds::new());
+        let events = Arc::new(EventBus::new(clock.clone()));
+        let probe: Arc<dyn lil_platform::fs::Probe> = Arc::new(lil_platform::fs::SystemProbe);
+        let hub = crate::workspace::WorkspaceHub::new(
+            env.env.clone(),
+            states.clone(),
+            events.clone(),
+            clock.clone(),
+            ids.clone(),
+            FailPoints::none(),
+            probe.clone(),
+            crate::watch::WatchConfig::default(),
+        );
+        let gates = Arc::new(TestGates::new());
+        gates.set_facts(Ok(Some(ConfirmFacts {
+            dependents: vec!["sketchbook/b".into(), "sketchbook/a".into()],
+            dependents_total: 0,
+            versions: vec!["1.0.0".into()],
+        })));
+        let reg = core_registry(
+            true,
+            &gates,
+            &states,
+            &hub,
+            &env.env,
+            &probe,
+            Arc::default(),
+            &crate::tools::AssetServices::unwired(),
+        );
+        let confirm = Confirm::new(
+            states.clone(),
+            events.clone(),
+            clock.clone(),
+            ids.clone(),
+            UiPresence::new(),
+            Arc::new(NoNotificationPath),
+            Duration::from_secs(1800),
+            McpConfirmation::ClaudeCode,
+            FailPoints::none(),
+        );
+        let dispatcher = Dispatcher::new(
+            reg,
+            PipelineHooks {
+                confirm: AgentConfirm::new(confirm.clone()),
+                ..PipelineHooks::plan2()
+            },
+            states,
+            events,
+            hub,
+            ids,
+            clock.clone(),
+            crate::lifecycle::Lifecycle::new(clock, crate::lifecycle::IDLE_EXIT_AFTER),
+        );
+        let reg = dispatcher.registry();
+        let listed = confirm.annotate(&CallerKind::Mcp, reg.list_for(&CallerKind::Mcp), reg);
+        let marked = |name: &str| {
+            let d = listed.iter().find(|d| d.name == name).unwrap();
+            d.annotations
+                .get("_meta")
+                .and_then(|m| m.get(REQUIRES_USER_INTERACTION))
+                == Some(&json!(true))
+        };
+        assert!(
+            marked("test.destructive"),
+            "an agents-only destructive tool"
+        );
+        assert!(!marked("test.ask_everyone"), "an every-caller tool");
+
+        confirm.presence().opened();
+        let mcp = Arc::new(Session {
+            id: "s_mcp".into(),
+            caller: CallerKind::Mcp,
+            non_interactive: false,
+            workspace: None,
+            capabilities: Vec::new(),
+            client_pid: 1,
+            profile_id: None,
+        });
+        let call = |name: &str, key: &str| ToolCallParams {
+            name: name.into(),
+            arguments: json!({"asset_id": "a"}).as_object().unwrap().clone(),
+            idempotency_key: Some(key.into()),
+            trace_id: None,
+        };
+        let out = dispatcher
+            .call(mcp.clone(), call("test.ask_everyone", "k1"))
+            .await;
+        let Outcome::PendingConfirmation(p) = out else {
+            panic!("expected pending_confirmation, got {out:?}");
+        };
+        let pending = confirm.list(ListState::Pending, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, p.confirmation_id);
+        assert_eq!(pending[0].confirmed_via, None, "not Claude Code's answer");
+        let facts = pending[0].view().facts.unwrap();
+        assert_eq!(facts.dependents, ["sketchbook/a", "sketchbook/b"]);
+        assert_eq!(facts.dependents_total, 2);
+        assert!(
+            confirm
+                .list(ListState::History, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn row(id: &str) -> ConfirmationRow {
         ConfirmationRow {
             id: id.into(),
@@ -1214,6 +1368,9 @@ mod tests {
             cap_action: None,
             session_id: "s".into(),
             project: None,
+            files: None,
+            facts: None,
+            facts_sha256: None,
         }
     }
 

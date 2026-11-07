@@ -286,9 +286,16 @@ pub const JOB_NOT_QUEUED: CodeSpec = spec("job.not_queued", C::DataConflict, R::
 /// `job.not_queued`'s message (Appendix D).
 pub const JOB_NOT_QUEUED_MESSAGE: &str = "Only a job that is waiting its turn can be moved; this one is with the engine, running or finished.";
 
-// Plan 4b (Appendix D). Task 7 returns the first two and Task 8 `repair.not_needed`; the plan's
-// other codes follow with the tasks that return them.
+// Plan 4b (Appendix D), in table order (P4b-R7: Task 10 defines every one; Task 7 returns
+// `asset.trashed` and `ref.redirect_broken`, Task 8 `repair.not_needed`, and the others follow
+// with the tasks that return them).
 
+/// `asset.trash` while a job, a sign-off or a document hold uses the asset (CORE-157).
+/// Message: [`ASSET_IN_USE_MESSAGE`].
+pub const ASSET_IN_USE: CodeSpec = spec("asset.in_use", C::DataConflict, R::AfterResolve, false);
+/// `asset.in_use`'s message (Appendix D).
+pub const ASSET_IN_USE_MESSAGE: &str =
+    "This asset is in use by a job, a sign-off or an open document. Try again when that is done.";
 /// A ref resolves to an asset that is in the trash (ARCH-125, CORE-157). Message: "This asset
 /// is in the trash (entry <entry_id>). Restore it with trash.restore."; `data: {entry_id}`.
 pub const ASSET_TRASHED: CodeSpec = spec("asset.trashed", C::UserFixable, R::AfterResolve, false);
@@ -300,11 +307,24 @@ pub const REF_REDIRECT_BROKEN: CodeSpec = spec(
     R::AfterResolve,
     false,
 );
+/// A collection or saved search id that `registry/collections.yaml` doesn't hold (CORE-155).
+pub const COLLECTION_UNKNOWN: CodeSpec =
+    spec("collection.unknown", C::UserFixable, R::AfterResolve, false);
+/// A collection name already used, compared case-insensitively (CORE-155). Message: "A saved
+/// search or collection is already called <name>."
+pub const COLLECTION_NAME_TAKEN: CodeSpec = spec(
+    "collection.name_taken",
+    C::DataConflict,
+    R::AfterResolve,
+    false,
+);
 /// `asset.accept_move` on an asset that isn't `moved`, or `asset.make_independent` on one that
 /// isn't a `copy` or `duplicate_uuid` (CORE-154). Message: [`REPAIR_NOT_NEEDED_MESSAGE`].
 pub const REPAIR_NOT_NEEDED: CodeSpec = spec("repair.not_needed", C::UserFixable, R::Never, false);
 /// `repair.not_needed`'s message (Appendix D).
 pub const REPAIR_NOT_NEEDED_MESSAGE: &str = "This asset doesn't need that repair.";
+/// An inbox entry (`import_id`) the inbox doesn't hold (CORE-179).
+pub const INBOX_UNKNOWN: CodeSpec = spec("inbox.unknown", C::UserFixable, R::AfterResolve, false);
 
 /// Every code, in table order.
 pub const ALL: &[&CodeSpec] = &[
@@ -375,9 +395,13 @@ pub const ALL: &[&CodeSpec] = &[
     &CONFIRM_ALREADY_ANSWERED,
     &CAPS_INVALID,
     &JOB_NOT_QUEUED,
+    &ASSET_IN_USE,
     &ASSET_TRASHED,
     &REF_REDIRECT_BROKEN,
+    &COLLECTION_UNKNOWN,
+    &COLLECTION_NAME_TAKEN,
     &REPAIR_NOT_NEEDED,
+    &INBOX_UNKNOWN,
 ];
 
 #[cfg(test)]
@@ -575,6 +599,7 @@ mod tests {
         ("confirm.already_answered", C::DataConflict, R::Never, false),
         ("caps.invalid", C::UserFixable, R::AfterResolve, false),
         ("job.not_queued", C::DataConflict, R::Never, false),
+        ("asset.in_use", C::DataConflict, R::AfterResolve, false),
         ("asset.trashed", C::UserFixable, R::AfterResolve, false),
         (
             "ref.redirect_broken",
@@ -582,7 +607,15 @@ mod tests {
             R::AfterResolve,
             false,
         ),
+        ("collection.unknown", C::UserFixable, R::AfterResolve, false),
+        (
+            "collection.name_taken",
+            C::DataConflict,
+            R::AfterResolve,
+            false,
+        ),
         ("repair.not_needed", C::UserFixable, R::Never, false),
+        ("inbox.unknown", C::UserFixable, R::AfterResolve, false),
     ];
 
     /// `^[a-z_]+(\.[a-z_]+)+$`
@@ -596,7 +629,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 70);
+        assert_eq!(TABLE.len(), 74);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);
@@ -640,6 +673,54 @@ mod tests {
         assert_eq!(
             JOB_NOT_QUEUED_MESSAGE,
             "Only a job that is waiting its turn can be moved; this one is with the engine, running or finished."
+        );
+    }
+
+    /// Plan 4b's seven codes (Appendix D; P4b-R7), each with its category and retry, in the
+    /// table and in Appendix D's order; `asset.in_use` with its message.
+    #[test] // spec: CORE-157, ARCH-125, CORE-155, CORE-154, CORE-179, QA-003
+    fn the_seven_new_codes_are_in_the_table() {
+        let want = [
+            ("asset.in_use", C::DataConflict, R::AfterResolve),
+            ("asset.trashed", C::UserFixable, R::AfterResolve),
+            ("ref.redirect_broken", C::UserFixable, R::AfterResolve),
+            ("collection.unknown", C::UserFixable, R::AfterResolve),
+            ("collection.name_taken", C::DataConflict, R::AfterResolve),
+            ("repair.not_needed", C::UserFixable, R::Never),
+            ("inbox.unknown", C::UserFixable, R::AfterResolve),
+        ];
+        let specs = [
+            &ASSET_IN_USE,
+            &ASSET_TRASHED,
+            &REF_REDIRECT_BROKEN,
+            &COLLECTION_UNKNOWN,
+            &COLLECTION_NAME_TAKEN,
+            &REPAIR_NOT_NEEDED,
+            &INBOX_UNKNOWN,
+        ];
+        for (spec, (code, category, retry)) in specs.iter().zip(want) {
+            assert_eq!(
+                (spec.code, spec.category, spec.retry),
+                (code, category, retry)
+            );
+            assert!(!spec.provisional, "{code}");
+            assert!(ALL.contains(spec), "{code} is in ALL");
+            assert!(
+                TABLE.contains(&(code, category, retry, false)),
+                "{code} is in the table"
+            );
+        }
+        let at: Vec<usize> = specs
+            .iter()
+            .map(|s| ALL.iter().position(|a| a == s).unwrap())
+            .collect();
+        assert!(
+            at.windows(2).all(|w| w[0] < w[1]),
+            "Appendix D's order: {at:?}"
+        );
+        assert_eq!(
+            ASSET_IN_USE_MESSAGE,
+            "This asset is in use by a job, a sign-off or an open document. Try again when that is done."
         );
     }
 
