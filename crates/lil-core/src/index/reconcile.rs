@@ -61,8 +61,9 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    AssetRow, FileKind, FileRow, FileState, Index, IndexError, Mismatch, PARKED_MAX, ParkedPath,
-    ReconcileOrder, ReconcileReport, Scope, asset_of, kind_of, lock, repair, sql,
+    AssetRow, FileKind, FileRow, FileState, Index, IndexError, Mismatch, OnDisk, PARKED_MAX,
+    ParkedPath, ReconcileOrder, ReconcileReport, Scope, asset_folder_on_disk, asset_of, kind_of,
+    lock, repair, sql,
 };
 use crate::store::{ChangeKind, StoreEvent, WsPath, lfs_pointer_oid, path_key};
 
@@ -1223,18 +1224,10 @@ pub(super) fn refresh_repairs(tx: &Transaction<'_>, root: &Path) -> rusqlite::Re
     Ok(())
 }
 
-/// Whether the asset folder of `row` is confirmed absent on disk: its attributes can't be read
-/// because it isn't there (`NotFound`, which a missing parent folder gives too). Any other
-/// error (access denied, a sharing violation, …) says nothing about absence.
+/// Whether the asset folder of `row` is confirmed absent on disk ([`OnDisk::Absent`]): any
+/// other answer (there, a file, access denied, …) says nothing about absence.
 fn folder_absent(root: &Path, row: &AssetRow) -> bool {
-    let Ok(rel) = WsPath::parse(&format!("projects/{}/assets/{}", row.project, row.asset_id))
-    else {
-        return false;
-    };
-    matches!(
-        lil_platform::fs::attributes(&rel.abs(root)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound
-    )
+    asset_folder_on_disk(root, &row.project, &row.asset_id) == OnDisk::Absent
 }
 
 /// `projects/<p>/assets/<a>/candidates/<run>` of a run file's path.

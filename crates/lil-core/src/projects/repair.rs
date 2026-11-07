@@ -11,8 +11,10 @@
 //! other folders with its creation UUID) is reconciled first, so a stale index row never
 //! decides, and the asset's `repair` is read from the index after that.
 //!
-//! - [`accept_move`] (on a `moved` asset whose old folder is not on disk, whatever the index
-//!   says, else `repair.not_needed`; ruling T8 R1): (1) appends a redirect
+//! - [`accept_move`] (on a `moved` asset whose old place is confirmed empty on disk, whatever
+//!   the index says: its attributes give `NotFound`, so a folder that can't be read or listed,
+//!   or a file at that name, refuses too; else `repair.not_needed`, saying what to remove or
+//!   rename; rulings T8 R1, R2-1, M-b): (1) appends a redirect
 //!   from the old place to the folder, unless the newest redirect from the old place already
 //!   leads there; (2) renames the manifest file to `<asset_id>.manifest.json` when it carries
 //!   another name; (3) sets the manifest's `project` and `asset_id` to the folder. Each step is
@@ -47,7 +49,7 @@ use serde_json::Value;
 use super::redirects::{Redirect, append_redirect, parse_name};
 use super::resolve::Resolver;
 use crate::index::repair::{RepairKind, agrees, uuid_key};
-use crate::index::{AssetRow, Index, Scope};
+use crate::index::{AssetRow, Index, OnDisk, Scope, asset_folder_on_disk};
 use crate::store::{Store, StoreError, WsPath};
 
 /// `(project, asset_id)`.
@@ -314,13 +316,30 @@ pub async fn accept_move(
         return Err(refuse());
     };
     let from = parse_name(&from).ok_or_else(|| invalid(format!("{from:?} is not a name")))?;
-    // Whatever the index believes, a folder still at the old place (even one that can't be
-    // read) means this is no move: nothing is written (ruling T8 R1).
-    if let Some((_, Some(there))) = spelled_on_disk(store, &from).await {
+    // Whatever the index believes, the old place must be confirmed empty on disk (its
+    // attributes give `NotFound`, the ghost clean-up's predicate); anything else, a folder (even
+    // an empty one or one that can't be read), a file or an error, means this is no move, and
+    // nothing is written (rulings T8 R1, R2-1). A listing only spells the name in the message.
+    let (root, (p, a)) = (store.root().to_path_buf(), from.clone());
+    let there = tokio::task::spawn_blocking(move || asset_folder_on_disk(&root, &p, &a))
+        .await
+        .unwrap_or(OnDisk::Unknown);
+    if there != OnDisk::Absent {
+        let spelled = match spelled_on_disk(store, &from).await {
+            Some((p, Some(a))) => (p, a),
+            _ => from.clone(),
+        };
+        let what = if there == OnDisk::File {
+            "file"
+        } else {
+            "folder"
+        };
         return Err(not_needed(&format!(
-            "Its old folder projects/{}/assets/{there} is still there, so this folder is no \
-             move; project.status says what it is.",
-            from.0
+            "Something is still at this asset's old place: the {what} projects/{}/assets/{} \
+             (even an empty folder, or one that can't be read, counts), so this folder is no \
+             move. If what is there is left over, remove or rename it, then call \
+             asset.accept_move again; otherwise project.status says what this folder is.",
+            spelled.0, spelled.1
         )));
     }
     let uuid = uuid_key(&row);

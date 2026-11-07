@@ -149,6 +149,36 @@ impl FileState {
     }
 }
 
+/// What is at an asset folder's place on disk, `projects/<project>/assets/<asset_id>` under
+/// `root`, by its attributes alone (`GetFileAttributesW`: no listing of the parent, no handle,
+/// case-insensitive, a reparse point not followed). Only [`OnDisk::Absent`] says nothing is
+/// there; the ghost clean-up and `asset.accept_move` both fail closed on anything else (rulings
+/// T8 R1, R2-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDisk {
+    /// `NotFound` (a missing parent folder gives it too): confirmed absent.
+    Absent,
+    Folder,
+    /// A file (or another non-folder entry) at the folder's name.
+    File,
+    /// Any other error (access denied, a name that isn't a workspace path, …): unknown.
+    Unknown,
+}
+
+/// [`OnDisk`] of the asset folder `projects/<project>/assets/<asset_id>` under `root`.
+pub fn asset_folder_on_disk(root: &Path, project: &str, asset_id: &str) -> OnDisk {
+    const DIRECTORY: u32 = 0x10;
+    let Ok(rel) = WsPath::parse(&format!("projects/{project}/assets/{asset_id}")) else {
+        return OnDisk::Unknown;
+    };
+    match lil_platform::fs::attributes(&rel.abs(root)) {
+        Ok(attrs) if attrs & DIRECTORY != 0 => OnDisk::Folder,
+        Ok(_) => OnDisk::File,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OnDisk::Absent,
+        Err(_) => OnDisk::Unknown,
+    }
+}
+
 /// What a file is, from its path alone (`watch::reconcile` uses this one too, CORE-010).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {

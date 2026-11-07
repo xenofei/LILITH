@@ -1481,7 +1481,125 @@ async fn accept_move_refuses_while_the_old_folder_is_on_disk_whatever_the_index_
     assert_eq!(kind, "moved", "the index believes the old folder gone");
     let e = error(accepted);
     assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(
+        e.message
+            .contains(&format!("folder projects/{P}/assets/{CRANE}"))
+            && e.message.contains("remove or rename"),
+        "{}",
+        e.message
+    );
     assert!(!wrote, "no redirect");
     assert_eq!(std::fs::read(&copy_file).unwrap(), bytes, "nothing written");
     fx.shutdown().await;
+}
+
+/// The paths (`/`-separated, matched as the end of a folder's path) whose listing
+/// [`PathDenyProbe`] refuses.
+static DENY_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// [`SystemProbe`], except that listing a folder whose path ends with an entry of
+/// [`DENY_PATHS`] fails with `PermissionDenied`.
+#[derive(Debug)]
+struct PathDenyProbe;
+
+impl Probe for PathDenyProbe {
+    fn identity(&self, p: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        SystemProbe.identity(p)
+    }
+    fn volume_info(&self, p: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(p)
+    }
+    fn open_read(&self, p: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(p)
+    }
+    fn long_name(&self, p: &Path) -> std::io::Result<PathBuf> {
+        SystemProbe.long_name(p)
+    }
+    fn reparse_tag(&self, p: &Path) -> std::io::Result<Option<u32>> {
+        SystemProbe.reparse_tag(p)
+    }
+    fn read_dir(&self, dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let path = path.trim_end_matches('/');
+        let denied = DENY_PATHS.lock().unwrap().clone();
+        if denied.iter().any(|d| path.ends_with(d.as_str())) {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        SystemProbe.read_dir(dir)
+    }
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 R2-1, M-a, M-b)
+async fn accept_move_refuses_when_the_old_assets_folder_cant_be_listed() {
+    // The crane copied into another project. The old project's `assets` folder and the
+    // crane's own can't be listed: the index keeps the crane as a gone row with the copy's
+    // UUID, so the harbor copy reads `moved`, and no listing can show the crane is there.
+    // The guard asks the old folder itself (its attributes) and fails closed.
+    *DENY_PATHS.lock().unwrap() = Vec::new();
+    let fx = Fx::with_probe(
+        |ws| {
+            write_file(
+                &file(ws, "projects/harbor/project.yaml"),
+                b"name: Harbor\nslug: harbor\ntype: media\nstatus: active\nlinks: []\ncreated: 2026-10-01\n",
+            );
+            outside_mkdir(&file(ws, "projects/harbor/assets"));
+            outside_copy(&asset_dir(ws, CRANE), &asset_dir_in(ws, "harbor", CRANE));
+        },
+        Arc::new(PathDenyProbe),
+    );
+    fx.open().await.index.ready().await;
+    *DENY_PATHS.lock().unwrap() = vec![
+        "projects/sketchbook/assets".into(),
+        "sketchbook/assets/chr_paper_crane".into(),
+    ];
+    fx.reconcile().await;
+    let accepted = fx
+        .call(
+            "asset.accept_move",
+            json!({"project": "harbor", "asset_id": CRANE}),
+        )
+        .await;
+    let wrote = fx.redirects();
+    *DENY_PATHS.lock().unwrap() = Vec::new();
+    let e = error(accepted);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(wrote.is_none(), "{wrote:?}");
+    assert!(
+        e.message
+            .contains(&format!("folder projects/{P}/assets/{CRANE}"))
+            && e.message.contains("remove or rename"),
+        "names the folder and what to do: {}",
+        e.message
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 M-b)
+async fn accept_move_says_what_to_do_about_a_file_at_the_old_place() {
+    // A genuine move, but a file now sits at the old folder's name: refused, naming the file
+    // and what to do; once it is removed, the same call goes ahead.
+    let fx = Fx::with(crane_renamed);
+    let stray = asset_dir(&fx.ws, CRANE);
+    write_file(&stray, b"not a folder");
+    let e = error(fx.accept(ORIGAMI).await);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(
+        e.message
+            .contains(&format!("file projects/{P}/assets/{CRANE}"))
+            && e.message.contains("remove or rename")
+            && e.message.contains("asset.accept_move again"),
+        "{}",
+        e.message
+    );
+    assert!(fx.redirects().is_none());
+    outside_remove_file(&stray);
+    structured(fx.accept(ORIGAMI).await);
+    assert_eq!(entries(&fx.redirects().unwrap()), 1);
+    fx.shutdown().await;
+}
+
+/// Removes a file as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn outside_remove_file(path: &Path) {
+    std::fs::remove_file(path).unwrap_or_else(|e| panic!("cannot remove {}: {e}", path.display()));
 }
