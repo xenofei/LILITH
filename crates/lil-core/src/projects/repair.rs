@@ -39,19 +39,21 @@
 //! two looks are taken again under the new UUID's lock, at most twice more; then the call is
 //! refused with `store.hash_conflict` (ruling T8 A-L3).
 //!
-//! `accept_move` never sends one asset's refs to another (ruling T8 A-H1): a folder that another
-//! lone folder (another asset) also claims to have moved from is `invalid` in the index, and
-//! the refusal names the other claimant; and before its redirect, holding the lock of the old
-//! name ([`Store::redirect_from_lock`], taken last), it follows where old refs to that name lead
-//! now: a chain that ends at a live asset folder with another creation UUID refuses, naming
-//! that asset (a chain that ends nowhere is fine). The
+//! `accept_move` never sends one asset's refs to another (rulings T8 A-H1, A-RM1, A-RM2): a
+//! folder whose old place another asset's folder (another creation UUID, or none) also names is
+//! `invalid` in the index, and the refusal names the other claimants (suggesting only a valid
+//! name, A-RL1); and before its redirect, holding the lock of the old name
+//! ([`Store::redirect_from_lock`], taken last), it follows where old refs to that name lead now:
+//! a chain that ends at a live asset folder with another creation UUID refuses, naming that
+//! asset, and so does one that ends in the trash (`asset.trashed`), naming the entry; a chain
+//! that ends nowhere (`target_missing`) or loops (`cycle`) is fine. The
 //! manifest edit re-checks that the manifest still has the creation UUID (and, for a move, the
 //! place) the decision was made on; one changed meanwhile is `store.hash_conflict`.
 
 use lil_platform::fs::Probe;
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{
-    ASSET_UNKNOWN, PARAMS_INVALID, REPAIR_NOT_NEEDED, REPAIR_NOT_NEEDED_MESSAGE,
+    ASSET_TRASHED, ASSET_UNKNOWN, PARAMS_INVALID, REPAIR_NOT_NEEDED, REPAIR_NOT_NEEDED_MESSAGE,
     STORE_HASH_CONFLICT,
 };
 use lil_schema::{Actor, Manifest, is_asset_id, is_slug};
@@ -290,16 +292,17 @@ fn place_of(row: &AssetRow) -> String {
     )
 }
 
-/// The other lone disagreeing folders that name the same place as `row` (without regard to
-/// case) with another creation UUID: the other claimants of an `invalid` folder (ruling T8
-/// A-H1).
+/// The other live disagreeing folders, in a group or alone, whose manifests name the same
+/// place as `row` (without regard to case) with another creation UUID or none: the other
+/// claimants of an `invalid` folder (rulings T8 A-H1, A-RM1). Every disagreeing folder needs a
+/// repair, so the index's repair rows hold them all (a gone folder has none).
 async fn claimants(index: &Index, row: &AssetRow) -> Result<Vec<String>, ErrorBody> {
     if !row.manifest_parses || agrees(row) || uuid_key(row).is_none() {
         return Ok(Vec::new());
     }
     let mine = place_of(row).to_ascii_lowercase();
     Ok(index
-        .repairs(&["invalid"])
+        .repairs(&["moved", "copy", "duplicate_uuid", "invalid"])
         .await
         .map_err(|e| e.to_error(""))?
         .iter()
@@ -307,11 +310,52 @@ async fn claimants(index: &Index, row: &AssetRow) -> Result<Vec<String>, ErrorBo
             (r.project.as_str(), r.asset_id.as_str())
                 != (row.project.as_str(), row.asset_id.as_str())
         })
-        .filter(|r| r.manifest_parses && !agrees(r) && uuid_key(r).is_some())
+        .filter(|r| r.manifest_parses && !agrees(r))
         .filter(|r| uuid_key(r) != uuid_key(row))
         .filter(|r| place_of(r).to_ascii_lowercase() == mine)
         .map(|r| format!("{}/{}", r.project, r.asset_id))
         .collect())
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn listed(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+/// The refusal of a folder whose old place other assets' folders (`others`) also name (ruling
+/// T8 A-RL1): it reads right for one or several, and suggests only a valid name: the place's
+/// canonical lowercase spelling, or, when even that isn't a valid `<project>/<asset_id>`, that
+/// a valid name comes first.
+fn claimants_refusal(place: &str, others: &[String]) -> String {
+    let canonical = place.to_ascii_lowercase();
+    let valid = canonical
+        .split_once('/')
+        .is_some_and(|(p, a)| is_slug(p) && is_asset_id(a));
+    let who = listed(others);
+    let (verb, pronoun, are) = if others.len() == 1 {
+        ("names", "it", "it is another asset")
+    } else {
+        ("name", "they", "they are other assets")
+    };
+    let way_out = if valid {
+        format!(
+            "Rename the folder of the asset that had {canonical} back to {canonical}; then make \
+             each other one independent (asset.make_independent), or, for one without a \
+             creation UUID, set its manifest's asset_id to its folder by hand."
+        )
+    } else {
+        "That place isn't a valid asset name, so none of them can move back there: give the \
+         right folder's manifest a valid asset_id and project by hand first."
+            .to_string()
+    };
+    format!(
+        "{who} also {verb} {canonical} as the folder {pronoun} moved from, and {are} (another \
+         creation UUID, or none), so this folder is no move from there. {way_out}"
+    )
 }
 
 fn dir_of(name: &Name) -> Result<WsPath, ErrorBody> {
@@ -397,14 +441,7 @@ pub async fn accept_move(
         if others.is_empty() {
             return Err(refuse());
         }
-        let place = place_of(&row);
-        return Err(not_needed(&format!(
-            "{} also names {place} as the folder it moved from, and it is another asset (its \
-             creation UUID differs), so neither is a move. Rename the folder that is {place}'s \
-             asset back to {place}; the other is then a copy of it, for \
-             asset.make_independent.",
-            others.join(", ")
-        )));
+        return Err(not_needed(&claimants_refusal(&place_of(&row), &others)));
     };
     let from = parse_name(&from).ok_or_else(|| invalid(format!("{from:?} is not a name")))?;
     // Whatever the index believes, the old place must be confirmed empty on disk (its
@@ -445,11 +482,32 @@ pub async fn accept_move(
     }
     let newest_to = resolver.newest_from(&from.0, &from.1).map(|r| r.to.clone());
     let present = newest_to.as_ref() == Some(&to);
-    // Old refs to the old name already lead somewhere else: never to another live asset.
-    if newest_to.is_some()
-        && !present
-        && let Ok(end) = resolver.resolve_name(&from.0, &from.1).await
+    // Old refs to the old name already lead somewhere else: never to another live asset, nor
+    // over an asset in the trash (ruling T8 A-RM2); a chain that ends nowhere (`target_missing`)
+    // or loops (`cycle`) is fine.
+    let end = if newest_to.is_some() && !present {
+        Some(resolver.resolve_name(&from.0, &from.1).await)
+    } else {
+        None
+    };
+    if let Some(Err(e)) = &end
+        && e.code == ASSET_TRASHED.code
     {
+        let entry = e
+            .data
+            .as_ref()
+            .and_then(|d| d.get("entry_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        return Err(not_needed(&format!(
+            "Old refs to {}/{} lead to an asset in the trash (entry {entry}), so this folder \
+             can't take them over by a move. Restore that entry with trash.restore, or empty it \
+             from the trash, then call asset.accept_move again.",
+            from.0, from.1
+        )));
+    }
+    if let Some(Ok(end)) = end {
         let same_folder =
             end.project.eq_ignore_ascii_case(&to.0) && end.asset_id.eq_ignore_ascii_case(&to.1);
         let end_uuid = index

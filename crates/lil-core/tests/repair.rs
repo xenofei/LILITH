@@ -1632,7 +1632,9 @@ async fn two_claimants_are_refused(fx: &Fx, a: &str, b: &str) {
         let e = error(fx.accept(me).await);
         assert_eq!(e.code, "repair.not_needed", "{me}: {e:?}");
         assert!(
-            e.message.contains(&format!("{P}/{other}")),
+            e.message.contains(&format!(
+                "{P}/{other} also names {P}/{CRANE} as the folder it moved from"
+            )),
             "{me}: names the other claimant: {}",
             e.message
         );
@@ -1821,5 +1823,182 @@ async fn the_evidence_of_another_asset_at_an_old_place_is_kept() {
     assert_eq!(fx.get(ORIGAMI).await["repair"]["kind"], "invalid");
     assert_eq!(error(fx.accept(ORIGAMI).await).code, "repair.not_needed");
     assert!(fx.redirects().is_none(), "no redirect from the crane");
+    fx.shutdown().await;
+}
+
+/// Asserts that `asset` isn't `moved` but `invalid`, that accept_move refuses it naming each of
+/// `others`, and that no redirect is written.
+async fn claimant_is_refused(fx: &Fx, asset: &str, others: &[&str]) {
+    let status = fx.status().await;
+    assert_eq!(status["moved"], json!([]), "{status}");
+    assert_eq!(fx.get(asset).await["repair"]["kind"], "invalid", "{asset}");
+    let e = error(fx.accept(asset).await);
+    assert_eq!(e.code, "repair.not_needed", "{asset}: {e:?}");
+    for other in others {
+        assert!(
+            e.message.contains(&format!("{P}/{other}")),
+            "{asset}: names {other}: {}",
+            e.message
+        );
+    }
+    assert!(fx.redirects().is_none(), "no redirect");
+}
+
+const LAMP_OLD: &str = "prop_lamp_old";
+const LAMP_NEW: &str = "prop_lamp_new";
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 A-RM1, warm)
+async fn a_new_asset_at_a_moved_and_copied_name_is_no_move_warm() {
+    // The crane (its UUID) is copied and renamed outside: a duplicate pair, both naming the
+    // crane. A new asset (another UUID) made at the crane's name is then renamed away too: it
+    // isn't alone in naming the crane's place, so it is no move.
+    let fx = Fx::with(|_| {});
+    fx.open().await.index.ready().await;
+    outside_copy(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, COPY));
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    outside_copy(&asset_dir(&fx.ws, ORIGAMI), &asset_dir(&fx.ws, CRANE));
+    hand_edit(&asset_dir(&fx.ws, CRANE), |m| {
+        m["creation_uuid"] = json!(OTHER_UUID);
+    });
+    fx.reconcile().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, XENON));
+    fx.reconcile().await;
+    claimant_is_refused(&fx, XENON, &[ORIGAMI, COPY]).await;
+    let fx = fx.restart().await;
+    fx.reconcile().await;
+    claimant_is_refused(&fx, XENON, &[ORIGAMI, COPY]).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 A-RM1, cold)
+async fn a_new_asset_at_a_moved_and_copied_name_is_no_move_cold() {
+    let fx = Fx::with(|ws| {
+        outside_copy(&asset_dir(ws, CRANE), &asset_dir(ws, COPY));
+        crane_renamed(ws);
+        outside_copy(&asset_dir(ws, ORIGAMI), &asset_dir(ws, XENON));
+        hand_edit(&asset_dir(ws, XENON), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+    });
+    claimant_is_refused(&fx, XENON, &[ORIGAMI, COPY]).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, CORE-047, ARCH-125 (T8 A-RM1, warm)
+async fn a_new_asset_at_a_legacy_assets_old_name_is_no_move_warm() {
+    // The lamp (a legacy manifest, no UUID) is renamed outside; a new asset (a UUID) made at
+    // the lamp's name is renamed away too. The legacy folder still names that place: another
+    // asset, so the new one is no move.
+    let fx = Fx::with(|_| {});
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, LAMP), &asset_dir(&fx.ws, LAMP_OLD));
+    fx.reconcile().await;
+    outside_copy(&asset_dir(&fx.ws, LAMP_OLD), &asset_dir(&fx.ws, LAMP));
+    hand_edit(&asset_dir(&fx.ws, LAMP), |m| {
+        m["creation_uuid"] = json!(OTHER_UUID);
+    });
+    fx.reconcile().await;
+    outside_rename(&asset_dir(&fx.ws, LAMP), &asset_dir(&fx.ws, LAMP_NEW));
+    fx.reconcile().await;
+    claimant_is_refused(&fx, LAMP_NEW, &[LAMP_OLD]).await;
+    let fx = fx.restart().await;
+    fx.reconcile().await;
+    claimant_is_refused(&fx, LAMP_NEW, &[LAMP_OLD]).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, CORE-047, ARCH-125 (T8 A-RM1, cold)
+async fn a_new_asset_at_a_legacy_assets_old_name_is_no_move_cold() {
+    let fx = Fx::with(|ws| {
+        outside_rename(&asset_dir(ws, LAMP), &asset_dir(ws, LAMP_OLD));
+        outside_copy(&asset_dir(ws, LAMP_OLD), &asset_dir(ws, LAMP_NEW));
+        hand_edit(&asset_dir(ws, LAMP_NEW), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+    });
+    claimant_is_refused(&fx, LAMP_NEW, &[LAMP_OLD]).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125, CORE-157 (T8 A-RM2)
+async fn accept_move_never_redirects_a_trashed_assets_old_name() {
+    // crane -> xenon accepted, then xenon trashed: old refs to the crane answer `asset.trashed`.
+    // A folder of another asset naming the crane then appears: accepting it would send those
+    // refs to it, so it is refused, naming the trash entry.
+    let fx = Fx::with(|ws| {
+        hand_edit(&asset_dir(ws, CRANE), |m| m["locks"] = json!([]));
+        outside_copy(&asset_dir(ws, CRANE), &file(ws, "backup_crane"));
+        hand_edit(&file(ws, "backup_crane"), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+    });
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, XENON));
+    fx.reconcile().await;
+    structured(fx.accept(XENON).await);
+    let trashed = fx
+        .ok(
+            "test.trash",
+            json!({ "path": format!("projects/{P}/assets/{XENON}") }),
+        )
+        .await;
+    let entry = trashed["entry_id"].as_str().unwrap().to_string();
+    outside_rename(&file(&fx.ws, "backup_crane"), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    let e = error(fx.accept(ORIGAMI).await);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(
+        e.message.contains(&entry) && e.message.contains("trash.restore"),
+        "names the trash entry: {}",
+        e.message
+    );
+    assert_eq!(entries(&fx.redirects().unwrap()), 1, "no second redirect");
+    let r = fx
+        .call(
+            "ref.resolve",
+            json!({"ref": format!("lil://{}/{P}/{CRANE}@1.0.0", fx.ws_id())}),
+        )
+        .await;
+    assert_eq!(error(r).code, "asset.trashed");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 A-RL1)
+async fn the_claimants_refusal_reads_right_and_suggests_only_valid_names() {
+    // Three claimants of the crane's place, one naming it by case only (`Chr_Paper_Crane`):
+    // each refusal names the other two in a sentence that reads right for several, and never
+    // suggests a name that isn't a valid asset id.
+    let fx = Fx::with(|ws| {
+        crane_renamed(ws);
+        outside_copy(&asset_dir(ws, ORIGAMI), &asset_dir(ws, XENON));
+        hand_edit(&asset_dir(ws, XENON), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+        outside_copy(&asset_dir(ws, ORIGAMI), &asset_dir(ws, "chr_third"));
+        hand_edit(&asset_dir(ws, "chr_third"), |m| {
+            m["creation_uuid"] = json!("44444444-5555-4666-8777-888888888888");
+            m["asset_id"] = json!("Chr_Paper_Crane");
+        });
+    });
+    let e = error(fx.accept("chr_third").await);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    let m = &e.message;
+    assert!(
+        m.contains(&format!("{P}/{ORIGAMI} and {P}/{XENON} also name")),
+        "plural: {m}"
+    );
+    assert!(
+        !m.contains("Chr_Paper_Crane"),
+        "no invalid name suggested: {m}"
+    );
+    assert!(m.contains(&format!("back to {P}/{CRANE}")), "{m}");
+    let e = error(fx.accept(XENON).await);
+    assert!(
+        e.message
+            .contains(&format!("{P}/{ORIGAMI} and {P}/chr_third also name")),
+        "{}",
+        e.message
+    );
     fx.shutdown().await;
 }

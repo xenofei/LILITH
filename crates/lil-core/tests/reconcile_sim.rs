@@ -1014,6 +1014,15 @@ fn check_kinds(rows: &[AssetRow], gone: &[AssetRow], got: &HashMap<(String, Stri
                     !other_gone(&from, &uuid_of(r)),
                     "moved, but the index knows another asset at {from:?}: {r:?} {gone:?}"
                 );
+                // No other live folder of another asset (another UUID, or none) has a manifest
+                // naming `from` (T8 A-RM1).
+                assert!(
+                    !rows.iter().any(|o| key_of(o) != here
+                        && !agrees(o)
+                        && uuid_of(o) != uuid_of(r)
+                        && place_of(o).is_some_and(|q| same_name(&q, &from))),
+                    "moved, but another asset's folder also names {from:?}: {r:?}"
+                );
             }
             Some(RepairKind::Copy { other }) => {
                 assert!(!agrees(r), "{r:?}");
@@ -1063,19 +1072,12 @@ fn check_kinds(rows: &[AssetRow], gone: &[AssetRow], got: &HashMap<(String, Stri
             && !same_name(&p, &here)
             && !live(&p)
         {
-            // Another lone folder (another asset) naming the same place: neither moved.
-            let lone = |o: &AssetRow| {
-                uuid_of(o).is_some_and(|u| {
-                    rows.iter()
-                        .filter(|x| uuid_of(x).as_ref() == Some(&u))
-                        .count()
-                        == 1
-                })
-            };
+            // Another folder of another asset (another UUID, or none), in a group or alone,
+            // whose manifest also names that place: no move (T8 A-RM1).
             let other_claimant = rows.iter().any(|o| {
                 key_of(o) != here
-                    && lone(o)
                     && !agrees(o)
+                    && uuid_of(o) != uuid_of(r)
                     && place_of(o).is_some_and(|q| same_name(&q, &p))
             });
             if other_gone(&p, &uuid_of(r)) || other_claimant {
