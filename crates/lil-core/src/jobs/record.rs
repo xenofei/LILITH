@@ -960,12 +960,48 @@ async fn list_columns(
             let run = || -> rusqlite::Result<Vec<JobRow>> {
                 let mut sql_text = format!("SELECT {columns} FROM jobs WHERE 1 = 1");
                 let mut values: Vec<rusqlite::types::Value> = Vec::new();
+                let json_list = |names: &[&str]| -> rusqlite::types::Value {
+                    serde_json::to_string(names)
+                        .expect("names serialise")
+                        .into()
+                };
+                if let Some(sel) = &f.status {
+                    // Any of its statuses or substatuses (Appendix H "Jobs"); a name it doesn't
+                    // take selects nothing (`Jobs::list` refuses one first).
+                    // The placeholders follow `values`, as `bind`'s do (fix round 1, M3).
+                    let (statuses, substatuses) = sel.columns().unwrap_or_default();
+                    values.push(json_list(&statuses));
+                    let statuses_at = values.len();
+                    values.push(json_list(&substatuses));
+                    let substatuses_at = values.len();
+                    sql_text.push_str(&format!(
+                        " AND (status IN (SELECT value FROM json_each(?{statuses_at})) \
+                         OR substatus IN (SELECT value FROM json_each(?{substatuses_at})))"
+                    ));
+                }
                 let mut bind = |sql_text: &mut String, clause: &str, v: rusqlite::types::Value| {
                     values.push(v);
                     sql_text.push_str(&format!(" AND {clause} ?{}", values.len()));
                 };
-                if let Some(status) = f.status {
-                    bind(&mut sql_text, "status =", status.wire().to_string().into());
+                if let Some(origin) = &f.origin {
+                    // The surface of who started it (`StartedBy`, the `origin` column).
+                    let names = origin.names();
+                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                    bind(
+                        &mut sql_text,
+                        "json_extract(origin, '$.surface') IN (SELECT value FROM json_each(",
+                        json_list(&names),
+                    );
+                    sql_text.push_str("))");
+                }
+                match f.dispatched {
+                    Some(true) => {
+                        sql_text.push_str(" AND (status = 'running' OR external_id IS NOT NULL)");
+                    }
+                    Some(false) => {
+                        sql_text.push_str(" AND status <> 'running' AND external_id IS NULL");
+                    }
+                    None => {}
                 }
                 if let Some(kind) = &f.kind {
                     bind(&mut sql_text, "kind =", kind.clone().into());
@@ -1009,13 +1045,14 @@ async fn list_columns(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
     use crate::state::{OnFatal, StateScope};
 
-    fn row(id: &str) -> JobRow {
+    /// A queued `waiting` row of kind `k` (also the runner's tests' row).
+    pub(crate) fn row(id: &str) -> JobRow {
         JobRow {
             seq: 0,
             job_id: id.to_string(),

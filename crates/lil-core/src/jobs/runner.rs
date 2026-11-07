@@ -41,12 +41,12 @@ use super::record::{self, Change, Inserted, JobRow, LiveView, RunReport};
 use super::scheduler::watchdog_limit;
 use super::{
     Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, CancelSelector, DISK_MARGIN_BYTES, EngineKind,
-    ExecWindow, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion,
-    JobCtx, JobDone, JobEndHook, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin,
-    JobResult, JobSpec, JobStatus, JobSummary, Lane, ListOrder, MAX_ATTEMPTS, MAX_CANCEL_IDS,
-    MAX_WAIT, MoveTo, NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob,
-    Reservations, RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, StartedBy, Substatus,
-    Subtask, Surface, Withdraw, WithdrawOutcome, backoff,
+    ExecWindow, FINISHED, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller,
+    JobCompletion, JobCtx, JobDone, JobEndHook, JobFailure, JobFilter, JobFuture, JobHandler,
+    JobId, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane, ListOrder, MAX_ATTEMPTS,
+    MAX_CANCEL_IDS, MAX_WAIT, MoveTo, NOTHING_CHANGED, NoReservations, Priority, Progress,
+    RefusedJob, Reservations, RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, STATUS_NAMES,
+    StartedBy, StatusSel, Substatus, Subtask, Surface, Withdraw, WithdrawOutcome, backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
@@ -954,7 +954,7 @@ impl Shared {
     /// The restart hold of one row ([`Shared::recover_rows`]): `true` when the job is queued
     /// again, held, and shown `queue_paused`.
     async fn hold(self: &Arc<Self>, row: &JobRow, scope: &Scope) -> Result<bool, StateError> {
-        if !holdable(row) || self.draining() {
+        if !self.restart_holds(row, scope).await || self.draining() {
             return Ok(false);
         }
         let Some(kind) = self.static_kind(&row.kind) else {
@@ -2266,7 +2266,7 @@ impl Shared {
         if let Some(lane) = lane {
             let (me, id) = (self.clone(), id.to_string());
             tokio::spawn(async move {
-                me.withdraw_one(&id).await;
+                me.withdraw_one(&id, None).await;
                 me.publish_queue(lane);
             });
         }
@@ -2372,6 +2372,52 @@ impl Shared {
         if !state.reasons.is_empty() {
             state.withdrawn += 1;
         }
+    }
+
+    /// `JobCtx::lane_paused`: whether a reason of job `id`'s lane covers its class now.
+    pub(crate) fn lane_paused(&self, id: &str) -> bool {
+        let q = self.queue();
+        q.jobs.get(id).is_some_and(|a| {
+            !q.lanes[a.info.spec.lane.index()]
+                .holding(a.info.spec.priority)
+                .is_empty()
+        })
+    }
+
+    /// `JobCtx::withdraw_waited_out` (NF-24, CORE-160; Appendix H "Jobs"): while a reason of its
+    /// lane covers running job `id`, which is waiting out `prompt_id`, the prompt of the job it
+    /// re-runs, that prompt is withdrawn as a pause withdraws a pending one
+    /// ([`Shared::withdraw_one`]: the engine's [`Withdraw`], the fail point, the row, the
+    /// count, the attempt's end). A job with external side effects, or one ending, cancelled,
+    /// preempted or held already, is left alone (`NotPending`). The lane's state is published.
+    pub(crate) async fn withdraw_waited_out(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: &str,
+    ) -> WithdrawOutcome {
+        let lane = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            let Some(a) = jobs.get_mut(id) else {
+                return WithdrawOutcome::NotPending;
+            };
+            let lane = a.info.spec.lane;
+            if lanes[lane.index()].holding(a.info.spec.priority).is_empty()
+                || !a.running
+                || a.completing
+                || a.cancelling
+                || a.preempted
+                || a.withdrawal != Withdrawal::None
+                || a.info.spec.external_side_effects
+            {
+                return WithdrawOutcome::NotPending;
+            }
+            a.withdrawal = Withdrawal::Deciding;
+            lane
+        };
+        let outcome = self.withdraw_one(id, Some(prompt_id)).await;
+        self.publish_queue(lane);
+        outcome
     }
 
     /// `JobCtx::settle_withdrawn`: the prompt a pause withdrew is known gone (`follow` is
@@ -2696,7 +2742,9 @@ impl Shared {
     /// its `abort` means anything: an error is logged and the withdrawal goes on), its row
     /// changes: the engine id moves to `withdrawn_id`, kept until the next attempt knows the
     /// old prompt gone (CORE-120), and it is `queue_paused` (Appendix G "Withdrawal").
-    async fn withdraw_one(self: &Arc<Self>, id: &str) {
+    /// `waited_out` (NF-24, [`Shared::withdraw_waited_out`]) names the earlier prompt a retry
+    /// waits out instead of the row's own engine id. The engine's answer comes back.
+    async fn withdraw_one(self: &Arc<Self>, id: &str, waited_out: Option<&str>) -> WithdrawOutcome {
         let decided = |me: &Self, w: Withdrawal| {
             if let Some(a) = me.queue().jobs.get_mut(id)
                 && a.withdrawal == Withdrawal::Deciding
@@ -2710,21 +2758,33 @@ impl Shared {
             .get(id)
             .and_then(|a| Some((a.info.scope.clone(), a.info.spec.engine?, a.info.spec.lane)))
         else {
-            return decided(self, Withdrawal::None);
+            decided(self, Withdrawal::None);
+            return WithdrawOutcome::NotPending;
         };
         let withdrawer = read(&self.withdrawers).get(&engine).cloned();
-        let external_id = match record::get(scope.db(), id).await {
-            Ok(Some(row)) if row.substatus == Some(Substatus::QueuedInEngine) => row.external_id,
-            _ => None,
+        let external_id = match waited_out {
+            Some(prompt_id) => Some(prompt_id.to_string()),
+            None => match record::get(scope.db(), id).await {
+                Ok(Some(row)) if row.substatus == Some(Substatus::QueuedInEngine) => {
+                    row.external_id
+                }
+                _ => None,
+            },
         };
         let (Some(withdrawer), Some(external_id)) = (withdrawer, external_id) else {
-            return decided(self, Withdrawal::None);
+            decided(self, Withdrawal::None);
+            return WithdrawOutcome::NotPending;
         };
         let job = JobId(id.to_string());
         let outcome = withdrawer.withdraw(&job, &external_id).await;
         if outcome != WithdrawOutcome::Withdrawn {
-            tracing::info!(job_id = id, outcome = ?outcome, "a paused lane's prompt was not withdrawn; it runs on");
-            return decided(self, Withdrawal::None);
+            // A waited-out prompt is asked about at each poll: only an answer that changes
+            // something is logged (fix round 1, M4).
+            if waited_out.is_none() || outcome == WithdrawOutcome::AlreadyStarted {
+                tracing::info!(job_id = id, outcome = ?outcome, "a paused lane's prompt was not withdrawn; it runs on");
+            }
+            decided(self, Withdrawal::None);
+            return outcome;
         }
         if let Err(e) = self.failpoints.hit("jobs.after_withdraw") {
             tracing::warn!(job_id = id, error = %e, "fail point jobs.after_withdraw");
@@ -2738,7 +2798,7 @@ impl Shared {
                     a.withdrawal = Withdrawal::Withdrawn;
                     a.held_shown = true;
                 }
-                _ => return,
+                _ => return outcome,
             }
         }
         tracing::info!(job_id = id, prompt_id = %external_id, "a paused lane's pending prompt was withdrawn");
@@ -2758,6 +2818,24 @@ impl Shared {
         {
             a.cancel.send_replace(true);
         }
+        outcome
+    }
+
+    /// Whether a restart holds `row` ([`holdable`]); for a retry still waiting for the prompt
+    /// of the job it re-runs, only when that job has no external side effects either
+    /// (controller ruling, audit fix round 1: such work stays your decision after a restart).
+    /// A row of that job that can't be read counts as having them.
+    async fn restart_holds(&self, row: &JobRow, scope: &Scope) -> bool {
+        if !holdable(row) {
+            return false;
+        }
+        match (&row.retry_of, row.waits_for_earlier_prompt()) {
+            (Some(of), true) => matches!(
+                record::get(scope.db(), of).await,
+                Ok(Some(original)) if !original.external_side_effects
+            ),
+            _ => true,
+        }
     }
 
     /// Marks a job of this core that a shutdown leaves behind, as a recovery would; the
@@ -2772,8 +2850,11 @@ impl Shared {
             }
         };
         // The restart hold (P4a-R41): a job that never reached an engine stays queued, so the
-        // next start holds it rather than failing it.
-        if !started && holdable(&row) {
+        // next start holds it rather than failing it. A retry still waiting for the prompt of
+        // the job it re-runs is one, though its attempt runs (audit L2).
+        if (!started || row.waits_for_earlier_prompt())
+            && self.restart_holds(&row, &info.scope).await
+        {
             tracing::info!(job_id = %info.id, "a queued job is left queued at shutdown; the next start holds it");
             return;
         }
@@ -2869,10 +2950,17 @@ const DIRECTOR_TASK_KIND: &str = "assistant_task";
 
 /// Whether a restart holds `row` (P4a-R41; Appendix G "Restart hold"): a queued job that never
 /// reached an engine (`waiting`, `waiting_for_vram` or `queue_paused`, and no engine id),
-/// other than a director task and a job the core submitted itself (Checkpoint A M2).
+/// other than a director task and a job the core submitted itself (Checkpoint A M2). A retry
+/// still waiting for the prompt of the job it re-runs (`submitting` with `retry_of` and
+/// `withdrawn_id`, [`JobRow::waits_for_earlier_prompt`]) and no engine id of its own is one
+/// too (audit L2): its prompt id is persisted before it is posted (CORE-120), so it posted
+/// nothing, and its next attempt asks about `withdrawn_id` before it posts. Such a retry with
+/// external side effects is not (controller ruling: [`Shared::restart_holds`] also checks the
+/// job it re-runs).
 fn holdable(row: &JobRow) -> bool {
     row.status == JobStatus::Queued
-        && never_ran(row.substatus)
+        && (never_ran(row.substatus)
+            || (row.waits_for_earlier_prompt() && !row.external_side_effects))
         && row.external_id.is_none()
         && row.kind != DIRECTOR_TASK_KIND
         && !cores_own(row)
@@ -3211,8 +3299,8 @@ impl Jobs {
     /// page (`None` on the last).
     ///
     /// # Errors
-    /// `params.invalid` for a `limit` outside 1–500 or a cursor this didn't give;
-    /// `state.unavailable`.
+    /// `params.invalid` for a `limit` outside 1–500, a cursor this didn't give or a `status`
+    /// name [`StatusSel`] doesn't take; `state.unavailable`.
     pub async fn list(
         &self,
         caller: &JobCaller,
@@ -3224,6 +3312,15 @@ impl Jobs {
         if !(1..=500).contains(&limit) {
             return Err(params_invalid(
                 format!("limit must be 1–500, not {limit}"),
+                trace_id,
+            ));
+        }
+        if let Some(Err(name)) = f.status.as_ref().map(StatusSel::columns) {
+            return Err(params_invalid(
+                format!(
+                    "status {name:?} is not one of {} or \"{FINISHED}\"",
+                    STATUS_NAMES.join(", ")
+                ),
                 trace_id,
             ));
         }
@@ -3804,7 +3901,7 @@ impl Jobs {
         for id in withdraw {
             let s = s.clone();
             tokio::spawn(async move {
-                s.withdraw_one(&id).await;
+                s.withdraw_one(&id, None).await;
                 s.publish_queue(lane);
             });
         }
@@ -4174,6 +4271,66 @@ mod tests {
     use super::*;
     use lil_platform::fs::SystemProbe;
     use lil_testkit::{FakeClock, SeqIds, TestEnv};
+
+    /// Audit L2 (P4a-R41, CORE-120): the restart hold takes a retry still waiting for the
+    /// prompt of the job it re-runs (it posted nothing of its own), only without external side
+    /// effects (controller ruling: such work stays your decision), and no other shape it
+    /// didn't take before: never a job with an engine id of its
+    /// own, a `submitting` job without both `retry_of` and `withdrawn_id`, a job in its engine
+    /// or ending, a director task, or a job the core submitted itself.
+    #[test] // spec: ARCH-022, CORE-160, CORE-120, CORE-128
+    fn the_restart_hold_takes_a_retry_waiting_for_an_earlier_prompt_and_nothing_else_new() {
+        let waiting = |change: &dyn Fn(&mut JobRow)| {
+            let mut r = record::tests::row("j_2");
+            r.status = JobStatus::Queued;
+            r.substatus = Some(Substatus::Submitting);
+            r.retry_of = Some("j_1".into());
+            r.withdrawn_id = Some("p_old".into());
+            change(&mut r);
+            holdable(&r)
+        };
+        assert!(waiting(&|_| {}));
+        assert!(
+            !waiting(&|r| r.external_side_effects = true),
+            "external work stays your decision after a restart"
+        );
+        assert!(!waiting(&|r| r.external_id = Some("p_new".into())));
+        assert!(!waiting(&|r| {
+            r.external_side_effects = true;
+            r.external_id = Some("p_new".into());
+        }));
+        assert!(!waiting(&|r| r.retry_of = None));
+        assert!(!waiting(&|r| r.withdrawn_id = None));
+        for s in [
+            Substatus::QueuedInEngine,
+            Substatus::Executing,
+            Substatus::Ingesting,
+            Substatus::Retrying { attempt: 1, of: 5 },
+            Substatus::Cancelling,
+            Substatus::InterruptedUnknown,
+        ] {
+            assert!(
+                !waiting(&|r| {
+                    r.status = s.status();
+                    r.substatus = Some(s);
+                }),
+                "{}",
+                s.wire()
+            );
+        }
+        assert!(!waiting(&|r| r.kind = DIRECTOR_TASK_KIND.into()));
+        assert!(!waiting(&|r| {
+            r.started_by = Some(StartedBy {
+                surface: Surface::Core,
+                id: None,
+                step: None,
+            });
+        }));
+        // A plain `submitting` job, as before: not held.
+        let mut plain = record::tests::row("j_3");
+        plain.substatus = Some(Substatus::Submitting);
+        assert!(!holdable(&plain));
+    }
 
     /// Runs `t.hold` jobs until they are cancelled.
     struct Hold;

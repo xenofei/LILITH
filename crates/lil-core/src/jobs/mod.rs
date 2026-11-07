@@ -888,6 +888,25 @@ impl JobCtx {
         self.jobs.hold_if_paused(self.id.as_str(), None, true).await
     }
 
+    /// Whether a reason of the job's lane covers it now (CORE-160): a read only, nothing is
+    /// held.
+    pub fn lane_paused(&self) -> bool {
+        self.jobs.lane_paused(self.id.as_str())
+    }
+
+    /// NF-24 (CORE-160; Appendix H "Jobs"): `prompt_id`, the prompt of the job this one
+    /// re-runs, which the attempt waits out before it posts its own, is withdrawn the way a
+    /// pause withdraws a pending prompt, through the engine's [`Withdraw`], but only while a
+    /// reason of the job's lane covers it and the job has no external side effects (else
+    /// `NotPending`, nothing asked). `Withdrawn`: the job's row is `queue_paused` with the id
+    /// in `withdrawn_id`, the attempt is told to end (the handler returns any error), and the
+    /// job waits again; its next attempt asks about the old prompt before it posts (CORE-120).
+    pub async fn withdraw_waited_out(&self, prompt_id: &str) -> WithdrawOutcome {
+        self.jobs
+            .withdraw_waited_out(self.id.as_str(), prompt_id)
+            .await
+    }
+
     /// The job's prompt `prompt_id` is gone after a withdrawal's delete whose outcome nobody
     /// saw (CORE-160; plan 4a ruling, 2026-10-24): the runner ends the attempt as a withdrawn
     /// one, with the id in `withdrawn_id`. The handler then returns any error.
@@ -1163,12 +1182,151 @@ pub trait JobCompletion: Send + Sync {
     }
 }
 
-/// `jobs.list`'s filter (Appendix F).
+/// `jobs.list`'s `status` (Appendix H "Jobs"): one name (as before), a list (any of), or
+/// `"finished"`. A name is a status (`queued`, `running`, `succeeded`, `failed`, `cancelled`)
+/// or one of the substatuses `interrupted` (a `failed` job) and `interrupted_unknown` (a
+/// `running` one); `finished` is `succeeded`, `failed`, `cancelled`, `interrupted` and
+/// `interrupted_unknown`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusSel {
+    One(String),
+    Many(Vec<String>),
+    Finished,
+}
+
+/// The names [`StatusSel`] takes, besides `finished`.
+pub const STATUS_NAMES: [&str; 7] = [
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "interrupted",
+    "interrupted_unknown",
+];
+
+/// The `status` value that selects every job that is done (Appendix H "Jobs").
+pub const FINISHED: &str = "finished";
+
+impl StatusSel {
+    /// The statuses and the substatuses it selects (a row matches either), or the first name
+    /// that is neither a status, a substatus it takes, nor `finished`.
+    pub fn columns(&self) -> Result<(Vec<&'static str>, Vec<&'static str>), String> {
+        let names: Vec<&str> = match self {
+            StatusSel::One(name) => vec![name.as_str()],
+            StatusSel::Many(names) => names.iter().map(String::as_str).collect(),
+            StatusSel::Finished => vec![FINISHED],
+        };
+        let (mut statuses, mut substatuses) = (Vec::new(), Vec::new());
+        for name in names {
+            match name {
+                FINISHED => {
+                    statuses.extend(["succeeded", "failed", "cancelled"]);
+                    substatuses.extend(["interrupted", "interrupted_unknown"]);
+                }
+                "interrupted" => substatuses.push("interrupted"),
+                "interrupted_unknown" => substatuses.push("interrupted_unknown"),
+                other => match JobStatus::parse(other) {
+                    Some(status) => statuses.push(status.wire()),
+                    None => return Err(other.to_string()),
+                },
+            }
+        }
+        Ok((statuses, substatuses))
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusSel {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<StatusSel, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(String),
+            Many(Vec<String>),
+        }
+        // Named for the caller, not after this type (fix round 1, M5).
+        let raw = Raw::deserialize(d).map_err(|_| {
+            serde::de::Error::custom(
+                "status must be a status name, a list of status names, or \"finished\"",
+            )
+        })?;
+        Ok(match raw {
+            Raw::One(name) if name == FINISHED => StatusSel::Finished,
+            Raw::One(name) => StatusSel::One(name),
+            Raw::Many(names) => StatusSel::Many(names),
+        })
+    }
+}
+
+impl JsonSchema for StatusSel {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "StatusSel".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let mut names: Vec<&str> = STATUS_NAMES.to_vec();
+        names.push(FINISHED);
+        schemars::json_schema!({
+            "anyOf": [
+                {"type": "string", "enum": names},
+                {"type": "array", "items": {"type": "string", "enum": names}},
+            ]
+        })
+    }
+}
+
+/// `jobs.list`'s `origin` (Appendix H "Jobs"): the surface that started a job, or a list of
+/// them (any of). Surfaces are an open set (P4a-R12).
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum OriginSel {
+    One(Surface),
+    Many(Vec<Surface>),
+}
+
+impl<'de> Deserialize<'de> for OriginSel {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<OriginSel, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(Surface),
+            Many(Vec<Surface>),
+        }
+        // Named for the caller, not after this type (fix round 1, M5).
+        let raw = Raw::deserialize(d).map_err(|_| {
+            serde::de::Error::custom("origin must be a surface name or a list of surface names")
+        })?;
+        Ok(match raw {
+            Raw::One(surface) => OriginSel::One(surface),
+            Raw::Many(surfaces) => OriginSel::Many(surfaces),
+        })
+    }
+}
+
+impl OriginSel {
+    /// Its surfaces' wire names.
+    pub fn names(&self) -> Vec<String> {
+        match self {
+            OriginSel::One(s) => vec![s.wire().to_string()],
+            OriginSel::Many(list) => list.iter().map(|s| s.wire().to_string()).collect(),
+        }
+    }
+}
+
+/// `jobs.list`'s filter (Appendix F; Appendix H "Jobs").
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobFilter {
+    /// A status, a list of them (any of), or `"finished"` ([`StatusSel`]).
     #[serde(default)]
-    pub status: Option<JobStatus>,
+    pub status: Option<StatusSel>,
+    /// Who started it: a surface (`panel`, `mcp`, `agent_session`, `cli`, `core`, …) or a list
+    /// of them (any of).
+    #[serde(default)]
+    pub origin: Option<OriginSel>,
+    /// `true`: running or holding an engine id (`external_id`); `false`: neither.
+    #[serde(default)]
+    pub dispatched: Option<bool>,
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
