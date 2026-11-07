@@ -944,6 +944,33 @@ fn uuid_of(r: &AssetRow) -> Option<String> {
         .flatten()
 }
 
+/// The place a live folder claims to have moved from, with the creation UUID it claims it as:
+/// a parsed manifest that disagrees with its folder, by its place and UUID; a manifest that no
+/// longer parses, by the place and UUID the index keeps for it (`None` when it kept none), when
+/// that place isn't its folder (T8 A-R2L1).
+fn claim_of(r: &AssetRow) -> Option<((String, String), Option<String>)> {
+    if r.manifest_parses {
+        return (!agrees(r)).then(|| (place_of(r).expect("it parses"), uuid_of(r)));
+    }
+    let kept = (
+        r.manifest_project
+            .clone()
+            .unwrap_or_else(|| r.project.clone()),
+        r.manifest_asset_id
+            .clone()
+            .unwrap_or_else(|| r.asset_id.clone()),
+    );
+    (kept != key_of(r)).then(|| {
+        (
+            kept,
+            r.creation_uuid
+                .as_ref()
+                .filter(|u| !u.is_empty())
+                .map(|u| u.to_ascii_lowercase()),
+        )
+    })
+}
+
 /// Whether `a` and `b` name one folder (Windows names are case-insensitive).
 fn same_name(a: &(String, String), b: &(String, String)) -> bool {
     a.0.eq_ignore_ascii_case(&b.0) && a.1.eq_ignore_ascii_case(&b.1)
@@ -970,7 +997,9 @@ fn split(name: &str) -> (String, String) {
 /// - `duplicate_uuid {other}`: `other` is another folder with its UUID, and it agrees or its
 ///   group hasn't exactly one agreeing member;
 /// - legacy or unparsed: never `moved`, `copy` or `duplicate_uuid`;
-/// - no two `moved` folders with different creation UUIDs share a `from` (case-insensitively);
+/// - no two `moved` folders with different creation UUIDs share a `from` (case-insensitively),
+///   and no other live folder claims a `moved` folder's `from` with another UUID or none, a
+///   folder whose manifest no longer parses claiming by what the index keeps (T8 A-R2L1);
 /// - and every folder that is healthy by CORE-047 and alone with its UUID needs nothing, every
 ///   folder sharing its UUID needs a repair, and a lone disagreeing folder whose manifest names
 ///   another valid place with no live folder is `moved` when the index knows no other asset
@@ -1018,9 +1047,8 @@ fn check_kinds(rows: &[AssetRow], gone: &[AssetRow], got: &HashMap<(String, Stri
                 // naming `from` (T8 A-RM1).
                 assert!(
                     !rows.iter().any(|o| key_of(o) != here
-                        && !agrees(o)
-                        && uuid_of(o) != uuid_of(r)
-                        && place_of(o).is_some_and(|q| same_name(&q, &from))),
+                        && claim_of(o)
+                            .is_some_and(|(q, u)| same_name(&q, &from) && u != uuid_of(r))),
                     "moved, but another asset's folder also names {from:?}: {r:?}"
                 );
             }
@@ -1076,9 +1104,7 @@ fn check_kinds(rows: &[AssetRow], gone: &[AssetRow], got: &HashMap<(String, Stri
             // whose manifest also names that place: no move (T8 A-RM1).
             let other_claimant = rows.iter().any(|o| {
                 key_of(o) != here
-                    && !agrees(o)
-                    && uuid_of(o) != uuid_of(r)
-                    && place_of(o).is_some_and(|q| same_name(&q, &p))
+                    && claim_of(o).is_some_and(|(q, u)| same_name(&q, &p) && u != uuid_of(r))
             });
             if other_gone(&p, &uuid_of(r)) || other_claimant {
                 assert_eq!(kind, Some(&RepairKind::Invalid), "{r:?} {gone:?}");

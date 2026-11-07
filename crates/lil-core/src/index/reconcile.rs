@@ -1177,19 +1177,11 @@ pub(super) fn refresh_repairs(tx: &Transaction<'_>, root: &Path) -> rusqlite::Re
     // kept, and one disk gives one answer from one refresh to the next.
     let mut claimed: HashMap<String, Vec<Option<String>>> = HashMap::new();
     for r in &live {
-        if !repair::agrees(r) && r.manifest_parses {
-            let p = r
-                .manifest_project
-                .clone()
-                .unwrap_or_else(|| r.project.clone());
-            let a = r
-                .manifest_asset_id
-                .clone()
-                .unwrap_or_else(|| r.asset_id.clone());
+        if let Some(((p, a), uuid)) = repair::claim(r) {
             claimed
                 .entry(path_key(&format!("projects/{p}/assets/{a}")))
                 .or_default()
-                .push(repair::uuid_key(r));
+                .push(uuid);
         }
     }
     let mut kept = Vec::with_capacity(gone.len());

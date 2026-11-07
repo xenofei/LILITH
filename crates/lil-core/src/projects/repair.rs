@@ -62,7 +62,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use super::redirects::{Redirect, append_redirect, parse_name};
 use super::resolve::Resolver;
-use crate::index::repair::{RepairKind, agrees, uuid_key};
+use crate::index::repair::{RepairKind, agrees, claim, uuid_key};
 use crate::index::{AssetRow, Index, OnDisk, Scope, asset_folder_on_disk};
 use crate::store::{Store, StoreError, WsPath};
 
@@ -310,9 +310,11 @@ async fn claimants(index: &Index, row: &AssetRow) -> Result<Vec<String>, ErrorBo
             (r.project.as_str(), r.asset_id.as_str())
                 != (row.project.as_str(), row.asset_id.as_str())
         })
-        .filter(|r| r.manifest_parses && !agrees(r))
-        .filter(|r| uuid_key(r) != uuid_key(row))
-        .filter(|r| place_of(r).to_ascii_lowercase() == mine)
+        .filter(|r| {
+            claim(r).is_some_and(|((p, a), uuid)| {
+                format!("{p}/{a}").to_ascii_lowercase() == mine && uuid != uuid_key(row)
+            })
+        })
         .map(|r| format!("{}/{}", r.project, r.asset_id))
         .collect())
 }
@@ -485,7 +487,9 @@ pub async fn accept_move(
     // Old refs to the old name already lead somewhere else: never to another live asset, nor
     // over an asset in the trash (ruling T8 A-RM2); a chain that ends nowhere (`target_missing`)
     // or loops (`cycle`) is fine.
-    let end = if newest_to.is_some() && !present {
+    // Resolved also with no redirect from the old name: an asset trashed there through the
+    // suite answers `asset.trashed` too (one rule for both trashed cases, ruling T8 A-R2M1).
+    let end = if !present {
         Some(resolver.resolve_name(&from.0, &from.1).await)
     } else {
         None

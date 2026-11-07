@@ -16,7 +16,7 @@
 //!   `invalid`: that is another asset's place, and a redirect must never send one asset's refs
 //!   to another (T8 round 2); another live disagreeing folder of another asset (another
 //!   creation UUID, or none: a legacy manifest), in a group or alone, whose manifest names the
-//!   same place, `invalid`: two assets can't both have moved from one place (rulings T8 A-H1,
+//!   same place ([`claim`]; one that no longer parses by what the index kept, A-R2L1), `invalid`: two assets can't both have moved from one place (rulings T8 A-H1,
 //!   A-RM1); else, a valid `<project>/<asset_id>`, `moved`, `from` that place and `to` the
 //!   folder; else `invalid`. So `moved` always means no live folder is at `from`
 //!   and the index knows no other asset there. Residuals (parked for the plan's final review):
@@ -143,6 +143,33 @@ pub fn needs_repair_alone(row: &AssetRow) -> bool {
     !agrees(row) || !canonical_file(row)
 }
 
+/// The place a live folder claims to have moved from, and the creation UUID it claims it as
+/// (`None`: none), when that place isn't its folder (rulings T8 A-RM1, A-R2L1): a manifest
+/// that parses, by its own `project`/`asset_id` and UUID; one that no longer parses, by the
+/// place and UUID the index kept from its last parse (`None` when it kept none), so breaking a
+/// claimant's manifest never makes another folder's move acceptable.
+pub fn claim(row: &AssetRow) -> Option<((String, String), Option<String>)> {
+    if row.manifest_parses {
+        return (!agrees(row)).then(|| (place(row).expect("it parses"), uuid_key(row)));
+    }
+    let kept = (
+        row.manifest_project
+            .clone()
+            .unwrap_or_else(|| row.project.clone()),
+        row.manifest_asset_id
+            .clone()
+            .unwrap_or_else(|| row.asset_id.clone()),
+    );
+    (kept != folder(row)).then(|| {
+        let uuid = row
+            .creation_uuid
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map(str::to_ascii_lowercase);
+        (kept, uuid)
+    })
+}
+
 /// The row's creation UUID as grouped: lowercase; `None` for none, an empty one, or a manifest
 /// that doesn't parse.
 pub fn uuid_key(row: &AssetRow) -> Option<String> {
@@ -184,13 +211,11 @@ pub fn detect_known(rows: &[AssetRow], gone: &[AssetRow]) -> HashMap<(String, St
     // for a legacy folder), ruling T8 A-RM1.
     let mut claims: HashMap<(String, String), HashSet<Option<String>>> = HashMap::new();
     for row in rows {
-        if !agrees(row)
-            && let Some(p) = place(row)
-        {
+        if let Some((p, uuid)) = claim(row) {
             claims
                 .entry((p.0.to_ascii_lowercase(), p.1.to_ascii_lowercase()))
                 .or_default()
-                .insert(uuid_key(row));
+                .insert(uuid);
         }
     }
     // The live folders, by their name without regard to case.
@@ -418,6 +443,11 @@ mod tests {
             row("s/b", ("s", "a"), Some("u1")),
             row("s/c", ("s", "a"), None),
         ]);
+        assert_eq!(got[&key("s/b")], RepairKind::Invalid);
+        // A claimant whose manifest no longer parses still counts, by what the index kept.
+        let mut broken = row("s/c", ("s", "a"), Some("u2"));
+        broken.manifest_parses = false;
+        let got = detect(&[row("s/b", ("s", "a"), Some("u1")), broken]);
         assert_eq!(got[&key("s/b")], RepairKind::Invalid);
         for other_place in [("s", "a"), ("s", "A")] {
             let got = detect(&[

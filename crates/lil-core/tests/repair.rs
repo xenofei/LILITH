@@ -2002,3 +2002,78 @@ async fn the_claimants_refusal_reads_right_and_suggests_only_valid_names() {
     );
     fx.shutdown().await;
 }
+
+#[tokio::test] // spec: CORE-154, ARCH-125, CORE-157 (T8 A-R2M1)
+async fn accept_move_never_takes_over_a_name_trashed_with_no_redirect() {
+    // The crane, never moved, is trashed through the suite: old refs to it answer
+    // `asset.trashed`. A folder of another asset naming the crane then appears: no folder, row
+    // or redirect is at the crane, but accepting would send the trashed asset's refs to it, so it
+    // is refused, naming the trash entry (one rule with or without a redirect).
+    let fx = Fx::with(|ws| {
+        hand_edit(&asset_dir(ws, CRANE), |m| m["locks"] = json!([]));
+        outside_copy(&asset_dir(ws, CRANE), &file(ws, "backup_crane"));
+        hand_edit(&file(ws, "backup_crane"), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+    });
+    fx.open().await.index.ready().await;
+    let trashed = fx
+        .ok(
+            "test.trash",
+            json!({ "path": format!("projects/{P}/assets/{CRANE}") }),
+        )
+        .await;
+    let entry = trashed["entry_id"].as_str().unwrap().to_string();
+    outside_rename(&file(&fx.ws, "backup_crane"), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    let e = error(fx.accept(ORIGAMI).await);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(
+        e.message.contains(&entry) && e.message.contains("trash.restore"),
+        "names the trash entry: {}",
+        e.message
+    );
+    assert!(fx.redirects().is_none(), "no redirect");
+    let r = fx
+        .call(
+            "ref.resolve",
+            json!({"ref": format!("lil://{}/{P}/{CRANE}@1.0.0", fx.ws_id())}),
+        )
+        .await;
+    assert_eq!(error(r).code, "asset.trashed");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, CORE-047, ARCH-125 (T8 A-R2L1)
+async fn a_claimant_whose_manifest_breaks_still_counts() {
+    // chr_origami and chr_xenon (another asset) both name the crane: neither is a move. Then
+    // xenon's manifest is broken by hand: the index keeps its last place and UUID, so it still
+    // claims the crane's place, and origami is still no move.
+    let fx = Fx::with(|ws| {
+        crane_renamed(ws);
+        outside_copy(&asset_dir(ws, ORIGAMI), &asset_dir(ws, XENON));
+        hand_edit(&asset_dir(ws, XENON), |m| {
+            m["creation_uuid"] = json!(OTHER_UUID);
+        });
+    });
+    fx.open().await.index.ready().await;
+    assert_eq!(fx.get(ORIGAMI).await["repair"]["kind"], "invalid");
+    write_file(
+        &manifest_in(&asset_dir(&fx.ws, XENON)),
+        b"{ this is not json",
+    );
+    fx.reconcile().await;
+    for _ in 0..2 {
+        fx.reconcile().await;
+        assert_eq!(fx.get(ORIGAMI).await["repair"]["kind"], "invalid");
+        let e = error(fx.accept(ORIGAMI).await);
+        assert_eq!(e.code, "repair.not_needed", "{e:?}");
+        assert!(
+            e.message.contains(&format!("{P}/{XENON}")),
+            "names the broken claimant: {}",
+            e.message
+        );
+        assert!(fx.redirects().is_none(), "no redirect");
+    }
+    fx.shutdown().await;
+}
