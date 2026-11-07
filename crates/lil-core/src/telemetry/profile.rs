@@ -212,6 +212,9 @@ mod tests {
             vram_total_mib: 0,
             vram_used_mib: 0,
             measured: true,
+            memory: None,
+            engines: None,
+            headline_util: crate::telemetry::HeadlineUtil::unknown(),
         });
         assert_eq!(verdict(&snap, true, 1), Verdict::Check);
     }

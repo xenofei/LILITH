@@ -866,6 +866,8 @@ impl Meter {
                 .as_ref()
                 .map_or_else(|| record::LOOSE.to_string(), |w| w.ws.id.clone());
             let mut e = attribute(job.id.as_str(), &workspace, &windows, &slices, &self.power);
+            // The fit signal the telemetry kept for the job (ARCH-071; `null` without one).
+            e.fit = self.telemetry.job_fit(job.id.as_str());
             // `from` and `to` are the times of the windows' first and last samples, so a series
             // over them holds exactly the samples the energy came from; a window without a
             // sample counts with its own ends, mapped to wall times.

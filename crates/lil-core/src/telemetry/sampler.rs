@@ -22,14 +22,28 @@
 //! - **Counters** (CORE-063): a counter that goes down was reset and the interval's delta is the
 //!   new value; the Energy Meter's raw picowatt-hours are accumulated as integers and converted
 //!   once.
+//! - **Adapter counters** (CORE-059, APP-127): the adapter's dedicated and shared memory and the
+//!   busiest engine per type are read at every step; the headline load is the busiest engine's,
+//!   else NVML's. They are for the Hardware display only.
+//! - **The fit signal** ([`FitTracker`]; ARCH-071, P4b-R37 as Appendix H states it): an engine
+//!   is its processes, and its figure is the sum of their `GPU Process Memory\Shared Usage`,
+//!   never the adapter's. Its idle level is the lowest figure since it became ready, fixed for
+//!   a job when the job starts; it resets when the engine becomes ready again.
+//! - **Alerts** (CORE-066, LT-04, APP-132): the temperature raises at >= 85 °C and clears after
+//!   30 s at <= 82 °C; a throttle alert clears after 30 s without its bit; neither raises again
+//!   within 60 s of clearing. `gpu_spill` raises after 10 s with the job's engine above its idle
+//!   level by more than [`SPILL_MARGIN_MIB`], and clears after 30 s at or below half of it,
+//!   when the job ends, or when the adapter counters can't be read. Times are the step's
+//!   (`StepIn::now`): the monotonic clock, or the nominal seconds of manual mode.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use lil_platform::hw::{
-    CpuEnergySample, CpuEnergySource, GpuMemSource, GpuSample, GpuSource, ProcGpuMem, SysSource,
-    ThrottleReasons,
+    CpuEnergySample, CpuEnergySource, GpuCounters, GpuMemSource, GpuSample, GpuSource, ProcGpuMem,
+    SysSource, ThrottleReasons,
 };
 use lil_platform::process::{ProcessInspector, SystemInspector};
 use serde_json::{Value, json};
@@ -41,8 +55,10 @@ use super::energy::{
     Accum, CounterStep, CounterTracker, cpu_estimate_mw, power_accum, pwh_accum, system_power_mw,
 };
 use super::{
-    APP_ROLE, AlertView, Basis, CpuView, DiskView, GPU_USERS, GpuUser, GpuView, HwSources, NetView,
-    Part, PowerSettings, ProcessView, RamView, Sizes, Snapshot, SystemPart, VramView, format_ts,
+    APP_ROLE, AlertView, Basis, CpuView, DiskView, EngineState, Fit, GPU_USERS, GpuEngineView,
+    GpuMemoryView, GpuUser, GpuView, HeadlineUtil, HwSources, NetView, Part, PowerSettings,
+    ProcessView, RamView, SPILL_MARGIN_MIB, Sizes, Snapshot, SystemPart, UtilSource, VramView,
+    format_ts, lock,
 };
 
 /// Per-process GPU memory while no job runs (CORE-061).
@@ -62,6 +78,16 @@ const MAX_REOPEN_GAP: u32 = 60;
 const HOLD_MAX_STEPS: u32 = 60;
 /// The GPU temperature that raises an alert (CORE-066).
 const TEMP_ALERT_C: u8 = 85;
+/// The temperature alert clears only after [`CLEAR_AFTER`] at or below this (LT-04).
+const TEMP_CLEAR_C: u8 = 82;
+/// A temperature or throttle alert clears after this long calm, and so does `gpu_spill`.
+const CLEAR_AFTER: Duration = Duration::from_secs(30);
+/// A cleared temperature or throttle alert doesn't raise again within this (LT-04).
+const REARM_AFTER: Duration = Duration::from_secs(60);
+/// `gpu_spill` raises after this long above the margin (APP-132).
+const SPILL_RAISE_AFTER: Duration = Duration::from_secs(10);
+/// The finished jobs' fits kept for `meter` to take.
+const FITS_KEPT: usize = 256;
 
 /// A source that opens the GPU again (`lil_platform::hw::nvml_gpu`).
 pub type GpuOpener = Box<dyn FnMut() -> Option<Box<dyn GpuSource>> + Send>;
@@ -116,6 +142,8 @@ pub(crate) struct StepIn<'a> {
     pub run: i64,
     pub busy: bool,
     pub tracked: &'a BTreeMap<u32, &'static str>,
+    /// Locked only after the sources are read.
+    pub fits: &'a Mutex<FitTracker>,
 }
 
 /// What one step produced.
@@ -131,6 +159,177 @@ struct Active {
     kind: &'static str,
     value: i64,
     since_ms: i64,
+    spill: Option<SpillNow>,
+}
+
+/// The timers of one alert id (LT-04): since when its raise condition held, since when its
+/// clear condition held, and when it last cleared.
+#[derive(Default)]
+struct Hysteresis {
+    on_since: Option<Duration>,
+    calm_since: Option<Duration>,
+    cleared_at: Option<Duration>,
+}
+
+/// How an alert raises and clears.
+struct Rule {
+    raise_after: Duration,
+    clear_after: Duration,
+    rearm_after: Duration,
+}
+
+/// One alert condition at a step.
+struct Check {
+    id: &'static str,
+    kind: &'static str,
+    /// The raise condition holds.
+    raise: bool,
+    /// The clear condition holds.
+    calm: bool,
+    value: i64,
+    spill: Option<SpillNow>,
+}
+
+/// A running job's engine above its idle level, at a step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpillNow {
+    job_id: String,
+    pid: Option<u32>,
+    above_idle_mib: u64,
+}
+
+/// One engine's state and fit figure.
+struct EngineTrack {
+    state: EngineState,
+    /// The lowest figure since the engine became ready.
+    low: Option<u64>,
+    /// The latest figure, and the engine process with the most `Shared Usage` in it.
+    figure: Option<(u64, Option<u32>)>,
+}
+
+/// A job running on an engine.
+struct RunningJob {
+    engine: String,
+    idle: Option<u64>,
+    max_above: u64,
+}
+
+/// The engines' fit figures and the jobs running on them (module docs, "The fit signal").
+#[derive(Default)]
+pub(crate) struct FitTracker {
+    engines: BTreeMap<String, EngineTrack>,
+    running: BTreeMap<String, RunningJob>,
+    /// Ended jobs' fits, oldest first, at most [`FITS_KEPT`].
+    finished: VecDeque<(String, Option<Fit>)>,
+}
+
+impl FitTracker {
+    pub(crate) fn set_engine(&mut self, s: EngineState) {
+        match self.engines.get_mut(&s.engine) {
+            Some(track) => {
+                if track.state.ready_at_ms != s.ready_at_ms {
+                    track.low = None;
+                    track.figure = None;
+                }
+                track.state = s;
+            }
+            None => {
+                self.engines.insert(
+                    s.engine.clone(),
+                    EngineTrack {
+                        state: s,
+                        low: None,
+                        figure: None,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn job_started(&mut self, job_id: &str, engine: &str) {
+        if self.running.contains_key(job_id) {
+            return;
+        }
+        let earlier = self
+            .finished
+            .iter()
+            .position(|(id, _)| id == job_id)
+            .and_then(|at| self.finished.remove(at))
+            .and_then(|(_, fit)| fit);
+        let now = self
+            .engines
+            .get(engine)
+            .filter(|t| t.state.ready_at_ms.is_some())
+            .and_then(|t| t.low);
+        self.running.insert(
+            job_id.to_string(),
+            RunningJob {
+                engine: engine.to_string(),
+                idle: earlier.map(|f| f.shared_idle_mib).or(now),
+                max_above: earlier.map_or(0, |f| f.shared_above_idle_max_mib),
+            },
+        );
+    }
+
+    pub(crate) fn job_ended(&mut self, job_id: &str) {
+        let Some(job) = self.running.remove(job_id) else {
+            return;
+        };
+        let fit = job.idle.map(|idle| Fit {
+            shared_idle_mib: idle,
+            shared_above_idle_max_mib: job.max_above,
+        });
+        self.finished.push_back((job_id.to_string(), fit));
+        while self.finished.len() > FITS_KEPT {
+            self.finished.pop_front();
+        }
+    }
+
+    pub(crate) fn take(&mut self, job_id: &str) -> Option<Fit> {
+        let at = self.finished.iter().position(|(id, _)| id == job_id)?;
+        self.finished.remove(at).and_then(|(_, fit)| fit)
+    }
+
+    /// A per-process GPU memory reading at `utc_ms`: each ready engine's figure, its lowest
+    /// since ready, and its running jobs' rise above their idle levels.
+    fn observe(&mut self, mem: &[ProcGpuMem], utc_ms: i64) {
+        for (name, track) in &mut self.engines {
+            if track.state.ready_at_ms.is_none_or(|ready| utc_ms < ready) {
+                continue;
+            }
+            let ours = mem.iter().filter(|p| track.state.pids.contains(&p.pid));
+            let figure: u64 = ours.clone().map(|p| p.shared_mib).sum();
+            let top = ours.max_by_key(|p| (p.shared_mib, std::cmp::Reverse(p.pid)));
+            track.figure = Some((figure, top.map(|p| p.pid)));
+            track.low = Some(track.low.map_or(figure, |low| low.min(figure)));
+            for job in self.running.values_mut().filter(|j| j.engine == *name) {
+                if let Some(idle) = job.idle {
+                    job.max_above = job.max_above.max(figure.saturating_sub(idle));
+                }
+            }
+        }
+    }
+
+    /// The running job whose engine is the furthest above its idle level, if any job has an
+    /// idle level and its engine a figure.
+    fn spill(&self) -> Option<SpillNow> {
+        self.running
+            .iter()
+            .filter_map(|(job_id, job)| {
+                let idle = job.idle?;
+                let (figure, pid) = self.engines.get(&job.engine)?.figure?;
+                Some(SpillNow {
+                    job_id: job_id.clone(),
+                    pid,
+                    above_idle_mib: figure.saturating_sub(idle),
+                })
+            })
+            .max_by_key(|s| s.above_idle_mib)
+    }
+
+    fn is_running(&self, job_id: &str) -> bool {
+        self.running.contains_key(job_id)
+    }
 }
 
 #[derive(Default)]
@@ -311,6 +510,7 @@ pub(crate) struct Sampler {
     gpu_mem: Option<Box<dyn GpuMemSource>>,
     cpu_energy: Option<Box<dyn CpuEnergySource>>,
     sys: Box<dyn SysSource>,
+    gpu_counters: Option<Box<dyn GpuCounters>>,
     gpu_opener: Option<GpuOpener>,
     sizes_probe: Option<SizesProbe>,
     /// Steps to wait before the next attempt to open the GPU, and the wait after a failure.
@@ -329,6 +529,9 @@ pub(crate) struct Sampler {
     names: BTreeMap<u32, String>,
     look_up_names: bool,
     alerts: BTreeMap<&'static str, Active>,
+    hysteresis: BTreeMap<&'static str, Hysteresis>,
+    /// The whole-system energy of each sample, accumulated so it never drifts (`e15`).
+    system_energy: Accum,
     last_ts: i64,
 }
 
@@ -341,11 +544,11 @@ impl Sampler {
             gpu_mem: src.gpu_mem,
             cpu_energy: src.cpu_energy,
             sys: src.sys,
+            gpu_counters: src.gpu_counters,
             gpu_opener: None,
             sizes_probe: None,
             reopen_wait: 0,
             reopen_gap: REOPEN_AFTER,
-            power,
             cadence: Cadence::default(),
             gpu_state: GpuState::default(),
             cpu_state: CpuState::new(),
@@ -358,6 +561,9 @@ impl Sampler {
             names: BTreeMap::new(),
             look_up_names,
             alerts: BTreeMap::new(),
+            hysteresis: BTreeMap::new(),
+            system_energy: Accum::new(1, u128::from(power.psu_efficiency_permille.clamp(1, 1000))),
+            power,
             last_ts: i64::MIN,
         }
     }
@@ -421,6 +627,7 @@ impl Sampler {
         let gpu = self.gpu_state.figures(gpu_read, dt_ms);
 
         // Per-process GPU memory: replaced whole, so processes that ended drop out.
+        let mut mem_read = false;
         if due.procs
             && let Some(source) = self.gpu_mem.as_mut()
         {
@@ -428,6 +635,7 @@ impl Sampler {
                 Ok(list) => {
                     self.mem_failing = false;
                     self.mem_cache = list;
+                    mem_read = true;
                 }
                 Err(e) => {
                     if !self.mem_failing {
@@ -438,6 +646,15 @@ impl Sampler {
                 }
             }
         }
+
+        // The adapter's counters (CORE-059): unknown when they can't be read.
+        let (adapter, engines) = match self.gpu_counters.as_mut() {
+            Some(c) => (c.adapter_memory(), c.engines()),
+            None => (None, None),
+        };
+        let busiest = engines
+            .as_ref()
+            .and_then(|e| e.iter().map(|e| e.util_permille).max());
 
         let sys = self.sys.sample(&tracked_pids, due.disks);
 
@@ -559,6 +776,7 @@ impl Sampler {
                     ram_mib: cpu_part.map(|(_, ram)| ram),
                     vram_local: mem_part.map(|p| p.local_mib),
                     vram_committed: mem_part.map(|p| p.committed_mib),
+                    vram_shared: mem_part.map(|p| p.shared_mib),
                 });
             }
         }
@@ -566,9 +784,25 @@ impl Sampler {
         self.names.retain(|pid, _| live_pids.contains(pid));
         let gpu_users = gpu_users(&processes);
 
-        // Alerts, from a real reading only (a gap leaves them as they were).
+        // The fit figures, then the alerts: the temperature and throttle from a real reading
+        // only (a gap leaves them as they were), the spill while the adapter counters read.
+        let (spill, spill_job_running) = {
+            let mut fits = lock(input.fits);
+            if mem_read {
+                fits.observe(&self.mem_cache, input.utc_ms);
+            }
+            let raised = self.alerts.get("gpu_spill").and_then(|a| a.spill.as_ref());
+            let running = raised.is_some_and(|s| fits.is_running(&s.job_id));
+            (fits.spill(), running)
+        };
         let live_sample = gpu.sample.as_ref().filter(|_| gpu.live);
-        let events = self.update_alerts(live_sample, input.utc_ms);
+        let mut events = self.update_alerts(live_sample, input.now, input.utc_ms);
+        events.extend(self.update_spill(
+            spill.filter(|_| adapter.is_some()),
+            spill_job_running && adapter.is_some(),
+            input.now,
+            input.utc_ms,
+        ));
 
         // The whole-system figure.
         let gpu_mw = gpu.power.map(|(mw, _)| mw);
@@ -616,6 +850,28 @@ impl Sampler {
                 vram_total_mib: s.vram_total_mib,
                 vram_used_mib: s.vram_used_mib,
                 measured: gpu.live,
+                memory: adapter.map(|a| GpuMemoryView {
+                    dedicated_used_mib: a.dedicated_mib,
+                    shared_used_mib: a.shared_mib,
+                }),
+                engines: engines.as_ref().map(|list| {
+                    list.iter()
+                        .map(|e| GpuEngineView {
+                            engtype: e.engtype.clone(),
+                            util_permille: e.util_permille,
+                        })
+                        .collect()
+                }),
+                headline_util: match busiest {
+                    Some(permille) => HeadlineUtil {
+                        permille,
+                        source: UtilSource::Engines,
+                    },
+                    None => HeadlineUtil {
+                        permille: u16::from(s.util_pct) * 10,
+                        source: UtilSource::Nvml,
+                    },
+                },
             }),
             processes,
             cpu: CpuView {
@@ -643,8 +899,9 @@ impl Sampler {
             mono: input.mono_ms,
             dt: i64::try_from(dt_ms).unwrap_or(i64::MAX),
             est: 0,
-            values: [None; 12],
+            values: [None; Metric::COUNT],
             cpu_ms_all: sys.cpu_permille as u64 * cores * dt_ms / 1000,
+            system_mj: None,
             procs: proc_rows,
         };
         let int = |v: u64| i64::try_from(v).ok();
@@ -682,6 +939,20 @@ impl Sampler {
         row.set(Metric::SystemPower, system.and_then(int));
         row.set(Metric::NetRx, int(net.iter().map(|n| n.rx_bps).sum()));
         row.set(Metric::NetTx, int(net.iter().map(|n| n.tx_bps).sum()));
+        if let Some(a) = adapter {
+            row.set(Metric::GpuMemDedicated, int(a.dedicated_mib));
+            row.set(Metric::GpuMemShared, int(a.shared_mib));
+        }
+        row.set(Metric::GpuEngineBusiest, busiest.map(i64::from));
+        // The whole-system energy of the sample, by `telemetry.energy`'s formula: (GPU + CPU +
+        // the rest-of-system baseline over the sample's time) / PSU efficiency, accumulated in
+        // microjoules so the quarter-hour sums never drift.
+        let (gpu_mj, cpu_mj) = (gpu.energy.map(|(mj, _)| mj), cpu.energy.map(|(mj, _)| mj));
+        if gpu_mj.is_some() || cpu_mj.is_some() || self.power.rest_of_system_mw > 0 {
+            let micro = (gpu_mj.unwrap_or(0) + cpu_mj.unwrap_or(0)).saturating_mul(1000)
+                + u64::from(self.power.rest_of_system_mw).saturating_mul(dt_ms);
+            row.system_mj = Some(self.system_energy.add(micro));
+        }
 
         let vram = gpu.sample.as_ref().filter(|_| gpu.live).map(|s| VramView {
             total_mib: s.vram_total_mib,
@@ -725,52 +996,139 @@ impl Sampler {
         name
     }
 
-    /// Raises and clears the alerts for a real GPU reading; returns the events.
-    fn update_alerts(&mut self, gpu: Option<&GpuSample>, now_ms: i64) -> Vec<Value> {
+    /// Raises and clears the temperature and throttle alerts for a real GPU reading (LT-04);
+    /// returns the events.
+    fn update_alerts(&mut self, gpu: Option<&GpuSample>, now: Duration, now_ms: i64) -> Vec<Value> {
         let Some(gpu) = gpu else {
             return Vec::new();
         };
-        let conditions = [
-            (
-                "gpu_temperature",
-                "temperature",
-                gpu.temp_c >= TEMP_ALERT_C,
-                i64::from(gpu.temp_c),
-            ),
-            (
-                "gpu_throttle_thermal",
-                "throttle_thermal",
-                gpu.throttle.thermal(),
-                (gpu.throttle.0 & 0x60) as i64,
-            ),
-            (
-                "gpu_throttle_power_brake",
-                "throttle_power_brake",
-                gpu.throttle.power_brake(),
-                (gpu.throttle.0 & 0x80) as i64,
-            ),
+        let lt04 = Rule {
+            raise_after: Duration::ZERO,
+            clear_after: CLEAR_AFTER,
+            rearm_after: REARM_AFTER,
+        };
+        let checks = [
+            Check {
+                id: "gpu_temperature",
+                kind: "temperature",
+                raise: gpu.temp_c >= TEMP_ALERT_C,
+                calm: gpu.temp_c <= TEMP_CLEAR_C,
+                value: i64::from(gpu.temp_c),
+                spill: None,
+            },
+            Check {
+                id: "gpu_throttle_thermal",
+                kind: "throttle_thermal",
+                raise: gpu.throttle.thermal(),
+                calm: !gpu.throttle.thermal(),
+                value: (gpu.throttle.0 & 0x60) as i64,
+                spill: None,
+            },
+            Check {
+                id: "gpu_throttle_power_brake",
+                kind: "throttle_power_brake",
+                raise: gpu.throttle.power_brake(),
+                calm: !gpu.throttle.power_brake(),
+                value: (gpu.throttle.0 & 0x80) as i64,
+                spill: None,
+            },
         ];
         let mut events = Vec::new();
-        for (id, kind, on, value) in conditions {
-            match (on, self.alerts.get_mut(id)) {
-                (true, None) => {
-                    let active = Active {
-                        kind,
-                        value,
-                        since_ms: now_ms,
-                    };
-                    events.push(json!({"kind": "alert", "alert": alert_json(id, &active)}));
-                    self.alerts.insert(id, active);
-                }
-                (true, Some(active)) => active.value = value,
-                (false, Some(_)) => {
-                    self.alerts.remove(id);
-                    events.push(json!({"kind": "alert_cleared", "id": id}));
-                }
-                (false, None) => {}
+        for check in checks {
+            self.apply(check, &lt04, now, now_ms, &mut events);
+        }
+        events
+    }
+
+    /// Raises and clears `gpu_spill` (APP-132): `spill` is the running job's engine above its
+    /// idle level (none while the adapter counters can't be read); `job_running` says the
+    /// raised alert's job still runs with readable counters, else the alert clears now.
+    fn update_spill(
+        &mut self,
+        spill: Option<SpillNow>,
+        job_running: bool,
+        now: Duration,
+        now_ms: i64,
+    ) -> Vec<Value> {
+        let mut events = Vec::new();
+        if self.alerts.contains_key("gpu_spill") && !job_running {
+            self.alerts.remove("gpu_spill");
+            self.hysteresis.remove("gpu_spill");
+            events.push(json!({"kind": "alert_cleared", "id": "gpu_spill"}));
+        }
+        let rule = Rule {
+            raise_after: SPILL_RAISE_AFTER,
+            clear_after: CLEAR_AFTER,
+            rearm_after: Duration::ZERO,
+        };
+        match spill {
+            Some(s) => {
+                let check = Check {
+                    id: "gpu_spill",
+                    kind: "spill",
+                    raise: s.above_idle_mib > SPILL_MARGIN_MIB,
+                    calm: s.above_idle_mib <= SPILL_MARGIN_MIB / 2,
+                    value: i64::try_from(s.above_idle_mib).unwrap_or(i64::MAX),
+                    spill: Some(s),
+                };
+                self.apply(check, &rule, now, now_ms, &mut events);
+            }
+            None => {
+                self.hysteresis.remove("gpu_spill");
             }
         }
         events
+    }
+
+    /// One alert's step under `rule` (module docs, "Alerts").
+    fn apply(
+        &mut self,
+        c: Check,
+        rule: &Rule,
+        now: Duration,
+        now_ms: i64,
+        events: &mut Vec<Value>,
+    ) {
+        let h = self.hysteresis.entry(c.id).or_default();
+        if let Some(active) = self.alerts.get_mut(c.id) {
+            active.value = c.value;
+            if c.spill.is_some() {
+                active.spill = c.spill;
+            }
+            if !c.calm {
+                h.calm_since = None;
+                return;
+            }
+            let calm_since = *h.calm_since.get_or_insert(now);
+            if now.saturating_sub(calm_since) >= rule.clear_after {
+                self.alerts.remove(c.id);
+                *h = Hysteresis {
+                    cleared_at: Some(now),
+                    ..Hysteresis::default()
+                };
+                events.push(json!({"kind": "alert_cleared", "id": c.id}));
+            }
+            return;
+        }
+        if !c.raise {
+            h.on_since = None;
+            return;
+        }
+        let on_since = *h.on_since.get_or_insert(now);
+        let rearmed = h
+            .cleared_at
+            .is_none_or(|at| now.saturating_sub(at) >= rule.rearm_after);
+        if now.saturating_sub(on_since) >= rule.raise_after && rearmed {
+            h.calm_since = None;
+            let active = Active {
+                kind: c.kind,
+                value: c.value,
+                since_ms: now_ms,
+                spill: c.spill,
+            };
+            events.push(json!({"kind": "alert", "alert": alert_json(c.id, &active)}));
+            self.alerts.insert(c.id, active);
+        }
     }
 
     fn alerts_view(&self) -> Vec<AlertView> {
@@ -781,6 +1139,10 @@ impl Sampler {
                 kind: a.kind.to_string(),
                 value: a.value,
                 since: format_ts(a.since_ms),
+                job_id: a.spill.as_ref().map(|s| s.job_id.clone()),
+                pid: a.spill.as_ref().and_then(|s| s.pid),
+                above_idle_mib: a.spill.as_ref().map(|s| s.above_idle_mib),
+                margin_mib: a.spill.as_ref().map(|_| SPILL_MARGIN_MIB),
             })
             .collect()
     }
@@ -812,7 +1174,17 @@ fn gpu_users(processes: &[ProcessView]) -> Vec<GpuUser> {
 }
 
 fn alert_json(id: &str, a: &Active) -> Value {
-    json!({"id": id, "kind": a.kind, "value": a.value, "since": format_ts(a.since_ms)})
+    let mut alert =
+        json!({"id": id, "kind": a.kind, "value": a.value, "since": format_ts(a.since_ms)});
+    if let Some(s) = &a.spill {
+        alert["job_id"] = json!(s.job_id);
+        if let Some(pid) = s.pid {
+            alert["pid"] = json!(pid);
+        }
+        alert["above_idle_mib"] = json!(s.above_idle_mib);
+        alert["margin_mib"] = json!(SPILL_MARGIN_MIB);
+    }
+    alert
 }
 
 /// NVML's clock event reasons by name.

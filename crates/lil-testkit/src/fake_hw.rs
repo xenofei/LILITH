@@ -44,8 +44,9 @@ impl FakeHwScript {
         )
     }
 
-    /// The GPU, per-process GPU memory, CPU energy and system sources, in that order (the
-    /// fields of the core's `HwSources`).
+    /// The GPU, per-process GPU memory, CPU energy, system and adapter-counter sources, in
+    /// that order (the fields of the core's `HwSources`). The script's `gpu_adapter` and
+    /// `gpu_engines` lists feed the adapter counters, `null` meaning unreadable.
     ///
     /// # Panics
     /// If a list is neither an array nor `null`.
@@ -69,7 +70,7 @@ mod tests {
             "cpu_energy": null,
             "sys": [{"cpu_permille": 500, "procs": [[7, 10, 20], [8, 1, 2]]}],
         }));
-        let (gpu, gpu_mem, cpu, mut sys) = script.sources();
+        let (gpu, gpu_mem, cpu, mut sys, _) = script.sources();
         let mut gpu = gpu.expect("a GPU");
         assert!(gpu.features().energy_counter && !gpu.features().fan);
         assert_eq!(gpu.sample().unwrap().util_pct, 10);

@@ -1,6 +1,7 @@
 //! Performance counters through PDH (CORE-059, ARCH-071), readable without admin rights:
-//! `GPU Process Memory` for each process's memory on the NVIDIA adapter, and the CPU package's
-//! `Energy Meter` (RAPL). Counter and instance names are the English ones
+//! `GPU Process Memory` for each process's memory on the NVIDIA adapter, the adapter's
+//! `GPU Adapter Memory` and `GPU Engine` load (`docs/spikes/12-browse-core.md`, S0.1), and the CPU
+//! package's `Energy Meter` (RAPL). Counter and instance names are the English ones
 //! (`PdhAddEnglishCounterW`), so a localised Windows reads the same paths. The adapter's LUID
 //! comes from DXGI.
 
@@ -11,15 +12,18 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
 };
 use windows::Win32::System::Performance::{
-    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
-    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
-    PDH_RAW_COUNTER, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT, PDH_FMT_COUNTERVALUE,
+    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
+    PDH_MORE_DATA, PDH_RAW_COUNTER, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
     PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhGetRawCounterValue,
     PdhOpenQueryW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
-use crate::hw::{CpuEnergySample, CpuEnergySource, GpuMemSource, ProcGpuMem};
+use crate::hw::{
+    AdapterMemory, CpuEnergySample, CpuEnergySource, EngineUtil, GpuCounters, GpuMemSource,
+    ProcGpuMem,
+};
 use crate::hw_nvml::nvml_identity;
 
 const MIB: u64 = 1024 * 1024;
@@ -148,13 +152,31 @@ impl Query {
 }
 
 /// Every instance of a wildcard counter as `(instance name, value)`, skipping instances whose
-/// value isn't valid.
+/// value isn't valid: the 64-bit integer form.
 fn instances(counter: PDH_HCOUNTER) -> io::Result<Vec<(String, i64)>> {
+    // SAFETY: PDH_FMT_LARGE fills `largeValue`.
+    instances_as(counter, PDH_FMT_LARGE, |v| unsafe {
+        v.Anonymous.largeValue
+    })
+}
+
+/// [`instances`] in the floating-point form (a percentage).
+fn instances_f64(counter: PDH_HCOUNTER) -> io::Result<Vec<(String, f64)>> {
+    // SAFETY: PDH_FMT_DOUBLE fills `doubleValue`.
+    instances_as(counter, PDH_FMT_DOUBLE, |v| unsafe {
+        v.Anonymous.doubleValue
+    })
+}
+
+fn instances_as<T>(
+    counter: PDH_HCOUNTER,
+    format: PDH_FMT,
+    value: impl Fn(&PDH_FMT_COUNTERVALUE) -> T,
+) -> io::Result<Vec<(String, T)>> {
     let (mut size, mut count) = (0u32, 0u32);
     // SAFETY: the size query: no buffer; PDH sets `size` and returns PDH_MORE_DATA.
-    let status = unsafe {
-        PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &mut size, &mut count, None)
-    };
+    let status =
+        unsafe { PdhGetFormattedCounterArrayW(counter, format, &mut size, &mut count, None) };
     if status != PDH_MORE_DATA {
         // No instance at all (no process uses the GPU) reports success with nothing to read.
         return if status == 0 {
@@ -168,7 +190,7 @@ fn instances(counter: PDH_HCOUNTER) -> io::Result<Vec<(String, i64)>> {
     let items = buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
     // SAFETY: `buf` is writable for `size` bytes and aligned for the items.
     let status = unsafe {
-        PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &mut size, &mut count, Some(items))
+        PdhGetFormattedCounterArrayW(counter, format, &mut size, &mut count, Some(items))
     };
     if status != 0 {
         // Instances that appeared since the size query: the next sample reads them.
@@ -180,14 +202,9 @@ fn instances(counter: PDH_HCOUNTER) -> io::Result<Vec<(String, i64)>> {
         .iter()
         .filter(|item| valid(item.FmtValue.CStatus))
         .map(|item| {
-            // SAFETY: each name is a NUL-terminated wide string inside `buf`, and the value is
-            // the `largeValue` that PDH_FMT_LARGE asked for.
-            unsafe {
-                (
-                    item.szName.to_string().unwrap_or_default(),
-                    item.FmtValue.Anonymous.largeValue,
-                )
-            }
+            // SAFETY: each name is a NUL-terminated wide string inside `buf`.
+            let name = unsafe { item.szName.to_string().unwrap_or_default() };
+            (name, value(&item.FmtValue))
         })
         .collect())
 }
@@ -274,6 +291,114 @@ impl GpuMemSource for PdhGpuMemory {
         }
         Ok(by_pid.into_values().filter(|p| p.pid != 0).collect())
     }
+}
+
+/// `luid_0x<hi>_0x<lo>_`, lower case, as it appears in the GPU counters' instance names, for
+/// the adapter `(LowPart, HighPart)`.
+fn luid_tag((low, high): (u32, i32)) -> String {
+    format!("luid_0x{:08x}_0x{low:08x}_", high as u32)
+}
+
+/// `\GPU Adapter Memory(*)\Dedicated Usage` and `Shared Usage`, and
+/// `\GPU Engine(*)\Utilization Percentage`, for the adapter `adapter_luid` (`(LowPart,
+/// HighPart)`). `None` when the counters can't be added or read (CORE-059's "not shown" path).
+/// The engine load is a rate between two collections, so it has its own query: each
+/// [`GpuCounters`] call collects only what it reads.
+pub fn pdh_gpu_counters(adapter_luid: (u32, i32)) -> Option<Box<dyn GpuCounters>> {
+    let memory = Query::open().ok()?;
+    let dedicated = memory.add(r"\GPU Adapter Memory(*)\Dedicated Usage").ok()?;
+    let shared = memory.add(r"\GPU Adapter Memory(*)\Shared Usage").ok()?;
+    let engine = Query::open().ok()?;
+    let utilization = engine.add(r"\GPU Engine(*)\Utilization Percentage").ok()?;
+    let mut counters = PdhGpuCounters {
+        memory,
+        dedicated,
+        shared,
+        engine,
+        utilization,
+        luid: luid_tag(adapter_luid),
+    };
+    counters.adapter_memory()?;
+    // The first collection is the base of the first rate.
+    counters.engine.collect().ok()?;
+    Some(Box::new(counters))
+}
+
+struct PdhGpuCounters {
+    memory: Query,
+    dedicated: PDH_HCOUNTER,
+    shared: PDH_HCOUNTER,
+    engine: Query,
+    utilization: PDH_HCOUNTER,
+    luid: String,
+}
+
+// SAFETY: as for `PdhGpuMemory`.
+unsafe impl Send for PdhGpuCounters {}
+
+impl GpuCounters for PdhGpuCounters {
+    fn adapter_memory(&mut self) -> Option<AdapterMemory> {
+        self.memory.collect().ok()?;
+        let dedicated = instances(self.dedicated).ok()?;
+        let shared = instances(self.shared).ok()?;
+        Some(AdapterMemory {
+            dedicated_mib: adapter_mib(&dedicated, &self.luid)?,
+            shared_mib: adapter_mib(&shared, &self.luid)?,
+        })
+    }
+
+    fn engines(&mut self) -> Option<Vec<EngineUtil>> {
+        self.engine.collect().ok()?;
+        let found = instances_f64(self.utilization).ok()?;
+        Some(busiest_engines(&found, &self.luid))
+    }
+}
+
+/// The adapter's figure in MiB: its `luid_<luid>_phys_<n>` instances summed (one per physical
+/// part); `None` when the adapter has no instance.
+fn adapter_mib(found: &[(String, i64)], luid: &str) -> Option<u64> {
+    let mut parts = found
+        .iter()
+        .filter(|(name, _)| name.to_ascii_lowercase().contains(luid))
+        .peekable();
+    parts.peek()?;
+    Some(
+        parts
+            .map(|(_, v)| u64::try_from(*v).unwrap_or(0))
+            .sum::<u64>()
+            / MIB,
+    )
+}
+
+/// Per engine type of the adapter `luid`, its busiest engine's load (CORE-059): an engine is an
+/// instance name without its `pid_<pid>_` prefix, and its load is the sum over the processes
+/// that use it. The type is everything after `engtype_` (it may hold spaces and underscores).
+fn busiest_engines(found: &[(String, f64)], luid: &str) -> Vec<EngineUtil> {
+    let mut by_engine: BTreeMap<String, (String, f64)> = BTreeMap::new();
+    for (name, pct) in found {
+        let lower = name.to_ascii_lowercase();
+        let (Some(at), Some(type_at)) = (lower.find(luid), lower.find("_engtype_")) else {
+            continue;
+        };
+        let engtype = name[type_at + "_engtype_".len()..].to_string();
+        let entry = by_engine
+            .entry(lower[at..].to_string())
+            .or_insert((engtype, 0.0));
+        entry.1 += pct.max(0.0);
+    }
+    let mut by_type: BTreeMap<String, u16> = BTreeMap::new();
+    for (engtype, pct) in by_engine.into_values() {
+        let permille = (pct * 10.0).round().clamp(0.0, 1000.0) as u16;
+        let busiest = by_type.entry(engtype).or_insert(0);
+        *busiest = (*busiest).max(permille);
+    }
+    by_type
+        .into_iter()
+        .map(|(engtype, util_permille)| EngineUtil {
+            engtype,
+            util_permille,
+        })
+        .collect()
 }
 
 /// The CPU package's `\Energy Meter(RAPL_Package0_PKG)\Energy` (picowatt-hours, kept raw) and
@@ -402,5 +527,50 @@ mod tests {
         );
         assert_eq!(instance_pid("_total"), None);
         assert_eq!(instance_pid("pid__luid_0x0_0x0_phys_0"), None);
+    }
+
+    /// Per engine, the sum over processes; per type, the busiest engine; another adapter's
+    /// instances are left out, and a type keeps its spaces and underscores (S0.1's grammar).
+    #[test] // spec: CORE-059, APP-127
+    fn busiest_engines_sum_processes_per_engine_and_take_the_busiest_per_type() {
+        let luid = luid_tag((0xd1a3, 0));
+        assert_eq!(luid, "luid_0x00000000_0x0000d1a3_");
+        let ours = "luid_0x00000000_0x0000D1A3_phys_0";
+        let other = "luid_0x00000000_0x0000beef_phys_0";
+        let found: Vec<(String, f64)> = [
+            (format!("pid_10_{ours}_eng_0_engtype_3D"), 30.0),
+            (format!("pid_11_{ours}_eng_0_engtype_3D"), 25.04),
+            (format!("pid_10_{ours}_eng_1_engtype_3D"), 40.0),
+            (format!("pid_12_{ours}_eng_2_engtype_Copy"), 3.0),
+            (format!("pid_12_{ours}_eng_3_engtype_Video Codec_0"), 1.0),
+            (format!("pid_13_{other}_eng_0_engtype_Compute 0"), 99.0),
+            ("_total".to_string(), 100.0),
+        ]
+        .into_iter()
+        .collect();
+        let util = |engtype: &str, util_permille: u16| EngineUtil {
+            engtype: engtype.to_string(),
+            util_permille,
+        };
+        assert_eq!(
+            busiest_engines(&found, &luid),
+            [util("3D", 550), util("Copy", 30), util("Video Codec_0", 10)]
+        );
+        assert_eq!(busiest_engines(&[], &luid), []);
+    }
+
+    /// The adapter's figure is its own instances summed, in MiB; an adapter with none is
+    /// unknown.
+    #[test] // spec: CORE-059
+    fn adapter_mib_sums_the_adapters_instances_only() {
+        let luid = luid_tag((0xd1a3, 0));
+        let mib = |n: i64| n * MIB as i64;
+        let found = vec![
+            ("luid_0x00000000_0x0000d1a3_phys_0".to_string(), mib(300)),
+            ("luid_0x00000000_0x0000d1a3_phys_1".to_string(), mib(12)),
+            ("luid_0x00000000_0x0000beef_phys_0".to_string(), mib(5000)),
+        ];
+        assert_eq!(adapter_mib(&found, &luid), Some(312));
+        assert_eq!(adapter_mib(&found[2..], &luid), None);
     }
 }

@@ -1132,6 +1132,8 @@ impl JobHandler for ComfyPromptHandler {
                 cached: HashSet::new(),
             };
             let mut result = attempt.run(args).await;
+            // The attempt's run on the engine is over: the fit signal's job ends (ARCH-071).
+            comfy.job_ended(job.id.as_str());
             // CORE-128: work with external side effects that ComfyUI accepted is never retried
             // automatically; what can't be accounted for is unknown.
             if external
@@ -1280,6 +1282,7 @@ impl Attempt<'_> {
                     if state == RemoteState::Running {
                         // Its execution_start went by unseen: the watchdog starts now.
                         self.started = Some(self.comfy.clock.monotonic());
+                        self.comfy.job_started(self.job.id.as_str());
                         self.job.set_substatus(Substatus::Executing).await;
                     } else {
                         self.job.set_substatus(Substatus::QueuedInEngine).await;
@@ -1790,6 +1793,7 @@ impl Attempt<'_> {
         match event {
             ComfyEvent::ExecutionStart { .. } => {
                 self.started = Some(self.comfy.clock.monotonic());
+                self.comfy.job_started(self.job.id.as_str());
                 if let Some(gpu) = self.comfy.gpu_name() {
                     self.job.set_engine_device(&gpu);
                 }

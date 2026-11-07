@@ -46,7 +46,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lil_platform::Clock;
-use lil_platform::hw::{CpuEnergySource, GpuMemSource, GpuSource, SysSample, SysSource};
+use lil_platform::hw::{
+    CpuEnergySource, GpuCounters, GpuMemSource, GpuSource, SysSample, SysSource,
+};
 use lil_protocol::estimate::Cost;
 use lil_protocol::{ErrorBody, codes};
 use lil_schema::{Currency, Money, PowerToml};
@@ -58,8 +60,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use self::db::{Db, Metric, RawPoint, Resolution};
+use self::sampler::{FitTracker, Sampler, StepIn};
 pub use self::sampler::{GpuOpener, SizesProbe};
-use self::sampler::{Sampler, StepIn};
 use crate::events::{EventBus, SnapshotProvider};
 
 /// The module the telemetry tools declare.
@@ -78,6 +80,9 @@ const MAX_DT_MS: u64 = 5000;
 const MAX_SEED_AHEAD_MS: i64 = 24 * 3_600_000;
 /// Retention is applied this often.
 const PRUNE_EVERY_MS: i64 = 60_000;
+/// The spill alert's margin (APP-132, P4b-R19): Task 0's S0.4 value by PF-26
+/// (`docs/spikes/12-browse-core.md`).
+pub const SPILL_MARGIN_MIB: u64 = 512;
 
 // ---------------------------------------------------------------------------------------------
 // The sources and settings.
@@ -89,6 +94,8 @@ pub struct HwSources {
     pub gpu_mem: Option<Box<dyn GpuMemSource>>,
     pub cpu_energy: Option<Box<dyn CpuEnergySource>>,
     pub sys: Box<dyn SysSource>,
+    /// The adapter's PDH memory and engine counters (CORE-059).
+    pub gpu_counters: Option<Box<dyn GpuCounters>>,
 }
 
 impl std::fmt::Debug for HwSources {
@@ -97,6 +104,7 @@ impl std::fmt::Debug for HwSources {
             .field("gpu", &self.gpu.is_some())
             .field("gpu_mem", &self.gpu_mem.is_some())
             .field("cpu_energy", &self.cpu_energy.is_some())
+            .field("gpu_counters", &self.gpu_counters.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -112,19 +120,19 @@ impl SysSource for NoSys {
 
 impl HwSources {
     /// This machine's hardware. Blocking: it loads `nvml.dll`, asks DXGI which adapter the GPU
-    /// is, and opens the PDH counters. Per-process GPU memory is read only from the NVML GPU's
-    /// own adapter, never from another one.
+    /// is, and opens the PDH counters. Per-process GPU memory and the adapter's counters are
+    /// read only from the NVML GPU's own adapter, never from another one.
     pub fn real() -> HwSources {
         let gpu = lil_platform::hw::nvml_gpu();
-        let gpu_mem = gpu
+        let luid = gpu
             .as_ref()
-            .and_then(|_| lil_platform::hw::nvidia_adapter_luid())
-            .and_then(|luid| lil_platform::hw::pdh_gpu_memory(Some(luid)));
+            .and_then(|_| lil_platform::hw::nvidia_adapter_luid());
         HwSources {
             gpu,
-            gpu_mem,
+            gpu_mem: luid.and_then(|luid| lil_platform::hw::pdh_gpu_memory(Some(luid))),
             cpu_energy: lil_platform::hw::energy_meter(),
             sys: lil_platform::hw::sysinfo_source(),
+            gpu_counters: luid.and_then(lil_platform::hw::pdh_gpu_counters),
         }
     }
 
@@ -136,19 +144,32 @@ impl HwSources {
             gpu_mem: None,
             cpu_energy: None,
             sys: Box::new(NoSys),
+            gpu_counters: None,
         }
     }
 
     /// The sources of a fake hardware script (`lil_platform::hw_fake`).
     pub fn from_fake(sources: lil_platform::hw_fake::FakeHwSources) -> HwSources {
-        let (gpu, gpu_mem, cpu_energy, sys) = sources;
+        let (gpu, gpu_mem, cpu_energy, sys, gpu_counters) = sources;
         HwSources {
             gpu,
             gpu_mem,
             cpu_energy,
             sys,
+            gpu_counters,
         }
     }
+}
+
+/// What an engine tells the telemetry about itself ([`Telemetry::set_engine_state`]): its
+/// processes (whose PDH `Shared Usage` summed is the engine's fit figure), when it last became
+/// ready (Unix ms; `None` while it isn't), and whether ComfyUI reports an outside job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineState {
+    pub engine: String,
+    pub pids: Vec<u32>,
+    pub ready_at_ms: Option<i64>,
+    pub outside_busy: bool,
 }
 
 /// How the sampler is driven (module docs).
@@ -345,6 +366,54 @@ pub struct GpuView {
     pub vram_total_mib: u64,
     pub vram_used_mib: u64,
     pub measured: bool,
+    /// The adapter's dedicated and shared memory in use (PDH `GPU Adapter Memory`); `null`
+    /// when the counters can't be read (CORE-059, Appendix H). Hardware display only.
+    #[serde(default)]
+    pub memory: Option<GpuMemoryView>,
+    /// Per engine type, the busiest engine's load (PDH `GPU Engine`); `null` when unreadable.
+    #[serde(default)]
+    pub engines: Option<Vec<GpuEngineView>>,
+    /// The headline load: the busiest engine's, else NVML's utilisation (APP-127).
+    #[serde(default = "HeadlineUtil::unknown")]
+    pub headline_util: HeadlineUtil,
+}
+
+/// `Snapshot.gpu.memory` (Appendix H).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GpuMemoryView {
+    pub dedicated_used_mib: u64,
+    pub shared_used_mib: u64,
+}
+
+/// One entry of `Snapshot.gpu.engines` (Appendix H).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GpuEngineView {
+    pub engtype: String,
+    pub util_permille: u16,
+}
+
+/// Where the headline GPU load came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UtilSource {
+    Engines,
+    Nvml,
+}
+
+/// `Snapshot.gpu.headline_util` (Appendix H).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HeadlineUtil {
+    pub permille: u16,
+    pub source: UtilSource,
+}
+
+impl HeadlineUtil {
+    fn unknown() -> HeadlineUtil {
+        HeadlineUtil {
+            permille: 0,
+            source: UtilSource::Nvml,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -416,6 +485,16 @@ pub struct AlertView {
     pub kind: String,
     pub value: i64,
     pub since: String,
+    /// `gpu_spill` only (Appendix H): the job, the engine process with the most shared
+    /// memory, the engine's shared memory above its idle level, and the margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub above_idle_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_mib: Option<u64>,
 }
 
 /// One of the processes with the most dedicated GPU memory (Appendix G `gpu_users`); `name` is
@@ -526,6 +605,18 @@ pub struct JobEnergy {
     pub measured: Measured,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub idle_unknown: bool,
+    /// The fit signal (ARCH-071, P4b-R37 as Appendix H states it); `null` when the engine had
+    /// no idle level at the job's start.
+    #[serde(default)]
+    pub fit: Option<Fit>,
+}
+
+/// A job's fit signal: the engine processes' `Shared Usage` idle level at its start, and the
+/// most it rose above that level while the job ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Fit {
+    pub shared_idle_mib: u64,
+    pub shared_above_idle_max_mib: u64,
 }
 
 /// One succeeded job of the estimator's history (`telemetry.db` `job_stats`, Appendix G):
@@ -553,6 +644,11 @@ pub struct EnergyTotals {
     pub cpu_mj: u64,
     pub system_mj: u64,
     pub measured: Measured,
+    /// The count of 1-second samples in the range; `null` when the range was read from a
+    /// roll-up (`m1` or `e15`; Appendix H).
+    pub samples: Option<u64>,
+    /// The GPU's or the CPU's energy was measured for some samples of the range but not all.
+    pub partly_measured: bool,
     /// `system_mj` at `[power] electricity`, in that rate's currency, when it is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_cost: Option<Cost>,
@@ -670,7 +766,8 @@ pub struct Series {
 #[serde(deny_unknown_fields)]
 pub struct SeriesQuery {
     /// Any of `gpu.util`, `gpu.power`, `gpu.energy`, `gpu.temp`, `gpu.vram_used`, `cpu.util`,
-    /// `cpu.power`, `cpu.energy`, `ram.used`, `system.power`, `net.rx`, `net.tx`.
+    /// `cpu.power`, `cpu.energy`, `ram.used`, `system.power`, `net.rx`, `net.tx`,
+    /// `gpu.mem.dedicated_mib`, `gpu.mem.shared_mib`, `gpu.engine.busiest_permille`.
     pub metrics: Vec<String>,
     /// RFC 3339 UTC; the range includes `from` and `to`.
     pub from: String,
@@ -729,6 +826,8 @@ struct Inner {
     vram: Mutex<Option<VramView>>,
     tracked: Mutex<BTreeMap<u32, &'static str>>,
     busy: AtomicBool,
+    /// The engines' fit figures and the jobs running on them (ARCH-071, APP-132).
+    fits: Mutex<FitTracker>,
     /// Whether the machine has a GPU source (kept beside the sampler so asking never waits for a
     /// step).
     has_gpu: AtomicBool,
@@ -769,6 +868,7 @@ impl Inner {
                 run: self.run,
                 busy: self.busy.load(Ordering::Relaxed),
                 tracked: &tracked,
+                fits: &self.fits,
             });
             self.has_gpu
                 .store(stepper.sampler.has_gpu(), Ordering::Relaxed);
@@ -877,6 +977,7 @@ impl Telemetry {
             vram: Mutex::new(None),
             tracked: Mutex::new(BTreeMap::new()),
             busy: AtomicBool::new(false),
+            fits: Mutex::new(FitTracker::default()),
             has_gpu: AtomicBool::new(has_gpu),
             hooks: Mutex::new(Vec::new()),
             samples: watch::Sender::new(0),
@@ -954,6 +1055,35 @@ impl Telemetry {
     /// What [`Telemetry::set_busy`] set last.
     pub fn busy(&self) -> bool {
         self.inner.busy.load(Ordering::Relaxed)
+    }
+
+    /// An engine's processes and readiness, pushed by the engine when it becomes ready or
+    /// stops, when its processes change and when an outside job starts or ends (`engines` uses
+    /// `telemetry`, never the reverse). A new `ready_at_ms` (a restart) resets the engine's idle
+    /// level (P4b-R37 as Appendix H states it). Whether a suite job runs stays
+    /// [`Telemetry::set_busy`]'s.
+    pub fn set_engine_state(&self, s: EngineState) {
+        lock(&self.inner.fits).set_engine(s);
+    }
+
+    /// A suite job's execution began on `engine`: its idle level is fixed now, the lowest
+    /// engine figure since the engine became ready (`None` without a sample since then: the
+    /// job gets `fit: null` and no spill alert). A later attempt of the same job keeps the
+    /// level its first start fixed.
+    pub fn job_started(&self, job_id: &str, engine: &str) {
+        lock(&self.inner.fits).job_started(job_id, engine);
+    }
+
+    /// A suite job's execution on its engine ended: its spill alert clears at the next sample,
+    /// and its fit is kept for [`Telemetry::job_fit`].
+    pub fn job_ended(&self, job_id: &str) {
+        lock(&self.inner.fits).job_ended(job_id);
+    }
+
+    /// The fit signal of a job whose execution ended (taken once: `meter` writes it with the
+    /// job's energy); `None` when it had no idle level or never ran on an engine.
+    pub fn job_fit(&self, job_id: &str) -> Option<Fit> {
+        lock(&self.inner.fits).take(job_id)
     }
 
     /// Calls `f` after every sample, once it is counted ([`Telemetry::sample_count`]): the
@@ -1244,6 +1374,8 @@ impl Telemetry {
                 gpu: found.gpu_measured,
                 cpu: found.cpu_measured,
             },
+            samples: (!found.rollup).then_some(found.samples),
+            partly_measured: found.partly_measured,
             energy_cost,
         })
     }

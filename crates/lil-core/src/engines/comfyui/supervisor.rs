@@ -39,7 +39,7 @@ use crate::events::EventBus;
 use crate::jobs::{EngineKind, Jobs};
 use crate::meter::UsageSink;
 use crate::state::StateDb;
-use crate::telemetry::Telemetry;
+use crate::telemetry::{EngineState as TelemetryEngine, Telemetry};
 
 /// How long after a failed catalogue probe another may be made (plan 4a ruling, 2026-10-24).
 const CATALOGUE_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -152,6 +152,9 @@ pub(crate) struct Comfy {
     sockets: Arc<dyn SocketTable>,
     view: Mutex<View>,
     pids: Mutex<Vec<u32>>,
+    /// When the engine last became ready (Unix ms), while it is: the telemetry's idle level
+    /// counts from it (ARCH-071, P4b-R37 as Appendix H states it).
+    ready_at_ms: Mutex<Option<i64>>,
     restart_needed: AtomicBool,
     ops: tokio::sync::Mutex<Option<Owned>>,
     idle: Mutex<Idle>,
@@ -247,6 +250,7 @@ impl Comfy {
             sockets,
             view: Mutex::new(STOPPED),
             pids: Mutex::new(Vec::new()),
+            ready_at_ms: Mutex::new(None),
             restart_needed: AtomicBool::new(false),
             ops: tokio::sync::Mutex::new(None),
             idle: Mutex::new(Idle {
@@ -518,13 +522,50 @@ impl Comfy {
             *was = ready;
             before != (*epoch, *was)
         });
-        if v.state == EngineState::Stopped
+        let ready_at = {
+            let mut at = lock(&self.ready_at_ms);
+            let before = *at;
+            if new_run {
+                *at = Some(self.now_ms());
+            } else if !ready {
+                *at = None;
+            }
+            before != *at
+        };
+        let outside_cleared = v.state == EngineState::Stopped
             && old.class == EngineClass::Owned
-            && self.outside.clear()
-        {
+            && self.outside.clear();
+        if outside_cleared {
             self.publish("outside_job");
         }
+        if ready_at || outside_cleared {
+            self.push_engine_state();
+        }
         old != v
+    }
+
+    /// Tells the telemetry the engine's processes, when it became ready and whether an
+    /// outside job runs (`engines` uses `telemetry`, never the reverse).
+    fn push_engine_state(&self) {
+        let pids = lock(&self.pids).clone();
+        let ready_at_ms = *lock(&self.ready_at_ms);
+        self.telemetry.set_engine_state(TelemetryEngine {
+            engine: COMFYUI_ROLE.to_string(),
+            pids,
+            ready_at_ms,
+            outside_busy: self.outside.any(),
+        });
+    }
+
+    /// A suite job's prompt began executing (`execution_start`): the telemetry fixes the job's
+    /// idle level for the fit signal and the spill alert (ARCH-071, APP-132).
+    pub(crate) fn job_started(&self, job_id: &str) {
+        self.telemetry.job_started(job_id, COMFYUI_ROLE);
+    }
+
+    /// A suite job's attempt on the engine ended.
+    pub(crate) fn job_ended(&self, job_id: &str) {
+        self.telemetry.job_ended(job_id);
     }
 
     /// The readiness epoch now (see the `ready` field).
@@ -705,6 +746,7 @@ impl Comfy {
             .await;
         if changed {
             self.publish("outside_job");
+            self.push_engine_state();
         }
         // The open `outside_paid` row is the write-ahead record (ruling P3-R27): the line, then
         // the mark. A core that stops in between finds the line in the log and writes no
@@ -741,7 +783,12 @@ impl Comfy {
         for pid in new.iter().filter(|p| !pids.contains(p)) {
             self.telemetry.track(*pid, COMFYUI_ROLE);
         }
+        let changed = *pids != new;
         *pids = new;
+        drop(pids);
+        if changed {
+            self.push_engine_state();
+        }
     }
 
     pub(crate) fn set_restart_needed(&self) {
