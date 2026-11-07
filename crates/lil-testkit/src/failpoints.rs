@@ -81,7 +81,7 @@ mod tests {
             "store.between_renames=abort,watch.start=unsupported,store.write_temp=disk_full"
         );
         // Every name and action of the closed lists is accepted.
-        assert_eq!((NAMES.len(), ACTIONS.len()), (21, 5));
+        assert_eq!((NAMES.len(), ACTIONS.len()), (22, 5));
         for name in NAMES {
             for action in ACTIONS {
                 assert_eq!(spec(&[(name, action)]), format!("{name}={action}"));

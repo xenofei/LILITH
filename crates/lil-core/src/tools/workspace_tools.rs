@@ -607,7 +607,8 @@ async fn close_unless_default(t: &Tools, ws: &WorkspaceRef) {
 /// Takes back the folder `workspace.create` made when a later check refuses the call. Only a
 /// folder the call made (`existed` is false) and only while it is empty: `RemoveDirectoryW`
 /// refuses one that isn't, so nothing is ever deleted (CORE-110). Parents that `ensure_dir`
-/// made stay. Best effort.
+/// made stay. A link at the path is removed as a link (`RemoveDirectoryW` never follows it),
+/// never its target. Best effort.
 fn discard_new_folder(path: &Path, existed: bool) {
     if !existed {
         let _ = fsops::remove_empty_dir(path);
