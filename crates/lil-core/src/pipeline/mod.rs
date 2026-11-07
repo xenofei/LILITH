@@ -17,7 +17,7 @@ pub mod status;
 
 pub use detail::{
     AssetDetail, AssetSummary, DisplayEntry, FileEntry, LastChange, NextVersions, UseEntry,
-    UsedByEntry, VersionEntry, asset_detail, asset_summary, file_state_wire,
+    UseError, UsedByEntry, VersionEntry, asset_detail, asset_summary, file_state_wire,
 };
 pub use record::{
     HandOff, RecordBranch, RecordOutcome, RecordPlan, RecordSlot, apply_record, asset_topic,

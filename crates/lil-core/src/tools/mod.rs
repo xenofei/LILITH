@@ -11,6 +11,7 @@ pub mod doctor_tools;
 pub mod job_tools;
 pub mod project_tools;
 pub mod record_stage;
+pub mod ref_tools;
 pub mod registry;
 pub mod stages;
 pub mod telemetry_tools;
@@ -34,6 +35,7 @@ pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
 pub use job_tools::{JOB_RETRY, register_job_tools};
 pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
+pub use ref_tools::register_ref_tools;
 pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool, with_estimate_key};
 pub use stages::{
     AllowOnce, Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput,
@@ -83,6 +85,7 @@ pub fn core_registry(
     register_trash_tools(&mut reg, &personal);
     register_asset_read_tools(&mut reg);
     register_asset_tools(&mut reg);
+    register_ref_tools(&mut reg);
     register_watch_tools(&mut reg);
     register_job_tools(&mut reg);
     let all_tools = Arc::new(OnceLock::new());

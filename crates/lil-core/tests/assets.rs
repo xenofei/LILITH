@@ -1968,11 +1968,28 @@ async fn asset_get_has_uses_status_log_and_trust() {
     let crane = fx
         .ok("asset.get", json!({"asset_id": "chr_paper_crane"}))
         .await;
+    let lamp_hash =
+        version_content_hash_of(&fx.path("projects/sketchbook/assets/prop_signal_lamp/v1.0.0"));
+    // Each with its resolution (ARCH-125, Task 7): no harbor project here, so the wall is
+    // unknown; the lamp's version is sealed, so its ref carries the hash.
     assert_eq!(
         crane["uses"],
         json!([
-            {"ref": "proj:harbor/env_harbor_wall@1.0.0", "role": "reference"},
-            {"ref": "prop_signal_lamp@1.0.0", "role": "style"},
+            {"ref": "proj:harbor/env_harbor_wall@1.0.0", "role": "reference", "resolved": null,
+             "error": {
+                 "code": "asset.unknown",
+                 "message": "There is no asset `env_harbor_wall` in the project `harbor`, no \
+                             redirect from it and nothing of it in the trash; assets.query \
+                             lists the assets there are.",
+                 "data": {"project": "harbor", "asset_id": "env_harbor_wall"},
+             }},
+            {"ref": "prop_signal_lamp@1.0.0", "role": "style", "resolved": {
+                "kind": "sealed",
+                "ref": format!("lil://{}/sketchbook/prop_signal_lamp@1.0.0#sha256={lamp_hash}",
+                               fx.ws_id()),
+                "project": "sketchbook", "asset_id": "prop_signal_lamp", "version": "1.0.0",
+                "read_only": true, "redirected_from": [],
+            }},
         ]),
         "{crane}"
     );

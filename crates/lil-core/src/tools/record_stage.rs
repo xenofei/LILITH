@@ -5,7 +5,9 @@
 //! [`RecordPlan`](crate::pipeline::RecordPlan): it calls [`apply_record`] in the call's
 //! workspace, on the store clock's UTC day, and sets the result's `structured.handoff` from
 //! the returned [`HandOff`](crate::pipeline::HandOff), and `structured.warnings` from what
-//! failed after the manifest edit (ruling Q31; an empty list when nothing did). A commit error
+//! failed after the manifest edit (ruling Q31; an empty list when nothing did), after the
+//! warnings the tool's own result already listed (such as `asset.import`'s creation warning,
+//! ARCH-125). A commit error
 //! before the manifest edit replaces the outcome with the store error (outputs already moved
 //! stay as listed orphans, ARCH-075); nothing after the manifest edit does. A plan left by a
 //! call that didn't end `ok` is dropped unwritten, and with it any version-lock guard.
@@ -76,7 +78,13 @@ impl RecordStage for WorkspaceRecord {
                     match &mut output.structured {
                         Value::Object(map) => {
                             map.insert("handoff".into(), handoff);
-                            map.insert("warnings".into(), Value::from(recorded.warnings));
+                            let recorded = recorded.warnings.into_iter().map(Value::from);
+                            match map.get_mut("warnings") {
+                                Some(Value::Array(own)) => own.extend(recorded),
+                                _ => {
+                                    map.insert("warnings".into(), recorded.collect());
+                                }
+                            }
                         }
                         other => {
                             tracing::error!(tool = %d.name, "a recorded result that isn't an object gets no hand-off block");

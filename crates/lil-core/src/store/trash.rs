@@ -127,7 +127,7 @@ fn parse_date(s: &str) -> Option<i64> {
 }
 
 /// Unix seconds of an RFC 3339 UTC time `YYYY-MM-DDTHH:MM:SS[.fraction]Z`.
-pub(super) fn parse_rfc3339(s: &str) -> Option<i64> {
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b.last() != Some(&b'Z') {
         return None;

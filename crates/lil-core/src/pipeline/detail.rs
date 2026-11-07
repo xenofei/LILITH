@@ -17,9 +17,15 @@
 //!   none), `proposed_bump` (`patch` when the open run's `target_version` is the patch bump,
 //!   else `minor`), the manifest's own `candidate_runs`, `human_edits`, `external`,
 //!   `status_log` and `trust` (as written), the index's file states (paths relative to the
-//!   asset folder), `uses` (the manifest's and its open runs' inputs, `{ref, role}`; APP-148)
-//!   and `used_by` (depth 1, from the index's edges: `{ref: "<project>/<asset_id>", kind:
-//!   "input"}`, a pin counting as an input).
+//!   asset folder), `uses` (the manifest's and its open runs' inputs, `{ref, role, resolved}`;
+//!   APP-148) and `used_by` (depth 1, from the index's edges to the asset and to every name
+//!   that resolves to it through `registry/redirects.yaml`: `{ref: "<project>/<asset_id>",
+//!   kind: "input"}`, a pin counting as an input).
+//! - `uses[].resolved` is the input resolved through `projects::Resolver` (ARCH-125): a link to
+//!   an asset's version names where the asset is now, with the version's content hash when it
+//!   is sealed; `null` for a library or style input, and `null` with `error: {code, message,
+//!   data?}` when it doesn't resolve (a loop, a dead end, the trash). A redirects file that
+//!   can't be read fails the call with its error (`manifest.needs_repair`).
 //!
 //! An asset whose manifest is `missing` fails with `manifest.needs_repair`, `data.missing`
 //! naming the manifest; one whose manifest doesn't parse is answered with `needs_repair: true`
@@ -33,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::index::{AssetRow, FileState, Index};
+use crate::projects::{Resolved, Resolver};
 use crate::store::Store;
 
 /// One asset in an `assets.query` page.
@@ -96,6 +103,21 @@ pub struct UseEntry {
     #[serde(rename = "ref")]
     pub r#ref: String,
     pub role: Option<String>,
+    /// Where it resolves to (module docs); `null` for a library or style input, or when it
+    /// doesn't resolve (`error` then says why).
+    pub resolved: Option<Resolved>,
+    /// Why it doesn't resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<UseError>,
+}
+
+/// Why an input doesn't resolve: the error `ref.resolve` would give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct UseError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// An asset that uses this one (`asset.get`'s `used_by`).
@@ -284,6 +306,7 @@ pub async fn asset_detail(
             .unwrap_or_else(|| json!([]))
     };
     let view = manifest.as_ref().map(Manifest::view).unwrap_or_default();
+    let resolver = Resolver::load(index, store).await?;
 
     let versions = store
         .versions(project, asset_id)
@@ -350,7 +373,7 @@ pub async fn asset_detail(
         })
         .collect();
 
-    let mut uses: Vec<UseEntry> = Vec::new();
+    let mut listed: Vec<(String, Option<String>)> = Vec::new();
     let run_inputs = view
         .candidate_runs
         .iter()
@@ -362,20 +385,34 @@ pub async fn asset_detail(
         .map(|i| (&i.r#ref, &i.role))
         .chain(run_inputs)
     {
-        let entry = UseEntry {
-            r#ref: r#ref.clone(),
-            role: role.clone(),
-        };
-        if !uses.contains(&entry) {
-            uses.push(entry);
+        let entry = (r#ref.clone(), role.clone());
+        if !listed.contains(&entry) {
+            listed.push(entry);
         }
     }
+    let mut uses: Vec<UseEntry> = Vec::with_capacity(listed.len());
+    for (r#ref, role) in listed {
+        let (resolved, error) = match resolver.resolve_input(ws_id, project, &r#ref).await {
+            None => (None, None),
+            Some(Ok(resolved)) => (Some(resolved), None),
+            Some(Err(e)) => (
+                None,
+                Some(UseError {
+                    code: e.code,
+                    message: e.message,
+                    data: e.data,
+                }),
+            ),
+        };
+        uses.push(UseEntry {
+            r#ref,
+            role,
+            resolved,
+            error,
+        });
+    }
     let mut used_by: Vec<UsedByEntry> = Vec::new();
-    for edge in index
-        .edges_to_any(&[(project.to_string(), asset_id.to_string())])
-        .await
-        .map_err(|e| e.to_error(""))?
-    {
+    for edge in resolver.edges_to(project, asset_id).await? {
         let entry = UsedByEntry {
             r#ref: format!("{}/{}", edge.from_project, edge.from_asset),
             kind: "input".to_string(),

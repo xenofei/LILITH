@@ -286,6 +286,21 @@ pub const JOB_NOT_QUEUED: CodeSpec = spec("job.not_queued", C::DataConflict, R::
 /// `job.not_queued`'s message (Appendix D).
 pub const JOB_NOT_QUEUED_MESSAGE: &str = "Only a job that is waiting its turn can be moved; this one is with the engine, running or finished.";
 
+// Plan 4b (Appendix D). Task 7 returns these two first; the plan's other codes follow with
+// the tasks that return them.
+
+/// A ref resolves to an asset that is in the trash (ARCH-125, CORE-157). Message: "This asset
+/// is in the trash (entry <entry_id>). Restore it with trash.restore."; `data: {entry_id}`.
+pub const ASSET_TRASHED: CodeSpec = spec("asset.trashed", C::UserFixable, R::AfterResolve, false);
+/// A redirect chain loops or ends at no asset (ARCH-125). Message: "The redirect for <name>
+/// leads nowhere: <reason>."; `data: {chain: [name], reason: "cycle" | "target_missing", to?}`.
+pub const REF_REDIRECT_BROKEN: CodeSpec = spec(
+    "ref.redirect_broken",
+    C::UserFixable,
+    R::AfterResolve,
+    false,
+);
+
 /// Every code, in table order.
 pub const ALL: &[&CodeSpec] = &[
     &CONFIRM_DENIED,
@@ -355,6 +370,8 @@ pub const ALL: &[&CodeSpec] = &[
     &CONFIRM_ALREADY_ANSWERED,
     &CAPS_INVALID,
     &JOB_NOT_QUEUED,
+    &ASSET_TRASHED,
+    &REF_REDIRECT_BROKEN,
 ];
 
 #[cfg(test)]
@@ -552,6 +569,13 @@ mod tests {
         ("confirm.already_answered", C::DataConflict, R::Never, false),
         ("caps.invalid", C::UserFixable, R::AfterResolve, false),
         ("job.not_queued", C::DataConflict, R::Never, false),
+        ("asset.trashed", C::UserFixable, R::AfterResolve, false),
+        (
+            "ref.redirect_broken",
+            C::UserFixable,
+            R::AfterResolve,
+            false,
+        ),
     ];
 
     /// `^[a-z_]+(\.[a-z_]+)+$`
@@ -565,7 +589,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 67);
+        assert_eq!(TABLE.len(), 69);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);

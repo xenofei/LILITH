@@ -138,6 +138,15 @@ fn cascade_layer(layer: &Map<String, Value>) -> Map<String, Value> {
     out
 }
 
+/// The top-level mapping of a registry file such as `registry/redirects.yaml`, as JSON, for its
+/// reader to check (an empty or comment-only file is an empty mapping).
+///
+/// # Errors
+/// When the text isn't YAML or its document isn't a mapping; the message names `file`.
+pub fn read_yaml_mapping(text: &str, file: &str) -> Result<Map<String, Value>, String> {
+    root_map(text, file)
+}
+
 /// The document's root mapping as JSON; an empty document is an empty mapping.
 fn root_map(text: &str, file: &str) -> Result<Map<String, Value>, String> {
     let text = text.strip_prefix(crate::manifest::BOM).unwrap_or(text);

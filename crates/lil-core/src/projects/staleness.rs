@@ -11,6 +11,11 @@
 //! `approved`, `exported` and `released` assets can go
 //! stale (CORE-048); others, and assets already `stale`, are left as they are, so the check
 //! can run again at any time (a retry after it failed midway finishes it).
+//!
+//! Every input and pin is resolved through [`Resolver`] (ARCH-125): an input naming an
+//! asset's old place reads the approved version where the asset is now, and a pin of either
+//! name pins it. An input that doesn't resolve (a loop, a dead end, the trash) can't make its
+//! asset stale. A redirects file that can't be read stops the check with its error.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +27,8 @@ use lil_schema::{
 };
 use serde_json::Value;
 
+use super::redirects::REDIRECTS_YAML;
+use super::resolve::Resolver;
 use super::{ProjectFile, read_project};
 use crate::graph::is_stale;
 use crate::index::{Index, IndexError};
@@ -35,6 +42,20 @@ fn index_error(e: &IndexError) -> StoreError {
     }
 }
 
+/// A redirects file that can't be read, as a store error: one that doesn't parse is
+/// `yaml.unsupported_edit` (as a `project.yaml` that doesn't parse is for `project.set_status`),
+/// any other failure `store.io`; the message says which and why.
+pub(crate) fn redirects_error(e: &lil_protocol::ErrorBody) -> StoreError {
+    if e.code == lil_protocol::codes::MANIFEST_NEEDS_REPAIR.code {
+        StoreError::YamlUnsupported(e.message.clone())
+    } else {
+        StoreError::Io {
+            path: REDIRECTS_YAML.to_string(),
+            why: e.message.clone(),
+        }
+    }
+}
+
 /// Whether `project.yaml` of `slug` says `archived`.
 async fn is_archived(store: &Store, slug: &str) -> bool {
     matches!(
@@ -45,7 +66,8 @@ async fn is_archived(store: &Store, slug: &str) -> bool {
 
 /// The assets whose manifest `inputs` or `pinned_inputs` name `project`/`asset_id`, as
 /// `(project, asset_id)`, sorted, without those in archived projects (I6: "Archived projects
-/// are skipped until restored").
+/// are skipped until restored"). By that name only: [`dependents_of`] takes every name that
+/// resolves to an asset.
 ///
 /// # Errors
 /// `store.io` when the index fails.
@@ -55,10 +77,26 @@ pub async fn dependents(
     project: &str,
     asset_id: &str,
 ) -> Result<Vec<(String, String)>, StoreError> {
-    let all = index
-        .dependents(project, asset_id)
+    dependents_of(store, index, &[(project.to_string(), asset_id.to_string())]).await
+}
+
+/// [`dependents`] of any of `names` (`(project, asset_id)`: an asset and every name that
+/// resolves to it, `Resolver::names_resolving_to`), each dependent once.
+///
+/// # Errors
+/// `store.io` when the index fails.
+pub async fn dependents_of(
+    store: &Store,
+    index: &Index,
+    names: &[(String, String)],
+) -> Result<Vec<(String, String)>, StoreError> {
+    let all: std::collections::BTreeSet<(String, String)> = index
+        .edges_to_any(names)
         .await
-        .map_err(|e| index_error(&e))?;
+        .map_err(|e| index_error(&e))?
+        .into_iter()
+        .map(|e| (e.from_project, e.from_asset))
+        .collect();
     let mut archived: HashMap<String, bool> = HashMap::new();
     let mut kept = Vec::with_capacity(all.len());
     for (p, a) in all {
@@ -106,25 +144,43 @@ fn target_of(project: &str, link: &LinkRef) -> Option<((String, String), Version
     }
 }
 
+/// Where `target` resolves to; `None` when it doesn't.
+async fn resolved(resolver: &Resolver<'_>, target: &(String, String)) -> Option<(String, String)> {
+    resolver
+        .resolve_name(&target.0, &target.1)
+        .await
+        .ok()
+        .map(|r| (r.project, r.asset_id))
+}
+
 /// The first input of `view` that makes it stale, as `(asset_id, approved version, the
-/// input's ref)`, looking targets' approved versions up in `approved` (read once per target).
+/// input's ref)`, looking targets' approved versions up in `approved` (read once per target),
+/// every target resolved through `resolver`.
 async fn stale_input(
     store: &Store,
+    resolver: &Resolver<'_>,
     project: &str,
     view: &ManifestView,
     approved: &mut HashMap<(String, String), Option<Version>>,
 ) -> Option<(String, Version, String)> {
-    let pinned: Vec<(String, String)> = view
+    let mut pinned: Vec<(String, String)> = Vec::new();
+    for link in view
         .pinned_inputs
         .iter()
         .filter_map(|p| p.r#ref.parse::<LinkRef>().ok())
-        .filter_map(|link| target_of(project, &link).map(|(target, _)| target))
-        .collect();
+    {
+        if let Some((target, _)) = target_of(project, &link) {
+            pinned.push(resolved(resolver, &target).await.unwrap_or(target));
+        }
+    }
     for input in &view.inputs {
         let Ok(link) = input.r#ref.parse::<LinkRef>() else {
             continue;
         };
-        let Some((target, version)) = target_of(project, &link) else {
+        let Some((named, version)) = target_of(project, &link) else {
+            continue;
+        };
+        let Some(target) = resolved(resolver, &named).await else {
             continue;
         };
         let now = match approved.get(&target) {
@@ -157,6 +213,9 @@ pub async fn restore_staleness(
     project: &str,
 ) -> Result<Vec<String>, StoreError> {
     ws.index.ready_result().await.map_err(|e| index_error(&e))?;
+    let resolver = Resolver::load(&ws.index, &ws.store)
+        .await
+        .map_err(|e| redirects_error(&e))?;
     let assets = ws
         .index
         .assets_of(project)
@@ -179,7 +238,7 @@ pub async fn restore_staleness(
             continue;
         }
         let Some((input, version, input_ref)) =
-            stale_input(&ws.store, project, &view, &mut approved).await
+            stale_input(&ws.store, &resolver, project, &view, &mut approved).await
         else {
             continue;
         };

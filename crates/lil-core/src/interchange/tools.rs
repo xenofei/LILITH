@@ -10,7 +10,9 @@
 //! | `lilref.write` | write | `{ref, title?}` (a sealed ref with `#sha256=`) | `{path}` |
 //! | `notify.claude_code` | write | `{message, title?}` (1–2,000 and at most 100 characters) | `{posted, reason?: "category_off" \| "foreground" \| "duplicate" \| "unavailable"}` |
 //!
-//! The intent set is closed (APP-066): any other value is `params.invalid`.
+//! The intent set is closed (APP-066): any other value is `params.invalid`. A ref target's type
+//! is looked up where the ref resolves to (`super::resolve`, through `registry/redirects.yaml`),
+//! for `handlers.for` as for `open_in` and `ui.show`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    HandlerView, INTERCHANGE_MODULE, Intent, Interchange, NotifyOutcome, OpenResult, Target,
+    HandlerView, INTERCHANGE_MODULE, Intent, Interchange, NotifyOutcome, OpenResult,
     handlers_for_target, write_lilref,
 };
 use crate::tools::{Registry, typed_tool};
@@ -106,9 +108,7 @@ pub fn register_interchange_tools(reg: &mut Registry, interchange: &Arc<Intercha
         move |ctx, args: ForArgs| {
             let ix = ix.clone();
             Box::pin(async move {
-                let target = Target::parse(&args.target).map_err(|why| {
-                    ErrorBody::new(&codes::PARAMS_INVALID, why, ctx.trace_id.clone())
-                })?;
+                let target = super::resolve(ctx, &args.target).await?;
                 let regs = tokio::task::spawn_blocking(move || ix.registrations())
                     .await
                     .unwrap_or_default();
