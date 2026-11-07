@@ -37,9 +37,11 @@
 //!   30 s at <= 82 °C; a throttle alert clears after 30 s without its bit; neither raises again
 //!   within 60 s of clearing. `gpu_spill` raises after 10 s with the job's engine above its idle
 //!   level by more than [`SPILL_MARGIN_MIB`], and clears after 30 s at or below half of it,
-//!   when the job ends, or when the adapter counters can't be read. While per-process memory
-//!   can't be read the figure is unknown: nothing raises, and a raised alert is held, clearing
-//!   only after 30 s unknown, so a passing failed read doesn't make it flap. Its timers belong
+//!   or when the job ends. While per-process memory or the adapter counters can't be read the
+//!   figure is unknown: nothing raises, and a raised alert is held, clearing only after 30 s
+//!   unknown, so a passing failed read doesn't make it flap. The 30 s calm of the temperature
+//!   and throttle alerts count only steps with a live GPU reading: a step without one starts
+//!   them again (audit L4). Its timers belong
 //!   to one start of one job. Times are the step's
 //!   (`StepIn::now`): the monotonic clock, or the nominal seconds of manual mode.
 
@@ -91,6 +93,12 @@ const TEMP_CLEAR_C: u8 = 82;
 const CLEAR_AFTER: Duration = Duration::from_secs(30);
 /// A cleared temperature or throttle alert doesn't raise again within this (LT-04).
 const REARM_AFTER: Duration = Duration::from_secs(60);
+/// The alerts LT-04's hysteresis governs.
+const LT04_ALERTS: [&str; 3] = [
+    "gpu_temperature",
+    "gpu_throttle_thermal",
+    "gpu_throttle_power_brake",
+];
 /// `gpu_spill` raises after this long above the margin (APP-132).
 const SPILL_RAISE_AFTER: Duration = Duration::from_secs(10);
 /// The finished jobs' fits kept for `meter` to take.
@@ -208,8 +216,7 @@ struct SpillNow {
 }
 
 /// What a raised `gpu_spill` is at a step: its job start runs with a known figure, runs with
-/// the figure unknown (per-process memory can't be read), or is over (or the adapter counters
-/// can't be read).
+/// the figure unknown (per-process memory or the adapter counters can't be read), or is over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpillHold {
     Measured,
@@ -880,12 +887,11 @@ impl Sampler {
         let mut events = self.update_alerts(live_sample, input.now, input.utc_ms);
         events.extend(self.update_spill(
             spill.filter(|_| adapter.is_some()),
-            hold.map(|h| {
-                if adapter.is_some() {
-                    h
-                } else {
-                    SpillHold::Gone
-                }
+            // Unreadable adapter counters make the figure unknown, as a failed per-process
+            // read does (audit L1); an ended job still clears at once.
+            hold.map(|h| match h {
+                SpillHold::Measured if adapter.is_none() => SpillHold::Unknown,
+                h => h,
             }),
             input.now,
             input.utc_ms,
@@ -1087,6 +1093,12 @@ impl Sampler {
     /// returns the events.
     fn update_alerts(&mut self, gpu: Option<&GpuSample>, now: Duration, now_ms: i64) -> Vec<Value> {
         let Some(gpu) = gpu else {
+            // No reading: the time isn't known to be calm, so the 30 s start again (audit L4).
+            for id in LT04_ALERTS {
+                if let Some(h) = self.hysteresis.get_mut(id) {
+                    h.calm_since = None;
+                }
+            }
             return Vec::new();
         };
         let lt04 = Rule {

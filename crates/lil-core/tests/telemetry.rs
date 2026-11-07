@@ -2648,7 +2648,8 @@ async fn unreadable_counters_send_null_and_no_spill_alert() {
             .is_empty()
     );
 
-    // A raised alert clears when the counters stop reading.
+    // A raised alert is held while the counters can't be read, and clears after 30 s of it
+    // (audit L1; the per-process path is review N1's).
     let mut hw = spill_script(&[200, 5000]);
     let mut adapter = vec![json!({"dedicated_mib": 1, "shared_mib": 1}); 12];
     adapter.push(Value::Null);
@@ -2658,8 +2659,10 @@ async fn unreadable_counters_send_null_and_no_spill_alert() {
     rig.telemetry.job_started("j_lost", "comfyui");
     let raised = rig.run(11).await;
     assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
-    let lost = rig.run(1).await;
-    assert!(spill_alert(&lost).is_none(), "{:?}", lost.alerts);
+    let lost = rig.run(30).await;
+    assert!(spill_alert(&lost).is_some(), "{:?}", lost.alerts);
+    let cleared = rig.run(1).await;
+    assert!(spill_alert(&cleared).is_none(), "{:?}", cleared.alerts);
 }
 
 /// An engine started for the job has a single reading before the job starts: that first
@@ -3186,4 +3189,91 @@ async fn a_raised_spill_survives_one_unknown_reading_and_clears_after_30_s() {
         .map(|e| e["kind"].clone())
         .collect();
     assert_eq!(kinds, [json!("alert"), json!("alert_cleared")], "no flap");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 19 audit fix round 1 (L1, L4).
+// ---------------------------------------------------------------------------------------------
+
+/// One adapter-counter reading that fails holds a raised `gpu_spill` like an unknown
+/// per-process reading: no flap; 30 s unreadable clears it (audit L1).
+#[tokio::test] // spec: APP-132, CORE-059
+async fn a_raised_spill_survives_one_unreadable_adapter_reading() {
+    // Seconds 1-11 at 900 raise it; second 12 the adapter can't be read; 13-17 it can;
+    // from 18 it can't.
+    let mut adapter = vec![json!({"dedicated_mib": 4500, "shared_mib": 300}); 12];
+    adapter.push(Value::Null);
+    adapter.extend(std::iter::repeat_n(
+        json!({"dedicated_mib": 4500, "shared_mib": 300}),
+        5,
+    ));
+    adapter.push(Value::Null);
+    let mut hw = spill_script(&[200, 900]);
+    hw["gpu_adapter"] = json!(adapter);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_adapter", "comfyui");
+    let raised = rig.run(11).await;
+    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
+    let gap = rig.run(1).await;
+    assert!(
+        spill_alert(&gap).is_some(),
+        "one unreadable reading holds it: {:?}",
+        gap.alerts
+    );
+    rig.run(5).await;
+    let unreadable = rig.run(30).await;
+    assert!(
+        spill_alert(&unreadable).is_some(),
+        "not yet 30 s: {:?}",
+        unreadable.alerts
+    );
+    let cleared = rig.run(1).await;
+    assert!(spill_alert(&cleared).is_none(), "{:?}", cleared.alerts);
+    let kinds: Vec<Value> = alert_events(&rig.events().await, "gpu_spill")
+        .iter()
+        .map(|e| e["kind"].clone())
+        .collect();
+    assert_eq!(kinds, [json!("alert"), json!("alert_cleared")], "no flap");
+
+    // A job that ends while the adapter can't be read still clears it at once.
+    let mut adapter = vec![json!({"dedicated_mib": 4500, "shared_mib": 300}); 12];
+    adapter.push(Value::Null);
+    let mut hw = spill_script(&[200, 900]);
+    hw["gpu_adapter"] = json!(adapter);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_ends", "comfyui");
+    assert!(spill_alert(&rig.run(11).await).is_some());
+    rig.telemetry.job_ended("j_ends");
+    assert!(spill_alert(&rig.run(1).await).is_none());
+}
+
+/// LT-04's 30 s at <= 82 °C count only time the GPU was read: after 40 s without a reading,
+/// one calm reading doesn't clear the temperature alert; 30 s of them do (audit L4).
+#[tokio::test] // spec: APP-132, CORE-066
+async fn lt04_clears_count_only_time_with_a_reading() {
+    let at = |temp: u64| {
+        let mut g = gpu(100_000, 1000);
+        g["temp_c"] = json!(temp);
+        g
+    };
+    let lost = json!({"error": "NVML: the driver was unloaded"});
+    // Second 0: 85. Second 1: 82. Seconds 2-41: no reading. From second 42: 82.
+    let mut readings = vec![at(85), at(82)];
+    readings.extend(std::iter::repeat_n(lost, 40));
+    readings.push(at(82));
+    let rig = Rig::new(&script(readings, vec![sys(100)]));
+    let temperature = |snap: &Snapshot| snap.alerts.iter().any(|a| a.id == "gpu_temperature");
+    assert!(temperature(&rig.run(2).await), "raised");
+    assert!(temperature(&rig.run(40).await), "held through the gap");
+    assert!(
+        temperature(&rig.run(1).await),
+        "one calm reading after the gap doesn't clear it"
+    );
+    assert!(temperature(&rig.run(29).await), "29 s of readings at 82");
+    assert!(
+        !temperature(&rig.run(1).await),
+        "30 s of readings at 82 clear it"
+    );
 }
