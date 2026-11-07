@@ -702,6 +702,18 @@ fn cancel_if_it_lands_late(client: ComfyClient, prompt_id: String, job: String) 
     });
 }
 
+/// Ends a waiting retry's logged outage (`silent`) once ComfyUI answers again: one line as it
+/// ends, matching the one as it began (fix round 2).
+fn answered_again(silent: &mut bool, prompt_id: &str) {
+    if *silent {
+        tracing::info!(
+            prompt_id,
+            "ComfyUI answers again about the prompt a retry waits out"
+        );
+        *silent = false;
+    }
+}
+
 /// Removes the attempt from [`SuitePrompts`] when it ends.
 struct LiveGuard {
     prompts: Arc<SuitePrompts>,
@@ -834,9 +846,16 @@ impl ComfyWithdraw {
             if !posted.may_withdraw(prompt_id) || live_shut(&live) {
                 return WithdrawOutcome::NotPending;
             }
+            // A waited-out prompt is asked about at each poll of a paused lane: its waiting
+            // retry logs an outage once (fix round 2), so this one goes to debug.
+            let waited_out = posted.prompt_id.is_none();
             let locked = tokio::time::timeout(LOCKED_WITHIN, async {
                 let queue = match client.queue().await {
                     Ok(queue) => queue,
+                    Err(e) if waited_out => {
+                        tracing::debug!(job_id = %job, prompt_id, error = %e, "/queue can't be read; the prompt is not withdrawn");
+                        return Some(WithdrawOutcome::NotPending);
+                    }
                     Err(e) => {
                         tracing::info!(job_id = %job, prompt_id, error = %e, "/queue can't be read; the prompt is not withdrawn");
                         return Some(WithdrawOutcome::NotPending);
@@ -1635,11 +1654,14 @@ impl Attempt<'_> {
     /// [`Attempt::wait_out`]'s looks. While the lane is paused and the withdrawal can still be
     /// tried (fix round 1, M1), a look that gets no answer doesn't end the attempt: the
     /// withdrawal is tried again at the next poll. Once its delete was sent, or the prompt
-    /// started, no more withdrawal is asked for in this attempt (M4).
+    /// started, no more withdrawal is asked for in this attempt (M4). Such an outage is logged
+    /// once as it starts and once as ComfyUI answers again, never per poll (fix round 2).
     async fn wait_out_looks(&self, old: &str, deletable: bool) -> Result<(), JobFailure> {
         let mut cancel = self.job.cancel.clone();
         // A prompt that started never waits in the queue again: no more withdrawals.
         let mut started = false;
+        // ComfyUI has answered none of the paused looks since the outage was logged.
+        let mut silent = false;
         loop {
             tokio::select! {
                 () = tokio::time::sleep(POLL_EVERY) => {}
@@ -1657,6 +1679,7 @@ impl Attempt<'_> {
             if deletable && !started && !self.waited_out_delete_sent().await {
                 match self.job.withdraw_waited_out(old).await {
                     WithdrawOutcome::Withdrawn => {
+                        answered_again(&mut silent, old);
                         return Err(JobFailure::Retryable(error(
                             &codes::COMFYUI_UNREACHABLE,
                             "The job's lane was paused while it waited for the earlier \
@@ -1665,19 +1688,29 @@ impl Attempt<'_> {
                             self.job,
                         )));
                     }
-                    WithdrawOutcome::AlreadyStarted => started = true,
+                    WithdrawOutcome::AlreadyStarted => {
+                        answered_again(&mut silent, old);
+                        started = true;
+                    }
                     WithdrawOutcome::NotPending => {
                         retry_withdrawal =
                             self.job.lane_paused() && !self.waited_out_delete_sent().await;
                     }
                 }
             }
-            match self.client.state(old).await {
+            let look = self.client.state(old).await;
+            if look.is_ok() {
+                answered_again(&mut silent, old);
+            }
+            match look {
                 Ok(RemoteState::Queued | RemoteState::Running) => {}
                 Ok(_) => return Ok(()),
                 // Nothing is posted meanwhile: the attempt only waits on (M1).
                 Err(e) if retry_withdrawal => {
-                    tracing::info!(prompt_id = %old, error = %e, "ComfyUI didn't answer a paused lane's look at the prompt a retry waits out; the withdrawal is tried again at the next poll");
+                    if !silent {
+                        tracing::info!(prompt_id = %old, error = %e, "ComfyUI doesn't answer while the lane is paused; the retry waits on and tries the withdrawal again at each poll");
+                        silent = true;
+                    }
                 }
                 Err(e) => return Err(unreachable(&e, self.job)),
             }

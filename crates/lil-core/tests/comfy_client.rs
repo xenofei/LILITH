@@ -3528,3 +3528,131 @@ async fn an_external_originals_prompt_is_never_deleted() {
     assert_eq!(posted(&fake).len(), 2, "one POST of the retry's own");
     assert!(queue_deletes(&fake).is_empty());
 }
+
+/// What this test process logs, all of it.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+impl Captured {
+    /// The `level` lines (`INFO`, `DEBUG`, …) that contain `text`.
+    fn count(&self, level: &str, text: &str) -> usize {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|l| l.contains(&format!(" {level} ")) && l.contains(text))
+            .count()
+    }
+}
+
+/// Set, to the test's name, in the process [`capture_logs`] starts for one test.
+const OWN_PROCESS: &str = "LIL_COMFY_LOG_TEST";
+
+/// Every log line of this process from now on, for the test `name`, which runs in a process
+/// of its own (as `tests/notify.rs` does: the log subscriber is process-wide, so only the one
+/// test of its process may own it). `None` here once it passed there; the capture in there.
+fn capture_logs(name: &str) -> Option<Captured> {
+    if std::env::var_os(OWN_PROCESS).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(OWN_PROCESS, name)
+            .output()
+            .expect("the test binary starts");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("test result: ok. 1 passed"),
+            "{name} in a process of its own:\n{text}"
+        );
+        return None;
+    }
+    let logs = Captured::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    )
+    .expect("the only test of its process owns the log subscriber");
+    Some(logs)
+}
+
+/// Fix round 2 (re-review R1-M1): a ComfyUI that answers nothing over several of a waiting
+/// retry's paused polls is logged once when the outage starts and once when it answers again,
+/// at info; nothing is written at info per poll in between (the withdrawal's own `/queue`
+/// failure goes to debug for a waited-out prompt). Exactly once is unchanged: one delete, one
+/// POST of the retry's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, ARCH-117
+async fn an_outage_while_paused_is_logged_once() {
+    let Some(logs) = capture_logs("an_outage_while_paused_is_logged_once") else {
+        return;
+    };
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 7, (false, false)).await;
+
+    fake.refuse_http(true);
+    let before = fake.requests().len();
+    rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    rig.until(&retry, "four refused polls", |_| {
+        queue_reads(&fake, before) >= 4
+    })
+    .await;
+    let outage = "ComfyUI doesn't answer while the lane is paused";
+    assert_eq!(logs.count("INFO", outage), 1, "logged once as it starts");
+    assert_eq!(
+        logs.count("INFO", "/queue can't be read"),
+        0,
+        "nothing at info per poll"
+    );
+    assert_eq!(
+        logs.count("INFO", "the withdrawal is tried again at the next poll"),
+        0
+    );
+
+    fake.refuse_http(false);
+    until_withdrawn(&rig, 1).await;
+    assert_eq!(logs.count("INFO", outage), 1);
+    assert_eq!(
+        logs.count("INFO", "ComfyUI answers again"),
+        1,
+        "logged once as it ends"
+    );
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    rig.until(&retry, "its own prompt is in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    fake.release(&outside);
+    assert_eq!(rig.done(&retry).await.status, JobStatus::Succeeded);
+    assert_eq!(
+        posted(&fake).len(),
+        2,
+        "exactly one POST of the retry's own"
+    );
+    assert_eq!(queue_deletes(&fake), [json!([old])], "deleted once");
+}
