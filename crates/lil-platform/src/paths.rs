@@ -213,9 +213,9 @@ mod tests {
             if up == name || up.encode_utf16().count() != 1 {
                 continue;
             }
-            if std::fs::write(dir.path().join(&name), b"x").is_err() {
-                continue;
-            }
+            // Every letter here is a valid file name character, so a failed write is a failure.
+            std::fs::write(dir.path().join(&name), b"x")
+                .unwrap_or_else(|e| panic!("U+{unit:04X} can't be a file name: {e}"));
             checked += 1;
             if !dir.path().join(&up).exists() {
                 disagree.push(format!("U+{unit:04X}"));
@@ -225,6 +225,31 @@ mod tests {
         assert!(
             disagree.is_empty(),
             "the volume does not fold these like upcase_name: {disagree:?}"
+        );
+        // The other way: letters `upcase_name` leaves alone stay distinct from their neighbours
+        // on the volume (a sample of every 7th, in a fresh folder so nothing else is there).
+        let other = tempfile::tempdir().unwrap();
+        let mut merged = Vec::new();
+        for unit in (0u32..0xFFFF).step_by(7) {
+            let (Some(ch), Some(next)) = (char::from_u32(unit), char::from_u32(unit + 1)) else {
+                continue;
+            };
+            let (name, next) = (ch.to_string(), next.to_string());
+            if !ch.is_alphabetic()
+                || upcase_name(&name) != name
+                || upcase_name(&next) == upcase_name(&name)
+            {
+                continue;
+            }
+            std::fs::write(other.path().join(&name), b"x")
+                .unwrap_or_else(|e| panic!("U+{unit:04X} can't be a file name: {e}"));
+            if other.path().join(&next).exists() {
+                merged.push(format!("U+{unit:04X}"));
+            }
+        }
+        assert!(
+            merged.is_empty(),
+            "the volume folds these together: {merged:?}"
         );
         // Two names on the volume, as in `upcase_name_follows_the_system_table`.
         std::fs::write(dir.path().join("\u{03C3}x"), b"x").unwrap();

@@ -629,7 +629,16 @@ async fn create(
         return Err(path_invalid(&args.path, &why, trace_id));
     }
     let dir = abs.clone();
-    let existed = abs.exists();
+    // Only `NotFound` says the call makes the folder; any other answer counts as "existed", so
+    // the cleanup never removes what it can't be sure it made.
+    let existed = {
+        let probe = abs.clone();
+        tokio::task::spawn_blocking(move || {
+            !matches!(std::fs::metadata(&probe), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .await
+        .unwrap_or(true)
+    };
     tokio::task::spawn_blocking(move || fsops::ensure_dir(&dir))
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(format!("the call stopped: {e}"))))

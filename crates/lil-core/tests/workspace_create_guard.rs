@@ -167,13 +167,52 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
 ///
 /// The race is injected at the fail point `workspace.after_create`: its hook registers the
 /// folder's parent in `suite.toml`, as another core or `lil workspace init` could. No ACL, link
-/// or timing is involved. (Under nextest each test is its own process, so the guard's arming in
-/// the other test of this file doesn't reach this one.)
+/// or timing is involved.
+///
+/// This file needs nextest's one-process-per-test model. `arm_test_guard` is first-call-wins,
+/// and this test's `TestEnv::new()` arms the guard from the system's locations; under plain
+/// `cargo test` threads, if it ran first, the other test here
+/// (`create_on_a_real_registered_workspace_trips_the_guard`, which arms its own fake "real"
+/// workspace before `TestEnv::new`) would find the guard already armed and could fail.
 #[test] // spec: ARCH-094, QA-040
 fn workspace_create_post_create_race_is_refused_cleanly() {
+    let r = refused_create(false, false);
+    assert!(
+        !r.inner.exists(),
+        "the refused call left the folder it made behind"
+    );
+}
+
+/// The cleanup removes only what the call made (CORE-110): a folder that was there before the
+/// call stays (empty), and so does a folder a racer put a file in, file included.
+#[test] // spec: ARCH-094, CORE-110
+fn a_refused_create_keeps_a_preexisting_folder_and_a_racers_file() {
+    let before = refused_create(true, false);
+    assert!(before.inner.is_dir(), "a folder that existed was removed");
+
+    let racer = refused_create(false, true);
+    let file = racer.inner.join("racer.txt");
+    assert_eq!(
+        std::fs::read(&file).expect("the racer's file is kept"),
+        b"racer"
+    );
+}
+
+struct Refused {
+    inner: PathBuf,
+    _env: TestEnv,
+}
+
+/// Runs `workspace.create` on a new folder below an unregistered folder, with the race injected
+/// after the folder is made, and checks the refusal itself. `preexisting` makes the folder
+/// (empty) before the call; `racer_file` has the racer write a file into it during the race.
+fn refused_create(preexisting: bool, racer_file: bool) -> Refused {
     let env = TestEnv::new();
     let outer = env.make_workspace("outer");
     let inner = outer.join("Ünïcödé inner");
+    if preexisting {
+        write_dir(&inner);
+    }
     let suite = env.env.suite_toml();
     let registered_outer = outer.to_str().expect("a UTF-8 path").to_string();
 
@@ -188,6 +227,9 @@ fn workspace_create_post_create_race_is_refused_cleanly() {
                 assert!(inner.is_dir(), "the hook runs after the folder was made");
                 hits.fetch_add(1, Ordering::SeqCst);
                 write_suite(&suite, &registered_outer);
+                if racer_file {
+                    write_file(&inner.join("racer.txt"), b"racer");
+                }
                 Ok(())
             }),
         );
@@ -215,10 +257,6 @@ fn workspace_create_post_create_race_is_refused_cleanly() {
         err.message.contains("inside the registered workspace"),
         "{err:?}"
     );
-    assert!(
-        !inner.exists(),
-        "the refused call left the folder it made behind"
-    );
     assert!(outer.is_dir(), "the registered workspace is untouched");
     assert_eq!(
         std::fs::read_to_string(&suite)
@@ -233,6 +271,17 @@ fn workspace_create_post_create_race_is_refused_cleanly() {
         "the refused folder was not registered"
     );
     states.close();
+    Refused { inner, _env: env }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn write_dir(path: &Path) {
+    std::fs::create_dir_all(path).expect("the folder");
+}
+
+#[allow(clippy::disallowed_methods)]
+fn write_file(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).expect("the file");
 }
 
 /// Registers `path` in `suite`: what another core's `workspace.create` would have written.
