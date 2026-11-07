@@ -1327,9 +1327,11 @@ impl Telemetry {
     }
 
     /// The energy of the samples from `from` to `to` (Unix ms, both included), from the finest
-    /// table whose retention still holds `from` (`s1`, `m1`, then `h1`; a coarser bucket counts
-    /// when it holds any of the range), with `JobEnergy`'s whole-system formula: (GPU + CPU +
-    /// `rest_of_system_w` over the samples' time) / `psu_efficiency` (APP-131; Appendix G).
+    /// table whose retention still holds `from` (`s1`, `m1`, then `h1` before the quarter-hour
+    /// rows and `e15` from them on; a coarser bucket counts when it holds any of the range), with
+    /// `JobEnergy`'s whole-system formula: (GPU + CPU + `rest_of_system_w` over the samples'
+    /// time) / `psu_efficiency` (APP-131; Appendix G), except where `e15` stored the whole
+    /// system's energy as it was measured (Appendix H; `db`'s module docs).
     ///
     /// # Errors
     /// `params.invalid` when `from` is after `to`; `store.io` when the read fails.
@@ -1351,9 +1353,15 @@ impl Telemetry {
             .map_err(|e| db_error("the read", &e))?
             .map_err(|e| db_error("the read", &e))?;
         let power = &self.inner.power;
-        let rest_mj = u64::from(power.rest_of_system_mw).saturating_mul(found.covered_ms) / 1000;
+        let covered_ms = found
+            .covered_ms
+            .saturating_sub(found.stored_samples.saturating_mul(1000));
+        let rest_mj = u64::from(power.rest_of_system_mw).saturating_mul(covered_ms) / 1000;
         let psu = u64::from(power.psu_efficiency_permille.clamp(1, 1000));
-        let system_mj = share(found.gpu_mj + found.cpu_mj + rest_mj, 1000, psu);
+        let computed = found.gpu_mj.saturating_sub(found.stored_gpu_mj)
+            + found.cpu_mj.saturating_sub(found.stored_cpu_mj)
+            + rest_mj;
+        let system_mj = found.stored_system_mj + share(computed, 1000, psu);
         let energy_cost = power.electricity.as_ref().map(|(rate, currency)| {
             // A kWh is 3.6e9 mJ.
             let rate = u64::try_from(rate.micros()).unwrap_or(0);

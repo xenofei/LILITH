@@ -28,12 +28,17 @@
 //! - **The fit signal** ([`FitTracker`]; ARCH-071, P4b-R37 as Appendix H states it): an engine
 //!   is its processes, and its figure is the sum of their `GPU Process Memory\Shared Usage`,
 //!   never the adapter's. Its idle level is the lowest figure since it became ready, fixed for
-//!   a job when the job starts; it resets when the engine becomes ready again.
+//!   a job when the job starts; it resets when the engine restarts (a new `ready_at_ms`, which
+//!   the engine sets only for a new process or a stop, never for a missed status poll). A
+//!   retry of a job keeps the level its first attempt fixed while the engine session is the
+//!   same, and takes the new session's after a restart. While per-process memory can't be read
+//!   the figure is unknown: no fit reading and no spill alert.
 //! - **Alerts** (CORE-066, LT-04, APP-132): the temperature raises at >= 85 °C and clears after
 //!   30 s at <= 82 °C; a throttle alert clears after 30 s without its bit; neither raises again
 //!   within 60 s of clearing. `gpu_spill` raises after 10 s with the job's engine above its idle
 //!   level by more than [`SPILL_MARGIN_MIB`], and clears after 30 s at or below half of it,
-//!   when the job ends, or when the adapter counters can't be read. Times are the step's
+//!   when the job ends, or when the adapter counters or per-process memory can't be read; its
+//!   timers belong to one start of one job. Times are the step's
 //!   (`StepIn::now`): the monotonic clock, or the nominal seconds of manual mode.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -194,6 +199,8 @@ struct Check {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SpillNow {
     job_id: String,
+    /// The job's start ([`RunningJob::start`]): the spill alert's timers are this start's.
+    start: u64,
     pid: Option<u32>,
     above_idle_mib: u64,
 }
@@ -212,6 +219,17 @@ struct RunningJob {
     engine: String,
     idle: Option<u64>,
     max_above: u64,
+    /// The engine session (its `ready_at_ms`) the idle level was fixed in.
+    session: Option<i64>,
+    /// Counts [`FitTracker::job_started`] calls, so each start is told apart.
+    start: u64,
+}
+
+/// An ended job's fit and the engine session it was measured in.
+struct Finished {
+    job_id: String,
+    fit: Option<Fit>,
+    session: Option<i64>,
 }
 
 /// The engines' fit figures and the jobs running on them (module docs, "The fit signal").
@@ -220,7 +238,8 @@ pub(crate) struct FitTracker {
     engines: BTreeMap<String, EngineTrack>,
     running: BTreeMap<String, RunningJob>,
     /// Ended jobs' fits, oldest first, at most [`FITS_KEPT`].
-    finished: VecDeque<(String, Option<Fit>)>,
+    finished: VecDeque<Finished>,
+    starts: u64,
 }
 
 impl FitTracker {
@@ -247,26 +266,35 @@ impl FitTracker {
     }
 
     pub(crate) fn job_started(&mut self, job_id: &str, engine: &str) {
-        if self.running.contains_key(job_id) {
+        self.starts += 1;
+        let start = self.starts;
+        if let Some(job) = self.running.get_mut(job_id) {
+            job.start = start;
             return;
         }
+        let track = self
+            .engines
+            .get(engine)
+            .filter(|t| t.state.ready_at_ms.is_some());
+        let session = track.and_then(|t| t.state.ready_at_ms);
+        // An earlier attempt's level stands only in the same engine session.
         let earlier = self
             .finished
             .iter()
-            .position(|(id, _)| id == job_id)
+            .position(|f| f.job_id == job_id)
             .and_then(|at| self.finished.remove(at))
-            .and_then(|(_, fit)| fit);
-        let now = self
-            .engines
-            .get(engine)
-            .filter(|t| t.state.ready_at_ms.is_some())
-            .and_then(|t| t.low);
+            .filter(|f| f.session.is_some() && f.session == session)
+            .and_then(|f| f.fit);
         self.running.insert(
             job_id.to_string(),
             RunningJob {
                 engine: engine.to_string(),
-                idle: earlier.map(|f| f.shared_idle_mib).or(now),
+                idle: earlier
+                    .map(|f| f.shared_idle_mib)
+                    .or(track.and_then(|t| t.low)),
                 max_above: earlier.map_or(0, |f| f.shared_above_idle_max_mib),
+                session,
+                start,
             },
         );
     }
@@ -279,15 +307,26 @@ impl FitTracker {
             shared_idle_mib: idle,
             shared_above_idle_max_mib: job.max_above,
         });
-        self.finished.push_back((job_id.to_string(), fit));
+        self.finished.push_back(Finished {
+            job_id: job_id.to_string(),
+            fit,
+            session: job.session,
+        });
         while self.finished.len() > FITS_KEPT {
             self.finished.pop_front();
         }
     }
 
     pub(crate) fn take(&mut self, job_id: &str) -> Option<Fit> {
-        let at = self.finished.iter().position(|(id, _)| id == job_id)?;
-        self.finished.remove(at).and_then(|(_, fit)| fit)
+        let at = self.finished.iter().position(|f| f.job_id == job_id)?;
+        self.finished.remove(at).and_then(|f| f.fit)
+    }
+
+    /// Per-process memory can't be read: every engine's figure is unknown until it can.
+    fn forget_figures(&mut self) {
+        for track in self.engines.values_mut() {
+            track.figure = None;
+        }
     }
 
     /// A per-process GPU memory reading at `utc_ms`: each ready engine's figure, its lowest
@@ -298,9 +337,17 @@ impl FitTracker {
                 continue;
             }
             let ours = mem.iter().filter(|p| track.state.pids.contains(&p.pid));
-            let figure: u64 = ours.clone().map(|p| p.shared_mib).sum();
-            let top = ours.max_by_key(|p| (p.shared_mib, std::cmp::Reverse(p.pid)));
-            track.figure = Some((figure, top.map(|p| p.pid)));
+            // None of the engine's processes listed (gone, or not on the GPU yet): unknown,
+            // never 0, so a missed reading can't lower the idle level.
+            let Some(top) = ours
+                .clone()
+                .max_by_key(|p| (p.shared_mib, std::cmp::Reverse(p.pid)))
+            else {
+                track.figure = None;
+                continue;
+            };
+            let figure: u64 = ours.map(|p| p.shared_mib).sum();
+            track.figure = Some((figure, Some(top.pid)));
             track.low = Some(track.low.map_or(figure, |low| low.min(figure)));
             for job in self.running.values_mut().filter(|j| j.engine == *name) {
                 if let Some(idle) = job.idle {
@@ -320,6 +367,7 @@ impl FitTracker {
                 let (figure, pid) = self.engines.get(&job.engine)?.figure?;
                 Some(SpillNow {
                     job_id: job_id.clone(),
+                    start: job.start,
                     pid,
                     above_idle_mib: figure.saturating_sub(idle),
                 })
@@ -327,8 +375,15 @@ impl FitTracker {
             .max_by_key(|s| s.above_idle_mib)
     }
 
-    fn is_running(&self, job_id: &str) -> bool {
-        self.running.contains_key(job_id)
+    /// The start `s` names still runs, and its engine's figure is known.
+    fn still_measured(&self, s: &SpillNow) -> bool {
+        self.running.get(&s.job_id).is_some_and(|job| {
+            job.start == s.start
+                && self
+                    .engines
+                    .get(&job.engine)
+                    .is_some_and(|t| t.figure.is_some())
+        })
     }
 }
 
@@ -530,6 +585,8 @@ pub(crate) struct Sampler {
     look_up_names: bool,
     alerts: BTreeMap<&'static str, Active>,
     hysteresis: BTreeMap<&'static str, Hysteresis>,
+    /// The job start whose engine the `gpu_spill` timers follow.
+    spill_owner: Option<(String, u64)>,
     /// The whole-system energy of each sample, accumulated so it never drifts (`e15`).
     system_energy: Accum,
     last_ts: i64,
@@ -562,6 +619,7 @@ impl Sampler {
             look_up_names,
             alerts: BTreeMap::new(),
             hysteresis: BTreeMap::new(),
+            spill_owner: None,
             system_energy: Accum::new(1, u128::from(power.psu_efficiency_permille.clamp(1, 1000))),
             power,
             last_ts: i64::MIN,
@@ -790,9 +848,11 @@ impl Sampler {
             let mut fits = lock(input.fits);
             if mem_read {
                 fits.observe(&self.mem_cache, input.utc_ms);
+            } else if self.mem_failing || self.gpu_mem.is_none() {
+                fits.forget_figures();
             }
             let raised = self.alerts.get("gpu_spill").and_then(|a| a.spill.as_ref());
-            let running = raised.is_some_and(|s| fits.is_running(&s.job_id));
+            let running = raised.is_some_and(|s| fits.still_measured(s));
             (fits.spill(), running)
         };
         let live_sample = gpu.sample.as_ref().filter(|_| gpu.live);
@@ -1055,6 +1115,12 @@ impl Sampler {
             self.alerts.remove("gpu_spill");
             self.hysteresis.remove("gpu_spill");
             events.push(json!({"kind": "alert_cleared", "id": "gpu_spill"}));
+        }
+        // The timers are one start's: another job, or a new start of one, begins them again.
+        let owner = spill.as_ref().map(|s| (s.job_id.clone(), s.start));
+        if owner != self.spill_owner {
+            self.hysteresis.remove("gpu_spill");
+            self.spill_owner = owner;
         }
         let rule = Rule {
             raise_after: SPILL_RAISE_AFTER,

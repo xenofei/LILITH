@@ -152,9 +152,8 @@ pub(crate) struct Comfy {
     sockets: Arc<dyn SocketTable>,
     view: Mutex<View>,
     pids: Mutex<Vec<u32>>,
-    /// When the engine last became ready (Unix ms), while it is: the telemetry's idle level
-    /// counts from it (ARCH-071, P4b-R37 as Appendix H states it).
-    ready_at_ms: Mutex<Option<i64>>,
+    /// The engine session the telemetry's idle level counts from ([`FitSession`]).
+    fit_session: Mutex<FitSession>,
     restart_needed: AtomicBool,
     ops: tokio::sync::Mutex<Option<Owned>>,
     idle: Mutex<Idle>,
@@ -190,6 +189,20 @@ pub(crate) struct Comfy {
     last_inventory: Mutex<Option<Arc<Inventory>>>,
     /// The asset catalogue as probed in a readiness epoch (ARCH-065).
     catalogue: Mutex<Option<CatalogueProbe>>,
+}
+
+/// One engine session for the fit signal (ARCH-071, P4b-R37 as Appendix H states it): when the
+/// engine process (its class and launcher or listener pid) first became ready, and the engine
+/// processes last known. It ends only when that process is gone: an owned engine stopped or
+/// exited, an attached one unanswering for [`RESTART_CLEARS_AFTER`], or another process
+/// ready in its place. A missed status poll (Unreachable, or an attached engine shown stopped
+/// for a moment) keeps it, and its processes, so the idle level and a running job's figure go
+/// on (review I2).
+#[derive(Debug, Default)]
+struct FitSession {
+    ready_at_ms: Option<i64>,
+    process: Option<(EngineClass, Option<u32>)>,
+    pids: Vec<u32>,
 }
 
 /// The asset-catalogue probes of one readiness epoch.
@@ -250,7 +263,7 @@ impl Comfy {
             sockets,
             view: Mutex::new(STOPPED),
             pids: Mutex::new(Vec::new()),
-            ready_at_ms: Mutex::new(None),
+            fit_session: Mutex::default(),
             restart_needed: AtomicBool::new(false),
             ops: tokio::sync::Mutex::new(None),
             idle: Mutex::new(Idle {
@@ -522,15 +535,18 @@ impl Comfy {
             *was = ready;
             before != (*epoch, *was)
         });
-        let ready_at = {
-            let mut at = lock(&self.ready_at_ms);
-            let before = *at;
-            if new_run {
-                *at = Some(self.now_ms());
-            } else if !ready {
-                *at = None;
+        let session = {
+            let mut fit = lock(&self.fit_session);
+            let before = fit.ready_at_ms;
+            if v.state == EngineState::Stopped && old.class == EngineClass::Owned {
+                *fit = FitSession::default();
             }
-            before != *at
+            let process = (v.class, v.pid);
+            if ready && fit.process != Some(process) {
+                fit.ready_at_ms = Some(self.now_ms());
+                fit.process = Some(process);
+            }
+            before != fit.ready_at_ms
         };
         let outside_cleared = v.state == EngineState::Stopped
             && old.class == EngineClass::Owned
@@ -538,7 +554,7 @@ impl Comfy {
         if outside_cleared {
             self.publish("outside_job");
         }
-        if ready_at || outside_cleared {
+        if session || outside_cleared {
             self.push_engine_state();
         }
         old != v
@@ -547,8 +563,10 @@ impl Comfy {
     /// Tells the telemetry the engine's processes, when it became ready and whether an
     /// outside job runs (`engines` uses `telemetry`, never the reverse).
     fn push_engine_state(&self) {
-        let pids = lock(&self.pids).clone();
-        let ready_at_ms = *lock(&self.ready_at_ms);
+        let (pids, ready_at_ms) = {
+            let fit = lock(&self.fit_session);
+            (fit.pids.clone(), fit.ready_at_ms)
+        };
         self.telemetry.set_engine_state(TelemetryEngine {
             engine: COMFYUI_ROLE.to_string(),
             pids,
@@ -783,7 +801,15 @@ impl Comfy {
         for pid in new.iter().filter(|p| !pids.contains(p)) {
             self.telemetry.track(*pid, COMFYUI_ROLE);
         }
-        let changed = *pids != new;
+        // The session keeps the last processes known: none listed is a missed poll.
+        let changed = {
+            let mut fit = lock(&self.fit_session);
+            let changed = !new.is_empty() && fit.pids != new;
+            if changed {
+                fit.pids.clone_from(&new);
+            }
+            changed
+        };
         *pids = new;
         drop(pids);
         if changed {
@@ -960,6 +986,16 @@ impl Comfy {
             }
             gone
         };
+        // Gone for good: its fit session ends with it.
+        let ended = gone && {
+            let mut fit = lock(&self.fit_session);
+            let ended = fit.ready_at_ms.is_some();
+            *fit = FitSession::default();
+            ended
+        };
+        if ended {
+            self.push_engine_state();
+        }
         // Its outside prompts went with it (review M5: not at the first missed answer).
         if gone && self.outside.clear() {
             self.publish("outside_job");

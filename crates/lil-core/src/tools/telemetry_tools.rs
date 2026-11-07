@@ -4,7 +4,7 @@
 //! |---|---|---|---|
 //! | `telemetry.snapshot` | read | `{}` | the [`Snapshot`](crate::telemetry::Snapshot) |
 //! | `telemetry.series` | read | `{metrics, from, to, resolution?}` | `{series: [{metric, points: [[ts, min, avg, max]]}]}` |
-//! | `telemetry.jobs` | read | `{job_ids?, from?, to?, limit?}` | `{jobs: [JobEnergy]}` (newest first) |
+//! | `telemetry.jobs` | read | `{job_ids?, from?, to?, limit?}` | `{jobs: [JobEnergy]}` (newest first; each with its `fit` or `null`) |
 //! | `telemetry.energy` | read | `{from, to}` | `{from, to, gpu_mj, cpu_mj, system_mj, measured: {gpu, cpu}, samples, partly_measured, energy_cost?}` (APP-131) |
 //!
 //! They live in `tools`, not in `telemetry`, so that `telemetry` depends on no `tools` type
@@ -46,8 +46,10 @@ const SERIES_DESCRIPTION: &str = "Returns hardware metrics over time: gpu.util, 
 const JOBS_DESCRIPTION: &str = "Returns the energy of finished jobs, newest first: for each, \
     the job id, its workspace (or loose), from and to (RFC 3339 UTC: its first and last \
     telemetry samples), GPU and CPU energy gross and above idle in mJ, the whole-system energy, \
-    SM-weighted GPU-seconds (milli), whether the GPU and CPU parts were measured, and \
-    idle_unknown when no idle baseline existed. Jobs of every workspace and loose ones are \
+    SM-weighted GPU-seconds (milli), whether the GPU and CPU parts were measured, \
+    idle_unknown when no idle baseline existed, and fit: {shared_idle_mib, \
+    shared_above_idle_max_mib} (the engine's shared GPU memory idle level and its largest rise \
+    during the job), null without one. Jobs of every workspace and loose ones are \
     listed. `job_ids` picks jobs; `from` and `to` (RFC 3339 UTC) keep jobs that ended at or \
     after `from` and began at or before `to`; `limit` is 1-500 (default 100).";
 

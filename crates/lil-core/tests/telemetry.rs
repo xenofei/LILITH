@@ -3014,3 +3014,146 @@ async fn energy_reports_samples_and_partly_measured() {
     assert_eq!(v["partly_measured"], true, "{v}");
     assert_eq!(rolled.gpu_mj, whole.gpu_mj);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 19 fix round 1 (review M1, M2, M3, M5).
+// ---------------------------------------------------------------------------------------------
+
+/// Per-process memory that stops reading leaves the engine's figure unknown: a single high
+/// reading never becomes a spill alert, and a raised alert clears at once, as when the adapter
+/// counters can't be read (review M1).
+#[tokio::test] // spec: APP-132, CORE-059
+async fn a_lost_process_reading_leaves_the_spill_figure_unknown() {
+    let lost = json!({"error": "PDH: the counter set went away"});
+    let mut hw = spill_script(&[200, 900]);
+    hw["gpu_mem"] = json!([engine_mem(200), engine_mem(900), lost.clone()]);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_stale", "comfyui");
+    let snap = rig.run(40).await;
+    assert!(spill_alert(&snap).is_none(), "{:?}", snap.alerts);
+    rig.telemetry.job_ended("j_stale");
+
+    // Raised, then the reading is lost: cleared at the next sample.
+    let mut readings = vec![engine_mem(200)];
+    readings.extend(std::iter::repeat_n(engine_mem(900), 11));
+    readings.push(lost);
+    let mut hw = spill_script(&[200]);
+    hw["gpu_mem"] = json!(readings);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_raised", "comfyui");
+    let raised = rig.run(11).await;
+    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
+    let after = rig.run(1).await;
+    assert!(spill_alert(&after).is_none(), "{:?}", after.alerts);
+}
+
+/// A retry after the engine restarted takes the new session's idle level, not its first
+/// attempt's (review M2); a retry in the same session keeps the first attempt's.
+#[tokio::test] // spec: ARCH-071, APP-132
+async fn a_retry_after_an_engine_restart_takes_the_new_sessions_level() {
+    // Session 1 at 1000 MiB; after the restart 100 MiB, then the retry rises to 1000.
+    let rig = engine_rig(&spill_script(&[1000, 1000, 100, 1000]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_retry", "comfyui");
+    rig.run(1).await;
+    rig.telemetry.job_ended("j_retry");
+    ready(&rig);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_retry", "comfyui");
+    let snap = rig.run(11).await;
+    assert_eq!(
+        spill_alert(&snap).and_then(|a| a.above_idle_mib),
+        Some(900),
+        "{:?}",
+        snap.alerts
+    );
+    rig.telemetry.job_ended("j_retry");
+    assert_eq!(
+        rig.telemetry.job_fit("j_retry"),
+        Some(Fit {
+            shared_idle_mib: 100,
+            shared_above_idle_max_mib: 900
+        })
+    );
+
+    // In one session a retry keeps the level its first attempt fixed.
+    let rig = engine_rig(&spill_script(&[300, 800, 200, 900]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_same", "comfyui");
+    rig.run(1).await;
+    rig.telemetry.job_ended("j_same");
+    rig.run(1).await;
+    rig.telemetry.job_started("j_same", "comfyui");
+    rig.run(1).await;
+    rig.telemetry.job_ended("j_same");
+    assert_eq!(
+        rig.telemetry.job_fit("j_same"),
+        Some(Fit {
+            shared_idle_mib: 300,
+            shared_above_idle_max_mib: 600
+        })
+    );
+}
+
+/// The spill alert's 10 s belong to one job: job B, started right after job A was 8 s above
+/// the margin, raises only after its own 10 s (review M3).
+#[tokio::test] // spec: APP-132
+async fn the_spill_timers_start_again_for_each_job() {
+    let rig = engine_rig(&spill_script(&[200, 800]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_a", "comfyui");
+    let a = rig.run(8).await;
+    assert!(spill_alert(&a).is_none());
+    rig.telemetry.job_ended("j_a");
+    rig.telemetry.job_started("j_b", "comfyui");
+    let b = rig.run(10).await;
+    assert!(
+        spill_alert(&b).is_none(),
+        "not 10 s of j_b yet: {:?}",
+        b.alerts
+    );
+    let raised = rig.run(1).await;
+    assert_eq!(
+        spill_alert(&raised)
+            .and_then(|a| a.job_id.clone())
+            .as_deref(),
+        Some("j_b")
+    );
+}
+
+/// A range old enough to come from the quarter-hour rows gives the whole system's energy those
+/// rows stored, as it was measured with that day's `[power]` settings, not recomputed with
+/// today's (Appendix H; review M5).
+#[tokio::test] // spec: APP-131, CORE-062, CORE-064
+async fn energy_reads_the_stored_system_energy_of_old_ranges() {
+    let then = PowerSettings {
+        psu_efficiency_permille: 500,
+        ..PowerSettings::default()
+    };
+    let first = Rig::with(&metered(), then);
+    first.run(6).await;
+    let measured = first.telemetry.energy(T0_MS, T0_MS + 5000).await.unwrap();
+    assert_eq!(
+        measured.system_mj,
+        (measured.gpu_mj + measured.cpu_mj) * 2,
+        "at 500 permille"
+    );
+    first.telemetry.shutdown().await;
+
+    // Today's settings differ; 40 days on, the range comes from e15.
+    let later = Rig::at(
+        HwSources::none(),
+        PowerSettings::default(),
+        first.db.clone(),
+        None,
+    );
+    later.clock.advance(Duration::from_secs(40 * 86_400));
+    let old = later.telemetry.energy(T0_MS, T0_MS + 5000).await.unwrap();
+    assert_eq!(old.samples, None, "from a roll-up");
+    assert_eq!(
+        (old.gpu_mj, old.cpu_mj, old.system_mj),
+        (measured.gpu_mj, measured.cpu_mj, measured.system_mj)
+    );
+}

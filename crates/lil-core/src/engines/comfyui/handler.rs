@@ -325,6 +325,19 @@ pub fn judged_nodes(graph: &Value, object_info: Option<&Value>) -> HashSet<Strin
         .collect()
 }
 
+/// Tells the telemetry, when dropped, that a job's attempt on the engine ended (review M4: a
+/// panic or an early return ends it too).
+struct JobEndedGuard<'a> {
+    comfy: &'a Comfy,
+    job_id: &'a str,
+}
+
+impl Drop for JobEndedGuard<'_> {
+    fn drop(&mut self) {
+        self.comfy.job_ended(self.job_id);
+    }
+}
+
 /// `lil_<first 16 hex of the job id>_`.
 fn job_prefix(job: &JobId) -> String {
     let hex = job.as_str().strip_prefix("j_").unwrap_or(job.as_str());
@@ -1131,9 +1144,14 @@ impl JobHandler for ComfyPromptHandler {
                 classes,
                 cached: HashSet::new(),
             };
+            // The attempt's run on the engine is over however it ends (a panic included): the
+            // fit signal's job ends (ARCH-071; review M4).
+            let ended = JobEndedGuard {
+                comfy: &comfy,
+                job_id: job.id.as_str(),
+            };
             let mut result = attempt.run(args).await;
-            // The attempt's run on the engine is over: the fit signal's job ends (ARCH-071).
-            comfy.job_ended(job.id.as_str());
+            drop(ended);
             // CORE-128: work with external side effects that ComfyUI accepted is never retried
             // automatically; what can't be accounted for is unknown.
             if external
