@@ -9,6 +9,7 @@
 //! | `test.panic` | read | `{message?}` | panics, with `message` when given |
 //! | `test.state_panic` | read | `{}` | panics the suite state actor (QA-012) |
 //! | `test.destructive` | destructive | `{cost?}` (a decimal string) | `{count}`: its runs in this core |
+//! | `test.ask_everyone` | destructive | `{project?, asset_id}` | `{count}`: its runs in this core; `ConfirmPolicy::EveryCaller` (it asks every caller, Task 10 of plan 4b), its touch `projects/{project}/assets/{asset_id}/` (`delete`), and its facts what `TestGates::set_facts` last set |
 //! | `test.emit` | read | `{topic, data}` | `{topic, seq}`: `data` published on `test:<topic>` |
 //! | `test.store_write` | write | `{path, text, expect: "new"\|"generated"\|"<sha256>"}` | `{sha256}`, through `Store::write` |
 //! | `test.ingest_run` | write | `{project?, asset_id, files: [{name, text}], job_line: bool}` | `{run_id, staging_dir, files: [path]}` |
@@ -68,6 +69,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
+use lil_protocol::app::{ConfirmFacts, TouchAccess};
 use lil_protocol::{EffectClass, ErrorBody, codes, is_valid_topic};
 use lil_schema::{Manifest, StatusEvent, change_status, is_asset_id, is_slug, sha256_hex};
 use schemars::JsonSchema;
@@ -75,7 +77,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use super::registry::{CallCtx, Registry, typed_tool, with_estimate_key};
+use super::registry::{
+    CallCtx, ConfirmPolicy, Registry, ToolMeta, TouchDecl, facts_fn, typed_tool, with_estimate_key,
+};
 use crate::jobs::{
     EngineKind, EstimateKey, JobCtx, JobDone, JobFailure, JobFuture, JobHandler, JobSpec,
     JobSummary, Lane, Priority, Substatus, runner::cancelled_error,
@@ -87,16 +91,19 @@ use crate::telemetry::Telemetry;
 /// The module every test tool declares.
 pub const TEST_MODULE: &str = "test";
 
-/// The gates `test.block` waits on. A gate, once opened, stays open.
+/// The gates `test.block` waits on (a gate, once opened, stays open), and the facts
+/// `test.ask_everyone`'s facts function answers.
 #[derive(Debug)]
 pub struct TestGates {
     open: watch::Sender<HashSet<String>>,
+    facts: Mutex<Result<Option<ConfirmFacts>, String>>,
 }
 
 impl Default for TestGates {
     fn default() -> Self {
         TestGates {
             open: watch::Sender::new(HashSet::new()),
+            facts: Mutex::new(Ok(None)),
         }
     }
 }
@@ -104,6 +111,20 @@ impl Default for TestGates {
 impl TestGates {
     pub fn new() -> TestGates {
         TestGates::default()
+    }
+
+    /// What `test.ask_everyone`'s facts function answers from now on: the facts (`None`: it has
+    /// none), or `Err(message)` to fail with `state.unavailable` and that message. At first
+    /// `Ok(None)`.
+    pub fn set_facts(&self, facts: Result<Option<ConfirmFacts>, String>) {
+        *self.facts.lock().unwrap_or_else(PoisonError::into_inner) = facts;
+    }
+
+    fn facts(&self) -> Result<Option<ConfirmFacts>, String> {
+        self.facts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Opens `gate`: every `test.block` waiting on it, and every later one, goes on.
@@ -530,6 +551,18 @@ struct DestructiveArgs {
 #[derive(Debug, Serialize, JsonSchema)]
 struct DestructiveResult {
     count: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AskEveryoneArgs {
+    /// The project its touch names; the call's project when left out.
+    #[serde(default)]
+    #[expect(dead_code, reason = "only its touch declaration reads it")]
+    project: Option<String>,
+    /// The asset its touch names.
+    #[expect(dead_code, reason = "only its touch declaration reads it")]
+    asset_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1005,6 +1038,7 @@ pub fn register_test_desktop(
 pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Arc<StateRegistry>) {
     let counters = Arc::new(Counters::default());
     let release_gates = gates.clone();
+    let facts_gates = gates.clone();
 
     reg.register(typed_tool(
         "test.echo",
@@ -1096,7 +1130,34 @@ pub fn register_test_tools(reg: &mut Registry, gates: Arc<TestGates>, states: Ar
         },
     ));
 
-    let destructive_counters = counters;
+    let destructive_counters = counters.clone();
+    let ask_counters = counters;
+    reg.register_with(
+        typed_tool(
+            "test.ask_everyone",
+            "Test channels only: a destructive tool that asks every caller, your own app's calls too, and only counts its runs. Its touch is the asset folder; its facts are what the test set.",
+            EffectClass::Destructive,
+            TEST_MODULE,
+            move |_ctx, _args: AskEveryoneArgs| {
+                let count = ask_counters.bump("test.ask_everyone", "");
+                Box::pin(async move { Ok((DestructiveResult { count }, format!("run {count}"))) })
+            },
+        ),
+        ToolMeta {
+            confirm_policy: ConfirmPolicy::EveryCaller,
+            touches: vec![TouchDecl {
+                template: "projects/{project}/assets/{asset_id}/",
+                access: TouchAccess::Delete,
+            }],
+            facts: Some(facts_fn(move |_input| {
+                let facts = facts_gates.facts().map_err(|message| {
+                    ErrorBody::new(&codes::STATE_UNAVAILABLE, message, "")
+                });
+                Box::pin(std::future::ready(facts))
+            })),
+        },
+    );
+
     reg.register(typed_tool(
         "test.destructive",
         "Test channels only: a destructive tool that only counts its runs. `cost` is a decimal string.",

@@ -784,6 +784,7 @@ fn dispatcher(
             env,
             &probe,
             Arc::default(),
+            &lil_core::tools::AssetServices::unwired(),
         ),
         PipelineHooks::plan2(),
         states.clone(),

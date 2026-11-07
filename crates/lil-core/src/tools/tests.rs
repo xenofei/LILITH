@@ -286,6 +286,7 @@ fn registry_with(
         &env.env,
         &probe,
         Arc::default(),
+        &AssetServices::unwired(),
     )
 }
 
@@ -433,6 +434,7 @@ async fn plan2_stage_defaults_still_hold() {
     }
     let destructive = reg.get("test.destructive").unwrap().descriptor().clone();
     let read = reg.get("test.echo").unwrap().descriptor().clone();
+    let everyone = reg.get("test.ask_everyone").unwrap().descriptor().clone();
     let ui = session(CallerKind::Ui("test".into()), false);
     let check = |s: Arc<Session>, d: ToolDescriptor| {
         let hooks = hooks.clone();
@@ -449,6 +451,8 @@ async fn plan2_stage_defaults_still_hold() {
                     project: None,
                     retry: false,
                     always_confirm: false,
+                    meta: reg.meta(&d.name),
+                    approved_facts_sha256: None,
                 })
                 .await
         }
@@ -463,6 +467,11 @@ async fn plan2_stage_defaults_still_hold() {
     );
     assert_eq!(check(ui.clone(), destructive).await, proceed);
     assert_eq!(check(cli(), read).await, proceed);
+    // A tool that asks every caller has no way to ask you either: it fails closed.
+    assert_eq!(
+        check(ui.clone(), everyone).await,
+        ConfirmDecision::Unavailable
+    );
     let reserved = hooks
         .reserve
         .reserve(ReserveInput {
@@ -1032,6 +1041,140 @@ fn the_ref_tools_are_pinned() {
     assert_eq!(resolve.input_schema["additionalProperties"], false);
 }
 
+/// `fill_touches` (P4b-R33; Appendix H "Confirmations"): `{project}` from the arguments, else
+/// the call's project; `{asset_id}`; `{files[]}` one touch per string; and a declaration whose
+/// argument is missing is skipped while the others are still listed (ruling 2's choice: the
+/// touch, not the whole list).
+#[test] // spec: APP-115, CORE-157
+fn fill_touches_fills_templates_from_the_arguments() {
+    use lil_protocol::app::{Touch, TouchAccess};
+    let asset = TouchDecl {
+        template: "projects/{project}/assets/{asset_id}/",
+        access: TouchAccess::Delete,
+    };
+    let outside = TouchDecl {
+        template: "{files[]}",
+        access: TouchAccess::Read,
+    };
+    let registry = TouchDecl {
+        template: "registry/collections.yaml",
+        access: TouchAccess::Write,
+    };
+    let touch = |path: &str, access| Touch {
+        path: path.into(),
+        access,
+    };
+    let decls = [asset, outside, registry];
+    // `{project}` from the arguments wins over the call's project.
+    assert_eq!(
+        fill_touches(
+            &decls[..1],
+            &json!({"project": "harbor", "asset_id": "crane"}),
+            Some("sketchbook")
+        ),
+        [touch("projects/harbor/assets/crane/", TouchAccess::Delete)]
+    );
+    // Without the argument it falls back to the call's project.
+    assert_eq!(
+        fill_touches(
+            &decls[..1],
+            &json!({"asset_id": "crane"}),
+            Some("sketchbook")
+        ),
+        [touch(
+            "projects/sketchbook/assets/crane/",
+            TouchAccess::Delete
+        )]
+    );
+    // `{files[]}`: one touch per string, in order; an empty array gives none.
+    assert_eq!(
+        fill_touches(
+            &decls[1..2],
+            &json!({"files": [r"C:\in\a.png", r"D:\b.png"]}),
+            None
+        ),
+        [
+            touch(r"C:\in\a.png", TouchAccess::Read),
+            touch(r"D:\b.png", TouchAccess::Read)
+        ]
+    );
+    assert!(fill_touches(&decls[1..2], &json!({"files": []}), None).is_empty());
+    // A missing argument skips that declaration only: no `{asset_id}`, no project at all, and
+    // no `files`; the literal declaration is still listed.
+    assert_eq!(
+        fill_touches(&decls, &json!({"project": "harbor"}), None),
+        [touch("registry/collections.yaml", TouchAccess::Write)]
+    );
+    assert_eq!(
+        fill_touches(&decls[..1], &json!({"asset_id": "crane"}), None),
+        []
+    );
+    assert_eq!(
+        fill_touches(&decls[..1], &json!({"asset_id": 7}), Some("p")),
+        [],
+        "not a string"
+    );
+    assert_eq!(
+        asset.placeholders(),
+        [("project", false), ("asset_id", false)]
+    );
+    assert_eq!(outside.placeholders(), [("files", true)]);
+    assert!(registry.placeholders().is_empty());
+}
+
+/// The asset services' slots (P4b-R32) left empty change nothing for the tools there are:
+/// every tool `core_registry` registers is listed and has its meta (only the test tool that
+/// asks every caller has one), and a read tool and a write tool of the asset tools run in a
+/// workspace as before.
+#[tokio::test] // spec: CORE-014, CORE-152, CORE-157
+async fn unwired_services_leave_every_existing_tool_working() {
+    let fx = fixture(&[]);
+    let reg = fx.dispatcher.registry();
+    let all: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
+    let listed: Vec<String> = reg
+        .list_for(&CallerKind::Cli)
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(listed, all);
+    for name in ["asset.import", "asset.mark", "asset.get", "assets.query"] {
+        assert!(all.iter().any(|n| n == name), "{name}");
+    }
+    for name in &all {
+        let meta = reg.meta(name);
+        let special = name == "test.ask_everyone";
+        assert_eq!(
+            meta.confirm_policy == ConfirmPolicy::EveryCaller,
+            special,
+            "{name}"
+        );
+        assert_eq!(!meta.touches.is_empty(), special, "{name}");
+        assert_eq!(meta.facts.is_some(), special, "{name}");
+    }
+
+    let ws = fx.env.copy_fixture_workspace("unwired");
+    fx.env.register_workspace(&ws, true);
+    let canonical = std::fs::canonicalize(&ws).unwrap();
+    let text = canonical.to_string_lossy().into_owned();
+    let mut s = (*cli()).clone();
+    s.workspace = Some(crate::workspace::WorkspaceRef {
+        id: lil_platform::Env::workspace_hash(&canonical),
+        path: std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)),
+    });
+    let s = Arc::new(s);
+    let asset = json!({"project": "sketchbook", "asset_id": "chr_paper_crane"});
+    let got = fx.call(&s, "asset.get", asset.clone(), None).await;
+    assert_eq!(
+        ok(&got).structured["asset_id"],
+        "chr_paper_crane",
+        "{got:?}"
+    );
+    let mut mark = asset;
+    mark["rating"] = json!(4);
+    let marked = fx.call(&s, "asset.mark", mark, Some("k-mark")).await;
+    assert_eq!(ok(&marked).structured["rating"], 4, "{marked:?}");
+}
+
 #[test] // spec: CORE-014
 fn registry_and_dispatcher_live_in_the_tools_module() {
     let _: fn() -> crate::tools::Registry = crate::tools::Registry::new;
@@ -1067,6 +1210,7 @@ async fn test_tools_exist_only_on_test_channels() {
     assert_eq!(
         names,
         [
+            "test.ask_everyone",
             "test.block",
             "test.destructive",
             "test.echo",

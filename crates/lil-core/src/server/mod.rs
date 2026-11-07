@@ -99,8 +99,9 @@ use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
 use crate::tools::{
-    Dispatcher, PipelineHooks, TestGates, TestJobHandler, ToolEstimates, core_registry,
-    register_desktop_tools, register_hw_tick, register_telemetry_tools, register_test_desktop,
+    AssetServices, Dispatcher, PipelineHooks, Registry, TestGates, TestJobHandler, ToolEstimates,
+    core_registry, register_desktop_tools, register_hw_tick, register_telemetry_tools,
+    register_test_desktop,
 };
 use crate::transport::serve_with;
 pub use crate::transport::{
@@ -143,6 +144,9 @@ pub struct RunningCore {
     ui_apps: Arc<UiApps>,
     /// The toasts and the confirmations' notification path (APP-146).
     notifier: Arc<Notifier>,
+    /// The dispatcher the router serves `tools/*` with, kept private: only its registry is
+    /// exposed, to tests ([`RunningCore::registry`]).
+    dispatcher: Dispatcher,
     /// The supervisor: ends with the shutdown's report.
     shutdown: JoinHandle<ShutdownReport>,
 }
@@ -187,6 +191,14 @@ impl RunningCore {
     /// The confirmations: pending ones, answers, the apps that can answer.
     pub fn confirm(&self) -> &Arc<Confirm> {
         &self.confirm
+    }
+
+    /// Tests only: the registry the core serves, every tool with its core-internal meta
+    /// (P4b-R33), for in-process tests that check the full server registry. Nothing else
+    /// should read it from here; calls go through the pipe.
+    #[doc(hidden)]
+    pub fn registry(&self) -> &Registry {
+        self.dispatcher.registry()
     }
 
     /// The fullscreen poll and the sleep log.
@@ -301,6 +313,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     crate::tools::register_snapshots(&events, &hub);
     let telemetry = start_telemetry(&cfg, &events).await;
     telemetry::register_snapshot(&events, &telemetry);
+    // The asset services' late-bound slots (P4b-R32): the asset tools keep them; `asset_use`
+    // is filled once the jobs exist and `thumbs` once the thumbnail service does (Tasks 11
+    // and 12). Until then both are empty.
+    let asset_services = AssetServices::unwired();
     let mut registry = core_registry(
         cfg.test_tools,
         &test_gates,
@@ -309,6 +325,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         &cfg.env,
         &cfg.probe,
         Arc::new(cfg.git_env.clone()),
+        &asset_services,
     );
     register_telemetry_tools(&mut registry, &telemetry);
     // The meter (CORE-069): usage records, stage 8, the jobs' energy and local work.
@@ -617,6 +634,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     lifecycle.add_shutdown_step(engines.cancel_prompts_step());
     lifecycle.add_shutdown_step(jobs.persist_interrupted_step());
     lifecycle.add_shutdown_step(engines.stop_engines_step());
+    let tools_dispatcher = dispatcher.clone();
     let mut router = RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
         .with_caps(caps.clone())
         .with_desktop(desktop_settings.clone())
@@ -726,6 +744,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         desktop_settings,
         ui_apps,
         notifier,
+        dispatcher: tools_dispatcher,
         shutdown,
     })
 }

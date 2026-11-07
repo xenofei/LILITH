@@ -12,15 +12,16 @@ use super::{Confirm, ConfirmRequest, McpConfirmation, Replay};
 use crate::meter::CapCheck;
 use crate::state::{StateDb, StateError};
 use crate::tools::{
-    AllowOnce, Approval, CapHit, ConfirmDecision, ConfirmInput, ConfirmStage, ConfirmedVia,
-    IdemRef, ReplayDecision, cap_exceeded,
+    AllowOnce, Approval, CapHit, ConfirmDecision, ConfirmInput, ConfirmPolicy, ConfirmStage,
+    ConfirmedVia, IdemRef, ReplayDecision, SealedFacts, cap_exceeded, fill_touches,
 };
 
 /// Agent safety confirmations and cap confirmations (ARCH-052–056, CORE-091, CORE-109–113,
 /// APP-045, APP-054, QA-016):
 /// - an agent's (`assistant`, `mcp`, `cli`) call of a `destructive` or `exec` tool needs a
 ///   confirmation (or a retry that must, [`ConfirmInput::always_confirm`]); your own actions
-///   don't;
+///   don't, except a call of an `EveryCaller` tool, which asks every caller (CORE-157; its
+///   facts are computed first, and their error refuses the call);
 /// - any caller's call whose estimate would pass a cap needs one too (the caps' check); a call
 ///   that needs both gets one confirmation covering `["confirm", "cap"]`;
 /// - a non-interactive caller is never asked (QA-016), whatever the mode: `confirm.unavailable`
@@ -43,12 +44,14 @@ impl AgentConfirm {
     }
 
     /// The decision for a call that needs a safety confirmation (`confirm`) and/or the caps
-    /// `hits` (module docs).
+    /// `hits` (module docs). `facts` are the tool's sealed facts (`None` for a tool without a
+    /// facts function), stored with their hash.
     async fn ask(
         &self,
         i: ConfirmInput<'_>,
         confirm: bool,
         hits: Option<Vec<CapHit>>,
+        facts: Option<SealedFacts>,
     ) -> ConfirmDecision {
         let refuse = |hits: &Option<Vec<CapHit>>| match hits {
             Some(hits) if !confirm => {
@@ -72,6 +75,13 @@ impl AgentConfirm {
         if hits.is_some() {
             covers.push(Cover::Cap);
         }
+        // A tool that declares none gets no `files` (the card shows the arguments).
+        let files =
+            Some(fill_touches(&i.meta.touches, i.args, i.project)).filter(|f| !f.is_empty());
+        let (facts, facts_sha256) = match facts {
+            Some(sealed) => (sealed.shown, Some(sealed.sha256)),
+            None => (None, None),
+        };
         let request = ConfirmRequest {
             scope: idem.scope.to_string(),
             idem_key: idem.key.to_string(),
@@ -83,12 +93,18 @@ impl AgentConfirm {
             project: i.project.map(str::to_string),
             covers,
             cap: hits.clone(),
+            files,
+            facts,
+            facts_sha256,
         };
+        // An `EveryCaller` tool always uses the core's dialog: Claude Code's prompt can't show
+        // its facts (P4b-R33), and its tool carries no marker (`Confirm::annotate`).
         let claude_code_asked = confirm
             && hits.is_none()
             && i.session.caller == CallerKind::Mcp
             && self.confirm.mcp() == McpConfirmation::ClaudeCode
             && i.descriptor.effect.needs_agent_confirmation()
+            && i.meta.confirm_policy == ConfirmPolicy::AgentsOnly
             && !i.retry;
         if claude_code_asked {
             let db: &StateDb = match i.workspace {
@@ -166,7 +182,17 @@ fn state_unavailable(e: &StateError) -> ErrorBody {
 impl ConfirmStage for AgentConfirm {
     fn check<'a>(&'a self, i: ConfirmInput<'a>) -> BoxFuture<'a, ConfirmDecision> {
         Box::pin(async move {
-            let confirm = i.needs_agent_confirmation();
+            let confirm = i.needs_confirmation();
+            // The facts first: a facts function that fails refuses the call before anything is
+            // asked (P4b-R9).
+            let facts = if confirm {
+                match i.facts().await {
+                    Ok(facts) => facts,
+                    Err(e) => return ConfirmDecision::Failed(e),
+                }
+            } else {
+                None
+            };
             let hits = match self.confirm.caps() {
                 None => None,
                 Some(caps) => match caps.check(i.estimate).await {
@@ -181,7 +207,7 @@ impl ConfirmStage for AgentConfirm {
                     cap_override: None,
                 };
             }
-            self.ask(i, confirm, hits).await
+            self.ask(i, confirm, hits, facts).await
         })
     }
 
@@ -190,7 +216,25 @@ impl ConfirmStage for AgentConfirm {
         i: ConfirmInput<'a>,
         hits: Vec<CapHit>,
     ) -> BoxFuture<'a, ConfirmDecision> {
-        Box::pin(self.ask(i, false, Some(hits)))
+        Box::pin(async move {
+            // The cap prompt of a call whose safety confirmation was given carries the tool's
+            // facts, so the retry it approves checks them again (P4b-R9). The facts may have
+            // changed since the approved retry compared them (they are read again here, after
+            // the reserve stage): then the prompt covers the safety confirmation as well, so
+            // approving the cap never lets through facts no one confirmed (review M3).
+            let needs = i.needs_confirmation();
+            let facts = if needs {
+                match i.facts().await {
+                    Ok(facts) => facts,
+                    Err(e) => return ConfirmDecision::Failed(e),
+                }
+            } else {
+                None
+            };
+            let confirm_again =
+                needs && facts.as_ref().map(|s| s.sha256.as_str()) != i.approved_facts_sha256;
+            self.ask(i, confirm_again, Some(hits), facts).await
+        })
     }
 
     fn on_replay<'a>(
@@ -200,7 +244,7 @@ impl ConfirmStage for AgentConfirm {
     ) -> BoxFuture<'a, Result<Option<ReplayDecision>, StateError>> {
         Box::pin(async move {
             Ok(Some(match self.confirm.on_replay(db, idem).await? {
-                Replay::Run(row) => ReplayDecision::Run(Approval {
+                Replay::Run(row) => ReplayDecision::Run(Box::new(Approval {
                     allowed: allowed_once(&row.id, row.cap_action.as_deref(), row.cap.as_ref()),
                     confirmation_id: row.id,
                     tool: row.tool,
@@ -208,7 +252,8 @@ impl ConfirmStage for AgentConfirm {
                     project: row.project,
                     confirmed_via: row.confirmed_via.unwrap_or(ConfirmedVia::App),
                     cap_action: row.cap_action,
-                }),
+                    facts_sha256: row.facts_sha256,
+                })),
                 Replay::StillPending(pending) => ReplayDecision::StillPending(pending),
                 Replay::Denied => ReplayDecision::Denied,
                 Replay::Expired => ReplayDecision::Expired,

@@ -55,7 +55,7 @@ fn hello_major_mismatch_is_refused() {
         "{response}"
     );
     assert_eq!(
-        result["error"]["data"]["core_protocol"], "1.3",
+        result["error"]["data"]["core_protocol"], "1.4",
         "{response}"
     );
 }

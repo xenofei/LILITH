@@ -522,6 +522,152 @@ fn queue_methods_need_a_verified_app_and_the_capability() {
     assert_eq!(lanes[0]["paused"], false, "{listed}");
 }
 
+/// Protocol 1.4's three `app/*` methods (APP-039; Appendix D): only for a verified app whose
+/// session shares `assets.v1` (else `caller.not_allowed`, the shape of the earlier capability
+/// refusals); with it, each is -32601 until its own task routes it.
+#[test] // spec: APP-039, APP-040, APP-043
+fn app_assets_methods_need_the_capability() {
+    let env = TestEnv::new();
+    let _core = app_core(&env);
+    let methods = [
+        (
+            "app/thumbs.request",
+            json!({"items": [{"path": "projects/p/assets/a/x.png"}], "tier": 96}),
+        ),
+        ("app/asset.trust", json!({"asset_id": "a"})),
+        (
+            "app/asset.ai_edit",
+            json!({"asset_id": "a", "path": "work/x.png", "sha256": "ab".repeat(32)}),
+        ),
+    ];
+    let refused = |response: &Value| {
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            response["result"]["error"]["code"], "caller.not_allowed",
+            "{response}"
+        );
+    };
+    // An agent, even one that offers `assets.v1`.
+    let mut cli = connect(&env, json!({}));
+    for (m, params) in &methods {
+        refused(&cli.call(m, params.clone()));
+    }
+    // An app of protocol 1.3: its shared capabilities lack `assets.v1`.
+    let caps_1_3 = &lil_protocol::CAPABILITIES[..9];
+    assert!(!caps_1_3.contains(&"assets.v1"));
+    let mut older = lil_testkit::TestApp::start_with_capabilities(&env, None, &[], caps_1_3);
+    assert_eq!(older.hello()["caller_kind"], "ui:test");
+    for (m, params) in &methods {
+        refused(&older.call(m, params.clone()));
+    }
+    // An app that shares it: not routed yet.
+    let mut app =
+        lil_testkit::TestApp::start_with_capabilities(&env, None, &[], lil_protocol::CAPABILITIES);
+    let shared = app.hello()["capabilities"].clone();
+    assert!(
+        shared.as_array().unwrap().contains(&json!("assets.v1")),
+        "{shared}"
+    );
+    for (m, params) in &methods {
+        let response = app.call(m, params.clone());
+        assert_eq!(response["error"]["code"], -32601, "{m}: {response}");
+    }
+}
+
+/// What is wrong with a touch placeholder naming `field` of an input schema whose properties are
+/// `props` (`many`: an array placeholder `{field[]}`), or `None`. `fill_touches` fills `{field}`
+/// only from a string and `{field[]}` only from an array of strings, so the property must have
+/// that type (`["string", "null"]` for an optional one; likewise `["array", "null"]`). `{project}`
+/// may name no property: it falls back to the call's project.
+fn touch_field_problem(
+    props: &serde_json::Map<String, Value>,
+    field: &str,
+    many: bool,
+) -> Option<String> {
+    let Some(schema) = props.get(field) else {
+        return (field != "project").then(|| format!("{field:?} isn't an argument"));
+    };
+    let is = |ty: &str| schema["type"] == ty || schema["type"] == json!([ty, "null"]);
+    match many {
+        false if !is("string") => Some(format!("{{{field}}} is not a string: {schema}")),
+        true if !is("array") || schema["items"]["type"] != "string" => Some(format!(
+            "{{{field}[]}} is not an array of strings: {schema}"
+        )),
+        _ => None,
+    }
+}
+
+/// P4b-R33 and ruling T10-S1: over the server's full registry, every touch template names only
+/// fields of its tool's input schema (or `{project}`, which falls back to the call's project),
+/// each of the type `fill_touches` fills from (review M4), only `destructive` and `exec` tools
+/// declare touches, and at least one does.
+#[test] // spec: APP-115, CORE-157
+fn touch_templates_name_only_input_fields() {
+    // The check itself: wrong types and a missing field are caught.
+    let props = json!({
+        "asset_id": {"type": "string"},
+        "project": {"type": ["string", "null"]},
+        "take": {"type": "integer"},
+        "files": {"type": "array", "items": {"type": "string"}},
+        "takes": {"type": "array", "items": {"type": "integer"}},
+    });
+    let props = props.as_object().unwrap();
+    assert_eq!(touch_field_problem(props, "asset_id", false), None);
+    assert_eq!(touch_field_problem(props, "project", false), None);
+    assert_eq!(
+        touch_field_problem(&serde_json::Map::new(), "project", false),
+        None
+    );
+    assert_eq!(touch_field_problem(props, "files", true), None);
+    for (field, many) in [
+        ("take", false),
+        ("files", false),
+        ("asset_id", true),
+        ("takes", true),
+        ("nope", false),
+    ] {
+        assert!(
+            touch_field_problem(props, field, many).is_some(),
+            "{field} {many}"
+        );
+    }
+
+    let env = TestEnv::new();
+    let core = core(&env);
+    let reg = core.core().registry();
+    let mut checked = Vec::new();
+    for d in reg.descriptors() {
+        let meta = reg.meta(&d.name);
+        if meta.touches.is_empty() {
+            continue;
+        }
+        assert!(
+            matches!(
+                d.effect,
+                lil_protocol::EffectClass::Destructive | lil_protocol::EffectClass::Exec
+            ),
+            "{} declares touches but is {:?}",
+            d.name,
+            d.effect
+        );
+        let props = d.input_schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{} has no input properties", d.name));
+        for decl in &meta.touches {
+            for (field, many) in decl.placeholders() {
+                if let Some(problem) = touch_field_problem(props, field, many) {
+                    panic!("{}: {:?}: {problem}", d.name, decl.template);
+                }
+            }
+        }
+        checked.push(d.name.clone());
+    }
+    assert!(
+        checked.contains(&"test.ask_everyone".to_string()),
+        "{checked:?}"
+    );
+}
+
 #[test] // spec: CORE-016
 fn concurrent_same_key_gets_in_progress() {
     let env = TestEnv::new();
@@ -740,6 +886,7 @@ fn direct(
         &env.env,
         &probe,
         Arc::default(),
+        &lil_core::tools::AssetServices::unwired(),
     );
     for tool in extra {
         reg.register(tool);
@@ -1165,6 +1312,7 @@ fn confirming(env: &TestEnv) -> (lil_core::tools::Dispatcher, Arc<lil_core::conf
         &env.env,
         &probe,
         Arc::default(),
+        &lil_core::tools::AssetServices::unwired(),
     );
     reg.register(destructive_job_tool());
     let confirm = Confirm::new(

@@ -696,10 +696,10 @@ fn migration_10_adds_family_and_captures() {
     db.close().expect("close");
 
     let migrated = StateDb::open(&path, StateScope::Suite, no_fatal()).expect("migrate");
-    // Migrated through 10 to the newest (11, the restart-hold toasts).
-    assert_eq!(migrated.schema_version(), 11);
-    assert_eq!(known(), 11);
-    assert_eq!(lil_schema::SUITE_STATE_SCHEMA, 11);
+    // Migrated through 10 to the newest (12, the confirmations' facts and files).
+    assert_eq!(migrated.schema_version(), 12);
+    assert_eq!(known(), 12);
+    assert_eq!(lil_schema::SUITE_STATE_SCHEMA, 12);
     migrated.close();
     let db = read_only(&path);
     let row: (String, Option<String>, i64) = db
@@ -729,4 +729,179 @@ fn migration_10_adds_family_and_captures() {
     insert(1).unwrap();
     assert!(insert(1).is_err(), "one capture per engine and time");
     insert(2).unwrap();
+}
+
+/// Suite migration 12 and workspace migration 9 (`CONFIRM_FACTS`, P4b-R9, P4b-R33): a
+/// confirmation row written before them reads back with no files, no facts and no facts hash,
+/// and its approval still runs (no hash, no facts check).
+#[tokio::test] // spec: CORE-004, CORE-091, APP-115
+async fn old_confirmation_rows_read_after_the_migration() {
+    use lil_core::confirm::{
+        AgentConfirm, Confirm, ListState, McpConfirmation, NoNotificationPath, UiPresence,
+    };
+    use lil_core::tools::{AssetServices, Dispatcher, PipelineHooks, TestGates, core_registry};
+    use lil_platform::{Clock, IdSource};
+    use lil_protocol::{Cover, Outcome, PendingConfirmation, ToolOutput};
+    use serde_json::json;
+
+    let env = TestEnv::new();
+    let clock = FakeClock::new();
+    let now = i64::try_from(
+        clock
+            .utc_now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let insert_row = |db: &Connection, id: &str, scope: &str| {
+        db.execute(
+            "INSERT INTO confirmations (id, scope, idem_key, tool, args_hash, arguments,
+                 caller_kind, covers, state, confirmed_via, created_utc, expires_utc,
+                 answered_utc, session_id)
+             VALUES (?1, ?2, 'k-old', 'test.destructive', ?3, '{}', 'cli', '[\"confirm\"]',
+                 'approved', 'app', ?4, ?4 + 1800, ?4, 's_cli')",
+            rusqlite::params![
+                id,
+                scope,
+                lil_protocol::args_hash(&json!({"name": "test.destructive", "arguments": {}})),
+                now
+            ],
+        )
+        .expect("an old confirmation row");
+    };
+
+    // A suite database at 11 holding an approved confirmation and its call's stored
+    // `pending_confirmation`.
+    let suite = env.env.suite_state_db();
+    env.write_state_db_version(&suite, 11, true);
+    let db = Connection::open(&suite).expect("open the old database");
+    for m in &SUITE_MIGRATIONS[..11] {
+        db.execute_batch(m).expect("an earlier migration");
+    }
+    insert_row(&db, "cf_00000000000000a1", "cli|none");
+    let stored = Outcome::<ToolOutput>::PendingConfirmation(PendingConfirmation {
+        confirmation_id: "cf_00000000000000a1".into(),
+        retry_token: "k-old".into(),
+        expires_at: lil_schema::time::rfc3339(now + 1800),
+        covers: vec![Cover::Confirm],
+    });
+    db.execute(
+        "INSERT INTO idempotency (scope, key, args_hash, state, outcome, created_utc)
+         VALUES ('cli|none', 'k-old', ?1, 'done', ?2, ?3)",
+        rusqlite::params![
+            lil_protocol::args_hash(&json!({"name": "test.destructive", "arguments": {}})),
+            serde_json::to_string(&stored).unwrap(),
+            now
+        ],
+    )
+    .expect("the stored outcome");
+    db.close().expect("close");
+
+    // A workspace database at 8 with one too: it migrates to 9 with the three columns NULL.
+    let ws_db = env.root().join("ws-local").join("state.db");
+    env.write_state_db_version(&ws_db, 8, true);
+    let db = Connection::open(&ws_db).expect("open the old workspace database");
+    for m in &WORKSPACE_MIGRATIONS[..8] {
+        db.execute_batch(m).expect("an earlier migration");
+    }
+    insert_row(&db, "cf_00000000000000b1", "cli|ws1");
+    db.close().expect("close");
+    let migrated = StateDb::open(&ws_db, StateScope::Workspace, no_fatal()).expect("migrate");
+    assert_eq!(migrated.schema_version(), 9);
+    assert_eq!(lil_schema::WORKSPACE_STATE_SCHEMA, 9);
+    migrated.close();
+    let nulls: (Option<String>, Option<String>, Option<String>) = read_only(&ws_db)
+        .query_row(
+            "SELECT facts, facts_sha256, files FROM confirmations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(nulls, (None, None, None));
+
+    // The suite one, through the core: the row reads, and the retry with its key runs.
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).expect("migrate"));
+    assert_eq!(states.suite().schema_version(), 12);
+    let dyn_clock: Arc<dyn Clock> = clock.clone();
+    let ids: Arc<dyn IdSource> = Arc::new(SeqIds::new());
+    let events = Arc::new(lil_core::events::EventBus::new(dyn_clock.clone()));
+    let probe: Arc<dyn lil_platform::fs::Probe> = Arc::new(lil_platform::fs::SystemProbe);
+    let hub = lil_core::workspace::WorkspaceHub::new(
+        env.env.clone(),
+        states.clone(),
+        events.clone(),
+        dyn_clock.clone(),
+        ids.clone(),
+        lil_core::store::FailPoints::none(),
+        probe.clone(),
+        lil_core::watch::WatchConfig::default(),
+    );
+    let reg = core_registry(
+        true,
+        &Arc::new(TestGates::new()),
+        &states,
+        &hub,
+        &env.env,
+        &probe,
+        Arc::default(),
+        &AssetServices::unwired(),
+    );
+    let confirm = Confirm::new(
+        states.clone(),
+        events.clone(),
+        dyn_clock.clone(),
+        ids.clone(),
+        UiPresence::new(),
+        Arc::new(NoNotificationPath),
+        Duration::from_secs(1800),
+        McpConfirmation::Core,
+        lil_core::store::FailPoints::none(),
+    );
+    let history = confirm.list(ListState::History, 10).await.expect("list");
+    assert_eq!(history.len(), 1);
+    let row = &history[0];
+    assert_eq!(row.id, "cf_00000000000000a1");
+    assert_eq!(
+        (&row.files, &row.facts, &row.facts_sha256),
+        (&None, &None, &None)
+    );
+    let view = serde_json::to_value(row.view()).unwrap();
+    assert!(
+        view.get("files").is_none() && view.get("facts").is_none(),
+        "{view}"
+    );
+    let dispatcher = Dispatcher::new(
+        reg,
+        PipelineHooks {
+            confirm: AgentConfirm::new(confirm.clone()),
+            ..PipelineHooks::plan2()
+        },
+        states.clone(),
+        events,
+        hub,
+        ids,
+        dyn_clock.clone(),
+        lil_core::Lifecycle::new(dyn_clock, lil_core::lifecycle::IDLE_EXIT_AFTER),
+    );
+    let cli = Arc::new(lil_core::session::Session {
+        id: "s_cli".into(),
+        caller: lil_protocol::CallerKind::Cli,
+        non_interactive: false,
+        workspace: None,
+        capabilities: Vec::new(),
+        client_pid: 1,
+        profile_id: None,
+    });
+    let retry = lil_protocol::ToolCallParams {
+        name: "test.destructive".into(),
+        arguments: serde_json::Map::new(),
+        idempotency_key: Some("k-old".into()),
+        trace_id: None,
+    };
+    let ran = dispatcher.call(cli, retry).await;
+    match ran {
+        Outcome::Ok(out) => assert_eq!(out.structured["count"], 1),
+        other => panic!("the old approval didn't run: {other:?}"),
+    }
 }

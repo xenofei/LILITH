@@ -44,7 +44,12 @@
 //! the tool and arguments you approved (an approval with the cap action `allow_once` lets the
 //! reservation pass the caps the prompt named, up to the estimate it showed, this once: the
 //! reserve stage gets them as `allow_once` and asks again for anything else), and the outcome
-//! is stored as usual; denied, expired or cancelled, the key is released and the call is
+//! is stored as usual. Unless the tool has facts (an `EveryCaller` tool such as `asset.trash`;
+//! P4b-R9): the approved retry recomputes them first, and when their hash differs from the one
+//! you approved, the call doesn't run but asks again (a new `pending_confirmation` for the same
+//! key; a facts function that fails ends the call with its error); and a cap prompt after it
+//! whose facts changed since that check covers `confirm` as well as `cap`
+//! (`ConfirmStage::cap_needed`). Denied, expired or cancelled, the key is released and the call is
 //! `confirm.denied` or `confirm.expired` (a cancelled one in its own words); still pending,
 //! the same `pending_confirmation`.
 //!
@@ -737,7 +742,7 @@ impl Inner {
                                 follow_up: Some(in_flight.follow_up()),
                                 finished: false,
                             },
-                            approval,
+                            *approval,
                         )))
                     }
                     Ok(false) => fail(
@@ -824,8 +829,13 @@ impl Inner {
         };
         let estimate = hooks.estimate.estimate(d, &args, &settings);
         // 5. Confirm and caps. A confirmation you approved for this tool and these arguments
-        // satisfies it (its `allow_once` lets the reservation pass the caps once); one for
+        // satisfies it (its `allow_once` lets the reservation pass the caps once), unless the
+        // tool's facts changed since you saw them (P4b-R9): then the call asks again. One for
         // another call (the call a `job.retry` runs again) goes on to that call.
+        let approved_facts = approved
+            .as_ref()
+            .filter(|a| a.covers_call(&d.name, &args, project.as_deref()))
+            .and_then(|a| a.facts_sha256.clone());
         let confirm_input = ConfirmInput {
             session,
             descriptor: d,
@@ -836,15 +846,31 @@ impl Inner {
             project: project.as_deref(),
             retry: is_retry,
             always_confirm,
+            meta: self.reg.meta(&d.name),
+            approved_facts_sha256: approved_facts.as_deref(),
         };
         let (decision, passed_on) = match approved {
-            Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => (
-                ConfirmDecision::Proceed {
-                    confirmed_via: Some(a.confirmed_via),
-                    cap_override: a.allowed.clone(),
-                },
-                None,
-            ),
+            Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => {
+                match a.facts_changed(&confirm_input).await {
+                    Err(error) => {
+                        return (
+                            refused(ConfirmDecision::Failed(error), &d.name, trace_id),
+                            None,
+                        );
+                    }
+                    Ok(true) => {
+                        tracing::info!(confirmation = %a.confirmation_id, tool = %d.name, "the facts of an approved call changed; it asks again");
+                        (hooks.confirm.check(confirm_input).await, None)
+                    }
+                    Ok(false) => (
+                        ConfirmDecision::Proceed {
+                            confirmed_via: Some(a.confirmed_via),
+                            cap_override: a.allowed.clone(),
+                        },
+                        None,
+                    ),
+                }
+            }
             other => {
                 let decision = hooks.confirm.check(confirm_input).await;
                 (decision, other)

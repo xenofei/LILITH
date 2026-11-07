@@ -96,6 +96,7 @@ impl Fx {
             &env.env,
             &probe,
             Arc::default(),
+            &lil_core::tools::AssetServices::unwired(),
         );
         let personal = Arc::new(Personal::new(
             env.env.data_dir().join("resources"),

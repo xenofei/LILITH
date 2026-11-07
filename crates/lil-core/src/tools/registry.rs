@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
+use lil_protocol::app::{ConfirmFacts, Touch, TouchAccess};
 use lil_protocol::{
     CallerKind, EffectClass, ErrorBody, MAX_DESCRIPTION_CHARS, ToolDescriptor, ToolOutput, codes,
 };
@@ -19,7 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::dispatcher::Redispatch;
-use super::stages::{ConfirmedVia, Settings};
+use super::stages::{ConfirmInput, ConfirmedVia, Settings};
 use crate::events::EventBus;
 use crate::jobs::{EstimateKey, JobCaller, JobId, JobOrigin, Jobs, SubmittedSlot};
 use crate::pipeline::RecordSlot;
@@ -277,10 +278,162 @@ where
     })
 }
 
+/// Who a tool's call asks for your confirmation (P4b-R9, P4b-R33; CORE-109, CORE-157).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfirmPolicy {
+    /// An agent's call of a `destructive` or `exec` tool (ARCH-052): every tool but these.
+    #[default]
+    AgentsOnly,
+    /// Every caller's call, your own included, always in the core's dialog (`asset.trash`).
+    EveryCaller,
+}
+
+/// A path a tool's call touches, as a template over its arguments (P4b-R33; Appendix H
+/// "Confirmations"): `{name}` is the argument `name` (a string), `{project}` falls back to the
+/// call's project, and `{name[]}` gives one touch per string of the array argument `name`
+/// (`{files[]}` for outside files).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchDecl {
+    pub template: &'static str,
+    pub access: TouchAccess,
+}
+
+impl TouchDecl {
+    /// The argument names its placeholders name, in order, each with whether it is an array
+    /// placeholder (`{name[]}`, `[]` left off the name) or a single one (`{name}`).
+    pub fn placeholders(&self) -> Vec<(&'static str, bool)> {
+        let mut found = Vec::new();
+        let mut rest = self.template;
+        while let Some((name, after)) = next_placeholder(rest) {
+            found.push(match name.strip_suffix("[]") {
+                Some(field) => (field, true),
+                None => (name, false),
+            });
+            rest = after;
+        }
+        found
+    }
+}
+
+/// The first `{…}` of `rest`: its name and the text after it.
+fn next_placeholder(rest: &str) -> Option<(&str, &str)> {
+    let open = rest.find('{')?;
+    let close = rest[open..].find('}')? + open;
+    Some((&rest[open + 1..close], &rest[close + 1..]))
+}
+
+/// The touches of a call with `args` in `project` (Appendix H "Confirmations"): each
+/// declaration filled from the arguments. A declaration whose placeholder names an argument the
+/// call doesn't give (or not as a string; `{project}` with neither the argument nor a call
+/// project) is skipped, and the others are still listed; `{name[]}` gives one touch per string
+/// of the array, so an empty array gives none.
+pub fn fill_touches(
+    decls: &[TouchDecl],
+    args: &serde_json::Value,
+    project: Option<&str>,
+) -> Vec<Touch> {
+    decls
+        .iter()
+        .flat_map(|decl| {
+            fill_one(decl.template, args, project)
+                .into_iter()
+                .map(|path| Touch {
+                    path,
+                    access: decl.access,
+                })
+        })
+        .collect()
+}
+
+/// The paths of one template (none when an argument it names is missing).
+fn fill_one(template: &str, args: &serde_json::Value, project: Option<&str>) -> Vec<String> {
+    let mut paths = vec![String::new()];
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some((name, after)) = next_placeholder(rest) else {
+            break;
+        };
+        let literal = &rest[..open];
+        let values: Vec<&str> = match name.strip_suffix("[]") {
+            Some(field) => args
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default(),
+            None => args
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .or(if name == "project" { project } else { None })
+                .into_iter()
+                .collect(),
+        };
+        if values.is_empty() {
+            return Vec::new();
+        }
+        paths = paths
+            .iter()
+            .flat_map(|p| values.iter().map(move |v| format!("{p}{literal}{v}")))
+            .collect();
+        rest = after;
+    }
+    paths.into_iter().map(|p| p + rest).collect()
+}
+
+/// What a tool's facts function returns (P4b-R33): the full facts, `None` when it has none.
+pub type FactsFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<ConfirmFacts>, ErrorBody>> + Send + 'a>>;
+
+/// A tool's facts function: what its confirmation tells you, recomputed at the approved retry
+/// (P4b-R9, P4b-R33). It returns the full lists, every dependent and the versions, in any
+/// order: the core hashes both sorted, shows the dependents sorted (the first 50, with the
+/// full count) and the versions in the order given ([`super::stages::seal_facts`]).
+/// `Ok(None)` means "this call has no facts", and that is a fact too: the confirmation stores
+/// its hash (`args_hash(null)`, the SHA-256 of `null`) like any other, so facts that appear
+/// before the approved retry, or vanish, ask again (review I1). Only a tool without a facts
+/// function, or a row stored before the hash existed, has no hash and is never checked.
+pub type FactsFn = Arc<dyn for<'a> Fn(&'a ConfirmInput<'a>) -> FactsFuture<'a> + Send + Sync>;
+
+/// `f` as a [`FactsFn`] (a closure's higher-ranked signature is inferred from this bound).
+pub fn facts_fn<F>(f: F) -> FactsFn
+where
+    F: for<'a> Fn(&'a ConfirmInput<'a>) -> FactsFuture<'a> + Send + Sync + 'static,
+{
+    Arc::new(f)
+}
+
+/// What the core keeps beside a tool's descriptor and never puts on the wire (P4b-R33): its
+/// confirmation policy, the paths its calls touch and its facts function. The default:
+/// `AgentsOnly`, no touches, no facts.
+#[derive(Clone, Default)]
+pub struct ToolMeta {
+    pub confirm_policy: ConfirmPolicy,
+    pub touches: Vec<TouchDecl>,
+    pub facts: Option<FactsFn>,
+}
+
+impl std::fmt::Debug for ToolMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolMeta")
+            .field("confirm_policy", &self.confirm_policy)
+            .field("touches", &self.touches)
+            .field("facts", &self.facts.is_some())
+            .finish()
+    }
+}
+
+/// The meta of a tool registered without one.
+static DEFAULT_META: ToolMeta = ToolMeta {
+    confirm_policy: ConfirmPolicy::AgentsOnly,
+    touches: Vec::new(),
+    facts: None,
+};
+
 /// Every tool the core serves, by name.
 #[derive(Default)]
 pub struct Registry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Each tool's [`ToolMeta`], for tools registered with one ([`Registry::register_with`]).
+    metas: BTreeMap<String, ToolMeta>,
     /// Every tool's descriptor, set once by [`Registry::seal`].
     all_tools: Arc<OnceLock<Vec<ToolDescriptor>>>,
 }
@@ -305,7 +458,21 @@ impl Registry {
     /// `#[serde(deny_unknown_fields)]` gives it). These are programming errors, caught by the
     /// registry tests.
     pub fn register(&mut self, t: Arc<dyn Tool>) {
+        self.register_with(t, ToolMeta::default());
+    }
+
+    /// Adds `t` with its core-internal `meta` (P4b-R33).
+    ///
+    /// # Panics
+    /// As [`Registry::register`]; and for an `EveryCaller` tool that only reads (a `read` call
+    /// has no idempotency key, so it could never be asked about).
+    pub fn register_with(&mut self, t: Arc<dyn Tool>, meta: ToolMeta) {
         let d = t.descriptor();
+        assert!(
+            meta.confirm_policy != ConfirmPolicy::EveryCaller || d.effect != EffectClass::Read,
+            "tool {}: a read tool can't ask every caller",
+            d.name
+        );
         let chars = d.description.chars().count();
         assert!(
             chars <= MAX_DESCRIPTION_CHARS,
@@ -330,7 +497,19 @@ impl Registry {
             !self.tools.contains_key(&name),
             "tool {name} is registered twice"
         );
+        if meta.confirm_policy != ConfirmPolicy::AgentsOnly
+            || !meta.touches.is_empty()
+            || meta.facts.is_some()
+        {
+            self.metas.insert(name.clone(), meta);
+        }
         self.tools.insert(name, t);
+    }
+
+    /// The core-internal meta of the tool `name` ([`ToolMeta::default`] for one registered
+    /// without, or unknown).
+    pub fn meta(&self, name: &str) -> &ToolMeta {
+        self.metas.get(name).unwrap_or(&DEFAULT_META)
     }
 
     /// A handle to every tool's descriptor, filled by [`Registry::seal`] once every tool is

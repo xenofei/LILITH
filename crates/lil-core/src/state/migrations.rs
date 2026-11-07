@@ -307,6 +307,15 @@ const RESTART_HOLD_TOASTS: &str = "CREATE TABLE restart_hold_toasts (
     toasted_ms INTEGER NOT NULL
 );";
 
+/// Suite migration 12 and workspace migration 9: a confirmation's facts and files (P4b-R9,
+/// P4b-R33; Appendix H "Confirmations"). `facts` is the JSON of the `ConfirmFacts` you were
+/// shown (at most 50 dependents), `facts_sha256` the hash of the full facts that the approved
+/// retry checks again, `files` the JSON list of the call's `Touch`es. A row from before this
+/// migration has all three `NULL`: no files, no facts, and its approval runs unchecked.
+const CONFIRM_FACTS: &str = "ALTER TABLE confirmations ADD COLUMN facts TEXT;
+ALTER TABLE confirmations ADD COLUMN facts_sha256 TEXT;
+ALTER TABLE confirmations ADD COLUMN files TEXT;";
+
 /// The suite `state.db` (`Env::local_dir()\state.db`).
 pub const SUITE_MIGRATIONS: &[&str] = &[
     IDEMPOTENCY_V1,
@@ -320,6 +329,7 @@ pub const SUITE_MIGRATIONS: &[&str] = &[
     JOBS_V2,
     ENGINE_RECORDS,
     RESTART_HOLD_TOASTS,
+    CONFIRM_FACTS,
 ];
 
 /// A workspace's `state.db` (`Env::workspace_local_dir(ws)\state.db`).
@@ -332,6 +342,7 @@ pub const WORKSPACE_MIGRATIONS: &[&str] = &[
     HOLDS,
     USAGE_PENDING,
     JOBS_V2,
+    CONFIRM_FACTS,
 ];
 
 #[cfg(test)]
@@ -404,7 +415,15 @@ mod tests {
             columns("generated_pending"),
             ["key", "path", "old_sha256", "new_sha256", "started_utc"]
         );
-        assert_eq!(SUITE_MIGRATIONS.len(), 11);
+        assert_eq!(SUITE_MIGRATIONS.len(), 12);
+        assert_eq!(
+            SUITE_MIGRATIONS[11], CONFIRM_FACTS,
+            "appended, never inserted"
+        );
+        assert_eq!(
+            WORKSPACE_MIGRATIONS[8], CONFIRM_FACTS,
+            "appended, never inserted"
+        );
         assert_eq!(
             SUITE_MIGRATIONS[10], RESTART_HOLD_TOASTS,
             "appended, never inserted"
@@ -413,7 +432,7 @@ mod tests {
             SUITE_MIGRATIONS[9], ENGINE_RECORDS,
             "appended, never inserted"
         );
-        assert_eq!(WORKSPACE_MIGRATIONS.len(), 8);
+        assert_eq!(WORKSPACE_MIGRATIONS.len(), 9);
         assert_eq!(SUITE_MIGRATIONS[8], JOBS_V2, "appended, never inserted");
         assert_eq!(WORKSPACE_MIGRATIONS[7], JOBS_V2, "appended, never inserted");
         assert_eq!(WORKSPACE_MIGRATIONS[5], HOLDS, "appended, never inserted");

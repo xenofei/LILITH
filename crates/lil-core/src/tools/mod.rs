@@ -13,6 +13,7 @@ pub mod project_tools;
 pub mod record_stage;
 pub mod ref_tools;
 pub mod registry;
+pub mod services;
 pub mod stages;
 pub mod telemetry_tools;
 pub mod test_tools;
@@ -36,13 +37,17 @@ pub use job_tools::{JOB_RETRY, register_job_tools};
 pub use project_tools::register_project_tools;
 pub use record_stage::WorkspaceRecord;
 pub use ref_tools::register_ref_tools;
-pub use registry::{CallCtx, Registry, Tool, ToolFuture, typed_tool, with_estimate_key};
+pub use registry::{
+    CallCtx, ConfirmPolicy, FactsFn, FactsFuture, Registry, Tool, ToolFuture, ToolMeta, TouchDecl,
+    facts_fn, fill_touches, typed_tool, with_estimate_key,
+};
+pub use services::{AssetServices, AssetUse, InUse, ThumbState, Thumbnails};
 pub use stages::{
     AllowOnce, Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput,
-    ConfirmStage, ConfirmedVia, Estimate, EstimateStage, IdemRef, MeterStage, PipelineHooks,
-    RecordStage, ReplayDecision, ReserveInput, ReserveOutcome, ReserveStage, SettingSource,
-    Settings, SettingsInput, SettingsStage, SettleInput, ToolEstimates, cap_exceeded,
-    cap_hits_json,
+    ConfirmStage, ConfirmedVia, Estimate, EstimateStage, FACTS_SHOWN, IdemRef, MeterStage,
+    PipelineHooks, RecordStage, ReplayDecision, ReserveInput, ReserveOutcome, ReserveStage,
+    SealedFacts, SettingSource, Settings, SettingsInput, SettingsStage, SettleInput, ToolEstimates,
+    cap_exceeded, cap_hits_json, seal_facts,
 };
 pub use telemetry_tools::register_telemetry_tools;
 pub use test_tools::{
@@ -63,7 +68,12 @@ use crate::workspace::WorkspaceHub;
 
 /// The registry a core serves: the product tools on every channel and, on a test channel
 /// (`test_tools`), the test-channel tools. `git_env` is added to every `git` the doctor runs
-/// (`CoreConfig.git_env`).
+/// (`CoreConfig.git_env`). `services` are the asset services' late-bound slots (P4b-R32), which
+/// the asset tools keep.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the plan's signature: today's arguments, then the asset services"
+)]
 pub fn core_registry(
     test_tools: bool,
     gates: &Arc<TestGates>,
@@ -72,6 +82,7 @@ pub fn core_registry(
     env: &Env,
     probe: &Arc<dyn Probe>,
     git_env: Arc<Vec<(OsString, OsString)>>,
+    services: &AssetServices,
 ) -> Registry {
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub.clone(), env.clone(), probe.clone());
@@ -84,7 +95,7 @@ pub fn core_registry(
     ));
     register_trash_tools(&mut reg, &personal);
     register_asset_read_tools(&mut reg);
-    register_asset_tools(&mut reg);
+    register_asset_tools(&mut reg, services);
     register_ref_tools(&mut reg);
     register_watch_tools(&mut reg);
     register_job_tools(&mut reg);

@@ -114,6 +114,7 @@ fn fx_full(
             &env.env,
             &probe,
             Arc::default(),
+            &lil_core::tools::AssetServices::unwired(),
         ),
     };
     let lifecycle = lil_core::Lifecycle::new(clock.clone(), lil_core::lifecycle::IDLE_EXIT_AFTER);

@@ -53,7 +53,7 @@ fn hello_returns_session_and_shared_capabilities() {
     let instance = result["instance_id"].as_str().expect("instance_id");
     assert!(session.starts_with("s_"), "{response}");
     assert!(instance.starts_with("c_"), "{response}");
-    assert_eq!(result["protocol"], "1.3", "{response}");
+    assert_eq!(result["protocol"], "1.4", "{response}");
     assert_eq!(result["build_id"], lil_protocol::BUILD_ID, "{response}");
     assert_eq!(
         result["schema_hash"],
@@ -71,10 +71,10 @@ fn hello_returns_session_and_shared_capabilities() {
     assert_eq!(second["result"]["status"], "ok", "{second}");
     assert_eq!(second["result"]["instance_id"], instance, "{second}");
     assert_ne!(second["result"]["session_id"], session, "{second}");
-    // The session runs at the lower minor, 1.3, and shares the core's list: protocol 1.1's
+    // The session runs at the lower minor, 1.4, and shares the core's list: protocol 1.1's
     // five capabilities, then `queue.v1`, `desktop.v1` and `context.v1` (later capabilities
     // follow them).
-    assert_eq!(second["result"]["protocol"], "1.3", "{second}");
+    assert_eq!(second["result"]["protocol"], "1.4", "{second}");
     let shared = second["result"]["capabilities"].as_array().unwrap();
     assert_eq!(
         shared[..8],
@@ -169,7 +169,7 @@ fn major_mismatch_with_unknown_params_is_incompatible_not_invalid_params() {
             "{response}"
         );
         assert_eq!(
-            result["error"]["data"]["core_protocol"], "1.3",
+            result["error"]["data"]["core_protocol"], "1.4",
             "{response}"
         );
         assert!(

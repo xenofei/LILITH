@@ -202,6 +202,7 @@ impl Rig {
             &env.env,
             &probe,
             Arc::default(),
+            &lil_core::tools::AssetServices::unwired(),
         );
         register_meter_tools(&mut reg, &meter, true);
         register_caps_tools(&mut reg, &caps);
