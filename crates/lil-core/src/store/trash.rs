@@ -19,10 +19,13 @@
 //!
 //! **A whole asset** (CORE-157, ruling PF-12): `asset.trash` moves `projects/<p>/assets/<a>`
 //! with [`Store::trash`] and the reason [`ASSET_TRASH_REASON`], as one entry, sealed version
-//! folders included and unmodified. Like any folder, an asset holding a path its manifest
-//! `locks` is never moved (ruling P3-R7, `store.locked`); [`Store::trash_locks_within`] lets
-//! the tool check that before it asks you. Right after the move the fail point
-//! `store.after_asset_trash` is hit (before the index hears of it). After a crash there, the next maintenance pass (right
+//! folders included and unmodified. That reason on exactly an asset folder is the one exception
+//! to ruling P3-R7 (owner decision 2026-11-07): the asset's own locked files move with it,
+//! unmodified, as part of the one entry, and come back unmodified, `locks` entries intact, on
+//! restore; the confirmation card warns about them (`ConfirmFacts.locked`). Every other trash of
+//! a folder holding a locked path stays refused (a folder an agent deletes, a project, part of
+//! an asset). Right after the move the fail point `store.after_asset_trash` is hit (before the
+//! index hears of it). After a crash there, the next maintenance pass (right
 //! after the workspace opens) tells the index the folder is gone, so its rows go rather than
 //! stay as `missing`.
 //!
@@ -427,8 +430,9 @@ impl Store {
     /// name (an 8.3 short name too, or a long form that can't be read), or a link (also a
     /// linked folder on the way);
     /// `store.locked` for a path in its manifest's `locks`, by any name, or a folder holding one
-    /// (ruling P3-R7: a whole asset or project too); `store.git_busy` when git is still working
-    /// after 60 s; `store.io` when there is nothing at `rel` or a file call fails (`store.busy` when
+    /// (ruling P3-R7: a whole asset or project too, except a whole asset with the reason
+    /// [`ASSET_TRASH_REASON`], owner decision 2026-11-07, module docs); `store.git_busy` when git
+    /// is still working after 60 s; `store.io` when there is nothing at `rel` or a file call fails (`store.busy` when
     /// it stays held, also a folder with a handle open inside it past the retries; nothing
     /// moves then).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
@@ -438,28 +442,17 @@ impl Store {
         writable(&long)?;
         self.check_locks(rel).await?;
         self.check_long_locks(rel, &long).await?;
-        // A folder holding a locked path is never moved either (ruling P3-R7).
-        self.refuse_locks_within(rel, &long).await?;
+        // A folder holding a locked path is never moved either (ruling P3-R7), except a whole
+        // asset by `asset.trash`, whose locked files move with it unmodified (owner decision
+        // 2026-11-07, module docs).
+        if !(reason == ASSET_TRASH_REASON && is_asset_folder(&long)) {
+            self.refuse_locks_within(rel, &long).await?;
+        }
         // The long form doesn't see through a junction: a linked folder on the way could reach
         // a sealed folder, `.lilith\` or `.git\`. Attributes only.
         self.refuse_links(rel).await?;
         self.git_gate().wait_clear(GIT_WAIT).await?;
         self.trash_now(rel, reason).await
-    }
-
-    /// [`Store::trash`]'s lock refusals for `rel` alone, without moving anything: `store.locked`
-    /// when `rel` (by any name) is in its manifest's `locks`, or is a folder holding a locked
-    /// path (ruling P3-R7), naming that path. `asset.trash` checks this before it asks you, so
-    /// you are never asked about a move that would be refused; the move checks it again.
-    ///
-    /// # Errors
-    /// `store.locked`; `store.path_invalid` for a path the trash refuses; `store.io` when a
-    /// manifest or a long form can't be read (fail closed).
-    pub async fn trash_locks_within(&self, rel: &WsPath) -> Result<(), StoreError> {
-        let long = self.reserved_on_disk(rel, "moved to the trash").await?;
-        self.check_locks(rel).await?;
-        self.check_long_locks(rel, &long).await?;
-        self.refuse_locks_within(rel, &long).await
     }
 
     /// Ruling P3-R7: `store.locked` when a manifest `locks` entry (CORE-035) and `long`, the

@@ -1265,6 +1265,7 @@ mod tests {
             dependents: vec!["sketchbook/b".into(), "sketchbook/a".into()],
             dependents_total: 0,
             versions: vec!["1.0.0".into()],
+            ..ConfirmFacts::default()
         })));
         let reg = core_registry(
             true,

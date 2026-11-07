@@ -1715,11 +1715,8 @@ fn edit_by_hand(ws: &Path, asset: &str, f: impl FnOnce(&mut Value)) {
     write_file(&path, serde_json::to_string_pretty(&m).unwrap().as_bytes());
 }
 
-/// The crane's manifest `locks` go: the fixture locks its prompt, and an asset holding a
-/// locked path is never trashed (ruling P3-R7; `asset_trash_is_refused_while_the_asset_has_a_lock`).
-fn crane_unlocked(ws: &Path) {
-    edit_by_hand(ws, CRANE, |m| m["locks"] = json!([]));
-}
+/// The path the fixture's crane locks (its manifest's `locks`), workspace-relative.
+const CRANE_LOCKED: &str = "projects/sketchbook/assets/chr_paper_crane/prompts/crane.txt";
 
 /// The lamp takes the crane's first version as an input: the crane's one dependent.
 fn lamp_uses_crane(ws: &Path) {
@@ -1834,12 +1831,10 @@ struct AssetFx {
 }
 
 impl AssetFx {
-    /// With `services` wired (or not) as given. The crane's lock goes first ([`crane_unlocked`]);
-    /// `setup` may put one back.
+    /// With `services` wired (or not) as given.
     async fn with(setup: impl FnOnce(&Path), services: AssetServices) -> AssetFx {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("asset-trash");
-        crane_unlocked(&ws);
         setup(&ws);
         env.register_workspace(&ws, true);
         let canonical = std::fs::canonicalize(&ws).expect("canonicalize");
@@ -2164,7 +2159,8 @@ async fn asset_trash_asks_even_the_app_and_lists_dependents_and_versions() {
     );
     assert_eq!(
         view["facts"],
-        json!({"dependents": [format!("{P4}/{LAMP}")], "dependents_total": 1, "versions": ["1.0.0"]}),
+        json!({"dependents": [format!("{P4}/{LAMP}")], "dependents_total": 1, "versions": ["1.0.0"],
+               "locked": [CRANE_LOCKED], "locked_total": 1}),
         "{view}"
     );
     assert!(
@@ -2391,50 +2387,127 @@ async fn an_unwired_asset_use_refuses_asset_trash() {
     fx.shutdown().await;
 }
 
-/// Ruling P3-R7 (controller ruling for Task 11): an asset holding a path its manifest `locks`
-/// is never trashed. `asset.trash` is `store.locked` naming the path and saying to remove the
-/// lock first, before anything is asked, and nothing moves; once the lock is removed, the trash
-/// asks and works.
+/// Owner decision 2026-11-07 (the one exception to ruling P3-R7): `asset.trash` of an asset
+/// whose manifest locks a path is allowed. The card warns (`facts.locked`, with the total); once
+/// approved, the locked file is in the trash entry byte for byte, and after the restore it is
+/// back, with its `locks` entry intact. Every other trash of the asset folder holding the lock
+/// (a plain `Store::trash` with another reason) stays refused with `store.locked`.
 #[tokio::test] // spec: CORE-157, CORE-035
-async fn asset_trash_is_refused_while_the_asset_has_a_lock() {
-    let (fx, _fake) = AssetFx::faked(|ws| {
-        edit_by_hand(ws, CRANE, |m| m["locks"] = json!(["prompts/crane.txt"]));
-    })
-    .await;
-    let before = tree(&asset_path(&fx.ws, CRANE));
-    for s in [fx.app(), fx.cli()] {
-        let e = err_of(
-            &fx.call_as(&s, "asset.trash", trash_args(CRANE), Some(&tkey()))
-                .await,
-            "a locked asset",
-        );
-        assert_eq!(e.code, "store.locked", "{e:?}");
-        let locked = format!("projects/{P4}/assets/{CRANE}/prompts/crane.txt");
-        assert!(e.message.contains(&locked), "names the path: {}", e.message);
-        assert!(
-            e.message
-                .contains("Remove that path from the manifest's locks first"),
-            "{}",
-            e.message
-        );
-        assert_eq!(e.data.as_ref().unwrap()["path"], locked.as_str(), "{e:?}");
-    }
-    assert_eq!(fx.pending_count().await, 0, "nothing was asked");
-    assert_eq!(tree(&asset_path(&fx.ws, CRANE)), before, "nothing moved");
-    assert!(fx.trash_entries().await.is_empty());
+async fn asset_trash_of_a_locked_asset_warns_and_keeps_the_files_unmodified() {
+    let (fx, _fake) = AssetFx::faked(|_| {}).await;
+    let crane = asset_path(&fx.ws, CRANE);
+    let prompt = std::fs::read(ws_file(&fx.ws, CRANE_LOCKED)).unwrap();
+    let before = tree(&crane);
 
-    // The lock is removed: the trash asks, and runs once approved.
-    edit_by_hand(&fx.ws, CRANE, |m| m["locks"] = json!([]));
+    // Any other trash of the folder holding the lock is refused, and nothing moves.
+    let open = fx.open().await;
+    let folder = p(&format!("projects/{P4}/assets/{CRANE}"));
+    let refused = open.store.trash(&folder, "test").await.unwrap_err();
+    assert!(
+        matches!(&refused, StoreError::Locked(path) if path.as_str() == CRANE_LOCKED),
+        "{refused:?}"
+    );
+    assert_eq!(tree(&crane), before);
+
     let k = tkey();
-    let p = pending_of(
+    let first = pending_of(
         &fx.call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&k))
             .await,
     );
-    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    let facts = &fx.pending_view(&first.confirmation_id).await["facts"];
+    assert_eq!(
+        facts["locked"],
+        json!([CRANE_LOCKED]),
+        "the card's warning: {facts}"
+    );
+    assert_eq!(facts["locked_total"], 1, "{facts}");
+    fx.answer(&first.confirmation_id, Answer::Approve).await;
+    let ran = ok_of(
+        &fx.call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&k))
+            .await,
+        "the approved trash of a locked asset",
+    );
+    let entry_id = ran["entry_id"].as_str().unwrap().to_string();
+    let record: TrashRecord = serde_json::from_value(fx.trash_entries().await[0].clone()).unwrap();
+    let payload = ws_file(
+        &fx.ws,
+        &format!(
+            ".trash/{}/{entry_id}/payload/{CRANE}",
+            &record.moved_utc[..10]
+        ),
+    );
+    assert_eq!(
+        std::fs::read(payload.join("prompts").join("crane.txt")).unwrap(),
+        prompt
+    );
+    assert_eq!(tree(&payload), before, "the whole folder, byte for byte");
+
+    fx.ok("trash.restore", json!({ "entry_id": entry_id }))
+        .await;
+    assert_eq!(
+        std::fs::read(ws_file(&fx.ws, CRANE_LOCKED)).unwrap(),
+        prompt
+    );
+    assert_eq!(tree(&crane), before);
+    let manifest = read_json_file(&crane.join(format!("{CRANE}.manifest.json")));
+    assert_eq!(
+        manifest["locks"],
+        json!(["prompts/crane.txt"]),
+        "the lock entry is intact"
+    );
+    // Still locked: a plain trash of the restored folder is refused again.
+    let refused = open.store.trash(&folder, "test").await.unwrap_err();
+    assert!(matches!(refused, StoreError::Locked(_)), "{refused:?}");
+    drop(open);
+    fx.shutdown().await;
+}
+
+/// Owner decision 2026-11-07: the locked paths are part of the facts' hash, so a lock added or
+/// removed between the question and the approved retry asks again instead of running.
+#[tokio::test] // spec: CORE-157, CORE-091
+async fn a_lock_changed_before_the_retry_asks_again() {
+    let (fx, _fake) = AssetFx::faked(|ws| {
+        edit_by_hand(ws, CRANE, |m| m["locks"] = json!([]));
+    })
+    .await;
+    let k = tkey();
+    let first = pending_of(
+        &fx.call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&k))
+            .await,
+    );
+    let facts = fx.pending_view(&first.confirmation_id).await["facts"].clone();
+    assert!(
+        facts.get("locked").is_none(),
+        "no warning without locks: {facts}"
+    );
+    fx.answer(&first.confirmation_id, Answer::Approve).await;
+
+    // A lock added since: a new question with the warning, nothing moved.
+    edit_by_hand(&fx.ws, CRANE, |m| m["locks"] = json!(["prompts/crane.txt"]));
+    let second = pending_of(
+        &fx.call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&k))
+            .await,
+    );
+    assert_ne!(second.confirmation_id, first.confirmation_id);
+    assert_eq!(
+        fx.pending_view(&second.confirmation_id).await["facts"]["locked"],
+        json!([CRANE_LOCKED])
+    );
+    assert!(asset_path(&fx.ws, CRANE).is_dir(), "nothing moved");
+    fx.answer(&second.confirmation_id, Answer::Approve).await;
+
+    // And removed again: asked once more.
+    edit_by_hand(&fx.ws, CRANE, |m| m["locks"] = json!([]));
+    let third = pending_of(
+        &fx.call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&k))
+            .await,
+    );
+    assert_ne!(third.confirmation_id, second.confirmation_id);
+    fx.answer(&third.confirmation_id, Answer::Approve).await;
     let ran = fx
         .call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&k))
         .await;
-    ok_of(&ran, "the trash after the unlock");
+    ok_of(&ran, "the third approval");
     assert!(!asset_path(&fx.ws, CRANE).exists());
     fx.shutdown().await;
 }
@@ -2923,10 +2996,9 @@ fn app_core(env: &TestEnv, failpoints: Arc<FailPoints>) -> lil_core::CoreThread 
     })
 }
 
-/// A copy of the fixture workspace registered as `env`'s default, the crane unlocked.
+/// A copy of the fixture workspace registered as `env`'s default.
 fn served_workspace(env: &TestEnv, name: &str) -> PathBuf {
     let ws = env.copy_fixture_workspace(name);
-    crane_unlocked(&ws);
     env.register_workspace(&ws, true);
     ws
 }

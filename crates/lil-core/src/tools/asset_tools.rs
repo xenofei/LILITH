@@ -121,11 +121,11 @@
 //!   confirmation is made and again at the approved retry, that the asset is live and not in
 //!   use (`tools::services::AssetUse`): an empty `AssetServices.asset_use` slot is
 //!   `state.unavailable`, an `in_use` error refuses with that error, and a job, a sign-off or a
-//!   document hold is `asset.in_use` (`data: {by: "job" | "signoff" | "hold"}`); then the
-//!   asset's manifest `locks`: an asset holding a locked path is never trashed (ruling P3-R7),
-//!   so it is `store.locked` naming that path (`data: {path}`) and saying to remove the lock
-//!   first, and you are never asked. The run checks all of these once more (the move itself
-//!   re-checks the locks), then takes the asset's version lock without waiting (held: `asset.in_use`,
+//!   document hold is `asset.in_use` (`data: {by: "job" | "signoff" | "hold"}`). An asset whose
+//!   manifest `locks` paths is trashed too, its locked files moved unmodified (owner decision
+//!   2026-11-07, the one exception to ruling P3-R7): the facts list them (`locked`, the
+//!   manifest's entries as workspace-relative paths, sorted), so the card warns, and they are
+//!   part of the facts' hash. The run checks liveness and use once more, then takes the asset's version lock without waiting (held: `asset.in_use`,
 //!   a sign-off), and under it recomputes the dependents, moves the folder and returns them as
 //!   found at the move. It publishes `{kind: "trashed", entry_id}` on the asset's topic and
 //!   `{kind: "trashed", asset_id, entry_id}` on `project:<slug>`.
@@ -2188,29 +2188,6 @@ async fn live_folder(open: &OpenWorkspace, project: &str, asset_id: &str) -> Res
     Err(e)
 }
 
-/// `store.locked` naming the locked path and what to do (ruling P3-R7): the store's refusal of
-/// a folder that holds a path its manifest `locks`.
-fn locked_error(e: &StoreError) -> ErrorBody {
-    let mut body = e.to_error("");
-    if let StoreError::Locked(path) = e {
-        body.message = format!(
-            "This asset holds {path}, which its manifest locks, so it can't be moved to the \
-             trash. Remove that path from the manifest's locks first, then trash the asset."
-        );
-    }
-    body
-}
-
-/// Refuses an asset that holds a locked path (ruling P3-R7), before anything is asked.
-async fn not_locked(open: &OpenWorkspace, project: &str, asset_id: &str) -> Result<(), ErrorBody> {
-    let dir = WsPath::parse(&format!("projects/{project}/assets/{asset_id}"))
-        .map_err(|e| e.to_error(""))?;
-    open.store
-        .trash_locks_within(&dir)
-        .await
-        .map_err(|e| locked_error(&e))
-}
-
 /// `asset.in_use` naming what uses the asset.
 fn in_use_error(by: InUse) -> ErrorBody {
     let by = match by {
@@ -2291,7 +2268,7 @@ async fn trash_facts(
     }
     live_folder(open, &project, &asset_id).await?;
     not_in_use(services, open, &project, &asset_id).await?;
-    not_locked(open, &project, &asset_id).await?;
+    let locked = locked_paths(open, &project, &asset_id).await?;
     let dependents = dependents_of(open, &project, &asset_id).await?;
     let versions = open
         .store
@@ -2305,7 +2282,42 @@ async fn trash_facts(
         dependents_total: u32::try_from(dependents.len()).unwrap_or(u32::MAX),
         dependents,
         versions,
+        locked_total: u32::try_from(locked.len()).unwrap_or(u32::MAX),
+        locked,
     }))
+}
+
+/// The paths the asset's manifest `locks`, workspace-relative, sorted and deduplicated (owner
+/// decision 2026-11-07: the card's warning). A manifest that can't be read refuses (the facts
+/// would be wrong).
+async fn locked_paths(
+    open: &OpenWorkspace,
+    project: &str,
+    asset_id: &str,
+) -> Result<Vec<String>, ErrorBody> {
+    let rel = WsPath::parse(&format!(
+        "projects/{project}/assets/{asset_id}/{asset_id}.manifest.json"
+    ))
+    .map_err(|e| e.to_error(""))?;
+    let Some(manifest) = read_manifest(&open.store, &rel)
+        .await
+        .map_err(|e| e.to_error(""))?
+    else {
+        return Ok(Vec::new());
+    };
+    let found: BTreeSet<String> = manifest
+        .view()
+        .locks
+        .iter()
+        .map(|entry| {
+            let entry = entry.replace('\\', "/");
+            format!(
+                "projects/{project}/assets/{asset_id}/{}",
+                entry.trim_start_matches('/')
+            )
+        })
+        .collect();
+    Ok(found.into_iter().collect())
 }
 
 /// `asset.trash`'s core-internal meta (P4b-R9, P4b-R33; Appendix H): it asks every caller, it
@@ -2340,9 +2352,6 @@ async fn trash(
     not_in_use(services, &open, &a.project, &a.asset_id)
         .await
         .map_err(|e| traced(ctx, e))?;
-    not_locked(&open, &a.project, &a.asset_id)
-        .await
-        .map_err(|e| traced(ctx, e))?;
     // The version lock without waiting: held means a sign-off (or a repair) is working on the
     // asset now.
     let guard = a
@@ -2359,7 +2368,7 @@ async fn trash(
         .store()
         .trash(&a.dir, ASSET_TRASH_REASON)
         .await
-        .map_err(|e| traced(ctx, locked_error(&e)))?;
+        .map_err(|e| e.to_error(&ctx.trace_id))?;
     drop(guard);
     ctx.events.publish(
         &a.topic(),
