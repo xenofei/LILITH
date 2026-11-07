@@ -68,7 +68,4 @@ tests = [
     { name = "lil-spec-tests::inbox_4b::keep_imports_and_dismiss_only_marks", rule = "CORE-179", file = "tests/inbox_4b.rs" },
     # CORE-179, CORE-130
     { name = "lil-spec-tests::inbox_4b::suite_job_outputs_are_not_inboxed", rule = "CORE-179", file = "tests/inbox_4b.rs" },
-    # Task 20
-    # APP-114, CORE-160
-    { name = "lil-spec-tests::jobs_4b::jobs_list_filters_by_status_list_origin_and_dispatch", rule = "APP-114", file = "tests/jobs_4b.rs" },
 ]

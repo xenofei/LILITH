@@ -68,7 +68,10 @@
 //! runner tells it; the old id is kept in the row's `withdrawn_id`, and the job's next attempt,
 //! in this core run or after a restart, asks about it (`/api/jobs/{old}`, `/history/{old}`)
 //! before it posts a new one, and follows it if it is still there (CORE-120). A paused lane's
-//! job that hasn't posted yet is held at the POST ([`JobCtx::hold_if_paused`]).
+//! job that hasn't posted yet is held at the POST ([`JobCtx::hold_if_paused`]). A retry that
+//! waits out the prompt of the job it re-runs (N5) withdraws that prompt the same way while
+//! its lane is paused (NF-24; Appendix H "Jobs"): at most once per attempt, never one of a job
+//! with external side effects, and one that started runs on (`wait_out`).
 //!
 //! **Cancel** ([`JobHandler::cancel_in_engine`]) posts `POST /api/jobs/{id}/cancel` once, never
 //! `/interrupt` (ARCH-021); the POST and the cancel take one lock, so a prompt is either never
@@ -558,6 +561,31 @@ struct Posted {
     /// (recommendation B, plan 4a ruling, 2026-10-24): finding it gone later is the
     /// withdrawal's doing, not an outside cancel.
     deleted: Option<String>,
+    /// The prompt of the job this one re-runs, which the attempt waits out before it posts
+    /// its own (`wait_out`, NF-24), and whether a withdrawal sent its delete already: a
+    /// paused lane's withdrawal may delete it once, never twice.
+    waiting_out: Option<(String, bool)>,
+}
+
+impl Posted {
+    /// Whether `prompt_id` is the one the attempt follows: its own once posted, else the
+    /// earlier prompt it waits out.
+    fn holds(&self, prompt_id: &str) -> bool {
+        match (&self.prompt_id, &self.waiting_out) {
+            (Some(own), _) => own == prompt_id,
+            (None, Some((old, _))) => old == prompt_id,
+            (None, None) => false,
+        }
+    }
+
+    /// Whether a withdrawal may still delete `prompt_id`: [`Posted::holds`] it, no cancel was
+    /// sent, and, for a waited-out prompt, no delete was sent for it yet.
+    fn may_withdraw(&self, prompt_id: &str) -> bool {
+        self.holds(prompt_id)
+            && !self.cancel_sent
+            && (self.prompt_id.is_some()
+                || self.waiting_out.as_ref().is_some_and(|(_, sent)| !sent))
+    }
 }
 
 impl SuitePrompts {
@@ -721,7 +749,8 @@ pub const INGESTING_PHASE: &str = "ingesting";
 /// which never touches a running prompt, under the lock of the POST; then `/api/jobs/{id}`
 /// says whether it is gone (withdrawn) or started (it runs on). When ComfyUI can't say, it is
 /// asked again [`LOOK_AGAIN`] times; a prompt never seen gone isn't withdrawn (plan 4a
-/// ruling, 2026-10-24): the attempt follows it on.
+/// ruling, 2026-10-24): the attempt follows it on. The prompt is the attempt's own, or, before
+/// it posts one, the earlier prompt it waits out (NF-24), whose delete is sent at most once.
 #[derive(Debug)]
 pub struct ComfyWithdraw {
     engines: Weak<Engines>,
@@ -802,10 +831,7 @@ impl ComfyWithdraw {
         {
             // No POST or cancel of the attempt runs while `/queue` is read and the delete sent.
             let mut posted = live.posted.lock().await;
-            if posted.prompt_id.as_deref() != Some(prompt_id)
-                || posted.cancel_sent
-                || live_shut(&live)
-            {
+            if !posted.may_withdraw(prompt_id) || live_shut(&live) {
                 return WithdrawOutcome::NotPending;
             }
             let locked = tokio::time::timeout(LOCKED_WITHIN, async {
@@ -825,6 +851,11 @@ impl ComfyWithdraw {
                 // Its disappearance from now on is the withdrawal's, not an outside cancel.
                 live.withdrawn.store(true, Ordering::SeqCst);
                 posted.deleted = Some(prompt_id.to_string());
+                if posted.prompt_id.is_none()
+                    && let Some((_, sent)) = posted.waiting_out.as_mut()
+                {
+                    *sent = true;
+                }
                 if let Err(e) = client.delete_pending(prompt_id).await {
                     tracing::warn!(job_id = %job, prompt_id, error = %e, "the withdrawal's delete got no answer; where the prompt is decides");
                 }
@@ -850,9 +881,7 @@ impl ComfyWithdraw {
         // a look with no answer is asked again, and still unknown it is no withdrawal.
         let after = Self::looks(client, prompt_id).await;
         let mut posted = live.posted.lock().await;
-        let ours = posted.prompt_id.as_deref() == Some(prompt_id)
-            && !posted.cancel_sent
-            && !live_shut(&live);
+        let ours = posted.holds(prompt_id) && !posted.cancel_sent && !live_shut(&live);
         let outcome = match after {
             AfterDelete::Gone if ours => WithdrawOutcome::Withdrawn,
             // Cancelled or stopped meanwhile: that path ends the attempt.
@@ -971,16 +1000,17 @@ async fn earlier_prompt(job: &JobCtx) -> Result<Earlier, JobFailure> {
             return Ok(Earlier::default());
         };
         // A `withdrawn_id` the row copied from the job it re-runs (N5) is that job's prompt.
-        let inherited = match (&row.withdrawn_id, &row.retry_of) {
+        let of = match (&row.withdrawn_id, &row.retry_of) {
             (Some(old), Some(of)) => record::get(&job.state, of)
                 .await?
-                .is_some_and(|r| r.withdrawn_id.as_ref() == Some(old)),
-            _ => false,
+                .filter(|r| r.withdrawn_id.as_ref() == Some(old)),
+            _ => None,
         };
         Ok::<_, crate::state::StateError>(Earlier {
             external_id: row.external_id,
             withdrawn_id: row.withdrawn_id,
-            inherited,
+            inherited: of.is_some(),
+            inherited_external: of.is_some_and(|r| r.external_side_effects),
         })
     };
     match read.await {
@@ -1009,6 +1039,8 @@ struct Earlier {
     withdrawn_id: Option<String>,
     /// `withdrawn_id` is the prompt of the job this one re-runs, not its own.
     inherited: bool,
+    /// That job has external side effects: its prompt is never deleted (NF-24).
+    inherited_external: bool,
 }
 
 /// The job stops because the core is stopping (the shutdown step ran): interrupted.
@@ -1249,7 +1281,10 @@ impl Attempt<'_> {
         let earlier = match (row.external_id, row.withdrawn_id) {
             (Some(prompt_id), _) => Some(prompt_id),
             (None, None) => None,
-            (None, Some(old)) => self.settle_withdrawn(&old, row.inherited).await?,
+            (None, Some(old)) => {
+                self.settle_withdrawn(&old, row.inherited, row.inherited_external)
+                    .await?
+            }
         };
         if let Some(prompt_id) = earlier {
             // Known to the shutdown step and to a cancel at once (I2), registered before the
@@ -1541,16 +1576,19 @@ impl Attempt<'_> {
     /// hold the next attempt asks again: the work never runs twice. A prompt `inherited` from
     /// the job this one re-runs (N5) is never taken over (its outputs carry that job's
     /// prefix): while it waits or runs, nothing is posted and the attempt is retried; once it
-    /// ended or is gone, a new prompt is posted.
+    /// ended or is gone, a new prompt is posted. `inherited_external`: that job has external
+    /// side effects, so its prompt is never deleted.
     async fn settle_withdrawn(
         &self,
         old: &str,
         inherited: bool,
+        inherited_external: bool,
     ) -> Result<Option<String>, JobFailure> {
         let follow = match self.client.state(old).await {
             Ok(RemoteState::Queued | RemoteState::Running) if inherited => {
                 tracing::info!(prompt_id = %old, "the prompt of the job this one re-runs is still in ComfyUI; the job waits for it");
-                self.wait_out(old).await?;
+                self.wait_out(old, !(self.external || inherited_external))
+                    .await?;
                 false
             }
             Ok(RemoteState::Queued | RemoteState::Running) => {
@@ -1574,8 +1612,27 @@ impl Attempt<'_> {
     /// neither pending nor running, asking ComfyUI every [`POLL_EVERY`] (Appendix G, plan 4a
     /// ruling, 2026-10-24). A cancel ends the attempt cancelled, the shutdown step interrupted;
     /// a look that gets no answer is `comfyui.unreachable` (retried; the row keeps the id).
-    async fn wait_out(&self, old: &str) -> Result<(), JobFailure> {
+    ///
+    /// NF-24 (CORE-160; Appendix H "Jobs"): at each look, while a reason of the job's lane
+    /// covers it and `deletable` (neither job has external side effects), `old` is withdrawn
+    /// the way a pause withdraws a pending prompt ([`JobCtx::withdraw_waited_out`], then
+    /// [`ComfyWithdraw`] under the POST's lock): deleted only while `/queue` lists it pending,
+    /// and at most once per attempt; one that started runs on and is waited out. Withdrawn,
+    /// the attempt ends and the job waits again (`queue_paused`), its row still naming `old`
+    /// until the next attempt knows it gone; that attempt then makes its own first post
+    /// (CORE-120).
+    async fn wait_out(&self, old: &str, deletable: bool) -> Result<(), JobFailure> {
+        self.live.posted.lock().await.waiting_out = Some((old.to_string(), false));
+        let waited = self.wait_out_looks(old, deletable).await;
+        self.live.posted.lock().await.waiting_out = None;
+        waited
+    }
+
+    /// [`Attempt::wait_out`]'s looks.
+    async fn wait_out_looks(&self, old: &str, deletable: bool) -> Result<(), JobFailure> {
         let mut cancel = self.job.cancel.clone();
+        // A prompt that started never waits in the queue again: no more withdrawals.
+        let mut started = false;
         loop {
             tokio::select! {
                 () = tokio::time::sleep(POLL_EVERY) => {}
@@ -1586,6 +1643,19 @@ impl Attempt<'_> {
             }
             if self.shut() {
                 return Err(stopping(self.job));
+            }
+            if deletable && !started {
+                match self.job.withdraw_waited_out(old).await {
+                    WithdrawOutcome::Withdrawn => {
+                        return Err(JobFailure::Retryable(error(
+                            &codes::COMFYUI_UNREACHABLE,
+                            "The job's lane was paused while it waited for the earlier                              attempt's prompt, which was taken out of ComfyUI's queue; it waits                              again.",
+                            self.job,
+                        )));
+                    }
+                    WithdrawOutcome::AlreadyStarted => started = true,
+                    WithdrawOutcome::NotPending => {}
+                }
             }
             match self.client.state(old).await {
                 Ok(RemoteState::Queued | RemoteState::Running) => {}

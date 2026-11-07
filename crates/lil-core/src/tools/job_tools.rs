@@ -3,7 +3,7 @@
 //!
 //! | Tool | Effect | Arguments | `structured` |
 //! |---|---|---|---|
-//! | `jobs.list` | read | `{status?, kind?, project?, ids?, since?, batch_id?, limit? (1–500, default 100), cursor?}` | `{jobs, next_cursor, lanes}`, newest first |
+//! | `jobs.list` | read | `{status? (a status, a list, or "finished"), origin? (a surface or a list), dispatched?, kind?, project?, ids?, since?, batch_id?, order?, limit? (1–500, default 100), cursor?}` | `{jobs, next_cursor, lanes}`, newest first |
 //! | `job.wait` | read | `{job_id, timeout_s? (1–90, default 90)}` | `{job, done}` |
 //! | `job.cancel` | write | exactly one of `{job_id}`, `{ids}` (1–500), `{batch_id}`, `{all_mine: true}` | `{job}` for `job_id`, else `{jobs}`; a finished job as it is |
 //! | `job.retry` | write | exactly one of `{job_id}`, `{batch_id}` | `{job, retry_of}`, or `{retried: [{job, retry_of}], refused: [{job_id, error}]}` |
@@ -194,7 +194,7 @@ fn params_invalid(message: String, trace_id: &str) -> ErrorBody {
 pub fn register_job_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "jobs.list",
-        "Lists jobs, newest first, or with `order: \"queue\"` the queued jobs in queue order (by lane, then `queue_position`): `status`, `kind`, `project`, `ids`, `since` (RFC 3339: updated later) and `batch_id` filter them; `limit` (1–500, default 100; a page may end sooner, under 3 MiB) and `cursor` (the previous page's `next_cursor`) page through them. `lanes` gives each lane's pause.",
+        "Lists jobs, newest first, or with `order: \"queue\"` the queued jobs in queue order (by lane, then `queue_position`): `status` (a status, a list of them, or \"finished\": succeeded, failed, cancelled, interrupted and interrupted_unknown), `origin` (the surface that started it, such as panel, mcp, agent_session, cli or core, or a list), `dispatched` (true: running or holding an engine id; false: neither), `kind`, `project`, `ids`, `since` (RFC 3339: updated later) and `batch_id` filter them, all together; `limit` (1–500, default 100; a page may end sooner, under 3 MiB) and `cursor` (the previous page's `next_cursor`) page through them. `lanes` gives each lane's pause.",
         EffectClass::Read,
         JOBS_MODULE,
         |ctx, f: JobFilter| {

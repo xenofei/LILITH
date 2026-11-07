@@ -26,8 +26,8 @@ use lil_core::jobs::record::{self, JobRow};
 use lil_core::jobs::{
     Admission, Admit, COMPLETION_GRACE, CancelSelector, EngineKind, JobCaller, JobCompletion,
     JobCtx, JobDone, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin, JobSpec,
-    JobStatus, JobSummary, Jobs, Lane, ListOrder, MAX_BACKOFF, MoveTo, PauseReason, Priority,
-    Reservations, SubmittedSlot, Substatus, backoff, cancelled_error,
+    JobStatus, JobSummary, Jobs, Lane, ListOrder, MAX_BACKOFF, MoveTo, OriginSel, PauseReason,
+    Priority, Reservations, StatusSel, SubmittedSlot, Substatus, Surface, backoff, cancelled_error,
 };
 use lil_core::lifecycle::{DrainReason, Lifecycle, ShutdownPhase, ShutdownStep};
 use lil_core::pipeline::{RecordBranch, RecordPlan, start_candidate_run};
@@ -71,8 +71,9 @@ struct Seen {
 /// that sees its cancel returns: `unknown`, `interrupted`, else the cancelled error), `fail`
 /// (`retryable` on attempts 1–2, `retryable_always`, `disk_full`, `unknown`, `interrupted`),
 /// `record` (leave a candidate-run record plan), `in_engine: true` (the attempt shows
-/// `queued_in_engine` first), `progress_on` (a gate: once it opens, a gated attempt reports
-/// one progress), `structured` (an object whose keys join the result's `structured`).
+/// `queued_in_engine` first), `external_id` (the engine id it persists first), `progress_on`
+/// (a gate: once it opens, a gated attempt reports one progress), `structured` (an object
+/// whose keys join the result's `structured`).
 #[derive(Default)]
 struct TestHandler {
     seen: Mutex<Seen>,
@@ -145,6 +146,9 @@ impl TestHandler {
             Some(gate) => Some(gate.to_string()),
             None => (args.get("gate_self") == Some(&json!(true))).then(|| job.id.to_string()),
         };
+        if let Some(id) = args.get("external_id").and_then(Value::as_str) {
+            job.set_external_id(id).await.unwrap();
+        }
         if args.get("in_engine") == Some(&json!(true)) {
             job.set_substatus(Substatus::QueuedInEngine).await;
         }
@@ -2448,7 +2452,7 @@ async fn a_dispatched_job_is_in_the_status_read_and_not_the_queue_order() {
     );
 
     let f = JobFilter {
-        status: Some(JobStatus::Queued),
+        status: Some(StatusSel::One("queued".into())),
         ..JobFilter::default()
     };
     let (listed, next) = fx.jobs.list(&fx.ctx(), f).await.unwrap();
@@ -2726,6 +2730,398 @@ async fn jobs_list_since_keeps_the_jobs_of_its_own_second() {
     );
     assert!(listed(since(format!("{second}.000Z"))).await.is_empty());
     assert!(listed(since(format!("{second}Z"))).await.is_empty());
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 4b's jobs.list filters (APP-114, CORE-160; Appendix H "Jobs").
+// ---------------------------------------------------------------------------------------------
+
+/// The sorted ids of every job `f` selects (one page of up to 500).
+async fn listed_ids(fx: &Fx, f: JobFilter) -> Vec<String> {
+    let f = JobFilter {
+        limit: Some(500),
+        ..f
+    };
+    let (jobs, next) = fx.jobs.list(&fx.ctx(), f).await.unwrap();
+    assert_eq!(next, None);
+    let mut ids: Vec<String> = jobs.into_iter().map(|j| j.job_id).collect();
+    ids.sort();
+    ids
+}
+
+/// `ids`, sorted.
+fn sorted_ids(ids: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
+    out.sort();
+    out
+}
+
+fn by_status(sel: StatusSel) -> JobFilter {
+    JobFilter {
+        status: Some(sel),
+        ..JobFilter::default()
+    }
+}
+
+/// `status` takes one status as before (`running` still lists an `interrupted_unknown` job,
+/// whose status is `running`), a list (any of, statuses and the substatuses `interrupted` and
+/// `interrupted_unknown`), or `"finished"`: succeeded, failed, cancelled, interrupted and
+/// interrupted_unknown. A name that is none of these is `params.invalid`; the wire takes a
+/// string, a list or `"finished"`.
+#[tokio::test(start_paused = true)] // spec: APP-114, CORE-160
+async fn status_takes_a_list_and_finished() {
+    let fx = Fx::suite().await;
+    let ok = fx.submit(spec(Lane::Cpu, Priority::User, json!({}))).await;
+    fx.finished(&ok.job_id).await;
+    let failed = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::User,
+            json!({"fail": "disk_full"}),
+        ))
+        .await;
+    fx.finished(&failed.job_id).await;
+    // A user-class job its engine lost is not re-run (only an agent's is, CORE-128).
+    let interrupted = fx
+        .submit(spec(
+            Lane::Cpu,
+            Priority::User,
+            json!({"fail": "interrupted"}),
+        ))
+        .await;
+    let end = fx.finished(&interrupted.job_id).await;
+    assert_eq!(end.substatus.as_deref(), Some("interrupted"));
+    let unknown = fx
+        .submit(spec(Lane::Cpu, Priority::User, json!({"fail": "unknown"})))
+        .await;
+    until_substatus(&fx, &unknown.job_id, "interrupted_unknown").await;
+    let cancelled = running_gate(&fx, Lane::Cpu, "never").await;
+    fx.jobs
+        .cancel(&fx.ctx(), &JobId(cancelled.job_id.clone()))
+        .await
+        .unwrap();
+    fx.finished(&cancelled.job_id).await;
+    let running = running_gate(&fx, Lane::GpuHeavy, "run").await;
+    let queued = fx
+        .submit(spec(Lane::GpuHeavy, Priority::User, json!({})))
+        .await;
+    let (ok, failed, interrupted, unknown, cancelled, running, queued) = (
+        ok.job_id.as_str(),
+        failed.job_id.as_str(),
+        interrupted.job_id.as_str(),
+        unknown.job_id.as_str(),
+        cancelled.job_id.as_str(),
+        running.job_id.as_str(),
+        queued.job_id.as_str(),
+    );
+    assert_eq!(
+        listed_ids(&fx, JobFilter::default()).await.len(),
+        7,
+        "no re-run"
+    );
+
+    let one = |s: &str| by_status(StatusSel::One(s.into()));
+    let many = |s: &[&str]| by_status(StatusSel::Many(s.iter().map(|s| (*s).into()).collect()));
+    assert_eq!(
+        listed_ids(&fx, one("running")).await,
+        sorted_ids(&[running, unknown])
+    );
+    assert_eq!(listed_ids(&fx, one("queued")).await, sorted_ids(&[queued]));
+    assert_eq!(
+        listed_ids(&fx, one("failed")).await,
+        sorted_ids(&[failed, interrupted])
+    );
+    assert_eq!(
+        listed_ids(&fx, many(&["queued", "running"])).await,
+        sorted_ids(&[queued, running, unknown])
+    );
+    assert_eq!(
+        listed_ids(&fx, many(&["succeeded", "cancelled"])).await,
+        sorted_ids(&[ok, cancelled])
+    );
+    assert_eq!(
+        listed_ids(&fx, many(&["interrupted", "interrupted_unknown"])).await,
+        sorted_ids(&[interrupted, unknown])
+    );
+    assert_eq!(
+        listed_ids(&fx, by_status(StatusSel::Finished)).await,
+        sorted_ids(&[ok, failed, interrupted, unknown, cancelled])
+    );
+    assert_eq!(
+        listed_ids(&fx, many(&["finished", "queued"])).await,
+        sorted_ids(&[ok, failed, interrupted, unknown, cancelled, queued])
+    );
+    for bad in [one("done"), many(&["queued", "Running"])] {
+        let e = fx.jobs.list(&fx.ctx(), bad).await.unwrap_err();
+        assert_eq!(e.code, "params.invalid", "{e:?}");
+    }
+
+    // The wire: a string, a list, or "finished".
+    let parse = |v: Value| serde_json::from_value::<JobFilter>(v).map(|f| f.status);
+    assert_eq!(
+        parse(json!({"status": "queued"})).unwrap(),
+        Some(StatusSel::One("queued".into()))
+    );
+    assert_eq!(
+        parse(json!({"status": "finished"})).unwrap(),
+        Some(StatusSel::Finished)
+    );
+    assert_eq!(
+        parse(json!({"status": ["queued", "failed"]})).unwrap(),
+        Some(StatusSel::Many(vec!["queued".into(), "failed".into()]))
+    );
+    assert!(parse(json!({"status": 3})).is_err());
+
+    fx.handler.open("run");
+    fx.finished(running).await;
+    fx.finished(queued).await;
+    fx.shutdown().await;
+}
+
+/// `origin` selects the jobs started from a surface, or from any of a list; it combines with
+/// the other filters (AND). Surfaces are an open set: one no job has lists nothing.
+#[tokio::test(start_paused = true)] // spec: APP-114, CORE-160
+async fn origin_filter_matches_surfaces() {
+    let fx = Fx::suite().await;
+    let mut made = Vec::new();
+    for caller in [
+        CallerKind::Cli,
+        CallerKind::Ui("image".into()),
+        CallerKind::Mcp,
+        CallerKind::Assistant,
+    ] {
+        let job = fx
+            .jobs
+            .submit(
+                &fx.ctx_as(caller, None, "t_origin"),
+                spec(Lane::Cpu, Priority::User, json!({})),
+            )
+            .await
+            .unwrap();
+        fx.finished(&job.job_id).await;
+        made.push(job.job_id);
+    }
+    // A job the core submits itself: a `cli` caller without a tool call.
+    let mut core = fx.ctx();
+    core.origin = None;
+    let own = fx
+        .jobs
+        .submit(&core, spec(Lane::Cpu, Priority::User, json!({})))
+        .await
+        .unwrap();
+    fx.finished(&own.job_id).await;
+    let held = fx
+        .jobs
+        .submit(
+            &fx.ctx_as(CallerKind::Ui("image".into()), None, "t_origin"),
+            spec(Lane::GpuHeavy, Priority::User, json!({"gate": "held"})),
+        )
+        .await
+        .unwrap();
+    fx.handler.until_started(&held.job_id).await;
+    let (cli, panel, mcp, assistant) = (&made[0], &made[1], &made[2], &made[3]);
+
+    let origin = |sel: OriginSel| JobFilter {
+        origin: Some(sel),
+        ..JobFilter::default()
+    };
+    let one = |s: &str| origin(OriginSel::One(Surface::parse(s)));
+    assert_eq!(listed_ids(&fx, one("cli")).await, sorted_ids(&[cli]));
+    assert_eq!(
+        listed_ids(&fx, one("panel")).await,
+        sorted_ids(&[panel, &held.job_id])
+    );
+    assert_eq!(
+        listed_ids(&fx, one("agent_session")).await,
+        sorted_ids(&[assistant])
+    );
+    assert_eq!(
+        listed_ids(&fx, one("core")).await,
+        sorted_ids(&[&own.job_id])
+    );
+    assert_eq!(
+        listed_ids(
+            &fx,
+            origin(OriginSel::Many(vec![Surface::Mcp, Surface::Cli]))
+        )
+        .await,
+        sorted_ids(&[mcp, cli])
+    );
+    assert!(listed_ids(&fx, one("director_task")).await.is_empty());
+    let panel_finished = JobFilter {
+        status: Some(StatusSel::Finished),
+        ..one("panel")
+    };
+    assert_eq!(listed_ids(&fx, panel_finished).await, sorted_ids(&[panel]));
+
+    // The wire: a surface or a list of them.
+    let parse = |v: Value| serde_json::from_value::<JobFilter>(v).unwrap().origin;
+    assert_eq!(
+        parse(json!({"origin": "mcp"})),
+        Some(OriginSel::One(Surface::Mcp))
+    );
+    assert_eq!(
+        parse(json!({"origin": ["panel", "director_task"]})),
+        Some(OriginSel::Many(vec![
+            Surface::Panel,
+            Surface::Other("director_task".into())
+        ]))
+    );
+
+    fx.handler.open("held");
+    fx.finished(&held.job_id).await;
+    fx.shutdown().await;
+}
+
+/// `dispatched: true` lists the jobs running or holding an engine id (a prompt queued in its
+/// engine keeps status `queued`); `false` the others. Together they list every job once.
+#[tokio::test(start_paused = true)] // spec: APP-114, CORE-160
+async fn dispatched_true_and_false_partition_the_queue() {
+    let fx = Fx::suite().await;
+    let done = fx.submit(spec(Lane::Cpu, Priority::User, json!({}))).await;
+    fx.finished(&done.job_id).await;
+    let mut in_engine = spec(
+        Lane::Cpu,
+        Priority::User,
+        json!({"gate": "engine", "in_engine": true, "external_id": "p-in-engine"}),
+    );
+    in_engine.engine = Some(EngineKind::ComfyUi);
+    let in_engine = fx.submit(in_engine).await;
+    until_substatus(&fx, &in_engine.job_id, "queued_in_engine").await;
+    let running = running_gate(&fx, Lane::GpuHeavy, "run").await;
+    let waiting = fx
+        .submit(spec(Lane::GpuHeavy, Priority::User, json!({})))
+        .await;
+    let (done, in_engine, running, waiting) = (
+        done.job_id.as_str(),
+        in_engine.job_id.as_str(),
+        running.job_id.as_str(),
+        waiting.job_id.as_str(),
+    );
+    assert_eq!(fx.row(in_engine).await.status, JobStatus::Queued);
+
+    let dispatched = |d: bool| JobFilter {
+        dispatched: Some(d),
+        ..JobFilter::default()
+    };
+    let yes = listed_ids(&fx, dispatched(true)).await;
+    let no = listed_ids(&fx, dispatched(false)).await;
+    assert_eq!(yes, sorted_ids(&[in_engine, running]));
+    assert_eq!(no, sorted_ids(&[done, waiting]));
+    let mut both = [yes, no].concat();
+    both.sort();
+    assert_eq!(both, listed_ids(&fx, JobFilter::default()).await);
+    // The queue as the panel reads it: what waits its turn, and what the engines have.
+    let unfinished = || Some(StatusSel::Many(vec!["queued".into(), "running".into()]));
+    let waits = JobFilter {
+        status: unfinished(),
+        ..dispatched(false)
+    };
+    assert_eq!(listed_ids(&fx, waits).await, sorted_ids(&[waiting]));
+    let queued_in_engine = JobFilter {
+        status: Some(StatusSel::One("queued".into())),
+        ..dispatched(true)
+    };
+    assert_eq!(
+        listed_ids(&fx, queued_in_engine).await,
+        sorted_ids(&[in_engine])
+    );
+
+    fx.handler.open("engine");
+    fx.handler.open("run");
+    for id in [in_engine, running, waiting] {
+        fx.finished(id).await;
+    }
+    fx.shutdown().await;
+}
+
+/// The new filters page with the cursors as before: newest first, each page after the last
+/// one's job, every selected job listed once and no other; and in queue order too.
+#[tokio::test(start_paused = true)] // spec: APP-114, CORE-160, CORE-146
+async fn filters_page_with_cursors_as_before() {
+    let fx = Fx::suite().await;
+    // A fresh caller per call: one call submits one job.
+    let app = || fx.ctx_as(CallerKind::Ui("image".into()), None, "t_page");
+    let mut theirs = Vec::new();
+    for i in 0..7 {
+        let caller = if i % 2 == 0 { app() } else { fx.ctx() };
+        let job = fx
+            .jobs
+            .submit(&caller, spec(Lane::Cpu, Priority::User, json!({})))
+            .await
+            .unwrap();
+        fx.finished(&job.job_id).await;
+        if i % 2 == 0 {
+            theirs.push(job.job_id);
+        }
+    }
+    running_gate(&fx, Lane::GpuHeavy, "run").await;
+    let mut queued_theirs = Vec::new();
+    for i in 0..5 {
+        let caller = if i % 2 == 0 { app() } else { fx.ctx() };
+        let job = fx
+            .jobs
+            .submit(&caller, spec(Lane::GpuHeavy, Priority::User, json!({})))
+            .await
+            .unwrap();
+        if i % 2 == 0 {
+            queued_theirs.push(job.job_id);
+        }
+    }
+    let filter = |limit: u32,
+                  cursor: Option<String>,
+                  order: Option<ListOrder>,
+                  status: Option<StatusSel>| JobFilter {
+        status,
+        origin: Some(OriginSel::Many(vec![Surface::Panel])),
+        dispatched: Some(false),
+        limit: Some(limit),
+        cursor,
+        order,
+        ..JobFilter::default()
+    };
+    let pages = |order: Option<ListOrder>, status: Option<StatusSel>| {
+        let fx = &fx;
+        async move {
+            let (mut seen, mut cursor, mut n) = (Vec::new(), None, 0);
+            loop {
+                let f = filter(2, cursor.take(), order, status.clone());
+                let (jobs, next) = fx.jobs.list(&fx.ctx(), f).await.unwrap();
+                assert!(jobs.len() <= 2);
+                n += 1;
+                seen.extend(jobs.into_iter().map(|j| j.job_id));
+                match next {
+                    Some(next) => cursor = Some(next),
+                    None => return (seen, n),
+                }
+            }
+        }
+    };
+    let newest_first: Vec<String> = theirs.iter().rev().cloned().collect();
+    let (seen, n) = pages(None, Some(StatusSel::Finished)).await;
+    assert_eq!(seen, newest_first, "newest first, each once");
+    assert_eq!(n, 2, "4 jobs in pages of 2");
+    let (whole, next) = fx
+        .jobs
+        .list(
+            &fx.ctx(),
+            filter(100, None, None, Some(StatusSel::Finished)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next, None);
+    assert_eq!(
+        whole.into_iter().map(|j| j.job_id).collect::<Vec<_>>(),
+        newest_first
+    );
+    let (seen, _) = pages(Some(ListOrder::Queue), None).await;
+    assert_eq!(seen, queued_theirs, "in queue order");
+
+    fx.handler.open("run");
+    while fx.jobs.busy() {
+        tokio::task::yield_now().await;
+    }
     fx.shutdown().await;
 }
 

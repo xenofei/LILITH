@@ -41,12 +41,12 @@ use super::record::{self, Change, Inserted, JobRow, LiveView, RunReport};
 use super::scheduler::watchdog_limit;
 use super::{
     Admission, Admit, AlwaysAdmit, COMPLETION_GRACE, CancelSelector, DISK_MARGIN_BYTES, EngineKind,
-    ExecWindow, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller, JobCompletion,
-    JobCtx, JobDone, JobEndHook, JobFailure, JobFilter, JobFuture, JobHandler, JobId, JobOrigin,
-    JobResult, JobSpec, JobStatus, JobSummary, Lane, ListOrder, MAX_ATTEMPTS, MAX_CANCEL_IDS,
-    MAX_WAIT, MoveTo, NOTHING_CHANGED, NoReservations, Priority, Progress, RefusedJob,
-    Reservations, RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, StartedBy, Substatus,
-    Subtask, Surface, Withdraw, WithdrawOutcome, backoff,
+    ExecWindow, FINISHED, JOB_CANCELLED, JOB_NOT_STARTED, JOB_RESOLVED_UNKNOWN, JobCaller,
+    JobCompletion, JobCtx, JobDone, JobEndHook, JobFailure, JobFilter, JobFuture, JobHandler,
+    JobId, JobOrigin, JobResult, JobSpec, JobStatus, JobSummary, Lane, ListOrder, MAX_ATTEMPTS,
+    MAX_CANCEL_IDS, MAX_WAIT, MoveTo, NOTHING_CHANGED, NoReservations, Priority, Progress,
+    RefusedJob, Reservations, RestartHoldSink, RetriedJob, RetryBatch, RetryPlan, STATUS_NAMES,
+    StartedBy, StatusSel, Substatus, Subtask, Surface, Withdraw, WithdrawOutcome, backoff,
 };
 use crate::events::{EventBus, SnapshotProvider};
 use crate::lifecycle::{IdleBlocker, ShutdownPhase, ShutdownStep};
@@ -2266,7 +2266,7 @@ impl Shared {
         if let Some(lane) = lane {
             let (me, id) = (self.clone(), id.to_string());
             tokio::spawn(async move {
-                me.withdraw_one(&id).await;
+                me.withdraw_one(&id, None).await;
                 me.publish_queue(lane);
             });
         }
@@ -2372,6 +2372,42 @@ impl Shared {
         if !state.reasons.is_empty() {
             state.withdrawn += 1;
         }
+    }
+
+    /// `JobCtx::withdraw_waited_out` (NF-24, CORE-160; Appendix H "Jobs"): while a reason of its
+    /// lane covers running job `id`, which is waiting out `prompt_id`, the prompt of the job it
+    /// re-runs, that prompt is withdrawn as a pause withdraws a pending one
+    /// ([`Shared::withdraw_one`]: the engine's [`Withdraw`], the fail point, the row, the
+    /// count, the attempt's end). A job with external side effects, or one ending, cancelled,
+    /// preempted or held already, is left alone (`NotPending`). The lane's state is published.
+    pub(crate) async fn withdraw_waited_out(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: &str,
+    ) -> WithdrawOutcome {
+        let lane = {
+            let mut q = self.queue();
+            let Queue { jobs, lanes, .. } = &mut *q;
+            let Some(a) = jobs.get_mut(id) else {
+                return WithdrawOutcome::NotPending;
+            };
+            let lane = a.info.spec.lane;
+            if lanes[lane.index()].holding(a.info.spec.priority).is_empty()
+                || !a.running
+                || a.completing
+                || a.cancelling
+                || a.preempted
+                || a.withdrawal != Withdrawal::None
+                || a.info.spec.external_side_effects
+            {
+                return WithdrawOutcome::NotPending;
+            }
+            a.withdrawal = Withdrawal::Deciding;
+            lane
+        };
+        let outcome = self.withdraw_one(id, Some(prompt_id)).await;
+        self.publish_queue(lane);
+        outcome
     }
 
     /// `JobCtx::settle_withdrawn`: the prompt a pause withdrew is known gone (`follow` is
@@ -2696,7 +2732,9 @@ impl Shared {
     /// its `abort` means anything: an error is logged and the withdrawal goes on), its row
     /// changes: the engine id moves to `withdrawn_id`, kept until the next attempt knows the
     /// old prompt gone (CORE-120), and it is `queue_paused` (Appendix G "Withdrawal").
-    async fn withdraw_one(self: &Arc<Self>, id: &str) {
+    /// `waited_out` (NF-24, [`Shared::withdraw_waited_out`]) names the earlier prompt a retry
+    /// waits out instead of the row's own engine id. The engine's answer comes back.
+    async fn withdraw_one(self: &Arc<Self>, id: &str, waited_out: Option<&str>) -> WithdrawOutcome {
         let decided = |me: &Self, w: Withdrawal| {
             if let Some(a) = me.queue().jobs.get_mut(id)
                 && a.withdrawal == Withdrawal::Deciding
@@ -2710,21 +2748,29 @@ impl Shared {
             .get(id)
             .and_then(|a| Some((a.info.scope.clone(), a.info.spec.engine?, a.info.spec.lane)))
         else {
-            return decided(self, Withdrawal::None);
+            decided(self, Withdrawal::None);
+            return WithdrawOutcome::NotPending;
         };
         let withdrawer = read(&self.withdrawers).get(&engine).cloned();
-        let external_id = match record::get(scope.db(), id).await {
-            Ok(Some(row)) if row.substatus == Some(Substatus::QueuedInEngine) => row.external_id,
-            _ => None,
+        let external_id = match waited_out {
+            Some(prompt_id) => Some(prompt_id.to_string()),
+            None => match record::get(scope.db(), id).await {
+                Ok(Some(row)) if row.substatus == Some(Substatus::QueuedInEngine) => {
+                    row.external_id
+                }
+                _ => None,
+            },
         };
         let (Some(withdrawer), Some(external_id)) = (withdrawer, external_id) else {
-            return decided(self, Withdrawal::None);
+            decided(self, Withdrawal::None);
+            return WithdrawOutcome::NotPending;
         };
         let job = JobId(id.to_string());
         let outcome = withdrawer.withdraw(&job, &external_id).await;
         if outcome != WithdrawOutcome::Withdrawn {
             tracing::info!(job_id = id, outcome = ?outcome, "a paused lane's prompt was not withdrawn; it runs on");
-            return decided(self, Withdrawal::None);
+            decided(self, Withdrawal::None);
+            return outcome;
         }
         if let Err(e) = self.failpoints.hit("jobs.after_withdraw") {
             tracing::warn!(job_id = id, error = %e, "fail point jobs.after_withdraw");
@@ -2738,7 +2784,7 @@ impl Shared {
                     a.withdrawal = Withdrawal::Withdrawn;
                     a.held_shown = true;
                 }
-                _ => return,
+                _ => return outcome,
             }
         }
         tracing::info!(job_id = id, prompt_id = %external_id, "a paused lane's pending prompt was withdrawn");
@@ -2758,6 +2804,7 @@ impl Shared {
         {
             a.cancel.send_replace(true);
         }
+        outcome
     }
 
     /// Marks a job of this core that a shutdown leaves behind, as a recovery would; the
@@ -3211,8 +3258,8 @@ impl Jobs {
     /// page (`None` on the last).
     ///
     /// # Errors
-    /// `params.invalid` for a `limit` outside 1–500 or a cursor this didn't give;
-    /// `state.unavailable`.
+    /// `params.invalid` for a `limit` outside 1–500, a cursor this didn't give or a `status`
+    /// name [`StatusSel`] doesn't take; `state.unavailable`.
     pub async fn list(
         &self,
         caller: &JobCaller,
@@ -3224,6 +3271,15 @@ impl Jobs {
         if !(1..=500).contains(&limit) {
             return Err(params_invalid(
                 format!("limit must be 1–500, not {limit}"),
+                trace_id,
+            ));
+        }
+        if let Some(Err(name)) = f.status.as_ref().map(StatusSel::columns) {
+            return Err(params_invalid(
+                format!(
+                    "status {name:?} is not one of {} or \"{FINISHED}\"",
+                    STATUS_NAMES.join(", ")
+                ),
                 trace_id,
             ));
         }
@@ -3804,7 +3860,7 @@ impl Jobs {
         for id in withdraw {
             let s = s.clone();
             tokio::spawn(async move {
-                s.withdraw_one(&id).await;
+                s.withdraw_one(&id, None).await;
                 s.publish_queue(lane);
             });
         }
