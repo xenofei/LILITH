@@ -7,13 +7,16 @@
 //!   the jobs, the store's version locks and the holds.
 //! - [`Thumbnails`]: the thumbnail cache (APP-038), for `app/thumbs.request` and the pick log's
 //!   copy. `interchange::thumbs` implements it.
+//! - [`ResourceIds`]: a restored resource's new id written inside its file (CORE-037), for
+//!   `trash.restore {to}`; `tools` never names `resources`, so `server` wires it from there.
 //!
 //! [`AssetServices`] holds them as **late-bound slots**: `core_registry` builds the tools before
 //! the dispatcher, while the jobs and the engines exist only after it, so `server` makes the
 //! slots, passes them to `core_registry`, and fills each once what it needs exists. Tests pass
 //! [`AssetServices::unwired`]. An empty `asset_use` fails closed (`asset.trash` refuses with
 //! `state.unavailable`, never "not in use"); an empty `thumbs` makes the pick log skip its
-//! thumbnail copy.
+//! thumbnail copy; an empty `resource_ids` refuses a resource's `trash.restore {to}` with
+//! `state.unavailable` (its id would stay the old one inside the file).
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -23,6 +26,7 @@ use lil_protocol::ErrorBody;
 use lil_protocol::app::ThumbItem;
 
 use crate::store::WsPath;
+use crate::workspace::OpenWorkspace;
 
 /// What uses an asset now (CORE-157).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,15 +41,28 @@ pub enum InUse {
 
 /// Whether an asset is in use (P4b-R32).
 pub trait AssetUse: Send + Sync {
-    /// What uses `project`/`asset_id` now, or `None`.
+    /// What uses `project`/`asset_id` of `workspace` now, or `None`. The workspace is the
+    /// call's: its jobs, its store's version locks and the holds on its paths are the ones that
+    /// count.
     ///
     /// # Errors
     /// It couldn't be told (a database failed): the caller refuses, failing closed.
     fn in_use<'a>(
         &'a self,
+        workspace: &'a OpenWorkspace,
         project: &'a str,
         asset_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<InUse>, ErrorBody>>;
+}
+
+/// A restored resource file's new id (CORE-037): `trash.restore {to}` of a resource file.
+pub trait ResourceIds: Send + Sync {
+    /// The resource file `bytes` with its `id` set to `new_id` by a targeted edit (only that
+    /// value changes).
+    ///
+    /// # Errors
+    /// Why it can't: `new_id` isn't a resource id, or `bytes` isn't a resource file.
+    fn with_id(&self, bytes: &[u8], new_id: &str) -> Result<Vec<u8>, String>;
 }
 
 /// One thumbnail's state (Appendix H "Thumbnails"): `state` is `ready`, `pending` or `icon`;
@@ -80,6 +97,7 @@ pub trait Thumbnails: Send + Sync {
 pub struct AssetServices {
     pub asset_use: Arc<OnceLock<Arc<dyn AssetUse>>>,
     pub thumbs: Arc<OnceLock<Arc<dyn Thumbnails>>>,
+    pub resource_ids: Arc<OnceLock<Arc<dyn ResourceIds>>>,
 }
 
 impl AssetServices {
@@ -94,6 +112,7 @@ impl std::fmt::Debug for AssetServices {
         f.debug_struct("AssetServices")
             .field("asset_use", &self.asset_use.get().is_some())
             .field("thumbs", &self.thumbs.get().is_some())
+            .field("resource_ids", &self.resource_ids.get().is_some())
             .finish()
     }
 }

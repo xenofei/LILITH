@@ -219,7 +219,7 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
             if resolver.file_error().is_some() {
                 needs_repair.push(REDIRECTS_YAML.to_string());
             }
-            needs_repair.extend(resolver.broken_from(project));
+            needs_repair.extend(resolver.broken_from(project).await);
         }
         Err(e) => {
             tracing::warn!(project, error = %e.message, "registry/redirects.yaml can't be read");

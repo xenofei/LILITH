@@ -41,7 +41,7 @@ pub use registry::{
     CallCtx, ConfirmPolicy, FactsFn, FactsFuture, Registry, Tool, ToolFuture, ToolMeta, TouchDecl,
     facts_fn, fill_touches, typed_tool, with_estimate_key,
 };
-pub use services::{AssetServices, AssetUse, InUse, ThumbState, Thumbnails};
+pub use services::{AssetServices, AssetUse, InUse, ResourceIds, ThumbState, Thumbnails};
 pub use stages::{
     AllowOnce, Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput,
     ConfirmStage, ConfirmedVia, Estimate, EstimateStage, FACTS_SHOWN, IdemRef, MeterStage,
@@ -93,7 +93,7 @@ pub fn core_registry(
         hub.ids().clone(),
         probe.clone(),
     ));
-    register_trash_tools(&mut reg, &personal);
+    register_trash_tools(&mut reg, &personal, services);
     register_asset_read_tools(&mut reg);
     register_asset_tools(&mut reg, services);
     register_ref_tools(&mut reg);

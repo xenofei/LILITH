@@ -22,6 +22,11 @@
 //! Saves and deletes run one at a time. The changes are published on the `resources` topic as
 //! `{kind: "saved", resource_kind, id, scope, updated, replaced_entry_id?}` and
 //! `{kind: "deleted", resource_kind, id, scope, entry_id}`.
+//!
+//! **Restore as…** (CORE-037): `trash.restore {to}` of a resource file restores it as
+//! `<kind>/<to>.json` with `to` as its `id`, written by [`ResourceIdEdit`], a targeted edit
+//! that changes only the value of the file's top-level `"id"` (every other byte stays), which
+//! the server gives the trash tools as their `ResourceIds` service.
 
 pub mod tools;
 
@@ -35,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::store::{Expect, Personal, Store, StoreError, WsPath, list_files};
-use crate::tools::CallCtx;
+use crate::tools::{CallCtx, ResourceIds};
 
 pub use tools::register_resource_tools;
 
@@ -218,6 +223,102 @@ fn ids_of(kind: &str, names: Vec<String>) -> Vec<String> {
             valid_id(id) && lil_schema::check_rel_path(&format!("{kind}/{id}.json")).is_ok()
         })
         .collect()
+}
+
+/// A resource file's `id` set by a targeted edit (module docs, "Restore as…").
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceIdEdit;
+
+/// The end (exclusive) of the JSON string that starts at `start` (its opening quote).
+fn string_end(b: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The byte span of the string value of the top-level key `key` of the JSON object `text`,
+/// the last when the key appears more than once (the one a parser keeps); `None` when there is
+/// none, or the value isn't a string.
+fn top_level_string(text: &str, key: &str) -> Option<(usize, usize)> {
+    let b = text.as_bytes();
+    let skip_ws = |mut j: usize| {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    let (mut i, mut depth, mut expect_key) = (0usize, 0usize, false);
+    let mut found = None;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let end = string_end(b, i)?;
+                if depth == 1 && expect_key {
+                    expect_key = false;
+                    let name: String = serde_json::from_str(&text[i..end]).ok()?;
+                    let colon = skip_ws(end);
+                    if b.get(colon) != Some(&b':') {
+                        return None;
+                    }
+                    let value = skip_ws(colon + 1);
+                    if name == key {
+                        found = if b.get(value) == Some(&b'"') {
+                            Some((value, string_end(b, value)?))
+                        } else {
+                            None
+                        };
+                    }
+                    i = value;
+                    continue;
+                }
+                i = end;
+                continue;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                expect_key = b[i] == b'{' && depth == 1;
+            }
+            b'}' | b']' => depth = depth.checked_sub(1)?,
+            b',' if depth == 1 => expect_key = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    found
+}
+
+impl ResourceIds for ResourceIdEdit {
+    fn with_id(&self, bytes: &[u8], new_id: &str) -> Result<Vec<u8>, String> {
+        if !valid_id(new_id) || lil_schema::check_rel_path(&format!("x/{new_id}.json")).is_err() {
+            return Err(format!(
+                "to is `{new_id}`: the entry is a resource, so to is its new id, which starts \
+                 with a lower-case letter and has at most 63 characters from a-z, 0-9, `_` and \
+                 `-`"
+            ));
+        }
+        let not_resource = || "the trash entry is not a resource file with an id".to_string();
+        let text = std::str::from_utf8(bytes).map_err(|_| not_resource())?;
+        let before: Value = serde_json::from_str(text).map_err(|_| not_resource())?;
+        let (start, end) = top_level_string(text, "id").ok_or_else(not_resource)?;
+        let quoted = serde_json::to_string(new_id).map_err(|e| e.to_string())?;
+        let edited = format!("{}{quoted}{}", &text[..start], &text[end..]);
+        // Only the id changed, and the file still reads as it did otherwise.
+        let mut after: Value = serde_json::from_str(&edited).map_err(|_| not_resource())?;
+        if after.get("id").and_then(Value::as_str) != Some(new_id) {
+            return Err(not_resource());
+        }
+        after["id"] = before["id"].clone();
+        if after != before {
+            return Err(not_resource());
+        }
+        Ok(edited.into_bytes())
+    }
 }
 
 /// Whether `id` matches `^[a-z][a-z0-9_-]{0,62}$`.

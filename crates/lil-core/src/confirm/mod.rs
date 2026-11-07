@@ -386,7 +386,9 @@ struct Tracked {
     workspace: String,
     expires_utc: i64,
     session_id: String,
-    ui_cap: bool,
+    /// Made by a `ui:*` session: a cap confirmation, or an `EveryCaller` tool's (the only
+    /// safety confirmations an app's own call gets, CORE-157). It ends with the app's session.
+    ui_made: bool,
     /// The live toast token of its toast, if one was posted (module docs, "Toast tokens").
     toast_token: Option<String>,
 }
@@ -571,7 +573,7 @@ impl Confirm {
                 workspace: row.workspace().to_string(),
                 expires_utc: row.expires_utc,
                 session_id: row.session_id.clone(),
-                ui_cap: row.caller_kind.starts_with("ui:") && row.covers.contains(&Cover::Cap),
+                ui_made: row.caller_kind.starts_with("ui:"),
                 toast_token,
             },
         );
@@ -1030,14 +1032,16 @@ impl Confirm {
         Ok(rows)
     }
 
-    /// Cancels the pending cap confirmations of the `ui:*` session `session_id`, whose
-    /// connection closed (Appendix F); each is published as `cancelled`. An agent's safety
-    /// confirmations stay: the agent retries with its token.
+    /// Cancels the pending confirmations the `ui:*` session `session_id` made, whose
+    /// connection closed (Appendix F): its cap confirmations, and an `EveryCaller` tool's
+    /// (`asset.trash`, Task 10 review M5: an app's question ends with the app, so no approvable
+    /// toast is left that would do nothing; reopen the app and ask again). Each is published as
+    /// `cancelled`. An agent's safety confirmations stay: the agent retries with its token.
     pub async fn cancel_for_session(&self, session_id: &str) {
         let ids: Vec<(String, String)> = self
             .tracked()
             .iter()
-            .filter(|(_, t)| t.session_id == session_id && t.ui_cap)
+            .filter(|(_, t)| t.session_id == session_id && t.ui_made)
             .map(|(id, t)| (id.clone(), t.workspace.clone()))
             .collect();
         for (id, workspace) in ids {
@@ -1047,13 +1051,13 @@ impl Confirm {
             };
             match store::end(&db, &id, ConfState::Cancelled, None, None, None, None).await {
                 Ok(Some(row)) => {
-                    tracing::info!(confirmation = %id, "a cap confirmation is cancelled: its app closed");
+                    tracing::info!(confirmation = %id, "an app's confirmation is cancelled: its app closed");
                     self.publish("cancelled", &row);
                 }
                 Ok(None) => {}
                 Err(e) => {
                     self.end_failed(&id);
-                    tracing::warn!(confirmation = %id, error = %e, "a cap confirmation could not be cancelled")
+                    tracing::warn!(confirmation = %id, error = %e, "an app's confirmation could not be cancelled")
                 }
             }
         }

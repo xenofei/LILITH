@@ -9,7 +9,22 @@
 //!
 //! [`Store::trash_restore`] moves the payload back to its original path, never over a file
 //! that is there now (`trash.restore_conflict`), and sets the read-only attribute again on
-//! every restored file under `projects/*/assets/*/v<semver>/` (CORE-026).
+//! every restored file under `projects/*/assets/*/v<semver>/` (CORE-026); for a whole asset
+//! folder, a sealed file its manifest's `hashes` lists is made read-only only where its SHA-256
+//! still matches (CORE-157), and a mismatch is logged and left as it is.
+//! [`Store::trash_restore_to`] restores under another name in the same folder ("restore as…",
+//! CORE-037), optionally rewriting a restored file's bytes (a resource's new id): the rewritten
+//! bytes are written as a new file at the target (never over one), and only then does the
+//! entry go.
+//!
+//! **A whole asset** (CORE-157, ruling PF-12): `asset.trash` moves `projects/<p>/assets/<a>`
+//! with [`Store::trash`] and the reason [`ASSET_TRASH_REASON`], as one entry, sealed version
+//! folders included and unmodified. Like any folder, an asset holding a path its manifest
+//! `locks` is never moved (ruling P3-R7, `store.locked`); [`Store::trash_locks_within`] lets
+//! the tool check that before it asks you. Right after the move the fail point
+//! `store.after_asset_trash` is hit (before the index hears of it). After a crash there, the next maintenance pass (right
+//! after the workspace opens) tells the index the folder is gone, so its rows go rather than
+//! stay as `missing`.
 //!
 //! [`Store::maintenance`], which the core runs in the background, right after a workspace
 //! opens and then every 24 hours ([`Store::maintenance_until`] stops between entries and
@@ -44,7 +59,8 @@ use super::order::{list, version_folder};
 use super::paths::{WsPath, path_key, writable};
 use super::versions::{files_under, set_readonly_all};
 use super::write::{
-    ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, link_refused, read_all, see,
+    ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, hash_file, link_refused, read_all,
+    see,
 };
 use lil_platform::fs::Probe;
 
@@ -54,6 +70,11 @@ pub const TRASH_KEEP_DAYS: i64 = 30;
 pub const REJECTED_KEEP_DAYS: i64 = 90;
 /// The trash folder, workspace-relative.
 pub const TRASH_DIR: &str = ".trash";
+/// The `reason` of a whole asset moved to the trash by `asset.trash` (CORE-157).
+pub const ASSET_TRASH_REASON: &str = "asset.trash";
+/// A transform of a restored file's bytes ([`Store::trash_restore_to`]): a resource's new id
+/// written inside the file (CORE-037). Its `Err` refuses the restore with `params.invalid`.
+pub type RestoreRewrite = std::sync::Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
 /// The record beside each entry's payload.
 pub(super) const RECORD: &str = "restore.json";
 pub(super) const PAYLOAD: &str = "payload";
@@ -236,6 +257,90 @@ fn in_version_folder(rel: &WsPath) -> bool {
         && version_folder(parts[4]).is_some()
 }
 
+/// The path `name` in `original`'s folder ("restore as…", CORE-037): one path component.
+///
+/// # Errors
+/// `params.invalid` for a name with a separator, or `.`/`..`; `store.path_invalid` for a path
+/// the workspace refuses.
+pub(super) fn restore_name(original: &WsPath, name: &str) -> Result<WsPath, StoreError> {
+    if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
+        return Err(StoreError::Invalid(format!(
+            "to is {name:?}: one name in the folder the entry came from, without / or \\"
+        )));
+    }
+    match original.parent() {
+        Some(dir) => WsPath::parse(&format!("{dir}/{name}")),
+        None => WsPath::parse(name),
+    }
+}
+
+/// Whether `rel` is exactly an asset folder, `projects/<p>/assets/<a>`.
+fn is_asset_folder(rel: &WsPath) -> bool {
+    let parts: Vec<&str> = rel.as_str().split('/').collect();
+    parts.len() == 4
+        && parts[0].eq_ignore_ascii_case("projects")
+        && parts[2].eq_ignore_ascii_case("assets")
+}
+
+/// The manifest of the asset folder `dir` as found on disk: `<asset_id>.manifest.json` for
+/// one of `ids` (tried in order), else the first `*.manifest.json` directly in it; parsed.
+fn folder_manifest(probe: &dyn Probe, dir: &Path, ids: &[&str]) -> Option<ManifestView> {
+    let mut names: Vec<String> = ids.iter().map(|id| format!("{id}.manifest.json")).collect();
+    let mut others: Vec<String> = list(dir)
+        .ok()?
+        .into_iter()
+        .filter(|e| !e.folder && e.name.to_ascii_lowercase().ends_with(".manifest.json"))
+        .map(|e| e.name)
+        .collect();
+    others.sort();
+    names.extend(others);
+    names.into_iter().find_map(|name| {
+        let Ok(Seen::Found(bytes)) = see(probe, &dir.join(name), read_all) else {
+            return None;
+        };
+        let text = std::str::from_utf8(&bytes).ok()?;
+        Manifest::parse(text).ok().map(|(m, _)| m.view())
+    })
+}
+
+/// Re-applies read-only to the sealed files of the restored asset folder `dir` (CORE-157): a
+/// file in a version folder that the manifest's `hashes` lists is made read-only only when its
+/// SHA-256 matches; any other file in a version folder (the snapshot, a legacy version's) is
+/// made read-only as every restored sealed file is. `restored` is the folder's
+/// workspace-relative path, `ids` the asset ids its manifest may be named after.
+fn reseal_asset_folder(
+    probe: &dyn Probe,
+    dir: &Path,
+    restored: &WsPath,
+    ids: &[&str],
+) -> io::Result<()> {
+    let hashes = folder_manifest(probe, dir, ids)
+        .map(|v| v.hashes)
+        .unwrap_or_default();
+    for (inside, file) in files_under(dir)? {
+        let rel = WsPath::from_disk(format!("{restored}/{inside}"));
+        if !in_version_folder(&rel) {
+            continue;
+        }
+        let listed = hashes
+            .iter()
+            .find(|(key, _)| path_key(key) == path_key(&inside))
+            .and_then(|(_, value)| lil_schema::bare_sha256(value).map(str::to_ascii_lowercase));
+        if let Some(want) = listed {
+            let found = match see(probe, &file, hash_file)? {
+                Seen::Found(h) => Some(h.sha256),
+                _ => None,
+            };
+            if found.as_deref() != Some(want.as_str()) {
+                tracing::warn!(path = %rel, "a restored sealed file doesn't match its recorded hash; it isn't made read-only");
+                continue;
+            }
+        }
+        fsops::set_readonly(&file, true)?;
+    }
+    Ok(())
+}
+
 /// The sign-off date (Unix seconds) that starts a rejected run's 90 days (module docs).
 fn signoff_date(view: &ManifestView, run: &CandidateRun) -> Option<i64> {
     let signed = || {
@@ -284,6 +389,13 @@ pub(super) fn drop_empty_entry(dir: &Path, day: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Takes an entry restored with a rewrite out of the trash: its payload file `payload`, whose
+/// bytes are now at the target with the new id, then the record and the empty folders.
+pub(super) fn drop_rewritten_entry(payload: &Path, dir: &Path, day: &Path) -> io::Result<()> {
+    fsops::remove_file(payload)?;
+    drop_empty_entry(dir, day)
+}
+
 /// The purge of one entry: its whole folder, then the day's when that is empty (CORE-110).
 ///
 /// The trash path is checked for links again right before the delete (`.trash`, the day and the
@@ -315,9 +427,10 @@ impl Store {
     /// name (an 8.3 short name too, or a long form that can't be read), or a link (also a
     /// linked folder on the way);
     /// `store.locked` for a path in its manifest's `locks`, by any name, or a folder holding one
-    /// (ruling P3-R7: a whole asset or project too); `store.git_busy` when
-    /// git is still working after 60 s; `store.io` when there is nothing at `rel` or a file
-    /// call fails (`store.busy` when it stays held).
+    /// (ruling P3-R7: a whole asset or project too); `store.git_busy` when git is still working
+    /// after 60 s; `store.io` when there is nothing at `rel` or a file call fails (`store.busy` when
+    /// it stays held, also a folder with a handle open inside it past the retries; nothing
+    /// moves then).
     pub async fn trash(&self, rel: &WsPath, reason: &str) -> Result<TrashRecord, StoreError> {
         self.writable_store()?;
         let long = self.reserved_on_disk(rel, "moved to the trash").await?;
@@ -332,6 +445,21 @@ impl Store {
         self.refuse_links(rel).await?;
         self.git_gate().wait_clear(GIT_WAIT).await?;
         self.trash_now(rel, reason).await
+    }
+
+    /// [`Store::trash`]'s lock refusals for `rel` alone, without moving anything: `store.locked`
+    /// when `rel` (by any name) is in its manifest's `locks`, or is a folder holding a locked
+    /// path (ruling P3-R7), naming that path. `asset.trash` checks this before it asks you, so
+    /// you are never asked about a move that would be refused; the move checks it again.
+    ///
+    /// # Errors
+    /// `store.locked`; `store.path_invalid` for a path the trash refuses; `store.io` when a
+    /// manifest or a long form can't be read (fail closed).
+    pub async fn trash_locks_within(&self, rel: &WsPath) -> Result<(), StoreError> {
+        let long = self.reserved_on_disk(rel, "moved to the trash").await?;
+        self.check_locks(rel).await?;
+        self.check_long_locks(rel, &long).await?;
+        self.refuse_locks_within(rel, &long).await
     }
 
     /// Ruling P3-R7: `store.locked` when a manifest `locks` entry (CORE-035) and `long`, the
@@ -421,11 +549,12 @@ impl Store {
         blocking(move || refuse_linked_trash(&root, probe.as_ref()))
             .await
             .map_err(|e| StoreError::io(rel, &e))?;
-        let sha256 = match self
+        let seen = self
             .see_hash(&abs)
             .await
-            .map_err(|e| StoreError::io(rel, &e))?
-        {
+            .map_err(|e| StoreError::io(rel, &e))?;
+        let folder = matches!(seen, Seen::Folder);
+        let sha256 = match seen {
             Seen::Found(h) => Some(h.sha256),
             Seen::Folder | Seen::Placeholder => None,
             Seen::Link => return Err(link_refused(rel)),
@@ -510,9 +639,21 @@ impl Store {
                 Ok(())
             })
             .await;
+            // A folder still refused with error 5 after the retries has a handle open inside
+            // it (MS-FSA 2.1.5.15.12): it is held, `store.busy`, as a held file is.
+            if lil_platform::fs::classify_move(&e, folder)
+                == lil_platform::fs::RetryClass::SharingViolation
+            {
+                return Err(StoreError::Busy(rel.clone()));
+            }
             return Err(StoreError::io(rel, &e));
         }
         tracing::info!(path = %rel, entry = %record.entry_id, "moved to the trash");
+        if reason == ASSET_TRASH_REASON
+            && let Err(e) = self.failpoints().hit("store.after_asset_trash")
+        {
+            tracing::warn!(path = %rel, error = %e, "fail point store.after_asset_trash");
+        }
         self.emit(vec![StoreEvent {
             path: rel.clone(),
             kind: ChangeKind::Removed,
@@ -521,6 +662,51 @@ impl Store {
         }])
         .await;
         Ok(record)
+    }
+
+    /// After a crash between `asset.trash`'s move and the index hearing of it (the fail point
+    /// `store.after_asset_trash`): every entry of `records` with the reason
+    /// [`ASSET_TRASH_REASON`] whose asset folder has nothing on disk now is told to the change
+    /// sink as removed again, so the index drops the asset's rows instead of keeping them as
+    /// `missing` (CORE-157). A removal the index has already applied changes nothing. Each
+    /// maintenance pass does it first, in the background, so no open waits for the trash.
+    async fn settle_trashed_assets(&self, records: &[TrashRecord]) {
+        let mut gone: Vec<WsPath> = Vec::new();
+        for record in records.iter().filter(|r| r.reason == ASSET_TRASH_REASON) {
+            let Ok(rel) = WsPath::parse(&record.original_path) else {
+                continue;
+            };
+            if !is_asset_folder(&rel) || gone.contains(&rel) {
+                continue;
+            }
+            let abs = rel.abs(self.root());
+            let absent = blocking(move || {
+                Ok(matches!(
+                    lil_platform::fs::attributes(&abs),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound
+                ))
+            })
+            .await
+            .unwrap_or(false);
+            if absent {
+                gone.push(rel);
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        tracing::info!(count = gone.len(), "trashed assets settled in the index");
+        self.emit(
+            gone.into_iter()
+                .map(|path| StoreEvent {
+                    path,
+                    kind: ChangeKind::Removed,
+                    sha256: None,
+                    identity: None,
+                })
+                .collect(),
+        )
+        .await;
     }
 
     /// The trash entries, oldest first. Entries whose record can't be read aren't listed (and
@@ -538,20 +724,23 @@ impl Store {
     }
 
     /// Moves trash entry `entry_id` back to its original path and returns that path (module
-    /// docs). The entry's folder goes once it is empty.
+    /// docs): [`Store::trash_restore_to`] without `to` or a rewrite.
     ///
     /// # Errors
-    /// `workspace.read_only`; `trash.unknown` for no such entry; `trash.restore_conflict`
-    /// (naming the original path) when something is at the original path now;
-    /// `store.locked` when the original path (by any name) is in its manifest's `locks`;
-    /// `store.path_invalid` when the original path is the trash, either workspace data folder,
-    /// `.git`, the ledger, or any other path a write refuses (also through an 8.3 name); a
-    /// `restore.json` edited by hand can name any of them. A path in a sealed version folder is
-    /// the exception: it is restored, read-only again (module docs). Also `store.path_invalid`
-    /// when a folder on the way to it is now a link. On every refusal the payload and
-    /// `restore.json` stay in the trash, untouched. `store.io` when a file call fails.
+    /// As [`Store::trash_restore_to`].
     pub async fn trash_restore(&self, entry_id: &str) -> Result<WsPath, StoreError> {
-        self.writable_store()?;
+        self.trash_restore_to(entry_id, None, None).await
+    }
+
+    /// The record of trash entry `entry_id`.
+    ///
+    /// # Errors
+    /// `trash.unknown` for no such entry; `store.io` when the trash can't be listed.
+    pub async fn trash_entry(&self, entry_id: &str) -> Result<TrashRecord, StoreError> {
+        self.find_entry(entry_id).await.map(|e| e.record)
+    }
+
+    async fn find_entry(&self, entry_id: &str) -> Result<Entry, StoreError> {
         let unknown = || StoreError::TrashUnknown(entry_id.to_string());
         if !is_entry_id(entry_id) {
             return Err(unknown());
@@ -561,15 +750,56 @@ impl Store {
         let found = blocking(move || entries(&root, probe.as_ref()))
             .await
             .map_err(|e| StoreError::io(&WsPath::from_disk(TRASH_DIR.to_string()), &e))?;
-        let entry = found
+        found
             .into_iter()
             .find(|e| {
                 e.dir
                     .file_name()
                     .is_some_and(|n| path_key(&n.to_string_lossy()) == path_key(entry_id))
             })
-            .ok_or_else(unknown)?;
-        let rel = WsPath::parse(&entry.record.original_path)?;
+            .ok_or_else(unknown)
+    }
+
+    /// Moves trash entry `entry_id` back and returns the restored path (module docs): to its
+    /// original path, or with `to` to the name `to` in the original's folder ("restore as…",
+    /// CORE-037; `to` is one path component, `params.invalid` otherwise). With `rewrite`, the
+    /// payload (a file) is read, rewritten and written as a new file at the target, and the
+    /// entry goes only after that; a folder payload is then `params.invalid`. The entry's
+    /// folder goes once it is empty.
+    ///
+    /// # Errors
+    /// `workspace.read_only`; `trash.unknown` for no such entry; `trash.restore_conflict`
+    /// (naming the target path) when something is at the target now; `params.invalid` for a
+    /// bad `to`, or the rewrite's own refusal; `store.locked` when the target path (by any
+    /// name) is in its manifest's `locks`; `store.path_invalid` when the target path is the
+    /// trash, either workspace data folder, `.git`, the ledger, or any other path a write
+    /// refuses (also through an 8.3 name); a `restore.json` edited by hand can name any of
+    /// them. A path in a sealed version folder is the exception: it is restored, read-only
+    /// again (module docs). Also `store.path_invalid` when a folder on the way to it is now a
+    /// link. On every refusal the payload and `restore.json` stay in the trash, untouched.
+    /// `store.io` when a file call fails.
+    pub async fn trash_restore_to(
+        &self,
+        entry_id: &str,
+        to: Option<&str>,
+        rewrite: Option<RestoreRewrite>,
+    ) -> Result<WsPath, StoreError> {
+        self.writable_store()?;
+        let entry = self.find_entry(entry_id).await?;
+        let original = WsPath::parse(&entry.record.original_path)?;
+        let rel = match to {
+            None => original.clone(),
+            Some(name) => restore_name(&original, name)?,
+        };
+        // A sealed path comes back only where it was sealed: never under another name.
+        if to.is_some()
+            && rel != original
+            && (in_version_folder(&original) || in_version_folder(&rel))
+        {
+            return Err(StoreError::Invalid(format!(
+                "{original} is in a sealed version folder, restored only under its own name"
+            )));
+        }
         // The trash's own refusals (by the long name too, so an 8.3 short name is refused like
         // the long one), then a write's, before anything moves; the entry stays as it is. A
         // sealed path is the one exception: it restores, read-only again (CORE-026).
@@ -592,11 +822,11 @@ impl Store {
             })
             .await
             .map_err(|e| StoreError::io(&rel, &e))?;
-            let wanted = path_key(rel.file_name());
+            let wanted = path_key(original.file_name());
             let named = items.iter().position(|i| path_key(&i.name) == wanted);
             match (named, items.len()) {
-                (Some(i), _) => items[i].path.clone(),
-                (None, 1) => items[0].path.clone(),
+                (Some(i), _) => (items[i].path.clone(), items[i].folder),
+                (None, 1) => (items[0].path.clone(), items[0].folder),
                 _ => {
                     return Err(StoreError::Io {
                         path: rel.as_str().to_string(),
@@ -605,24 +835,55 @@ impl Store {
                 }
             }
         };
+        let (payload, payload_is_folder) = payload;
+        if rewrite.is_some() && payload_is_folder {
+            return Err(StoreError::Invalid(format!(
+                "the trash entry {entry_id} holds a folder; only a file is restored with a new id \
+                 inside it"
+            )));
+        }
         // The move checks only its target: a linked folder above it would let it land outside
         // the workspace.
         self.refuse_links(&rel).await?;
         let target = rel.abs(self.root());
         let _held = self.lock_path(&rel).await;
-        let (from, to) = (payload.clone(), target.clone());
-        // A restored folder also retries error 5 (ruling Q19).
-        let moved = self
-            .fs_retry_move(Some("store.replace"), &payload, move || {
-                if lil_platform::fs::attributes(&to).is_ok() {
-                    return Err(io::Error::from_raw_os_error(183));
-                }
-                if let Some(parent) = to.parent() {
-                    fsops::ensure_dir(parent)?;
-                }
-                fsops::move_new(&from, &to)
-            })
-            .await;
+        let (from, to_abs) = (payload.clone(), target.clone());
+        let mut written_sha256 = None;
+        let moved = match rewrite {
+            // A restored folder also retries error 5 (ruling Q19).
+            None => {
+                self.fs_retry_move(Some("store.replace"), &payload, move || {
+                    if lil_platform::fs::attributes(&to_abs).is_ok() {
+                        return Err(io::Error::from_raw_os_error(183));
+                    }
+                    if let Some(parent) = to_abs.parent() {
+                        fsops::ensure_dir(parent)?;
+                    }
+                    fsops::move_new(&from, &to_abs)
+                })
+                .await
+            }
+            Some(rewrite) => {
+                let probe = self.probe().clone();
+                let read = blocking(move || match see(probe.as_ref(), &from, read_all)? {
+                    Seen::Found(bytes) => Ok(bytes),
+                    _ => Err(io::Error::other("the payload can't be read")),
+                })
+                .await
+                .map_err(|e| StoreError::io(&rel, &e))?;
+                let bytes = rewrite(&read).map_err(StoreError::Invalid)?;
+                written_sha256 = Some(lil_schema::sha256_hex(&bytes));
+                let tmp = format!(".{}.tmp", self.ids().id("tmp"));
+                let fp = self.failpoints().clone();
+                blocking(move || {
+                    if lil_platform::fs::attributes(&to_abs).is_ok() {
+                        return Err(io::Error::from_raw_os_error(183));
+                    }
+                    fsops::write_new_file(&to_abs, &tmp, &bytes, &fp)
+                })
+                .await
+            }
+        };
         match moved {
             Ok(()) => {}
             Err(e) if e.raw_os_error().is_some_and(|c| c == 80 || c == 183) => {
@@ -631,18 +892,28 @@ impl Store {
             Err(e) => return Err(StoreError::io(&rel, &e)),
         }
         // Every restored file in a sealed version folder is read-only again, whether the
-        // restored path is the file, its version folder, or a folder above it.
-        let (path, restored) = (target.clone(), rel.clone());
+        // restored path is the file, its version folder, or a folder above it; a whole asset
+        // folder's listed sealed files only where their hashes match (module docs).
+        let (path, restored, probe) = (target.clone(), rel.clone(), self.probe().clone());
+        let ids = [
+            rel.file_name().to_string(),
+            original.file_name().to_string(),
+        ];
         let sealed = blocking(move || {
             if in_version_folder(&restored) {
                 return set_readonly_all(&path, true);
             }
-            if lil_platform::fs::attributes(&path)? & 0x10 != 0 {
-                for (inside, file) in files_under(&path)? {
-                    let rel = WsPath::from_disk(format!("{restored}/{inside}"));
-                    if in_version_folder(&rel) {
-                        fsops::set_readonly(&file, true)?;
-                    }
+            if lil_platform::fs::attributes(&path)? & 0x10 == 0 {
+                return Ok(());
+            }
+            if is_asset_folder(&restored) {
+                let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+                return reseal_asset_folder(probe.as_ref(), &path, &restored, &ids);
+            }
+            for (inside, file) in files_under(&path)? {
+                let rel = WsPath::from_disk(format!("{restored}/{inside}"));
+                if in_version_folder(&rel) {
+                    fsops::set_readonly(&file, true)?;
                 }
             }
             Ok(())
@@ -651,13 +922,13 @@ impl Store {
         if let Err(e) = sealed {
             tracing::warn!(path = %rel, error = %e, "a restored sealed file couldn't be made read-only again");
         }
+        // A rewritten restore leaves the payload behind: it goes with the entry, now that its
+        // bytes are at the target with the new id.
+        let rewritten = written_sha256.is_some().then(|| payload.clone());
         let (dir, day) = (entry.dir.clone(), entry.day.clone());
-        let cleaned = blocking(move || {
-            fsops::remove_file(&dir.join(RECORD))?;
-            remove_if_empty(&dir.join(PAYLOAD));
-            remove_if_empty(&dir);
-            remove_if_empty(&day);
-            Ok(())
+        let cleaned = blocking(move || match rewritten {
+            Some(file) => drop_rewritten_entry(&file, &dir, &day),
+            None => drop_empty_entry(&dir, &day),
         })
         .await;
         if let Err(e) = cleaned {
@@ -667,7 +938,7 @@ impl Store {
         self.emit(vec![StoreEvent {
             path: rel.clone(),
             kind: ChangeKind::Created,
-            sha256: entry.record.sha256.clone(),
+            sha256: written_sha256.or_else(|| entry.record.sha256.clone()),
             identity: None,
         }])
         .await;
@@ -709,6 +980,10 @@ impl Store {
                 .await
                 .map_err(|e| StoreError::io(&trash_rel, &e))?
         };
+        // Trashed assets the index may still hold after a crash (module docs), before the
+        // purge.
+        let records: Vec<TrashRecord> = found.iter().map(|e| e.record.clone()).collect();
+        self.settle_trashed_assets(&records).await;
         for entry in &found {
             if stop() {
                 return Ok(report);
@@ -778,7 +1053,8 @@ impl Store {
     }
 
     /// Moves the due rejected runs of one asset to the trash and records their `trashed_utc`,
-    /// under the asset's version lock. A due run whose folder is already in the trash
+    /// under the asset's version lock, taken only when a run is due (a first read without it
+    /// decides). A due run whose folder is already in the trash
     /// (`in_trash` has an entry from that folder: the manifest edit failed, or the core
     /// stopped, after the move) only gets its `trashed_utc`, the entry's `moved_utc`.
     async fn trash_rejected_runs(
@@ -790,25 +1066,38 @@ impl Store {
     ) -> Result<Vec<WsPath>, StoreError> {
         let asset = WsPath::parse(&format!("projects/{project}/assets/{asset_id}"))?;
         let manifest_rel = asset.join(&format!("{asset_id}.manifest.json"))?;
-        let _guard = self.version_lock(project, asset_id).lock_owned().await;
-        let Some(bytes) = self.read(&manifest_rel).await? else {
-            return Ok(Vec::new());
+        let read_view = || async {
+            let Some(bytes) = self.read(&manifest_rel).await? else {
+                return Ok::<_, StoreError>(None);
+            };
+            Ok(std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|t| Manifest::parse(t).ok())
+                .map(|(m, _)| m.view()))
         };
-        let Some((manifest, _)) = std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|t| Manifest::parse(t).ok())
-        else {
-            return Ok(Vec::new());
-        };
-        let view = manifest.view();
-        let mut trashed = Vec::new();
-        for run in &view.candidate_runs {
-            let due = signoff_date(&view, run).map(|d| d + REJECTED_KEEP_DAYS * DAY);
-            let wanted = run.status.as_deref() == Some("rejected")
+        let wanted = |view: &ManifestView, run: &CandidateRun| {
+            let due = signoff_date(view, run).map(|d| d + REJECTED_KEEP_DAYS * DAY);
+            run.status.as_deref() == Some("rejected")
                 && !run.pinned
                 && run.trashed_utc.is_none()
-                && due.is_some_and(|due| now_utc >= due);
-            if !wanted {
+                && due.is_some_and(|due| now_utc >= due)
+        };
+        // The version lock only when a run is due: a pass over an asset with nothing to move
+        // never holds it, so it never looks like a sign-off to `asset.trash`'s in-use check
+        // (CORE-157). The manifest is read again under the lock.
+        let due_now = read_view()
+            .await?
+            .is_some_and(|view| view.candidate_runs.iter().any(|r| wanted(&view, r)));
+        if !due_now {
+            return Ok(Vec::new());
+        }
+        let _guard = self.version_lock(project, asset_id).lock_owned().await;
+        let Some(view) = read_view().await? else {
+            return Ok(Vec::new());
+        };
+        let mut trashed = Vec::new();
+        for run in &view.candidate_runs {
+            if !wanted(&view, run) {
                 continue;
             }
             let folder = asset.join(&format!("candidates/{}", run.run_id))?;

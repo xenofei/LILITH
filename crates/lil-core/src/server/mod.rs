@@ -110,6 +110,132 @@ pub use crate::transport::{
 };
 use crate::workspace::WorkspaceHub;
 
+/// `asset.trash`'s in-use check (CORE-157, P4b-R24, P4b-R32), over the call's workspace:
+/// - a sign-off: the asset's version lock is held (tried without waiting, never waited on);
+/// - a job: an unfinished (`queued` or `running`) job in the workspace's `state.db` whose row,
+///   or whose stored arguments (`project`/`asset_id`, or `asset: {project, asset_id}`), name
+///   the asset; a job's own project stands in for arguments that name none;
+/// - a hold: a document hold the workspace's sessions can see (its own and loose ones) whose
+///   path, absolute or relative as the hold keeps it, normalised to the workspace-relative
+///   form, is the asset folder or lies under it.
+///
+/// Names compare without regard to case, as Windows paths do. A `state.db` that can't be read
+/// is an error, so the trash is refused (fail closed).
+struct ServerAssetUse {
+    holds: Arc<Holds>,
+}
+
+/// Whether `job` names `project`/`asset_id` (see [`ServerAssetUse`]).
+fn job_names_asset(job: &crate::jobs::record::JobRow, project: &str, asset_id: &str) -> bool {
+    let same = |a: Option<&str>, b: &str| a.is_some_and(|a| a.eq_ignore_ascii_case(b));
+    fn text(v: Option<&serde_json::Value>) -> Option<&str> {
+        v.and_then(serde_json::Value::as_str)
+    }
+    let args = &job.args;
+    let nested = args.get("asset");
+    let named_asset = text(nested.and_then(|a| a.get("asset_id")))
+        .or_else(|| text(args.get("asset_id")))
+        .or(job.asset_id.as_deref());
+    let named_project = text(nested.and_then(|a| a.get("project")))
+        .or_else(|| text(args.get("project")))
+        .or(job.project.as_deref());
+    (same(named_asset, asset_id) && same(named_project, project))
+        || (same(job.asset_id.as_deref(), asset_id) && same(job.project.as_deref(), project))
+}
+
+/// `path` (a hold's, absolute or relative) as a workspace-relative path with `/` separators
+/// and no `.` or `..` parts, when it is inside the workspace `root`.
+fn workspace_relative(root: &std::path::Path, path: &str) -> Option<String> {
+    use std::path::Component;
+    let strip = |text: &str| -> String {
+        let text = text.replace('/', "\\");
+        text.strip_prefix(r"\\?\")
+            .map_or(text.clone(), str::to_string)
+    };
+    let held = std::path::PathBuf::from(strip(path));
+    let mut parts: Vec<String> = Vec::new();
+    let relative = if held.is_absolute() {
+        let root = std::path::PathBuf::from(strip(&root.to_string_lossy()));
+        let (held_parts, root_parts): (Vec<_>, Vec<_>) =
+            (held.components().collect(), root.components().collect());
+        let key = |c: &Component| c.as_os_str().to_string_lossy().to_lowercase();
+        if held_parts.len() < root_parts.len()
+            || held_parts
+                .iter()
+                .zip(&root_parts)
+                .any(|(a, b)| key(a) != key(b))
+        {
+            return None;
+        }
+        held_parts[root_parts.len()..].to_vec()
+    } else {
+        held.components().collect()
+    };
+    for c in relative {
+        match c {
+            Component::Normal(name) => parts.push(name.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(parts.join("/"))
+}
+
+impl crate::tools::AssetUse for ServerAssetUse {
+    fn in_use<'a>(
+        &'a self,
+        workspace: &'a crate::workspace::OpenWorkspace,
+        project: &'a str,
+        asset_id: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<crate::tools::InUse>, lil_protocol::ErrorBody>,
+    > {
+        use crate::tools::InUse;
+        Box::pin(async move {
+            if workspace
+                .store
+                .version_lock(project, asset_id)
+                .try_lock()
+                .is_err()
+            {
+                return Ok(Some(InUse::Signoff));
+            }
+            let open = crate::jobs::record::open_rows(&workspace.state)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "the jobs couldn't be read for asset.trash's in-use check");
+                    lil_protocol::ErrorBody::new(
+                        &lil_protocol::codes::STATE_UNAVAILABLE,
+                        "Whether a job uses this asset can't be told (the workspace's state \
+                         database failed), so it isn't moved to the trash.",
+                        "",
+                    )
+                })?;
+            if open.iter().any(|j| job_names_asset(j, project, asset_id)) {
+                return Ok(Some(InUse::Job));
+            }
+            let folder = format!("projects/{project}/assets/{asset_id}").to_lowercase();
+            let held = self
+                .holds
+                .list_for(Some(&workspace.ws.id))
+                .into_iter()
+                .filter_map(|h| workspace_relative(&workspace.ws.path, &h.path))
+                .any(|rel| {
+                    let rel = rel.to_lowercase();
+                    rel == folder || rel.starts_with(&format!("{folder}/"))
+                });
+            if held {
+                return Ok(Some(InUse::Hold));
+            }
+            Ok(None)
+        })
+    }
+}
+
 /// A core that is serving.
 ///
 /// Its shutdown (ARCH-021) runs in a supervisor task once a drain begins: the lifecycle's
@@ -327,6 +453,10 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
         Arc::new(cfg.git_env.clone()),
         &asset_services,
     );
+    // A restored resource's new id inside its file (CORE-037): `tools` never names `resources`.
+    let _ = asset_services
+        .resource_ids
+        .set(Arc::new(crate::resources::ResourceIdEdit));
     register_telemetry_tools(&mut registry, &telemetry);
     // The meter (CORE-069): usage records, stage 8, the jobs' energy and local work.
     let meter = Meter::new(
@@ -496,6 +626,11 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     dispatcher.set_error_sink(diagnostics.clone());
     let active_projects = dispatcher.active_projects().clone();
     let jobs = dispatcher.jobs().clone();
+    // `asset.trash`'s in-use check (P4b-R32), right after the jobs exist: until now its slot was
+    // empty, and an empty slot refuses (fail closed).
+    let _ = asset_services.asset_use.set(Arc::new(ServerAssetUse {
+        holds: holds.clone(),
+    }));
     notifier.set_jobs(&jobs).await;
     // Whether a suite window is in front as each job ends, before its final row (P4a-R7).
     {

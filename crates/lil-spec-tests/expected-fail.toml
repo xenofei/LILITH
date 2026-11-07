@@ -11,15 +11,15 @@ tests = [
     { name = "lil-spec-tests::collections_4b::save_list_query_delete_restore", rule = "CORE-155", file = "tests/collections_4b.rs" },
     # CORE-155
     { name = "lil-spec-tests::collections_4b::quick_collection_is_always_listed_and_never_deleted", rule = "CORE-155", file = "tests/collections_4b.rs" },
-    # Task 11
+    # Task 11: these four trash the fixture's crane, whose manifest locks prompts/crane.txt; an
+    # asset holding a locked path is refused with store.locked (ruling P3-R7, controller ruling
+    # for Task 11), so they stay expected to fail until the controller settles it.
     # CORE-157, APP-115
     { name = "lil-spec-tests::trash_4b::asset_trash_asks_even_the_app", rule = "CORE-157", file = "tests/trash_4b.rs" },
     # CORE-157, CORE-037
     { name = "lil-spec-tests::trash_4b::trash_moves_the_whole_asset_and_restores_it_read_only", rule = "CORE-157", file = "tests/trash_4b.rs" },
     # CORE-157, ARCH-125
     { name = "lil-spec-tests::trash_4b::refs_to_a_trashed_asset_are_asset_trashed", rule = "CORE-157", file = "tests/trash_4b.rs" },
-    # CORE-157
-    { name = "lil-spec-tests::trash_4b::trash_refused_while_in_use", rule = "CORE-157", file = "tests/trash_4b.rs" },
     # CORE-037, ARCH-125
     { name = "lil-spec-tests::trash_4b::restore_to_a_free_name", rule = "CORE-037", file = "tests/trash_4b.rs" },
     # Task 12
