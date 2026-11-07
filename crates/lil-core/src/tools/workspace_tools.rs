@@ -20,7 +20,9 @@
 //! **`workspace.create`:**
 //! 1. The path is made absolute and passed through `check_workspace` before anything is
 //!    created (QA-040), then created (`fsops::ensure_dir`), canonicalised and checked again (a
-//!    junction or a short name can lead elsewhere).
+//!    junction or a short name can lead elsewhere). A refusal at the second check (or a failure
+//!    between the two) removes the folder this call made, if it is still empty
+//!    (`discard_new_folder`); the fail point `workspace.after_create` marks the window.
 //! 2. `workspace.path_invalid`: a file, the install folder or a folder inside it (ARCH-094,
 //!    [`refuse_inside`]), or a folder inside another registered workspace.
 //! 3. A folder that holds a workspace file (`names::workspace_file_in`: `lilith.yaml`, or the
@@ -602,6 +604,17 @@ async fn close_unless_default(t: &Tools, ws: &WorkspaceRef) {
     }
 }
 
+/// Takes back the folder `workspace.create` made when a later check refuses the call. Only a
+/// folder the call made (`existed` is false) and only while it is empty: `RemoveDirectoryW`
+/// refuses one that isn't, so nothing is ever deleted (CORE-110). Parents that `ensure_dir`
+/// made stay. A link at the path is removed as a link (`RemoveDirectoryW` never follows it),
+/// never its target. Best effort.
+fn discard_new_folder(path: &Path, existed: bool) {
+    if !existed {
+        let _ = fsops::remove_empty_dir(path);
+    }
+}
+
 /// `workspace.create`'s body (module docs).
 async fn create(
     t: &Tools,
@@ -617,6 +630,16 @@ async fn create(
         return Err(path_invalid(&args.path, &why, trace_id));
     }
     let dir = abs.clone();
+    // Only `NotFound` says the call makes the folder; any other answer counts as "existed", so
+    // the cleanup never removes what it can't be sure it made.
+    let existed = {
+        let probe = abs.clone();
+        tokio::task::spawn_blocking(move || {
+            !matches!(std::fs::metadata(&probe), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .await
+        .unwrap_or(true)
+    };
     tokio::task::spawn_blocking(move || fsops::ensure_dir(&dir))
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(format!("the call stopped: {e}"))))
@@ -627,8 +650,29 @@ async fn create(
                 trace_id,
             )
         })?;
-    let ws = resolve(&abs, &args.path, trace_id)?;
+    // The fail point stands for a change between the two checks (the race the second check is
+    // for); an error from it is the folder failing at that moment.
+    let ws = t
+        .hub
+        .failpoints()
+        .hit("workspace.after_create")
+        .map_err(|e| {
+            path_invalid(
+                &args.path,
+                &format!("the folder can't be used ({e})"),
+                trace_id,
+            )
+        })
+        .and_then(|()| resolve(&abs, &args.path, trace_id));
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(e) => {
+            discard_new_folder(&abs, existed);
+            return Err(e);
+        }
+    };
     if let Some(why) = refusal(&ws.path, &t.env) {
+        discard_new_folder(&abs, existed);
         return Err(path_invalid(&args.path, &why, trace_id));
     }
     let warnings = volume_warnings(t.probe.as_ref(), &ws.path);

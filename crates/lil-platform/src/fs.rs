@@ -380,7 +380,10 @@ pub fn classify_move(e: &io::Error, folder: bool) -> RetryClass {
 /// `volume_serial` and `file_id` come from `FILE_ID_INFO` (a 64-bit serial and a 128-bit id).
 /// `file_id` is `None` where `FileIdInfo` fails, and when the id is all zero or all `0xFF`
 /// (MS-FSCC: such ids "MUST be ignored"); the serial then comes from
-/// `BY_HANDLE_FILE_INFORMATION`. `change_time` is `None` when the file system reports 0.
+/// `BY_HANDLE_FILE_INFORMATION`. That fallback serial is 32-bit (zero-extended into the `u64`),
+/// so it is never comparable with a `FILE_ID_INFO` serial, even of the same volume: compare
+/// identities only when both were read the same way (the id's presence says which).
+/// `change_time` is `None` when the file system reports 0.
 /// On ReFS the id is built from the parent folder, so a move across folders changes it: ids
 /// detect changes in place, never identity across folders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,8 +652,10 @@ fn at(offset: u64) -> OVERLAPPED {
 /// another handle holds it.
 fn lock_byte(file: &File, offset: u64) -> io::Result<bool> {
     let mut overlapped = at(offset);
-    // SAFETY: the handle is open while `file` is borrowed and is synchronous, so the call
-    // completes before it returns and `overlapped` is not used afterwards.
+    // SAFETY: the handle is open while `file` is borrowed, and `overlapped` is a valid
+    // pointer for the call. `LOCKFILE_FAIL_IMMEDIATELY` makes the call return at once, with
+    // the lock taken or `ERROR_LOCK_VIOLATION`, whether or not the handle is synchronous, so
+    // the system keeps no reference to `overlapped` after the call returns.
     let locked = unsafe {
         LockFileEx(
             handle(file),
@@ -775,8 +780,10 @@ const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
 pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 
 /// Creates the folder `link` as a junction (a mount-point reparse point) to the existing folder
-/// `target`. Unlike a symbolic link it needs no privilege. Test support for the store's link
-/// checks; the suite itself never creates links.
+/// `target`. Unlike a symbolic link it needs no privilege. For tests and tools: the store's link
+/// checks are tested with it, and the suite itself never creates links. It is `pub` (not
+/// `cfg(test)`) because other crates' tests and tools call it; hidden from the docs.
+#[doc(hidden)]
 pub fn create_junction(link: &Path, target: &Path) -> io::Result<()> {
     let target = strip_verbatim(&std::path::absolute(target)?);
     let print: Vec<u16> = target.as_os_str().encode_wide().collect();
