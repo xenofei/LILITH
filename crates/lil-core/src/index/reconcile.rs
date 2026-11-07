@@ -1139,15 +1139,17 @@ fn repair_input(r: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
 /// over the live rows, those whose manifest isn't `missing` (a folder that is gone holds no
 /// creation UUID). A gone folder (its manifest `missing`):
 /// - whose creation UUID a live folder holds, with every file it still has a row for
-///   `missing`, is the old place of a move, not a lost asset (ruling T8 I2): its asset row and
-///   every row under it (files, tags, takes, edges, expected files, text) leave the index, so
-///   it isn't listed, its files aren't `missing` and nothing says to put it back;
+///   `missing`, and whose folder is confirmed absent on disk (`NotFound` under `root`; a folder
+///   that is there but can't be read is never taken for gone, ruling T8 R1), is the old place of
+///   a move, not a lost asset (ruling T8 I2): its asset row and every row under it (files,
+///   tags, takes, edges, expected files, text) leave the index, so it isn't listed, its files
+///   aren't `missing` and nothing says to put it back;
 /// - else it keeps today's `missing` listing, with no `repair` and the CORE-047 check alone as
 ///   `needs_repair`.
 ///
 /// Only rows that change are written. It reads and writes the index only, never a manifest:
 /// nothing is repaired by itself.
-pub(super) fn refresh_repairs(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+pub(super) fn refresh_repairs(tx: &Transaction<'_>, root: &Path) -> rusqlite::Result<()> {
     let missing: HashSet<String> = tx
         .prepare_cached("SELECT key FROM files WHERE state = 'missing' AND kind = 'other'")?
         .query_map([], |r| r.get(0))?
@@ -1181,7 +1183,7 @@ pub(super) fn refresh_repairs(tx: &Transaction<'_>) -> rusqlite::Result<()> {
                 ))?
                 .query_row(params![folder], |r| r.get::<_, i64>(0))?
                 == 0;
-        if all_missing {
+        if all_missing && folder_absent(root, &row) {
             tx.execute(&format!("DELETE FROM files WHERE {UNDER}"), params![folder])?;
             delete_assets_under(tx, &folder)?;
         } else {
@@ -1219,6 +1221,20 @@ pub(super) fn refresh_repairs(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the asset folder of `row` is confirmed absent on disk: its attributes can't be read
+/// because it isn't there (`NotFound`, which a missing parent folder gives too). Any other
+/// error (access denied, a sharing violation, …) says nothing about absence.
+fn folder_absent(root: &Path, row: &AssetRow) -> bool {
+    let Ok(rel) = WsPath::parse(&format!("projects/{}/assets/{}", row.project, row.asset_id))
+    else {
+        return false;
+    };
+    matches!(
+        lil_platform::fs::attributes(&rel.abs(root)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound
+    )
 }
 
 /// `projects/<p>/assets/<a>/candidates/<run>` of a run file's path.
@@ -1583,13 +1599,14 @@ pub(super) async fn run(
                 std::mem::take(&mut manifests.parsed),
             );
             let scope = scope.clone();
+            let root = index.root.clone();
             let recorded = index
                 .db
                 .call(move |conn| {
                     if !rows.is_empty() {
                         let tx = conn.transaction().map_err(|e| sql(&e))?;
                         write_rows(&tx, &rows, &parsed, true).map_err(|e| sql(&e))?;
-                        refresh_repairs(&tx).map_err(|e| sql(&e))?;
+                        refresh_repairs(&tx, &root).map_err(|e| sql(&e))?;
                         tx.commit().map_err(|e| sql(&e))?;
                     }
                     load_recorded(conn, &scope).map_err(|e| sql(&e))
@@ -1630,6 +1647,7 @@ pub(super) async fn run(
         Mode::Cold => runs_elsewhere(index, &parsed_all).await?,
         Mode::Warm => HashSet::new(),
     };
+    let root = index.root.clone();
     let removals = index
         .db
         .call(move |conn| {
@@ -1652,6 +1670,10 @@ pub(super) async fn run(
                 whole.then_some(started),
             )
             .map_err(|e| sql(&e))?;
+            if mode == Mode::Cold || !rows_all.is_empty() || !gone.is_empty() || !replay.is_empty()
+            {
+                refresh_repairs(&tx, &root).map_err(|e| sql(&e))?;
+            }
             tx.commit().map_err(|e| sql(&e))?;
             Ok(done)
         })
@@ -1746,9 +1768,6 @@ fn finish(
                 removed.push(WsPath::from_disk(old.path.clone()));
             }
         }
-    }
-    if mode == Mode::Cold || !rows.is_empty() || !gone.is_empty() || !replay.is_empty() {
-        refresh_repairs(tx)?;
     }
     if let Some(started) = scan_start {
         tx.execute(
@@ -1861,6 +1880,7 @@ pub(super) async fn apply_events(index: &Index, events: &[StoreEvent]) -> Result
         }
     }
     if !rows.is_empty() || !removed.is_empty() {
+        let root = index.root.clone();
         let changes = StoreChanges {
             removed,
             rows,
@@ -1878,7 +1898,7 @@ pub(super) async fn apply_events(index: &Index, events: &[StoreEvent]) -> Result
                 store_changes(&tx, &changes.removed, &changes.rows, &changes.parsed)
                     .map_err(|e| sql(&e))?;
                 if !changes.parsed.is_empty() || !changes.removed.is_empty() {
-                    refresh_repairs(&tx).map_err(|e| sql(&e))?;
+                    refresh_repairs(&tx, &root).map_err(|e| sql(&e))?;
                 }
                 tx.commit().map_err(|e| sql(&e))
             })

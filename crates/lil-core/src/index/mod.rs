@@ -799,10 +799,11 @@ impl Index {
     /// # Errors
     /// [`IndexError::Sql`] when the database fails.
     pub async fn refresh_repairs(&self) -> Result<(), IndexError> {
+        let root = self.root.clone();
         self.db
             .call(move |conn| {
                 let tx = conn.transaction().map_err(|e| sql(&e))?;
-                reconcile::refresh_repairs(&tx).map_err(|e| sql(&e))?;
+                reconcile::refresh_repairs(&tx, &root).map_err(|e| sql(&e))?;
                 tx.commit().map_err(|e| sql(&e))
             })
             .await
@@ -1097,6 +1098,7 @@ impl Index {
         // A manifest gone `missing` (or back) changes which asset folders are live, and a file
         // gone `missing` may complete a gone folder (ruling T8 I2).
         let manifest = kind_of(path) == FileKind::Manifest || state == FileState::Missing;
+        let root = self.root.clone();
         self.db
             .call(move |conn| {
                 let tx = conn.transaction().map_err(|e| sql(&e))?;
@@ -1106,7 +1108,7 @@ impl Index {
                 )
                 .map_err(|e| sql(&e))?;
                 if manifest {
-                    reconcile::refresh_repairs(&tx).map_err(|e| sql(&e))?;
+                    reconcile::refresh_repairs(&tx, &root).map_err(|e| sql(&e))?;
                 }
                 tx.commit().map_err(|e| sql(&e))
             })

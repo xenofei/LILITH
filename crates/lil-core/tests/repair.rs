@@ -145,21 +145,35 @@ impl Fx {
         Fx::build(setup, FailPoints::none(), watch)
     }
 
+    /// [`Fx::with`], the store, index and watcher seeing the disk through `probe`.
+    fn with_probe(setup: impl FnOnce(&Path), probe: Arc<dyn Probe>) -> Fx {
+        let env = TestEnv::new();
+        let ws = env.copy_fixture_workspace("repair");
+        setup(&ws);
+        env.register_workspace(&ws, true);
+        Fx::start_with(env, ws, FailPoints::none(), WatchConfig::default(), probe)
+    }
+
     fn build(setup: impl FnOnce(&Path), fp: Arc<FailPoints>, watch: WatchConfig) -> Fx {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("repair");
         setup(&ws);
         env.register_workspace(&ws, true);
-        Fx::start_with(env, ws, fp, watch)
+        Fx::start_with(env, ws, fp, watch, Arc::new(SystemProbe))
     }
 
     /// A core over `env`'s suite state and the workspace `ws`.
     fn start(env: TestEnv, ws: PathBuf, fp: Arc<FailPoints>) -> Fx {
-        Fx::start_with(env, ws, fp, WatchConfig::default())
+        Fx::start_with(env, ws, fp, WatchConfig::default(), Arc::new(SystemProbe))
     }
 
-    fn start_with(env: TestEnv, ws: PathBuf, fp: Arc<FailPoints>, watch: WatchConfig) -> Fx {
-        let probe: Arc<dyn Probe> = Arc::new(SystemProbe);
+    fn start_with(
+        env: TestEnv,
+        ws: PathBuf,
+        fp: Arc<FailPoints>,
+        watch: WatchConfig,
+        probe: Arc<dyn Probe>,
+    ) -> Fx {
         let states = Arc::new(
             StateRegistry::open(
                 &env.env,
@@ -1307,14 +1321,15 @@ async fn a_redirects_file_that_doesnt_parse_stops_accept_move_before_any_write()
     fx.shutdown().await;
 }
 
-#[tokio::test] // spec: CORE-154 (T8 M5)
+#[tokio::test] // spec: CORE-154 (T8 M5, R3)
 async fn a_repair_looks_at_the_place_a_manifest_names_on_disk() {
     // A copy with a UUID of its own is a copy of the live crane. The crane then leaves the
     // workspace while the core runs, unseen (the watcher here never applies a change): the
-    // index still has it live. The repair reconciles the place the copy's manifest names, which
-    // shows the crane gone, so the copy is judged again: another asset held that place, so it
-    // is `invalid` now (T8 round 2), not still a `copy` of a folder that is no longer there.
-    // Nothing is written either way.
+    // index still has it live. The tool refuses either way (`repair.not_needed`: a copy, or
+    // `invalid`), so this guards what the index shows after the call, not the tool's decision:
+    // the repair reconciles the place the copy's manifest names, so afterwards the index shows
+    // the crane gone and the copy `invalid` (another asset held that place, T8 round 2), not
+    // still a `copy` of a folder that is no longer there. Nothing is written.
     let fx = Fx::with_idle_watcher(|ws| {
         crane_copied(ws);
         hand_edit(&asset_dir(ws, COPY), |m| {
@@ -1388,5 +1403,85 @@ async fn a_genuine_move_seen_while_the_core_runs_is_still_moved() {
     structured(fx.accept(ORIGAMI).await);
     assert_eq!(entries(&fx.redirects().unwrap()), 1);
     assert_eq!(fx.ids().await, [ORIGAMI, LAMP]);
+    fx.shutdown().await;
+}
+
+/// The folder name whose listing [`DenyProbe`] refuses (`PermissionDenied`), if any.
+static DENY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// [`SystemProbe`], except that listing the folder named in [`DENY`] fails with
+/// `PermissionDenied`: a folder that is there but can't be read.
+#[derive(Debug)]
+struct DenyProbe;
+
+impl Probe for DenyProbe {
+    fn identity(&self, p: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        SystemProbe.identity(p)
+    }
+    fn volume_info(&self, p: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(p)
+    }
+    fn open_read(&self, p: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(p)
+    }
+    fn long_name(&self, p: &Path) -> std::io::Result<PathBuf> {
+        SystemProbe.long_name(p)
+    }
+    fn reparse_tag(&self, p: &Path) -> std::io::Result<Option<u32>> {
+        SystemProbe.reparse_tag(p)
+    }
+    fn read_dir(&self, dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+        let denied = DENY.lock().unwrap().clone();
+        if let Some(name) = denied
+            && dir.file_name().is_some_and(|n| n.to_string_lossy() == name)
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        SystemProbe.read_dir(dir)
+    }
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 R1)
+async fn an_unreadable_original_is_never_dropped_nor_its_copy_a_move() {
+    // The crane beside a plain copy (same UUID). The crane's folder then can't be listed: the
+    // index marks its files `missing`, but "can't read" is not "gone", so its rows stay, and
+    // the copy's move is never accepted (no redirect sends the crane's refs to the copy).
+    *DENY.lock().unwrap() = None;
+    let fx = Fx::with_probe(crane_copied, Arc::new(DenyProbe));
+    fx.open().await.index.ready().await;
+    assert_eq!(fx.get(COPY).await["repair"]["kind"], "copy");
+    *DENY.lock().unwrap() = Some(CRANE.to_string());
+    fx.reconcile().await;
+    let ids = fx.ids().await;
+    let accepted = fx.accept(COPY).await;
+    let wrote = fx.redirects().is_some();
+    *DENY.lock().unwrap() = None;
+    assert!(ids.contains(&CRANE.to_string()), "{ids:?}");
+    assert!(matches!(accepted, Outcome::Error { .. }), "{accepted:?}");
+    assert!(!wrote, "no redirect");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 R1, part 2)
+async fn accept_move_refuses_while_the_old_folder_is_on_disk_whatever_the_index_says() {
+    // The index believes the crane gone (its folder can't be listed, so its files are
+    // `missing`; the row is kept, with the copy's UUID): the copy reads `moved`. The crane's
+    // folder is still on disk, so accept_move refuses and writes nothing.
+    *DENY.lock().unwrap() = None;
+    let fx = Fx::with_probe(crane_copied, Arc::new(DenyProbe));
+    fx.open().await.index.ready().await;
+    *DENY.lock().unwrap() = Some(CRANE.to_string());
+    fx.reconcile().await;
+    let kind = fx.get(COPY).await["repair"]["kind"].clone();
+    let copy_file = manifest_in(&asset_dir(&fx.ws, COPY));
+    let bytes = std::fs::read(&copy_file).unwrap();
+    let accepted = fx.accept(COPY).await;
+    let wrote = fx.redirects().is_some();
+    *DENY.lock().unwrap() = None;
+    assert_eq!(kind, "moved", "the index believes the old folder gone");
+    let e = error(accepted);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(!wrote, "no redirect");
+    assert_eq!(std::fs::read(&copy_file).unwrap(), bytes, "nothing written");
     fx.shutdown().await;
 }

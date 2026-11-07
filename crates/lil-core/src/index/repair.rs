@@ -16,8 +16,12 @@
 //!   `invalid`: that is another asset's place, and a redirect must never send one asset's refs
 //!   to another (T8 round 2); else, a valid `<project>/<asset_id>`, `moved`, `from` that place
 //!   and `to` the folder; else `invalid`. So `moved` always means no live folder is at `from`
-//!   and the index knows no other asset there. (An original trashed through the suite leaves
-//!   no row, so it isn't seen here; parked for the plan's final review.)
+//!   and the index knows no other asset there. Residuals (parked for the plan's final review):
+//!   an original trashed through the suite leaves no row, so it isn't seen here; and the rule
+//!   reads the index, so the same disk can be judged two ways. Warm, a gone row at `from`
+//!   with another UUID (or none: a legacy asset) makes the folder `invalid`; after a cold
+//!   rebuild no gone row exists and the same folder reads `moved`. A legacy gone row has no
+//!   UUID, so it is never dropped as a move's old place and stays `missing` (ruling T8 R2).
 //! - **Several folders** with one UUID: every one needs repair. Agreeing ones are
 //!   `duplicate_uuid`; a disagreeing one is `copy` with `other` the original when exactly one
 //!   agrees, else `duplicate_uuid` too (neither is clearly the original: you choose).

@@ -11,7 +11,8 @@
 //! other folders with its creation UUID) is reconciled first, so a stale index row never
 //! decides, and the asset's `repair` is read from the index after that.
 //!
-//! - [`accept_move`] (on a `moved` asset, else `repair.not_needed`): (1) appends a redirect
+//! - [`accept_move`] (on a `moved` asset whose old folder is not on disk, whatever the index
+//!   says, else `repair.not_needed`; ruling T8 R1): (1) appends a redirect
 //!   from the old place to the folder, unless the newest redirect from the old place already
 //!   leads there; (2) renames the manifest file to `<asset_id>.manifest.json` when it carries
 //!   another name; (3) sets the manifest's `project` and `asset_id` to the folder. Each step is
@@ -313,6 +314,15 @@ pub async fn accept_move(
         return Err(refuse());
     };
     let from = parse_name(&from).ok_or_else(|| invalid(format!("{from:?} is not a name")))?;
+    // Whatever the index believes, a folder still at the old place (even one that can't be
+    // read) means this is no move: nothing is written (ruling T8 R1).
+    if let Some((_, Some(there))) = spelled_on_disk(store, &from).await {
+        return Err(not_needed(&format!(
+            "Its old folder projects/{}/assets/{there} is still there, so this folder is no \
+             move; project.status says what it is.",
+            from.0
+        )));
+    }
     let uuid = uuid_key(&row);
 
     // (1) The redirect, unless the newest one from the old place already leads here.
