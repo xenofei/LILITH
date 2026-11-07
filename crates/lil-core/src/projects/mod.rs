@@ -39,7 +39,10 @@ pub use active::{
 pub use progress::add_done_entry;
 pub use redirects::{REDIRECTS_YAML, Redirect, append_redirect, read_redirects};
 pub use resolve::{Resolution, Resolved, ResolvedKind, Resolver};
-pub use staleness::{dependents, dependents_of, restore_staleness, stale_ref};
+pub use staleness::{
+    StalenessPlan, apply_staleness, dependents, dependents_of, plan_staleness, restore_staleness,
+    stale_ref,
+};
 
 /// The project statuses `project.yaml` takes (I4).
 pub const PROJECT_STATUSES: &[&str] = &["active", "paused", "archived"];
@@ -193,7 +196,12 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
     // Redirects from the project's names that loop (Appendix H); a redirects file that can't
     // be read needs repair itself, and nothing else of the status depends on it.
     match Resolver::load(&ws.index, &ws.store).await {
-        Ok(resolver) => needs_repair.extend(resolver.broken_from(project)),
+        Ok(resolver) => {
+            if resolver.file_error().is_some() {
+                needs_repair.push(REDIRECTS_YAML.to_string());
+            }
+            needs_repair.extend(resolver.broken_from(project));
+        }
         Err(e) => {
             tracing::warn!(project, error = %e.message, "registry/redirects.yaml can't be read");
             needs_repair.push(REDIRECTS_YAML.to_string());

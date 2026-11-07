@@ -2185,7 +2185,7 @@ impl Shared {
                             serde_json::to_value(&recorded.handoff)
                                 .expect("a hand-off block serialises"),
                         );
-                        map.insert("warnings".into(), Value::from(recorded.warnings));
+                        crate::pipeline::merge_warnings(map, recorded.warnings);
                     }
                 }
                 Err(error) => {

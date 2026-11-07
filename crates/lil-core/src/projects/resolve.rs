@@ -28,6 +28,12 @@
 //! [`Resolver::load`] reads the redirects once, and checks liveness on disk once for every
 //! name the file mentions, so [`Resolver::names_resolving_to`] and [`Resolver::broken_from`]
 //! need no I/O. A name the file doesn't mention is checked when it is first resolved.
+//!
+//! **A redirects file that doesn't parse** blocks only what needs it: `load` keeps its
+//! `manifest.needs_repair` error aside ([`Resolver::file_error`]); a live name still resolves
+//! (step 1 never reads the file), and only a name that would have to follow a redirect gets
+//! that error, never a silent "no redirects". [`Resolver::names_resolving_to`] is then the
+//! asset's own name only. A store error reading the file is a hard error of `load`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -151,6 +157,9 @@ pub struct Resolver<'a> {
     store: &'a Store,
     index: &'a Index,
     redirects: Vec<Redirect>,
+    /// Why the redirects file can't be read as redirects (module docs); its entries are then
+    /// empty.
+    broken: Option<ErrorBody>,
     /// Each `from` and the entry followed from it.
     newest: HashMap<Name, usize>,
     /// Liveness on disk, checked once per name.
@@ -168,19 +177,31 @@ impl std::fmt::Debug for Resolver<'_> {
     }
 }
 
+const DIRECTORY: u32 = 0x10;
+const REPARSE_POINT: u32 = 0x400;
+
+/// Whether `path`, with `attributes`, is a link: a reparse point whose tag names another file
+/// (a junction or symbolic link), as the store decides (`store/write.rs`). Other reparse
+/// points (a OneDrive cloud file or folder, a deduplicated file) hold their own data and are
+/// not links. A tag that can't be read counts as a link (fail closed).
+fn is_link(probe: &dyn Probe, path: &Path, attributes: u32) -> bool {
+    attributes & REPARSE_POINT != 0
+        && probe.reparse_tag(path).map_or(true, |tag| {
+            tag.is_some_and(lil_platform::fs::is_name_surrogate)
+        })
+}
+
 /// Whether `name` has a live folder on disk (module docs): `projects/<p>/assets/<a>/` is a
 /// folder, neither it nor a folder on the way to it is a link (a junction or symbolic link
 /// leads outside the workspace's own folders), and it holds its manifest as the index finds
 /// one, `<asset_id>.manifest.json`, else a `*.manifest.json` (a folder moved, copied or
-/// restored under another name keeps its manifest's file name). Attributes and the folder's
-/// listing only; any failure is not live.
+/// restored under another name keeps its manifest's file name). Attributes, reparse tags and
+/// the folder's listing only; any failure is not live.
 fn on_disk(probe: &dyn Probe, root: &Path, name: &Name) -> bool {
-    const DIRECTORY: u32 = 0x10;
-    const REPARSE_POINT: u32 = 0x400;
     let folder = |rel: String| -> Option<PathBuf> {
         let path = WsPath::parse(&rel).ok()?.abs(root);
         let id = probe.identity(&path).ok()?;
-        (id.attributes & DIRECTORY != 0 && id.attributes & REPARSE_POINT == 0).then_some(path)
+        (id.attributes & DIRECTORY != 0 && !is_link(probe, &path, id.attributes)).then_some(path)
     };
     let (p, a) = (&name.0, &name.1);
     let on_the_way = [
@@ -194,23 +215,37 @@ fn on_disk(probe: &dyn Probe, root: &Path, name: &Name) -> bool {
     let Some(dir) = folder(format!("projects/{p}/assets/{a}")) else {
         return false;
     };
+    manifest_in(probe, &dir, a).is_some()
+}
+
+/// The manifest file of the asset folder `dir` (of `asset_id`) as the index finds it:
+/// `<asset_id>.manifest.json`, else the first `*.manifest.json` directly in it; a file, not a
+/// link.
+fn manifest_in(probe: &dyn Probe, dir: &Path, asset_id: &str) -> Option<String> {
     let is_file = |path: &Path| {
         probe
             .identity(path)
-            .is_ok_and(|id| id.attributes & (DIRECTORY | REPARSE_POINT) == 0)
+            .is_ok_and(|id| id.attributes & DIRECTORY == 0 && !is_link(probe, path, id.attributes))
     };
-    if is_file(&dir.join(format!("{a}.manifest.json"))) {
-        return true;
+    let canonical = format!("{asset_id}.manifest.json");
+    if is_file(&dir.join(&canonical)) {
+        return Some(canonical);
     }
-    probe.read_dir(&dir).is_ok_and(|entries| {
-        entries.flatten().any(|e| {
+    let mut found: Vec<String> = probe
+        .read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
             e.file_name()
                 .to_string_lossy()
                 .to_ascii_lowercase()
                 .ends_with(".manifest.json")
                 && is_file(&e.path())
         })
-    })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    found.into_iter().next()
 }
 
 /// `names`' liveness, checked on a blocking thread.
@@ -315,19 +350,38 @@ fn needs_repair(why: &str) -> ErrorBody {
 }
 
 impl<'a> Resolver<'a> {
+    /// A resolver that reads no redirects file: for what never follows a redirect (a path
+    /// names a place, [`Resolver::resolve_path`]).
+    pub fn without_redirects(index: &'a Index, store: &'a Store) -> Resolver<'a> {
+        Resolver {
+            store,
+            index,
+            redirects: Vec::new(),
+            broken: None,
+            newest: HashMap::new(),
+            live: Mutex::new(HashMap::new()),
+            trash: OnceCell::new(),
+            trash_listed: AtomicBool::new(false),
+        }
+    }
+
     /// Reads the redirects and checks every name they mention on disk (module docs). The
-    /// trash is listed only when a resolution needs it.
+    /// trash is listed only when a resolution needs it. A file that isn't redirects is kept
+    /// aside as [`Resolver::file_error`] (`manifest.needs_repair`, `data: {path:
+    /// "registry/redirects.yaml", why}`), returned by each resolution that needs the file.
     ///
     /// # Errors
-    /// `manifest.needs_repair` (`data: {path: "registry/redirects.yaml", why}`) when the file
-    /// isn't redirects: never read as "no redirects"; the store's read error.
+    /// The store's error reading the file.
     pub async fn load(index: &'a Index, store: &'a Store) -> Result<Resolver<'a>, ErrorBody> {
-        let redirects = match store.read(&redirects_path()).await {
-            Ok(None) => Vec::new(),
-            Ok(Some(bytes)) => std::str::from_utf8(&bytes)
+        let (redirects, broken) = match store.read(&redirects_path()).await {
+            Ok(None) => (Vec::new(), None),
+            Ok(Some(bytes)) => match std::str::from_utf8(&bytes)
                 .map_err(|_| "it is not UTF-8".to_string())
                 .and_then(parse_redirects)
-                .map_err(|why| needs_repair(&why))?,
+            {
+                Ok(redirects) => (redirects, None),
+                Err(why) => (Vec::new(), Some(needs_repair(&why))),
+            },
             Err(e) => return Err(e.to_error("")),
         };
         let mut newest: HashMap<Name, usize> = HashMap::new();
@@ -350,6 +404,7 @@ impl<'a> Resolver<'a> {
             store,
             index,
             redirects,
+            broken,
             newest,
             live: Mutex::new(live),
             trash: OnceCell::new(),
@@ -357,9 +412,21 @@ impl<'a> Resolver<'a> {
         })
     }
 
-    /// The redirects, in file order.
+    /// The redirects, in file order (none when the file doesn't parse).
     pub fn redirects(&self) -> &[Redirect] {
         &self.redirects
+    }
+
+    /// Why the redirects file can't be read as redirects, when it can't
+    /// (`manifest.needs_repair`).
+    pub fn file_error(&self) -> Option<&ErrorBody> {
+        self.broken.as_ref()
+    }
+
+    /// Whether `e` is the redirects file's own error: the resolution needed the file and it
+    /// doesn't parse.
+    pub fn is_file_error(&self, e: &ErrorBody) -> bool {
+        self.broken.as_ref() == Some(e)
     }
 
     /// Whether this resolver has listed the trash (it does so only for a name that ends with
@@ -441,14 +508,20 @@ impl<'a> Resolver<'a> {
     ///
     /// # Errors
     /// `ref.redirect_broken`, `asset.trashed` or `asset.unknown` (module docs), with an empty
-    /// trace id; `store.io` when the trash can't be listed.
+    /// trace id; the file's `manifest.needs_repair` for a name that isn't live while the
+    /// redirects file doesn't parse; `store.io` when the trash can't be listed.
     pub async fn resolve_name(
         &self,
         project: &str,
         asset_id: &str,
     ) -> Result<Resolution, ErrorBody> {
         let start = (project.to_string(), asset_id.to_string());
-        self.is_live(&start).await;
+        let live = self.is_live(&start).await;
+        if let Some(broken) = &self.broken
+            && !live
+        {
+            return Err(broken.clone());
+        }
         match self.walk(&start) {
             Walk::Live(chain) => {
                 let (end, before) = chain.split_last().expect("a chain is never empty");
@@ -499,7 +572,8 @@ impl<'a> Resolver<'a> {
     }
 
     /// Every name that resolves to `project`/`asset_id` through the redirects, that name
-    /// included, sorted (`asset.get`'s `used_by`).
+    /// included, sorted (`asset.get`'s `used_by`); the name alone while the redirects file
+    /// doesn't parse.
     pub fn names_resolving_to(&self, project: &str, asset_id: &str) -> Vec<(String, String)> {
         let target = (project.to_string(), asset_id.to_string());
         let mut found: BTreeSet<Name> = BTreeSet::from([target.clone()]);
@@ -726,10 +800,13 @@ impl<'a> Resolver<'a> {
     /// docs of `tools::ref_tools`): under `projects/<p>/assets/<a>/` of a live asset,
     /// `v<version>/…` is `sealed` (read-only), `candidates/<run>/…` is `candidate`, the folder
     /// or its manifest is `asset`; under `inbox/` it is `inbox`; anything else is `outside`,
-    /// with no project or asset fields. Paths compare the Windows way (case-insensitive,
-    /// `.` and `..` resolved, either separator); one whose real location is outside the
-    /// workspace, through `..` or through a junction or symbolic link, is `outside`. A path
-    /// names a place, so no redirect is followed.
+    /// with no project or asset fields. A `v<version>/…` of a version the asset doesn't have
+    /// is `outside`; the folder's manifest is the one liveness finds (an old file name too).
+    /// Paths compare the Windows way (case-insensitive, either separator, `.` and `..`
+    /// resolved by name after a relative path is joined to the workspace); one whose real
+    /// location is outside the workspace, through `..` or through a junction or symbolic
+    /// link, is `outside`. A path names a place, so no redirect is followed: use
+    /// [`Resolver::without_redirects`].
     ///
     /// # Errors
     /// The store's read error of the asset's versions.
@@ -754,16 +831,24 @@ impl<'a> Resolver<'a> {
             return Ok(Resolved::outside());
         }
         let rest = &parts[4..];
-        let manifest = format!("{}.manifest.json", name.1);
         match rest {
             [] => Ok(Resolved::at(ResolvedKind::Asset, &name)),
-            [m] if m.eq_ignore_ascii_case(&manifest) => Ok(Resolved {
-                file: Some(rel.clone()),
-                ..Resolved::at(ResolvedKind::Asset, &name)
-            }),
+            [m] if self
+                .folder_manifest(&name)
+                .await
+                .is_some_and(|f| m.eq_ignore_ascii_case(&f)) =>
+            {
+                Ok(Resolved {
+                    file: Some(rel.clone()),
+                    ..Resolved::at(ResolvedKind::Asset, &name)
+                })
+            }
             [v, inner @ ..] if v.starts_with(['v', 'V']) && v[1..].parse::<Version>().is_ok() => {
                 let version: Version = v[1..].parse().expect("checked");
-                let sha256 = self.content_hash(&name, version).await?.flatten();
+                // Only a version the asset has is sealed.
+                let Some(sha256) = self.content_hash(&name, version).await? else {
+                    return Ok(Resolved::outside());
+                };
                 let r = AssetRef::Sealed {
                     ws: ws_id.to_string(),
                     project: name.0.clone(),
@@ -802,22 +887,37 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// The file name of the manifest the live folder of `name` holds, as liveness finds it.
+    async fn folder_manifest(&self, name: &Name) -> Option<String> {
+        let (probe, root, name) = (
+            self.store.probe().clone(),
+            self.store.root().to_path_buf(),
+            name.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let dir = WsPath::parse(&format!("projects/{}/assets/{}", name.0, name.1))
+                .ok()?
+                .abs(&root);
+            manifest_in(probe.as_ref(), &dir, &name.1)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// `path` relative to the workspace (`/` separators, the spelling on disk), when its real
     /// location is inside it; `None` otherwise (module docs of [`Resolver::resolve_path`]).
     async fn inside(&self, path: &str) -> Option<String> {
         let root = self.store.root().to_path_buf();
-        // `None` when a `..` climbs out: of the workspace for a relative path.
-        let given = lexical(Path::new(&path.replace('/', "\\")))?;
+        // A relative path is joined to the workspace first, then `.` and `..` are resolved by
+        // name, so one that climbs out and back in is inside. Whether the result is inside is
+        // decided on its real (canonical) location, which also catches a junction or symbolic
+        // link that leads out.
+        let given = PathBuf::from(path.replace('/', "\\"));
         let rooted = given
             .components()
             .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir));
-        let joined = if rooted {
-            given
-        } else if given.components().next().is_none() {
-            return None;
-        } else {
-            root.join(given)
-        };
+        let joined = lexical(&if rooted { given } else { root.join(given) })?;
         tokio::task::spawn_blocking(move || lil_platform::paths::relative_inside(&root, &joined))
             .await
             .ok()

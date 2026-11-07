@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::registry::CallCtx;
 use super::stages::RecordStage;
-use crate::pipeline::{RecordPlan, apply_record};
+use crate::pipeline::{RecordPlan, apply_record, merge_warnings};
 
 /// The workspace Record stage (module docs).
 #[derive(Debug, Clone, Copy, Default)]
@@ -78,13 +78,7 @@ impl RecordStage for WorkspaceRecord {
                     match &mut output.structured {
                         Value::Object(map) => {
                             map.insert("handoff".into(), handoff);
-                            let recorded = recorded.warnings.into_iter().map(Value::from);
-                            match map.get_mut("warnings") {
-                                Some(Value::Array(own)) => own.extend(recorded),
-                                _ => {
-                                    map.insert("warnings".into(), recorded.collect());
-                                }
-                            }
+                            merge_warnings(map, recorded.warnings);
                         }
                         other => {
                             tracing::error!(tool = %d.name, "a recorded result that isn't an object gets no hand-off block");

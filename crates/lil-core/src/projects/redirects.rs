@@ -4,7 +4,8 @@
 //!
 //! [`read_redirects`] reads the file strictly: a file that isn't YAML, whose `redirects` isn't
 //! a list, or with an entry whose `from` or `to` isn't a `<project>/<asset_id>` name, whose
-//! `moved_utc` or `by` isn't a string, or whose `actor` isn't `{kind, …}`, is refused as a
+//! `moved_utc` is missing or not a scalar (any scalar is kept as its text), whose `by` isn't a
+//! string, or whose `actor` isn't `{kind, …}`, is refused as a
 //! whole, never read as "no redirects". No file is an empty list. [`append_redirect`] adds one
 //! entry with the targeted YAML edit (ARCH-076), so comments, key order and the other entries
 //! stay byte for byte; it creates the file when there is none. Who writes a redirect (Task 8's
@@ -91,10 +92,23 @@ fn parse_entry(entry: &Value) -> Result<Redirect, String> {
     Ok(Redirect {
         from: name("from")?,
         to: name("to")?,
-        moved_utc: text("moved_utc")?,
+        moved_utc: moved_utc(map)?,
         by: text("by")?,
         actor,
     })
+}
+
+/// `moved_utc` as written: any scalar is kept as its text (a value that isn't an RFC 3339 UTC
+/// time sorts before any that is, so it never refuses the file); a missing key or a list or
+/// mapping is refused.
+fn moved_utc(map: &Map<String, Value>) -> Result<String, String> {
+    match map.get("moved_utc") {
+        None => Err("`moved_utc` is missing".to_string()),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::Null) => Ok(String::new()),
+        Some(v @ (Value::Number(_) | Value::Bool(_))) => Ok(v.to_string()),
+        Some(_) => Err("`moved_utc` is a list or a mapping, not a time".to_string()),
+    }
 }
 
 fn parse_actor(a: &Map<String, Value>) -> Result<Actor, String> {
@@ -194,6 +208,11 @@ mod tests {
         assert_eq!(read[0].to, ("harbor".into(), "b".into()));
         assert_eq!(read[0].moved_utc, "2026-11-01T10:00:00Z");
         assert_eq!(read[0].actor.as_ref().unwrap().kind, ActorKind::ClaudeCode);
+        // Any scalar `moved_utc` is kept as its text.
+        let odd = "redirects:\n  - {from: s/a, to: s/b, moved_utc: 20261101, by: cli}\n  - {from: s/a, to: s/c, moved_utc: ~, by: cli}\n";
+        let read = parse_redirects(odd).unwrap();
+        assert_eq!(read[0].moved_utc, "20261101");
+        assert_eq!(read[1].moved_utc, "");
         for empty in ["", "# only a comment\n", "redirects:\n", "redirects: []\n"] {
             assert_eq!(parse_redirects(empty).unwrap(), Vec::new(), "{empty:?}");
         }
@@ -206,6 +225,7 @@ mod tests {
             "redirects:\n  - {from: s/a, to: s, moved_utc: t, by: cli}\n",
             "redirects:\n  - {from: s/a, to: s/b/c, moved_utc: t, by: cli}\n",
             "redirects:\n  - {from: s/a, to: s/b, by: cli}\n",
+            "redirects:\n  - {from: s/a, to: s/b, moved_utc: [1], by: cli}\n",
             "redirects:\n  - {from: s/a, to: s/b, moved_utc: t, by: 1}\n",
             "redirects:\n  - {from: s/a, to: s/b, moved_utc: t, by: cli, actor: x}\n",
             "redirects:\n  - {from: s/a, to: s/b, moved_utc: t, by: cli, actor: {task_id: x}}\n",

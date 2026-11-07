@@ -19,7 +19,8 @@
 //!    `projects::Resolver` (ARCH-125): a dependent that names the asset's old place is one of
 //!    its dependents, and a pin of either name pins it. A dependent that can't be read or
 //!    edited, or a redirects file that can't be read, is logged and skipped: the commit has
-//!    happened.
+//!    happened. A redirects file that doesn't parse leaves the asset's own name only, with a
+//!    warning.
 //! 3. Events: `asset:<ref>` `{kind: "candidate_run", run_id}` or
 //!    `{kind: "version_sealed", version}`, `project:<slug>` `{kind: "progress"}`, and
 //!    `{kind: "status", status: "stale"}` on the topic of each asset marked stale.
@@ -133,6 +134,19 @@ impl RecordSlot {
 
     pub fn take(&self) -> Option<RecordPlan> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+/// Puts the Record stage's `warnings` in a recorded result's `structured` object, after the
+/// warnings the tool's own result already lists (such as `asset.import`'s creation warning,
+/// ARCH-125): the inline Record stage and a job's Record step both use it.
+pub fn merge_warnings(structured: &mut Map<String, Value>, recorded: Vec<String>) {
+    let recorded = recorded.into_iter().map(Value::from);
+    match structured.get_mut("warnings") {
+        Some(Value::Array(own)) => own.extend(recorded),
+        _ => {
+            structured.insert("warnings".into(), recorded.collect());
+        }
     }
 }
 
@@ -307,6 +321,14 @@ async fn hand_off_dependents(
             return;
         }
     };
+    if let Some(e) = resolver.file_error() {
+        // Only the asset's own name is checked: refs to its old places can't be followed.
+        tracing::warn!(project = sealed.0, asset = sealed.1, error = %e.message, "the redirects file doesn't parse; dependents by old names weren't checked");
+        warnings.push(format!(
+            "dependents that name this asset's old places weren't checked: {}",
+            e.message
+        ));
+    }
     // The asset and every old name that reaches it (ARCH-125).
     let names = resolver.names_resolving_to(sealed.0, sealed.1);
     let found = match dependents_of(store, index, &names).await {

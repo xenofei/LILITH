@@ -143,8 +143,12 @@ struct Fx {
 
 impl Fx {
     fn with(setup: impl FnOnce(&Path)) -> Fx {
+        Fx::with_probe(Arc::new(SystemProbe), setup)
+    }
+
+    /// [`Fx::with`], the store and index seeing the disk through `probe`.
+    fn with_probe(probe: Arc<dyn Probe>, setup: impl FnOnce(&Path)) -> Fx {
         let env = TestEnv::new();
-        let probe: Arc<dyn Probe> = Arc::new(SystemProbe);
         let ws = env.copy_fixture_workspace("redirects");
         setup(&ws);
         env.register_workspace(&ws, true);
@@ -1066,7 +1070,6 @@ async fn resolve_path_maps_sealed_candidate_inbox_and_outside() {
         format!("projects/{P}/assets/chr_nobody/v1.0.0/x.png"),
         format!("projects/{P}/progress.md"),
         elsewhere.join("x.png").to_string_lossy().into_owned(),
-        format!("../ws-redirects/projects/{P}/assets/{CRANE}/v1.0.0/crane_b.png"),
         r"projects\..\..\elsewhere\x.png".to_string(),
         format!("projects/{P}/assets/chr_linked/v1.0.0/x.png"),
         format!("projects/{P}/assets/chr_linked/chr_linked.manifest.json"),
@@ -1078,6 +1081,20 @@ async fn resolve_path_maps_sealed_candidate_inbox_and_outside() {
             "{outside}"
         );
     }
+    // A path that climbs out of the workspace and back in is inside it.
+    let r = resolve(path(&format!(
+        "../ws-redirects/projects/{P}/assets/{CRANE}/v1.0.0/crane_b.png"
+    )))
+    .await;
+    assert_eq!(r["kind"], "sealed", "{r}");
+    let r = resolve(path(&format!(
+        r"projects\..\..\ws-redirects\.\projects\{P}\assets\{CRANE}"
+    )))
+    .await;
+    assert_eq!(r["kind"], "asset", "{r}");
+    // A version the asset doesn't have isn't sealed (M1).
+    let r = resolve(path(&format!("projects/{P}/assets/{CRANE}/v9.9.9/x.png"))).await;
+    assert_eq!(r["kind"], "outside", "{r}");
     // One of `ref` and `path`.
     for bad in [
         json!({}),
@@ -1191,21 +1208,290 @@ async fn redirects_yaml_keeps_comments_and_order() {
         .unwrap_err();
     assert_eq!(e.to_error("").code, "yaml.unsupported_edit", "{e}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
-    let e = Resolver::load(&open.index, &open.store).await.unwrap_err();
+    // The resolver keeps the file's error aside: a live name still resolves (a live folder
+    // wins without the file); a name that would follow a redirect gets the error.
+    let resolver = Resolver::load(&open.index, &open.store).await.unwrap();
+    let e = resolver.file_error().unwrap().clone();
     assert_eq!(e.code, "manifest.needs_repair", "{e:?}");
     assert_eq!(e.data.as_ref().unwrap()["path"], "registry/redirects.yaml");
     assert!(e.message.contains("entry 1"), "{}", e.message);
+    assert_eq!(resolver.resolve_name(P, LAMP).await.unwrap().asset_id, LAMP);
+    assert_eq!(resolver.resolve_name(P, "chr_x").await.unwrap_err(), e);
+    assert_eq!(
+        resolver.names_resolving_to(P, LAMP),
+        [(P.to_string(), LAMP.to_string())]
+    );
+    drop(resolver);
     drop(open);
-    let e = fx.resolve_err(&fx.sealed(LAMP, "1.0.0")).await;
-    assert_eq!(e.code, "manifest.needs_repair", "{e:?}");
-    let e = fx
-        .err("asset.get", json!({"project": P, "asset_id": LAMP}))
-        .await;
+    let r = fx.resolve(&fx.sealed(LAMP, "1.0.0")).await;
+    assert_eq!(r["asset_id"], LAMP, "{r}");
+    let e = fx.resolve_err(&fx.sealed("chr_x", "1.0.0")).await;
     assert_eq!(e.code, "manifest.needs_repair", "{e:?}");
     let needs_repair = fx.status_needs_repair().await;
     assert!(
         needs_repair.contains(&"registry/redirects.yaml".to_string()),
         "{needs_repair:?}"
     );
+    fx.shutdown().await;
+}
+
+/// A `registry/redirects.yaml` that isn't redirects (entry 1's names aren't lowercase).
+const BROKEN: &str = "redirects:\n  - from: Sketchbook/Chr_X\n    to: nowhere\n";
+
+fn broken_file(ws: &Path) {
+    write_file(&file(ws, "registry/redirects.yaml"), BROKEN.as_bytes());
+}
+
+#[tokio::test] // spec: ARCH-125
+async fn a_broken_redirects_file_blocks_only_what_needs_it() {
+    let fx = Fx::with(|ws| {
+        broken_file(ws);
+        edit_manifest(ws, LAMP, |m| {
+            m["inputs"] = json!([
+                {"ref": format!("{CRANE}@1.0.0"), "role": "reference"},
+                {"ref": "chr_gone@1.0.0", "role": "reference"},
+            ]);
+        });
+    });
+    // `ref.resolve` of a live asset, and of a path (no redirect is read for a path).
+    let r = fx.resolve(&fx.sealed(LAMP, "1.0.0")).await;
+    assert_eq!(r["asset_id"], LAMP, "{r}");
+    let r = fx
+        .ok(
+            "ref.resolve",
+            json!({"path": format!("projects/{P}/assets/{CRANE}/v1.0.0/crane_b.png")}),
+        )
+        .await;
+    assert_eq!(r["kind"], "sealed", "{r}");
+    // Arguments are checked before the file is read.
+    let e = fx.err("ref.resolve", json!({})).await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    // `asset.get` answers: a live input resolves, one that would need the file says so, and
+    // `used_by` is by the asset's own name.
+    let lamp = fx
+        .ok("asset.get", json!({"project": P, "asset_id": LAMP}))
+        .await;
+    assert_eq!(lamp["uses"][0]["resolved"]["asset_id"], CRANE, "{lamp}");
+    assert_eq!(
+        lamp["uses"][1]["error"]["code"], "manifest.needs_repair",
+        "{lamp}"
+    );
+    let crane = fx
+        .ok("asset.get", json!({"project": P, "asset_id": CRANE}))
+        .await;
+    assert_eq!(
+        crane["used_by"],
+        json!([{"ref": "sketchbook/prop_signal_lamp", "kind": "input"}]),
+        "{crane}"
+    );
+    // `asset.pin_input`: the name as written.
+    let pinned = fx
+        .ok(
+            "asset.pin_input",
+            json!({"project": P, "asset_id": LAMP, "ref": format!("{CRANE}@1.0.0"),
+                   "reason": "kept"}),
+        )
+        .await;
+    assert_eq!(pinned["pinned_inputs"][0]["ref"], format!("{CRANE}@1.0.0"));
+    // The file is listed as needing repair.
+    let needs_repair = fx.status_needs_repair().await;
+    assert!(
+        needs_repair.contains(&"registry/redirects.yaml".to_string()),
+        "{needs_repair:?}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-125, CORE-048
+async fn a_broken_redirects_file_fails_a_restore_only_when_an_input_needs_it() {
+    let fx = Fx::with(|ws| {
+        edit_manifest(ws, LAMP, |m| {
+            m["status"] = json!("approved");
+            m["approved_version"] = json!("1.0.0");
+            m["inputs"] = json!([{"ref": format!("{CRANE}@1.0.0"), "role": "reference"}]);
+        });
+    });
+    let yaml = file(&fx.ws, &format!("projects/{P}/project.yaml"));
+    // Every input of a checked asset is live: the restore runs.
+    fx.ok(
+        "project.set_status",
+        json!({"project": P, "status": "archived"}),
+    )
+    .await;
+    broken_file(&fx.ws);
+    let restored = fx
+        .ok(
+            "project.set_status",
+            json!({"project": P, "status": "active"}),
+        )
+        .await;
+    assert_eq!(restored["status"], "active", "{restored}");
+    // An input whose name has no folder needs the file: the restore fails and writes nothing.
+    fx.ok(
+        "project.set_status",
+        json!({"project": P, "status": "archived"}),
+    )
+    .await;
+    edit_manifest(&fx.ws, LAMP, |m| {
+        m["inputs"] = json!([{"ref": "chr_gone@1.0.0", "role": "reference"}]);
+    });
+    let before = std::fs::read(&yaml).unwrap();
+    let e = fx
+        .err(
+            "project.set_status",
+            json!({"project": P, "status": "active"}),
+        )
+        .await;
+    assert_eq!(e.code, "yaml.unsupported_edit", "{e:?}");
+    assert!(
+        e.message.contains("registry/redirects.yaml"),
+        "{}",
+        e.message
+    );
+    assert_eq!(
+        std::fs::read(&yaml).unwrap(),
+        before,
+        "project.yaml is untouched"
+    );
+    // Fixing the file lets it through.
+    write_redirects(&fx.ws, &[]);
+    let restored = fx
+        .ok(
+            "project.set_status",
+            json!({"project": P, "status": "active"}),
+        )
+        .await;
+    assert_eq!(restored["status"], "active", "{restored}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-125
+async fn a_moved_utc_of_any_scalar_sorts_first_and_never_refuses_the_file() {
+    let fx = Fx::with(|ws| {
+        move_asset(ws, CRANE, ORIGAMI);
+        write_file(
+            &file(ws, "registry/redirects.yaml"),
+            format!(
+                "redirects:\n  - {{from: {P}/{CRANE}, to: {P}/{ORIGAMI}, moved_utc: 2026-11-01T10:00:00Z, by: cli}}\n  - {{from: {P}/{CRANE}, to: {P}/chr_lost, moved_utc: 20261231, by: cli}}\n  - {{from: {P}/{CRANE}, to: {P}/chr_lost, moved_utc: true, by: cli}}\n  - {{from: {P}/{CRANE}, to: {P}/chr_lost, moved_utc: ~, by: cli}}\n"
+            )
+            .as_bytes(),
+        );
+    });
+    let r = fx.resolve(&fx.sealed(CRANE, "1.0.0")).await;
+    assert_eq!(r["asset_id"], ORIGAMI, "{r}");
+    let open = fx.open().await;
+    let read = read_redirects(&open.store).await.unwrap();
+    assert_eq!(read[1].moved_utc, "20261231");
+    drop(open);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-019, ARCH-125
+async fn pin_input_follows_redirects_only_for_its_own_workspace() {
+    let fx = Fx::with(|ws| {
+        crane_moved(ws);
+        let mut text = std::fs::read_to_string(file(ws, "registry/redirects.yaml")).unwrap();
+        text.push_str("  - from: harbor/old_wall\n    to: sketchbook/chr_origami\n    moved_utc: 2026-11-01T10:00:00Z\n    by: cli\n");
+        write_file(&file(ws, "registry/redirects.yaml"), text.as_bytes());
+    });
+    let yaml = file(&fx.ws, &format!("projects/{P}/project.yaml"));
+    // Another workspace's harbor/old_wall isn't this one's: it keeps its project as written.
+    fx.ok(
+        "asset.pin_input",
+        json!({"project": P, "asset_id": LAMP,
+               "ref": "lil://0123456789abcdef/harbor/old_wall@1.0.0", "reason": "kept"}),
+    )
+    .await;
+    let text = std::fs::read_to_string(&yaml).unwrap();
+    assert!(text.contains("proj:harbor"), "{text}");
+    fx.shutdown().await;
+
+    // This workspace's own ref follows the redirect into this project: no link.
+    let fx = Fx::with(|ws| {
+        crane_moved(ws);
+        let mut text = std::fs::read_to_string(file(ws, "registry/redirects.yaml")).unwrap();
+        text.push_str("  - from: harbor/old_wall\n    to: sketchbook/chr_origami\n    moved_utc: 2026-11-01T10:00:00Z\n    by: cli\n");
+        write_file(&file(ws, "registry/redirects.yaml"), text.as_bytes());
+    });
+    let yaml = file(&fx.ws, &format!("projects/{P}/project.yaml"));
+    fx.ok(
+        "asset.pin_input",
+        json!({"project": P, "asset_id": LAMP,
+               "ref": format!("lil://{}/harbor/old_wall@1.0.0", fx.ws_id()), "reason": "kept"}),
+    )
+    .await;
+    let text = std::fs::read_to_string(&yaml).unwrap();
+    assert!(text.contains("links: []"), "{text}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: APP-019, CORE-154
+async fn a_live_folder_s_manifest_under_its_old_name_is_the_asset() {
+    let fx = Fx::with(|ws| {
+        outside_rename(&asset_dir(ws, LAMP), &asset_dir(ws, "prop_lamp_two"));
+    });
+    let r = fx
+        .ok(
+            "ref.resolve",
+            json!({"path": format!("projects/{P}/assets/prop_lamp_two/{LAMP}.manifest.json")}),
+        )
+        .await;
+    assert_eq!(r["kind"], "asset", "{r}");
+    assert_eq!(r["asset_id"], "prop_lamp_two", "{r}");
+    assert_eq!(
+        r["file"],
+        format!("projects/{P}/assets/prop_lamp_two/{LAMP}.manifest.json")
+    );
+    // Another manifest-like name there isn't.
+    let r = fx
+        .ok(
+            "ref.resolve",
+            json!({"path": format!("projects/{P}/assets/prop_lamp_two/other.manifest.json")}),
+        )
+        .await;
+    assert_eq!(r["kind"], "outside", "{r}");
+    fx.shutdown().await;
+}
+
+/// A OneDrive (cloud-files) workspace: every folder under `projects` is a reparse point whose
+/// tag is a cloud tag, not a name surrogate, as Files On-Demand folders are.
+#[derive(Debug)]
+struct CloudProbe;
+
+fn cloudy(path: &Path) -> bool {
+    path.to_string_lossy().to_lowercase().contains(r"\projects") && path.is_dir()
+}
+
+impl Probe for CloudProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if cloudy(path) {
+            id.attributes |= 0x400;
+        }
+        Ok(id)
+    }
+    fn volume_info(&self, path: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+    fn reparse_tag(&self, path: &Path) -> std::io::Result<Option<u32>> {
+        if cloudy(path) {
+            return Ok(Some(0x9000_601A)); // IO_REPARSE_TAG_CLOUD_6
+        }
+        SystemProbe.reparse_tag(path)
+    }
+}
+
+#[tokio::test] // spec: ARCH-125
+async fn cloud_reparse_folders_are_live() {
+    let fx = Fx::with_probe(Arc::new(CloudProbe), |_| {});
+    let open = fx.open().await;
+    let resolver = Resolver::load(&open.index, &open.store).await.unwrap();
+    let r = resolver.resolve_name(P, LAMP).await;
+    assert_eq!(r.map(|r| r.asset_id), Ok(LAMP.to_string()));
+    drop(resolver);
+    drop(open);
     fx.shutdown().await;
 }

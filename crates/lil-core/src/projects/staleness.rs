@@ -15,7 +15,13 @@
 //! Every input and pin is resolved through [`Resolver`] (ARCH-125): an input naming an
 //! asset's old place reads the approved version where the asset is now, and a pin of either
 //! name pins it. An input that doesn't resolve (a loop, a dead end, the trash) can't make its
-//! asset stale. A redirects file that can't be read stops the check with its error.
+//! asset stale. A redirects file that doesn't parse fails the check only when an input or a
+//! pin of a checked asset needs it (its name has no live folder): never a silent "no
+//! redirects".
+//!
+//! The check is two steps, [`plan_staleness`] (reads only; every failure happens here) and
+//! [`apply_staleness`] (the manifest edits), so `project.set_status` plans before it writes
+//! `project.yaml` and a failed check writes nothing; [`restore_staleness`] runs both.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,8 +72,8 @@ async fn is_archived(store: &Store, slug: &str) -> bool {
 
 /// The assets whose manifest `inputs` or `pinned_inputs` name `project`/`asset_id`, as
 /// `(project, asset_id)`, sorted, without those in archived projects (I6: "Archived projects
-/// are skipped until restored"). By that name only: [`dependents_of`] takes every name that
-/// resolves to an asset.
+/// are skipped until restored"). By this name only; use [`dependents_of`] with
+/// `Resolver::names_resolving_to`.
 ///
 /// # Errors
 /// `store.io` when the index fails.
@@ -145,12 +151,18 @@ fn target_of(project: &str, link: &LinkRef) -> Option<((String, String), Version
 }
 
 /// Where `target` resolves to; `None` when it doesn't.
-async fn resolved(resolver: &Resolver<'_>, target: &(String, String)) -> Option<(String, String)> {
-    resolver
-        .resolve_name(&target.0, &target.1)
-        .await
-        .ok()
-        .map(|r| (r.project, r.asset_id))
+///
+/// # Errors
+/// The redirects file's own error when the resolution needed the file and it doesn't parse.
+async fn resolved(
+    resolver: &Resolver<'_>,
+    target: &(String, String),
+) -> Result<Option<(String, String)>, StoreError> {
+    match resolver.resolve_name(&target.0, &target.1).await {
+        Ok(r) => Ok(Some((r.project, r.asset_id))),
+        Err(e) if resolver.is_file_error(&e) => Err(redirects_error(&e)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// The first input of `view` that makes it stale, as `(asset_id, approved version, the
@@ -162,7 +174,7 @@ async fn stale_input(
     project: &str,
     view: &ManifestView,
     approved: &mut HashMap<(String, String), Option<Version>>,
-) -> Option<(String, Version, String)> {
+) -> Result<Option<(String, Version, String)>, StoreError> {
     let mut pinned: Vec<(String, String)> = Vec::new();
     for link in view
         .pinned_inputs
@@ -170,7 +182,7 @@ async fn stale_input(
         .filter_map(|p| p.r#ref.parse::<LinkRef>().ok())
     {
         if let Some((target, _)) = target_of(project, &link) {
-            pinned.push(resolved(resolver, &target).await.unwrap_or(target));
+            pinned.push(resolved(resolver, &target).await?.unwrap_or(target));
         }
     }
     for input in &view.inputs {
@@ -180,7 +192,7 @@ async fn stale_input(
         let Some((named, version)) = target_of(project, &link) else {
             continue;
         };
-        let Some(target) = resolved(resolver, &named).await else {
+        let Some(target) = resolved(resolver, &named).await? else {
             continue;
         };
         let now = match approved.get(&target) {
@@ -194,24 +206,30 @@ async fn stale_input(
             }
         };
         if is_stale(&version, now.as_ref(), pinned.contains(&target)) {
-            return now.map(|v| (target.1.clone(), v, input.r#ref.clone()));
+            return Ok(now.map(|v| (target.1.clone(), v, input.r#ref.clone())));
         }
     }
-    None
+    Ok(None)
 }
 
-/// Marks the assets of `project` stale whose inputs moved on while it was archived (module
-/// docs), and returns the refs of those this call marked
-/// (`lil://<ws>/<project>/<asset_id>@<approved version>#sha256=<content hash>`, see
-/// `stale_ref`). Each edit is the store's hash-checked
-/// manifest edit; the status is checked again on the manifest as it is written.
+/// What [`apply_staleness`] marks: per asset of the project, the input that makes it stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalenessPlan {
+    project: String,
+    /// `(asset_id, the input's asset_id, its approved version, the input's ref)`.
+    marks: Vec<(String, String, Version, String)>,
+}
+
+/// The first step of [`restore_staleness`]: which assets of `project` an input moved on for
+/// while it was archived (module docs). Reads only.
 ///
 /// # Errors
-/// `store.io` when the index fails; a store error of a manifest edit.
-pub async fn restore_staleness(
+/// `store.io` when the index fails; the redirects file's error (`yaml.unsupported_edit`, or
+/// `store.io` when it can't be read) when a checked input or pin needs it.
+pub async fn plan_staleness(
     ws: &OpenWorkspace,
     project: &str,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<StalenessPlan, StoreError> {
     ws.index.ready_result().await.map_err(|e| index_error(&e))?;
     let resolver = Resolver::load(&ws.index, &ws.store)
         .await
@@ -222,7 +240,7 @@ pub async fn restore_staleness(
         .await
         .map_err(|e| index_error(&e))?;
     let mut approved: HashMap<(String, String), Option<Version>> = HashMap::new();
-    let mut stale = Vec::new();
+    let mut marks = Vec::new();
     for asset in assets {
         if asset.needs_repair {
             continue;
@@ -237,12 +255,47 @@ pub async fn restore_staleness(
         ) {
             continue;
         }
-        let Some((input, version, input_ref)) =
-            stale_input(&ws.store, &resolver, project, &view, &mut approved).await
-        else {
-            continue;
-        };
-        let Some(rel) = manifest_path(project, &asset.asset_id) else {
+        if let Some((input, version, input_ref)) =
+            stale_input(&ws.store, &resolver, project, &view, &mut approved).await?
+        {
+            marks.push((asset.asset_id.clone(), input, version, input_ref));
+        }
+    }
+    Ok(StalenessPlan {
+        project: project.to_string(),
+        marks,
+    })
+}
+
+/// Marks the assets of `project` stale whose inputs moved on while it was archived (module
+/// docs), and returns the refs of those this call marked
+/// (`lil://<ws>/<project>/<asset_id>@<approved version>#sha256=<content hash>`, see
+/// `stale_ref`): [`plan_staleness`], then [`apply_staleness`].
+///
+/// # Errors
+/// As [`plan_staleness`]; a store error of a manifest edit.
+pub async fn restore_staleness(
+    ws: &OpenWorkspace,
+    project: &str,
+) -> Result<Vec<String>, StoreError> {
+    let plan = plan_staleness(ws, project).await?;
+    apply_staleness(ws, plan).await
+}
+
+/// The second step of [`restore_staleness`]: marks each planned asset stale. Each edit is the
+/// store's hash-checked manifest edit; the status is checked again on the manifest as it is
+/// written, so an asset that changed since the plan is left as it is.
+///
+/// # Errors
+/// A store error of a manifest edit.
+pub async fn apply_staleness(
+    ws: &OpenWorkspace,
+    plan: StalenessPlan,
+) -> Result<Vec<String>, StoreError> {
+    let project = plan.project.as_str();
+    let mut stale = Vec::new();
+    for (asset_id, input, version, input_ref) in plan.marks {
+        let Some(rel) = manifest_path(project, &asset_id) else {
             continue;
         };
         let note = format!("input {input} {version} signed off");
@@ -270,7 +323,7 @@ pub async fn restore_staleness(
             .await?;
         if marked.load(Ordering::SeqCst) {
             let approved = after.view().approved_version;
-            stale.push(stale_ref(&ws.store, &ws.ws.id, project, &asset.asset_id, approved).await);
+            stale.push(stale_ref(&ws.store, &ws.ws.id, project, &asset_id, approved).await);
         }
     }
     Ok(stale)

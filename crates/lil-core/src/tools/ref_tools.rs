@@ -10,8 +10,12 @@
 //!   ref's hash is checked at the end. The ref a `.lilref` file carries is resolved this way.
 //!   Any other text, or a ref of another workspace, is `ref.invalid`.
 //! - `{path}`: an absolute or workspace-relative file path (APP-019), mapped by
-//!   `Resolver::resolve_path`: a sealed file is `read_only`; a path whose real location is
-//!   outside the workspace (through `..`, a junction or a symbolic link) is `outside`.
+//!   `Resolver::resolve_path` without reading the redirects (a path names a place): a sealed
+//!   file is `read_only`; a path whose real location is outside the workspace (through `..`,
+//!   a junction or a symbolic link) is `outside`.
+//!
+//! The arguments are checked first; a redirects file that doesn't parse fails only a `{ref}`
+//! whose name isn't live (`manifest.needs_repair`).
 //!
 //! Exactly one of the two (`params.invalid` otherwise).
 
@@ -77,9 +81,7 @@ fn summary(r: &Resolved) -> String {
 async fn resolve(ctx: &CallCtx, args: ResolveArgs) -> Result<(Resolved, String), ErrorBody> {
     let open = ctx.workspace()?;
     let invalid = |why: &str| ErrorBody::new(&PARAMS_INVALID, why, ctx.trace_id.clone());
-    let resolver = Resolver::load(&open.index, &open.store)
-        .await
-        .map_err(|e| traced(ctx, e))?;
+    // The arguments are checked before anything is read.
     let resolved = match (args.r#ref, args.path) {
         (Some(text), None) => {
             let refused = |why: String| {
@@ -95,6 +97,9 @@ async fn resolve(ctx: &CallCtx, args: ResolveArgs) -> Result<(Resolved, String),
                     open.ws.id
                 )));
             }
+            let resolver = Resolver::load(&open.index, &open.store)
+                .await
+                .map_err(|e| traced(ctx, e))?;
             resolver.resolve_ref(&parsed).await
         }
         (None, Some(path)) => {
@@ -103,7 +108,10 @@ async fn resolve(ctx: &CallCtx, args: ResolveArgs) -> Result<(Resolved, String),
                     "path is 1 to 4096 bytes of UTF-8 with no control character",
                 ));
             }
-            resolver.resolve_path(&open.ws.id, &path).await
+            // A path names a place: the redirects aren't read.
+            Resolver::without_redirects(&open.index, &open.store)
+                .resolve_path(&open.ws.id, &path)
+                .await
         }
         _ => return Err(invalid("give exactly one of ref and path")),
     }

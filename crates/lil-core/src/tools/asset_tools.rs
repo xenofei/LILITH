@@ -59,7 +59,8 @@
 //! - **`asset.pin_input`** needs a ref that parses (`ref.invalid`; a candidate ref is never an
 //!   input), whose target need not exist on this machine. Its target is resolved through
 //!   `projects::Resolver` (ARCH-125): the project it lives in now decides the `links` source
-//!   (one that doesn't resolve counts by its name as written). It pushes
+//!   (one that doesn't resolve, also for a redirects file that doesn't parse, and a ref of
+//!   another workspace count by the name as written). It pushes
 //!   `{ref, reason, by, date}` to `pinned_inputs` (once per ref, as written) and, for a
 //!   `proj:` or `lib:` source the project's `links` lack, appends it there with the
 //!   comment-keeping YAML edit, in Execute (CORE-019).
@@ -1822,12 +1823,16 @@ enum PinTarget {
     Library(String),
     /// An asset of the workspace, by the name the ref gives: `(project, asset_id)`.
     Asset(String, String),
+    /// An asset of another workspace, by its project as written: never followed through this
+    /// workspace's redirects.
+    Foreign(String),
     /// `style@<n>`: the project's own style bible.
     Style,
 }
 
-/// `Err` for text that is neither a link nor a sealed ref.
-fn pin_target(project: &str, r: &str) -> Result<PinTarget, ()> {
+/// `Err` for text that is neither a link nor a sealed ref. A sealed ref of a workspace other
+/// than `ws_id` is [`PinTarget::Foreign`].
+fn pin_target(ws_id: &str, project: &str, r: &str) -> Result<PinTarget, ()> {
     if let Ok(link) = r.parse::<LinkRef>() {
         return Ok(match link {
             LinkRef::Local { asset, .. } => PinTarget::Asset(project.to_string(), asset),
@@ -1837,19 +1842,27 @@ fn pin_target(project: &str, r: &str) -> Result<PinTarget, ()> {
         });
     }
     match r.parse::<AssetRef>() {
-        Ok(AssetRef::Sealed { project, asset, .. }) => Ok(PinTarget::Asset(project, asset)),
+        Ok(AssetRef::Sealed {
+            ws, project, asset, ..
+        }) => Ok(if ws == ws_id {
+            PinTarget::Asset(project, asset)
+        } else {
+            PinTarget::Foreign(project)
+        }),
         // A candidate ref is for viewing only, never an input (ARCH-042).
         Ok(AssetRef::Candidate { .. }) | Err(_) => Err(()),
     }
 }
 
 /// The `links` source a pinned target needs from `project`: `proj:<slug>` for an asset of
-/// another project where it resolves to now (as named when it doesn't resolve), `lib:<item>`
-/// for a library item; `None` otherwise.
+/// another project where it resolves to now (as named when it doesn't resolve, the redirects
+/// file doesn't parse, or it is another workspace's), `lib:<item>` for a library item; `None`
+/// otherwise.
 async fn link_source(resolver: &Resolver<'_>, project: &str, target: PinTarget) -> Option<String> {
     match target {
         PinTarget::Library(item) => Some(format!("lib:{item}")),
         PinTarget::Style => None,
+        PinTarget::Foreign(p) => (p != project).then(|| format!("proj:{p}")),
         PinTarget::Asset(p, asset) => {
             let p = match resolver.resolve_name(&p, &asset).await {
                 Ok(r) => r.project,
@@ -1863,7 +1876,7 @@ async fn link_source(resolver: &Resolver<'_>, project: &str, target: PinTarget) 
 async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), ErrorBody> {
     let a = asset_of(ctx, args.project, &args.asset_id).await?;
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
-    let Ok(target) = pin_target(&a.project, &args.r#ref) else {
+    let Ok(target) = pin_target(&a.open.ws.id, &a.project, &args.r#ref) else {
         let mut e = ErrorBody::new(
             &REF_INVALID,
             "ref is not a link (<asset_id>@<v>, proj:<slug>/<asset_id>@<v>, lib:<item>@<v>, \
