@@ -1045,13 +1045,14 @@ async fn list_columns(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
     use crate::state::{OnFatal, StateScope};
 
-    fn row(id: &str) -> JobRow {
+    /// A queued `waiting` row of kind `k` (also the runner's tests' row).
+    pub(crate) fn row(id: &str) -> JobRow {
         JobRow {
             seq: 0,
             job_id: id.to_string(),

@@ -847,7 +847,8 @@ impl ComfyWithdraw {
                 return WithdrawOutcome::NotPending;
             }
             // A waited-out prompt is asked about at each poll of a paused lane: its waiting
-            // retry logs an outage once (fix round 2), so this one goes to debug.
+            // retry logs an outage once (fix round 2), so a `/queue` read refused or unanswered
+            // in time (audit L1) goes to debug.
             let waited_out = posted.prompt_id.is_none();
             let locked = tokio::time::timeout(LOCKED_WITHIN, async {
                 let queue = match client.queue().await {
@@ -888,6 +889,11 @@ impl ComfyWithdraw {
                 // follow) decide, as for an unanswered delete.
                 Err(_) if posted.deleted.as_deref() == Some(prompt_id) => {
                     tracing::warn!(job_id = %job, prompt_id, "ComfyUI didn't answer the withdrawal's delete in time");
+                }
+                // As for a refused read: the waiting retry logs the outage (audit L1).
+                Err(_) if waited_out => {
+                    tracing::debug!(job_id = %job, prompt_id, "/queue didn't answer in time; the prompt is not withdrawn");
+                    return WithdrawOutcome::NotPending;
                 }
                 Err(_) => {
                     tracing::info!(job_id = %job, prompt_id, "/queue didn't answer in time; the prompt is not withdrawn");

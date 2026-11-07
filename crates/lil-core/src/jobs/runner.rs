@@ -2833,8 +2833,9 @@ impl Shared {
             }
         };
         // The restart hold (P4a-R41): a job that never reached an engine stays queued, so the
-        // next start holds it rather than failing it.
-        if !started && holdable(&row) {
+        // next start holds it rather than failing it. A retry still waiting for the prompt of
+        // the job it re-runs is one, though its attempt runs (audit L2).
+        if (!started || row.waits_for_earlier_prompt()) && holdable(&row) {
             tracing::info!(job_id = %info.id, "a queued job is left queued at shutdown; the next start holds it");
             return;
         }
@@ -2930,10 +2931,14 @@ const DIRECTOR_TASK_KIND: &str = "assistant_task";
 
 /// Whether a restart holds `row` (P4a-R41; Appendix G "Restart hold"): a queued job that never
 /// reached an engine (`waiting`, `waiting_for_vram` or `queue_paused`, and no engine id),
-/// other than a director task and a job the core submitted itself (Checkpoint A M2).
+/// other than a director task and a job the core submitted itself (Checkpoint A M2). A retry
+/// still waiting for the prompt of the job it re-runs (`submitting` with `retry_of` and
+/// `withdrawn_id`, [`JobRow::waits_for_earlier_prompt`]) and no engine id of its own is one
+/// too (audit L2): its prompt id is persisted before it is posted (CORE-120), so it posted
+/// nothing, and its next attempt asks about `withdrawn_id` before it posts.
 fn holdable(row: &JobRow) -> bool {
     row.status == JobStatus::Queued
-        && never_ran(row.substatus)
+        && (never_ran(row.substatus) || row.waits_for_earlier_prompt())
         && row.external_id.is_none()
         && row.kind != DIRECTOR_TASK_KIND
         && !cores_own(row)
@@ -4244,6 +4249,65 @@ mod tests {
     use super::*;
     use lil_platform::fs::SystemProbe;
     use lil_testkit::{FakeClock, SeqIds, TestEnv};
+
+    /// Audit L2 (P4a-R41, CORE-120): the restart hold takes a retry still waiting for the
+    /// prompt of the job it re-runs (it posted nothing of its own), external side effects or
+    /// not, and no other shape it didn't take before: never a job with an engine id of its
+    /// own, a `submitting` job without both `retry_of` and `withdrawn_id`, a job in its engine
+    /// or ending, a director task, or a job the core submitted itself.
+    #[test] // spec: ARCH-022, CORE-160, CORE-120, CORE-128
+    fn the_restart_hold_takes_a_retry_waiting_for_an_earlier_prompt_and_nothing_else_new() {
+        let waiting = |change: &dyn Fn(&mut JobRow)| {
+            let mut r = record::tests::row("j_2");
+            r.status = JobStatus::Queued;
+            r.substatus = Some(Substatus::Submitting);
+            r.retry_of = Some("j_1".into());
+            r.withdrawn_id = Some("p_old".into());
+            change(&mut r);
+            holdable(&r)
+        };
+        assert!(waiting(&|_| {}));
+        assert!(
+            waiting(&|r| r.external_side_effects = true),
+            "nothing of its own was sent"
+        );
+        assert!(!waiting(&|r| r.external_id = Some("p_new".into())));
+        assert!(!waiting(&|r| {
+            r.external_side_effects = true;
+            r.external_id = Some("p_new".into());
+        }));
+        assert!(!waiting(&|r| r.retry_of = None));
+        assert!(!waiting(&|r| r.withdrawn_id = None));
+        for s in [
+            Substatus::QueuedInEngine,
+            Substatus::Executing,
+            Substatus::Ingesting,
+            Substatus::Retrying { attempt: 1, of: 5 },
+            Substatus::Cancelling,
+            Substatus::InterruptedUnknown,
+        ] {
+            assert!(
+                !waiting(&|r| {
+                    r.status = s.status();
+                    r.substatus = Some(s);
+                }),
+                "{}",
+                s.wire()
+            );
+        }
+        assert!(!waiting(&|r| r.kind = DIRECTOR_TASK_KIND.into()));
+        assert!(!waiting(&|r| {
+            r.started_by = Some(StartedBy {
+                surface: Surface::Core,
+                id: None,
+                step: None,
+            });
+        }));
+        // A plain `submitting` job, as before: not held.
+        let mut plain = record::tests::row("j_3");
+        plain.substatus = Some(Substatus::Submitting);
+        assert!(!holdable(&plain));
+    }
 
     /// Runs `t.hold` jobs until they are cancelled.
     struct Hold;

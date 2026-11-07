@@ -3656,3 +3656,155 @@ async fn an_outage_while_paused_is_logged_once() {
     );
     assert_eq!(queue_deletes(&fake), [json!([old])], "deleted once");
 }
+
+/// Audit fix round 1, L1: as [`an_outage_while_paused_is_logged_once`], with a ComfyUI that
+/// takes connections and answers nothing (`hang_http`): each paused poll's withdrawal runs
+/// into its bound on the `/queue` read, and that goes to debug for a waited-out prompt. The
+/// outage is logged once as it starts and once as it ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, ARCH-117
+async fn a_hang_while_paused_is_logged_once() {
+    let Some(logs) = capture_logs("a_hang_while_paused_is_logged_once") else {
+        return;
+    };
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 8, (false, false)).await;
+
+    fake.hang_http(true);
+    let before = fake.requests().len();
+    rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    // Two hung polls: the second's withdrawal has run into its bound once the look after it
+    // was sent.
+    rig.until(&retry, "two hung polls", |_| {
+        let requests = fake.requests();
+        let reads: Vec<usize> = requests[before..]
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.method == "GET" && r.path == "/queue")
+            .map(|(i, _)| before + i)
+            .collect();
+        reads.get(1).is_some_and(|&second| {
+            requests[second..]
+                .iter()
+                .any(|r| r.method == "GET" && bare(&r.path) == format!("/jobs/{old}"))
+        })
+    })
+    .await;
+    let outage = "ComfyUI doesn't answer while the lane is paused";
+    assert_eq!(logs.count("INFO", outage), 1, "logged once as it starts");
+    assert_eq!(
+        logs.count("INFO", "/queue didn't answer in time"),
+        0,
+        "nothing at info per poll"
+    );
+    assert!(logs.count("DEBUG", "/queue didn't answer in time") >= 2);
+
+    fake.hang_http(false);
+    until_withdrawn(&rig, 1).await;
+    assert_eq!(logs.count("INFO", outage), 1);
+    assert_eq!(
+        logs.count("INFO", "ComfyUI answers again"),
+        1,
+        "logged once as it ends"
+    );
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    rig.until(&retry, "its own prompt is in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    fake.release(&outside);
+    assert_eq!(rig.done(&retry).await.status, JobStatus::Succeeded);
+    assert_eq!(
+        posted(&fake).len(),
+        2,
+        "exactly one POST of the retry's own"
+    );
+    assert_eq!(queue_deletes(&fake), [json!([old])], "deleted once");
+}
+
+/// Audit fix round 1, L2 (P4a-R41): a retry waits out the old prompt while the lane is paused
+/// and ComfyUI refuses every connection, so it stays `submitting` (fix round 1, M1). When the
+/// core stops then (`clean`: the drain's shutdown steps; else a crash), the next start holds
+/// it (`restart`) instead of failing it: it never posted a prompt of its own. Released with
+/// ComfyUI up, it asks about the old prompt first and posts exactly once.
+async fn waiting_out_then_restarted(n: u8, clean: bool) {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let ids = Arc::new(SeqIds::new());
+    let rig = Rig::with_ids(&env, ids.clone());
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, n, (false, false)).await;
+
+    fake.refuse_http(true);
+    let before = fake.requests().len();
+    rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    rig.until(&retry, "two refused polls", |_| {
+        queue_reads(&fake, before) >= 2
+    })
+    .await;
+    let row = rig.row(&retry).await;
+    assert_eq!(
+        (row.status, row.substatus, row.external_id.as_deref()),
+        (JobStatus::Queued, Some(Substatus::Submitting), None),
+        "still waiting it out"
+    );
+    assert_eq!(row.withdrawn_id.as_deref(), Some(old.as_str()));
+    if clean {
+        rig.engines.cancel_prompts_step().run().await;
+        rig.jobs.persist_interrupted_step().run().await;
+        let row = rig.row(&retry).await;
+        assert_eq!(row.status, JobStatus::Queued, "left queued: {row:?}");
+    }
+    rig.close().await;
+
+    fake.refuse_http(false);
+    let rig = Rig::with_ids(&env, ids);
+    let marked = rig.jobs.recover_suite().await.unwrap();
+    assert!(marked.is_empty(), "nothing is interrupted: {marked:?}");
+    let held = rig.summary(&retry).await;
+    assert_eq!(
+        (held.status, held.substatus.as_deref()),
+        (JobStatus::Queued, Some("queue_paused"))
+    );
+    assert_eq!(held.pause_reasons, ["restart"]);
+    let posts_before = posted(&fake).len();
+    let from = fake.requests().len();
+    rig.jobs.release_restart_held(Lane::GpuHeavy).await;
+    rig.until(&retry, "the old prompt is asked about", |_| {
+        fake.requests()[from..]
+            .iter()
+            .any(|r| r.method == "GET" && bare(&r.path) == format!("/jobs/{old}"))
+    })
+    .await;
+    assert_eq!(
+        posted(&fake).len(),
+        posts_before,
+        "nothing posted before the look"
+    );
+    // The lane isn't paused in this core: the retry waits the old prompt out, then posts.
+    fake.release(&outside);
+    let done = rig.done(&retry).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    let bodies = posted(&fake);
+    assert_eq!(
+        bodies.len(),
+        2,
+        "exactly one POST of the retry's own: {bodies:?}"
+    );
+    assert_ne!(bodies[1]["prompt_id"], old.as_str());
+    assert!(queue_deletes(&fake).len() <= 1, "never deleted twice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120, ARCH-022
+async fn a_crash_while_waiting_out_during_an_outage_holds_the_retry() {
+    waiting_out_then_restarted(9, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120, ARCH-021
+async fn a_drain_while_waiting_out_during_an_outage_holds_the_retry() {
+    waiting_out_then_restarted(9, true).await;
+}
