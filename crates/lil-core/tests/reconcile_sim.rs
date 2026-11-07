@@ -937,65 +937,121 @@ fn uuid_of(r: &AssetRow) -> Option<String> {
         .flatten()
 }
 
-/// Appendix H's rules, checked row by row against `detect`.
+/// Whether `a` and `b` name one folder (Windows names are case-insensitive).
+fn same_name(a: &(String, String), b: &(String, String)) -> bool {
+    a.0.eq_ignore_ascii_case(&b.0) && a.1.eq_ignore_ascii_case(&b.1)
+}
+
+fn key_of(r: &AssetRow) -> (String, String) {
+    (r.project.clone(), r.asset_id.clone())
+}
+
+fn split(name: &str) -> (String, String) {
+    let (p, a) = name.split_once('/').expect("<project>/<asset_id>");
+    (p.to_string(), a.to_string())
+}
+
+/// Appendix H and the T8 rulings, each stated as a property of the result (not as the
+/// algorithm that computes it):
+/// - `moved {from, to}`: `to` is the folder, its manifest disagrees and names `from`, a valid
+///   name; no live folder is at `from` (case-insensitively) and no other folder holds its UUID;
+/// - `copy {other}`: its manifest disagrees and `other` is another live folder, either the one
+///   agreeing member of its UUID group, or (alone with its UUID) the live folder its manifest
+///   names;
+/// - `duplicate_uuid {other}`: `other` is another folder with its UUID, and it agrees or its
+///   group hasn't exactly one agreeing member;
+/// - legacy or unparsed: never `moved`, `copy` or `duplicate_uuid`;
+/// - and every folder that is healthy by CORE-047 and alone with its UUID needs nothing, every
+///   folder sharing its UUID needs a repair, and a lone disagreeing folder whose manifest names
+///   another valid place with no live folder is `moved`.
 fn check_kinds(rows: &[AssetRow], got: &HashMap<(String, String), RepairKind>) {
+    let live = |n: &(String, String)| rows.iter().any(|o| same_name(&key_of(o), n));
     for r in rows {
-        let kind = got.get(&(r.project.clone(), r.asset_id.clone()));
+        let here = key_of(r);
+        let kind = got.get(&here);
         let canonical = r
             .manifest
             .file_name()
             .eq_ignore_ascii_case(&format!("{}.manifest.json", r.asset_id));
-        let Some(uuid) = uuid_of(r) else {
-            // Legacy or unparsed: never moved, copy or duplicate_uuid.
-            let bad = !agrees(r) || !canonical;
-            assert_eq!(kind, bad.then_some(&RepairKind::Invalid), "{r:?}");
-            continue;
+        let group: Vec<&AssetRow> = match uuid_of(r) {
+            Some(u) => rows
+                .iter()
+                .filter(|o| uuid_of(o).as_ref() == Some(&u))
+                .collect(),
+            None => Vec::new(),
         };
-        let group: Vec<&AssetRow> = rows
-            .iter()
-            .filter(|o| uuid_of(o).as_ref() == Some(&uuid))
-            .collect();
-        if group.len() == 1 {
-            let here = (r.project.clone(), r.asset_id.clone());
-            let want = match place_of(r) {
-                Some(p) if p == here => (!canonical).then_some(RepairKind::Invalid),
-                Some(p)
-                    if lil_schema::is_slug(&p.0)
-                        && lil_schema::is_asset_id(&p.1)
-                        && !(p.0.eq_ignore_ascii_case(&here.0)
-                            && p.1.eq_ignore_ascii_case(&here.1)) =>
-                {
-                    Some(RepairKind::Moved {
-                        from: format!("{}/{}", p.0, p.1),
-                        to: name(r),
-                    })
-                }
-                _ => Some(RepairKind::Invalid),
-            };
-            assert_eq!(kind, want.as_ref(), "{r:?}");
-            continue;
-        }
-        let agreeing: Vec<&&AssetRow> = group.iter().filter(|o| agrees(o)).collect();
         match kind {
+            Some(RepairKind::Moved { from, to }) => {
+                assert_eq!(to, &name(r), "{r:?}");
+                assert!(!agrees(r) && group.len() == 1, "{r:?}");
+                let from = split(from);
+                assert_eq!(place_of(r).as_ref(), Some(&from), "{r:?}");
+                assert!(
+                    lil_schema::is_slug(&from.0) && lil_schema::is_asset_id(&from.1),
+                    "{r:?}"
+                );
+                assert!(
+                    !live(&from),
+                    "moved, but a live folder is at {from:?}: {r:?}"
+                );
+            }
             Some(RepairKind::Copy { other }) => {
                 assert!(!agrees(r), "{r:?}");
-                assert_eq!(agreeing.len(), 1, "{r:?}");
-                assert_eq!(other, &name(agreeing[0]), "{r:?}");
+                let other_row = rows
+                    .iter()
+                    .find(|o| &name(o) == other)
+                    .unwrap_or_else(|| panic!("copy of {other}, no such live folder: {r:?}"));
+                assert_ne!(key_of(other_row), here, "{r:?}");
+                if group.len() > 1 {
+                    let agreeing: Vec<&&AssetRow> = group.iter().filter(|o| agrees(o)).collect();
+                    assert_eq!(agreeing.len(), 1, "{r:?}");
+                    assert_eq!(&name(agreeing[0]), other, "{r:?}");
+                } else {
+                    let place = place_of(r).expect("a copy's manifest parses");
+                    assert!(same_name(&place, &key_of(other_row)), "{r:?}");
+                }
             }
             Some(RepairKind::DuplicateUuid { other }) => {
-                assert!(agrees(r) || agreeing.len() != 1, "{r:?}");
+                assert!(group.len() > 1, "{r:?}");
                 assert!(
                     group.iter().any(|o| &name(o) == other) && other != &name(r),
                     "{r:?}"
                 );
+                let agreeing = group.iter().filter(|o| agrees(o)).count();
+                assert!(agrees(r) || agreeing != 1, "{r:?}");
             }
-            other => panic!("a folder sharing its UUID is {other:?}: {r:?}"),
+            Some(RepairKind::Invalid) | None => {}
+        }
+        if uuid_of(r).is_none() {
+            let bad = !agrees(r) || !canonical;
+            assert_eq!(kind, bad.then_some(&RepairKind::Invalid), "{r:?}");
+            continue;
+        }
+        if group.len() > 1 {
+            assert!(
+                matches!(
+                    kind,
+                    Some(RepairKind::Copy { .. } | RepairKind::DuplicateUuid { .. })
+                ),
+                "a folder sharing its UUID needs a repair: {r:?} {kind:?}"
+            );
+        } else if agrees(r) {
+            assert_eq!(kind, (!canonical).then_some(&RepairKind::Invalid), "{r:?}");
+        } else if let Some(p) = place_of(r)
+            && lil_schema::is_slug(&p.0)
+            && lil_schema::is_asset_id(&p.1)
+            && !same_name(&p, &here)
+            && !live(&p)
+        {
+            assert!(
+                matches!(kind, Some(RepairKind::Moved { .. })),
+                "{r:?} {kind:?}"
+            );
+        } else {
+            assert!(kind.is_some(), "a disagreeing folder needs a repair: {r:?}");
         }
     }
-    let names: BTreeSet<(String, String)> = rows
-        .iter()
-        .map(|r| (r.project.clone(), r.asset_id.clone()))
-        .collect();
+    let names: BTreeSet<(String, String)> = rows.iter().map(key_of).collect();
     assert!(got.keys().all(|k| names.contains(k)), "{got:?}");
 }
 

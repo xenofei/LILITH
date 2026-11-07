@@ -251,8 +251,11 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
 }
 
 /// `project.status`'s `moved` and `duplicates` (Appendix H "Moved and copied folders"), from
-/// the index's `repair` column, workspace-wide (a folder moved from or into another project
-/// counts in both).
+/// the index's `repair` column, workspace-wide: a folder moved from or into another project
+/// counts in both, and a project is matched without regard to case (a folder moved into
+/// `projects/Harbor/` counts under `harbor`; ruling T8 M1). A group of duplicates is the
+/// folders sharing a creation UUID, joined with the folder a `copy` names as its `other` (a
+/// copy with a UUID of its own beside its live original; ruling T8 I1).
 async fn moves_and_copies(
     ws: &OpenWorkspace,
     project: &str,
@@ -262,34 +265,73 @@ async fn moves_and_copies(
         .repairs(&["moved", "copy", "duplicate_uuid"])
         .await
         .map_err(|e| e.to_error(""))?;
+    let ours = |p: &str| p.eq_ignore_ascii_case(project);
     let mut moved = BTreeSet::new();
-    let mut groups: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    // Union-find over `<project>/<asset_id>` names.
+    let mut parent: BTreeMap<String, String> = BTreeMap::new();
+    fn root(parent: &mut BTreeMap<String, String>, n: &str) -> String {
+        let up = parent
+            .entry(n.to_string())
+            .or_insert_with(|| n.to_string())
+            .clone();
+        if up == n {
+            return up;
+        }
+        let top = root(parent, &up);
+        parent.insert(n.to_string(), top.clone());
+        top
+    }
+    let join = |parent: &mut BTreeMap<String, String>, a: &str, b: &str| {
+        let (ra, rb) = (root(parent, a), root(parent, b));
+        if ra != rb {
+            parent.insert(ra, rb);
+        }
+    };
+    let mut by_uuid: BTreeMap<String, String> = BTreeMap::new();
     for row in &rows {
+        let me = format!("{}/{}", row.project, row.asset_id);
         match row.repair.as_ref().and_then(RepairKind::from_json) {
             Some(RepairKind::Moved { from, to }) => {
-                let in_project =
-                    |name: &str| name.split_once('/').is_some_and(|(p, _)| p == project);
+                let in_project = |name: &str| name.split_once('/').is_some_and(|(p, _)| ours(p));
                 if in_project(&from) || in_project(&to) {
                     moved.insert(MovedEntry { from, to });
                 }
             }
-            Some(RepairKind::Copy { .. } | RepairKind::DuplicateUuid { .. }) => {
+            Some(RepairKind::Copy { other } | RepairKind::DuplicateUuid { other }) => {
+                join(&mut parent, &me, &other);
                 if let Some(uuid) = uuid_key(row) {
-                    groups
-                        .entry(uuid)
-                        .or_default()
-                        .insert((row.project.clone(), row.asset_id.clone()));
+                    match by_uuid.get(&uuid) {
+                        Some(first) => {
+                            let first = first.clone();
+                            join(&mut parent, &me, &first);
+                        }
+                        None => {
+                            by_uuid.insert(uuid, me.clone());
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
+    let names: Vec<String> = parent.keys().cloned().collect();
+    let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for n in names {
+        let r = root(&mut parent, &n);
+        groups.entry(r).or_default().insert(n);
+    }
     let duplicates = groups
         .into_values()
-        .filter(|g| g.iter().any(|(p, _)| p == project))
+        .filter(|g| {
+            g.iter()
+                .any(|n| n.split_once('/').is_some_and(|(p, _)| ours(p)))
+        })
         .map(|g| {
             g.into_iter()
-                .map(|(p, a)| format!("projects/{p}/assets/{a}"))
+                .filter_map(|n| {
+                    n.split_once('/')
+                        .map(|(p, a)| format!("projects/{p}/assets/{a}"))
+                })
                 .collect()
         })
         .collect::<BTreeSet<Vec<String>>>()

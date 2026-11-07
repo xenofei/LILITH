@@ -8,10 +8,12 @@
 //! as UUIDs are); a row without one (a legacy manifest) is never in a group, so it is never
 //! `moved`, `copy` or `duplicate_uuid`.
 //!
-//! - **One folder** with the UUID that disagrees: `moved`, `from` the manifest's place, `to` the
-//!   folder, when that place is a valid `<project>/<asset_id>` other than the folder itself
-//!   (compared without regard to case: on Windows a name that differs only by case is the same
-//!   folder); else `invalid`.
+//! - **One folder** with the UUID that disagrees, by the place its manifest names (compared
+//!   without regard to case: on Windows a name that differs only by case is the same folder):
+//!   the folder itself, `invalid`; another **live** folder, `copy` with `other` that folder (it
+//!   is no move: CORE-154's "while its old folder is gone"; ruling T8 I1); else, a valid
+//!   `<project>/<asset_id>`, `moved`, `from` that place and `to` the folder; else `invalid`. So
+//!   `moved` always means no live folder is at `from`.
 //! - **Several folders** with one UUID: every one needs repair. Agreeing ones are
 //!   `duplicate_uuid`; a disagreeing one is `copy` with `other` the original when exactly one
 //!   agrees, else `duplicate_uuid` too (neither is clearly the original: you choose).
@@ -150,6 +152,14 @@ pub fn detect(rows: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
             groups.entry(uuid).or_default().push(row);
         }
     }
+    // The live folders, by their name without regard to case.
+    let live: HashMap<(String, String), (String, String)> = rows
+        .iter()
+        .map(|r| {
+            let f = folder(r);
+            ((f.0.to_ascii_lowercase(), f.1.to_ascii_lowercase()), f)
+        })
+        .collect();
     let mut out = HashMap::new();
     for row in rows {
         let kind = match uuid_key(row) {
@@ -159,7 +169,7 @@ pub fn detect(rows: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
                 group.sort_by_key(|r| folder(r));
                 group.dedup_by_key(|r| folder(r));
                 if group.len() == 1 {
-                    alone(row)
+                    alone(row, &live)
                 } else {
                     Some(in_group(row, &group))
                 }
@@ -172,16 +182,24 @@ pub fn detect(rows: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
     out
 }
 
-/// A folder whose UUID is nowhere else.
-fn alone(row: &AssetRow) -> Option<RepairKind> {
+/// A folder whose UUID is nowhere else; `live` maps each live folder's lowercased name to it.
+fn alone(row: &AssetRow, live: &HashMap<(String, String), (String, String)>) -> Option<RepairKind> {
     if agrees(row) {
         return (!canonical_file(row)).then_some(RepairKind::Invalid);
     }
     let here = folder(row);
     let from = place(row)?;
-    let valid = is_slug(&from.0) && is_asset_id(&from.1);
     let same_folder = from.0.eq_ignore_ascii_case(&here.0) && from.1.eq_ignore_ascii_case(&here.1);
-    Some(if valid && !same_folder {
+    if same_folder {
+        return Some(RepairKind::Invalid);
+    }
+    let lowered = (from.0.to_ascii_lowercase(), from.1.to_ascii_lowercase());
+    if let Some(original) = live.get(&lowered) {
+        return Some(RepairKind::Copy {
+            other: name(original),
+        });
+    }
+    Some(if is_slug(&from.0) && is_asset_id(&from.1) {
         RepairKind::Moved {
             from: name(&from),
             to: name(&here),
@@ -285,6 +303,17 @@ mod tests {
         ]);
         assert_eq!(got[&key("s/b")].as_str(), "duplicate_uuid");
         assert_eq!(got[&key("s/c")].as_str(), "duplicate_uuid");
+        // Alone with its UUID but naming a live folder (any UUID, any case): a copy of it.
+        let got = detect(&[
+            row("s/Orig", ("s", "x"), Some("u2")),
+            row("s/c", ("s", "orig"), Some("u1")),
+        ]);
+        assert_eq!(
+            got[&key("s/c")],
+            RepairKind::Copy {
+                other: "s/Orig".into()
+            }
+        );
         // Legacy: never moved; a disagreeing one is invalid, an agreeing one fine.
         let got = detect(&[row("s/b", ("s", "a"), None), row("s/a", ("s", "a"), None)]);
         assert_eq!(got[&key("s/b")], RepairKind::Invalid);

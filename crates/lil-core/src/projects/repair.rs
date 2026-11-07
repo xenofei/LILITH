@@ -15,14 +15,25 @@
 //!   from the old place to the folder, unless the newest redirect from the old place already
 //!   leads there; (2) renames the manifest file to `<asset_id>.manifest.json` when it carries
 //!   another name; (3) sets the manifest's `project` and `asset_id` to the folder. Each step is
-//!   skipped when done, so a retry after a crash at any point finishes the work and writes no
-//!   second redirect (P4b-R34). Dependents aren't rewritten: they resolve through the redirect.
+//!   skipped when done, so a retry after a crash before or during step (3) finishes the work
+//!   and writes no second redirect (P4b-R34). A retry after a crash *past* step (3) (the
+//!   manifest edit landed, the call failed after it) finds the asset healthy and answers
+//!   `repair.not_needed`: the work is done, and no `moved` event is published again (ruling
+//!   T8 M2). Dependents aren't rewritten: they resolve through the redirect. Then the index
+//!   drops the old place's rows, a folder the move left behind (ruling T8 I2), also when step
+//!   (3) found its work done.
 //! - [`make_independent`] (on a `copy` or `duplicate_uuid` asset, else `repair.not_needed`):
 //!   renames the manifest file as (2), then gives the manifest a fresh `creation_uuid` from the
-//!   store's id source and sets its `project` and `asset_id` to the folder.
+//!   store's id source and sets its `project` and `asset_id` to the folder. "That copy" is the
+//!   one to change (CORE-154): the one agreeing folder of a group whose other members are its
+//!   copies is refused with `repair.not_needed`, naming the copies; when every folder of the
+//!   group agrees, or none does, any of them may be chosen (ruling T8 I1).
 //!
-//! The manifest edit re-checks that the manifest still has the creation UUID (and, for a move,
-//! the place) the decision was made on; one changed meanwhile is `store.hash_conflict`.
+//! Both decide and write under the lock of the folder's creation UUID
+//! ([`Store::creation_uuid_lock`]), taken after a first look and followed by a second one, so
+//! two repairs of one group of folders never both act on the same view (ruling T8 M3). The
+//! manifest edit re-checks that the manifest still has the creation UUID (and, for a move, the
+//! place) the decision was made on; one changed meanwhile is `store.hash_conflict`.
 
 use lil_platform::fs::Probe;
 use lil_protocol::ErrorBody;
@@ -34,7 +45,7 @@ use serde_json::Value;
 
 use super::redirects::{Redirect, append_redirect, parse_name};
 use super::resolve::Resolver;
-use crate::index::repair::{RepairKind, uuid_key};
+use crate::index::repair::{RepairKind, agrees, uuid_key};
 use crate::index::{AssetRow, Index, Scope};
 use crate::store::{Store, StoreError, WsPath};
 
@@ -285,12 +296,21 @@ pub async fn accept_move(
     actor: Option<Actor>,
 ) -> Result<AcceptedMove, ErrorBody> {
     let to: Name = (project.to_string(), asset_id.to_string());
-    let row = settled_row(index, store, &to).await?;
-    let Some(RepairKind::Moved { from, .. }) = kind_of(&row) else {
-        return Err(not_needed(
+    let refuse = || {
+        not_needed(
             "asset.accept_move accepts a folder moved outside the suite (project.status lists \
              them under moved).",
-        ));
+        )
+    };
+    let first = settled_row(index, store, &to).await?;
+    let Some(group) = uuid_key(&first) else {
+        return Err(refuse());
+    };
+    let lock = store.creation_uuid_lock(&group);
+    let _decided = lock.lock().await;
+    let row = settled_row(index, store, &to).await?;
+    let Some(RepairKind::Moved { from, .. }) = kind_of(&row) else {
+        return Err(refuse());
     };
     let from = parse_name(&from).ok_or_else(|| invalid(format!("{from:?} is not a name")))?;
     let uuid = uuid_key(&row);
@@ -344,6 +364,13 @@ pub async fn accept_move(
         .edit_manifest(&rel, &edit)
         .await
         .map_err(|e| store_error(&e))?;
+    // The old place is now known to be a folder the move left behind: the index drops it,
+    // also when step (3) found its work done (no store event then).
+    index
+        .reconcile(Scope::Paths(vec![dir_of(&from)?]))
+        .await
+        .map_err(|e| e.to_error(""))?;
+    index.refresh_repairs().await.map_err(|e| e.to_error(""))?;
     Ok(AcceptedMove {
         from,
         to,
@@ -371,6 +398,12 @@ pub async fn make_independent(
              (project.status lists them under duplicates).",
         )
     };
+    let first = settled_row(index, store, &here).await?;
+    let Some(group) = uuid_key(&first) else {
+        return Err(refuse());
+    };
+    let lock = store.creation_uuid_lock(&group);
+    let _decided = lock.lock().await;
     let row = settled_row(index, store, &here).await?;
     if !matches!(
         kind_of(&row),
@@ -379,6 +412,26 @@ pub async fn make_independent(
         return Err(refuse());
     }
     let uuid = uuid_key(&row);
+    // The one agreeing folder of a group whose others are its copies: change a copy instead.
+    if agrees(&row) {
+        let me = format!("{}/{}", here.0, here.1);
+        let copies: Vec<String> = index
+            .repairs(&["copy"])
+            .await
+            .map_err(|e| e.to_error(""))?
+            .iter()
+            .filter(|r| uuid_key(r) == uuid)
+            .filter(|r| matches!(kind_of(r), Some(RepairKind::Copy { other }) if other == me))
+            .map(|r| format!("{}/{}", r.project, r.asset_id))
+            .collect();
+        if !copies.is_empty() {
+            return Err(not_needed(&format!(
+                "{me} is the original: its manifest names its own folder, so the copy to make \
+                 independent is {}.",
+                copies.join(", ")
+            )));
+        }
+    }
     let fresh = store.ids().uuid();
     let rel = rename_manifest(store, &row).await?;
     let (target, new_uuid, at) = (here.clone(), fresh.clone(), rel.clone());

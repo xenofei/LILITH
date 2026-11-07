@@ -793,6 +793,21 @@ impl Index {
             .await
     }
 
+    /// Recomputes every asset's `repair` (and drops the rows of folders a move left behind) as a
+    /// reconcile does after a change ([`repair`]); index only.
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn refresh_repairs(&self) -> Result<(), IndexError> {
+        self.db
+            .call(move |conn| {
+                let tx = conn.transaction().map_err(|e| sql(&e))?;
+                reconcile::refresh_repairs(&tx).map_err(|e| sql(&e))?;
+                tx.commit().map_err(|e| sql(&e))
+            })
+            .await
+    }
+
     /// Every asset that needs a repair of `kind` (`moved`, `copy`, `duplicate_uuid` or
     /// `invalid`; [`repair`]), workspace-wide, by project and asset id (`project.status`'s
     /// `moved` and `duplicates`, the repair tools).
@@ -1079,8 +1094,9 @@ impl Index {
     pub async fn set_state(&self, path: &WsPath, state: FileState) -> Result<(), IndexError> {
         let key = path_key(path.as_str());
         lock(&self.mismatched).remove(&key);
-        // A manifest gone `missing` (or back) changes which asset folders are live.
-        let manifest = kind_of(path) == FileKind::Manifest;
+        // A manifest gone `missing` (or back) changes which asset folders are live, and a file
+        // gone `missing` may complete a gone folder (ruling T8 I2).
+        let manifest = kind_of(path) == FileKind::Manifest || state == FileState::Missing;
         self.db
             .call(move |conn| {
                 let tx = conn.transaction().map_err(|e| sql(&e))?;

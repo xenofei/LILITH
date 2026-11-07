@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a3ff6fb0810e9d395f971c708afbc7a3638cf58c7bc757941a84c7a95d5d0c86 # shrinks to folders = [Folder { project: 0, asset: 3, place: (Some(1), None), uuid: Some(0), parses: true, canonical: false }, Folder { project: 1, asset: 3, place: (None, None), uuid: None, parses: false, canonical: false }]

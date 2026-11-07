@@ -11,6 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use lil_core::events::EventBus;
 use lil_core::index::Scope;
@@ -18,6 +19,7 @@ use lil_core::session::Session;
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
+use lil_core::watch::WatchConfig;
 use lil_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{Probe, SystemProbe};
 use lil_platform::{Clock, IdSource};
@@ -130,15 +132,33 @@ impl Fx {
     }
 
     fn with_fp(setup: impl FnOnce(&Path), fp: Arc<FailPoints>) -> Fx {
+        Fx::build(setup, fp, WatchConfig::default())
+    }
+
+    /// [`Fx::with`], with a watcher that collects changes for an hour: it never applies one
+    /// during the test, so the index sees an outside change only when a call reconciles it.
+    fn with_idle_watcher(setup: impl FnOnce(&Path)) -> Fx {
+        let watch = WatchConfig {
+            batch: Duration::from_secs(3600),
+            ..WatchConfig::default()
+        };
+        Fx::build(setup, FailPoints::none(), watch)
+    }
+
+    fn build(setup: impl FnOnce(&Path), fp: Arc<FailPoints>, watch: WatchConfig) -> Fx {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("repair");
         setup(&ws);
         env.register_workspace(&ws, true);
-        Fx::start(env, ws, fp)
+        Fx::start_with(env, ws, fp, watch)
     }
 
     /// A core over `env`'s suite state and the workspace `ws`.
     fn start(env: TestEnv, ws: PathBuf, fp: Arc<FailPoints>) -> Fx {
+        Fx::start_with(env, ws, fp, WatchConfig::default())
+    }
+
+    fn start_with(env: TestEnv, ws: PathBuf, fp: Arc<FailPoints>, watch: WatchConfig) -> Fx {
         let probe: Arc<dyn Probe> = Arc::new(SystemProbe);
         let states = Arc::new(
             StateRegistry::open(
@@ -158,7 +178,7 @@ impl Fx {
             ids.clone(),
             fp,
             probe.clone(),
-            lil_core::watch::WatchConfig::default(),
+            watch,
         );
         let gates = Arc::new(TestGates::new());
         let reg = core_registry(
@@ -307,6 +327,17 @@ impl Fx {
             json!({"project": P, "asset_id": asset}),
         )
         .await
+    }
+
+    /// The project's asset ids, as `assets.query` lists them.
+    async fn ids(&self) -> Vec<String> {
+        let page = self.ok("assets.query", json!({"project": P})).await;
+        page["assets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{page}"))
+            .iter()
+            .map(|a| a["asset_id"].as_str().unwrap().to_string())
+            .collect()
     }
 
     fn redirects(&self) -> Option<String> {
@@ -718,6 +749,12 @@ async fn a_moved_folder_back_to_its_place_clears_moved() {
     let status = fx.status().await;
     assert_eq!(status["moved"], json!([]), "{status}");
     assert_eq!(status["duplicates"], json!([]), "{status}");
+    assert_eq!(
+        status["missing"],
+        json!([]),
+        "no ghost of the other name: {status}"
+    );
+    assert_eq!(fx.ids().await, [CRANE, LAMP]);
     let crane = fx.get(CRANE).await;
     assert!(crane["repair"].is_null(), "{crane}");
     assert_eq!(crane["needs_repair"], false);
@@ -735,6 +772,8 @@ async fn a_moved_folder_back_to_its_place_clears_moved() {
     assert_eq!(entries(&fx.redirects().unwrap()), 2);
     let crane = fx.get(CRANE).await;
     assert!(crane["repair"].is_null(), "{crane}");
+    assert_eq!(fx.ids().await, [CRANE, LAMP], "no ghost of chr_origami");
+    assert_eq!(fx.status().await["missing"], json!([]));
     // Both old names reach the crane.
     for name in [CRANE, ORIGAMI] {
         let r = fx
@@ -965,11 +1004,11 @@ async fn a_stale_index_row_never_decides() {
     fx.shutdown().await;
 }
 
-#[tokio::test] // spec: CORE-154, CORE-047
-async fn a_manifest_edited_by_hand_is_judged_again_at_the_next_reconcile() {
-    // Only the copy's manifest changes (its creation UUID, by hand): the copy is then alone
-    // with its UUID and names the crane's place, so it is `moved` (Appendix H), and the crane
-    // needs no repair any more.
+#[tokio::test] // spec: CORE-154, CORE-047 (T8 I1, probe P8)
+async fn a_copy_with_a_hand_edited_uuid_is_a_copy_of_its_live_original() {
+    // Only the copy's manifest changes (its creation UUID, by hand): it is then alone with its
+    // UUID, but the place its manifest names is a live folder, so it is no move (CORE-154:
+    // "while its old folder is gone") but a copy of that folder; the crane needs no repair.
     let fx = Fx::with(crane_copied);
     assert_eq!(fx.get(COPY).await["repair"]["kind"], "copy");
     hand_edit(&asset_dir(&fx.ws, COPY), |m| {
@@ -979,23 +1018,196 @@ async fn a_manifest_edited_by_hand_is_judged_again_at_the_next_reconcile() {
     let crane = fx.get(CRANE).await;
     assert!(crane["repair"].is_null(), "{crane}");
     assert_eq!(crane["needs_repair"], false, "{crane}");
-    assert_eq!(fx.get(COPY).await["repair"]["kind"], "moved");
-    let status = fx.status().await;
-    assert_eq!(status["duplicates"], json!([]), "{status}");
     assert_eq!(
-        status["moved"],
-        json!([moved_entry(CRANE, COPY)]),
+        fx.get(COPY).await["repair"],
+        json!({"kind": "copy", "other": format!("{P}/{CRANE}")})
+    );
+    let status = fx.status().await;
+    assert_eq!(status["moved"], json!([]), "{status}");
+    assert_eq!(
+        status["duplicates"],
+        json!([[
+            format!("projects/{P}/assets/{CRANE}"),
+            format!("projects/{P}/assets/{COPY}")
+        ]]),
         "{status}"
     );
+    assert_eq!(error(fx.accept(COPY).await).code, "repair.not_needed");
+    assert!(fx.redirects().is_none());
+    // The copy's repair is making it independent.
+    structured(fx.independent(COPY).await);
+    assert!(fx.get(COPY).await["repair"].is_null());
+    assert_eq!(fx.status().await["duplicates"], json!([]));
     fx.shutdown().await;
 }
 
-#[tokio::test] // spec: CORE-154
-async fn accept_move_right_after_an_outside_rename_looks_at_the_disk() {
-    // The folder is renamed while the core runs and the move accepted at once, before any
-    // rescan may have seen it: the old folder's row still looks live in the index, which
-    // would make the new folder a copy. The repair reconciles the folders it depends on first.
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 I1, probe P8b)
+async fn an_original_that_leaves_never_sends_its_refs_to_a_copy() {
+    let fx = Fx::with(crane_copied);
+    hand_edit(&asset_dir(&fx.ws, COPY), |m| {
+        m["creation_uuid"] = json!("11111111-2222-4333-8444-555555555555");
+    });
+    fx.reconcile().await;
+    assert_eq!(error(fx.accept(COPY).await).code, "repair.not_needed");
+    assert!(
+        fx.redirects().is_none(),
+        "no redirect from the live original"
+    );
+    outside_rename(&asset_dir(&fx.ws, CRANE), &file(&fx.ws, "elsewhere_crane"));
+    fx.reconcile().await;
+    let r = fx
+        .call(
+            "ref.resolve",
+            json!({"ref": format!("lil://{}/{P}/{CRANE}@1.0.0", fx.ws_id())}),
+        )
+        .await;
+    if let Outcome::Ok(out) = &r {
+        assert_ne!(
+            out.structured["asset_id"], COPY,
+            "the crane's refs reach the copy: {r:?}"
+        );
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 I1, probe P10)
+async fn make_independent_refuses_the_original_of_a_clear_copy() {
+    let fx = Fx::with(crane_copied);
+    let crane_bytes = std::fs::read(manifest_in(&asset_dir(&fx.ws, CRANE))).unwrap();
+    let e = error(fx.independent(CRANE).await);
+    assert_eq!(e.code, "repair.not_needed", "{e:?}");
+    assert!(
+        e.message.contains(&format!("{P}/{COPY}")),
+        "names the copy to change instead: {}",
+        e.message
+    );
+    assert_eq!(
+        std::fs::read(manifest_in(&asset_dir(&fx.ws, CRANE))).unwrap(),
+        crane_bytes
+    );
+    assert_eq!(fx.get(COPY).await["repair"]["kind"], "copy");
+    // The copy is the one to change.
+    structured(fx.independent(COPY).await);
+    assert!(fx.get(CRANE).await["repair"].is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, CORE-038 (T8 I2, probe P13)
+async fn an_accepted_move_leaves_no_ghost_across_reconciles_and_a_restart() {
     let fx = Fx::with(|_| {});
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    structured(fx.accept(ORIGAMI).await);
+    for _ in 0..3 {
+        fx.reconcile().await;
+    }
+    let fx = fx.restart().await;
+    fx.reconcile().await;
+    assert!(fx.get(ORIGAMI).await["repair"].is_null());
+    assert_eq!(entries(&fx.redirects().unwrap()), 1);
+    assert_eq!(fx.ids().await, [ORIGAMI, LAMP]);
+    let status = fx.status().await;
+    assert_eq!(status["missing"], json!([]), "{status}");
+    assert_eq!(status["needs_repair"], json!([]), "{status}");
+    let e = fx
+        .err("asset.get", json!({"project": P, "asset_id": CRANE}))
+        .await;
+    assert_eq!(e.code, "asset.unknown", "no \"Put it back\": {e:?}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-038, CORE-154 (T8 I2)
+async fn a_folder_gone_with_its_uuid_nowhere_stays_missing() {
+    // No live folder holds the crane's creation UUID: it is lost, not moved, and stays listed
+    // with its files `missing` and the advice to put it back.
+    let fx = Fx::with(|_| {});
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &file(&fx.ws, "elsewhere_crane"));
+    fx.reconcile().await;
+    let fx = fx.restart().await;
+    fx.reconcile().await;
+    assert_eq!(fx.ids().await, [CRANE, LAMP]);
+    let status = fx.status().await;
+    let manifest = format!("projects/{P}/assets/{CRANE}/{CRANE}.manifest.json");
+    assert!(
+        status["missing"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(manifest)),
+        "{status}"
+    );
+    let e = fx
+        .err("asset.get", json!({"project": P, "asset_id": CRANE}))
+        .await;
+    assert_eq!(e.code, "manifest.needs_repair", "{e:?}");
+    assert!(e.message.contains("Put it back"), "{}", e.message);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 M1, probe P5)
+async fn a_move_into_a_project_folder_spelled_by_case_is_listed_there() {
+    let fx = Fx::with(|ws| {
+        write_file(
+            &file(ws, "projects/Harbor/project.yaml"),
+            b"name: Harbor\nslug: harbor\ntype: media\nstatus: active\nlinks: []\ncreated: 2026-10-01\n",
+        );
+        outside_mkdir(&file(ws, "projects/Harbor/assets"));
+        outside_rename(&asset_dir(ws, CRANE), &asset_dir_in(ws, "Harbor", CRANE));
+    });
+    let entry = json!({"from": format!("{P}/{CRANE}"), "to": format!("Harbor/{CRANE}")});
+    assert_eq!(fx.status().await["moved"], json!([entry.clone()]));
+    assert_eq!(fx.status_of("harbor").await["moved"], json!([entry]));
+    let e = fx
+        .err(
+            "asset.accept_move",
+            json!({"project": "harbor", "asset_id": CRANE}),
+        )
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(fx.redirects().is_none());
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 M3, probe P14)
+async fn concurrent_repairs_of_one_uuid_group_never_both_succeed() {
+    // Both folders agree: either may be made independent, but only one of them.
+    let fx = Fx::with(|ws| {
+        crane_copied(ws);
+        let dir = asset_dir(ws, COPY);
+        outside_rename(
+            &dir.join(format!("{CRANE}.manifest.json")),
+            &dir.join(format!("{COPY}.manifest.json")),
+        );
+        hand_edit(&dir, |m| m["asset_id"] = json!(COPY));
+    });
+    let (a, b) = tokio::join!(fx.independent(CRANE), fx.independent(COPY));
+    let ok = [&a, &b]
+        .iter()
+        .filter(|o| matches!(o, Outcome::Ok(_)))
+        .count();
+    assert_eq!(ok, 1, "{a:?} / {b:?}");
+    let refused = if matches!(a, Outcome::Ok(_)) { b } else { a };
+    assert_eq!(error(refused).code, "repair.not_needed");
+    let uuids: Vec<Value> = [CRANE, COPY]
+        .iter()
+        .map(|x| read_json(&manifest_in(&asset_dir(&fx.ws, x)))["creation_uuid"].clone())
+        .collect();
+    assert!(
+        uuids.contains(&json!(CRANE_UUID)),
+        "one keeps it: {uuids:?}"
+    );
+    assert_ne!(uuids[0], uuids[1]);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 M5)
+async fn accept_move_right_after_an_outside_rename_looks_at_the_disk() {
+    // The folder is renamed while the core runs and the move accepted before any rescan saw it
+    // (the watcher here never applies a change): the old folder's row still looks live in the
+    // index, which would make the new folder a copy. The repair reconciles the folders it
+    // depends on (the place its manifest names) first.
+    let fx = Fx::with_idle_watcher(|_| {});
     fx.open().await.index.ready().await;
     outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, ORIGAMI));
     let r = structured(fx.accept(ORIGAMI).await);
@@ -1030,9 +1242,10 @@ async fn the_index_judges_a_manifest_edited_alone_again() {
     index.reconcile(Scope::All).await.expect("a reconcile");
     let crane = index.asset(P, CRANE).await.unwrap().unwrap();
     assert!(crane.repair.is_none() && !crane.needs_repair, "{crane:?}");
+    // Alone with its UUID now, but naming the live crane: a copy of it (T8 I1).
     assert_eq!(
         kind(index.asset(P, COPY).await.unwrap()).as_deref(),
-        Some("moved")
+        Some("copy")
     );
     index.close();
     drop(index);
@@ -1041,27 +1254,35 @@ async fn the_index_judges_a_manifest_edited_alone_again() {
     }
 }
 
-#[tokio::test] // spec: CORE-154
+#[tokio::test] // spec: CORE-154 (T8 M5)
 async fn a_case_only_rename_beside_a_copy_adds_no_folder_to_the_index() {
-    // The original renamed by case only, and a copy of it: neither agrees, so both are
-    // `duplicate_uuid`. Making the copy independent looks at the original's folder by the
-    // name it has on disk, so the index never gains a second row for the same folder.
-    let fx = Fx::with(|ws| {
+    // The original renamed by case only (`invalid`), and a copy of it with a UUID of its own
+    // (`copy` of the original's live folder). The original's manifest then changes while the
+    // core runs, unseen (the watcher here never applies a change). Making the copy independent
+    // reconciles the original's folder by the name it has on disk: reconciled by the name the
+    // copy's manifest gives, its changed manifest would be indexed as a second asset.
+    let fx = Fx::with_idle_watcher(|ws| {
         crane_copied(ws);
+        hand_edit(&asset_dir(ws, COPY), |m| {
+            m["creation_uuid"] = json!("11111111-2222-4333-8444-555555555555");
+        });
         outside_rename(&asset_dir(ws, CRANE), &asset_dir(ws, "Chr_Paper_Crane"));
     });
-    assert_eq!(fx.get(COPY).await["repair"]["kind"], "duplicate_uuid");
+    assert_eq!(
+        fx.get(COPY).await["repair"],
+        json!({"kind": "copy", "other": format!("{P}/Chr_Paper_Crane")})
+    );
+    hand_edit(&asset_dir(&fx.ws, "Chr_Paper_Crane"), |m| {
+        m["notes"] = json!("edited while the core runs");
+    });
     structured(fx.independent(COPY).await);
+    assert_eq!(fx.ids().await, ["Chr_Paper_Crane", COPY, LAMP]);
     let page = fx.ok("assets.query", json!({"project": P})).await;
-    let ids: Vec<&str> = page["assets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["asset_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids, ["Chr_Paper_Crane", COPY, LAMP], "{page}");
-    let original = page["assets"][0]["repair"].clone();
-    assert_eq!(original, json!({"kind": "invalid"}), "{page}");
+    assert_eq!(
+        page["assets"][0]["repair"],
+        json!({"kind": "invalid"}),
+        "{page}"
+    );
     assert!(fx.get(COPY).await["repair"].is_null());
     fx.shutdown().await;
 }
@@ -1083,5 +1304,25 @@ async fn a_redirects_file_that_doesnt_parse_stops_accept_move_before_any_write()
         "the manifest is untouched"
     );
     assert_eq!(fx.get(ORIGAMI).await["repair"]["kind"], "moved");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 M5)
+async fn a_repair_looks_at_the_place_a_manifest_names_on_disk() {
+    // A copy with a UUID of its own is a copy of the live crane. The crane then leaves the
+    // workspace while the core runs, unseen (the watcher here never applies a change): the
+    // index still has it live. Only reconciling the place the copy's manifest names shows it
+    // gone, so the copy is alone (`moved`) and accept_move goes ahead.
+    let fx = Fx::with_idle_watcher(|ws| {
+        crane_copied(ws);
+        hand_edit(&asset_dir(ws, COPY), |m| {
+            m["creation_uuid"] = json!("11111111-2222-4333-8444-555555555555");
+        });
+    });
+    assert_eq!(fx.get(COPY).await["repair"]["kind"], "copy");
+    outside_rename(&asset_dir(&fx.ws, CRANE), &file(&fx.ws, "elsewhere_crane"));
+    let r = structured(fx.accept(COPY).await);
+    assert_eq!(r["redirect"]["from"], format!("{P}/{CRANE}"), "{r}");
+    assert!(fx.get(COPY).await["repair"].is_null());
     fx.shutdown().await;
 }

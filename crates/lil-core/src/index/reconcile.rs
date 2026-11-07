@@ -1137,9 +1137,16 @@ fn repair_input(r: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
 
 /// Recomputes every asset row's `repair` and `needs_repair` (CORE-154; [`repair`]): `detect`
 /// over the live rows, those whose manifest isn't `missing` (a folder that is gone holds no
-/// creation UUID); a row whose manifest is missing has no `repair` and keeps the CORE-047
-/// check alone as `needs_repair`. Only rows that change are written. It reads and writes the
-/// index only, never a manifest: nothing is repaired by itself.
+/// creation UUID). A gone folder (its manifest `missing`):
+/// - whose creation UUID a live folder holds, with every file it still has a row for
+///   `missing`, is the old place of a move, not a lost asset (ruling T8 I2): its asset row and
+///   every row under it (files, tags, takes, edges, expected files, text) leave the index, so
+///   it isn't listed, its files aren't `missing` and nothing says to put it back;
+/// - else it keeps today's `missing` listing, with no `repair` and the CORE-047 check alone as
+///   `needs_repair`.
+///
+/// Only rows that change are written. It reads and writes the index only, never a manifest:
+/// nothing is repaired by itself.
 pub(super) fn refresh_repairs(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let missing: HashSet<String> = tx
         .prepare_cached("SELECT key FROM files WHERE state = 'missing' AND kind = 'other'")?
@@ -1157,6 +1164,31 @@ pub(super) fn refresh_repairs(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         .into_iter()
         .partition(|r| !missing.contains(&path_key(r.manifest.as_str())));
     let found = repair::detect(&live);
+    let live_uuids: HashSet<String> = live.iter().filter_map(repair::uuid_key).collect();
+    let live_folders: HashSet<String> = live
+        .iter()
+        .map(|r| path_key(&format!("projects/{}/assets/{}", r.project, r.asset_id)))
+        .collect();
+    let mut kept = Vec::with_capacity(gone.len());
+    for row in gone {
+        let folder = path_key(&format!("projects/{}/assets/{}", row.project, row.asset_id));
+        let moved_away = repair::uuid_key(&row).is_some_and(|u| live_uuids.contains(&u))
+            && !live_folders.contains(&folder);
+        let all_missing = moved_away
+            && tx
+                .prepare_cached(&format!(
+                    "SELECT count(*) FROM files WHERE {UNDER} AND state != 'missing'"
+                ))?
+                .query_row(params![folder], |r| r.get::<_, i64>(0))?
+                == 0;
+        if all_missing {
+            tx.execute(&format!("DELETE FROM files WHERE {UNDER}"), params![folder])?;
+            delete_assets_under(tx, &folder)?;
+        } else {
+            kept.push(row);
+        }
+    }
+    let gone = kept;
     let mut update = tx.prepare_cached(
         "UPDATE assets SET repair = ?3, needs_repair = ?4 WHERE project = ?1 AND asset_id = ?2",
     )?;
