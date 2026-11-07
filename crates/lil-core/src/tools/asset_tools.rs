@@ -13,6 +13,8 @@
 //! | `asset.pin_input` | write | `{project?, asset_id, ref, reason}` | `{pinned_inputs}` |
 //! | `asset.deprecate` | write | `{project?, asset_id, deprecated}` | `{status}` |
 //! | `asset.mark` | write | `{project?, asset_id, run_id?, take?, file?, tags?, add_tags?, remove_tags?, rating?, label?, flag?, review_view?}` | `{tags, rating, label, take?: {run_id, take, flag, rating}}` |
+//! | `asset.accept_move` | write | `{project?, asset_id}` | `{project, asset_id, redirect: {from, to}}` |
+//! | `asset.make_independent` | write | `{project?, asset_id}` | `{creation_uuid}` |
 //!
 //! - **`asset.import`, `copy`**: an asset without a manifest gets `Manifest::new` with a fresh
 //!   `creation_uuid` (CORE-047). Each file (an absolute path) is copied into a staging handle
@@ -91,6 +93,17 @@
 //!   names a run, else the asset's. Nothing changed writes and publishes nothing. No jobs log
 //!   line, no `progress.md` entry, no status change. `review_view` is validated and stored
 //!   nowhere until the pick log.
+//! - **`asset.accept_move`** and **`asset.make_independent`** (CORE-154; Appendix H "Moved and
+//!   copied folders"; P4b-R34) repair an asset folder moved or copied outside the suite, as
+//!   `projects::repair` does them, on the asset at its folder: a folder (or project) whose name
+//!   isn't valid, also by case only, is `params.invalid` saying to rename it first, before
+//!   anything is written; an asset that doesn't need the repair is `repair.not_needed`. Each
+//!   holds the asset's version lock around its writes. `accept_move` records the redirect with
+//!   `by` the caller (`pipeline::status_by`; no `actor` until attribution, Task 15), and
+//!   publishes `{kind: "moved", from, to}` (names `<project>/<asset_id>`) on the asset's topic
+//!   at its new name, on `project:<slug>`, and on the old project's topic when that differs.
+//!   `make_independent` publishes `{kind: "manifest"}` on the asset's topic. Neither runs by
+//!   itself: no reconcile, watch event or restart changes a moved or copied asset.
 //!
 //! Every status change goes through `lil_schema::change_status`, which logs one status-log
 //! entry in the same manifest edit, `by` the caller (`pipeline::status_by`).
@@ -126,6 +139,7 @@ use crate::pipeline::{
     signed_off_by, start_candidate_run, status_by,
 };
 use crate::projects::redirects::{name_of, read_redirects};
+use crate::projects::repair as folder_repair;
 use crate::projects::{
     ProjectFile, REDIRECTS_YAML, Resolver, project_yaml_path, read_project, unknown_project,
 };
@@ -169,6 +183,15 @@ const DEPRECATE_DESCRIPTION: &str = "Deprecate an asset (deprecated: true): its 
     becomes deprecated, every file stays and its dependents keep working. deprecated: false \
     returns it to the status it had before. Reversible; the change is in its status log.";
 
+const ACCEPT_MOVE_DESCRIPTION: &str = "Accept that an asset folder was moved or renamed outside \
+    LILITH (project.status lists it under moved): records a redirect from the old place in \
+    registry/redirects.yaml, so old refs keep resolving, then sets the manifest's project and \
+    asset_id to the folder. Dependents are not rewritten. Name the asset by its new folder; on \
+    an asset that wasn't moved it fails with repair.not_needed.";
+const MAKE_INDEPENDENT_DESCRIPTION: &str = "Make a copied asset folder independent \
+    (project.status lists folders that share a creation UUID under duplicates): gives it a new \
+    creation_uuid and sets its manifest's project and asset_id to its folder; the other folder \
+    keeps its UUID. On an asset that isn't such a copy it fails with repair.not_needed.";
 const PIN_INPUT_DESCRIPTION: &str = "Pin an input of an asset, so a newer version of it \
     doesn't make the asset stale: ref is a link (<asset_id>@<v>, proj:<slug>/<asset_id>@<v>, \
     lib:<item>@<v>, style@<n>) or a lil:// ref to a sealed version; its target need not exist \
@@ -413,6 +436,25 @@ struct DeprecateArgs {
     asset_id: String,
     /// true deprecates; false returns to the status before.
     deprecated: bool,
+}
+
+/// `asset.accept_move`'s redirect: names `<project>/<asset_id>`.
+#[derive(Debug, Serialize, JsonSchema)]
+struct RedirectNames {
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct AcceptMoveResult {
+    project: String,
+    asset_id: String,
+    redirect: RedirectNames,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct MakeIndependentResult {
+    creation_uuid: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1818,6 +1860,81 @@ async fn mark(ctx: &CallCtx, args: MarkArgs) -> Result<(MarkResult, String), Err
     Ok((result, summary))
 }
 
+/// The asset folder a repair tool works on: its name checked as a folder's
+/// (`folder_repair::check_folder`), then as any call's.
+async fn repair_target(ctx: &CallCtx, args: AssetArgs, tool: &str) -> Result<Asset, ErrorBody> {
+    let project = args.project.unwrap_or_else(|| ctx.project_or_default());
+    let open = ctx.workspace()?.clone();
+    folder_repair::check_folder(&open.store, &project, &args.asset_id, tool)
+        .await
+        .map_err(|e| traced(ctx, e))?;
+    asset_of(ctx, Some(project), &args.asset_id).await
+}
+
+async fn accept_move(
+    ctx: &CallCtx,
+    args: AssetArgs,
+) -> Result<(AcceptMoveResult, String), ErrorBody> {
+    let a = repair_target(ctx, args, "asset.accept_move").await?;
+    let by = status_by(&ctx.session.caller);
+    // The asset's version lock, as `asset.signoff` holds it from its seal to its manifest
+    // edit: the repair never lands between the two.
+    let guard = a
+        .store()
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
+    let done = folder_repair::accept_move(
+        &a.open.index,
+        a.store(),
+        &a.project,
+        &a.asset_id,
+        by.as_str(),
+        None,
+    )
+    .await
+    .map_err(|e| traced(ctx, e))?;
+    drop(guard);
+    let (from, to) = (name_of(&done.from), name_of(&done.to));
+    let event = json!({"kind": "moved", "from": from, "to": to});
+    ctx.events.publish(&a.topic(), event.clone());
+    ctx.events
+        .publish(&format!("project:{}", done.to.0), event.clone());
+    if done.from.0 != done.to.0 {
+        ctx.events
+            .publish(&format!("project:{}", done.from.0), event);
+    }
+    let summary = format!("accepted the move of {from} to {to}");
+    Ok((
+        AcceptMoveResult {
+            project: a.project.clone(),
+            asset_id: a.asset_id.clone(),
+            redirect: RedirectNames { from, to },
+        },
+        summary,
+    ))
+}
+
+async fn make_independent(
+    ctx: &CallCtx,
+    args: AssetArgs,
+) -> Result<(MakeIndependentResult, String), ErrorBody> {
+    let a = repair_target(ctx, args, "asset.make_independent").await?;
+    let guard = a
+        .store()
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
+    let creation_uuid =
+        folder_repair::make_independent(&a.open.index, a.store(), &a.project, &a.asset_id)
+            .await
+            .map_err(|e| traced(ctx, e))?;
+    drop(guard);
+    ctx.events.publish(&a.topic(), json!({"kind": "manifest"}));
+    let summary = format!("{} has its own creation UUID now", a.asset_id);
+    Ok((MakeIndependentResult { creation_uuid }, summary))
+}
+
 /// What a pinned ref names from `project`.
 enum PinTarget {
     Library(String),
@@ -1958,7 +2075,8 @@ async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), 
 }
 
 /// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,
-/// `asset.pin_input`, `asset.deprecate` and `asset.mark` (module `workspace`).
+/// `asset.pin_input`, `asset.deprecate`, `asset.mark`, `asset.accept_move` and
+/// `asset.make_independent` (module `workspace`).
 pub fn register_asset_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "asset.import",
@@ -2008,5 +2126,19 @@ pub fn register_asset_tools(reg: &mut Registry) {
         EffectClass::Write,
         WORKSPACE_MODULE,
         |ctx, args: MarkArgs| Box::pin(mark(ctx, args)),
+    ));
+    reg.register(typed_tool(
+        "asset.accept_move",
+        ACCEPT_MOVE_DESCRIPTION,
+        EffectClass::Write,
+        WORKSPACE_MODULE,
+        |ctx, args: AssetArgs| Box::pin(accept_move(ctx, args)),
+    ));
+    reg.register(typed_tool(
+        "asset.make_independent",
+        MAKE_INDEPENDENT_DESCRIPTION,
+        EffectClass::Write,
+        WORKSPACE_MODULE,
+        |ctx, args: AssetArgs| Box::pin(make_independent(ctx, args)),
     ));
 }

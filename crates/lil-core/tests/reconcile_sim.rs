@@ -22,11 +22,21 @@
 //! - no orphan is deleted;
 //! - no store write happens while `index.lock` exists.
 //!
+//! A second property covers moved and copied asset folders (CORE-154, CORE-047): over random
+//! sets of live asset folders (names, the places their manifests name, creation UUIDs in any
+//! case or none, manifests that don't parse or carry an old file name), `index::repair::detect`
+//! gives each folder the repair Appendix H says, whatever the rows' order, and accepting each
+//! move and making each copy independent, as the two tools do, always ends with no folder
+//! `moved`, `copy` or `duplicate_uuid`.
+//!
 //! The case count comes from `test-params.toml` (`lil_testkit::params::proptest_cases`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lil_core::index::FileKind;
+use std::collections::HashMap;
+
+use lil_core::index::repair::{RepairKind, detect_known};
+use lil_core::index::{AssetRow, FileKind};
 use lil_core::store::{Expect, WriteDecision, WsPath, decide_write};
 use lil_core::watch::reconcile::{Action, Observed, Recorded, decide};
 use proptest::prelude::*;
@@ -811,6 +821,290 @@ impl Model {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Moved and copied folders (CORE-154).
+// ---------------------------------------------------------------------------------------------
+
+/// Names drawn from: valid ones, and one that isn't a valid asset id (`B`, which differs from
+/// `b` only by case).
+const PROJECTS: [&str; 2] = ["s", "t"];
+const IDS: [&str; 5] = ["a", "b", "c", "d", "B"];
+const UUIDS: [&str; 3] = ["u1", "U1", "u2"];
+
+/// One live asset folder: its folder, the place its manifest names (`None` per key: absent),
+/// its creation UUID, whether the manifest parses and whether it carries its folder's file
+/// name; or, `gone`, a folder the index still knows (its manifest `missing`).
+#[derive(Debug, Clone)]
+struct Folder {
+    project: usize,
+    asset: usize,
+    place: (Option<usize>, Option<usize>),
+    uuid: Option<usize>,
+    parses: bool,
+    canonical: bool,
+    gone: bool,
+}
+
+fn folder() -> impl Strategy<Value = Folder> {
+    (
+        0..PROJECTS.len(),
+        0..IDS.len(),
+        (
+            prop::option::weighted(0.8, 0..PROJECTS.len()),
+            prop::option::weighted(0.8, 0..IDS.len()),
+        ),
+        prop::option::weighted(0.8, 0..UUIDS.len()),
+        prop::bool::weighted(0.9),
+        prop::bool::weighted(0.8),
+        prop::bool::weighted(0.25),
+    )
+        .prop_map(
+            |(project, asset, place, uuid, parses, canonical, gone)| Folder {
+                project,
+                asset,
+                place,
+                uuid,
+                parses,
+                canonical,
+                gone,
+            },
+        )
+}
+
+fn asset_row(f: &Folder) -> AssetRow {
+    let (proj, id) = (PROJECTS[f.project], IDS[f.asset]);
+    let file = if f.canonical { id } else { "old" };
+    AssetRow {
+        project: proj.into(),
+        asset_id: id.into(),
+        asset_type: None,
+        status: None,
+        version: None,
+        approved_version: None,
+        manifest: p(&format!("projects/{proj}/assets/{id}/{file}.manifest.json")),
+        creation_uuid: f.uuid.map(|u| UUIDS[u].to_string()),
+        updated: 0,
+        needs_repair: false,
+        tags: Vec::new(),
+        rating: 0,
+        label: None,
+        runs_waiting: 0,
+        external: false,
+        working_doc: false,
+        display: None,
+        last_change: None,
+        repair: None,
+        manifest_project: f.place.0.map(|i| PROJECTS[i].to_string()),
+        manifest_asset_id: f.place.1.map(|i| IDS[i].to_string()),
+        manifest_parses: f.parses,
+    }
+}
+
+/// The live folders and the gone ones the index still knows (one row per folder name: Windows
+/// names are case-insensitive).
+fn rows_of(folders: &[Folder]) -> (Vec<AssetRow>, Vec<AssetRow>) {
+    let mut seen = BTreeSet::new();
+    let (mut live, mut gone) = (Vec::new(), Vec::new());
+    for f in folders {
+        let r = asset_row(f);
+        if seen.insert((
+            r.project.to_ascii_lowercase(),
+            r.asset_id.to_ascii_lowercase(),
+        )) {
+            if f.gone { gone.push(r) } else { live.push(r) }
+        }
+    }
+    (live, gone)
+}
+
+fn name(r: &AssetRow) -> String {
+    format!("{}/{}", r.project, r.asset_id)
+}
+
+fn place_of(r: &AssetRow) -> Option<(String, String)> {
+    r.manifest_parses.then(|| {
+        (
+            r.manifest_project
+                .clone()
+                .unwrap_or_else(|| r.project.clone()),
+            r.manifest_asset_id
+                .clone()
+                .unwrap_or_else(|| r.asset_id.clone()),
+        )
+    })
+}
+
+fn agrees(r: &AssetRow) -> bool {
+    place_of(r) == Some((r.project.clone(), r.asset_id.clone()))
+}
+
+fn uuid_of(r: &AssetRow) -> Option<String> {
+    r.manifest_parses
+        .then(|| r.creation_uuid.as_ref().map(|u| u.to_ascii_lowercase()))
+        .flatten()
+}
+
+/// Whether `a` and `b` name one folder (Windows names are case-insensitive).
+fn same_name(a: &(String, String), b: &(String, String)) -> bool {
+    a.0.eq_ignore_ascii_case(&b.0) && a.1.eq_ignore_ascii_case(&b.1)
+}
+
+fn key_of(r: &AssetRow) -> (String, String) {
+    (r.project.clone(), r.asset_id.clone())
+}
+
+fn split(name: &str) -> (String, String) {
+    let (p, a) = name.split_once('/').expect("<project>/<asset_id>");
+    (p.to_string(), a.to_string())
+}
+
+/// Appendix H and the T8 rulings, each stated as a property of the result (not as the
+/// algorithm that computes it):
+/// - `moved {from, to}`: `to` is the folder, its manifest disagrees and names `from`, a valid
+///   name; no live folder is at `from` (case-insensitively), no other folder holds its UUID,
+///   and the index knows no gone asset at `from` with another creation UUID (a redirect never
+///   sends one asset's refs to another; T8 round 2);
+/// - `copy {other}`: its manifest disagrees and `other` is another live folder, either the one
+///   agreeing member of its UUID group, or (alone with its UUID) the live folder its manifest
+///   names;
+/// - `duplicate_uuid {other}`: `other` is another folder with its UUID, and it agrees or its
+///   group hasn't exactly one agreeing member;
+/// - legacy or unparsed: never `moved`, `copy` or `duplicate_uuid`;
+/// - and every folder that is healthy by CORE-047 and alone with its UUID needs nothing, every
+///   folder sharing its UUID needs a repair, and a lone disagreeing folder whose manifest names
+///   another valid place with no live folder is `moved` when the index knows no other asset
+///   there, else `invalid`.
+fn check_kinds(rows: &[AssetRow], gone: &[AssetRow], got: &HashMap<(String, String), RepairKind>) {
+    let live = |n: &(String, String)| rows.iter().any(|o| same_name(&key_of(o), n));
+    // A gone asset at `n` whose creation UUID isn't `uuid`.
+    let other_gone = |n: &(String, String), uuid: &Option<String>| {
+        gone.iter()
+            .any(|o| same_name(&key_of(o), n) && &uuid_of(o) != uuid)
+    };
+    for r in rows {
+        let here = key_of(r);
+        let kind = got.get(&here);
+        let canonical = r
+            .manifest
+            .file_name()
+            .eq_ignore_ascii_case(&format!("{}.manifest.json", r.asset_id));
+        let group: Vec<&AssetRow> = match uuid_of(r) {
+            Some(u) => rows
+                .iter()
+                .filter(|o| uuid_of(o).as_ref() == Some(&u))
+                .collect(),
+            None => Vec::new(),
+        };
+        match kind {
+            Some(RepairKind::Moved { from, to }) => {
+                assert_eq!(to, &name(r), "{r:?}");
+                assert!(!agrees(r) && group.len() == 1, "{r:?}");
+                let from = split(from);
+                assert_eq!(place_of(r).as_ref(), Some(&from), "{r:?}");
+                assert!(
+                    lil_schema::is_slug(&from.0) && lil_schema::is_asset_id(&from.1),
+                    "{r:?}"
+                );
+                assert!(
+                    !live(&from),
+                    "moved, but a live folder is at {from:?}: {r:?}"
+                );
+                assert!(
+                    !other_gone(&from, &uuid_of(r)),
+                    "moved, but the index knows another asset at {from:?}: {r:?} {gone:?}"
+                );
+            }
+            Some(RepairKind::Copy { other }) => {
+                assert!(!agrees(r), "{r:?}");
+                let other_row = rows
+                    .iter()
+                    .find(|o| &name(o) == other)
+                    .unwrap_or_else(|| panic!("copy of {other}, no such live folder: {r:?}"));
+                assert_ne!(key_of(other_row), here, "{r:?}");
+                if group.len() > 1 {
+                    let agreeing: Vec<&&AssetRow> = group.iter().filter(|o| agrees(o)).collect();
+                    assert_eq!(agreeing.len(), 1, "{r:?}");
+                    assert_eq!(&name(agreeing[0]), other, "{r:?}");
+                } else {
+                    let place = place_of(r).expect("a copy's manifest parses");
+                    assert!(same_name(&place, &key_of(other_row)), "{r:?}");
+                }
+            }
+            Some(RepairKind::DuplicateUuid { other }) => {
+                assert!(group.len() > 1, "{r:?}");
+                assert!(
+                    group.iter().any(|o| &name(o) == other) && other != &name(r),
+                    "{r:?}"
+                );
+                let agreeing = group.iter().filter(|o| agrees(o)).count();
+                assert!(agrees(r) || agreeing != 1, "{r:?}");
+            }
+            Some(RepairKind::Invalid) | None => {}
+        }
+        if uuid_of(r).is_none() {
+            let bad = !agrees(r) || !canonical;
+            assert_eq!(kind, bad.then_some(&RepairKind::Invalid), "{r:?}");
+            continue;
+        }
+        if group.len() > 1 {
+            assert!(
+                matches!(
+                    kind,
+                    Some(RepairKind::Copy { .. } | RepairKind::DuplicateUuid { .. })
+                ),
+                "a folder sharing its UUID needs a repair: {r:?} {kind:?}"
+            );
+        } else if agrees(r) {
+            assert_eq!(kind, (!canonical).then_some(&RepairKind::Invalid), "{r:?}");
+        } else if let Some(p) = place_of(r)
+            && lil_schema::is_slug(&p.0)
+            && lil_schema::is_asset_id(&p.1)
+            && !same_name(&p, &here)
+            && !live(&p)
+        {
+            if other_gone(&p, &uuid_of(r)) {
+                assert_eq!(kind, Some(&RepairKind::Invalid), "{r:?} {gone:?}");
+            } else {
+                assert!(
+                    matches!(kind, Some(RepairKind::Moved { .. })),
+                    "{r:?} {kind:?}"
+                );
+            }
+        } else {
+            assert!(kind.is_some(), "a disagreeing folder needs a repair: {r:?}");
+        }
+    }
+    let names: BTreeSet<(String, String)> = rows.iter().map(key_of).collect();
+    assert!(got.keys().all(|k| names.contains(k)), "{got:?}");
+}
+
+/// Applies what `asset.accept_move` (a `moved` folder) and `asset.make_independent` (a `copy`
+/// or `duplicate_uuid` one) do, one folder at a time, until none is `moved`, `copy` or
+/// `duplicate_uuid`: true when that is reached within one repair per folder.
+fn repair_all(rows: &mut [AssetRow], gone: &[AssetRow]) -> bool {
+    for fresh in 0..=rows.len() {
+        let got = detect_known(rows, gone);
+        let Some((i, kind)) = rows.iter().enumerate().find_map(|(i, r)| {
+            got.get(&(r.project.clone(), r.asset_id.clone()))
+                .filter(|k| !matches!(k, RepairKind::Invalid))
+                .map(|k| (i, k.clone()))
+        }) else {
+            return true;
+        };
+        let r = &mut rows[i];
+        r.manifest_project = Some(r.project.clone());
+        r.manifest_asset_id = Some(r.asset_id.clone());
+        r.manifest = p(&format!(
+            "projects/{}/assets/{}/{}.manifest.json",
+            r.project, r.asset_id, r.asset_id
+        ));
+        if !matches!(kind, RepairKind::Moved { .. }) {
+            r.creation_uuid = Some(format!("fresh-{fresh}"));
+        }
+    }
+    false
+}
+
 fn config() -> ProptestConfig {
     ProptestConfig::with_cases(lil_testkit::params::proptest_cases())
 }
@@ -826,5 +1120,25 @@ proptest! {
             model.check(op);
         }
         model.converged();
+    }
+
+    #[test] // spec: CORE-154, CORE-047
+    fn moved_and_copied_folders_follow_appendix_h(
+        folders in prop::collection::vec(folder(), 1..8),
+    ) {
+        let (rows, gone) = rows_of(&folders);
+        let got = detect_known(&rows, &gone);
+        check_kinds(&rows, &gone, &got);
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        let mut gone_reversed = gone.clone();
+        gone_reversed.reverse();
+        prop_assert_eq!(
+            &detect_known(&reversed, &gone_reversed),
+            &got,
+            "the rows' order doesn't matter"
+        );
+        let mut fixed = rows;
+        prop_assert!(repair_all(&mut fixed, &gone), "the two repairs always suffice");
     }
 }

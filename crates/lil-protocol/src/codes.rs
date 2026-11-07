@@ -286,8 +286,8 @@ pub const JOB_NOT_QUEUED: CodeSpec = spec("job.not_queued", C::DataConflict, R::
 /// `job.not_queued`'s message (Appendix D).
 pub const JOB_NOT_QUEUED_MESSAGE: &str = "Only a job that is waiting its turn can be moved; this one is with the engine, running or finished.";
 
-// Plan 4b (Appendix D). Task 7 returns these two first; the plan's other codes follow with
-// the tasks that return them.
+// Plan 4b (Appendix D). Task 7 returns the first two and Task 8 `repair.not_needed`; the plan's
+// other codes follow with the tasks that return them.
 
 /// A ref resolves to an asset that is in the trash (ARCH-125, CORE-157). Message: "This asset
 /// is in the trash (entry <entry_id>). Restore it with trash.restore."; `data: {entry_id}`.
@@ -300,6 +300,11 @@ pub const REF_REDIRECT_BROKEN: CodeSpec = spec(
     R::AfterResolve,
     false,
 );
+/// `asset.accept_move` on an asset that isn't `moved`, or `asset.make_independent` on one that
+/// isn't a `copy` or `duplicate_uuid` (CORE-154). Message: [`REPAIR_NOT_NEEDED_MESSAGE`].
+pub const REPAIR_NOT_NEEDED: CodeSpec = spec("repair.not_needed", C::UserFixable, R::Never, false);
+/// `repair.not_needed`'s message (Appendix D).
+pub const REPAIR_NOT_NEEDED_MESSAGE: &str = "This asset doesn't need that repair.";
 
 /// Every code, in table order.
 pub const ALL: &[&CodeSpec] = &[
@@ -372,6 +377,7 @@ pub const ALL: &[&CodeSpec] = &[
     &JOB_NOT_QUEUED,
     &ASSET_TRASHED,
     &REF_REDIRECT_BROKEN,
+    &REPAIR_NOT_NEEDED,
 ];
 
 #[cfg(test)]
@@ -576,6 +582,7 @@ mod tests {
             R::AfterResolve,
             false,
         ),
+        ("repair.not_needed", C::UserFixable, R::Never, false),
     ];
 
     /// `^[a-z_]+(\.[a-z_]+)+$`
@@ -589,7 +596,7 @@ mod tests {
 
     #[test] // spec: QA-003, QA-004, QA-005
     fn code_specs_follow_the_table() {
-        assert_eq!(TABLE.len(), 69);
+        assert_eq!(TABLE.len(), 70);
         assert_eq!(ALL.len(), TABLE.len());
         for (spec, (code, category, retry, provisional)) in ALL.iter().zip(TABLE) {
             assert_eq!(spec.code, *code);
@@ -633,6 +640,20 @@ mod tests {
         assert_eq!(
             JOB_NOT_QUEUED_MESSAGE,
             "Only a job that is waiting its turn can be moved; this one is with the engine, running or finished."
+        );
+    }
+
+    /// Plan 4b's `repair.not_needed` (Appendix D; Task 8): `user_fixable`, `never`, with its
+    /// message.
+    #[test] // spec: CORE-154, QA-003
+    fn repair_not_needed_is_in_the_table() {
+        assert!(ALL.iter().any(|s| **s == REPAIR_NOT_NEEDED));
+        assert_eq!(REPAIR_NOT_NEEDED.code, "repair.not_needed");
+        assert_eq!(REPAIR_NOT_NEEDED.category, C::UserFixable);
+        assert_eq!(REPAIR_NOT_NEEDED.retry, R::Never);
+        assert_eq!(
+            REPAIR_NOT_NEEDED_MESSAGE,
+            "This asset doesn't need that repair."
         );
     }
 }

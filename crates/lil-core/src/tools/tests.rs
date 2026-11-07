@@ -977,6 +977,36 @@ fn the_organising_tools_are_pinned() {
     assert!(!required.contains(&json!("rating")), "{required:?}");
 }
 
+/// The plan-4b repair rows (CORE-154; Appendix H "Moved and copied folders"):
+/// `asset.accept_move` and `asset.make_independent` write in `workspace` and take
+/// `{project?, asset_id}`, nothing else.
+#[test] // spec: CORE-154, CORE-146, CORE-058
+fn the_repair_tools_are_pinned() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
+    for name in ["asset.accept_move", "asset.make_independent"] {
+        let d = reg
+            .descriptors()
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} is registered"));
+        assert_eq!(
+            (d.effect, d.module.as_str()),
+            (EffectClass::Write, WORKSPACE_MODULE),
+            "{name}"
+        );
+        let props: Vec<&String> = d.input_schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(props, ["project", "asset_id"], "{name}");
+        assert_eq!(d.input_schema["required"], json!(["asset_id"]), "{name}");
+        assert_eq!(d.input_schema["additionalProperties"], false, "{name}");
+    }
+}
+
 /// The plan-4b `ref.resolve` row (CORE-146, P4b-R25; Appendix H "`ref.resolve`"): it reads, in
 /// `workspace`, and takes `ref` or `path`, nothing else.
 #[test] // spec: ARCH-125, APP-019, CORE-146, CORE-058

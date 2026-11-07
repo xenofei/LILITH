@@ -1094,8 +1094,20 @@ async fn manifest_disagreeing_with_its_folder_is_needs_repair() {
         .await
         .unwrap()
         .unwrap();
-    assert!(!first.needs_repair);
+    // The copy is the folder whose manifest disagrees; the original shares its creation UUID,
+    // so it needs repair too until one of them is made independent (CORE-154).
+    assert!(first.needs_repair);
     assert!(second.needs_repair);
+    assert_eq!(
+        first.repair,
+        Some(
+            serde_json::json!({"kind": "duplicate_uuid", "other": "sketchbook/chr_paper_crane_copy"})
+        )
+    );
+    assert_eq!(
+        second.repair,
+        Some(serde_json::json!({"kind": "copy", "other": "sketchbook/chr_paper_crane"}))
+    );
     let uuid = Some("6f1c2a3e-8b4d-4c5e-9a7b-1d2e3f405162".to_string());
     assert_eq!(first.creation_uuid, uuid);
     assert_eq!(second.creation_uuid, uuid);

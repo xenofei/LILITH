@@ -300,6 +300,22 @@ impl Store {
         held
     }
 
+    /// The lock of a creation UUID (compared without regard to case): one `tokio::sync::Mutex`
+    /// per UUID, shared like [`Store::version_lock`] (in the same map, under a key no
+    /// `<project>/<asset_id>` can have). The asset repairs take it around their decision and
+    /// edit, so two repairs of one group of folders never both run on the same view (CORE-154).
+    pub fn creation_uuid_lock(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = lock(&self.version_locks);
+        locks.retain(|_, w| w.strong_count() > 0);
+        let key = format!("creation_uuid:{}", uuid.to_ascii_lowercase());
+        if let Some(held) = locks.get(&key).and_then(Weak::upgrade) {
+            return held;
+        }
+        let held = Arc::new(PathLock::new(()));
+        locks.insert(key, Arc::downgrade(&held));
+        held
+    }
+
     /// Seals run `req.run_id`'s chosen files as `v<req.version>/` (module docs). `guard` is
     /// the caller's guard of the asset's [`Store::version_lock`]: a seal under any other lock
     /// (or another asset's) is refused, so no seal runs without the asset's version lock.
