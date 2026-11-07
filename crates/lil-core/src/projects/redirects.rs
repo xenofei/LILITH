@@ -162,8 +162,8 @@ pub(crate) fn unreadable(why: String) -> StoreError {
 /// # Errors
 /// `params.invalid` naming the entry and field when `r` wouldn't read back (a name that isn't
 /// `<project>/<asset_id>`, an empty `by`, …), with nothing written; `yaml.unsupported_edit`
-/// when the file doesn't parse as redirects or the edit can't be made safely; the store's
-/// write errors.
+/// when the file isn't UTF-8, doesn't parse as redirects, or the edit can't be made safely;
+/// the store's read and write errors.
 pub async fn append_redirect(store: &Store, r: &Redirect) -> Result<Written, StoreError> {
     let mut entries = vec![
         ("from".to_string(), YamlValue::Str(name_of(&r.from))),
@@ -187,6 +187,10 @@ pub async fn append_redirect(store: &Store, r: &Redirect) -> Result<Written, Sto
         }
         entries.push(("actor".to_string(), YamlValue::Map(fields)));
     }
+    // A file that isn't UTF-8 or doesn't parse is `yaml.unsupported_edit` (as `edit_yaml` gave
+    // it), never the store's transient `store.io` for text it can't decode. Checked again on the
+    // text the edit reads, below.
+    read_redirects(store).await?;
     let edits = [YamlEdit::AppendMappingToList {
         path: vec!["redirects".to_string()],
         entries,
@@ -203,7 +207,8 @@ pub async fn append_redirect(store: &Store, r: &Redirect) -> Result<Written, Sto
                     "{REDIRECTS_YAML}: the appended entry doesn't read back as one redirect"
                 ))),
                 Err(why) => Err(StoreError::Invalid(format!(
-                    "This redirect can't be written: {REDIRECTS_YAML} would no longer read                      ({why})."
+                    "This redirect can't be written: {REDIRECTS_YAML} would no longer read \
+                     ({why})."
                 ))),
             }
         })

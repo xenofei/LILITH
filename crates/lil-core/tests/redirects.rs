@@ -1739,16 +1739,38 @@ async fn append_redirect_writes_only_what_reads_back() {
         by: by.to_string(),
         actor: None,
     };
-    for (bad, field) in [
-        (redirect("Prop Lamp", "cli"), "from"),
-        (redirect("prop_lamp", ""), "by"),
+    for (bad, why) in [
+        (
+            redirect("Prop Lamp", "cli"),
+            "entry 2: `from` is \"sketchbook/Prop Lamp\", not `<project>/<asset_id>` \
+             (lowercase, as on disk)",
+        ),
+        (
+            redirect("prop_lamp", ""),
+            "entry 2: `by` is not a non-empty string",
+        ),
     ] {
         let e = append_redirect(&open.store, &bad).await.unwrap_err();
         let body = e.to_error("");
         assert_eq!(body.code, "params.invalid", "{e}");
-        assert!(body.message.contains(field), "{}", body.message);
+        assert_eq!(
+            body.message,
+            format!(
+                "This redirect can't be written: registry/redirects.yaml would no longer read \
+                 ({why})."
+            )
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
     }
+    // A file that isn't UTF-8 is unsupported (not a transient store error), and untouched.
+    let latin1 = b"redirects:\n  - from: sketchbook/caf\xe9\n";
+    write_file(&path, latin1);
+    let e = append_redirect(&open.store, &redirect("prop_lamp", "cli"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_error("").code, "yaml.unsupported_edit", "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), latin1, "nothing written");
+    write_file(&path, &before);
     // The redirects still read.
     assert_eq!(read_redirects(&open.store).await.unwrap().len(), 1);
     append_redirect(&open.store, &redirect("prop_lamp", "cli"))
