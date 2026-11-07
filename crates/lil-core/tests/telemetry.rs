@@ -3020,8 +3020,7 @@ async fn energy_reports_samples_and_partly_measured() {
 // ---------------------------------------------------------------------------------------------
 
 /// Per-process memory that stops reading leaves the engine's figure unknown: a single high
-/// reading never becomes a spill alert, and a raised alert clears at once, as when the adapter
-/// counters can't be read (review M1).
+/// reading never becomes a spill alert (review M1).
 #[tokio::test] // spec: APP-132, CORE-059
 async fn a_lost_process_reading_leaves_the_spill_figure_unknown() {
     let lost = json!({"error": "PDH: the counter set went away"});
@@ -3033,20 +3032,8 @@ async fn a_lost_process_reading_leaves_the_spill_figure_unknown() {
     let snap = rig.run(40).await;
     assert!(spill_alert(&snap).is_none(), "{:?}", snap.alerts);
     rig.telemetry.job_ended("j_stale");
-
-    // Raised, then the reading is lost: cleared at the next sample.
-    let mut readings = vec![engine_mem(200)];
-    readings.extend(std::iter::repeat_n(engine_mem(900), 11));
-    readings.push(lost);
-    let mut hw = spill_script(&[200]);
-    hw["gpu_mem"] = json!(readings);
-    let rig = engine_rig(&hw);
-    rig.run(1).await;
-    rig.telemetry.job_started("j_raised", "comfyui");
-    let raised = rig.run(11).await;
-    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
-    let after = rig.run(1).await;
-    assert!(spill_alert(&after).is_none(), "{:?}", after.alerts);
+    // A raised alert across a lost reading is held: see
+    // `a_raised_spill_survives_one_unknown_reading_and_clears_after_30_s` (review N1).
 }
 
 /// A retry after the engine restarted takes the new session's idle level, not its first
@@ -3156,4 +3143,47 @@ async fn energy_reads_the_stored_system_energy_of_old_ranges() {
         (old.gpu_mj, old.cpu_mj, old.system_mj),
         (measured.gpu_mj, measured.cpu_mj, measured.system_mj)
     );
+}
+
+/// A raised `gpu_spill` is held while one per-process reading fails, so a spill that never
+/// stopped doesn't flap; it clears only after 30 s with the figure unknown, as when the
+/// counters can't be read (Appendix H; review N1).
+#[tokio::test] // spec: APP-132
+async fn a_raised_spill_survives_one_unknown_reading_and_clears_after_30_s() {
+    let lost = json!({"error": "PDH: the counter set went away"});
+    // Second 0: idle 200. Seconds 1-11: 900, raised at 11. Second 12: unknown. Seconds 13-17:
+    // 900 again. From second 18: unknown for good.
+    let mut readings = vec![engine_mem(200)];
+    readings.extend(std::iter::repeat_n(engine_mem(900), 11));
+    readings.push(lost.clone());
+    readings.extend(std::iter::repeat_n(engine_mem(900), 5));
+    readings.push(lost);
+    let mut hw = spill_script(&[200]);
+    hw["gpu_mem"] = json!(readings);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_held", "comfyui");
+    let raised = rig.run(11).await;
+    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
+    let gap = rig.run(1).await;
+    assert!(
+        spill_alert(&gap).is_some(),
+        "one unknown reading holds it: {:?}",
+        gap.alerts
+    );
+    let back = rig.run(5).await;
+    assert_eq!(spill_alert(&back).and_then(|a| a.above_idle_mib), Some(700));
+    let unknown = rig.run(30).await;
+    assert!(
+        spill_alert(&unknown).is_some(),
+        "not yet 30 s unknown: {:?}",
+        unknown.alerts
+    );
+    let cleared = rig.run(1).await;
+    assert!(spill_alert(&cleared).is_none(), "{:?}", cleared.alerts);
+    let kinds: Vec<Value> = alert_events(&rig.events().await, "gpu_spill")
+        .iter()
+        .map(|e| e["kind"].clone())
+        .collect();
+    assert_eq!(kinds, [json!("alert"), json!("alert_cleared")], "no flap");
 }

@@ -37,8 +37,10 @@
 //!   30 s at <= 82 °C; a throttle alert clears after 30 s without its bit; neither raises again
 //!   within 60 s of clearing. `gpu_spill` raises after 10 s with the job's engine above its idle
 //!   level by more than [`SPILL_MARGIN_MIB`], and clears after 30 s at or below half of it,
-//!   when the job ends, or when the adapter counters or per-process memory can't be read; its
-//!   timers belong to one start of one job. Times are the step's
+//!   when the job ends, or when the adapter counters can't be read. While per-process memory
+//!   can't be read the figure is unknown: nothing raises, and a raised alert is held, clearing
+//!   only after 30 s unknown, so a passing failed read doesn't make it flap. Its timers belong
+//!   to one start of one job. Times are the step's
 //!   (`StepIn::now`): the monotonic clock, or the nominal seconds of manual mode.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -203,6 +205,16 @@ struct SpillNow {
     start: u64,
     pid: Option<u32>,
     above_idle_mib: u64,
+}
+
+/// What a raised `gpu_spill` is at a step: its job start runs with a known figure, runs with
+/// the figure unknown (per-process memory can't be read), or is over (or the adapter counters
+/// can't be read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillHold {
+    Measured,
+    Unknown,
+    Gone,
 }
 
 /// One engine's state and fit figure.
@@ -375,15 +387,22 @@ impl FitTracker {
             .max_by_key(|s| s.above_idle_mib)
     }
 
-    /// The start `s` names still runs, and its engine's figure is known.
-    fn still_measured(&self, s: &SpillNow) -> bool {
-        self.running.get(&s.job_id).is_some_and(|job| {
-            job.start == s.start
-                && self
+    /// Whether the start `s` names still runs, and with a known figure ([`SpillHold`]).
+    fn hold(&self, s: &SpillNow) -> SpillHold {
+        match self.running.get(&s.job_id) {
+            Some(job) if job.start == s.start => {
+                let known = self
                     .engines
                     .get(&job.engine)
-                    .is_some_and(|t| t.figure.is_some())
-        })
+                    .is_some_and(|t| t.figure.is_some());
+                if known {
+                    SpillHold::Measured
+                } else {
+                    SpillHold::Unknown
+                }
+            }
+            _ => SpillHold::Gone,
+        }
     }
 }
 
@@ -587,6 +606,8 @@ pub(crate) struct Sampler {
     hysteresis: BTreeMap<&'static str, Hysteresis>,
     /// The job start whose engine the `gpu_spill` timers follow.
     spill_owner: Option<(String, u64)>,
+    /// Since when a raised `gpu_spill`'s figure has been unknown.
+    spill_unknown_since: Option<Duration>,
     /// The whole-system energy of each sample, accumulated so it never drifts (`e15`).
     system_energy: Accum,
     last_ts: i64,
@@ -620,6 +641,7 @@ impl Sampler {
             alerts: BTreeMap::new(),
             hysteresis: BTreeMap::new(),
             spill_owner: None,
+            spill_unknown_since: None,
             system_energy: Accum::new(1, u128::from(power.psu_efficiency_permille.clamp(1, 1000))),
             power,
             last_ts: i64::MIN,
@@ -844,7 +866,7 @@ impl Sampler {
 
         // The fit figures, then the alerts: the temperature and throttle from a real reading
         // only (a gap leaves them as they were), the spill while the adapter counters read.
-        let (spill, spill_job_running) = {
+        let (spill, hold) = {
             let mut fits = lock(input.fits);
             if mem_read {
                 fits.observe(&self.mem_cache, input.utc_ms);
@@ -852,14 +874,19 @@ impl Sampler {
                 fits.forget_figures();
             }
             let raised = self.alerts.get("gpu_spill").and_then(|a| a.spill.as_ref());
-            let running = raised.is_some_and(|s| fits.still_measured(s));
-            (fits.spill(), running)
+            (fits.spill(), raised.map(|s| fits.hold(s)))
         };
         let live_sample = gpu.sample.as_ref().filter(|_| gpu.live);
         let mut events = self.update_alerts(live_sample, input.now, input.utc_ms);
         events.extend(self.update_spill(
             spill.filter(|_| adapter.is_some()),
-            spill_job_running && adapter.is_some(),
+            hold.map(|h| {
+                if adapter.is_some() {
+                    h
+                } else {
+                    SpillHold::Gone
+                }
+            }),
             input.now,
             input.utc_ms,
         ));
@@ -1106,14 +1133,26 @@ impl Sampler {
     fn update_spill(
         &mut self,
         spill: Option<SpillNow>,
-        job_running: bool,
+        hold: Option<SpillHold>,
         now: Duration,
         now_ms: i64,
     ) -> Vec<Value> {
         let mut events = Vec::new();
-        if self.alerts.contains_key("gpu_spill") && !job_running {
+        let clear = match hold {
+            Some(SpillHold::Gone) => true,
+            Some(SpillHold::Unknown) => {
+                let since = *self.spill_unknown_since.get_or_insert(now);
+                now.saturating_sub(since) >= CLEAR_AFTER
+            }
+            Some(SpillHold::Measured) | None => {
+                self.spill_unknown_since = None;
+                false
+            }
+        };
+        if clear {
             self.alerts.remove("gpu_spill");
             self.hysteresis.remove("gpu_spill");
+            self.spill_unknown_since = None;
             events.push(json!({"kind": "alert_cleared", "id": "gpu_spill"}));
         }
         // The timers are one start's: another job, or a new start of one, begins them again.
