@@ -22,6 +22,7 @@ use lil_platform::fs::{
     FileIdentity, PLACEHOLDER_ATTRIBUTES, Probe, RetryClass, Share, SystemProbe, VolumeInfo,
     classify,
 };
+use lil_platform::paths::folder_key;
 use lil_platform::{Channel, Clock};
 use lil_protocol::{ErrorCategory, RetryPolicy};
 use lil_schema::Manifest;
@@ -484,16 +485,24 @@ async fn expect_generated_without_a_row_is_conflict_or_new() {
 
 /// The real probe, except that one path reports the cloud placeholder attributes; every data
 /// open is counted.
+///
+/// Paths are compared as `folder_key` compares them, not by spelling (as in `assets.rs`).
 #[derive(Debug)]
 struct CloudProbe {
     placeholder: PathBuf,
     opens: AtomicUsize,
 }
 
+impl CloudProbe {
+    fn is_placeholder(&self, path: &Path) -> bool {
+        folder_key(path) == folder_key(&self.placeholder)
+    }
+}
+
 impl Probe for CloudProbe {
     fn identity(&self, path: &Path) -> io::Result<FileIdentity> {
         let mut id = SystemProbe.identity(path)?;
-        if path == self.placeholder {
+        if self.is_placeholder(path) {
             id.attributes |= PLACEHOLDER_ATTRIBUTES;
         }
         Ok(id)

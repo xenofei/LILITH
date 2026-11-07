@@ -294,11 +294,27 @@ fn identity_needs_no_data_access() {
     assert!(!identity(&placeholder).unwrap().is_cloud_placeholder());
 }
 
+/// The NTFS family: the file systems whose volume facts the tests below assert. A Dev Drive is
+/// ReFS, and `%TEMP%` can sit on one.
+fn ntfs_family(fs_name: &str) -> bool {
+    fs_name.eq_ignore_ascii_case("NTFS") || fs_name.eq_ignore_ascii_case("ReFS")
+}
+
+#[test] // spec: CORE-041
+fn ntfs_only_assertions_accept_refs() {
+    for yes in ["NTFS", "ntfs", "ReFS", "REFS"] {
+        assert!(ntfs_family(yes), "{yes}");
+    }
+    for no in ["FAT32", "exFAT", "FAT", "CDFS", "UDF", ""] {
+        assert!(!ntfs_family(no), "{no}");
+    }
+}
+
 #[test] // spec: CORE-041, ARCH-089
-fn volume_info_reports_ntfs_for_the_temp_volume() {
+fn volume_info_reports_ntfs_or_refs_for_the_temp_volume() {
     let dir = tempfile::tempdir().unwrap();
     let info = volume_info(dir.path()).unwrap();
-    assert_eq!(info.fs_name, "NTFS", "{info:?}");
+    assert!(ntfs_family(&info.fs_name), "{info:?}");
     assert!(!info.remote, "{info:?}");
     assert!(!info.cloud_sync_root, "{info:?}");
     assert!(info.stable_ids());

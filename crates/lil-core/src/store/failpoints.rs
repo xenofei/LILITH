@@ -52,6 +52,9 @@ pub const NAMES: &[&str] = &[
     // changes (plan 4a, CORE-160). Only `abort` means anything here: an error is logged and
     // the withdrawal goes on (Appendix G).
     "jobs.after_withdraw",
+    // Plan 4b (Task 21c): after `workspace.create` made the folder, before it looks at it again
+    // (a test registers a workspace around it here; the call then refuses and removes the folder).
+    "workspace.after_create",
 ];
 
 /// The exit code of the `abort` action.

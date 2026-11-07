@@ -19,6 +19,7 @@ use lil_core::store::{
 };
 use lil_core::workspace::Access;
 use lil_platform::fs::{Probe, SystemProbe};
+use lil_platform::paths::folder_key;
 use lil_schema::Manifest;
 use lil_schema::logs::read_lines;
 use lil_testkit::files::write_file;
@@ -408,13 +409,21 @@ async fn a_cloud_only_progress_md_is_a_warning_and_the_index_still_learns() {
 
 /// The real probe, except that one path reports the cloud placeholder attributes and its data
 /// is never opened.
+///
+/// Paths are compared as `folder_key` compares them, not by spelling (as in `record.rs`).
 #[derive(Debug)]
 struct PlaceholderAt(PathBuf);
+
+impl PlaceholderAt {
+    fn is_placeholder(&self, path: &Path) -> bool {
+        folder_key(path) == folder_key(&self.0)
+    }
+}
 
 impl Probe for PlaceholderAt {
     fn identity(&self, path: &Path) -> io::Result<lil_platform::fs::FileIdentity> {
         let mut id = SystemProbe.identity(path)?;
-        if path == self.0 {
+        if self.is_placeholder(path) {
             id.attributes |= lil_platform::fs::PLACEHOLDER_ATTRIBUTES;
         }
         Ok(id)
@@ -425,7 +434,11 @@ impl Probe for PlaceholderAt {
     }
 
     fn open_read(&self, path: &Path) -> io::Result<std::fs::File> {
-        assert_ne!(path, self.0, "a placeholder's data was opened");
+        assert!(
+            !self.is_placeholder(path),
+            "a placeholder's data was opened: {}",
+            path.display()
+        );
         SystemProbe.open_read(path)
     }
 }

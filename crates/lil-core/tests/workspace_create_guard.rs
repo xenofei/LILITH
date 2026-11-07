@@ -11,6 +11,7 @@ use std::io::Write as _;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lil_core::events::EventBus;
 use lil_core::session::Session;
@@ -49,22 +50,15 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_default()
 }
 
-#[test] // spec: QA-040
-fn create_on_a_real_registered_workspace_trips_the_guard() {
-    // 1. A workspace folder, as if the owner had registered it for real.
-    let dir = tempfile::Builder::new()
-        .prefix("lil-guard-create-")
-        .tempdir()
-        .expect("tempdir");
-    let real = canonical(dir.path());
-    write_manifest(&real);
-    // 2. Arm the guard with it among the real workspaces, before any `TestEnv`.
-    arm_test_guard(RealLocations {
-        workspaces: vec![real.clone()],
-        ..RealLocations::from_system().expect("the real known folders")
-    });
-    // 3. A test channel whose core has the workspace tools.
-    let env = TestEnv::new();
+/// A test channel's `workspace.create` tool with its call context, run directly (outside the
+/// dispatcher), over a hub that owns `failpoints`.
+struct Rig {
+    states: Arc<StateRegistry>,
+    reg: Registry,
+    ctx: CallCtx,
+}
+
+fn rig(env: &TestEnv, failpoints: Arc<FailPoints>) -> Rig {
     let states = Arc::new(
         StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}")))
             .expect("the suite state.db"),
@@ -78,7 +72,7 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         events.clone(),
         clock,
         Arc::new(SeqIds::new()),
-        FailPoints::none(),
+        failpoints,
         probe.clone(),
         lil_core::watch::WatchConfig::default(),
     );
@@ -92,7 +86,6 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
     );
     let mut reg = Registry::new();
     register_workspace_tools(&mut reg, hub, env.env.clone(), probe);
-    let tool = reg.get("workspace.create").expect("workspace.create");
     let ctx = CallCtx {
         session: Arc::new(Session {
             id: "s_1".into(),
@@ -120,6 +113,27 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         retry_of: None,
         redispatch: None,
     };
+    Rig { states, reg, ctx }
+}
+
+#[test] // spec: QA-040
+fn create_on_a_real_registered_workspace_trips_the_guard() {
+    // 1. A workspace folder, as if the owner had registered it for real.
+    let dir = tempfile::Builder::new()
+        .prefix("lil-guard-create-")
+        .tempdir()
+        .expect("tempdir");
+    let real = canonical(dir.path());
+    write_manifest(&real);
+    // 2. Arm the guard with it among the real workspaces, before any `TestEnv`.
+    arm_test_guard(RealLocations {
+        workspaces: vec![real.clone()],
+        ..RealLocations::from_system().expect("the real known folders")
+    });
+    // 3. A test channel whose core has the workspace tools.
+    let env = TestEnv::new();
+    let Rig { states, reg, ctx } = rig(&env, FailPoints::none());
+    let tool = reg.get("workspace.create").expect("workspace.create");
 
     // 4. Creating a new subfolder of that workspace trips the guard before the folder exists.
     let sub = real.join("Ünïcödé new");
@@ -145,4 +159,91 @@ fn create_on_a_real_registered_workspace_trips_the_guard() {
         "the subfolder was created before the guard tripped"
     );
     states.close();
+}
+
+/// The check after the folder is made (ARCH-094, CORE-110): a workspace registered around the
+/// new folder between the two checks (the race the second check is for) makes `workspace.create`
+/// refuse, remove the empty folder it made, and register and write nothing.
+///
+/// The race is injected at the fail point `workspace.after_create`: its hook registers the
+/// folder's parent in `suite.toml`, as another core or `lil workspace init` could. No ACL, link
+/// or timing is involved. (Under nextest each test is its own process, so the guard's arming in
+/// the other test of this file doesn't reach this one.)
+#[test] // spec: ARCH-094, QA-040
+fn workspace_create_post_create_race_is_refused_cleanly() {
+    let env = TestEnv::new();
+    let outer = env.make_workspace("outer");
+    let inner = outer.join("Ünïcödé inner");
+    let suite = env.env.suite_toml();
+    let registered_outer = outer.to_str().expect("a UTF-8 path").to_string();
+
+    let failpoints = FailPoints::none();
+    let hits = Arc::new(AtomicUsize::new(0));
+    {
+        let (hits, suite, inner) = (hits.clone(), suite.clone(), inner.clone());
+        failpoints.on(
+            "workspace.after_create",
+            Box::new(move || {
+                // The folder exists now; the registration comes after the first check.
+                assert!(inner.is_dir(), "the hook runs after the folder was made");
+                hits.fetch_add(1, Ordering::SeqCst);
+                write_suite(&suite, &registered_outer);
+                Ok(())
+            }),
+        );
+    }
+    let Rig { states, reg, ctx } = rig(&env, failpoints);
+    let tool = reg.get("workspace.create").expect("workspace.create");
+    assert!(
+        !suite.exists(),
+        "nothing is registered before the call: the first check passes"
+    );
+
+    let args = json!({"path": inner.to_str().expect("a UTF-8 path")});
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let err = rt
+        .block_on(tool.run(&ctx, args))
+        .map(|out| out.structured)
+        .expect_err("the second check refuses");
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the race was injected once");
+    assert_eq!(err.code, "workspace.path_invalid", "{err:?}");
+    assert!(
+        err.message.contains("inside the registered workspace"),
+        "{err:?}"
+    );
+    assert!(
+        !inner.exists(),
+        "the refused call left the folder it made behind"
+    );
+    assert!(outer.is_dir(), "the registered workspace is untouched");
+    assert_eq!(
+        std::fs::read_to_string(&suite)
+            .expect("suite.toml")
+            .matches("[[workspaces]]")
+            .count(),
+        1,
+        "only the racing registration is in suite.toml"
+    );
+    assert!(
+        !suite_text(&suite).contains("inner"),
+        "the refused folder was not registered"
+    );
+    states.close();
+}
+
+/// Registers `path` in `suite`: what another core's `workspace.create` would have written.
+#[allow(clippy::disallowed_methods)]
+fn write_suite(suite: &Path, path: &str) {
+    if let Some(dir) = suite.parent() {
+        std::fs::create_dir_all(dir).expect("the data folder");
+    }
+    std::fs::write(suite, format!("[[workspaces]]\npath = '{path}'\n")).expect("suite.toml");
+}
+
+fn suite_text(suite: &Path) -> String {
+    std::fs::read_to_string(suite).expect("suite.toml")
 }

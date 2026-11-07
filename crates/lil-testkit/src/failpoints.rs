@@ -33,6 +33,8 @@ pub const NAMES: &[&str] = &[
     "confirm.after_answer",
     // Plan 4a (Global Constraints, "Fail points added").
     "jobs.after_withdraw",
+    // Plan 4b (Task 21c).
+    "workspace.after_create",
 ];
 
 /// Every fail point action, a closed list.

@@ -181,6 +181,57 @@ mod tests {
         }
     }
 
+    /// `upcase_name` is the operating system's table; the volume compares names with its own
+    /// `$UpCase`, written when it was formatted. Reading `$UpCase` itself needs admin rights, so
+    /// the volume is asked the way every program asks it: by file name. A file is made for each
+    /// BMP letter that has a one-unit uppercase, and found again under that uppercase; the final
+    /// and the medial sigma stay two names. A volume formatted by an older Windows may differ
+    /// for letters added to Unicode since (see `upcase_name`). Runs on the temp volume only and
+    /// is skipped on a file system that doesn't fold case itself.
+    #[test] // spec: CORE-040
+    fn upcase_agrees_with_the_volume_for_bmp_letters() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs_name = crate::fs::volume_info(dir.path()).unwrap().fs_name;
+        if !["NTFS", "ReFS"]
+            .iter()
+            .any(|n| fs_name.eq_ignore_ascii_case(n))
+        {
+            eprintln!("skipped: the temp volume is {fs_name}; nothing is asserted");
+            return;
+        }
+        let mut checked = 0;
+        let mut disagree = Vec::new();
+        for unit in 0u32..=0xFFFF {
+            let Some(ch) = char::from_u32(unit) else {
+                continue; // a surrogate
+            };
+            if !ch.is_alphabetic() {
+                continue;
+            }
+            let name = ch.to_string();
+            let up = upcase_name(&name);
+            if up == name || up.encode_utf16().count() != 1 {
+                continue;
+            }
+            if std::fs::write(dir.path().join(&name), b"x").is_err() {
+                continue;
+            }
+            checked += 1;
+            if !dir.path().join(&up).exists() {
+                disagree.push(format!("U+{unit:04X}"));
+            }
+        }
+        assert!(checked > 900, "only {checked} letters were checked");
+        assert!(
+            disagree.is_empty(),
+            "the volume does not fold these like upcase_name: {disagree:?}"
+        );
+        // Two names on the volume, as in `upcase_name_follows_the_system_table`.
+        std::fs::write(dir.path().join("\u{03C3}x"), b"x").unwrap();
+        assert!(dir.path().join("\u{03A3}X").exists());
+        assert!(!dir.path().join("\u{03C2}x").exists());
+    }
+
     #[test] // spec: ARCH-027, ARCH-097
     fn folder_key_strips_prefixes_case_and_trailing_separators() {
         assert_eq!(folder_key(Path::new(r"\\?\C:\Ws\")), r"c:\ws");
@@ -193,14 +244,45 @@ mod tests {
             r"\\srv\share\x"
         );
         assert_eq!(spelling_key(Path::new(r"\\srv\share\X\")), r"\\srv\share\x");
-        assert_eq!(folder_key(Path::new(r"Z:\")), r"z:\");
-        assert_eq!(folder_key(Path::new(r"\\?\Z:\")), r"z:\");
-        assert_eq!(folder_key(Path::new("Z:")), r"z:\");
-        // Unicode lowercase, not just ASCII.
+        // Unicode lowercase, not just ASCII (a folder that doesn't exist: the key keeps the
+        // spelling given, lowercased).
         assert_eq!(
-            folder_key(Path::new(r"Z:\NO SUCH\ÜNÏCÖDÉ SPACE")),
-            r"z:\no such\ünïcödé space"
+            folder_key(Path::new(r"\\?\C:\NO SUCH\ÜNÏCÖDÉ SPACE")),
+            r"c:\no such\ünïcödé space"
         );
+    }
+
+    /// Drive letters, tested through the pure half so that no drive is looked up: a letter that
+    /// is unmapped, a network drive or a `subst` drive would answer slowly or differently.
+    #[test] // spec: ARCH-027, ARCH-097
+    fn folder_key_handles_drive_letters() {
+        for (given, key) in [
+            (r"Z:\", r"z:\"),
+            (r"z:\", r"z:\"),
+            (r"\\?\Z:\", r"z:\"),
+            ("Z:", r"z:\"),
+            ("Z:/", r"z:\"),
+            (r"\\?\Z:", r"z:\"),
+            (r"Z:\\", r"z:\"),
+            (r"Z:\NO SUCH\ÜNÏCÖDÉ SPACE", r"z:\no such\ünïcödé space"),
+            (r"\\?\z:\No Such\", r"z:\no such"),
+            ("Z:/No Such/Deep/", r"z:\no such\deep"),
+        ] {
+            assert_eq!(spelling_key(Path::new(given)), key, "{given}");
+        }
+        // Two drives are two keys.
+        assert_ne!(
+            spelling_key(Path::new(r"A:\x")),
+            spelling_key(Path::new(r"B:\x"))
+        );
+        // The system drive's root exists on every machine (its letter is not asserted):
+        // however it is spelled, one key, in lower case, ending in `:\`.
+        let drive = std::env::var("SystemDrive").expect("SystemDrive is set");
+        let root = format!(r"{drive}\");
+        let key = folder_key(Path::new(&root));
+        assert_eq!(key, format!(r"{}\", drive.to_lowercase()));
+        assert_eq!(folder_key(Path::new(&format!(r"\\?\{root}"))), key);
+        assert_eq!(folder_key(Path::new(&format!("{drive}/"))), key);
     }
 
     #[test] // spec: ARCH-097
