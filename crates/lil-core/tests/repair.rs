@@ -1949,7 +1949,12 @@ async fn accept_move_never_redirects_a_trashed_assets_old_name() {
     let e = error(fx.accept(ORIGAMI).await);
     assert_eq!(e.code, "repair.not_needed", "{e:?}");
     assert!(
-        e.message.contains(&entry) && e.message.contains("trash.restore"),
+        e.message.contains(&format!(
+            "To accept this move, empty trash entry {entry} first"
+        )) && e.message.contains(&format!(
+            "Restoring that entry with trash.restore instead puts that older asset back at \
+                 {P}/{CRANE}, and this folder is then a copy of it"
+        )),
         "names the trash entry: {}",
         e.message
     );
@@ -2029,7 +2034,12 @@ async fn accept_move_never_takes_over_a_name_trashed_with_no_redirect() {
     let e = error(fx.accept(ORIGAMI).await);
     assert_eq!(e.code, "repair.not_needed", "{e:?}");
     assert!(
-        e.message.contains(&entry) && e.message.contains("trash.restore"),
+        e.message.contains(&format!(
+            "To accept this move, empty trash entry {entry} first"
+        )) && e.message.contains(&format!(
+            "Restoring that entry with trash.restore instead puts that older asset back at \
+                 {P}/{CRANE}, and this folder is then a copy of it"
+        )),
         "names the trash entry: {}",
         e.message
     );

@@ -506,9 +506,11 @@ pub async fn accept_move(
             .to_string();
         return Err(not_needed(&format!(
             "Old refs to {}/{} lead to an asset in the trash (entry {entry}), so this folder \
-             can't take them over by a move. Restore that entry with trash.restore, or empty it \
-             from the trash, then call asset.accept_move again.",
-            from.0, from.1
+             can't take them over by a move. To accept this move, empty trash entry {entry} \
+             first, then call asset.accept_move again. Restoring that entry with trash.restore \
+             instead puts that older asset back at {}/{}, and this folder is then a copy of it, \
+             not a move.",
+            from.0, from.1, from.0, from.1
         )));
     }
     if let Some(Ok(end)) = end {
