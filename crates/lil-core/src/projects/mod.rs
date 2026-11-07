@@ -6,12 +6,17 @@
 //! - [`active`]: the per-session active project and the `state.json` hint;
 //! - [`staleness`]: the staleness check when a project is restored, and dependents that skip
 //!   archived projects (I6);
+//! - [`redirects`]: `registry/redirects.yaml` (ARCH-125);
+//! - [`resolve`]: the [`Resolver`], which every ref-to-folder lookup goes through (ARCH-125,
+//!   APP-019);
 //! - this file: reading `project.yaml`, and [`project_status`], the `project.status` result.
 //!
 //! A project exists when its `projects/<slug>/project.yaml` does.
 
 pub mod active;
 pub mod progress;
+pub mod redirects;
+pub mod resolve;
 pub mod staleness;
 
 use std::collections::BTreeMap;
@@ -32,7 +37,12 @@ pub use active::{
     resolve_project, write_hint,
 };
 pub use progress::add_done_entry;
-pub use staleness::{dependents, restore_staleness, stale_ref};
+pub use redirects::{REDIRECTS_YAML, Redirect, append_redirect, read_redirects};
+pub use resolve::{Resolution, Resolved, ResolvedKind, Resolver};
+pub use staleness::{
+    StalenessPlan, apply_staleness, dependents, dependents_of, plan_staleness, restore_staleness,
+    stale_ref,
+};
 
 /// The project statuses `project.yaml` takes (I4).
 pub const PROJECT_STATUSES: &[&str] = &["active", "paused", "archived"];
@@ -126,7 +136,9 @@ pub struct ProjectStatus {
     /// Orphans under the project's folder (CORE-038): never deleted, only listed.
     pub orphans: Vec<String>,
     /// Manifests that don't parse or disagree with their folder, files in state
-    /// `needs_repair`, and a `project.yaml` that doesn't parse.
+    /// `needs_repair`, a `project.yaml` that doesn't parse, the project's redirects that loop
+    /// (`registry/redirects.yaml#<project>/<asset_id>`, ARCH-125), and
+    /// `registry/redirects.yaml` itself when it can't be read.
     pub needs_repair: Vec<String>,
     /// Files the suite still expects that disappeared outside it (state `missing`).
     pub missing: Vec<String>,
@@ -179,6 +191,20 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
         match file.state {
             FileState::Missing => missing.push(path),
             _ => needs_repair.push(path),
+        }
+    }
+    // Redirects from the project's names that loop (Appendix H); a redirects file that can't
+    // be read needs repair itself, and nothing else of the status depends on it.
+    match Resolver::load(&ws.index, &ws.store).await {
+        Ok(resolver) => {
+            if resolver.file_error().is_some() {
+                needs_repair.push(REDIRECTS_YAML.to_string());
+            }
+            needs_repair.extend(resolver.broken_from(project));
+        }
+        Err(e) => {
+            tracing::warn!(project, error = %e.message, "registry/redirects.yaml can't be read");
+            needs_repair.push(REDIRECTS_YAML.to_string());
         }
     }
     needs_repair.sort();

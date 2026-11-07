@@ -9,7 +9,8 @@
 //! caller keeps its text. New lines use the file's line ending (that of its first line break).
 //!
 //! A missing top-level key is appended at the end of the document (`key: value`, or
-//! `key: [item]` for [`YamlEdit::AppendToList`]); a missing nested key is `Unsupported`.
+//! `key: [item]` for [`YamlEdit::AppendToList`], or a block list of one mapping for
+//! [`YamlEdit::AppendMappingToList`]); a missing nested key is `Unsupported`.
 //!
 //! A leading UTF-8 byte-order mark is set aside before the text is scanned and written back in
 //! front of the result.
@@ -38,6 +39,16 @@ pub enum YamlEdit {
         path: Vec<String>,
         entries: Vec<(String, YamlValue)>,
     },
+    /// Appends a mapping of these entries, in this order, to a list (`registry/redirects.yaml`
+    /// and the other registry lists of records). In a block list the item is written as a
+    /// block mapping after the list's last item, at the list's indent; in a flow list (`[]`
+    /// included), or for a `~` or `null` value, as a flow mapping. A key with no value and
+    /// nothing below it gets a block list below it; a missing top-level key is appended at the
+    /// end of the document as a block list. The entries may not be empty.
+    AppendMappingToList {
+        path: Vec<String>,
+        entries: Vec<(String, YamlValue)>,
+    },
 }
 
 /// A scalar [`YamlEdit::SetMapping`] writes.
@@ -47,6 +58,9 @@ pub enum YamlValue {
     /// otherwise.
     Str(String),
     Int(i64),
+    /// A nested mapping of these entries, in this order (a block mapping below its key, or a
+    /// flow mapping inside a flow item).
+    Map(Vec<(String, YamlValue)>),
 }
 
 /// Why an edit was refused.
@@ -150,7 +164,8 @@ fn unsupported(edit: &YamlEdit, why: String) -> YamlEditError {
     let path = match edit {
         YamlEdit::SetScalar { path, .. }
         | YamlEdit::AppendToList { path, .. }
-        | YamlEdit::SetMapping { path, .. } => path.join("."),
+        | YamlEdit::SetMapping { path, .. }
+        | YamlEdit::AppendMappingToList { path, .. } => path.join("."),
     };
     YamlEditError::Unsupported(format!("`{path}`: {why}"))
 }
@@ -176,17 +191,8 @@ fn edit_value(doc: &mut Yaml, edit: &YamlEdit) -> Result<(), YamlEditError> {
     let (path, new) = match edit {
         YamlEdit::SetScalar { path, value } => (path, Yaml::String(value.clone())),
         YamlEdit::AppendToList { path, item } => (path, Yaml::String(item.clone())),
-        YamlEdit::SetMapping { path, entries } => {
-            let mut mapping = yaml_rust2::yaml::Hash::new();
-            for (key, value) in entries {
-                let value = match value {
-                    YamlValue::Str(s) => Yaml::String(s.clone()),
-                    YamlValue::Int(n) => Yaml::Integer(*n),
-                };
-                mapping.insert(Yaml::String(key.clone()), value);
-            }
-            (path, Yaml::Hash(mapping))
-        }
+        YamlEdit::SetMapping { path, entries }
+        | YamlEdit::AppendMappingToList { path, entries } => (path, mapping_yaml(entries)),
     };
     let Some((last, parents)) = path.split_last() else {
         return Err(unsupported(edit, "an empty path".into()));
@@ -212,20 +218,86 @@ fn edit_value(doc: &mut Yaml, edit: &YamlEdit) -> Result<(), YamlEditError> {
             ));
         }
         (YamlEdit::SetScalar { .. } | YamlEdit::SetMapping { .. }, Some(v)) => *v = new,
-        (YamlEdit::AppendToList { .. }, Some(Yaml::Array(a))) => a.push(new),
-        (YamlEdit::AppendToList { .. }, Some(v @ Yaml::Null)) => *v = Yaml::Array(vec![new]),
-        (YamlEdit::AppendToList { .. }, Some(_)) => {
+        (
+            YamlEdit::AppendToList { .. } | YamlEdit::AppendMappingToList { .. },
+            Some(Yaml::Array(a)),
+        ) => a.push(new),
+        (
+            YamlEdit::AppendToList { .. } | YamlEdit::AppendMappingToList { .. },
+            Some(v @ Yaml::Null),
+        ) => *v = Yaml::Array(vec![new]),
+        (YamlEdit::AppendToList { .. } | YamlEdit::AppendMappingToList { .. }, Some(_)) => {
             return Err(unsupported(edit, "the value is not a list".into()));
         }
         (YamlEdit::SetScalar { .. } | YamlEdit::SetMapping { .. }, None) => {
             // `replace` keeps an existing key in place; here the key is new and goes last.
             h.replace(key, new);
         }
-        (YamlEdit::AppendToList { .. }, None) => {
+        (YamlEdit::AppendToList { .. } | YamlEdit::AppendMappingToList { .. }, None) => {
             h.replace(key, Yaml::Array(vec![new]));
         }
     }
     Ok(())
+}
+
+/// The parsed form of a mapping of `entries`.
+fn mapping_yaml(entries: &[(String, YamlValue)]) -> Yaml {
+    let mut mapping = yaml_rust2::yaml::Hash::new();
+    for (key, value) in entries {
+        let value = match value {
+            YamlValue::Str(s) => Yaml::String(s.clone()),
+            YamlValue::Int(n) => Yaml::Integer(*n),
+            YamlValue::Map(inner) => mapping_yaml(inner),
+        };
+        mapping.insert(Yaml::String(key.clone()), value);
+    }
+    Yaml::Hash(mapping)
+}
+
+/// `entries` as the lines of a block mapping at indent `pad`, each ending with `eol`; a nested
+/// mapping goes below its key, two spaces deeper (an empty one is `{}`).
+fn block_entries(entries: &[(String, YamlValue)], pad: usize, eol: &str) -> String {
+    let indent = " ".repeat(pad);
+    let mut out = String::new();
+    for (key, value) in entries {
+        let key = scalar(key);
+        match value {
+            YamlValue::Str(s) => out.push_str(&format!("{indent}{key}: {}{eol}", scalar(s))),
+            YamlValue::Int(n) => out.push_str(&format!("{indent}{key}: {n}{eol}")),
+            YamlValue::Map(inner) if inner.is_empty() => {
+                out.push_str(&format!("{indent}{key}: {{}}{eol}"));
+            }
+            YamlValue::Map(inner) => {
+                out.push_str(&format!("{indent}{key}:{eol}"));
+                out.push_str(&block_entries(inner, pad + 2, eol));
+            }
+        }
+    }
+    out
+}
+
+/// `entries` as a one-line flow mapping (`{a: b, c: {d: e}}`); [`scalar`] quotes any value
+/// holding a flow indicator.
+fn flow_mapping(entries: &[(String, YamlValue)]) -> String {
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(key, value)| {
+            let value = match value {
+                YamlValue::Str(s) => scalar(s),
+                YamlValue::Int(n) => n.to_string(),
+                YamlValue::Map(inner) => flow_mapping(inner),
+            };
+            format!("{}: {value}", scalar(key))
+        })
+        .collect();
+    format!("{{{}}}", items.join(", "))
+}
+
+/// `entries` (not empty) as a block list item at indent `seq_indent`: `- ` and the first entry
+/// on the item's line, the others below it, two spaces deeper than the dash.
+fn block_item(entries: &[(String, YamlValue)], seq_indent: usize, eol: &str) -> String {
+    let body = block_entries(entries, seq_indent + 2, eol);
+    format!("{}- {}", " ".repeat(seq_indent), &body[seq_indent + 2..])
 }
 
 /// A line: `start..end` is its content without the line break, `next` the next line's start.
@@ -459,6 +531,9 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
         YamlEdit::SetScalar { path, value } => (path, scalar(value), Kind::Scalar),
         YamlEdit::AppendToList { path, item } => (path, scalar(item), Kind::Append),
         YamlEdit::SetMapping { path, entries } => return edit_mapping(text, edit, path, entries),
+        YamlEdit::AppendMappingToList { path, entries } => {
+            return append_mapping(text, edit, path, entries);
+        }
     };
     let fail = |why: &str| unsupported(edit, why.to_string());
     let Some((last, parents)) = path.split_last() else {
@@ -579,17 +654,7 @@ fn edit_mapping(
     let (from, to) = descend(text, &lines, parents, &fail)?;
     let block = |pad: usize| {
         let mut out = format!("{}{}:{eol}", " ".repeat(pad), scalar(last));
-        for (key, value) in entries {
-            let value = match value {
-                YamlValue::Str(s) => scalar(s),
-                YamlValue::Int(n) => n.to_string(),
-            };
-            out.push_str(&format!(
-                "{}{}: {value}{eol}",
-                " ".repeat(pad + 2),
-                scalar(key)
-            ));
-        }
+        out.push_str(&block_entries(entries, pad + 2, eol));
         out
     };
     let Some(hit) = find_key(text, &lines, from, to, last) else {
@@ -620,6 +685,113 @@ fn edit_mapping(
     out.push_str(&block(hit.indent));
     out.push_str(&text[stop..]);
     Ok(out)
+}
+
+/// [`YamlEdit::AppendMappingToList`] as a line edit (see the variant).
+fn append_mapping(
+    text: &str,
+    edit: &YamlEdit,
+    path: &[String],
+    entries: &[(String, YamlValue)],
+) -> Result<String, YamlEditError> {
+    let fail = |why: &str| unsupported(edit, why.to_string());
+    if entries.is_empty() {
+        return Err(fail("an empty mapping"));
+    }
+    let Some((last, parents)) = path.split_last() else {
+        return Err(fail("an empty path"));
+    };
+    let lines = lines_of(text);
+    let eol = eol_of(text);
+    let (from, to) = descend(text, &lines, parents, &fail)?;
+    let Some(hit) = find_key(text, &lines, from, to, last) else {
+        if !parents.is_empty() {
+            return Err(fail("a missing nested key"));
+        }
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&format!("{}:{eol}", scalar(last)));
+        out.push_str(&block_item(entries, 2, eol));
+        return Ok(out);
+    };
+    let line = lines[hit.line];
+    let end = block_end(text, &lines, hit);
+    let below = has_content(text, &lines, hit.line + 1, end);
+    // A list may also sit at the key's own indent, right after it.
+    let same_indent_seq = !below && end < lines.len() && {
+        let l = lines[end];
+        indent(text, l) == hit.indent && is_seq_item(text, l)
+    };
+    if hit.empty {
+        if below || same_indent_seq {
+            let first = if below {
+                (hit.line + 1..end)
+                    .find(|&i| is_content(text, lines[i]))
+                    .expect("content below")
+            } else {
+                end
+            };
+            if !is_seq_item(text, lines[first]) {
+                return Err(fail("the value is a mapping, not a list"));
+            }
+            let (seq_indent, after) = block_list_end(text, &lines, first);
+            let item = block_item(entries, seq_indent, eol);
+            return Ok(insert_after(text, after, &item, eol));
+        }
+        // No value and nothing below: a block list under the key, after its line.
+        let item = block_item(entries, hit.indent + 2, eol);
+        return Ok(insert_after(text, line, &item, eol));
+    }
+    let first = text[hit.value..].chars().next().expect("a value");
+    if let Some(why) = refuse_value(first) {
+        return Err(fail(why));
+    }
+    let item = flow_mapping(entries);
+    if first != '[' {
+        // yaml-rust2 reads only `~` and `null` as null.
+        if let Some(vend) = scalar_end(text, hit.value, line.end)
+            && matches!(&text[hit.value..vend], "~" | "null")
+        {
+            let list = format!("[{item}]");
+            return Ok(replace_keeping_comment(text, line, hit.value, vend, &list));
+        }
+        return Err(fail("the value is not a list"));
+    }
+    append_flow_item(text, hit.value, &item).ok_or_else(|| fail("a flow list it can't follow"))
+}
+
+/// `text` with `new` (whole lines) inserted after the line `l`, with a line break first when `l`
+/// is the last line of a file without a final one.
+fn insert_after(text: &str, l: Line, new: &str, eol: &str) -> String {
+    let mut out = String::with_capacity(text.len() + new.len() + 2);
+    out.push_str(&text[..l.next]);
+    if l.next == l.end {
+        out.push_str(eol);
+    }
+    out.push_str(new);
+    out.push_str(&text[l.next..]);
+    out
+}
+
+/// The indent of the block list whose first item is on line `first`, and its last line: the
+/// last item at that indent, or a line indented deeper below it.
+fn block_list_end(text: &str, lines: &[Line], first: usize) -> (usize, Line) {
+    let seq_indent = indent(text, lines[first]);
+    let mut last = first;
+    for (i, &l) in lines.iter().enumerate().skip(first + 1) {
+        if !is_content(text, l) {
+            continue;
+        }
+        let ind = indent(text, l);
+        if ind > seq_indent || (ind == seq_indent && is_seq_item(text, l)) {
+            last = i;
+        } else {
+            break;
+        }
+    }
+    (seq_indent, lines[last])
 }
 
 /// The end of the scalar at `start` on its line (before spaces and a comment), or `None` when a
@@ -672,32 +844,9 @@ fn append_block_item(
     item: &str,
     eol: &str,
 ) -> Result<String, YamlEditError> {
-    let seq_indent = indent(text, lines[first]);
-    let mut last = first;
-    for (i, &l) in lines.iter().enumerate().skip(first + 1) {
-        if !is_content(text, l) {
-            continue;
-        }
-        let ind = indent(text, l);
-        if ind > seq_indent || (ind == seq_indent && is_seq_item(text, l)) {
-            last = i;
-        } else {
-            break;
-        }
-    }
-    let l = lines[last];
-    let mut out = String::with_capacity(text.len() + item.len() + seq_indent + 4);
-    out.push_str(&text[..l.next]);
-    if l.next == l.end {
-        // The last line of a file without a final line break.
-        out.push_str(eol);
-    }
-    out.extend(std::iter::repeat_n(' ', seq_indent));
-    out.push_str("- ");
-    out.push_str(item);
-    out.push_str(eol);
-    out.push_str(&text[l.next..]);
-    Ok(out)
+    let (seq_indent, l) = block_list_end(text, lines, first);
+    let line = format!("{}- {item}{eol}", " ".repeat(seq_indent));
+    Ok(insert_after(text, l, &line, eol))
 }
 
 /// Appends `item` to the flow list whose `[` is at `open`; `None` when the list can't be read
@@ -1265,6 +1414,102 @@ tools: {}
             assert!(
                 matches!(apply(refused, &[edit]), Err(YamlEditError::Unsupported(_))),
                 "{refused:?}"
+            );
+        }
+    }
+
+    fn redirect(from: &str, to: &str, actor: bool) -> YamlEdit {
+        let mut entries = vec![
+            ("from".to_string(), YamlValue::Str(from.into())),
+            ("to".to_string(), YamlValue::Str(to.into())),
+            (
+                "moved_utc".to_string(),
+                YamlValue::Str("2026-11-05T10:00:00Z".into()),
+            ),
+            ("by".to_string(), YamlValue::Str("cli".into())),
+        ];
+        if actor {
+            entries.push((
+                "actor".to_string(),
+                YamlValue::Map(vec![
+                    ("kind".to_string(), YamlValue::Str("claude_code".into())),
+                    ("session_id".to_string(), YamlValue::Str("s: 1".into())),
+                ]),
+            ));
+        }
+        YamlEdit::AppendMappingToList {
+            path: vec!["redirects".to_string()],
+            entries,
+        }
+    }
+
+    #[test] // spec: ARCH-076, ARCH-125
+    fn yaml_append_mapping_keeps_comments_and_order() {
+        // A block list: the item goes after the last one, comments and the rest untouched.
+        let text = "# Redirects (ARCH-125).\nredirects:\n  # oldest first\n  - from: a/x  # moved\n    to: a/y\n    moved_utc: 2026-11-01T10:00:00Z\n    by: cli\n# the end\nother: 1\n";
+        let out = apply(text, &[redirect("a/y", "b/z", true)]).unwrap();
+        assert_eq!(
+            out,
+            text.replace(
+                "    by: cli\n# the end",
+                "    by: cli\n  - from: a/y\n    to: b/z\n    moved_utc: 2026-11-05T10:00:00Z\n    by: cli\n    actor:\n      kind: claude_code\n      session_id: \"s: 1\"\n# the end"
+            )
+        );
+        // A list at the key's own indent, CRLF, and no final line break.
+        let text = "redirects:\r\n- from: a/x\r\n  to: a/y";
+        let out = apply(text, &[redirect("a/y", "a/z", false)]).unwrap();
+        assert_eq!(
+            out,
+            "redirects:\r\n- from: a/x\r\n  to: a/y\r\n- from: a/y\r\n  to: a/z\r\n  moved_utc: 2026-11-05T10:00:00Z\r\n  by: cli\r\n"
+        );
+        // A missing file or key: a block list at the end.
+        let out = apply("", &[redirect("a/x", "a/y", false)]).unwrap();
+        assert_eq!(
+            out,
+            "redirects:\n  - from: a/x\n    to: a/y\n    moved_utc: 2026-11-05T10:00:00Z\n    by: cli\n"
+        );
+        let out = apply("# c", &[redirect("a/x", "a/y", false)]).unwrap();
+        assert!(out.starts_with("# c\nredirects:\n  - from: a/x\n"), "{out}");
+        // A key with no value: the list goes under it; its comment stays.
+        let out = apply(
+            "redirects:   # none yet\nname: x\n",
+            &[redirect("a/x", "a/y", false)],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "redirects:   # none yet\n  - from: a/x\n    to: a/y\n    moved_utc: 2026-11-05T10:00:00Z\n    by: cli\nname: x\n"
+        );
+        // A flow list and a null: a flow mapping.
+        let out = apply("redirects: []  # c\n", &[redirect("a/x", "a/y", true)]).unwrap();
+        assert_eq!(
+            out,
+            "redirects: [{from: a/x, to: a/y, moved_utc: 2026-11-05T10:00:00Z, by: cli, actor: {kind: claude_code, session_id: \"s: 1\"}}]  # c\n"
+        );
+        let out = apply("redirects: ~\n", &[redirect("a/x", "a/y", false)]).unwrap();
+        assert_eq!(
+            out,
+            "redirects: [{from: a/x, to: a/y, moved_utc: 2026-11-05T10:00:00Z, by: cli}]\n"
+        );
+        // Not a list, an anchor, an empty mapping: refused, the text untouched.
+        for (text, edit) in [
+            ("redirects: x\n", redirect("a/x", "a/y", false)),
+            ("redirects:\n  a: b\n", redirect("a/x", "a/y", false)),
+            ("redirects: &r []\n", redirect("a/x", "a/y", false)),
+            (
+                "redirects: []\n",
+                YamlEdit::AppendMappingToList {
+                    path: vec!["redirects".into()],
+                    entries: Vec::new(),
+                },
+            ),
+        ] {
+            assert!(
+                matches!(
+                    apply(text, std::slice::from_ref(&edit)),
+                    Err(YamlEditError::Unsupported(_))
+                ),
+                "{text:?}"
             );
         }
     }

@@ -17,11 +17,11 @@ pub mod status;
 
 pub use detail::{
     AssetDetail, AssetSummary, DisplayEntry, FileEntry, LastChange, NextVersions, UseEntry,
-    UsedByEntry, VersionEntry, asset_detail, asset_summary, file_state_wire,
+    UseError, UsedByEntry, VersionEntry, asset_detail, asset_summary, file_state_wire,
 };
 pub use record::{
     HandOff, RecordBranch, RecordOutcome, RecordPlan, RecordSlot, apply_record, asset_topic,
-    start_candidate_run,
+    merge_warnings, start_candidate_run,
 };
 pub use signoff::{Chosen, ChosenFiles, auto_pick, chosen_files, plan_signoff, signed_off_by};
 pub use status::status_by;

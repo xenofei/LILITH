@@ -19,9 +19,11 @@
 //!   and `progress.md` has no `- <date>: project created` line, the entry is added and the
 //!   call succeeds; anything else at that path is `project.exists`.
 //! - `project.set_status` sets `status` in `project.yaml` with the comment-preserving YAML
-//!   edit. Every status but `archived` runs the staleness check ([`restore_staleness`]), so a
-//!   project leaving `archived` catches up (to `active` or to `paused`), and a retry after a
-//!   check that failed midway finishes it. The check is idempotent: an asset already `stale`
+//!   edit. Every status but `archived` runs the staleness check
+//!   ([`crate::projects::restore_staleness`]), so a project leaving `archived` catches up (to
+//!   `active` or to `paused`), and a retry after a check that failed midway finishes it. The
+//!   check is planned (read only) before `project.yaml` is written, so a check that can't be
+//!   made (a redirects file that doesn't parse, needed by an input) writes nothing. The check is idempotent: an asset already `stale`
 //!   is not marked again. `stale` lists the assets this call marked.
 //! - `project.status` is [`project_status`].
 //! - `project.context` gives the call's settings with their sources, the project's `links`,
@@ -51,8 +53,8 @@ use super::registry::{CallCtx, Registry, typed_tool};
 use super::stages::Settings;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::projects::{
-    PROJECT_STATUSES, ProjectFile, ProjectStatus, add_done_entry, progress_path, project_status,
-    project_yaml_path, read_project, restore_staleness, unknown_project,
+    PROJECT_STATUSES, ProjectFile, ProjectStatus, add_done_entry, apply_staleness, plan_staleness,
+    progress_path, project_status, project_yaml_path, read_project, unknown_project,
 };
 use crate::store::{Expect, StoreError};
 
@@ -312,6 +314,14 @@ async fn set_status(
         }
     };
     let status = args.status.as_str();
+    // The staleness check reads (and can fail) before anything is written; its edits follow
+    // the status edit. A retry after a failed edit finds the status already set and the
+    // assets already marked stay as they are.
+    let plan = if args.status != StatusArg::Archived {
+        Some(plan_staleness(open, &slug).await.map_err(error)?)
+    } else {
+        None
+    };
     open.store
         .edit_yaml(
             &yaml_rel,
@@ -324,10 +334,9 @@ async fn set_status(
         .map_err(error)?;
     // Not only on a move out of `archived`: a check that failed midway (after `status` was
     // written) must be finished by the retry, which then finds the status already set.
-    let stale = if args.status != StatusArg::Archived {
-        restore_staleness(open, &slug).await.map_err(error)?
-    } else {
-        Vec::new()
+    let stale = match plan {
+        Some(plan) => apply_staleness(open, plan).await.map_err(error)?,
+        None => Vec::new(),
     };
     ctx.events.publish(
         &format!("project:{slug}"),

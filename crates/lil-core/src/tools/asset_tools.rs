@@ -22,6 +22,11 @@
 //!   The asset's version lock is held from the run id to the end of the Record stage, so two
 //!   imports of one asset in the same minute get different run ids.
 //!   `ref` is the first file's candidate ref, `handoff.refs` every file's.
+//! - **Creating onto a redirect** (ARCH-125; Appendix H): the import that creates an asset
+//!   (there is no manifest yet), in either mode, whose `<project>/<asset_id>` is some entry's
+//!   `from` in `registry/redirects.yaml`, adds the warning "Old refs to <name> will now reach
+//!   this asset (registry/redirects.yaml)." to `warnings`; it never blocks. A redirects file
+//!   that can't be read is a warning too, saying the check couldn't be made.
 //! - **`asset.import`, `link_external`**: each file is hashed where it is and recorded in
 //!   `external: [{path, sha256}]` with a manifest edit; nothing is copied and no run is
 //!   started; a `planned` asset goes `in_progress`. `ref` is the asset's ref without a
@@ -52,9 +57,13 @@
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
 //!   writes no `progress.md` entry.
 //! - **`asset.pin_input`** needs a ref that parses (`ref.invalid`; a candidate ref is never an
-//!   input), whose target need not exist on this machine. It pushes `{ref, reason, by, date}`
-//!   to `pinned_inputs` (once per ref) and, for a `proj:` or `lib:` source the project's
-//!   `links` lack, appends it there with the comment-keeping YAML edit, in Execute (CORE-019).
+//!   input), whose target need not exist on this machine. Its target is resolved through
+//!   `projects::Resolver` (ARCH-125): the project it lives in now decides the `links` source
+//!   (one that doesn't resolve, also for a redirects file that doesn't parse, and a ref of
+//!   another workspace count by the name as written). It pushes
+//!   `{ref, reason, by, date}` to `pinned_inputs` (once per ref, as written) and, for a
+//!   `proj:` or `lib:` source the project's `links` lack, appends it there with the
+//!   comment-keeping YAML edit, in Execute (CORE-019).
 //! - **`asset.deprecate`** (CORE-170; P4b-R4) sets the status `deprecated` with a manifest
 //!   edit (`status_before_deprecated` = the status it had), or with `deprecated: false` returns
 //!   it to the status `lil_schema::status::transition`'s fallback order gives. An asset already
@@ -116,7 +125,10 @@ use crate::pipeline::{
     Chosen, HandOff, RecordBranch, RecordPlan, asset_topic, chosen_files, plan_signoff,
     signed_off_by, start_candidate_run, status_by,
 };
-use crate::projects::{ProjectFile, project_yaml_path, read_project, unknown_project};
+use crate::projects::redirects::{name_of, read_redirects};
+use crate::projects::{
+    ProjectFile, REDIRECTS_YAML, Resolver, project_yaml_path, read_project, unknown_project,
+};
 use crate::store::{
     CommitOp, ManifestEdit, OutputMove, SNAPSHOT, SealRequest, Store, StoreError, Written, WsPath,
     path_key,
@@ -725,6 +737,7 @@ async fn import(ctx: &CallCtx, args: ImportArgs) -> Result<(ImportResult, String
         return Err(invalid(ctx, "type is one non-empty line".to_string()));
     }
     let files = sources(ctx, &args.files)?;
+    let warnings = creation_warnings(ctx, &a).await?;
     match args.mode {
         ImportMode::Copy => {
             let (run_id, refs, names) =
@@ -743,13 +756,40 @@ async fn import(ctx: &CallCtx, args: ImportArgs) -> Result<(ImportResult, String
                         ..HandOff::default()
                     },
                     files: untrusted(&names),
-                    warnings: Vec::new(),
+                    warnings,
                 },
                 summary,
             ))
         }
-        ImportMode::LinkExternal => link_external(ctx, &a, asset_type, &files).await,
+        ImportMode::LinkExternal => link_external(ctx, &a, asset_type, &files, warnings).await,
     }
+}
+
+/// The warning of an import that creates an asset onto a redirect's `from` (module docs).
+async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, ErrorBody> {
+    if a.store()
+        .read(&a.manifest)
+        .await
+        .map_err(|e| e.to_error(&ctx.trace_id))?
+        .is_some()
+    {
+        return Ok(Vec::new());
+    }
+    let name = (a.project.clone(), a.asset_id.clone());
+    Ok(match read_redirects(a.store()).await {
+        Ok(redirects) if redirects.iter().any(|r| r.from == name) => vec![format!(
+            "Old refs to {} will now reach this asset ({REDIRECTS_YAML}).",
+            name_of(&name)
+        )],
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "registry/redirects.yaml can't be read for an import");
+            vec![format!(
+                "{REDIRECTS_YAML} couldn't be read, so whether old refs to {} will now reach this asset wasn't checked: {e}",
+                name_of(&name)
+            )]
+        }
+    })
 }
 
 /// `asset.import` with `mode: link_external` (module docs).
@@ -758,6 +798,7 @@ async fn link_external(
     a: &Asset,
     asset_type: &str,
     files: &[(PathBuf, String)],
+    warnings: Vec<String>,
 ) -> Result<(ImportResult, String), ErrorBody> {
     let store = a.store();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
@@ -822,7 +863,7 @@ async fn link_external(
             run_id: None,
             handoff: HandOff::default(),
             files: untrusted(&names),
-            warnings: Vec::new(),
+            warnings,
         },
         summary,
     ))
@@ -1777,28 +1818,65 @@ async fn mark(ctx: &CallCtx, args: MarkArgs) -> Result<(MarkResult, String), Err
     Ok((result, summary))
 }
 
-/// The `links` source a pinned ref names from `project`: `proj:<slug>` for another project's
-/// asset, `lib:<item>` for a library item; `None` otherwise.
-fn link_source(project: &str, r: &str) -> Result<Option<String>, ()> {
+/// What a pinned ref names from `project`.
+enum PinTarget {
+    Library(String),
+    /// An asset of the workspace, by the name the ref gives: `(project, asset_id)`.
+    Asset(String, String),
+    /// An asset of another workspace, by its project as written: never followed through this
+    /// workspace's redirects.
+    Foreign(String),
+    /// `style@<n>`: the project's own style bible.
+    Style,
+}
+
+/// `Err` for text that is neither a link nor a sealed ref. A sealed ref of a workspace other
+/// than `ws_id` is [`PinTarget::Foreign`].
+fn pin_target(ws_id: &str, project: &str, r: &str) -> Result<PinTarget, ()> {
     if let Ok(link) = r.parse::<LinkRef>() {
         return Ok(match link {
-            LinkRef::Project { slug, .. } if slug != project => Some(format!("proj:{slug}")),
-            LinkRef::Library { item, .. } => Some(format!("lib:{item}")),
-            _ => None,
+            LinkRef::Local { asset, .. } => PinTarget::Asset(project.to_string(), asset),
+            LinkRef::Project { slug, asset, .. } => PinTarget::Asset(slug, asset),
+            LinkRef::Library { item, .. } => PinTarget::Library(item),
+            LinkRef::Style(_) => PinTarget::Style,
         });
     }
     match r.parse::<AssetRef>() {
-        Ok(AssetRef::Sealed { project: p, .. }) if p != project => Ok(Some(format!("proj:{p}"))),
-        Ok(AssetRef::Sealed { .. }) => Ok(None),
+        Ok(AssetRef::Sealed {
+            ws, project, asset, ..
+        }) => Ok(if ws == ws_id {
+            PinTarget::Asset(project, asset)
+        } else {
+            PinTarget::Foreign(project)
+        }),
         // A candidate ref is for viewing only, never an input (ARCH-042).
         Ok(AssetRef::Candidate { .. }) | Err(_) => Err(()),
+    }
+}
+
+/// The `links` source a pinned target needs from `project`: `proj:<slug>` for an asset of
+/// another project where it resolves to now (as named when it doesn't resolve, the redirects
+/// file doesn't parse, or it is another workspace's), `lib:<item>` for a library item; `None`
+/// otherwise.
+async fn link_source(resolver: &Resolver<'_>, project: &str, target: PinTarget) -> Option<String> {
+    match target {
+        PinTarget::Library(item) => Some(format!("lib:{item}")),
+        PinTarget::Style => None,
+        PinTarget::Foreign(p) => (p != project).then(|| format!("proj:{p}")),
+        PinTarget::Asset(p, asset) => {
+            let p = match resolver.resolve_name(&p, &asset).await {
+                Ok(r) => r.project,
+                Err(_) => p,
+            };
+            (p != project).then(|| format!("proj:{p}"))
+        }
     }
 }
 
 async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), ErrorBody> {
     let a = asset_of(ctx, args.project, &args.asset_id).await?;
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
-    let Ok(source) = link_source(&a.project, &args.r#ref) else {
+    let Ok(target) = pin_target(&a.open.ws.id, &a.project, &args.r#ref) else {
         let mut e = ErrorBody::new(
             &REF_INVALID,
             "ref is not a link (<asset_id>@<v>, proj:<slug>/<asset_id>@<v>, lib:<item>@<v>, \
@@ -1815,6 +1893,12 @@ async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), 
     {
         return Err(unknown_asset(ctx, &a));
     }
+    let source = {
+        let resolver = Resolver::load(&a.open.index, a.store())
+            .await
+            .map_err(|e| traced(ctx, e))?;
+        link_source(&resolver, &a.project, target).await
+    };
     // CORE-019: the source goes into the project's `links`, in Execute.
     if let Some(source) = source {
         let yaml = project_yaml_path(&a.project).map_err(|e| traced(ctx, e))?;

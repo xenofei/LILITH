@@ -10,13 +10,16 @@
 //!    → progress → index, including `commit.moved`. The plan's version-lock guard is dropped
 //!    when the commit returns, whether it succeeded or not, and the staging handles the
 //!    outputs came from are given back (one that still holds files stays as an orphan).
-//! 2. For a sealed version: the dependents of the asset (`projects::dependents`, which skips
+//! 2. For a sealed version: the dependents of the asset (`projects::dependents_of`, which skips
 //!    archived projects) that are `approved`, `exported` or `released`, take the new version
 //!    through an input that isn't pinned, and whose input names an older version, go
 //!    `MarkStale` (a hash-checked manifest edit), into `made_stale` as refs that carry the
 //!    content hash. Dependents in `planned` or `blocked` whose every asset input now names a
-//!    sealed version go into `unlocks`. A dependent that can't be read or edited is logged
-//!    and skipped: the commit has happened.
+//!    sealed version go into `unlocks`. Inputs and pins are resolved through
+//!    `projects::Resolver` (ARCH-125): a dependent that names the asset's old place is one of
+//!    its dependents, and a pin of either name pins it. A dependent that can't be read or
+//!    edited is logged and skipped: the commit has happened. A redirects file that can't be
+//!    read or parsed leaves the asset's own name only, with a warning.
 //! 3. Events: `asset:<ref>` `{kind: "candidate_run", run_id}` or
 //!    `{kind: "version_sealed", version}`, `project:<slug>` `{kind: "progress"}`, and
 //!    `{kind: "status", status: "stale"}` on the topic of each asset marked stale.
@@ -43,7 +46,7 @@ use serde_json::{Map, Value, json};
 use crate::events::EventBus;
 use crate::graph::is_stale;
 use crate::index::Index;
-use crate::projects::{add_done_entry, dependents, stale_ref};
+use crate::projects::{Resolver, add_done_entry, dependents_of, stale_ref};
 use crate::store::{CommitOp, StagingHandle, Store, StoreError, WsPath};
 
 /// Which Record branch a plan takes (CORE-020).
@@ -130,6 +133,19 @@ impl RecordSlot {
 
     pub fn take(&self) -> Option<RecordPlan> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+/// Puts the Record stage's `warnings` in a recorded result's `structured` object, after the
+/// warnings the tool's own result already lists (such as `asset.import`'s creation warning,
+/// ARCH-125): the inline Record stage and a job's Record step both use it.
+pub fn merge_warnings(structured: &mut Map<String, Value>, recorded: Vec<String>) {
+    let recorded = recorded.into_iter().map(Value::from);
+    match structured.get_mut("warnings") {
+        Some(Value::Array(own)) => own.extend(recorded),
+        _ => {
+            structured.insert("warnings".into(), recorded.collect());
+        }
     }
 }
 
@@ -269,13 +285,14 @@ fn target_of(project: &str, link: &LinkRef) -> Option<((String, String), Version
     }
 }
 
-/// Whether `view` (of an asset in `project`) pins `target`.
-fn pins(project: &str, view: &ManifestView, target: &(String, String)) -> bool {
+/// Whether `view` (of an asset in `project`) pins one of `names` (an asset and every name that
+/// resolves to it).
+fn pins(project: &str, view: &ManifestView, names: &[(String, String)]) -> bool {
     view.pinned_inputs
         .iter()
         .filter_map(|p| p.r#ref.parse::<LinkRef>().ok())
         .filter_map(|l| target_of(project, &l).map(|(t, _)| t))
-        .any(|t| &t == target)
+        .any(|t| names.contains(&t))
 }
 
 /// Step 2 (module docs): marks dependents stale and lists what the new version unlocks. What
@@ -292,7 +309,28 @@ async fn hand_off_dependents(
     warnings: &mut Vec<String>,
 ) {
     let target = (sealed.0.to_string(), sealed.1.to_string());
-    let found = match dependents(store, index, sealed.0, sealed.1).await {
+    let resolver = match Resolver::load(index, store).await {
+        Ok(resolver) => resolver,
+        Err(e) => {
+            tracing::warn!(project = sealed.0, asset = sealed.1, error = %e.message, "the redirects can't be read, so no dependent was checked");
+            warnings.push(format!(
+                "the dependents of the new version couldn't be listed, so none was marked stale: {}",
+                e.message
+            ));
+            return;
+        }
+    };
+    if let Some(e) = resolver.file_error() {
+        // Only the asset's own name is checked: refs to its old places can't be followed.
+        tracing::warn!(project = sealed.0, asset = sealed.1, error = %e.message, "the redirects file can't be read or parsed; dependents by old names weren't checked");
+        warnings.push(format!(
+            "dependents that name this asset's old places weren't checked: {}",
+            e.message
+        ));
+    }
+    // The asset and every old name that reaches it (ARCH-125).
+    let names = resolver.names_resolving_to(sealed.0, sealed.1);
+    let found = match dependents_of(store, index, &names).await {
         Ok(found) => found,
         Err(e) => {
             tracing::warn!(project = sealed.0, asset = sealed.1, error = %e, "the dependents of a sealed version can't be listed");
@@ -328,8 +366,8 @@ async fn hand_off_dependents(
                         .ok()
                         .and_then(|l| target_of(&project, &l))
                         .is_some_and(|(t, named)| {
-                            t == target
-                                && is_stale(&named, Some(&version), pins(&project, &view, &t))
+                            names.contains(&t)
+                                && is_stale(&named, Some(&version), pins(&project, &view, &names))
                         })
                 });
                 let Some(input) = stale_through else {
@@ -372,6 +410,12 @@ async fn hand_off_dependents(
                     else {
                         continue;
                     };
+                    // Where the input's asset is now; one that doesn't resolve isn't sealed.
+                    let Ok(r) = resolver.resolve_name(&t.0, &t.1).await else {
+                        all_sealed = false;
+                        break;
+                    };
+                    let t = (r.project, r.asset_id);
                     let now = match approved.get(&t) {
                         Some(v) => *v,
                         None => {
@@ -522,6 +566,27 @@ mod tests {
             unreachable!()
         };
         map
+    }
+
+    #[test] // spec: CORE-020
+    fn merge_warnings_keeps_the_tool_s_own_first() {
+        let mut with = json!({"warnings": ["own"], "ref": "r"});
+        let Value::Object(map) = &mut with else {
+            unreachable!()
+        };
+        merge_warnings(map, vec!["recorded".to_string()]);
+        assert_eq!(with, json!({"warnings": ["own", "recorded"], "ref": "r"}));
+        let mut without = json!({"ref": "r"});
+        let Value::Object(map) = &mut without else {
+            unreachable!()
+        };
+        merge_warnings(map, vec!["recorded".to_string()]);
+        assert_eq!(without, json!({"ref": "r", "warnings": ["recorded"]}));
+        let Value::Object(map) = &mut without else {
+            unreachable!()
+        };
+        merge_warnings(map, Vec::new());
+        assert_eq!(without["warnings"], json!(["recorded"]));
     }
 
     #[test] // spec: CORE-023, CORE-027

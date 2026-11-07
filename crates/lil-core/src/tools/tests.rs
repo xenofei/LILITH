@@ -977,6 +977,31 @@ fn the_organising_tools_are_pinned() {
     assert!(!required.contains(&json!("rating")), "{required:?}");
 }
 
+/// The plan-4b `ref.resolve` row (CORE-146, P4b-R25; Appendix H "`ref.resolve`"): it reads, in
+/// `workspace`, and takes `ref` or `path`, nothing else.
+#[test] // spec: ARCH-125, APP-019, CORE-146, CORE-058
+fn the_ref_tools_are_pinned() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
+    let resolve = reg
+        .descriptors()
+        .into_iter()
+        .find(|d| d.name == "ref.resolve")
+        .expect("ref.resolve is registered");
+    assert_eq!(
+        (resolve.effect, resolve.module.as_str()),
+        (EffectClass::Read, WORKSPACE_MODULE)
+    );
+    let props: Vec<&String> = resolve.input_schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(props, ["ref", "path"]);
+    assert_eq!(resolve.input_schema["additionalProperties"], false);
+}
+
 #[test] // spec: CORE-014
 fn registry_and_dispatcher_live_in_the_tools_module() {
     let _: fn() -> crate::tools::Registry = crate::tools::Registry::new;

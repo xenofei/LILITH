@@ -56,6 +56,7 @@ pub use toast_xml::{ToastActions, ToastText, toast_xml};
 pub use tools::register_interchange_tools;
 
 use crate::events::EventBus;
+use crate::projects::Resolver;
 use crate::session::Session;
 use crate::tools::CallCtx;
 use crate::transport::ConnObserver;
@@ -325,8 +326,12 @@ impl ConnObserver for Interchange {
 }
 
 /// `target` as a [`Target`], its asset type looked up in the call's workspace when it is a
-/// ref (the type isn't in the ref).
-async fn resolve(ctx: &CallCtx, text: &str) -> Result<Target, ErrorBody> {
+/// ref (the type isn't in the ref). The ref's name is resolved through
+/// [`Resolver`](crate::projects::Resolver) first (ARCH-125), so an old name finds the type of
+/// the asset it reaches now; a ref that doesn't resolve (a loop, a dead end, the trash, a
+/// redirects file that can't be read) has no type, as a ref of a workspace that isn't open
+/// has none. The target's text stays as given.
+pub(crate) async fn resolve(ctx: &CallCtx, text: &str) -> Result<Target, ErrorBody> {
     let mut target = Target::parse(text)
         .map_err(|why| ErrorBody::new(&codes::PARAMS_INVALID, why, ctx.trace_id.clone()))?;
     if target.kind.is_none()
@@ -340,9 +345,21 @@ async fn resolve(ctx: &CallCtx, text: &str) -> Result<Target, ErrorBody> {
         ) = text.parse::<AssetRef>()
         && let Some(open) = &ctx.workspace
         && open.ws.id == ws
-        && let Ok(Some(row)) = open.index.asset(&project, &asset).await
     {
-        target.kind = row.asset_type;
+        let found = match Resolver::load(&open.index, &open.store).await {
+            Ok(resolver) => resolver.resolve_name(&project, &asset).await,
+            Err(e) => Err(e),
+        };
+        match found {
+            Ok(r) => {
+                if let Ok(Some(row)) = open.index.asset(&r.project, &r.asset_id).await {
+                    target.kind = row.asset_type;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(code = %e.code, why = %e.message, "a ref target doesn't resolve; it has no type");
+            }
+        }
     }
     Ok(target)
 }
