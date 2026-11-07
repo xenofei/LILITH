@@ -5,11 +5,13 @@
 //! - [`reconcile`]: the walk, the per-file decision (size, last write, FileId, ChangeTime),
 //!   stable-snapshot hashing, parked reads, manifests parsed into `assets` and `edges`,
 //!   `missing` files, the cold rebuild and the store's change events;
-//! - [`query`]: `assets.query`'s keyset paging, filters and facets, and its opaque cursor.
+//! - [`query`]: `assets.query`'s keyset paging, filters and facets, and its opaque cursor;
+//! - [`repair`]: moved and copied asset folders (CORE-154), from `creation_uuid`.
 //!
 //! Schema 2 (plan 4b) adds the marks and tile fields of each asset, its tags (`asset_tags`), the
 //! takes of every run not trashed (`take_marks`), and each file's `kind` with an index on its
-//! SHA-256 (duplicates, CORE-168).
+//! SHA-256 (duplicates, CORE-168), and each asset's `repair` with the manifest's own `project`
+//! and `asset_id` it is computed from (CORE-154).
 //!
 //! One SQLite connection lives on its own thread (`lil-index-<id>`); callers send it jobs and
 //! await the answer, as `state` does. Walking and hashing run on blocking threads, never on
@@ -23,6 +25,7 @@
 
 mod query;
 mod reconcile;
+pub mod repair;
 mod schema;
 
 use std::collections::{BTreeMap, HashMap};
@@ -241,7 +244,9 @@ pub struct AssetRow {
     pub creation_uuid: Option<String>,
     /// The manifest's last write as indexed, in Unix seconds.
     pub updated: i64,
-    /// The manifest doesn't parse, or its `asset_id` or `project` disagrees with the folder.
+    /// The asset needs repair: the manifest doesn't parse, disagrees with the folder or isn't
+    /// named for it (CORE-047), or the folder is moved or shares its creation UUID (CORE-154);
+    /// exactly when `repair` is set, except for a folder whose manifest is `missing`.
     pub needs_repair: bool,
     /// The asset's tags as written (by their fold).
     pub tags: Vec<String>,
@@ -259,8 +264,15 @@ pub struct AssetRow {
     pub display: Option<serde_json::Value>,
     /// The newest status-log entry: `{to, by, utc}`.
     pub last_change: Option<serde_json::Value>,
-    /// `{kind, from?, to?, other?}` (Task 8 fills it).
+    /// `{kind, from?, to?, other?}` ([`repair::RepairKind`]).
     pub repair: Option<serde_json::Value>,
+    /// The manifest's own `project`, as written (`None` when it has none).
+    pub manifest_project: Option<String>,
+    /// The manifest's own `asset_id`, as written (`None` when it has none).
+    pub manifest_asset_id: Option<String>,
+    /// The manifest parses, and its `project` and `asset_id` are strings when present (the
+    /// other fields keep their last values when it doesn't).
+    pub manifest_parses: bool,
 }
 
 /// An `edges` row: `from` names `to` as an input (`input`) or a pin (`pinned`).
@@ -781,6 +793,41 @@ impl Index {
             .await
     }
 
+    /// Every asset that needs a repair of `kind` (`moved`, `copy`, `duplicate_uuid` or
+    /// `invalid`; [`repair`]), workspace-wide, by project and asset id (`project.status`'s
+    /// `moved` and `duplicates`, the repair tools).
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn repairs(&self, kinds: &[&str]) -> Result<Vec<AssetRow>, IndexError> {
+        let kinds: Vec<String> = kinds.iter().map(|k| (*k).to_string()).collect();
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT {} FROM assets a WHERE a.repair IS NOT NULL \
+                         ORDER BY a.project, a.asset_id",
+                        query::ASSET_COLUMNS
+                    ))
+                    .map_err(|e| sql(&e))?;
+                let rows = stmt
+                    .query_map([], query::asset_row)
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                    .map_err(|e| sql(&e))?;
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| {
+                        r.repair
+                            .as_ref()
+                            .and_then(|v| v.get("kind"))
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|k| kinds.iter().any(|w| w == k))
+                    })
+                    .collect())
+            })
+            .await
+    }
+
     /// How many assets each project has, by project, from one grouped count; a project
     /// without assets isn't listed (`projects.list`, Checkpoint A store M5).
     ///
@@ -1032,14 +1079,20 @@ impl Index {
     pub async fn set_state(&self, path: &WsPath, state: FileState) -> Result<(), IndexError> {
         let key = path_key(path.as_str());
         lock(&self.mismatched).remove(&key);
+        // A manifest gone `missing` (or back) changes which asset folders are live.
+        let manifest = kind_of(path) == FileKind::Manifest;
         self.db
             .call(move |conn| {
-                conn.execute(
+                let tx = conn.transaction().map_err(|e| sql(&e))?;
+                tx.execute(
                     "UPDATE files SET state = ?2 WHERE key = ?1",
                     params![key, state.as_str()],
                 )
-                .map(drop)
-                .map_err(|e| sql(&e))
+                .map_err(|e| sql(&e))?;
+                if manifest {
+                    reconcile::refresh_repairs(&tx).map_err(|e| sql(&e))?;
+                }
+                tx.commit().map_err(|e| sql(&e))
             })
             .await
     }

@@ -28,7 +28,11 @@
 //! `asset_tags`, `take_marks` (the takes of every run not trashed, P4b-R40), `edges`,
 //! `assets_fts` and `expected`. The folder is authoritative: one that doesn't parse,
 //! or whose `asset_id` or `project` disagrees with its folder, is `needs_repair` and its asset
-//! row is flagged; the manifest is never rewritten. With [`ReconcileOrder::ManifestsFirst`]
+//! row is flagged; the manifest is never rewritten. Each asset row also keeps the manifest's
+//! own `project` and `asset_id`, and after every run (and every store change) that touched an
+//! asset, each row's `repair` and `needs_repair` are computed again across the workspace from
+//! `creation_uuid` ([`refresh_repairs`], [`super::repair::detect`]; CORE-154): only the index
+//! changes. With [`ReconcileOrder::ManifestsFirst`]
 //! every manifest is looked at, and its results written, before any other file.
 //!
 //! **Removed files:** a file the suite still expects on disk (a manifest, a file in its
@@ -57,8 +61,8 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    FileKind, FileRow, FileState, Index, IndexError, Mismatch, PARKED_MAX, ParkedPath,
-    ReconcileOrder, ReconcileReport, Scope, asset_of, kind_of, lock, sql,
+    AssetRow, FileKind, FileRow, FileState, Index, IndexError, Mismatch, PARKED_MAX, ParkedPath,
+    ReconcileOrder, ReconcileReport, Scope, asset_of, kind_of, lock, repair, sql,
 };
 use crate::store::{ChangeKind, StoreEvent, WsPath, lfs_pointer_oid, path_key};
 
@@ -721,6 +725,11 @@ struct Fields {
     version: Option<String>,
     approved_version: Option<String>,
     creation_uuid: Option<String>,
+    /// The manifest's own `project` and `asset_id` (strings as written; `None` when absent).
+    manifest_project: Option<String>,
+    manifest_asset_id: Option<String>,
+    /// Both are strings when present (one that isn't can't name a place).
+    place_strings: bool,
     edges: Vec<Edge>,
     expected: Vec<Expected>,
     body: String,
@@ -782,6 +791,13 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
         Some(Value::String(s)) => s != folder,
         Some(_) => true,
     };
+    let own = |key: &str| match map.get(key) {
+        None | Some(Value::Null) => (None, true),
+        Some(Value::String(s)) => (Some(s.clone()), true),
+        Some(_) => (None, false),
+    };
+    let ((manifest_project, project_ok), (manifest_asset_id, asset_ok)) =
+        (own("project"), own("asset_id"));
     let canonical = format!("{asset_id}.manifest.json");
     let needs_repair = disagrees("asset_id", &asset_id)
         || disagrees("project", &project)
@@ -912,6 +928,9 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
             version: string(map, "version"),
             approved_version: string(map, "approved_version"),
             creation_uuid: view.creation_uuid.clone(),
+            manifest_project,
+            manifest_asset_id,
+            place_strings: project_ok && asset_ok,
             edges,
             expected,
             body: body.join(" "),
@@ -947,10 +966,12 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
     let Some(fields) = &parsed.fields else {
         // It doesn't parse: flag the row and keep its last values, edges and expected files.
         tx.prepare_cached(
-            "INSERT INTO assets (project, asset_id, manifest, updated, needs_repair)
-             VALUES (?1, ?2, ?3, ?4, 1)
+            "INSERT INTO assets (project, asset_id, manifest, updated, needs_repair,
+                 manifest_parses)
+             VALUES (?1, ?2, ?3, ?4, 1, 0)
              ON CONFLICT (project, asset_id) DO UPDATE SET
-                 manifest = excluded.manifest, updated = excluded.updated, needs_repair = 1",
+                 manifest = excluded.manifest, updated = excluded.updated, needs_repair = 1,
+                 manifest_parses = 0",
         )?
         .execute(params![
             parsed.project,
@@ -964,8 +985,10 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
         .prepare_cached(
             "INSERT INTO assets (project, asset_id, asset_type, status, version, approved_version,
                  manifest, creation_uuid, updated, needs_repair, rating, label, runs_waiting,
-                 external, working_doc, display, last_change)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 external, working_doc, display, last_change, manifest_project,
+                 manifest_asset_id, manifest_parses)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18, ?19, ?20)
              ON CONFLICT (project, asset_id) DO UPDATE SET
                  asset_type = excluded.asset_type, status = excluded.status,
                  version = excluded.version, approved_version = excluded.approved_version,
@@ -974,7 +997,9 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
                  rating = excluded.rating, label = excluded.label,
                  runs_waiting = excluded.runs_waiting, external = excluded.external,
                  working_doc = excluded.working_doc, display = excluded.display,
-                 last_change = excluded.last_change
+                 last_change = excluded.last_change, manifest_project = excluded.manifest_project,
+                 manifest_asset_id = excluded.manifest_asset_id,
+                 manifest_parses = excluded.manifest_parses
              RETURNING id",
         )?
         .query_row(
@@ -996,6 +1021,9 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
                 i64::from(fields.working_doc),
                 fields.display,
                 fields.last_change,
+                fields.manifest_project,
+                fields.manifest_asset_id,
+                i64::from(fields.place_strings),
             ],
             |r| r.get(0),
         )?;
@@ -1068,6 +1096,95 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
             e.sha256,
             i64::from(e.tracked)
         ])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Repairs (CORE-154).
+// ---------------------------------------------------------------------------------------------
+
+/// An asset row with what [`repair::detect`] reads (the other fields are left empty), and its
+/// stored `repair` and `needs_repair`.
+fn repair_input(r: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
+    Ok(AssetRow {
+        project: r.get(0)?,
+        asset_id: r.get(1)?,
+        asset_type: None,
+        status: None,
+        version: None,
+        approved_version: None,
+        manifest: WsPath::from_disk(r.get(2)?),
+        creation_uuid: r.get(3)?,
+        updated: 0,
+        needs_repair: r.get::<_, i64>(4)? != 0,
+        tags: Vec::new(),
+        rating: 0,
+        label: None,
+        runs_waiting: 0,
+        external: false,
+        working_doc: false,
+        display: None,
+        last_change: None,
+        repair: r
+            .get::<_, Option<String>>(5)?
+            .and_then(|t| serde_json::from_str(&t).ok()),
+        manifest_project: r.get(6)?,
+        manifest_asset_id: r.get(7)?,
+        manifest_parses: r.get::<_, i64>(8)? != 0,
+    })
+}
+
+/// Recomputes every asset row's `repair` and `needs_repair` (CORE-154; [`repair`]): `detect`
+/// over the live rows, those whose manifest isn't `missing` (a folder that is gone holds no
+/// creation UUID); a row whose manifest is missing has no `repair` and keeps the CORE-047
+/// check alone as `needs_repair`. Only rows that change are written. It reads and writes the
+/// index only, never a manifest: nothing is repaired by itself.
+pub(super) fn refresh_repairs(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let missing: HashSet<String> = tx
+        .prepare_cached("SELECT key FROM files WHERE state = 'missing' AND kind = 'other'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let rows: Vec<AssetRow> = tx
+        .prepare_cached(
+            "SELECT project, asset_id, manifest, creation_uuid, needs_repair, repair,
+                 manifest_project, manifest_asset_id, manifest_parses
+             FROM assets",
+        )?
+        .query_map([], repair_input)?
+        .collect::<rusqlite::Result<_>>()?;
+    let (live, gone): (Vec<AssetRow>, Vec<AssetRow>) = rows
+        .into_iter()
+        .partition(|r| !missing.contains(&path_key(r.manifest.as_str())));
+    let found = repair::detect(&live);
+    let mut update = tx.prepare_cached(
+        "UPDATE assets SET repair = ?3, needs_repair = ?4 WHERE project = ?1 AND asset_id = ?2",
+    )?;
+    // A gone folder needs no repair of its own (its manifest is listed as `missing`); it keeps
+    // the CORE-047 check alone, as before it went.
+    let kinds = live
+        .iter()
+        .map(|row| {
+            let kind = found
+                .get(&(row.project.clone(), row.asset_id.clone()))
+                .cloned();
+            let needs = kind.is_some();
+            (row, kind, needs)
+        })
+        .chain(
+            gone.iter()
+                .map(|row| (row, None, repair::needs_repair_alone(row))),
+        );
+    for (row, kind, needs) in kinds {
+        let value = kind.as_ref().map(repair::RepairKind::to_json);
+        if value != row.repair || needs != row.needs_repair {
+            update.execute(params![
+                row.project,
+                row.asset_id,
+                value.map(|v| v.to_string()),
+                i64::from(needs)
+            ])?;
+        }
     }
     Ok(())
 }
@@ -1440,6 +1557,7 @@ pub(super) async fn run(
                     if !rows.is_empty() {
                         let tx = conn.transaction().map_err(|e| sql(&e))?;
                         write_rows(&tx, &rows, &parsed, true).map_err(|e| sql(&e))?;
+                        refresh_repairs(&tx).map_err(|e| sql(&e))?;
                         tx.commit().map_err(|e| sql(&e))?;
                     }
                     load_recorded(conn, &scope).map_err(|e| sql(&e))
@@ -1597,6 +1715,9 @@ fn finish(
             }
         }
     }
+    if mode == Mode::Cold || !rows.is_empty() || !gone.is_empty() || !replay.is_empty() {
+        refresh_repairs(tx)?;
+    }
     if let Some(started) = scan_start {
         tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('scan_start', ?1)",
@@ -1724,6 +1845,9 @@ pub(super) async fn apply_events(index: &Index, events: &[StoreEvent]) -> Result
                 let tx = conn.transaction().map_err(|e| sql(&e))?;
                 store_changes(&tx, &changes.removed, &changes.rows, &changes.parsed)
                     .map_err(|e| sql(&e))?;
+                if !changes.parsed.is_empty() || !changes.removed.is_empty() {
+                    refresh_repairs(&tx).map_err(|e| sql(&e))?;
+                }
                 tx.commit().map_err(|e| sql(&e))
             })
             .await?;

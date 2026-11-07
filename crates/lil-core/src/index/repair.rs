@@ -1,0 +1,319 @@
+//! Moved and copied asset folders (CORE-154, CORE-047; Appendix H "Moved and copied folders"):
+//! [`detect`], a pure function over the index's asset rows that `reconcile` calls to fill each
+//! row's `repair` (and `needs_repair`).
+//!
+//! The folder name is authoritative. A row **agrees** when its manifest parses and its own
+//! `project` and `asset_id` (each, when present) are the folder's, compared exactly as the
+//! CORE-047 check does. Rows are grouped by `creation_uuid` (compared without regard to case,
+//! as UUIDs are); a row without one (a legacy manifest) is never in a group, so it is never
+//! `moved`, `copy` or `duplicate_uuid`.
+//!
+//! - **One folder** with the UUID that disagrees: `moved`, `from` the manifest's place, `to` the
+//!   folder, when that place is a valid `<project>/<asset_id>` other than the folder itself
+//!   (compared without regard to case: on Windows a name that differs only by case is the same
+//!   folder); else `invalid`.
+//! - **Several folders** with one UUID: every one needs repair. Agreeing ones are
+//!   `duplicate_uuid`; a disagreeing one is `copy` with `other` the original when exactly one
+//!   agrees, else `duplicate_uuid` too (neither is clearly the original: you choose).
+//!   `duplicate_uuid`'s `other` is the first other folder of the group, by name.
+//! - **`invalid`**: any other CORE-047 `needs_repair`: a manifest that doesn't parse (or whose
+//!   `project` or `asset_id` isn't a string), a manifest file not named `<asset_id>.manifest.json`
+//!   in a folder whose fields agree, or a disagreeing manifest without a UUID.
+//!
+//! The caller passes only the **live** rows (whose manifest isn't `missing`): a folder that is
+//! gone holds no UUID. A row not in the result needs no repair.
+
+use std::collections::{BTreeMap, HashMap};
+
+use lil_schema::{is_asset_id, is_slug};
+use serde_json::{Value, json};
+
+use super::AssetRow;
+
+/// What repair an asset folder needs (Appendix H `repair.kind`); names are
+/// `<project>/<asset_id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairKind {
+    /// The folder's creation UUID is nowhere else and its manifest names `from`.
+    Moved { from: String, to: String },
+    /// A second folder with `other`'s creation UUID, whose manifest disagrees with it.
+    Copy { other: String },
+    /// One of several folders with one creation UUID (module docs).
+    DuplicateUuid { other: String },
+    /// Any other CORE-047 `needs_repair`.
+    Invalid,
+}
+
+impl RepairKind {
+    /// `moved`, `copy`, `duplicate_uuid` or `invalid`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RepairKind::Moved { .. } => "moved",
+            RepairKind::Copy { .. } => "copy",
+            RepairKind::DuplicateUuid { .. } => "duplicate_uuid",
+            RepairKind::Invalid => "invalid",
+        }
+    }
+
+    /// The wire form, `{kind, from?, to?, other?}`.
+    pub fn to_json(&self) -> Value {
+        match self {
+            RepairKind::Moved { from, to } => json!({"kind": "moved", "from": from, "to": to}),
+            RepairKind::Copy { other } => json!({"kind": "copy", "other": other}),
+            RepairKind::DuplicateUuid { other } => {
+                json!({"kind": "duplicate_uuid", "other": other})
+            }
+            RepairKind::Invalid => json!({"kind": "invalid"}),
+        }
+    }
+
+    /// The wire form read back; `None` for anything else.
+    pub fn from_json(v: &Value) -> Option<RepairKind> {
+        let text = |key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
+        Some(match v.get("kind")?.as_str()? {
+            "moved" => RepairKind::Moved {
+                from: text("from")?,
+                to: text("to")?,
+            },
+            "copy" => RepairKind::Copy {
+                other: text("other")?,
+            },
+            "duplicate_uuid" => RepairKind::DuplicateUuid {
+                other: text("other")?,
+            },
+            "invalid" => RepairKind::Invalid,
+            _ => return None,
+        })
+    }
+}
+
+/// `(project, asset_id)` of the folder.
+fn folder(row: &AssetRow) -> (String, String) {
+    (row.project.clone(), row.asset_id.clone())
+}
+
+fn name(n: &(String, String)) -> String {
+    format!("{}/{}", n.0, n.1)
+}
+
+/// The place the manifest names: its own `project` and `asset_id`, the folder's for one that is
+/// absent. `None` when the manifest doesn't parse.
+fn place(row: &AssetRow) -> Option<(String, String)> {
+    row.manifest_parses.then(|| {
+        (
+            row.manifest_project
+                .clone()
+                .unwrap_or_else(|| row.project.clone()),
+            row.manifest_asset_id
+                .clone()
+                .unwrap_or_else(|| row.asset_id.clone()),
+        )
+    })
+}
+
+/// The manifest parses and names its folder (exactly, as the CORE-047 check compares).
+pub fn agrees(row: &AssetRow) -> bool {
+    place(row).is_some_and(|p| p == folder(row))
+}
+
+/// The manifest file is `<asset_id>.manifest.json` (without regard to case).
+fn canonical_file(row: &AssetRow) -> bool {
+    row.manifest
+        .file_name()
+        .eq_ignore_ascii_case(&format!("{}.manifest.json", row.asset_id))
+}
+
+/// The CORE-047 check alone: the manifest doesn't parse, disagrees with its folder, or isn't
+/// named for it.
+pub fn needs_repair_alone(row: &AssetRow) -> bool {
+    !agrees(row) || !canonical_file(row)
+}
+
+/// The row's creation UUID as grouped: lowercase; `None` for none, an empty one, or a manifest
+/// that doesn't parse.
+pub fn uuid_key(row: &AssetRow) -> Option<String> {
+    if !row.manifest_parses {
+        return None;
+    }
+    row.creation_uuid
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// The repair each live asset folder of `rows` needs (module docs), by `(project, asset_id)`;
+/// a folder that needs none isn't listed.
+pub fn detect(rows: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
+    let mut groups: BTreeMap<String, Vec<&AssetRow>> = BTreeMap::new();
+    for row in rows {
+        if let Some(uuid) = uuid_key(row) {
+            groups.entry(uuid).or_default().push(row);
+        }
+    }
+    let mut out = HashMap::new();
+    for row in rows {
+        let kind = match uuid_key(row) {
+            None => needs_repair_alone(row).then_some(RepairKind::Invalid),
+            Some(uuid) => {
+                let mut group = groups[&uuid].clone();
+                group.sort_by_key(|r| folder(r));
+                group.dedup_by_key(|r| folder(r));
+                if group.len() == 1 {
+                    alone(row)
+                } else {
+                    Some(in_group(row, &group))
+                }
+            }
+        };
+        if let Some(kind) = kind {
+            out.insert(folder(row), kind);
+        }
+    }
+    out
+}
+
+/// A folder whose UUID is nowhere else.
+fn alone(row: &AssetRow) -> Option<RepairKind> {
+    if agrees(row) {
+        return (!canonical_file(row)).then_some(RepairKind::Invalid);
+    }
+    let here = folder(row);
+    let from = place(row)?;
+    let valid = is_slug(&from.0) && is_asset_id(&from.1);
+    let same_folder = from.0.eq_ignore_ascii_case(&here.0) && from.1.eq_ignore_ascii_case(&here.1);
+    Some(if valid && !same_folder {
+        RepairKind::Moved {
+            from: name(&from),
+            to: name(&here),
+        }
+    } else {
+        RepairKind::Invalid
+    })
+}
+
+/// A folder of a group of two or more (sorted by name, one entry per folder).
+fn in_group(row: &AssetRow, group: &[&AssetRow]) -> RepairKind {
+    let here = folder(row);
+    let agreeing: Vec<&&AssetRow> = group.iter().filter(|r| agrees(r)).collect();
+    if !agrees(row)
+        && let [original] = agreeing.as_slice()
+    {
+        return RepairKind::Copy {
+            other: name(&folder(original)),
+        };
+    }
+    let other = group
+        .iter()
+        .map(|r| folder(r))
+        .find(|f| *f != here)
+        .expect("a group of two or more has another folder");
+    RepairKind::DuplicateUuid {
+        other: name(&other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::WsPath;
+
+    fn row(folder: &str, manifest: (&str, &str), uuid: Option<&str>) -> AssetRow {
+        let (p, a) = folder.split_once('/').unwrap();
+        AssetRow {
+            project: p.into(),
+            asset_id: a.into(),
+            asset_type: None,
+            status: None,
+            version: None,
+            approved_version: None,
+            manifest: WsPath::from_disk(format!("projects/{p}/assets/{a}/{a}.manifest.json")),
+            creation_uuid: uuid.map(str::to_string),
+            updated: 0,
+            needs_repair: false,
+            tags: Vec::new(),
+            rating: 0,
+            label: None,
+            runs_waiting: 0,
+            external: false,
+            working_doc: false,
+            display: None,
+            last_change: None,
+            repair: None,
+            manifest_project: Some(manifest.0.into()),
+            manifest_asset_id: Some(manifest.1.into()),
+            manifest_parses: true,
+        }
+    }
+
+    fn key(n: &str) -> (String, String) {
+        let (p, a) = n.split_once('/').unwrap();
+        (p.into(), a.into())
+    }
+
+    #[test] // spec: CORE-154, CORE-047
+    fn kinds_follow_appendix_h() {
+        // Moved: alone, disagreeing.
+        let got = detect(&[row("s/b", ("s", "a"), Some("U1"))]);
+        assert_eq!(
+            got[&key("s/b")],
+            RepairKind::Moved {
+                from: "s/a".into(),
+                to: "s/b".into()
+            }
+        );
+        // A copy beside its original; the UUID compared without regard to case.
+        let got = detect(&[
+            row("s/a", ("s", "a"), Some("u1")),
+            row("s/c", ("s", "a"), Some("U1")),
+        ]);
+        assert_eq!(
+            got[&key("s/c")],
+            RepairKind::Copy {
+                other: "s/a".into()
+            }
+        );
+        assert_eq!(
+            got[&key("s/a")],
+            RepairKind::DuplicateUuid {
+                other: "s/c".into()
+            }
+        );
+        // Both disagree (a move and a copy at once): both duplicate_uuid.
+        let got = detect(&[
+            row("s/b", ("s", "a"), Some("u1")),
+            row("s/c", ("s", "a"), Some("u1")),
+        ]);
+        assert_eq!(got[&key("s/b")].as_str(), "duplicate_uuid");
+        assert_eq!(got[&key("s/c")].as_str(), "duplicate_uuid");
+        // Legacy: never moved; a disagreeing one is invalid, an agreeing one fine.
+        let got = detect(&[row("s/b", ("s", "a"), None), row("s/a", ("s", "a"), None)]);
+        assert_eq!(got[&key("s/b")], RepairKind::Invalid);
+        assert!(!got.contains_key(&key("s/a")));
+        // A case-only difference names the folder itself: invalid, not moved.
+        let got = detect(&[row("s/Prop", ("s", "prop"), Some("u1"))]);
+        assert_eq!(got[&key("s/Prop")], RepairKind::Invalid);
+        // A place that isn't a name: invalid.
+        let got = detect(&[row("s/b", ("s", "Not A Name"), Some("u1"))]);
+        assert_eq!(got[&key("s/b")], RepairKind::Invalid);
+        // An agreeing manifest under another file name: invalid.
+        let mut r = row("s/a", ("s", "a"), Some("u1"));
+        r.manifest = WsPath::from_disk("projects/s/assets/a/old.manifest.json".to_string());
+        assert_eq!(detect(&[r])[&key("s/a")], RepairKind::Invalid);
+        // Wire form round trip.
+        for k in [
+            RepairKind::Moved {
+                from: "s/a".into(),
+                to: "s/b".into(),
+            },
+            RepairKind::Copy {
+                other: "s/a".into(),
+            },
+            RepairKind::DuplicateUuid {
+                other: "s/a".into(),
+            },
+            RepairKind::Invalid,
+        ] {
+            assert_eq!(RepairKind::from_json(&k.to_json()), Some(k));
+        }
+    }
+}

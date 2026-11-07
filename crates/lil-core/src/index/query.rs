@@ -374,7 +374,8 @@ pub(super) const ASSET_COLUMNS: &str = "a.project, a.asset_id, a.asset_type, a.s
     a.version, a.approved_version, a.manifest, a.creation_uuid, a.updated, a.needs_repair, \
     a.rating, a.label, a.runs_waiting, a.external, a.working_doc, a.display, a.last_change, \
     a.repair, (SELECT json_group_array(t.tag ORDER BY t.pos) FROM asset_tags t \
-    WHERE t.project = a.project AND t.asset_id = a.asset_id)";
+    WHERE t.project = a.project AND t.asset_id = a.asset_id), a.manifest_project, \
+    a.manifest_asset_id, a.manifest_parses";
 
 /// A JSON column: `None` for NULL or text that isn't JSON.
 fn json_column(text: Option<String>) -> Option<Value> {
@@ -407,6 +408,9 @@ pub(super) fn asset_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
         display: json_column(r.get(15)?),
         last_change: json_column(r.get(16)?),
         repair: json_column(r.get(17)?),
+        manifest_project: r.get(19)?,
+        manifest_asset_id: r.get(20)?,
+        manifest_parses: r.get::<_, i64>(21)? != 0,
     })
 }
 

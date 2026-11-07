@@ -22,11 +22,21 @@
 //! - no orphan is deleted;
 //! - no store write happens while `index.lock` exists.
 //!
+//! A second property covers moved and copied asset folders (CORE-154, CORE-047): over random
+//! sets of live asset folders (names, the places their manifests name, creation UUIDs in any
+//! case or none, manifests that don't parse or carry an old file name), `index::repair::detect`
+//! gives each folder the repair Appendix H says, whatever the rows' order, and accepting each
+//! move and making each copy independent, as the two tools do, always ends with no folder
+//! `moved`, `copy` or `duplicate_uuid`.
+//!
 //! The case count comes from `test-params.toml` (`lil_testkit::params::proptest_cases`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lil_core::index::FileKind;
+use std::collections::HashMap;
+
+use lil_core::index::repair::{RepairKind, detect};
+use lil_core::index::{AssetRow, FileKind};
 use lil_core::store::{Expect, WriteDecision, WsPath, decide_write};
 use lil_core::watch::reconcile::{Action, Observed, Recorded, decide};
 use proptest::prelude::*;
@@ -811,6 +821,211 @@ impl Model {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Moved and copied folders (CORE-154).
+// ---------------------------------------------------------------------------------------------
+
+/// Names drawn from: valid ones, and one that isn't a valid asset id (`B`, which differs from
+/// `b` only by case).
+const PROJECTS: [&str; 2] = ["s", "t"];
+const IDS: [&str; 5] = ["a", "b", "c", "d", "B"];
+const UUIDS: [&str; 3] = ["u1", "U1", "u2"];
+
+/// One live asset folder: its folder, the place its manifest names (`None` per key: absent),
+/// its creation UUID, whether the manifest parses and whether it carries its folder's file
+/// name.
+#[derive(Debug, Clone)]
+struct Folder {
+    project: usize,
+    asset: usize,
+    place: (Option<usize>, Option<usize>),
+    uuid: Option<usize>,
+    parses: bool,
+    canonical: bool,
+}
+
+fn folder() -> impl Strategy<Value = Folder> {
+    (
+        0..PROJECTS.len(),
+        0..IDS.len(),
+        (
+            prop::option::weighted(0.8, 0..PROJECTS.len()),
+            prop::option::weighted(0.8, 0..IDS.len()),
+        ),
+        prop::option::weighted(0.8, 0..UUIDS.len()),
+        prop::bool::weighted(0.9),
+        prop::bool::weighted(0.8),
+    )
+        .prop_map(|(project, asset, place, uuid, parses, canonical)| Folder {
+            project,
+            asset,
+            place,
+            uuid,
+            parses,
+            canonical,
+        })
+}
+
+fn asset_row(f: &Folder) -> AssetRow {
+    let (proj, id) = (PROJECTS[f.project], IDS[f.asset]);
+    let file = if f.canonical { id } else { "old" };
+    AssetRow {
+        project: proj.into(),
+        asset_id: id.into(),
+        asset_type: None,
+        status: None,
+        version: None,
+        approved_version: None,
+        manifest: p(&format!("projects/{proj}/assets/{id}/{file}.manifest.json")),
+        creation_uuid: f.uuid.map(|u| UUIDS[u].to_string()),
+        updated: 0,
+        needs_repair: false,
+        tags: Vec::new(),
+        rating: 0,
+        label: None,
+        runs_waiting: 0,
+        external: false,
+        working_doc: false,
+        display: None,
+        last_change: None,
+        repair: None,
+        manifest_project: f.place.0.map(|i| PROJECTS[i].to_string()),
+        manifest_asset_id: f.place.1.map(|i| IDS[i].to_string()),
+        manifest_parses: f.parses,
+    }
+}
+
+/// The live folders (one per folder name: Windows names are case-insensitive).
+fn rows_of(folders: &[Folder]) -> Vec<AssetRow> {
+    let mut seen = BTreeSet::new();
+    folders
+        .iter()
+        .map(asset_row)
+        .filter(|r| {
+            seen.insert((
+                r.project.to_ascii_lowercase(),
+                r.asset_id.to_ascii_lowercase(),
+            ))
+        })
+        .collect()
+}
+
+fn name(r: &AssetRow) -> String {
+    format!("{}/{}", r.project, r.asset_id)
+}
+
+fn place_of(r: &AssetRow) -> Option<(String, String)> {
+    r.manifest_parses.then(|| {
+        (
+            r.manifest_project
+                .clone()
+                .unwrap_or_else(|| r.project.clone()),
+            r.manifest_asset_id
+                .clone()
+                .unwrap_or_else(|| r.asset_id.clone()),
+        )
+    })
+}
+
+fn agrees(r: &AssetRow) -> bool {
+    place_of(r) == Some((r.project.clone(), r.asset_id.clone()))
+}
+
+fn uuid_of(r: &AssetRow) -> Option<String> {
+    r.manifest_parses
+        .then(|| r.creation_uuid.as_ref().map(|u| u.to_ascii_lowercase()))
+        .flatten()
+}
+
+/// Appendix H's rules, checked row by row against `detect`.
+fn check_kinds(rows: &[AssetRow], got: &HashMap<(String, String), RepairKind>) {
+    for r in rows {
+        let kind = got.get(&(r.project.clone(), r.asset_id.clone()));
+        let canonical = r
+            .manifest
+            .file_name()
+            .eq_ignore_ascii_case(&format!("{}.manifest.json", r.asset_id));
+        let Some(uuid) = uuid_of(r) else {
+            // Legacy or unparsed: never moved, copy or duplicate_uuid.
+            let bad = !agrees(r) || !canonical;
+            assert_eq!(kind, bad.then_some(&RepairKind::Invalid), "{r:?}");
+            continue;
+        };
+        let group: Vec<&AssetRow> = rows
+            .iter()
+            .filter(|o| uuid_of(o).as_ref() == Some(&uuid))
+            .collect();
+        if group.len() == 1 {
+            let here = (r.project.clone(), r.asset_id.clone());
+            let want = match place_of(r) {
+                Some(p) if p == here => (!canonical).then_some(RepairKind::Invalid),
+                Some(p)
+                    if lil_schema::is_slug(&p.0)
+                        && lil_schema::is_asset_id(&p.1)
+                        && !(p.0.eq_ignore_ascii_case(&here.0)
+                            && p.1.eq_ignore_ascii_case(&here.1)) =>
+                {
+                    Some(RepairKind::Moved {
+                        from: format!("{}/{}", p.0, p.1),
+                        to: name(r),
+                    })
+                }
+                _ => Some(RepairKind::Invalid),
+            };
+            assert_eq!(kind, want.as_ref(), "{r:?}");
+            continue;
+        }
+        let agreeing: Vec<&&AssetRow> = group.iter().filter(|o| agrees(o)).collect();
+        match kind {
+            Some(RepairKind::Copy { other }) => {
+                assert!(!agrees(r), "{r:?}");
+                assert_eq!(agreeing.len(), 1, "{r:?}");
+                assert_eq!(other, &name(agreeing[0]), "{r:?}");
+            }
+            Some(RepairKind::DuplicateUuid { other }) => {
+                assert!(agrees(r) || agreeing.len() != 1, "{r:?}");
+                assert!(
+                    group.iter().any(|o| &name(o) == other) && other != &name(r),
+                    "{r:?}"
+                );
+            }
+            other => panic!("a folder sharing its UUID is {other:?}: {r:?}"),
+        }
+    }
+    let names: BTreeSet<(String, String)> = rows
+        .iter()
+        .map(|r| (r.project.clone(), r.asset_id.clone()))
+        .collect();
+    assert!(got.keys().all(|k| names.contains(k)), "{got:?}");
+}
+
+/// Applies what `asset.accept_move` (a `moved` folder) and `asset.make_independent` (a `copy`
+/// or `duplicate_uuid` one) do, one folder at a time, until none is `moved`, `copy` or
+/// `duplicate_uuid`: true when that is reached within one repair per folder.
+fn repair_all(rows: &mut [AssetRow]) -> bool {
+    for fresh in 0..=rows.len() {
+        let got = detect(rows);
+        let Some((i, kind)) = rows.iter().enumerate().find_map(|(i, r)| {
+            got.get(&(r.project.clone(), r.asset_id.clone()))
+                .filter(|k| !matches!(k, RepairKind::Invalid))
+                .map(|k| (i, k.clone()))
+        }) else {
+            return true;
+        };
+        let r = &mut rows[i];
+        r.manifest_project = Some(r.project.clone());
+        r.manifest_asset_id = Some(r.asset_id.clone());
+        r.manifest = p(&format!(
+            "projects/{}/assets/{}/{}.manifest.json",
+            r.project, r.asset_id, r.asset_id
+        ));
+        if !matches!(kind, RepairKind::Moved { .. }) {
+            r.creation_uuid = Some(format!("fresh-{fresh}"));
+        }
+    }
+    false
+}
+
 fn config() -> ProptestConfig {
     ProptestConfig::with_cases(lil_testkit::params::proptest_cases())
 }
@@ -826,5 +1041,19 @@ proptest! {
             model.check(op);
         }
         model.converged();
+    }
+
+    #[test] // spec: CORE-154, CORE-047
+    fn moved_and_copied_folders_follow_appendix_h(
+        folders in prop::collection::vec(folder(), 1..8),
+    ) {
+        let rows = rows_of(&folders);
+        let got = detect(&rows);
+        check_kinds(&rows, &got);
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        prop_assert_eq!(&detect(&reversed), &got, "the rows' order doesn't matter");
+        let mut fixed = rows;
+        prop_assert!(repair_all(&mut fixed), "the two repairs always suffice");
     }
 }

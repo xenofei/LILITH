@@ -9,6 +9,7 @@
 //! - [`redirects`]: `registry/redirects.yaml` (ARCH-125);
 //! - [`resolve`]: the [`Resolver`], which every ref-to-folder lookup goes through (ARCH-125,
 //!   APP-019);
+//! - [`repair`]: accepting a move and making a copy independent (CORE-154);
 //! - this file: reading `project.yaml`, and [`project_status`], the `project.status` result.
 //!
 //! A project exists when its `projects/<slug>/project.yaml` does.
@@ -16,10 +17,11 @@
 pub mod active;
 pub mod progress;
 pub mod redirects;
+pub mod repair;
 pub mod resolve;
 pub mod staleness;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{PARAMS_INVALID, PROJECT_UNKNOWN};
@@ -29,6 +31,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::index::FileState;
+use crate::index::repair::{RepairKind, uuid_key};
 use crate::store::{Store, StoreError, WsPath};
 use crate::workspace::OpenWorkspace;
 
@@ -135,13 +138,29 @@ pub struct ProjectStatus {
     pub assets_by_status: BTreeMap<String, u64>,
     /// Orphans under the project's folder (CORE-038): never deleted, only listed.
     pub orphans: Vec<String>,
-    /// Manifests that don't parse or disagree with their folder, files in state
+    /// The manifests of assets that need repair (one that doesn't parse or disagrees with its
+    /// folder, CORE-047; a folder moved or sharing its creation UUID, CORE-154), files in state
     /// `needs_repair`, a `project.yaml` that doesn't parse, the project's redirects that loop
     /// (`registry/redirects.yaml#<project>/<asset_id>`, ARCH-125), and
     /// `registry/redirects.yaml` itself when it can't be read.
     pub needs_repair: Vec<String>,
     /// Files the suite still expects that disappeared outside it (state `missing`).
     pub missing: Vec<String>,
+    /// Asset folders moved outside the suite (CORE-154) from or into the project, by `from`:
+    /// names `<project>/<asset_id>`. Each stays until `asset.accept_move`.
+    pub moved: Vec<MovedEntry>,
+    /// Asset folders that share a creation UUID (copies, CORE-154), one group per UUID with a
+    /// folder in the project: each group's folders (`projects/<p>/assets/<a>`), sorted.
+    pub duplicates: Vec<Vec<String>>,
+}
+
+/// One of `project.status`'s `moved`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+pub struct MovedEntry {
+    /// Where the manifest says the asset is, `<project>/<asset_id>`.
+    pub from: String,
+    /// The folder it is in, `<project>/<asset_id>`.
+    pub to: String,
 }
 
 /// `project.status` of `project` in `ws`. It waits for the workspace's first reconcile or
@@ -209,6 +228,7 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
     }
     needs_repair.sort();
     needs_repair.dedup();
+    let (moved, duplicates) = moves_and_copies(ws, project).await?;
     // Only the project's own folder is walked, never the whole workspace.
     let orphans = ws
         .store
@@ -225,5 +245,55 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
         orphans,
         needs_repair,
         missing,
+        moved,
+        duplicates,
     })
+}
+
+/// `project.status`'s `moved` and `duplicates` (Appendix H "Moved and copied folders"), from
+/// the index's `repair` column, workspace-wide (a folder moved from or into another project
+/// counts in both).
+async fn moves_and_copies(
+    ws: &OpenWorkspace,
+    project: &str,
+) -> Result<(Vec<MovedEntry>, Vec<Vec<String>>), ErrorBody> {
+    let rows = ws
+        .index
+        .repairs(&["moved", "copy", "duplicate_uuid"])
+        .await
+        .map_err(|e| e.to_error(""))?;
+    let mut moved = BTreeSet::new();
+    let mut groups: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    for row in &rows {
+        match row.repair.as_ref().and_then(RepairKind::from_json) {
+            Some(RepairKind::Moved { from, to }) => {
+                let in_project =
+                    |name: &str| name.split_once('/').is_some_and(|(p, _)| p == project);
+                if in_project(&from) || in_project(&to) {
+                    moved.insert(MovedEntry { from, to });
+                }
+            }
+            Some(RepairKind::Copy { .. } | RepairKind::DuplicateUuid { .. }) => {
+                if let Some(uuid) = uuid_key(row) {
+                    groups
+                        .entry(uuid)
+                        .or_default()
+                        .insert((row.project.clone(), row.asset_id.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let duplicates = groups
+        .into_values()
+        .filter(|g| g.iter().any(|(p, _)| p == project))
+        .map(|g| {
+            g.into_iter()
+                .map(|(p, a)| format!("projects/{p}/assets/{a}"))
+                .collect()
+        })
+        .collect::<BTreeSet<Vec<String>>>()
+        .into_iter()
+        .collect();
+    Ok((moved.into_iter().collect(), duplicates))
 }
