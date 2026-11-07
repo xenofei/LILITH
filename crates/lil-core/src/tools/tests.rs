@@ -452,6 +452,7 @@ async fn plan2_stage_defaults_still_hold() {
                     retry: false,
                     always_confirm: false,
                     meta: reg.meta(&d.name),
+                    approved_facts_sha256: None,
                 })
                 .await
         }
@@ -1113,9 +1114,12 @@ fn fill_touches_fills_templates_from_the_arguments() {
         [],
         "not a string"
     );
-    assert_eq!(asset.fields(), ["project", "asset_id"]);
-    assert_eq!(outside.fields(), ["files"]);
-    assert!(registry.fields().is_empty());
+    assert_eq!(
+        asset.placeholders(),
+        [("project", false), ("asset_id", false)]
+    );
+    assert_eq!(outside.placeholders(), [("files", true)]);
+    assert!(registry.placeholders().is_empty());
 }
 
 /// The asset services' slots (P4b-R32) left empty change nothing for the tools there are:

@@ -46,7 +46,7 @@ pub use stages::{
     AllowOnce, Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput,
     ConfirmStage, ConfirmedVia, Estimate, EstimateStage, FACTS_SHOWN, IdemRef, MeterStage,
     PipelineHooks, RecordStage, ReplayDecision, ReserveInput, ReserveOutcome, ReserveStage,
-    SettingSource, Settings, SettingsInput, SettingsStage, SettleInput, ToolEstimates,
+    SealedFacts, SettingSource, Settings, SettingsInput, SettingsStage, SettleInput, ToolEstimates,
     cap_exceeded, cap_hits_json, seal_facts,
 };
 pub use telemetry_tools::register_telemetry_tools;

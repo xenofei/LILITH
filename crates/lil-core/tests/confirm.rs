@@ -460,6 +460,141 @@ async fn a_retry_with_changed_facts_asks_again() {
     assert_eq!(ok(&ran)["count"], 1, "{ran:?}");
 }
 
+/// P4b-R9 (review I1): facts that appear after a confirmation whose tool had none ask again at
+/// the approved retry: "none" is facts too, and its hash is stored.
+#[tokio::test] // spec: CORE-157, CORE-091
+async fn a_retry_whose_facts_appear_asks_again() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    fx.gates.set_facts(Ok(None));
+    let k = next_key();
+    let first = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_eq!(pending_view(&fx, &first.confirmation_id).await.facts, None);
+    fx.answer(&first.confirmation_id, Answer::Approve).await;
+    fx.gates.set_facts(Ok(Some(facts_with(3))));
+    let second = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_ne!(second.confirmation_id, first.confirmation_id);
+    let shown = pending_view(&fx, &second.confirmation_id)
+        .await
+        .facts
+        .unwrap();
+    assert_eq!(shown.dependents_total, 3);
+    fx.answer(&second.confirmation_id, Answer::Approve).await;
+    let ran = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&ran)["count"], 1, "{ran:?}");
+}
+
+/// The reverse of the above: facts that vanish after the confirmation ask again too.
+#[tokio::test] // spec: CORE-157, CORE-091
+async fn a_retry_whose_facts_vanish_asks_again() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    fx.gates.set_facts(Ok(Some(facts_with(3))));
+    let k = next_key();
+    let first = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    fx.answer(&first.confirmation_id, Answer::Approve).await;
+    fx.gates.set_facts(Ok(None));
+    let second = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    assert_ne!(second.confirmation_id, first.confirmation_id);
+    assert_eq!(pending_view(&fx, &second.confirmation_id).await.facts, None);
+    fx.answer(&second.confirmation_id, Answer::Approve).await;
+    let ran = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&ran)["count"], 1, "{ran:?}");
+}
+
+/// Review M1: the hash covers `versions` sorted (Appendix H: "the full sorted dependents list
+/// and versions"), so the same versions in another order don't ask again; the card keeps the
+/// tool's order.
+#[tokio::test] // spec: CORE-157, CORE-091
+async fn a_retry_with_reordered_versions_runs_once() {
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let mut facts = facts_with(2);
+    facts.versions = vec!["1.1.0".into(), "1.0.0".into(), "2.0.0".into()];
+    fx.gates.set_facts(Ok(Some(facts.clone())));
+    let k = next_key();
+    let p = pending(&fx.call(&app(), "test.ask_everyone", ask_args(), &k).await);
+    let shown = pending_view(&fx, &p.confirmation_id).await.facts.unwrap();
+    assert_eq!(
+        shown.versions,
+        ["1.1.0", "1.0.0", "2.0.0"],
+        "the tool's order"
+    );
+    fx.answer(&p.confirmation_id, Answer::Approve).await;
+    facts.versions.reverse();
+    fx.gates.set_facts(Ok(Some(facts)));
+    let ran = fx.call(&app(), "test.ask_everyone", ask_args(), &k).await;
+    assert_eq!(ok(&ran)["count"], 1, "{ran:?}");
+}
+
+/// Review M3: the cap-only prompt after an approved call (`ConfirmStage::cap_needed`) reads the
+/// facts again; when they differ from the approval's hash, it covers the safety confirmation as
+/// well as the cap, so approving the cap alone can't let unconfirmed facts through. Driven at
+/// the stage, since no gate changes the facts between the dispatcher's two reads.
+#[tokio::test] // spec: CORE-157, CORE-091, APP-045
+async fn a_cap_prompt_after_changed_facts_covers_confirm_too() {
+    use lil_core::tools::{
+        CapHit, ConfirmDecision, ConfirmInput, ConfirmStage, Estimate, IdemRef, seal_facts,
+    };
+    use lil_schema::money::Money;
+    let fx = fixture(McpConfirmation::Core);
+    fx.confirm.presence().opened();
+    let stage = AgentConfirm::new(fx.confirm.clone());
+    let reg = fx.dispatcher.registry();
+    let d = reg.get("test.ask_everyone").unwrap().descriptor().clone();
+    let (args, s) = (ask_args(), app());
+    let hits = vec![CapHit {
+        cap: "monthly".into(),
+        limit: Money::parse_decimal("10").unwrap(),
+        settled: Money::ZERO,
+        held: Money::parse_decimal("9").unwrap(),
+        estimate: Money::parse_decimal("2").unwrap(),
+        currency: "USD".into(),
+        rate: None,
+    }];
+    let seen = seal_facts(Some(facts_with(2))).sha256;
+    let input = |key: &'static str| ConfirmInput {
+        session: &s,
+        descriptor: &d,
+        estimate: &Estimate::Zero,
+        args: &args,
+        idem: Some(IdemRef {
+            scope: "ui:test|none",
+            key,
+            args_hash: "h",
+        }),
+        workspace: None,
+        project: None,
+        retry: false,
+        always_confirm: false,
+        meta: reg.meta("test.ask_everyone"),
+        approved_facts_sha256: Some(&seen),
+    };
+    let covers = |decision: ConfirmDecision| match decision {
+        ConfirmDecision::Pending(p) => p.covers,
+        other => panic!("expected pending, got {other:?}"),
+    };
+    // The facts are the approved ones: the cap only.
+    fx.gates.set_facts(Ok(Some(facts_with(2))));
+    let same = stage.cap_needed(input("k-same"), hits.clone()).await;
+    assert_eq!(covers(same), [Cover::Cap]);
+    // They changed after the approved retry compared them: the safety confirmation too.
+    fx.gates.set_facts(Ok(Some(facts_with(3))));
+    let changed = stage.cap_needed(input("k-changed"), hits.clone()).await;
+    assert_eq!(covers(changed), [Cover::Confirm, Cover::Cap]);
+    let row = fx
+        .pending()
+        .await
+        .into_iter()
+        .find(|r| r.idem_key == "k-changed")
+        .unwrap();
+    assert_eq!(row.facts.unwrap().dependents_total, 3);
+    // Facts that vanished count as changed as well.
+    fx.gates.set_facts(Ok(None));
+    let vanished = stage.cap_needed(input("k-vanished"), hits).await;
+    assert_eq!(covers(vanished), [Cover::Confirm, Cover::Cap]);
+}
+
 /// P4b-R9: a facts function that fails refuses the call with its error before anything is
 /// asked, and so does one that fails at the approved retry (nothing runs).
 #[tokio::test] // spec: CORE-157

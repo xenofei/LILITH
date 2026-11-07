@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
-use lil_protocol::app::ConfirmFacts;
 use lil_protocol::{CallerKind, Cover, ErrorBody, codes};
 use lil_schema::money::{Money, Rate};
 use serde_json::Value;
@@ -14,7 +13,7 @@ use crate::meter::CapCheck;
 use crate::state::{StateDb, StateError};
 use crate::tools::{
     AllowOnce, Approval, CapHit, ConfirmDecision, ConfirmInput, ConfirmPolicy, ConfirmStage,
-    ConfirmedVia, IdemRef, ReplayDecision, cap_exceeded, fill_touches,
+    ConfirmedVia, IdemRef, ReplayDecision, SealedFacts, cap_exceeded, fill_touches,
 };
 
 /// Agent safety confirmations and cap confirmations (ARCH-052–056, CORE-091, CORE-109–113,
@@ -45,14 +44,14 @@ impl AgentConfirm {
     }
 
     /// The decision for a call that needs a safety confirmation (`confirm`) and/or the caps
-    /// `hits` (module docs). `facts` are the tool's sealed facts and their hash, for a safety
-    /// confirmation.
+    /// `hits` (module docs). `facts` are the tool's sealed facts (`None` for a tool without a
+    /// facts function), stored with their hash.
     async fn ask(
         &self,
         i: ConfirmInput<'_>,
         confirm: bool,
         hits: Option<Vec<CapHit>>,
-        facts: Option<(ConfirmFacts, String)>,
+        facts: Option<SealedFacts>,
     ) -> ConfirmDecision {
         let refuse = |hits: &Option<Vec<CapHit>>| match hits {
             Some(hits) if !confirm => {
@@ -79,7 +78,10 @@ impl AgentConfirm {
         // A tool that declares none gets no `files` (the card shows the arguments).
         let files =
             Some(fill_touches(&i.meta.touches, i.args, i.project)).filter(|f| !f.is_empty());
-        let (facts, facts_sha256) = facts.unzip();
+        let (facts, facts_sha256) = match facts {
+            Some(sealed) => (sealed.shown, Some(sealed.sha256)),
+            None => (None, None),
+        };
         let request = ConfirmRequest {
             scope: idem.scope.to_string(),
             idem_key: idem.key.to_string(),
@@ -215,9 +217,13 @@ impl ConfirmStage for AgentConfirm {
         hits: Vec<CapHit>,
     ) -> BoxFuture<'a, ConfirmDecision> {
         Box::pin(async move {
-            // The cap-only prompt of a call whose safety confirmation was given still carries
-            // the tool's facts, so the retry it approves checks them again (P4b-R9).
-            let facts = if i.needs_confirmation() {
+            // The cap prompt of a call whose safety confirmation was given carries the tool's
+            // facts, so the retry it approves checks them again (P4b-R9). The facts may have
+            // changed since the approved retry compared them (they are read again here, after
+            // the reserve stage): then the prompt covers the safety confirmation as well, so
+            // approving the cap never lets through facts no one confirmed (review M3).
+            let needs = i.needs_confirmation();
+            let facts = if needs {
                 match i.facts().await {
                     Ok(facts) => facts,
                     Err(e) => return ConfirmDecision::Failed(e),
@@ -225,7 +231,9 @@ impl ConfirmStage for AgentConfirm {
             } else {
                 None
             };
-            self.ask(i, false, Some(hits), facts).await
+            let confirm_again =
+                needs && facts.as_ref().map(|s| s.sha256.as_str()) != i.approved_facts_sha256;
+            self.ask(i, confirm_again, Some(hits), facts).await
         })
     }
 

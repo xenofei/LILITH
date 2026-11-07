@@ -299,15 +299,19 @@ pub struct TouchDecl {
 }
 
 impl TouchDecl {
-    /// The argument names its placeholders name, `[]` left off, in order.
-    pub fn fields(&self) -> Vec<&'static str> {
-        let mut fields = Vec::new();
+    /// The argument names its placeholders name, in order, each with whether it is an array
+    /// placeholder (`{name[]}`, `[]` left off the name) or a single one (`{name}`).
+    pub fn placeholders(&self) -> Vec<(&'static str, bool)> {
+        let mut found = Vec::new();
         let mut rest = self.template;
         while let Some((name, after)) = next_placeholder(rest) {
-            fields.push(name.strip_suffix("[]").unwrap_or(name));
+            found.push(match name.strip_suffix("[]") {
+                Some(field) => (field, true),
+                None => (name, false),
+            });
             rest = after;
         }
-        fields
+        found
     }
 }
 
@@ -380,8 +384,13 @@ pub type FactsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ConfirmFacts>, ErrorBody>> + Send + 'a>>;
 
 /// A tool's facts function: what its confirmation tells you, recomputed at the approved retry
-/// (P4b-R9, P4b-R33). It returns the full lists (every dependent, sorted, and the versions);
-/// the core hashes them, then keeps the first 50 dependents ([`super::stages::seal_facts`]).
+/// (P4b-R9, P4b-R33). It returns the full lists, every dependent and the versions, in any
+/// order: the core hashes both sorted, shows the dependents sorted (the first 50, with the
+/// full count) and the versions in the order given ([`super::stages::seal_facts`]).
+/// `Ok(None)` means "this call has no facts", and that is a fact too: the confirmation stores
+/// its hash (`args_hash(null)`, the SHA-256 of `null`) like any other, so facts that appear
+/// before the approved retry, or vanish, ask again (review I1). Only a tool without a facts
+/// function, or a row stored before the hash existed, has no hash and is never checked.
 pub type FactsFn = Arc<dyn for<'a> Fn(&'a ConfirmInput<'a>) -> FactsFuture<'a> + Send + Sync>;
 
 /// `f` as a [`FactsFn`] (a closure's higher-ranked signature is inferred from this bound).

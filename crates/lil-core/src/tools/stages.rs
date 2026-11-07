@@ -158,6 +158,10 @@ pub struct ConfirmInput<'a> {
     /// The tool's core-internal meta (P4b-R33): its confirmation policy, touches and facts.
     /// Read from the registry, never from the caller.
     pub meta: &'a ToolMeta,
+    /// The facts hash of the confirmation you approved for this very call, when the call runs
+    /// on one (`Approval::facts_sha256`): a cap-only prompt after it compares the facts again
+    /// ([`ConfirmStage::cap_needed`]).
+    pub approved_facts_sha256: Option<&'a str>,
 }
 
 impl ConfirmInput<'_> {
@@ -175,35 +179,58 @@ impl ConfirmInput<'_> {
         self.needs_agent_confirmation() || self.meta.confirm_policy == ConfirmPolicy::EveryCaller
     }
 
-    /// The tool's facts for this call, sealed ([`seal_facts`]); `None` for a tool without a
-    /// facts function, or when it has none.
+    /// The tool's facts for this call, sealed ([`seal_facts`]); `None` only for a tool without
+    /// a facts function. A facts function that answers "none" is sealed too: its hash is
+    /// stored, so facts that appear later ask again (review I1).
     ///
     /// # Errors
     /// The facts function's error: the call is refused with it.
-    pub async fn facts(&self) -> Result<Option<(ConfirmFacts, String)>, ErrorBody> {
+    pub async fn facts(&self) -> Result<Option<SealedFacts>, ErrorBody> {
         let Some(facts) = &self.meta.facts else {
             return Ok(None);
         };
-        Ok(facts(self).await?.map(seal_facts))
+        Ok(Some(seal_facts(facts(self).await?)))
     }
 }
 
 /// How many dependents a confirmation's facts show (Appendix H "Trash an asset").
 pub const FACTS_SHOWN: usize = 50;
 
+/// A facts function's answer as a confirmation stores it: the facts shown (`None` when the
+/// tool had none) and the hash of the full facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedFacts {
+    pub shown: Option<ConfirmFacts>,
+    pub sha256: String,
+}
+
 /// `facts` as a confirmation stores them, and their hash (P4b-R9, P4b-R33): the hash is the
-/// SHA-256 of the canonical JSON of `{dependents, versions}` over the full dependents list,
-/// sorted (the retry binding's [`lil_protocol::args_hash`]); only then are the dependents cut
-/// to the first [`FACTS_SHOWN`], with `dependents_total` the full count.
-pub fn seal_facts(mut facts: ConfirmFacts) -> (ConfirmFacts, String) {
+/// retry binding's [`lil_protocol::args_hash`] (SHA-256 of the canonical JSON) of
+/// `{dependents, versions}`, both full and each sorted (Appendix H: "the full sorted
+/// dependents list and versions"), so neither list's order counts; facts `None` hash as
+/// `args_hash(null)`, the SHA-256 of `null`. Then the shown dependents are sorted and cut to
+/// the first [`FACTS_SHOWN`], with `dependents_total` the full count; the versions are shown in
+/// the tool's order.
+pub fn seal_facts(facts: Option<ConfirmFacts>) -> SealedFacts {
+    let Some(mut facts) = facts else {
+        return SealedFacts {
+            shown: None,
+            sha256: lil_protocol::args_hash(&Value::Null),
+        };
+    };
     facts.dependents.sort();
-    let hash = lil_protocol::args_hash(&serde_json::json!({
+    let mut versions = facts.versions.clone();
+    versions.sort();
+    let sha256 = lil_protocol::args_hash(&serde_json::json!({
         "dependents": facts.dependents,
-        "versions": facts.versions,
+        "versions": versions,
     }));
     facts.dependents_total = u32::try_from(facts.dependents.len()).unwrap_or(u32::MAX);
     facts.dependents.truncate(FACTS_SHOWN);
-    (facts, hash)
+    SealedFacts {
+        shown: Some(facts),
+        sha256,
+    }
 }
 
 /// A confirmation you approved, as a retry with its token runs it (CORE-091, Appendix F): the
@@ -223,8 +250,8 @@ pub struct Approval {
     /// With `allow_once`: the caps and the estimate the prompt showed, which the reserve
     /// stage may pass this once.
     pub allowed: Option<AllowOnce>,
-    /// The hash of the facts you saw ([`seal_facts`]); `None` for a confirmation without facts
-    /// (or one stored before they existed), which the retry doesn't check.
+    /// The hash of the facts you saw ([`seal_facts`]); `None` only for a tool without a facts
+    /// function or a row stored before the hash existed, which the retry doesn't check.
     pub facts_sha256: Option<String>,
 }
 
@@ -268,7 +295,7 @@ impl Approval {
 
     /// Whether the facts of the call `i` (which this approval covers) differ now from the ones
     /// you saw (P4b-R9): the tool's facts function runs again and its sealed hash is compared.
-    /// `false` without a stored hash or a facts function.
+    /// `false` without a stored hash (a pre-migration row, ruling 8) or a facts function.
     ///
     /// # Errors
     /// The facts function's error.
@@ -276,11 +303,7 @@ impl Approval {
         let Some(seen) = &self.facts_sha256 else {
             return Ok(false);
         };
-        if i.meta.facts.is_none() {
-            return Ok(false);
-        }
-        let now = i.facts().await?.map(|(_, hash)| hash);
-        Ok(now.as_ref() != Some(seen))
+        Ok(i.facts().await?.is_some_and(|now| now.sha256 != *seen))
     }
 }
 

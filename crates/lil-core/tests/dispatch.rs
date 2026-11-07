@@ -574,14 +574,67 @@ fn app_assets_methods_need_the_capability() {
     }
 }
 
+/// What is wrong with a touch placeholder naming `field` of an input schema whose properties are
+/// `props` (`many`: an array placeholder `{field[]}`), or `None`. `fill_touches` fills `{field}`
+/// only from a string and `{field[]}` only from an array of strings, so the property must have
+/// that type (`["string", "null"]` for an optional one; likewise `["array", "null"]`). `{project}`
+/// may name no property: it falls back to the call's project.
+fn touch_field_problem(
+    props: &serde_json::Map<String, Value>,
+    field: &str,
+    many: bool,
+) -> Option<String> {
+    let Some(schema) = props.get(field) else {
+        return (field != "project").then(|| format!("{field:?} isn't an argument"));
+    };
+    let is = |ty: &str| schema["type"] == ty || schema["type"] == json!([ty, "null"]);
+    match many {
+        false if !is("string") => Some(format!("{{{field}}} is not a string: {schema}")),
+        true if !is("array") || schema["items"]["type"] != "string" => Some(format!(
+            "{{{field}[]}} is not an array of strings: {schema}"
+        )),
+        _ => None,
+    }
+}
+
 /// P4b-R33 and ruling T10-S1: over the server's full registry, every touch template names only
 /// fields of its tool's input schema (or `{project}`, which falls back to the call's project),
-/// only `destructive` and `exec` tools declare touches, and at least one does.
+/// each of the type `fill_touches` fills from (review M4), only `destructive` and `exec` tools
+/// declare touches, and at least one does.
 #[test] // spec: APP-115, CORE-157
 fn touch_templates_name_only_input_fields() {
+    // The check itself: wrong types and a missing field are caught.
+    let props = json!({
+        "asset_id": {"type": "string"},
+        "project": {"type": ["string", "null"]},
+        "take": {"type": "integer"},
+        "files": {"type": "array", "items": {"type": "string"}},
+        "takes": {"type": "array", "items": {"type": "integer"}},
+    });
+    let props = props.as_object().unwrap();
+    assert_eq!(touch_field_problem(props, "asset_id", false), None);
+    assert_eq!(touch_field_problem(props, "project", false), None);
+    assert_eq!(
+        touch_field_problem(&serde_json::Map::new(), "project", false),
+        None
+    );
+    assert_eq!(touch_field_problem(props, "files", true), None);
+    for (field, many) in [
+        ("take", false),
+        ("files", false),
+        ("asset_id", true),
+        ("takes", true),
+        ("nope", false),
+    ] {
+        assert!(
+            touch_field_problem(props, field, many).is_some(),
+            "{field} {many}"
+        );
+    }
+
     let env = TestEnv::new();
     let core = core(&env);
-    let reg = core.core().dispatcher().registry();
+    let reg = core.core().registry();
     let mut checked = Vec::new();
     for d in reg.descriptors() {
         let meta = reg.meta(&d.name);
@@ -601,13 +654,10 @@ fn touch_templates_name_only_input_fields() {
             .as_object()
             .unwrap_or_else(|| panic!("{} has no input properties", d.name));
         for decl in &meta.touches {
-            for field in decl.fields() {
-                assert!(
-                    field == "project" || props.contains_key(field),
-                    "{}: {:?} names {field:?}, which isn't an argument",
-                    d.name,
-                    decl.template
-                );
+            for (field, many) in decl.placeholders() {
+                if let Some(problem) = touch_field_problem(props, field, many) {
+                    panic!("{}: {:?}: {problem}", d.name, decl.template);
+                }
             }
         }
         checked.push(d.name.clone());

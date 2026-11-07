@@ -827,6 +827,10 @@ impl Inner {
         // satisfies it (its `allow_once` lets the reservation pass the caps once), unless the
         // tool's facts changed since you saw them (P4b-R9): then the call asks again. One for
         // another call (the call a `job.retry` runs again) goes on to that call.
+        let approved_facts = approved
+            .as_ref()
+            .filter(|a| a.covers_call(&d.name, &args, project.as_deref()))
+            .and_then(|a| a.facts_sha256.clone());
         let confirm_input = ConfirmInput {
             session,
             descriptor: d,
@@ -838,6 +842,7 @@ impl Inner {
             retry: is_retry,
             always_confirm,
             meta: self.reg.meta(&d.name),
+            approved_facts_sha256: approved_facts.as_deref(),
         };
         let (decision, passed_on) = match approved {
             Some(a) if a.covers_call(&d.name, &args, project.as_deref()) => {

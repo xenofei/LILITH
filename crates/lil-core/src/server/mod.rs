@@ -99,7 +99,7 @@ use crate::state::{OnFatal, StateError, StateRegistry};
 use crate::store::Personal;
 use crate::telemetry::{self, HwSources, PowerSettings, Telemetry, TickMode};
 use crate::tools::{
-    AssetServices, Dispatcher, PipelineHooks, TestGates, TestJobHandler, ToolEstimates,
+    AssetServices, Dispatcher, PipelineHooks, Registry, TestGates, TestJobHandler, ToolEstimates,
     core_registry, register_desktop_tools, register_hw_tick, register_telemetry_tools,
     register_test_desktop,
 };
@@ -144,7 +144,8 @@ pub struct RunningCore {
     ui_apps: Arc<UiApps>,
     /// The toasts and the confirmations' notification path (APP-146).
     notifier: Arc<Notifier>,
-    /// The dispatcher the router serves `tools/*` with: its registry and the tools' meta.
+    /// The dispatcher the router serves `tools/*` with, kept private: only its registry is
+    /// exposed, to tests ([`RunningCore::registry`]).
     dispatcher: Dispatcher,
     /// The supervisor: ends with the shutdown's report.
     shutdown: JoinHandle<ShutdownReport>,
@@ -192,10 +193,12 @@ impl RunningCore {
         &self.confirm
     }
 
-    /// The dispatcher: in-process tests read the full registry and each tool's core-internal
-    /// meta through it (P4b-R33).
-    pub fn dispatcher(&self) -> &Dispatcher {
-        &self.dispatcher
+    /// Tests only: the registry the core serves, every tool with its core-internal meta
+    /// (P4b-R33), for in-process tests that check the full server registry. Nothing else
+    /// should read it from here; calls go through the pipe.
+    #[doc(hidden)]
+    pub fn registry(&self) -> &Registry {
+        self.dispatcher.registry()
     }
 
     /// The fullscreen poll and the sleep log.
