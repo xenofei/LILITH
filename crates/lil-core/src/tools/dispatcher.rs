@@ -44,7 +44,12 @@
 //! the tool and arguments you approved (an approval with the cap action `allow_once` lets the
 //! reservation pass the caps the prompt named, up to the estimate it showed, this once: the
 //! reserve stage gets them as `allow_once` and asks again for anything else), and the outcome
-//! is stored as usual; denied, expired or cancelled, the key is released and the call is
+//! is stored as usual. Unless the tool has facts (an `EveryCaller` tool such as `asset.trash`;
+//! P4b-R9): the approved retry recomputes them first, and when their hash differs from the one
+//! you approved, the call doesn't run but asks again (a new `pending_confirmation` for the same
+//! key; a facts function that fails ends the call with its error); and a cap prompt after it
+//! whose facts changed since that check covers `confirm` as well as `cap`
+//! (`ConfirmStage::cap_needed`). Denied, expired or cancelled, the key is released and the call is
 //! `confirm.denied` or `confirm.expired` (a cancelled one in its own words); still pending,
 //! the same `pending_confirmation`.
 //!

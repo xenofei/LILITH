@@ -449,15 +449,28 @@ pub struct ThumbsRequestParams {
     pub large_px: Option<u32>,
 }
 
-/// One thumbnail as `app/thumbs.request` answers it: `state` is `ready`, `pending` or `icon`;
-/// `file` is the cached PNG's absolute path; `px` the size it was rendered at.
+/// A thumbnail's state (Appendix H "Thumbnails"): wire `ready` (the cached PNG is there),
+/// `pending` (it is being rendered and is announced on topic `thumbs`) or `icon` (no file: the
+/// app draws the media kind's icon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThumbStateWire {
+    Ready,
+    Pending,
+    Icon,
+}
+
+/// One thumbnail as `app/thumbs.request` answers it: `file` is the cached PNG's absolute path;
+/// `px` the size it was rendered at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ThumbView {
     pub path: String,
+    /// The SHA-256 of the bytes read; always present, `null` when the file couldn't be read or
+    /// hashed.
     pub sha256: Option<String>,
     pub media_kind: String,
     pub renderer: String,
-    pub state: String,
+    pub state: ThumbStateWire,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     pub px: u32,
@@ -628,6 +641,47 @@ mod tests {
             serde_json::to_value(&path).unwrap(),
             json!({"toasts": "not_yet_shown", "shortcut": "ok", "handlers": "ok"})
         );
+    }
+
+    /// Appendix H "Thumbnails": a thumbnail's `state` is exactly `ready`, `pending` or `icon` on
+    /// the wire (anything else is refused), and `sha256` is always present, `null` allowed.
+    #[test] // spec: APP-038, APP-039
+    fn thumb_view_state_is_one_of_three() {
+        for (state, wire) in [
+            (ThumbStateWire::Ready, "ready"),
+            (ThumbStateWire::Pending, "pending"),
+            (ThumbStateWire::Icon, "icon"),
+        ] {
+            let view = ThumbView {
+                path: "projects/p/assets/a/x.png".into(),
+                sha256: None,
+                media_kind: "image".into(),
+                renderer: "image@1".into(),
+                state,
+                file: None,
+                px: 96,
+            };
+            let wire_json = serde_json::to_value(&view).unwrap();
+            assert_eq!(wire_json["state"], wire);
+            assert_eq!(
+                wire_json["sha256"],
+                serde_json::Value::Null,
+                "present, null"
+            );
+            assert!(wire_json.get("file").is_none());
+            assert_eq!(
+                serde_json::from_value::<ThumbView>(wire_json).unwrap(),
+                view
+            );
+        }
+        for bad in ["done", "Ready", "", "ICON"] {
+            let wire_json = json!({"path": "x", "sha256": null, "media_kind": "image",
+                                   "renderer": "icon@1", "state": bad, "px": 96});
+            assert!(
+                serde_json::from_value::<ThumbView>(wire_json).is_err(),
+                "{bad:?} is no state"
+            );
+        }
     }
 
     #[test] // spec: APP-043, CORE-111

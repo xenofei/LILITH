@@ -669,11 +669,13 @@ mod tests {
         // no wire value changed, so no protocol bump. `app/set_context`'s result gained the
         // additive `effective_project`, which plan 4a hasn't released. 1.3 added
         // `core/prove`'s params and result. 1.4 (plan 4b, P4b-R7) added `app/thumbs.request`'s
-        // `ThumbsRequestParams`, `ThumbItem`, `ThumbsRequestResult` and `ThumbView`,
+        // `ThumbsRequestParams`, `ThumbItem`, `ThumbsRequestResult` and `ThumbView` (its `state`
+        // the `ThumbStateWire` enum `ready | pending | icon`, its `sha256` nullable),
         // `app/asset.trust`'s `AssetTrustParams` and `AssetTrustResult`, `app/asset.ai_edit`'s
         // `AiEditParams` and `AiEditResult`, and `ConfirmationView`'s optional `files: [Touch]`
-        // (`Touch`, `TouchAccess`) and `facts: ConfirmFacts`.
-        assert_eq!(h, "236a874b05714a5a");
+        // (`Touch`, `TouchAccess`) and `facts: ConfirmFacts`. (Unreleased within 1.4: the audit
+        // of Task 10 made `ThumbView.state` an enum, `236a874b05714a5a` before.)
+        assert_eq!(h, "9ec12c38a6b2886a");
     }
 
     #[test] // spec: ARCH-029
