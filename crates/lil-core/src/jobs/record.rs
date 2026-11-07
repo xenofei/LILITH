@@ -968,13 +968,16 @@ async fn list_columns(
                 if let Some(sel) = &f.status {
                     // Any of its statuses or substatuses (Appendix H "Jobs"); a name it doesn't
                     // take selects nothing (`Jobs::list` refuses one first).
+                    // The placeholders follow `values`, as `bind`'s do (fix round 1, M3).
                     let (statuses, substatuses) = sel.columns().unwrap_or_default();
                     values.push(json_list(&statuses));
+                    let statuses_at = values.len();
                     values.push(json_list(&substatuses));
-                    sql_text.push_str(
-                        " AND (status IN (SELECT value FROM json_each(?1)) \
-                         OR substatus IN (SELECT value FROM json_each(?2)))",
-                    );
+                    let substatuses_at = values.len();
+                    sql_text.push_str(&format!(
+                        " AND (status IN (SELECT value FROM json_each(?{statuses_at})) \
+                         OR substatus IN (SELECT value FROM json_each(?{substatuses_at})))"
+                    ));
                 }
                 let mut bind = |sql_text: &mut String, clause: &str, v: rusqlite::types::Value| {
                     values.push(v);

@@ -1621,6 +1621,10 @@ impl Attempt<'_> {
     /// the attempt ends and the job waits again (`queue_paused`), its row still naming `old`
     /// until the next attempt knows it gone; that attempt then makes its own first post
     /// (CORE-120).
+    ///
+    /// Scope (fix round 1, controller ruling on M1): NF-24 covers a retry inside `wait_out`.
+    /// A lane paused before the retry is dispatched (it is held at once and never waits), and
+    /// a second retry held behind the first, leave their inherited prompts alone.
     async fn wait_out(&self, old: &str, deletable: bool) -> Result<(), JobFailure> {
         self.live.posted.lock().await.waiting_out = Some((old.to_string(), false));
         let waited = self.wait_out_looks(old, deletable).await;
@@ -1628,7 +1632,10 @@ impl Attempt<'_> {
         waited
     }
 
-    /// [`Attempt::wait_out`]'s looks.
+    /// [`Attempt::wait_out`]'s looks. While the lane is paused and the withdrawal can still be
+    /// tried (fix round 1, M1), a look that gets no answer doesn't end the attempt: the
+    /// withdrawal is tried again at the next poll. Once its delete was sent, or the prompt
+    /// started, no more withdrawal is asked for in this attempt (M4).
     async fn wait_out_looks(&self, old: &str, deletable: bool) -> Result<(), JobFailure> {
         let mut cancel = self.job.cancel.clone();
         // A prompt that started never waits in the queue again: no more withdrawals.
@@ -1644,25 +1651,48 @@ impl Attempt<'_> {
             if self.shut() {
                 return Err(stopping(self.job));
             }
-            if deletable && !started {
+            // The withdrawal is still to be tried at a later poll, should this one get no
+            // answer.
+            let mut retry_withdrawal = false;
+            if deletable && !started && !self.waited_out_delete_sent().await {
                 match self.job.withdraw_waited_out(old).await {
                     WithdrawOutcome::Withdrawn => {
                         return Err(JobFailure::Retryable(error(
                             &codes::COMFYUI_UNREACHABLE,
-                            "The job's lane was paused while it waited for the earlier                              attempt's prompt, which was taken out of ComfyUI's queue; it waits                              again.",
+                            "The job's lane was paused while it waited for the earlier \
+                             attempt's prompt, which was taken out of ComfyUI's queue; it waits \
+                             again.",
                             self.job,
                         )));
                     }
                     WithdrawOutcome::AlreadyStarted => started = true,
-                    WithdrawOutcome::NotPending => {}
+                    WithdrawOutcome::NotPending => {
+                        retry_withdrawal =
+                            self.job.lane_paused() && !self.waited_out_delete_sent().await;
+                    }
                 }
             }
             match self.client.state(old).await {
                 Ok(RemoteState::Queued | RemoteState::Running) => {}
                 Ok(_) => return Ok(()),
+                // Nothing is posted meanwhile: the attempt only waits on (M1).
+                Err(e) if retry_withdrawal => {
+                    tracing::info!(prompt_id = %old, error = %e, "ComfyUI didn't answer a paused lane's look at the prompt a retry waits out; the withdrawal is tried again at the next poll");
+                }
                 Err(e) => return Err(unreachable(&e, self.job)),
             }
         }
+    }
+
+    /// A withdrawal sent its delete for the prompt this attempt waits out.
+    async fn waited_out_delete_sent(&self) -> bool {
+        self.live
+            .posted
+            .lock()
+            .await
+            .waiting_out
+            .as_ref()
+            .is_some_and(|(_, sent)| *sent)
     }
 
     /// `POST /prompt`, under the cancel lock (module docs, step 2). A pause of the job's lane

@@ -888,6 +888,12 @@ impl JobCtx {
         self.jobs.hold_if_paused(self.id.as_str(), None, true).await
     }
 
+    /// Whether a reason of the job's lane covers it now (CORE-160): a read only, nothing is
+    /// held.
+    pub fn lane_paused(&self) -> bool {
+        self.jobs.lane_paused(self.id.as_str())
+    }
+
     /// NF-24 (CORE-160; Appendix H "Jobs"): `prompt_id`, the prompt of the job this one
     /// re-runs, which the attempt waits out before it posts its own, is withdrawn the way a
     /// pause withdraws a pending prompt, through the engine's [`Withdraw`], but only while a
@@ -1238,7 +1244,13 @@ impl<'de> Deserialize<'de> for StatusSel {
             One(String),
             Many(Vec<String>),
         }
-        Ok(match Raw::deserialize(d)? {
+        // Named for the caller, not after this type (fix round 1, M5).
+        let raw = Raw::deserialize(d).map_err(|_| {
+            serde::de::Error::custom(
+                "status must be a status name, a list of status names, or \"finished\"",
+            )
+        })?;
+        Ok(match raw {
             Raw::One(name) if name == FINISHED => StatusSel::Finished,
             Raw::One(name) => StatusSel::One(name),
             Raw::Many(names) => StatusSel::Many(names),
@@ -1265,11 +1277,30 @@ impl JsonSchema for StatusSel {
 
 /// `jobs.list`'s `origin` (Appendix H "Jobs"): the surface that started a job, or a list of
 /// them (any of). Surfaces are an open set (P4a-R12).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(untagged)]
 pub enum OriginSel {
     One(Surface),
     Many(Vec<Surface>),
+}
+
+impl<'de> Deserialize<'de> for OriginSel {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<OriginSel, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(Surface),
+            Many(Vec<Surface>),
+        }
+        // Named for the caller, not after this type (fix round 1, M5).
+        let raw = Raw::deserialize(d).map_err(|_| {
+            serde::de::Error::custom("origin must be a surface name or a list of surface names")
+        })?;
+        Ok(match raw {
+            Raw::One(surface) => OriginSel::One(surface),
+            Raw::Many(surfaces) => OriginSel::Many(surfaces),
+        })
+    }
 }
 
 impl OriginSel {

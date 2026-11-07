@@ -3083,18 +3083,19 @@ async fn external_side_effects_jobs_are_never_withdrawn() {
 /// A retry waiting out the prompt of the job it retries (N5): an earlier core's job
 /// `j_…d<n>` (interrupted, its row naming its prompt in `withdrawn_id`) whose prompt the fake
 /// holds, and the retry, which copied the id and is in `wait_out` once it has looked at the old
-/// prompt. `external`: both jobs have external side effects. Returns `(retry, old prompt)`.
+/// prompt. `(original, retry)`: which of the two jobs have external side effects. Returns
+/// `(retry, old prompt)`.
 async fn a_retry_waiting_out(
     rig: &Rig,
     fake: &FakeComfy,
     n: u8,
-    external: bool,
+    (original_external, retry_external): (bool, bool),
 ) -> (String, String) {
     let mut original = earlier_row(
         &format!("j_00000000000000d{n}"),
         &format!("00000000-0000-4000-8000-0000000000d{n}"),
         Substatus::Interrupted,
-        external,
+        original_external,
     );
     post_as_earlier_core(fake, &original).await;
     let old = original.external_id.take().unwrap();
@@ -3114,7 +3115,7 @@ async fn a_retry_waiting_out(
         None,
         DEFAULT_EXPECTED_SECS,
     );
-    spec.external_side_effects = external;
+    spec.external_side_effects = retry_external;
     let retry = rig.jobs.submit(&caller, spec).await.unwrap().job_id;
     let deadline = Instant::now() + DEADLINE;
     while count(fake, "GET", &format!("/jobs/{old}")) < 1 {
@@ -3156,7 +3157,7 @@ async fn a_waited_out_prompt_is_deleted_while_paused_and_the_retry_posts_once() 
     // The old prompt stays pending behind it.
     let outside = fake.add_outside_prompt(true, None);
     let rig = Rig::new(&env);
-    let (retry, old) = a_retry_waiting_out(&rig, &fake, 1, false).await;
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 1, (false, false)).await;
 
     rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
     until_withdrawn(&rig, 1).await;
@@ -3233,7 +3234,7 @@ async fn a_waited_out_prompt_that_started_runs_on() {
     // The old prompt runs at once and stays running.
     fake.hold_prompts(true);
     let rig = Rig::new(&env);
-    let (retry, old) = a_retry_waiting_out(&rig, &fake, 2, false).await;
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 2, (false, false)).await;
 
     let before = fake.requests().len();
     rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
@@ -3291,7 +3292,7 @@ async fn crash_after_the_delete_never_posts_twice() {
     let outside = fake.add_outside_prompt(true, None);
     let ids = Arc::new(SeqIds::new());
     let rig = Rig::with_ids(&env, ids.clone());
-    let (retry, old) = a_retry_waiting_out(&rig, &fake, 3, false).await;
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 3, (false, false)).await;
 
     fake.stall_after_delete(Stall::Refuse);
     rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
@@ -3352,13 +3353,159 @@ async fn external_side_effects_prompts_are_never_deleted() {
     attach(&env, &fake);
     let outside = fake.add_outside_prompt(true, None);
     let rig = Rig::new(&env);
-    let (retry, old) = a_retry_waiting_out(&rig, &fake, 4, true).await;
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 4, (true, true)).await;
 
     let state = rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
     assert_eq!(state.withdrawn, 0);
     let looks = count(&fake, "GET", &format!("/jobs/{old}"));
     until_looks(&fake, &old, looks, 2).await;
     assert!(queue_deletes(&fake).is_empty(), "never deleted");
+    assert_eq!(count(&fake, "POST", &format!("/jobs/{old}/cancel")), 0);
+    let waiting = rig.summary(&retry).await;
+    assert_eq!(
+        waiting.substatus.as_deref(),
+        Some("submitting"),
+        "{waiting:?}"
+    );
+    assert!(waiting.waiting_for_earlier_prompt);
+    assert_eq!(rig.jobs.queue_state(Lane::GpuHeavy).withdrawn, 0);
+
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    fake.release(&outside);
+    let done = rig.done(&retry).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    let client = ComfyClient::new(&fake.url()).unwrap();
+    assert!(
+        client.history(&old).await.unwrap().is_some(),
+        "the old prompt ran"
+    );
+    assert_eq!(posted(&fake).len(), 2, "one POST of the retry's own");
+    assert!(queue_deletes(&fake).is_empty());
+}
+
+/// The `{kind: "queue"}` events read from `rx` so far, drained.
+fn queue_events(rx: &mut mpsc::Receiver<String>) -> usize {
+    let mut n = 0;
+    while let Ok(line) = rx.try_recv() {
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["params"]["data"]["kind"] == "queue" {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// How many withdrawal `/queue` reads (the bare path) the fake saw from request `from` on.
+fn queue_reads(fake: &FakeComfy, from: usize) -> usize {
+    fake.requests()[from..]
+        .iter()
+        .filter(|r| r.method == "GET" && r.path == "/queue")
+        .count()
+}
+
+/// Fix round 1, M1 (NF-24): ComfyUI answers nothing during the waiting retry's paused polls
+/// (the withdrawal's `/queue` read and the look at the old prompt both fail). The attempt
+/// doesn't end on a failed look while the withdrawal can still be tried: it is tried again at
+/// the next poll, deletes the old prompt once ComfyUI answers, and the retry posts exactly once
+/// after the resume. The lane's state is published only when it changes, never once per
+/// failed poll (M4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120
+async fn a_failed_look_while_paused_retries_the_withdrawal_at_the_next_poll() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 5, (false, false)).await;
+    let (tx, mut rx) = mpsc::channel(1024);
+    rig.events.attach(7, tx);
+    rig.events
+        .subscribe(7, &["jobs".to_string()], &BTreeMap::new())
+        .await;
+
+    fake.refuse_http(true);
+    let before = fake.requests().len();
+    rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    rig.until(&retry, "a paused poll was refused", |_| {
+        let requests = fake.requests();
+        requests[before..]
+            .iter()
+            .position(|r| r.method == "GET" && r.path == "/queue")
+            .is_some_and(|q| {
+                requests[before + q..]
+                    .iter()
+                    .any(|r| r.method == "GET" && bare(&r.path) == format!("/jobs/{old}"))
+            })
+    })
+    .await;
+    queue_events(&mut rx);
+    rig.until(&retry, "two more refused polls", |_| {
+        queue_reads(&fake, before) >= 3
+    })
+    .await;
+    assert_eq!(
+        queue_events(&mut rx),
+        0,
+        "no lane state is published per failed poll"
+    );
+    let waiting = rig.summary(&retry).await;
+    assert_eq!(
+        (waiting.substatus.as_deref(), waiting.attempt),
+        (Some("submitting"), 1),
+        "the attempt goes on waiting: {waiting:?}"
+    );
+    assert!(queue_deletes(&fake).is_empty());
+
+    fake.refuse_http(false);
+    until_withdrawn(&rig, 1).await;
+    rig.until(&retry, "held", |j| {
+        j.substatus.as_deref() == Some("queue_paused")
+    })
+    .await;
+    assert_eq!(queue_deletes(&fake), [json!([old])]);
+    assert_eq!(posted(&fake).len(), 1, "nothing is posted while paused");
+    rig.jobs.resume(Lane::GpuHeavy, PauseReason::Manual).await;
+    rig.until(&retry, "its own prompt is in ComfyUI", |j| {
+        j.substatus.as_deref() == Some("queued_in_engine")
+    })
+    .await;
+    fake.release(&outside);
+    let done = rig.done(&retry).await;
+    assert_eq!(done.status, JobStatus::Succeeded, "{done:?}");
+    let bodies = posted(&fake);
+    assert_eq!(
+        bodies.len(),
+        2,
+        "exactly one POST of the retry's own: {bodies:?}"
+    );
+    assert_ne!(bodies[1]["prompt_id"], old.as_str());
+    assert_eq!(queue_deletes(&fake), [json!([old])], "deleted once");
+    let client = ComfyClient::new(&fake.url()).unwrap();
+    assert!(
+        client.history(&old).await.unwrap().is_none(),
+        "the old prompt never ran"
+    );
+}
+
+/// Fix round 1, M6 (NF-24): only the job the retry re-runs has external side effects, the
+/// retry none. Its prompt is never deleted either: the retry waits it out over paused polls,
+/// nothing is withdrawn, and the retry posts once after the old prompt ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-128
+async fn an_external_originals_prompt_is_never_deleted() {
+    let env = TestEnv::new();
+    let fake = FakeComfy::start();
+    attach(&env, &fake);
+    let outside = fake.add_outside_prompt(true, None);
+    let rig = Rig::new(&env);
+    let (retry, old) = a_retry_waiting_out(&rig, &fake, 6, (true, false)).await;
+
+    let before = fake.requests().len();
+    let state = rig.jobs.pause(Lane::GpuHeavy, PauseReason::Manual).await;
+    assert_eq!(state.withdrawn, 0);
+    let looks = count(&fake, "GET", &format!("/jobs/{old}"));
+    until_looks(&fake, &old, looks, 2).await;
+    assert!(queue_deletes(&fake).is_empty(), "never deleted");
+    assert_eq!(queue_reads(&fake, before), 0, "no withdrawal was tried");
     assert_eq!(count(&fake, "POST", &format!("/jobs/{old}/cancel")), 0);
     let waiting = rig.summary(&retry).await;
     assert_eq!(

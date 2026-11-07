@@ -3036,6 +3036,40 @@ async fn dispatched_true_and_false_partition_the_queue() {
     fx.shutdown().await;
 }
 
+/// Fix round 1, M5: a malformed `status` or `origin` is refused with a message that names the
+/// field and the forms it takes, never an internal type (the tool turns it into
+/// `params.invalid`, "invalid arguments for jobs.list: …").
+#[test] // spec: APP-114, CORE-160
+fn malformed_status_and_origin_say_what_they_take() {
+    let refused = |v: Value| {
+        serde_json::from_value::<JobFilter>(v.clone())
+            .expect_err(&format!("{v} was taken"))
+            .to_string()
+    };
+    for bad in [
+        json!({"status": ["queued", 3]}),
+        json!({"status": 3}),
+        json!({"status": {"name": "queued"}}),
+    ] {
+        let text = refused(bad);
+        assert!(
+            text.starts_with(
+                "status must be a status name, a list of status names, or \"finished\""
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("enum"), "{text}");
+    }
+    for bad in [json!({"origin": 3}), json!({"origin": ["panel", 3]})] {
+        let text = refused(bad);
+        assert!(
+            text.starts_with("origin must be a surface name or a list of surface names"),
+            "{text}"
+        );
+        assert!(!text.contains("enum"), "{text}");
+    }
+}
+
 /// The new filters page with the cursors as before: newest first, each page after the last
 /// one's job, every selected job listed once and no other; and in queue order too.
 #[tokio::test(start_paused = true)] // spec: APP-114, CORE-160, CORE-146

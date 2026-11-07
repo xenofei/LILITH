@@ -2374,6 +2374,16 @@ impl Shared {
         }
     }
 
+    /// `JobCtx::lane_paused`: whether a reason of job `id`'s lane covers its class now.
+    pub(crate) fn lane_paused(&self, id: &str) -> bool {
+        let q = self.queue();
+        q.jobs.get(id).is_some_and(|a| {
+            !q.lanes[a.info.spec.lane.index()]
+                .holding(a.info.spec.priority)
+                .is_empty()
+        })
+    }
+
     /// `JobCtx::withdraw_waited_out` (NF-24, CORE-160; Appendix H "Jobs"): while a reason of its
     /// lane covers running job `id`, which is waiting out `prompt_id`, the prompt of the job it
     /// re-runs, that prompt is withdrawn as a pause withdraws a pending one
@@ -2768,7 +2778,11 @@ impl Shared {
         let job = JobId(id.to_string());
         let outcome = withdrawer.withdraw(&job, &external_id).await;
         if outcome != WithdrawOutcome::Withdrawn {
-            tracing::info!(job_id = id, outcome = ?outcome, "a paused lane's prompt was not withdrawn; it runs on");
+            // A waited-out prompt is asked about at each poll: only an answer that changes
+            // something is logged (fix round 1, M4).
+            if waited_out.is_none() || outcome == WithdrawOutcome::AlreadyStarted {
+                tracing::info!(job_id = id, outcome = ?outcome, "a paused lane's prompt was not withdrawn; it runs on");
+            }
             decided(self, Withdrawal::None);
             return outcome;
         }
