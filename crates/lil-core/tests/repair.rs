@@ -1311,8 +1311,10 @@ async fn a_redirects_file_that_doesnt_parse_stops_accept_move_before_any_write()
 async fn a_repair_looks_at_the_place_a_manifest_names_on_disk() {
     // A copy with a UUID of its own is a copy of the live crane. The crane then leaves the
     // workspace while the core runs, unseen (the watcher here never applies a change): the
-    // index still has it live. Only reconciling the place the copy's manifest names shows it
-    // gone, so the copy is alone (`moved`) and accept_move goes ahead.
+    // index still has it live. The repair reconciles the place the copy's manifest names, which
+    // shows the crane gone, so the copy is judged again: another asset held that place, so it
+    // is `invalid` now (T8 round 2), not still a `copy` of a folder that is no longer there.
+    // Nothing is written either way.
     let fx = Fx::with_idle_watcher(|ws| {
         crane_copied(ws);
         hand_edit(&asset_dir(ws, COPY), |m| {
@@ -1321,8 +1323,70 @@ async fn a_repair_looks_at_the_place_a_manifest_names_on_disk() {
     });
     assert_eq!(fx.get(COPY).await["repair"]["kind"], "copy");
     outside_rename(&asset_dir(&fx.ws, CRANE), &file(&fx.ws, "elsewhere_crane"));
-    let r = structured(fx.accept(COPY).await);
-    assert_eq!(r["redirect"]["from"], format!("{P}/{CRANE}"), "{r}");
-    assert!(fx.get(COPY).await["repair"].is_null());
+    assert_eq!(error(fx.accept(COPY).await).code, "repair.not_needed");
+    assert_eq!(fx.get(COPY).await["repair"], json!({"kind": "invalid"}));
+    assert!(fx.redirects().is_none());
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154, ARCH-125 (T8 round 2 ruling)
+async fn a_copy_whose_original_left_outside_is_invalid_not_moved() {
+    // A copy with a UUID of its own; its original's folder then leaves the workspace outside
+    // the suite. The index keeps the original as `missing` (its UUID lives nowhere), so it
+    // knows a different asset at the place the copy names: the copy is no move (`invalid`),
+    // and neither repair writes anything. A redirect never sends one asset's refs to another.
+    let fx = Fx::with(|ws| {
+        crane_copied(ws);
+        hand_edit(&asset_dir(ws, COPY), |m| {
+            m["creation_uuid"] = json!("11111111-2222-4333-8444-555555555555");
+        });
+    });
+    fx.open().await.index.ready().await;
+    assert_eq!(fx.get(COPY).await["repair"]["kind"], "copy");
+    outside_rename(&asset_dir(&fx.ws, CRANE), &file(&fx.ws, "elsewhere_crane"));
+    fx.reconcile().await;
+    let fx = fx.restart().await;
+    fx.reconcile().await;
+    assert_eq!(
+        fx.ids().await,
+        [CRANE, COPY, LAMP],
+        "the crane stays, missing"
+    );
+    assert_eq!(fx.get(COPY).await["repair"], json!({"kind": "invalid"}));
+    let status = fx.status().await;
+    assert_eq!(status["moved"], json!([]), "{status}");
+    let copy_file = manifest_in(&asset_dir(&fx.ws, COPY));
+    let bytes = std::fs::read(&copy_file).unwrap();
+    assert_eq!(error(fx.accept(COPY).await).code, "repair.not_needed");
+    assert_eq!(error(fx.independent(COPY).await).code, "repair.not_needed");
+    assert!(fx.redirects().is_none(), "no redirect");
+    assert_eq!(std::fs::read(&copy_file).unwrap(), bytes, "nothing written");
+    let r = fx
+        .call(
+            "ref.resolve",
+            json!({"ref": format!("lil://{}/{P}/{CRANE}@1.0.0", fx.ws_id())}),
+        )
+        .await;
+    if let Outcome::Ok(out) = &r {
+        assert_ne!(out.structured["asset_id"], COPY, "{r:?}");
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-154 (T8 round 2 ruling: the genuine move is unchanged)
+async fn a_genuine_move_seen_while_the_core_runs_is_still_moved() {
+    // The old place's row is still indexed (missing) when the move is judged, and holds the
+    // same UUID: it is a move.
+    let fx = Fx::with_idle_watcher(|_| {});
+    fx.open().await.index.ready().await;
+    outside_rename(&asset_dir(&fx.ws, CRANE), &asset_dir(&fx.ws, ORIGAMI));
+    fx.reconcile().await;
+    assert_eq!(
+        fx.get(ORIGAMI).await["repair"],
+        json!({"kind": "moved", "from": format!("{P}/{CRANE}"), "to": format!("{P}/{ORIGAMI}")})
+    );
+    structured(fx.accept(ORIGAMI).await);
+    assert_eq!(entries(&fx.redirects().unwrap()), 1);
+    assert_eq!(fx.ids().await, [ORIGAMI, LAMP]);
     fx.shutdown().await;
 }

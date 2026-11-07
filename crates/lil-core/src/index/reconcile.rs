@@ -1163,7 +1163,7 @@ pub(super) fn refresh_repairs(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let (live, gone): (Vec<AssetRow>, Vec<AssetRow>) = rows
         .into_iter()
         .partition(|r| !missing.contains(&path_key(r.manifest.as_str())));
-    let found = repair::detect(&live);
+    let found = repair::detect_known(&live, &gone);
     let live_uuids: HashSet<String> = live.iter().filter_map(repair::uuid_key).collect();
     let live_folders: HashSet<String> = live
         .iter()

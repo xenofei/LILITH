@@ -11,9 +11,13 @@
 //! - **One folder** with the UUID that disagrees, by the place its manifest names (compared
 //!   without regard to case: on Windows a name that differs only by case is the same folder):
 //!   the folder itself, `invalid`; another **live** folder, `copy` with `other` that folder (it
-//!   is no move: CORE-154's "while its old folder is gone"; ruling T8 I1); else, a valid
-//!   `<project>/<asset_id>`, `moved`, `from` that place and `to` the folder; else `invalid`. So
-//!   `moved` always means no live folder is at `from`.
+//!   is no move: CORE-154's "while its old folder is gone"; ruling T8 I1); a place where the
+//!   index still knows a gone asset (its manifest `missing`) with another creation UUID,
+//!   `invalid`: that is another asset's place, and a redirect must never send one asset's refs
+//!   to another (T8 round 2); else, a valid `<project>/<asset_id>`, `moved`, `from` that place
+//!   and `to` the folder; else `invalid`. So `moved` always means no live folder is at `from`
+//!   and the index knows no other asset there. (An original trashed through the suite leaves
+//!   no row, so it isn't seen here; parked for the plan's final review.)
 //! - **Several folders** with one UUID: every one needs repair. Agreeing ones are
 //!   `duplicate_uuid`; a disagreeing one is `copy` with `other` the original when exactly one
 //!   agrees, else `duplicate_uuid` too (neither is clearly the original: you choose).
@@ -22,8 +26,9 @@
 //!   `project` or `asset_id` isn't a string), a manifest file not named `<asset_id>.manifest.json`
 //!   in a folder whose fields agree, or a disagreeing manifest without a UUID.
 //!
-//! The caller passes only the **live** rows (whose manifest isn't `missing`): a folder that is
-//! gone holds no UUID. A row not in the result needs no repair.
+//! [`detect_known`] takes the **live** rows (whose manifest isn't `missing`: a folder that is
+//! gone holds no UUID) and the gone rows the index still has, which only tell what asset was at
+//! a place; [`detect`] is the same with no gone rows. A row not in the result needs no repair.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -144,8 +149,23 @@ pub fn uuid_key(row: &AssetRow) -> Option<String> {
 }
 
 /// The repair each live asset folder of `rows` needs (module docs), by `(project, asset_id)`;
-/// a folder that needs none isn't listed.
+/// a folder that needs none isn't listed. The index knows no gone folder here.
 pub fn detect(rows: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
+    detect_known(rows, &[])
+}
+
+/// [`detect`], with the gone folders the index still knows (`gone`, their manifests `missing`):
+/// a lone folder naming a place where one of them held another creation UUID is `invalid`, not
+/// `moved` (module docs).
+pub fn detect_known(rows: &[AssetRow], gone: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
+    // The UUIDs of the gone folders, by their name without regard to case.
+    let mut held: HashMap<(String, String), Vec<Option<String>>> = HashMap::new();
+    for g in gone {
+        let f = folder(g);
+        held.entry((f.0.to_ascii_lowercase(), f.1.to_ascii_lowercase()))
+            .or_default()
+            .push(uuid_key(g));
+    }
     let mut groups: BTreeMap<String, Vec<&AssetRow>> = BTreeMap::new();
     for row in rows {
         if let Some(uuid) = uuid_key(row) {
@@ -169,7 +189,7 @@ pub fn detect(rows: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
                 group.sort_by_key(|r| folder(r));
                 group.dedup_by_key(|r| folder(r));
                 if group.len() == 1 {
-                    alone(row, &live)
+                    alone(row, &live, &held)
                 } else {
                     Some(in_group(row, &group))
                 }
@@ -182,8 +202,13 @@ pub fn detect(rows: &[AssetRow]) -> HashMap<(String, String), RepairKind> {
     out
 }
 
-/// A folder whose UUID is nowhere else; `live` maps each live folder's lowercased name to it.
-fn alone(row: &AssetRow, live: &HashMap<(String, String), (String, String)>) -> Option<RepairKind> {
+/// A folder whose UUID is nowhere else; `live` maps each live folder's lowercased name to it,
+/// `held` each gone folder's to the UUIDs the index has there.
+fn alone(
+    row: &AssetRow,
+    live: &HashMap<(String, String), (String, String)>,
+    held: &HashMap<(String, String), Vec<Option<String>>>,
+) -> Option<RepairKind> {
     if agrees(row) {
         return (!canonical_file(row)).then_some(RepairKind::Invalid);
     }
@@ -198,6 +223,13 @@ fn alone(row: &AssetRow, live: &HashMap<(String, String), (String, String)>) -> 
         return Some(RepairKind::Copy {
             other: name(original),
         });
+    }
+    let mine = uuid_key(row);
+    if held
+        .get(&lowered)
+        .is_some_and(|uuids| uuids.iter().any(|u| *u != mine))
+    {
+        return Some(RepairKind::Invalid);
     }
     Some(if is_slug(&from.0) && is_asset_id(&from.1) {
         RepairKind::Moved {
@@ -314,6 +346,22 @@ mod tests {
                 other: "s/Orig".into()
             }
         );
+        // A place where the index knows a gone asset: the same UUID is a move; another UUID,
+        // or none, is another asset's place, so invalid.
+        let mover = row("s/b", ("s", "a"), Some("u1"));
+        let gone_same = row("s/a", ("s", "a"), Some("U1"));
+        let gone_other = row("s/A", ("s", "a"), Some("u9"));
+        let gone_legacy = row("s/a", ("s", "a"), None);
+        assert_eq!(
+            detect_known(std::slice::from_ref(&mover), &[gone_same])[&key("s/b")].as_str(),
+            "moved"
+        );
+        for g in [gone_other, gone_legacy] {
+            assert_eq!(
+                detect_known(std::slice::from_ref(&mover), &[g])[&key("s/b")],
+                RepairKind::Invalid
+            );
+        }
         // Legacy: never moved; a disagreeing one is invalid, an agreeing one fine.
         let got = detect(&[row("s/b", ("s", "a"), None), row("s/a", ("s", "a"), None)]);
         assert_eq!(got[&key("s/b")], RepairKind::Invalid);
