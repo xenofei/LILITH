@@ -29,11 +29,13 @@
 //! name the file mentions, so [`Resolver::names_resolving_to`] and [`Resolver::broken_from`]
 //! need no I/O. A name the file doesn't mention is checked when it is first resolved.
 //!
-//! **A redirects file that doesn't parse** blocks only what needs it: `load` keeps its
-//! `manifest.needs_repair` error aside ([`Resolver::file_error`]); a live name still resolves
-//! (step 1 never reads the file), and only a name that would have to follow a redirect gets
-//! that error, never a silent "no redirects". [`Resolver::names_resolving_to`] is then the
-//! asset's own name only. A store error reading the file is a hard error of `load`.
+//! **A redirects file that can't be read or parsed** blocks only what needs it: `load` keeps
+//! its error aside ([`Resolver::file_error`]: `manifest.needs_repair` for one that doesn't
+//! parse, the store's error, such as `store.io` for a cloud-only placeholder or a folder at the
+//! path, for one that can't be read); a live name still resolves (step 1 never reads the
+//! file), and only a name that would have to follow a redirect gets that error, never a silent
+//! "no redirects". [`Resolver::names_resolving_to`] is then the asset's own name only. `load`
+//! never fails because of the file.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -157,7 +159,7 @@ pub struct Resolver<'a> {
     store: &'a Store,
     index: &'a Index,
     redirects: Vec<Redirect>,
-    /// Why the redirects file can't be read as redirects (module docs); its entries are then
+    /// Why the redirects file can't be read or parsed (module docs); its entries are then
     /// empty.
     broken: Option<ErrorBody>,
     /// Each `from` and the entry followed from it.
@@ -366,12 +368,13 @@ impl<'a> Resolver<'a> {
     }
 
     /// Reads the redirects and checks every name they mention on disk (module docs). The
-    /// trash is listed only when a resolution needs it. A file that isn't redirects is kept
-    /// aside as [`Resolver::file_error`] (`manifest.needs_repair`, `data: {path:
-    /// "registry/redirects.yaml", why}`), returned by each resolution that needs the file.
+    /// trash is listed only when a resolution needs it. A file that isn't redirects
+    /// (`manifest.needs_repair`, `data: {path: "registry/redirects.yaml", why}`) or can't be
+    /// read (the store's error) is kept aside as [`Resolver::file_error`], returned by each
+    /// resolution that needs the file.
     ///
     /// # Errors
-    /// The store's error reading the file.
+    /// None today: the `Result` is the interface's (Task 7), kept for callers.
     pub async fn load(index: &'a Index, store: &'a Store) -> Result<Resolver<'a>, ErrorBody> {
         let (redirects, broken) = match store.read(&redirects_path()).await {
             Ok(None) => (Vec::new(), None),
@@ -382,7 +385,9 @@ impl<'a> Resolver<'a> {
                 Ok(redirects) => (redirects, None),
                 Err(why) => (Vec::new(), Some(needs_repair(&why))),
             },
-            Err(e) => return Err(e.to_error("")),
+            // Unreadable (a cloud-only placeholder, a folder, held by another program): set
+            // aside like a file that doesn't parse, so a live name still resolves.
+            Err(e) => (Vec::new(), Some(e.to_error(""))),
         };
         let mut newest: HashMap<Name, usize> = HashMap::new();
         let key = |r: &Redirect| instant(&r.moved_utc);
@@ -417,8 +422,8 @@ impl<'a> Resolver<'a> {
         &self.redirects
     }
 
-    /// Why the redirects file can't be read as redirects, when it can't
-    /// (`manifest.needs_repair`).
+    /// Why the redirects file can't be read or parsed, when it can't (`manifest.needs_repair`
+    /// for a file that doesn't parse, else the store's read error).
     pub fn file_error(&self) -> Option<&ErrorBody> {
         self.broken.as_ref()
     }
@@ -731,9 +736,9 @@ impl<'a> Resolver<'a> {
 
     /// An input as a manifest or a run writes it (`asset.get`'s `uses`), in workspace `ws_id`
     /// from `project`: a link to an asset's version resolves its name through the redirects
-    /// and names that version (`kind: "sealed"`), with its content hash when the version is
-    /// sealed here, and is not an error when it isn't sealed yet (a planned dependent names
-    /// the version it waits for); a `lil://` ref resolves as [`Resolver::resolve_ref`]. `None`
+    /// and names that version: `kind: "sealed"` (read-only, with the content hash) when the
+    /// store lists it, else `kind: "asset"` (not read-only, no hash), which is not an error (a
+    /// planned dependent names the version it waits for); a `lil://` ref resolves as [`Resolver::resolve_ref`]. `None`
     /// for a library or style input, which isn't an asset of the workspace.
     ///
     /// # Errors
@@ -780,7 +785,11 @@ impl<'a> Resolver<'a> {
     ) -> Result<Resolved, ErrorBody> {
         let res = self.resolve_name(&name.0, &name.1).await?;
         let end = (res.project.clone(), res.asset_id.clone());
-        let sha256 = self.content_hash(&end, version).await?.flatten();
+        // A version the store doesn't list isn't sealed (yet): the input names the asset.
+        let (kind, sha256) = match self.content_hash(&end, version).await? {
+            Some(sha256) => (ResolvedKind::Sealed, sha256),
+            None => (ResolvedKind::Asset, None),
+        };
         let out = AssetRef::Sealed {
             ws: ws_id.to_string(),
             project: end.0.clone(),
@@ -792,7 +801,7 @@ impl<'a> Resolver<'a> {
             r#ref: Some(out.to_string()),
             version: Some(version.to_string()),
             redirected_from: res.redirected_from,
-            ..Resolved::at(ResolvedKind::Sealed, &end)
+            ..Resolved::at(kind, &end)
         })
     }
 

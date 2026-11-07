@@ -14,8 +14,8 @@
 //!   file is `read_only`; a path whose real location is outside the workspace (through `..`,
 //!   a junction or a symbolic link) is `outside`.
 //!
-//! The arguments are checked first; a redirects file that doesn't parse fails only a `{ref}`
-//! whose name isn't live (`manifest.needs_repair`).
+//! The arguments are checked first; a redirects file that can't be read or parsed fails only
+//! a `{ref}` whose name isn't live (with its `manifest.needs_repair` or read error).
 //!
 //! Exactly one of the two (`params.invalid` otherwise).
 

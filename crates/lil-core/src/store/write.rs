@@ -39,9 +39,10 @@ use lil_platform::names::{
 use lil_platform::{Clock, IdSource};
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{
-    MANIFEST_NEEDS_REPAIR, STATUS_INVALID_TRANSITION, STORE_BUSY, STORE_DISK_FULL, STORE_GIT_BUSY,
-    STORE_HASH_CONFLICT, STORE_IO, STORE_LOCKED, STORE_PATH_INVALID, TRASH_RESTORE_CONFLICT,
-    TRASH_UNKNOWN, VERSION_EXISTS, WORKSPACE_READ_ONLY, YAML_UNSUPPORTED_EDIT,
+    MANIFEST_NEEDS_REPAIR, PARAMS_INVALID, STATUS_INVALID_TRANSITION, STORE_BUSY, STORE_DISK_FULL,
+    STORE_GIT_BUSY, STORE_HASH_CONFLICT, STORE_IO, STORE_LOCKED, STORE_PATH_INVALID,
+    TRASH_RESTORE_CONFLICT, TRASH_UNKNOWN, VERSION_EXISTS, WORKSPACE_READ_ONLY,
+    YAML_UNSUPPORTED_EDIT,
 };
 use lil_schema::{EditError, Manifest, YamlEdit, YamlEditError, sha256_hex};
 use serde_json::{Value, json};
@@ -122,6 +123,8 @@ pub enum StoreError {
     TrashUnknown(String),
     /// A trash entry's original path is taken, so it was not restored.
     RestoreConflict(WsPath),
+    /// What the caller asked to write isn't valid for the file (`params.invalid`): why.
+    Invalid(String),
     /// A file the suite recorded (a run file about to be sealed) no longer has the recorded
     /// SHA-256: it changed outside the suite, so it was not used. Hashes are bare hex.
     Changed {
@@ -189,8 +192,9 @@ impl StoreError {
     /// `store.path_invalid`, `store.disk_full`, `store.io`, `store.locked`, `store.git_busy`,
     /// `store.hash_conflict` with `data {path, expected, found}` for a recorded file that
     /// changed, `workspace.read_only`, `manifest.needs_repair`, `yaml.unsupported_edit`,
-    /// `version.exists`, `status.invalid_transition`, `trash.unknown` (with `data.entry_id`)
-    /// and `trash.restore_conflict` (with `data.path`, the occupied original path).
+    /// `version.exists`, `status.invalid_transition`, `trash.unknown` (with `data.entry_id`),
+    /// `trash.restore_conflict` (with `data.path`, the occupied original path) and
+    /// `params.invalid` (`StoreError::Invalid`).
     pub fn to_error(&self, trace_id: &str) -> ErrorBody {
         let (spec, data) = match self {
             StoreError::HashConflict {
@@ -240,6 +244,7 @@ impl StoreError {
                 &TRASH_RESTORE_CONFLICT,
                 Some(json!({ "path": path.as_str() })),
             ),
+            StoreError::Invalid(_) => (&PARAMS_INVALID, None),
         };
         let mut body = ErrorBody::new(spec, self.to_string(), trace_id);
         body.data = data;
@@ -318,6 +323,7 @@ impl std::fmt::Display for StoreError {
                 "`{path}` is taken, so the trash entry was not restored; move or rename what is \
                  there first, then restore it again"
             ),
+            StoreError::Invalid(why) => f.write_str(why),
         }
     }
 }

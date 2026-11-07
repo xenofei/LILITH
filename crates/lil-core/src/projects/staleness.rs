@@ -15,9 +15,9 @@
 //! Every input and pin is resolved through [`Resolver`] (ARCH-125): an input naming an
 //! asset's old place reads the approved version where the asset is now, and a pin of either
 //! name pins it. An input that doesn't resolve (a loop, a dead end, the trash) can't make its
-//! asset stale. A redirects file that doesn't parse fails the check only when an input or a
-//! pin of a checked asset needs it (its name has no live folder): never a silent "no
-//! redirects".
+//! asset stale. A redirects file that can't be read or parsed fails the check only when an
+//! input or a pin of a checked asset needs it (its name has no live folder), naming that asset
+//! and that input or pin: never a silent "no redirects".
 //!
 //! The check is two steps, [`plan_staleness`] (reads only; every failure happens here) and
 //! [`apply_staleness`] (the manifest edits), so `project.set_status` plans before it writes
@@ -48,16 +48,20 @@ fn index_error(e: &IndexError) -> StoreError {
     }
 }
 
-/// A redirects file that can't be read, as a store error: one that doesn't parse is
-/// `yaml.unsupported_edit` (as a `project.yaml` that doesn't parse is for `project.set_status`),
-/// any other failure `store.io`; the message says which and why.
-pub(crate) fn redirects_error(e: &lil_protocol::ErrorBody) -> StoreError {
+/// A redirects file that can't be read or parsed, needed for `needed` (`"<asset>'s input
+/// <ref>"`), as a store error: one that doesn't parse is `yaml.unsupported_edit` (as a
+/// `project.yaml` that doesn't parse is for `project.set_status`), any other failure
+/// `store.io`. The message says why, names the file once and says what needed it.
+pub(crate) fn redirects_error(e: &lil_protocol::ErrorBody, needed: &str) -> StoreError {
     if e.code == lil_protocol::codes::MANIFEST_NEEDS_REPAIR.code {
-        StoreError::YamlUnsupported(e.message.clone())
+        StoreError::YamlUnsupported(format!("{} (needed for {needed})", e.message))
     } else {
+        // The store's message already starts with the path; `StoreError::Io` adds it again.
+        let prefix = format!("`{REDIRECTS_YAML}`: ");
+        let why = e.message.strip_prefix(&prefix).unwrap_or(&e.message);
         StoreError::Io {
             path: REDIRECTS_YAML.to_string(),
-            why: e.message.clone(),
+            why: format!("{why} (needed for {needed})"),
         }
     }
 }
@@ -150,17 +154,19 @@ fn target_of(project: &str, link: &LinkRef) -> Option<((String, String), Version
     }
 }
 
-/// Where `target` resolves to; `None` when it doesn't.
+/// Where `target` resolves to; `None` when it doesn't. `needed` says what asks (for the error).
 ///
 /// # Errors
-/// The redirects file's own error when the resolution needed the file and it doesn't parse.
+/// The redirects file's own error when the resolution needed the file and it can't be read or
+/// parsed.
 async fn resolved(
     resolver: &Resolver<'_>,
     target: &(String, String),
+    needed: &str,
 ) -> Result<Option<(String, String)>, StoreError> {
     match resolver.resolve_name(&target.0, &target.1).await {
         Ok(r) => Ok(Some((r.project, r.asset_id))),
-        Err(e) if resolver.is_file_error(&e) => Err(redirects_error(&e)),
+        Err(e) if resolver.is_file_error(&e) => Err(redirects_error(&e, needed)),
         Err(_) => Ok(None),
     }
 }
@@ -175,14 +181,19 @@ async fn stale_input(
     view: &ManifestView,
     approved: &mut HashMap<(String, String), Option<Version>>,
 ) -> Result<Option<(String, Version, String)>, StoreError> {
+    let asset = &view.asset_id;
     let mut pinned: Vec<(String, String)> = Vec::new();
-    for link in view
-        .pinned_inputs
-        .iter()
-        .filter_map(|p| p.r#ref.parse::<LinkRef>().ok())
-    {
+    for pin in &view.pinned_inputs {
+        let Ok(link) = pin.r#ref.parse::<LinkRef>() else {
+            continue;
+        };
         if let Some((target, _)) = target_of(project, &link) {
-            pinned.push(resolved(resolver, &target).await?.unwrap_or(target));
+            let needed = format!("{asset}'s pin {}", pin.r#ref);
+            pinned.push(
+                resolved(resolver, &target, &needed)
+                    .await?
+                    .unwrap_or(target),
+            );
         }
     }
     for input in &view.inputs {
@@ -192,7 +203,8 @@ async fn stale_input(
         let Some((named, version)) = target_of(project, &link) else {
             continue;
         };
-        let Some(target) = resolved(resolver, &named).await? else {
+        let needed = format!("{asset}'s input {}", input.r#ref);
+        let Some(target) = resolved(resolver, &named, &needed).await? else {
             continue;
         };
         let now = match approved.get(&target) {
@@ -212,12 +224,27 @@ async fn stale_input(
     Ok(None)
 }
 
+/// One asset [`apply_staleness`] marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mark {
+    asset_id: String,
+    /// The SHA-256 of the manifest the plan read (as `Manifest::to_text` writes it).
+    manifest_sha256: String,
+    /// The input's asset id, its approved version and the input's ref.
+    input: String,
+    version: Version,
+    input_ref: String,
+}
+
 /// What [`apply_staleness`] marks: per asset of the project, the input that makes it stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StalenessPlan {
     project: String,
-    /// `(asset_id, the input's asset_id, its approved version, the input's ref)`.
-    marks: Vec<(String, String, Version, String)>,
+    marks: Vec<Mark>,
+}
+
+fn manifest_sha256(m: &Manifest) -> String {
+    lil_schema::sha256_hex(m.to_text().as_bytes())
 }
 
 /// The first step of [`restore_staleness`]: which assets of `project` an input moved on for
@@ -233,7 +260,7 @@ pub async fn plan_staleness(
     ws.index.ready_result().await.map_err(|e| index_error(&e))?;
     let resolver = Resolver::load(&ws.index, &ws.store)
         .await
-        .map_err(|e| redirects_error(&e))?;
+        .map_err(|e| redirects_error(&e, "the staleness check"))?;
     let assets = ws
         .index
         .assets_of(project)
@@ -258,7 +285,13 @@ pub async fn plan_staleness(
         if let Some((input, version, input_ref)) =
             stale_input(&ws.store, &resolver, project, &view, &mut approved).await?
         {
-            marks.push((asset.asset_id.clone(), input, version, input_ref));
+            marks.push(Mark {
+                asset_id: asset.asset_id.clone(),
+                manifest_sha256: manifest_sha256(&manifest),
+                input,
+                version,
+                input_ref,
+            });
         }
     }
     Ok(StalenessPlan {
@@ -283,8 +316,9 @@ pub async fn restore_staleness(
 }
 
 /// The second step of [`restore_staleness`]: marks each planned asset stale. Each edit is the
-/// store's hash-checked manifest edit; the status is checked again on the manifest as it is
-/// written, so an asset that changed since the plan is left as it is.
+/// store's hash-checked manifest edit, and inside it the manifest must still hash as it did
+/// when the plan read it: an asset that changed since the plan (re-signed, re-pinned, edited)
+/// is left as it is, and the next check sees it as it is now.
 ///
 /// # Errors
 /// A store error of a manifest edit.
@@ -294,7 +328,14 @@ pub async fn apply_staleness(
 ) -> Result<Vec<String>, StoreError> {
     let project = plan.project.as_str();
     let mut stale = Vec::new();
-    for (asset_id, input, version, input_ref) in plan.marks {
+    for Mark {
+        asset_id,
+        manifest_sha256: planned,
+        input,
+        version,
+        input_ref,
+    } in plan.marks
+    {
         let Some(rel) = manifest_path(project, &asset_id) else {
             continue;
         };
@@ -311,6 +352,9 @@ pub async fn apply_staleness(
             .store
             .edit_manifest(&rel, &move |m: &mut Manifest| {
                 did.store(false, Ordering::SeqCst);
+                if manifest_sha256(m) != planned {
+                    return Ok(());
+                }
                 let ev = StatusEvent::MarkStale;
                 let by = StatusBy::Core;
                 if change_status(m, &ev, by, None, Some(reason.clone()), &utc).is_err() {

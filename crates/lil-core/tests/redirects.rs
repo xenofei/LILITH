@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lil_core::events::EventBus;
 use lil_core::interchange::{Interchange, register_interchange_tools, write_lilref};
-use lil_core::projects::{Redirect, Resolver, append_redirect, read_redirects};
+use lil_core::projects::{
+    Redirect, Resolver, append_redirect, apply_staleness, plan_staleness, read_redirects,
+};
 use lil_core::session::Session;
 use lil_core::state::StateRegistry;
 use lil_core::tools::{Dispatcher, PipelineHooks, Registry, TestGates, core_registry};
@@ -67,6 +69,12 @@ fn edit_manifest(ws: &Path, asset: &str, f: impl FnOnce(&mut Value)) {
 #[allow(clippy::disallowed_methods)]
 fn outside_rename(from: &Path, to: &Path) {
     std::fs::rename(from, to).unwrap_or_else(|e| panic!("cannot rename {}: {e}", from.display()));
+}
+
+/// Makes a folder (and those above it) as an outside program would.
+#[allow(clippy::disallowed_methods)]
+fn outside_mkdir(path: &Path) {
+    std::fs::create_dir_all(path).unwrap_or_else(|e| panic!("cannot make {}: {e}", path.display()));
 }
 
 /// Removes a file, or an empty folder or junction, as an outside program would.
@@ -811,7 +819,10 @@ async fn uses_carry_their_resolution() {
         "{}",
         uses[2]
     );
-    // A version not sealed yet is named, without a hash.
+    // A version not sealed yet is named, without a hash, and isn't a sealed version (as for
+    // `ref.resolve {path}`): the asset, not read-only.
+    assert_eq!(uses[3]["resolved"]["kind"], "asset", "{}", uses[3]);
+    assert_eq!(uses[3]["resolved"]["read_only"], false, "{}", uses[3]);
     assert_eq!(uses[3]["resolved"]["version"], "2.0.0", "{}", uses[3]);
     assert_eq!(
         uses[3]["resolved"]["ref"],
@@ -1493,5 +1504,396 @@ async fn cloud_reparse_folders_are_live() {
     assert_eq!(r.map(|r| r.asset_id), Ok(LAMP.to_string()));
     drop(resolver);
     drop(open);
+    fx.shutdown().await;
+}
+
+/// `setup` that makes the lamp approved (at 1.0.0) with these inputs and pins.
+fn approved_lamp_with(inputs: Value, pins: Value) -> impl FnOnce(&Path) {
+    move |ws: &Path| {
+        edit_manifest(ws, LAMP, |m| {
+            m["status"] = json!("approved");
+            m["approved_version"] = json!("1.0.0");
+            m["inputs"] = inputs;
+            m["pinned_inputs"] = pins;
+        });
+    }
+}
+
+/// `registry/redirects.yaml` seen as a OneDrive cloud-only placeholder ("Free up space"):
+/// the store never reads it.
+#[derive(Debug)]
+struct PlaceholderProbe;
+
+fn is_redirects_file(path: &Path) -> bool {
+    path.to_string_lossy()
+        .to_lowercase()
+        .ends_with(r"registry\redirects.yaml")
+}
+
+impl Probe for PlaceholderProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        let mut id = SystemProbe.identity(path)?;
+        if is_redirects_file(path) {
+            id.attributes |= 0x0040_0000; // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        }
+        Ok(id)
+    }
+    fn volume_info(&self, path: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+    fn reparse_tag(&self, path: &Path) -> std::io::Result<Option<u32>> {
+        SystemProbe.reparse_tag(path)
+    }
+}
+
+/// With a redirects file that can't be read, only what needs it fails: live assets resolve,
+/// `asset.get`, `asset.pin_input`, `project.set_status` and interchange's type lookup work, and
+/// a sign-off marks dependents by the asset's own name.
+async fn unreadable_file_blocks_only_what_needs_it(fx: Fx) {
+    let r = fx.resolve(&fx.sealed(LAMP, "1.0.0")).await;
+    assert_eq!(r["asset_id"], LAMP, "{r}");
+    let e = fx.resolve_err(&fx.sealed("chr_gone", "1.0.0")).await;
+    assert!(e.message.contains("registry/redirects.yaml"), "{e:?}");
+    let lamp = fx
+        .ok("asset.get", json!({"project": P, "asset_id": LAMP}))
+        .await;
+    assert_eq!(lamp["uses"][0]["resolved"]["asset_id"], CRANE, "{lamp}");
+    fx.ok(
+        "project.set_status",
+        json!({"project": P, "status": "archived"}),
+    )
+    .await;
+    let r = fx
+        .ok(
+            "project.set_status",
+            json!({"project": P, "status": "active"}),
+        )
+        .await;
+    assert_eq!(r["status"], "active", "{r}");
+    let needs_repair = fx.status_needs_repair().await;
+    assert!(
+        needs_repair.contains(&"registry/redirects.yaml".to_string()),
+        "{needs_repair:?}"
+    );
+    // A sign-off of the crane still marks the lamp, which names it, stale.
+    let src = fx.env.root().join("src").join("crane_d.png");
+    write_file(&src, b"crane four");
+    let imported = fx
+        .ok(
+            "asset.import",
+            json!({"project": P, "asset_id": CRANE, "type": "image",
+                   "files": [src.to_string_lossy()], "mode": "copy"}),
+        )
+        .await;
+    let signed = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": P, "asset_id": CRANE,
+                   "run_id": imported["run_id"], "files": ["crane_d.png"]}),
+        )
+        .await;
+    let made_stale = signed["handoff"]["made_stale"].as_array().unwrap();
+    assert!(
+        made_stale
+            .iter()
+            .any(|r| r.as_str().unwrap().starts_with(&fx.sealed(LAMP, "1.0.0"))),
+        "{signed}"
+    );
+    // A pin of the crane (after the sign-off, which a pin would hold back) by the name as
+    // written.
+    fx.ok(
+        "asset.pin_input",
+        json!({"project": P, "asset_id": LAMP, "ref": format!("{CRANE}@1.0.0"),
+               "reason": "kept"}),
+    )
+    .await;
+    // Interchange still finds a live ref's type.
+    let core_dir = fx.env.root().join("core");
+    write_file(
+        &core_dir.join("apps").join("test.toml"),
+        b"app = \"test\"\nexe = \"test.exe\"\n[[opens]]\ntypes = [\"image\"]\nintents = [\"open\"]\n",
+    );
+    let interchange = Interchange::new(core_dir, fx.env.env.clone());
+    let mut reg = Registry::new();
+    register_interchange_tools(&mut reg, &interchange);
+    let mut ctx = common::ctx(&fx.env, CallerKind::Cli, &fx.events);
+    ctx.workspace = Some(fx.open().await);
+    let handlers = common::call(
+        &reg,
+        &ctx,
+        "handlers.for",
+        json!({"target": fx.sealed(CRANE, "1.0.0")}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(handlers["handlers"][0]["app"], "test", "{handlers}");
+    drop((ctx, reg, interchange));
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-125
+async fn a_redirects_file_that_is_a_folder_blocks_only_what_needs_it() {
+    let fx = Fx::with(|ws| {
+        approved_lamp_with(
+            json!([{"ref": format!("{CRANE}@1.0.0"), "role": "reference"}]),
+            json!([]),
+        )(ws);
+        outside_mkdir(&file(ws, "registry/redirects.yaml"));
+    });
+    unreadable_file_blocks_only_what_needs_it(fx).await;
+}
+
+#[tokio::test] // spec: ARCH-125
+async fn a_cloud_only_redirects_file_blocks_only_what_needs_it() {
+    let fx = Fx::with_probe(Arc::new(PlaceholderProbe), |ws| {
+        approved_lamp_with(
+            json!([{"ref": format!("{CRANE}@1.0.0"), "role": "reference"}]),
+            json!([]),
+        )(ws);
+        write_redirects(ws, &[("chr_gone", "chr_nowhere", T1)]);
+    });
+    unreadable_file_blocks_only_what_needs_it(fx).await;
+}
+
+#[tokio::test] // spec: ARCH-125, CORE-048
+async fn a_restore_refusal_names_the_asset_and_the_input_that_needed_the_file() {
+    for (inputs, pins, named) in [
+        (
+            json!([{"ref": "chr_gone@1.0.0", "role": "reference"}]),
+            json!([]),
+            "chr_gone@1.0.0",
+        ),
+        (
+            json!([{"ref": format!("{CRANE}@1.0.0"), "role": "reference"}]),
+            json!([{"ref": "proj:harbor/old_wall@1.0.0", "reason": "kept"}]),
+            "proj:harbor/old_wall@1.0.0",
+        ),
+    ] {
+        let fx = Fx::with(approved_lamp_with(inputs, pins));
+        fx.ok(
+            "project.set_status",
+            json!({"project": P, "status": "archived"}),
+        )
+        .await;
+        broken_file(&fx.ws);
+        let e = fx
+            .err(
+                "project.set_status",
+                json!({"project": P, "status": "active"}),
+            )
+            .await;
+        assert!(
+            e.message.contains(LAMP) && e.message.contains(named),
+            "{named}: {}",
+            e.message
+        );
+        assert_eq!(
+            e.message.matches("registry/redirects.yaml").count(),
+            1,
+            "the path once: {}",
+            e.message
+        );
+        fx.shutdown().await;
+    }
+    // An unreadable file: the path once too.
+    let fx = Fx::with(approved_lamp_with(
+        json!([{"ref": "chr_gone@1.0.0", "role": "reference"}]),
+        json!([]),
+    ));
+    fx.ok(
+        "project.set_status",
+        json!({"project": P, "status": "archived"}),
+    )
+    .await;
+    outside_mkdir(&file(&fx.ws, "registry/redirects.yaml"));
+    let e = fx
+        .err(
+            "project.set_status",
+            json!({"project": P, "status": "active"}),
+        )
+        .await;
+    assert_eq!(e.code, "store.io", "{e:?}");
+    assert_eq!(
+        e.message.matches("registry/redirects.yaml").count(),
+        1,
+        "the path once: {}",
+        e.message
+    );
+    assert!(e.message.contains("chr_gone@1.0.0"), "{}", e.message);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-125, ARCH-076
+async fn append_redirect_writes_only_what_reads_back() {
+    let fx = Fx::with(crane_moved);
+    let open = fx.open().await;
+    let path = file(&fx.ws, "registry/redirects.yaml");
+    let before = std::fs::read(&path).unwrap();
+    let redirect = |from: &str, by: &str| Redirect {
+        from: (P.to_string(), from.to_string()),
+        to: (P.to_string(), ORIGAMI.to_string()),
+        moved_utc: "2026-11-05T09:30:00Z".to_string(),
+        by: by.to_string(),
+        actor: None,
+    };
+    for (bad, field) in [
+        (redirect("Prop Lamp", "cli"), "from"),
+        (redirect("prop_lamp", ""), "by"),
+    ] {
+        let e = append_redirect(&open.store, &bad).await.unwrap_err();
+        let body = e.to_error("");
+        assert_eq!(body.code, "params.invalid", "{e}");
+        assert!(body.message.contains(field), "{}", body.message);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    }
+    // The redirects still read.
+    assert_eq!(read_redirects(&open.store).await.unwrap().len(), 1);
+    append_redirect(&open.store, &redirect("prop_lamp", "cli"))
+        .await
+        .unwrap();
+    assert_eq!(read_redirects(&open.store).await.unwrap().len(), 2);
+    drop(open);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-048, ARCH-125
+async fn apply_staleness_leaves_an_asset_changed_since_the_plan() {
+    let fx = Fx::with(|ws| {
+        approved_lamp_with(
+            json!([{"ref": format!("{CRANE}@1.0.0"), "role": "reference"}]),
+            json!([]),
+        )(ws);
+        edit_manifest(ws, CRANE, |m| m["approved_version"] = json!("1.1.0"));
+    });
+    let open = fx.open().await;
+    let plan = plan_staleness(&open, P).await.unwrap();
+    // Re-signed against the new version before the plan is applied.
+    edit_manifest(&fx.ws, LAMP, |m| {
+        m["inputs"] = json!([{"ref": format!("{CRANE}@1.1.0"), "role": "reference"}]);
+    });
+    let stale = apply_staleness(&open, plan).await.unwrap();
+    assert_eq!(stale, Vec::<String>::new());
+    assert_eq!(
+        read_json(&manifest_file(&fx.ws, LAMP))["status"],
+        "approved"
+    );
+    // Unchanged, the same plan marks it.
+    let plan = plan_staleness(&open, P).await.unwrap();
+    edit_manifest(&fx.ws, LAMP, |m| {
+        m["inputs"] = json!([{"ref": format!("{CRANE}@1.0.0"), "role": "reference"}]);
+    });
+    let replanned = plan_staleness(&open, P).await.unwrap();
+    assert_eq!(apply_staleness(&open, replanned).await.unwrap().len(), 1);
+    drop(plan);
+    drop(open);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-125, CORE-020
+async fn a_signoff_with_a_broken_redirects_file_marks_by_own_name_and_warns() {
+    let fx = Fx::with(approved_lamp_with(
+        json!([{"ref": format!("{CRANE}@1.0.0"), "role": "reference"}]),
+        json!([]),
+    ));
+    broken_file(&fx.ws);
+    let src = fx.env.root().join("src").join("crane_d.png");
+    write_file(&src, b"crane four");
+    let imported = fx
+        .ok(
+            "asset.import",
+            json!({"project": P, "asset_id": CRANE, "type": "image",
+                   "files": [src.to_string_lossy()], "mode": "copy"}),
+        )
+        .await;
+    let signed = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": P, "asset_id": CRANE,
+                   "run_id": imported["run_id"], "files": ["crane_d.png"]}),
+        )
+        .await;
+    let stale = signed["handoff"]["made_stale"].as_array().unwrap();
+    assert!(
+        stale.iter().any(|r| r.as_str().unwrap().contains(LAMP)),
+        "{signed}"
+    );
+    let warnings = signed["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| {
+            let w = w.as_str().unwrap();
+            w.contains("old places weren't checked") && w.contains("registry/redirects.yaml")
+        }),
+        "{signed}"
+    );
+    fx.shutdown().await;
+}
+
+/// Cloud reparse folders everywhere, and real junctions: the probe gives a real reparse tag
+/// first, so a junction stays a link.
+#[derive(Debug)]
+struct MixedProbe;
+
+impl Probe for MixedProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<lil_platform::fs::FileIdentity> {
+        CloudProbe.identity(path)
+    }
+    fn volume_info(&self, path: &Path) -> std::io::Result<lil_platform::fs::VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+    fn reparse_tag(&self, path: &Path) -> std::io::Result<Option<u32>> {
+        if let Some(tag) = SystemProbe.reparse_tag(path).ok().flatten() {
+            return Ok(Some(tag));
+        }
+        CloudProbe.reparse_tag(path)
+    }
+}
+
+#[tokio::test] // spec: ARCH-125
+async fn a_junction_is_never_live_beside_cloud_reparse_folders() {
+    let fx = Fx::with_probe(Arc::new(MixedProbe), |ws| {
+        write_redirects(
+            ws,
+            &[("chr_old", "chr_linked", T1), ("chr_old2", "chr_alias", T1)],
+        );
+    });
+    let elsewhere = fx.env.root().join("elsewhere");
+    write_file(
+        &elsewhere.join("chr_linked.manifest.json"),
+        br#"{"asset_id":"chr_linked","project":"sketchbook"}"#,
+    );
+    junction(&asset_dir(&fx.ws, "chr_linked"), &elsewhere);
+    junction(&asset_dir(&fx.ws, "chr_alias"), &asset_dir(&fx.ws, CRANE));
+    let open = fx.open().await;
+    let resolver = Resolver::load(&open.index, &open.store).await.unwrap();
+    for live in [LAMP, CRANE] {
+        let r = resolver.resolve_name(P, live).await;
+        assert_eq!(r.map(|r| r.asset_id), Ok(live.to_string()));
+    }
+    for (name, code) in [
+        ("chr_old", "ref.redirect_broken"),
+        ("chr_old2", "ref.redirect_broken"),
+        ("chr_linked", "asset.unknown"),
+        ("chr_alias", "asset.unknown"),
+    ] {
+        let e = resolver.resolve_name(P, name).await.unwrap_err();
+        assert_eq!(e.code, code, "{name}: {e:?}");
+    }
+    drop(resolver);
+    drop(open);
+    let r = fx
+        .ok(
+            "ref.resolve",
+            json!({"path": format!("projects/{P}/assets/{CRANE}/v1.0.0/crane_b.png")}),
+        )
+        .await;
+    assert_eq!(r["kind"], "sealed", "{r}");
+    outside_remove(&asset_dir(&fx.ws, "chr_linked"));
+    outside_remove(&asset_dir(&fx.ws, "chr_alias"));
     fx.shutdown().await;
 }

@@ -25,7 +25,9 @@
 //!   an asset's version names where the asset is now, with the version's content hash when it
 //!   is sealed; `null` for a library or style input, and `null` with `error: {code, message,
 //!   data?}` when it doesn't resolve (a loop, a dead end, the trash). A redirects file that
-//!   can't be read fails the call with its error (`manifest.needs_repair`).
+//!   can't be read or parsed fails no call: the entries that would need it carry its error
+//!   (`manifest.needs_repair` for one that doesn't parse, the store's read error otherwise),
+//!   live inputs still resolve, and `used_by` is by the asset's own name.
 //!
 //! An asset whose manifest is `missing` fails with `manifest.needs_repair`, `data.missing`
 //! naming the manifest; one whose manifest doesn't parse is answered with `needs_repair: true`

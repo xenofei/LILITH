@@ -153,15 +153,18 @@ pub(crate) fn unreadable(why: String) -> StoreError {
 }
 
 /// Appends `r` to `registry/redirects.yaml` with the targeted YAML edit (module docs), creating
-/// the file when there is none. Nothing is checked against the other entries: a redirect never
-/// blocks anything (ARCH-125).
+/// the file when there is none. Inside the store's hash-checked edit, the file as it is must
+/// read as redirects, and the edited text must read back with the reader's own rules
+/// ([`parse_redirects`]), so the call never writes an entry that would make every redirect
+/// unreadable. Nothing is checked against the other entries: a redirect never blocks anything
+/// (ARCH-125).
 ///
 /// # Errors
-/// `yaml.unsupported_edit` when the file doesn't parse as redirects or the edit can't be made
-/// safely; the store's write errors.
+/// `params.invalid` naming the entry and field when `r` wouldn't read back (a name that isn't
+/// `<project>/<asset_id>`, an empty `by`, …), with nothing written; `yaml.unsupported_edit`
+/// when the file doesn't parse as redirects or the edit can't be made safely; the store's
+/// write errors.
 pub async fn append_redirect(store: &Store, r: &Redirect) -> Result<Written, StoreError> {
-    // A file that doesn't parse is never edited (the edit would keep what's wrong in it).
-    read_redirects(store).await?;
     let mut entries = vec![
         ("from".to_string(), YamlValue::Str(name_of(&r.from))),
         ("to".to_string(), YamlValue::Str(name_of(&r.to))),
@@ -184,14 +187,26 @@ pub async fn append_redirect(store: &Store, r: &Redirect) -> Result<Written, Sto
         }
         entries.push(("actor".to_string(), YamlValue::Map(fields)));
     }
+    let edits = [YamlEdit::AppendMappingToList {
+        path: vec!["redirects".to_string()],
+        entries,
+    }];
     store
-        .edit_yaml(
-            &redirects_path(),
-            &[YamlEdit::AppendMappingToList {
-                path: vec!["redirects".to_string()],
-                entries,
-            }],
-        )
+        .edit_text(&redirects_path(), &|text: &str| {
+            // A file that doesn't parse is never edited (the edit would keep what's wrong).
+            let before = parse_redirects(text).map_err(unreadable)?.len();
+            let after = lil_schema::yaml_edit::apply(text, &edits)
+                .map_err(|e| StoreError::YamlUnsupported(e.to_string()))?;
+            match parse_redirects(&after) {
+                Ok(read) if read.len() == before + 1 => Ok(after),
+                Ok(_) => Err(StoreError::YamlUnsupported(format!(
+                    "{REDIRECTS_YAML}: the appended entry doesn't read back as one redirect"
+                ))),
+                Err(why) => Err(StoreError::Invalid(format!(
+                    "This redirect can't be written: {REDIRECTS_YAML} would no longer read                      ({why})."
+                ))),
+            }
+        })
         .await
 }
 

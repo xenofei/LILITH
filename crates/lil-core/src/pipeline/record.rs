@@ -18,9 +18,8 @@
 //!    sealed version go into `unlocks`. Inputs and pins are resolved through
 //!    `projects::Resolver` (ARCH-125): a dependent that names the asset's old place is one of
 //!    its dependents, and a pin of either name pins it. A dependent that can't be read or
-//!    edited, or a redirects file that can't be read, is logged and skipped: the commit has
-//!    happened. A redirects file that doesn't parse leaves the asset's own name only, with a
-//!    warning.
+//!    edited is logged and skipped: the commit has happened. A redirects file that can't be
+//!    read or parsed leaves the asset's own name only, with a warning.
 //! 3. Events: `asset:<ref>` `{kind: "candidate_run", run_id}` or
 //!    `{kind: "version_sealed", version}`, `project:<slug>` `{kind: "progress"}`, and
 //!    `{kind: "status", status: "stale"}` on the topic of each asset marked stale.
@@ -323,7 +322,7 @@ async fn hand_off_dependents(
     };
     if let Some(e) = resolver.file_error() {
         // Only the asset's own name is checked: refs to its old places can't be followed.
-        tracing::warn!(project = sealed.0, asset = sealed.1, error = %e.message, "the redirects file doesn't parse; dependents by old names weren't checked");
+        tracing::warn!(project = sealed.0, asset = sealed.1, error = %e.message, "the redirects file can't be read or parsed; dependents by old names weren't checked");
         warnings.push(format!(
             "dependents that name this asset's old places weren't checked: {}",
             e.message
@@ -567,6 +566,27 @@ mod tests {
             unreachable!()
         };
         map
+    }
+
+    #[test] // spec: CORE-020
+    fn merge_warnings_keeps_the_tool_s_own_first() {
+        let mut with = json!({"warnings": ["own"], "ref": "r"});
+        let Value::Object(map) = &mut with else {
+            unreachable!()
+        };
+        merge_warnings(map, vec!["recorded".to_string()]);
+        assert_eq!(with, json!({"warnings": ["own", "recorded"], "ref": "r"}));
+        let mut without = json!({"ref": "r"});
+        let Value::Object(map) = &mut without else {
+            unreachable!()
+        };
+        merge_warnings(map, vec!["recorded".to_string()]);
+        assert_eq!(without, json!({"ref": "r", "warnings": ["recorded"]}));
+        let Value::Object(map) = &mut without else {
+            unreachable!()
+        };
+        merge_warnings(map, Vec::new());
+        assert_eq!(without["warnings"], json!(["recorded"]));
     }
 
     #[test] // spec: CORE-023, CORE-027
