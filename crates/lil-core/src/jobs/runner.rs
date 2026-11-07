@@ -954,7 +954,7 @@ impl Shared {
     /// The restart hold of one row ([`Shared::recover_rows`]): `true` when the job is queued
     /// again, held, and shown `queue_paused`.
     async fn hold(self: &Arc<Self>, row: &JobRow, scope: &Scope) -> Result<bool, StateError> {
-        if !holdable(row) || self.draining() {
+        if !self.restart_holds(row, scope).await || self.draining() {
             return Ok(false);
         }
         let Some(kind) = self.static_kind(&row.kind) else {
@@ -2821,6 +2821,23 @@ impl Shared {
         outcome
     }
 
+    /// Whether a restart holds `row` ([`holdable`]); for a retry still waiting for the prompt
+    /// of the job it re-runs, only when that job has no external side effects either
+    /// (controller ruling, audit fix round 1: such work stays your decision after a restart).
+    /// A row of that job that can't be read counts as having them.
+    async fn restart_holds(&self, row: &JobRow, scope: &Scope) -> bool {
+        if !holdable(row) {
+            return false;
+        }
+        match (&row.retry_of, row.waits_for_earlier_prompt()) {
+            (Some(of), true) => matches!(
+                record::get(scope.db(), of).await,
+                Ok(Some(original)) if !original.external_side_effects
+            ),
+            _ => true,
+        }
+    }
+
     /// Marks a job of this core that a shutdown leaves behind, as a recovery would; the
     /// completions of one that never started run (module docs, "Reservations").
     async fn persist_one(self: &Arc<Self>, info: &Info, started: bool) {
@@ -2835,7 +2852,9 @@ impl Shared {
         // The restart hold (P4a-R41): a job that never reached an engine stays queued, so the
         // next start holds it rather than failing it. A retry still waiting for the prompt of
         // the job it re-runs is one, though its attempt runs (audit L2).
-        if (!started || row.waits_for_earlier_prompt()) && holdable(&row) {
+        if (!started || row.waits_for_earlier_prompt())
+            && self.restart_holds(&row, &info.scope).await
+        {
             tracing::info!(job_id = %info.id, "a queued job is left queued at shutdown; the next start holds it");
             return;
         }
@@ -2935,10 +2954,13 @@ const DIRECTOR_TASK_KIND: &str = "assistant_task";
 /// still waiting for the prompt of the job it re-runs (`submitting` with `retry_of` and
 /// `withdrawn_id`, [`JobRow::waits_for_earlier_prompt`]) and no engine id of its own is one
 /// too (audit L2): its prompt id is persisted before it is posted (CORE-120), so it posted
-/// nothing, and its next attempt asks about `withdrawn_id` before it posts.
+/// nothing, and its next attempt asks about `withdrawn_id` before it posts. Such a retry with
+/// external side effects is not (controller ruling: [`Shared::restart_holds`] also checks the
+/// job it re-runs).
 fn holdable(row: &JobRow) -> bool {
     row.status == JobStatus::Queued
-        && (never_ran(row.substatus) || row.waits_for_earlier_prompt())
+        && (never_ran(row.substatus)
+            || (row.waits_for_earlier_prompt() && !row.external_side_effects))
         && row.external_id.is_none()
         && row.kind != DIRECTOR_TASK_KIND
         && !cores_own(row)
@@ -4251,8 +4273,9 @@ mod tests {
     use lil_testkit::{FakeClock, SeqIds, TestEnv};
 
     /// Audit L2 (P4a-R41, CORE-120): the restart hold takes a retry still waiting for the
-    /// prompt of the job it re-runs (it posted nothing of its own), external side effects or
-    /// not, and no other shape it didn't take before: never a job with an engine id of its
+    /// prompt of the job it re-runs (it posted nothing of its own), only without external side
+    /// effects (controller ruling: such work stays your decision), and no other shape it
+    /// didn't take before: never a job with an engine id of its
     /// own, a `submitting` job without both `retry_of` and `withdrawn_id`, a job in its engine
     /// or ending, a director task, or a job the core submitted itself.
     #[test] // spec: ARCH-022, CORE-160, CORE-120, CORE-128
@@ -4268,8 +4291,8 @@ mod tests {
         };
         assert!(waiting(&|_| {}));
         assert!(
-            waiting(&|r| r.external_side_effects = true),
-            "nothing of its own was sent"
+            !waiting(&|r| r.external_side_effects = true),
+            "external work stays your decision after a restart"
         );
         assert!(!waiting(&|r| r.external_id = Some("p_new".into())));
         assert!(!waiting(&|r| {

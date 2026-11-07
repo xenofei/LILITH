@@ -475,6 +475,14 @@ async fn prompt_ids_are_minted_persisted_then_posted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-120
 async fn post_failure_checks_status_before_resubmitting() {
+    // The asset catalogue's `/api/features` probe runs on its own and may land anywhere: the
+    // request-order checks below skip it too.
+    let job_requests = |fake: &FakeComfy| -> Vec<FakeRequest> {
+        job_requests(fake)
+            .into_iter()
+            .filter(|r| !(r.method == "GET" && r.path == "/api/features"))
+            .collect()
+    };
     // Accepted, then the connection dropped before the answer: the job's prompt is found and
     // never posted again.
     let env = TestEnv::new();
@@ -3807,4 +3815,64 @@ async fn a_crash_while_waiting_out_during_an_outage_holds_the_retry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-160, CORE-120, ARCH-021
 async fn a_drain_while_waiting_out_during_an_outage_holds_the_retry() {
     waiting_out_then_restarted(9, true).await;
+}
+
+/// Audit fix round 1, controller ruling: a crash while a retry waits out the old prompt (no
+/// pause; ComfyUI up, the old prompt pending) leaves the retry `submitting`. The next start
+/// holds it only when neither it nor the job it re-runs has external side effects; else it
+/// keeps the old behaviour (interrupted: `interrupted_unknown` for an external retry), and
+/// you decide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-022, CORE-128, CORE-160
+async fn a_restart_holds_a_waiting_retry_only_without_external_side_effects() {
+    for (n, (original, retry_external)) in
+        [(1, (false, false)), (2, (true, false)), (3, (true, true))]
+    {
+        let env = TestEnv::new();
+        let fake = FakeComfy::start();
+        attach(&env, &fake);
+        let outside = fake.add_outside_prompt(true, None);
+        let ids = Arc::new(SeqIds::new());
+        let rig = Rig::with_ids(&env, ids.clone());
+        let (retry, _old) = a_retry_waiting_out(&rig, &fake, n, (original, retry_external)).await;
+        let row = rig.row(&retry).await;
+        assert_eq!(
+            (row.status, row.substatus),
+            (JobStatus::Queued, Some(Substatus::Submitting))
+        );
+        // The crash: no drain step runs.
+        rig.close().await;
+
+        let rig = Rig::with_ids(&env, ids);
+        let marked = rig.jobs.recover_suite().await.unwrap();
+        let after = rig.summary(&retry).await;
+        let case = format!("original external {original}, retry external {retry_external}");
+        match (original, retry_external) {
+            (false, false) => {
+                assert!(marked.is_empty(), "{case}: {marked:?}");
+                assert_eq!(after.pause_reasons, ["restart"], "{case}: {after:?}");
+            }
+            (true, false) => {
+                assert_eq!(marked, [JobId(retry.clone())], "{case}");
+                assert_eq!(
+                    (after.status, after.substatus.as_deref()),
+                    (JobStatus::Failed, Some("interrupted")),
+                    "{case}"
+                );
+            }
+            _ => {
+                assert_eq!(marked, [JobId(retry.clone())], "{case}");
+                assert_eq!(
+                    after.substatus.as_deref(),
+                    Some("interrupted_unknown"),
+                    "{case}"
+                );
+            }
+        }
+        assert_eq!(
+            posted(&fake).len(),
+            1,
+            "{case}: nothing of the retry's was posted"
+        );
+        fake.release(&outside);
+    }
 }
