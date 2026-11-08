@@ -53,12 +53,20 @@
 //!
 //! **Who made a change** (CORE-034; P4b-R16). Only a report names one: [`Watcher::notify`]
 //! takes the reporter's actor (`watch.notify` computes it; the watcher never maps a caller).
-//! The human edits its own reconcile records get that `actor`; then, for each file given whose
-//! latest `human_edits` entry has the file's current hash and no `actor` (the watcher's own
-//! batch saw the change first), the actor is filled in. An entry that has an actor keeps it:
-//! an agent edit is never later made a human one. What the watcher sees by itself, the
-//! verification and the post-git rescan record no actor; a path a report gives that waits for
-//! git or for a version lock is decided later without one.
+//! - The human edits recorded by the decisions of the paths given (a folder: its subtree) get
+//!   that `actor`. That holds for a decision made later too: the actor goes with a path
+//!   deferred to the post-git rescan, with a path waiting for a held version lock, and with a
+//!   read the index parked (unstable or locked) until its path is next decided. A later
+//!   deferral of the same path without an actor (the watcher's own batch) never replaces it.
+//! - A **claim** (fix round 1, I2): the watcher's own batch usually records an agent's write
+//!   before the agent's report comes, with no actor. The report's actor is filled into that
+//!   entry only when all of these hold: the actor is an agent's (`claude_code`, `tether`,
+//!   `director`); the entry has no actor; its hash is the file's current one; and the watcher
+//!   recorded it at most [`CLAIM_WINDOW`] before the report (the core's clock, kept in
+//!   memory). Otherwise it stays a human edit, which only your relabel changes (OD-10). The
+//!   first claim wins.
+//! - An entry that has an actor keeps it: an agent edit is never later made a human one. What
+//!   the watcher sees by itself and the verification record no actor.
 
 pub mod git;
 pub mod reconcile;
@@ -72,7 +80,7 @@ use std::time::Duration;
 
 use lil_platform::names::WORKSPACE_DIR;
 use lil_platform::watcher::{DirChange, DirWatcher};
-use lil_schema::{Actor, Manifest, SCHEME, bare_sha256};
+use lil_schema::{Actor, ActorKind, Manifest, SCHEME, bare_sha256};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc::UnboundedReceiver, watch};
 use tokio::time::Instant;
@@ -85,7 +93,7 @@ use crate::store::{Store, StoreError, WsPath, path_key};
 
 pub use reconcile::{Action, Observed, Recorded, decide, map_notify_path};
 
-use git::{Class, GitState, classify};
+use git::{Class, GitState, Reported, classify};
 
 /// The watcher's knobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +114,37 @@ impl Default for WatchConfig {
             batch: Duration::from_millis(200),
             git_quiet: Duration::from_secs(2),
         }
+    }
+}
+
+/// How long after the watcher recorded a human edit without an actor an agent's report may
+/// still claim it (module docs, "Who made a change"): well above the batch window and a
+/// hook's start, short enough that a report never takes over an older edit of yours.
+pub const CLAIM_WINDOW: Duration = Duration::from_secs(10);
+
+/// Whether `actor` is an agent's: an edit with this actor is an agent edit (CORE-034).
+fn is_agent(actor: &Actor) -> bool {
+    matches!(
+        actor.kind,
+        ActorKind::ClaudeCode | ActorKind::Tether | ActorKind::Director
+    )
+}
+
+/// The reporter of `path` among `reported` (paths deferred with their reporters): the path
+/// itself, or a folder above it.
+fn reporter_of(path: &WsPath, reported: &[Reported]) -> Option<Actor> {
+    let key = path_key(path.as_str());
+    reported.iter().find_map(|(p, actor)| {
+        let folder = path_key(p.as_str());
+        let under = key == folder || key.starts_with(&format!("{folder}/"));
+        if under { actor.clone() } else { None }
+    })
+}
+
+/// Gives each of `decided` without an actor its reporter among `reported`.
+fn stamp(decided: &mut [Decided], reported: &[Reported]) {
+    for d in decided.iter_mut().filter(|d| d.actor.is_none()) {
+        d.actor = reporter_of(d.obs.path(), reported);
     }
 }
 
@@ -178,8 +217,15 @@ struct Shared {
     apply: tokio::sync::Mutex<()>,
     git: Mutex<GitState>,
     fences: watch::Sender<FenceState>,
-    /// Assets whose version lock a task waits for, with the paths it decides after it.
-    deferring: Mutex<HashMap<String, Vec<WsPath>>>,
+    /// Assets whose version lock a task waits for, with the paths it decides after it, each
+    /// with the actor of the report that gave it, if any.
+    deferring: Mutex<HashMap<String, Vec<Reported>>>,
+    /// The reporters of the reads a report's reconcile parked, by path key: the path's next
+    /// decision, whatever it is, takes the actor (module docs, "Who made a change").
+    parked_actors: Mutex<HashMap<String, Actor>>,
+    /// The human edits recorded with no actor, by workspace path key: their hash and when (the
+    /// core's monotonic clock), for a claim within [`CLAIM_WINDOW`].
+    unclaimed: Mutex<HashMap<String, (String, Duration)>>,
     /// `watcher_unavailable` was published.
     unavailable: AtomicBool,
     /// Wakes the loop when git starts outside a batch (`lil notify`, the verification).
@@ -363,6 +409,8 @@ impl Watcher {
                 ..FenceState::default()
             }),
             deferring: Mutex::new(HashMap::new()),
+            parked_actors: Mutex::new(HashMap::new()),
+            unclaimed: Mutex::new(HashMap::new()),
             unavailable: AtomicBool::new(false),
             wake: Notify::new(),
         });
@@ -417,7 +465,7 @@ impl Watcher {
         if s.git_busy_now() {
             let mut git = lock(&s.git);
             for path in keep {
-                git.defer(path);
+                git.defer(path, actor.clone());
             }
             return report;
         }
@@ -729,7 +777,7 @@ impl Shared {
         if busy {
             let mut git = lock(&self.git);
             for path in paths {
-                git.defer(path);
+                git.defer(path, None);
             }
             git.overflowed |= overflow;
         } else if overflow {
@@ -784,8 +832,9 @@ impl Shared {
     /// Reconciles `paths`, re-checks the parked paths, and decides and applies what changed.
     /// A path in (or of) an asset folder whose version lock is held waits for the lock: the
     /// sign-off moves files there, and a reconcile meanwhile would take its moves for removals.
-    /// With a reporter's `actor`, the human edits the reconcile of `paths` records get it, and
-    /// each file of `paths` whose latest human edit has none gets it then ([`Shared::claim`]).
+    /// With a reporter's `actor`, the human edits the reconcile of `paths` records get it (also
+    /// later, for a path deferred to a version lock or a read parked), and an agent's actor may
+    /// claim the entry of each file given ([`Shared::claim`]).
     async fn reconcile_paths(self: &Arc<Self>, all: Vec<WsPath>, actor: Option<&Actor>) {
         let mut paths = Vec::with_capacity(all.len());
         let mut seen = HashSet::new();
@@ -795,7 +844,7 @@ impl Shared {
             }
             match asset_folder_of(&path) {
                 Some((project, asset)) if self.version_lock_held(project, asset) => {
-                    self.defer_asset(project, asset, path.clone());
+                    self.defer_asset(project, asset, path.clone(), actor.cloned());
                 }
                 _ => paths.push(path),
             }
@@ -803,6 +852,12 @@ impl Shared {
         if !paths.is_empty() {
             match self.index.reconcile(Scope::Paths(paths.clone())).await {
                 Ok(report) => {
+                    if let Some(actor) = actor {
+                        let mut parked = lock(&self.parked_actors);
+                        for path in &report.parked {
+                            parked.insert(path_key(path.as_str()), actor.clone());
+                        }
+                    }
                     let mut decided = self.decide_report(&report, &[]).await;
                     for d in &mut decided {
                         d.actor = actor.cloned();
@@ -818,6 +873,11 @@ impl Shared {
             Ok(report) => {
                 let decided = self.decide_report(&report, &[]).await;
                 self.apply_all(decided).await;
+                // A read no longer parked was decided (and took its reporter) or dropped by the
+                // index: its reporter goes, so it never labels a later edit.
+                let still: HashSet<String> =
+                    report.parked.iter().map(|p| path_key(p.as_str())).collect();
+                lock(&self.parked_actors).retain(|key, _| still.contains(key));
             }
             Err(e) => tracing::warn!(error = %e, "parked paths couldn't be re-checked"),
         }
@@ -828,11 +888,24 @@ impl Shared {
         }
     }
 
-    /// Fills `actor` into the latest `human_edits` entry of the file `path` when that entry has
-    /// the file's current hash and no actor (module docs, "Who made a change"). Anything else
-    /// (another kind of file, no human edit now, an entry with an actor) is left as it is.
+    /// Whether the watcher recorded a human edit of `path` (a workspace path) with `sha256` and
+    /// no actor at most [`CLAIM_WINDOW`] ago. Older records are dropped.
+    fn claimable(&self, path: &WsPath, sha256: &str) -> bool {
+        let now = self.store.clock().monotonic();
+        let mut unclaimed = lock(&self.unclaimed);
+        unclaimed.retain(|_, (_, at)| now.saturating_sub(*at) <= CLAIM_WINDOW);
+        unclaimed
+            .get(&path_key(path.as_str()))
+            .is_some_and(|(recorded, _)| recorded == sha256)
+    }
+
+    /// Fills the agent's `actor` into the latest `human_edits` entry of the file `path` when
+    /// the claim's conditions hold (module docs, "Who made a change"): an agent's actor, an
+    /// entry with the file's current hash and no actor, recorded by the watcher within
+    /// [`CLAIM_WINDOW`]. Anything else is left as it is. A claim that wrote publishes
+    /// `{kind: "manifest"}` on the asset's topic.
     async fn claim(&self, path: &WsPath, actor: &Actor) {
-        if !matches!(kind_of(path), FileKind::Candidate | FileKind::Sealed) {
+        if !is_agent(actor) || !matches!(kind_of(path), FileKind::Candidate | FileKind::Sealed) {
             return;
         }
         let row = match self.index.files_of_path(path).await {
@@ -842,6 +915,9 @@ impl Shared {
         let (Some(sha256), Some(manifest)) = (row.sha256, self.manifest_path(path).await) else {
             return;
         };
+        if !self.claimable(path, &sha256) {
+            return;
+        }
         let key = path_key(&Self::in_asset(path));
         let unclaimed = |m: &Manifest| {
             latest_edit(m, &key).is_some_and(|e| {
@@ -861,16 +937,22 @@ impl Shared {
         if !current.is_some_and(|(m, _)| unclaimed(&m)) {
             return;
         }
+        let claimed = AtomicBool::new(false);
         let edit = |m: &mut Manifest| -> Result<(), StoreError> {
-            if unclaimed(m) {
+            let fill = unclaimed(m);
+            if fill {
                 set_latest_actor(m, &key, actor);
             }
+            claimed.store(fill, Ordering::SeqCst);
             Ok(())
         };
         match self.store.edit_manifest(&manifest, &edit).await {
-            Ok(_) => {
-                tracing::info!(path = %path, kind = actor.kind.as_str(), "a recorded human edit was reported by its actor");
+            Ok(_) if claimed.load(Ordering::SeqCst) => {
+                lock(&self.unclaimed).remove(&path_key(path.as_str()));
+                tracing::info!(path = %path, kind = actor.kind.as_str(), "a recorded human edit was claimed by the agent that reported it");
+                self.publish_asset(path, json!({"kind": "manifest"}));
             }
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(path = %path, error = %e, "the actor of a recorded human edit couldn't be written");
             }
@@ -1093,8 +1175,13 @@ impl Shared {
         }
     }
 
-    /// Carries out one decision (module docs).
-    async fn apply(self: &Arc<Self>, d: Decided) {
+    /// Carries out one decision (module docs). A decision of a path whose read a report parked
+    /// takes that reporter's actor.
+    async fn apply(self: &Arc<Self>, mut d: Decided) {
+        let parked = lock(&self.parked_actors).remove(&path_key(d.obs.path().as_str()));
+        if d.actor.is_none() {
+            d.actor = parked;
+        }
         match d.action {
             Action::Reindex(path) => {
                 // A reconcile has indexed it already; a verification's row still trusts the
@@ -1147,7 +1234,7 @@ impl Shared {
                     && self.version_lock_held(project, asset)
                 {
                     // The suite's own move (a sign-off in progress): decided after it.
-                    self.defer_asset(project, asset, path.clone());
+                    self.defer_asset(project, asset, path.clone(), d.actor.clone());
                     return;
                 }
                 if let Err(e) = self.index.set_state(&path, FileState::Missing).await {
@@ -1161,7 +1248,7 @@ impl Shared {
             }
             Action::DeferUntilGitDone(path) => {
                 let mut git = lock(&self.git);
-                git.defer(path);
+                git.defer(path, d.actor.clone());
                 if d.verify {
                     git.observed.push(d.obs);
                 }
@@ -1176,9 +1263,10 @@ impl Shared {
     }
 
     /// Pushes `{path, sha256, previous_sha256, date, actor?}` to the manifest's `human_edits`,
-    /// unless its latest entry for the path already has this hash (then only an `actor` it
-    /// lacks is filled in); the file itself is never touched (CORE-034). Then `asset:`
-    /// `{kind:"human_edit"}`.
+    /// unless its latest entry for the path already has this hash (then an agent's `actor` is
+    /// filled in only as a claim allows: [`Shared::claim`]); the file itself is never touched
+    /// (CORE-034). Then `asset:` `{kind:"human_edit"}` (or `{kind:"manifest"}` for a claim).
+    /// An entry pushed with no actor is remembered for a claim within [`CLAIM_WINDOW`].
     ///
     /// It runs under the decision lock, and the manifest edit waits at the store's git gate
     /// (write step 2). Should git take `index.lock` again between the decision and the write,
@@ -1217,7 +1305,11 @@ impl Shared {
             entry["actor"] = actor.to_value();
         }
         let key = path_key(&inside);
+        let may_claim = actor.is_some_and(is_agent) && self.claimable(path, sha256);
+        let (pushed, claimed) = (AtomicBool::new(false), AtomicBool::new(false));
         let edit = |m: &mut Manifest| -> Result<(), StoreError> {
+            pushed.store(false, Ordering::SeqCst);
+            claimed.store(false, Ordering::SeqCst);
             let recorded = m
                 .view()
                 .human_edits
@@ -1227,18 +1319,32 @@ impl Shared {
                 .is_some_and(|e| e.sha256 == sha256);
             if recorded {
                 if let Some(actor) = actor
+                    && may_claim
                     && latest_edit(m, &key)
                         .is_some_and(|e| e.get("actor").is_none_or(Value::is_null))
                 {
                     set_latest_actor(m, &key, actor);
+                    claimed.store(true, Ordering::SeqCst);
                 }
                 return Ok(());
             }
+            pushed.store(true, Ordering::SeqCst);
             m.push("human_edits", entry.clone())
                 .map_err(|e| StoreError::manifest_edit(manifest, &e))
         };
         match self.store.edit_manifest(manifest, &edit).await {
+            Ok(_) if claimed.load(Ordering::SeqCst) => {
+                lock(&self.unclaimed).remove(&path_key(path.as_str()));
+                self.accept(path, sha256, FileState::HumanEdit).await;
+                tracing::info!(path = %path, "a recorded human edit was claimed by the agent that reported it");
+                self.publish_asset(path, json!({"kind": "manifest"}));
+            }
             Ok(_) => {
+                if actor.is_none() && pushed.load(Ordering::SeqCst) {
+                    let now = self.store.clock().monotonic();
+                    lock(&self.unclaimed)
+                        .insert(path_key(path.as_str()), (sha256.to_string(), now));
+                }
                 self.accept(path, sha256, FileState::HumanEdit).await;
                 tracing::info!(path = %path, sha256, "an outside edit was recorded as a human edit");
                 self.publish_asset(
@@ -1261,15 +1367,24 @@ impl Shared {
     /// once), then reconciles the asset folder against the manifest the sign-off wrote and
     /// decides `path` (and the other paths deferred meanwhile) again. One task per asset; a
     /// fence waits for it.
-    fn defer_asset(self: &Arc<Self>, project: &str, asset: &str, path: WsPath) {
+    ///
+    /// `actor` is the reporter of `path`, if any: the later decisions of the path (or of its
+    /// subtree) record it, and an agent's may claim the path's entry then.
+    fn defer_asset(
+        self: &Arc<Self>,
+        project: &str,
+        asset: &str,
+        path: WsPath,
+        actor: Option<Actor>,
+    ) {
         let key = path_key(&format!("{project}/{asset}"));
         {
             let mut deferring = lock(&self.deferring);
             if let Some(paths) = deferring.get_mut(&key) {
-                paths.push(path);
+                paths.push((path, actor));
                 return;
             }
-            deferring.insert(key.clone(), vec![path]);
+            deferring.insert(key.clone(), vec![(path, actor)]);
         }
         self.fences.send_modify(|s| s.deferred += 1);
         let shared = self.clone();
@@ -1282,12 +1397,23 @@ impl Shared {
             {
                 let _apply = shared.apply.lock().await;
                 if lock(&shared.git).busy {
-                    lock(&shared.git).defer(folder);
+                    let mut git = lock(&shared.git);
+                    git.defer(folder, None);
+                    for (path, actor) in &paths {
+                        git.defer(path.clone(), actor.clone());
+                    }
                 } else {
                     match shared.index.reconcile(Scope::Paths(vec![folder])).await {
                         Ok(report) => {
-                            let decided = shared.decide_report(&report, &paths).await;
+                            let extra: Vec<WsPath> = paths.iter().map(|(p, _)| p.clone()).collect();
+                            let mut decided = shared.decide_report(&report, &extra).await;
+                            stamp(&mut decided, &paths);
                             shared.apply_all(decided).await;
+                            for (path, actor) in &paths {
+                                if let Some(actor) = actor {
+                                    shared.claim(path, actor).await;
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "an asset folder couldn't be reconciled after its sign-off");
@@ -1320,7 +1446,8 @@ impl Shared {
         let (deferred, observed, overflowed) = lock(&self.git).finish();
         lock(&self.git).busy = true;
         // 1 and 2.
-        let (report, mut decided) = self.full_rescan(&deferred).await;
+        let paths: Vec<WsPath> = deferred.iter().map(|(p, _)| p.clone()).collect();
+        let (report, mut decided) = self.full_rescan(&paths).await;
         // A verification's observation stands where the rescan saw the file neither change
         // nor go (what the rescan read is newer).
         let fresh: HashSet<String> = report
@@ -1344,6 +1471,8 @@ impl Shared {
                 actor: None,
             });
         }
+        // The reports made while git worked name their paths' actors.
+        stamp(&mut decided, &deferred);
         let (now, queued): (Vec<Decided>, Vec<Decided>) = decided
             .into_iter()
             .partition(|d| matches!(d.action, Action::Reindex(_) | Action::NotFetched(_)));
@@ -1360,6 +1489,11 @@ impl Shared {
         tracing::info!(workspace = %self.store.root().display(), "git has finished; store writes go on");
         // 5.
         self.apply_all(queued).await;
+        for (path, actor) in &deferred {
+            if let Some(actor) = actor {
+                self.claim(path, actor).await;
+            }
+        }
     }
 }
 

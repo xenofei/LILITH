@@ -56,11 +56,11 @@ struct NotifyArgs {
     by: Option<ActorArg>,
 }
 
-/// `Actor.kind` (P4b-R16).
+/// `Actor.kind` as `by` takes it (P4b-R16): never `owner`, which a change of yours doesn't
+/// need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum ActorKindArg {
-    Owner,
     Tether,
     Director,
     ClaudeCode,
@@ -81,7 +81,6 @@ struct ActorArg {
 impl ActorArg {
     fn into_actor(self) -> Actor {
         let kind = match self.kind {
-            ActorKindArg::Owner => ActorKind::Owner,
             ActorKindArg::Tether => ActorKind::Tether,
             ActorKindArg::Director => ActorKind::Director,
             ActorKindArg::ClaudeCode => ActorKind::ClaudeCode,
@@ -104,6 +103,7 @@ fn reporter(caller: &CallerKind, by: Option<ActorArg>) -> Result<Actor, String> 
     let Some(by) = by.map(ActorArg::into_actor) else {
         return Ok(own);
     };
+    // The schema leaves `owner` out; this guard stays for any other way in.
     if by.kind == ActorKind::Owner {
         return Err(
             "by.kind is never owner: a change of yours, from an app or lil, needs no by"

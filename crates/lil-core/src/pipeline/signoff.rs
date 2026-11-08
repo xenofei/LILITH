@@ -123,12 +123,13 @@ pub fn signed_off_by(caller: &CallerKind) -> String {
 }
 
 /// Who a sign-off is by (CORE-051; Appendix H "Manifest fields"): `signed_off.by` and its
-/// optional `via`, which its status-log entry carries too.
+/// optional `via`, which its status-log entry carries too. Only its constructors make one, so
+/// no caller can name `auto` itself (ruling 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedOffBy {
     /// `user`, `assistant`, `claude-code`, `cli` or `auto`.
-    pub by: String,
-    pub via: Option<Via>,
+    by: String,
+    via: Option<Via>,
 }
 
 impl SignedOffBy {
@@ -141,8 +142,10 @@ impl SignedOffBy {
     }
 
     /// A sign-off `auto_approve` makes under `rule`: `by: auto`, `via: {rule}`. No tool argument
-    /// asks for it.
-    pub fn auto(rule: &str) -> SignedOffBy {
+    /// asks for it, and until the `auto_approve` caller exists only this crate's tests make one
+    /// (ruling 4).
+    #[cfg(test)]
+    pub(crate) fn auto(rule: &str) -> SignedOffBy {
         SignedOffBy {
             by: StatusBy::Auto.as_str().to_string(),
             via: Some(Via {
@@ -400,6 +403,54 @@ mod tests {
             "hashes": {},
         });
         Manifest::parse(&text.to_string()).unwrap().0
+    }
+
+    #[test] // spec: CORE-051
+    fn auto_approve_signoff_is_by_auto_with_via_rule() {
+        // The sign-off path with `auto` and its rule, as the `auto_approve` caller will call it.
+        let (signed, version) = plan_signoff(
+            &manifest(),
+            "r_1",
+            &files(&["a.png"]),
+            None,
+            &[],
+            &SignedOffBy::auto("auto_approve:image"),
+            86_400,
+        )
+        .unwrap();
+        let run = &signed.as_map()["candidate_runs"][0];
+        assert_eq!(run["signed_off"]["by"], "auto", "{run}");
+        assert_eq!(
+            run["signed_off"]["via"],
+            json!({"rule": "auto_approve:image"}),
+            "{run}"
+        );
+        assert_eq!(run["signed_off"]["version"], version.to_string());
+        let newest = signed.as_map()["status_log"]
+            .as_array()
+            .and_then(|log| log.last())
+            .cloned()
+            .unwrap();
+        assert_eq!(newest["by"], "auto", "{newest}");
+        assert_eq!(
+            newest["via"],
+            json!({"rule": "auto_approve:image"}),
+            "{newest}"
+        );
+        // A caller's sign-off has no `via`.
+        let (signed, _) = plan_signoff(
+            &manifest(),
+            "r_1",
+            &files(&["a.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Mcp),
+            86_400,
+        )
+        .unwrap();
+        let signed_off = &signed.as_map()["candidate_runs"][0]["signed_off"];
+        assert_eq!(signed_off["by"], "claude-code");
+        assert!(signed_off.get("via").is_none(), "{signed_off}");
     }
 
     #[test] // spec: CORE-051

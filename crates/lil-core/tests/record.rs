@@ -1643,7 +1643,9 @@ async fn an_agent_by_of_another_kind_is_refused() {
         (CallerKind::Mcp, "cli"),
         (CallerKind::Mcp, "core"),
         (CallerKind::Assistant, "claude_code"),
+        (CallerKind::Assistant, "director"),
         (CallerKind::Assistant, "cli"),
+        (CallerKind::Assistant, "core"),
     ] {
         let e = fx
             .err_by(
@@ -1696,9 +1698,11 @@ async fn by_owner_is_refused() {
     fx.shutdown().await;
 }
 
+/// No tool argument signs off as `auto` (ruling 4): `asset.signoff` has no `by`. The sign-off
+/// path with `auto` is `pipeline::signoff`'s unit test
+/// `auto_approve_signoff_is_by_auto_with_via_rule`.
 #[tokio::test] // spec: CORE-051
-async fn auto_approve_signoff_is_by_auto_with_via_rule() {
-    // No tool argument claims `auto`: `asset.signoff` has no `by`.
+async fn no_tool_argument_signs_off_as_auto() {
     let fx = Fx::plain();
     let run = fx.import_run(KITE, "kite.png", b"kite").await;
     let e = fx
@@ -1708,41 +1712,14 @@ async fn auto_approve_signoff_is_by_auto_with_via_rule() {
         )
         .await;
     assert_eq!(e.code, "params.invalid", "{e:?}");
-
-    // The sign-off path with `auto` and its rule, as the `auto_approve` caller will call it.
-    let text = serde_json::to_string(&fx.manifest(KITE)).unwrap();
-    let (m, _) = lil_schema::Manifest::parse(&text).unwrap();
-    let (signed, version) = lil_core::pipeline::plan_signoff(
-        &m,
-        &run,
-        &lil_core::pipeline::Chosen::Files(vec!["kite.png".to_string()]),
-        None,
-        &[],
-        &lil_core::pipeline::SignedOffBy::auto("auto_approve:image"),
-        0,
-    )
-    .unwrap();
-    let out: Value = serde_json::from_str(&signed.to_text()).unwrap();
-    let run_entry = out["candidate_runs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["run_id"] == run.as_str())
-        .unwrap()
-        .clone();
-    assert_eq!(run_entry["signed_off"]["by"], "auto", "{run_entry}");
-    assert_eq!(
-        run_entry["signed_off"]["via"],
-        json!({"rule": "auto_approve:image"}),
-        "{run_entry}"
-    );
-    assert_eq!(run_entry["signed_off"]["version"], version.to_string());
-    let newest = newest_entry(&out);
-    assert_eq!(newest["by"], "auto", "{newest}");
-    assert_eq!(
-        newest["via"],
-        json!({"rule": "auto_approve:image"}),
-        "{newest}"
+    let m = fx.manifest(KITE);
+    assert!(
+        m["candidate_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["signed_off"].is_null()),
+        "{m}"
     );
     fx.shutdown().await;
 }
@@ -1765,11 +1742,28 @@ async fn ai_edit_relabels_one_entry_from_the_app_only() {
         sha256: sha256.to_string(),
     };
     let app = fx.session(ui());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(15, tx);
+    let topic = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_ref.id);
+    fx.events
+        .subscribe(15, std::slice::from_ref(&topic), &Default::default())
+        .await;
+    drain_events(&mut rx);
     let r = fx
         .dispatcher
         .ai_edit(&app, params(&one), "t_ai_edit")
         .await
         .unwrap();
+    // Fix round 1, M1: the asset's views hear that its manifest changed.
+    let manifest_event =
+        |e: &Value| e["topic"] == topic.as_str() && e["data"] == json!({"kind": "manifest"});
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut published = drain_events(&mut rx);
+    while !published.iter().any(manifest_event) && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+        published.extend(drain_events(&mut rx));
+    }
+    assert!(published.iter().any(manifest_event), "{published:?}");
     let edit = &r.human_edit;
     assert_eq!(edit["sha256"], one.as_str(), "{edit}");
     assert_eq!(edit["path"], inside.as_str(), "{edit}");
