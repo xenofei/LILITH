@@ -1679,8 +1679,8 @@ pub(super) struct StoreChanges {
     parsed: Vec<Parsed>,
 }
 
-/// While it lives, a cold rebuild is running: `apply_events` logs what it writes. Dropping it
-/// (the rebuild ended, either way) stops the log.
+/// While it lives, a reconcile or a cold rebuild is running: `apply_events` logs what it
+/// writes. Dropping it (the run ended, either way) stops the log.
 struct ColdLog<'a>(&'a Mutex<Option<Vec<StoreChanges>>>);
 
 impl Drop for ColdLog<'_> {
@@ -1704,10 +1704,8 @@ pub(super) async fn run(
     let whole = scope == Scope::All;
     let mut report = ReconcileReport::default();
     let (stable, fat) = volume_facts(index).await?;
-    let _cold = (mode == Mode::Cold).then(|| {
-        *lock(&index.cold_log) = Some(Vec::new());
-        ColdLog(&index.cold_log)
-    });
+    *lock(&index.cold_log) = Some(Vec::new());
+    let _log = ColdLog(&index.cold_log);
 
     let (rows, known) = match mode {
         Mode::Cold => (HashMap::new(), HashSet::new()),
@@ -1816,10 +1814,23 @@ pub(super) async fn run(
             let tx = conn.transaction().map_err(|e| sql(&e))?;
             write_conflicts(&tx, &conflicts, conflict_scope.as_deref()).map_err(|e| sql(&e))?;
             // Taken on the actor, so every store change written before this job is in it; a
-            // later one is written after the rebuild commits.
+            // later one is written after the run commits.
+            let logged = lock(&cold_log).take().unwrap_or_default();
             let replay = match mode {
-                Mode::Cold => lock(&cold_log).take().unwrap_or_default(),
-                Mode::Warm => Vec::new(),
+                Mode::Cold => logged,
+                Mode::Warm => {
+                    // The walk's conflict copies are written whole, not compared and set as
+                    // file rows are: a removal the store applied while the walk ran is applied
+                    // to them once more, so a copy the store moved away isn't put back.
+                    for key in logged.iter().flat_map(|c| &c.removed) {
+                        tx.execute(
+                            &format!("DELETE FROM conflicts WHERE {UNDER}"),
+                            params![key],
+                        )
+                        .map_err(|e| sql(&e))?;
+                    }
+                    Vec::new()
+                }
             };
             let done = finish(
                 &tx,
@@ -1937,6 +1948,13 @@ fn finish(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('scan_start', ?1)",
             params![started],
         )?;
+        // Only a cold rebuild that commits marks the index built (`Index::needs_rebuild`).
+        if mode == Mode::Cold {
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('rebuilt', ?1)",
+                params![started],
+            )?;
+        }
     }
     Ok((removed, missing))
 }

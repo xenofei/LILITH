@@ -52,8 +52,10 @@ pub use query::{
 };
 
 /// `PRAGMA user_version` of `index.db`: 2 since plan 4b (marks, tags, takes, file kinds, tile
-/// fields). An index of another version is removed and rebuilt.
-pub const INDEX_SCHEMA_VERSION: i64 = 2;
+/// fields), 3 since its orphans come from the index (each asset's folder key and recorded runs
+/// and versions, and the conflict copies). An index of another version is removed and rebuilt,
+/// so a core of either schema never writes into the other's file.
+pub const INDEX_SCHEMA_VERSION: i64 = 3;
 
 /// Paths parked after an unstable or locked read, at most (beyond that, the next rescan picks
 /// them up).
@@ -503,8 +505,9 @@ pub struct Index {
     mismatched: Mutex<HashMap<String, Seen>>,
     /// Where the next `verify_pending` batch starts (a key; empty: from the first row).
     verify_from: Mutex<String>,
-    /// While a cold rebuild runs: the store's changes applied meanwhile, replayed in the
-    /// rebuild's own transaction so none is lost (`None` otherwise).
+    /// While a reconcile or a cold rebuild runs: the store's changes applied meanwhile. A cold
+    /// rebuild replays them in its own transaction so none is lost; a reconcile re-applies
+    /// their removals to the conflict copies it writes (`None` otherwise).
     cold_log: Arc<Mutex<Option<Vec<reconcile::StoreChanges>>>>,
     closed: Arc<AtomicBool>,
 }
@@ -546,13 +549,16 @@ impl Index {
         root: &Path,
         probe: Arc<dyn Probe>,
     ) -> Result<Index, IndexError> {
-        let scan_start: Option<i64> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'scan_start'", [], |r| {
-                r.get(0)
-            })
-            .optional()
-            .map_err(|e| sql(&e))?
-            .flatten();
+        let meta = |key: &str| -> Result<Option<i64>, IndexError> {
+            conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+                .optional()
+                .map(Option::flatten)
+                .map_err(|e| sql(&e))
+        };
+        let scan_start = meta("scan_start")?;
+        // A cold rebuild that never committed (the core stopped while it ran) is done again in
+        // full: only a finished one writes `rebuilt`.
+        let cold = cold || meta("rebuilt")?.is_none();
         let db = Db::start(conn, format!("lil-index-{}", Env::workspace_hash(root)))?;
         Ok(Index {
             root: root.to_path_buf(),
@@ -589,7 +595,7 @@ impl Index {
     }
 
     /// Whether the first reconcile must be a cold rebuild: the index is new, was rebuilt at
-    /// open, or lives in memory.
+    /// open, lives in memory, or no cold rebuild of it ever finished.
     pub fn needs_rebuild(&self) -> bool {
         self.cold
     }

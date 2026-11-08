@@ -47,11 +47,12 @@ pub type TextEdit = Arc<dyn Fn(&str) -> Result<String, StoreError> + Send + Sync
 pub struct CommitOp {
     pub outputs: Vec<OutputMove>,
     /// Files a caller already moved into place (a sealed version): they reach the index in
-    /// the index step, with the hash and identity given, never before the manifest edit.
+    /// the index step, with the hash and identity given, never before the manifest edit; when
+    /// the commit fails before that edit, as it returns its error (an orphan version folder).
     pub moved: Vec<Written>,
     /// Paths a caller already moved away (the run files a seal took out of
     /// `candidates/<run>/`): they reach the index as removals in the index step, after the
-    /// manifest edit.
+    /// manifest edit, or, when the commit fails before it, as it returns its error.
     pub removed: Vec<WsPath>,
     pub manifest: Option<(WsPath, ManifestEdit)>,
     pub job_line: Option<Map<String, Value>>,
@@ -159,6 +160,20 @@ fn conflict_files(root: &Path, start: &Path, probe: &dyn Probe) -> io::Result<Ve
     Ok(found)
 }
 
+/// The index's events for the files `op`'s caller already moved: a `Removed` per entry of
+/// `op.removed`, then a `Written` per entry of `op.moved`, with its hash and identity as given.
+fn caller_moves(op: &CommitOp) -> impl Iterator<Item = StoreEvent> + '_ {
+    op.removed
+        .iter()
+        .map(|path| StoreEvent {
+            path: path.clone(),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        })
+        .chain(op.moved.iter().map(|w| event(w, ChangeKind::Written)))
+}
+
 /// Whether `name` is a conflict copy's (`*.lil-conflict-*`, or the legacy marker).
 pub(super) fn is_conflict_copy(name: &str) -> bool {
     name.contains(CONFLICT_MARKER) || name.contains(LEGACY_CONFLICT_MARKER)
@@ -192,9 +207,10 @@ impl Store {
     /// after 60 s; `store.path_invalid` for an output that isn't in a staging handle, a target
     /// the store never writes, or one under a linked folder; `store.locked` for a target a
     /// manifest `locks` entry covers (nothing has moved then); `store.hash_conflict` when a file
-    /// is already at an output's target; any error of steps 1 and 2. An error after step 1
-    /// leaves the outputs in place (orphans until the manifest records them), and the index
-    /// still hears of them.
+    /// is already at an output's target; any error of steps 1 and 2. On any of these errors the
+    /// index still hears of what is on disk: the outputs already moved (orphans until a manifest
+    /// records them; one that couldn't be read back, by its path alone) and the files the
+    /// caller moved (`op.moved`, a seal's orphan version folder, and `op.removed`).
     pub async fn commit(&self, op: CommitOp) -> Result<CommitReport, StoreError> {
         self.writable_store()?;
         let subject = op
@@ -205,29 +221,30 @@ impl Store {
             .unwrap_or_else(|| WsPath::from_disk(String::new()));
         let mut events: Vec<StoreEvent> = Vec::new();
 
-        // 1. Outputs. They wait at the git gate first, as every write does: a run folder
-        // never appears in the middle of a checkout.
-        if !op.outputs.is_empty() {
-            self.git_gate().wait_clear(GIT_WAIT).await?;
-        }
-        let staging = self.staging_root();
-        // Every target is checked before any output moves: a manifest lock (CORE-035) refuses
-        // the commit as it refuses a write, by the path and by its long form.
-        for out in &op.outputs {
-            if !out.from.starts_with(&staging) || out.from == staging {
-                return Err(StoreError::PathInvalid {
-                    path: out.from.display().to_string(),
-                    why: "an output is ingested only from a staging handle".to_string(),
-                });
-            }
-            writable(&out.to)?;
-            self.check_locks(&out.to).await?;
-            let long = self.writable_on_disk(&out.to).await?;
-            self.check_long_locks(&out.to, &long).await?;
-        }
-        // An error in steps 1 and 2 still tells the index of the outputs already moved: they
-        // stay, as orphans, and `project.status` lists orphans from the index's rows.
+        // Steps 1 and 2. On an error the index still hears of what is already on disk, since
+        // `project.status` lists orphans from its rows: the outputs moved so far, and the
+        // files a caller already moved (a seal's version folder, and the run files it took).
         let moved = async {
+            // 1. Outputs. They wait at the git gate first, as every write does: a run folder
+            // never appears in the middle of a checkout.
+            if !op.outputs.is_empty() {
+                self.git_gate().wait_clear(GIT_WAIT).await?;
+            }
+            let staging = self.staging_root();
+            // Every target is checked before any output moves: a manifest lock (CORE-035)
+            // refuses the commit as it refuses a write, by the path and by its long form.
+            for out in &op.outputs {
+                if !out.from.starts_with(&staging) || out.from == staging {
+                    return Err(StoreError::PathInvalid {
+                        path: out.from.display().to_string(),
+                        why: "an output is ingested only from a staging handle".to_string(),
+                    });
+                }
+                writable(&out.to)?;
+                self.check_locks(&out.to).await?;
+                let long = self.writable_on_disk(&out.to).await?;
+                self.check_long_locks(&out.to, &long).await?;
+            }
             let mut outputs = Vec::with_capacity(op.outputs.len());
             for out in &op.outputs {
                 // The move checks only its target: a linked folder above it is refused here.
@@ -251,20 +268,33 @@ impl Store {
                     },
                     _ => StoreError::io(&out.to, &e),
                 })?;
-                let sha256 = match self.see_hash(&target).await {
-                    Ok(Seen::Found(h)) => h.sha256,
-                    Ok(_) => {
-                        return Err(StoreError::Io {
-                            path: out.to.as_str().to_string(),
-                            why: "the output is no longer there after its move".to_string(),
-                        });
-                    }
-                    Err(e) => return Err(StoreError::io(&out.to, &e)),
+                let seen = match self.see_hash(&target).await {
+                    Ok(Seen::Found(h)) => match self.identity(&out.to).await {
+                        Ok(identity) => Ok(Written {
+                            path: out.to.clone(),
+                            sha256: h.sha256,
+                            identity,
+                        }),
+                        Err(e) => Err(e),
+                    },
+                    Ok(_) => Err(StoreError::Io {
+                        path: out.to.as_str().to_string(),
+                        why: "the output is no longer there after its move".to_string(),
+                    }),
+                    Err(e) => Err(StoreError::io(&out.to, &e)),
                 };
-                let written = Written {
-                    path: out.to.clone(),
-                    sha256,
-                    identity: self.identity(&out.to).await?,
+                let written = match seen {
+                    Ok(written) => written,
+                    Err(e) => {
+                        // Moved, but not read back: the index looks at the path itself.
+                        events.push(StoreEvent {
+                            path: out.to.clone(),
+                            kind: ChangeKind::Created,
+                            sha256: None,
+                            identity: None,
+                        });
+                        return Err(e);
+                    }
                 };
                 events.push(event(&written, ChangeKind::Created));
                 outputs.push(written);
@@ -286,6 +316,7 @@ impl Store {
         let (outputs, manifest) = match moved {
             Ok(done) => done,
             Err(e) => {
+                events.extend(caller_moves(&op));
                 self.emit(events).await;
                 return Err(e);
             }
@@ -337,13 +368,7 @@ impl Store {
         }
 
         // 5. The index, with the files already moved away and into place.
-        events.extend(op.removed.iter().map(|path| StoreEvent {
-            path: path.clone(),
-            kind: ChangeKind::Removed,
-            sha256: None,
-            identity: None,
-        }));
-        events.extend(op.moved.iter().map(|w| event(w, ChangeKind::Written)));
+        events.extend(caller_moves(&op));
         self.emit(events).await;
         if let Err(e) = self.point("store.after_index", &subject).await {
             warn("store.after_index", &e);

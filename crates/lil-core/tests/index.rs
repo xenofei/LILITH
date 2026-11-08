@@ -511,7 +511,7 @@ async fn fresh_index_is_wal_and_versioned() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(version, lil_core::index::INDEX_SCHEMA_VERSION);
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     drop(db);
     drop(index);
 
@@ -574,7 +574,7 @@ async fn version_mismatch_or_failed_quick_check_rebuilds() {
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 
     // A damaged page: quick_check fails (or SQLite refuses the file).
     {
@@ -1073,6 +1073,117 @@ async fn runs_elsewhere_exempts_only_absent_run_folders() {
         [format!("{ASSET}/candidates/{denied}/c.png")],
         "a folder that can't be looked at isn't a folder that is absent"
     );
+}
+
+/// A cold rebuild that never commits (the core stopped, or the rebuild failed) is done again in
+/// full at the next open, even after a whole reconcile ran in between: until one finishes, a
+/// file that a manifest records and that vanished while no core watched is listed `missing`
+/// only by a cold rebuild (CORE-038).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-038, ARCH-089
+async fn an_interrupted_first_rebuild_is_redone_at_the_next_open() {
+    let fx = fx();
+    let x = b"sealed x".as_slice();
+    fx.write(&format!("{ASSET}/v1.0.0/x.png"), x);
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"approved_version": "1.0.0", "hashes": {
+                "v1.0.0/x.png": format!("sha256:{}", sha256_bytes(x)),
+                "v1.0.0/gone.png": format!("sha256:{}", sha256_bytes(b"gone")),
+            }}),
+        ),
+    );
+    {
+        // The first rebuild fails before it commits.
+        let failing = FakeProbe::with(|b| b.volume = Volume::Panics);
+        let index = fx.open(failing.clone());
+        assert!(index.needs_rebuild());
+        assert!(index.rebuild().await.is_err());
+        // A whole reconcile commits meanwhile, but it isn't a rebuild.
+        failing.set(|b| b.volume = Volume::Real);
+        index.reconcile(Scope::All).await.unwrap();
+    }
+
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(index.needs_rebuild(), "no cold rebuild ever finished");
+    let report = index.retry_first().await.unwrap();
+    assert_eq!(
+        report.missing,
+        [p(&format!("{ASSET}/v1.0.0/gone.png"))],
+        "{report:?}"
+    );
+    drop(index);
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(
+        !index.needs_rebuild(),
+        "a finished rebuild is warm from then on"
+    );
+}
+
+/// An `index.db` of schema 2 (a core from before orphans came from the index) is rebuilt, so
+/// neither core writes rows the other doesn't fill.
+#[tokio::test] // spec: ARCH-089
+async fn a_schema_2_index_db_is_rebuilt() {
+    let fx = fx();
+    indexed_once(&fx).await;
+    Connection::open(&fx.db)
+        .unwrap()
+        .pragma_update(None, "user_version", 2)
+        .unwrap();
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(index.needs_rebuild(), "a schema-2 index.db is rebuilt");
+}
+
+/// A removal the store applies while a reconcile's walk runs isn't undone for the conflict
+/// copies the walk saw: the reconcile writes them whole, then applies the removal once more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-038
+async fn a_store_removal_during_a_reconcile_keeps_its_conflict_copies_out() {
+    let fx = fx();
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json("p", "a", json!({})),
+    );
+    fx.write(
+        &format!("{ASSET}/work/s.blend.lil-conflict-20270101T080000Z"),
+        b"an outside save",
+    );
+    fx.write("projects/p/assets/z/zz.txt", b"z");
+    let probe = FakeProbe::new();
+    let index = fx.open(probe.clone());
+    index.rebuild().await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap().len(), 1);
+
+    // While the next reconcile looks at zz.txt (the walk has listed the copy), the store moves
+    // asset `a` to the trash and says so.
+    let fired = Arc::new(AtomicBool::new(false));
+    // Weak: the index holds the probe, which holds this hook.
+    let (hook_index, root) = (Arc::downgrade(&index), fx.root.clone());
+    let handle = tokio::runtime::Handle::current();
+    let installed = probe.hook.set(Box::new(move |path: &Path| {
+        if name_of(path) != "zz.txt" || fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(hook_index) = hook_index.upgrade() else {
+            return;
+        };
+        outside_move(
+            &native(&root, ASSET),
+            &native(&root, ".trash/e_1/payload/a"),
+        );
+        handle.block_on(hook_index.applied(&[StoreEvent {
+            path: p(ASSET),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        }]));
+    }));
+    assert!(installed.is_ok());
+    index.reconcile(Scope::All).await.unwrap();
+
+    assert_eq!(index.files_of("p", "a").await.unwrap(), Vec::new());
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
 }
 
 /// A removal the store reports (an asset folder moved to the trash, a run moved away) takes
@@ -2568,7 +2679,7 @@ async fn schema_1_index_is_rebuilt_as_2() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     for table in ["asset_tags", "take_marks"] {
         db.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
             .unwrap_or_else(|e| panic!("{table}: {e}"));

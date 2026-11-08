@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lil_core::index::Index;
 use lil_core::state::{StateDb, StateScope};
 use lil_core::store::{
     ChangeKind, ChangeSink, CommitOp, FailPoints, LogKind, ManifestEdit, OutputMove, Store,
@@ -301,6 +302,86 @@ async fn error_after_output_leaves_a_listed_orphan_never_deleted() {
     // The later steps never ran.
     assert!(!ws.exists(&jobs_log(MONTH)));
     assert!(!ws.exists("projects/sketchbook/progress.md"));
+}
+
+/// The Record stage of a sign-off whose commit fails before its manifest edit, after the seal
+/// moved the chosen file into `v1.1.0/`: the store still tells the index of the seal's files
+/// and of the run file it took, so `project.status`'s orphans (from the index's rows) list the
+/// version folder at once, with no watcher and no reopen (Appendix E), and the run file leaves
+/// no row behind.
+#[tokio::test] // spec: ARCH-075, CORE-038
+async fn a_failed_signoff_commit_still_lists_the_sealed_version() {
+    let ws = workspace();
+    let mut m = Manifest::new(
+        "sketchbook",
+        "crane",
+        "image",
+        "00000000-0000-4000-8000-0000000000aa",
+    );
+    m.push(
+        "candidate_runs",
+        json!({"run_id": "r_1", "path": "candidates/r_1/", "status": "open",
+               "files": [{"path": "candidates/r_1/a.png", "role": "candidate"}]}),
+    )
+    .unwrap();
+    write_file(&ws.file(MANIFEST), m.to_text().as_bytes());
+    let taken = format!("{ASSET}/candidates/r_1/a.png");
+    write_file(&ws.file(&taken), b"chosen");
+    let index = Arc::new(
+        Index::open(
+            &ws.env.root().join("local-ws").join("index.db"),
+            &ws.root,
+            Arc::new(SystemProbe),
+        )
+        .expect("the index opens"),
+    );
+    index.rebuild().await.unwrap();
+    assert_eq!(
+        index.orphans_of("sketchbook").await.unwrap(),
+        Vec::<WsPath>::new()
+    );
+
+    // The seal: the chosen file moved into the version folder, beside its snapshot.
+    let (sealed, snapshot) = (
+        format!("{ASSET}/v1.1.0/a.png"),
+        format!("{ASSET}/v1.1.0/manifest.snapshot.json"),
+    );
+    fsops::ensure_dir(ws.file(&sealed).parent().unwrap()).unwrap();
+    fsops::move_new(&ws.file(&taken), &ws.file(&sealed)).unwrap();
+    write_file(&ws.file(&snapshot), b"{}");
+    let written = |rel: &str| Written {
+        path: p(rel),
+        sha256: sha256_bytes(&ws.read(rel)),
+        identity: SystemProbe.identity(&ws.file(rel)).unwrap(),
+    };
+    let record: ManifestEdit = Arc::new(|m: &mut Manifest| {
+        m.set("approved_version", json!("1.1.0"));
+        Ok(())
+    });
+    let op = CommitOp {
+        moved: vec![written(&sealed), written(&snapshot)],
+        removed: vec![p(&taken)],
+        manifest: Some((p(MANIFEST), record)),
+        ..CommitOp::default()
+    };
+    let store = ws.store(Arc::new(
+        FailPoints::parse("store.after_output=io").unwrap(),
+    ));
+    store.set_sink(index.clone());
+    store
+        .commit(op)
+        .await
+        .expect_err("the fail point stops the commit before the manifest edit");
+
+    assert_eq!(
+        index.orphans_of("sketchbook").await.unwrap(),
+        [p(&format!("{ASSET}/v1.1.0"))]
+    );
+    assert!(
+        index.files_of_path(&p(&taken)).await.unwrap().is_none(),
+        "the run file the seal took leaves no row"
+    );
+    index.close();
 }
 
 #[tokio::test(start_paused = true)] // spec: ARCH-075, CORE-020
