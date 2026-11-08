@@ -55,6 +55,9 @@ pub const NAMES: &[&str] = &[
     // Plan 4b (Task 21c): after `workspace.create` made the folder, before it looks at it again
     // (a test registers a workspace around it here; the call then refuses and removes the folder).
     "workspace.after_create",
+    // After `asset.trash` moved the whole asset folder to the trash, before the index hears
+    // of it (plan 4b, Task 11; CORE-157).
+    "store.after_asset_trash",
 ];
 
 /// The exit code of the `abort` action.

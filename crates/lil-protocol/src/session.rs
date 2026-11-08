@@ -674,8 +674,11 @@ mod tests {
         // `app/asset.trust`'s `AssetTrustParams` and `AssetTrustResult`, `app/asset.ai_edit`'s
         // `AiEditParams` and `AiEditResult`, and `ConfirmationView`'s optional `files: [Touch]`
         // (`Touch`, `TouchAccess`) and `facts: ConfirmFacts`. (Unreleased within 1.4: the audit
-        // of Task 10 made `ThumbView.state` an enum, `236a874b05714a5a` before.)
-        assert_eq!(h, "9ec12c38a6b2886a");
+        // of Task 10 made `ThumbView.state` an enum, `236a874b05714a5a` before. Also unreleased
+        // within 1.4: Task 11's owner decision of 2026-11-07 added `ConfirmFacts`' optional
+        // `locked: [path]` and `locked_total`, the card's warning for `asset.trash` of an
+        // asset with locked files, `9ec12c38a6b2886a` before.)
+        assert_eq!(h, "bcfd75e2ddd70f2b");
     }
 
     #[test] // spec: ARCH-029

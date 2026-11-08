@@ -311,6 +311,7 @@ fn facts_with(n: usize) -> ConfirmFacts {
         dependents: (0..n).map(|i| format!("sketchbook/dep_{i:02}")).collect(),
         dependents_total: 0,
         versions: vec!["1.0.0".into(), "1.1.0".into()],
+        ..ConfirmFacts::default()
     }
 }
 

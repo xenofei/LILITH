@@ -206,7 +206,9 @@ pub struct SealedFacts {
 
 /// `facts` as a confirmation stores them, and their hash (P4b-R9, P4b-R33): the hash is the
 /// retry binding's [`lil_protocol::args_hash`] (SHA-256 of the canonical JSON) of
-/// `{dependents, versions}`, both full and each sorted (Appendix H: "the full sorted
+/// `{dependents, versions}` (with `locked` too when there are locked paths, owner decision
+/// 2026-11-07, so a lock added or removed before the approved retry asks again), each full and
+/// sorted (Appendix H: "the full sorted
 /// dependents list and versions"), so neither list's order counts; facts `None` hash as
 /// `args_hash(null)`, the SHA-256 of `null`. Then the shown dependents are sorted and cut to
 /// the first [`FACTS_SHOWN`], with `dependents_total` the full count; the versions are shown in
@@ -219,14 +221,23 @@ pub fn seal_facts(facts: Option<ConfirmFacts>) -> SealedFacts {
         };
     };
     facts.dependents.sort();
+    facts.locked.sort();
     let mut versions = facts.versions.clone();
     versions.sort();
-    let sha256 = lil_protocol::args_hash(&serde_json::json!({
+    let mut hashed = serde_json::json!({
         "dependents": facts.dependents,
         "versions": versions,
-    }));
+    });
+    // The locked paths (owner decision 2026-11-07), full and sorted, only when there are any:
+    // facts without them hash as before.
+    if !facts.locked.is_empty() {
+        hashed["locked"] = serde_json::json!(facts.locked);
+    }
+    let sha256 = lil_protocol::args_hash(&hashed);
     facts.dependents_total = u32::try_from(facts.dependents.len()).unwrap_or(u32::MAX);
     facts.dependents.truncate(FACTS_SHOWN);
+    facts.locked_total = u32::try_from(facts.locked.len()).unwrap_or(u32::MAX);
+    facts.locked.truncate(FACTS_SHOWN);
     SealedFacts {
         shown: Some(facts),
         sha256,

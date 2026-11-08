@@ -21,8 +21,9 @@ use super::fsops;
 use super::order::list_with;
 use super::paths::{WsPath, path_key};
 use super::trash::{
-    DAY, PAYLOAD, RECORD, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord, drop_empty_entry, entries,
-    is_entry_id, parse_rfc3339, purge_entry, refuse_link_at, refuse_linked_trash, remove_if_empty,
+    DAY, PAYLOAD, RECORD, RestoreRewrite, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord, claimed_payload,
+    drop_empty_entry, drop_rewritten_entry, entries, is_entry_id, parse_rfc3339, purge_entry,
+    refuse_link_at, refuse_linked_trash, remove_if_empty, restore_name,
 };
 use super::write::{Seen, StoreError, blocking, link_refused, read_all, see};
 
@@ -295,19 +296,28 @@ impl Personal {
     }
 
     /// Moves trash entry `entry_id` back to its original path and returns that path. Nothing
-    /// is replaced.
+    /// is replaced: [`Personal::trash_restore_to`] without `to` or a rewrite.
     ///
     /// # Errors
-    /// `trash.unknown` for no such entry; `trash.restore_conflict` when something is at the
-    /// original path now; `store.path_invalid` for a record (edited by hand) that names the
-    /// trash or a path through a link; `store.io` when a file call fails.
+    /// As [`Personal::trash_restore_to`].
     pub async fn trash_restore(&self, entry_id: &str) -> Result<WsPath, StoreError> {
+        self.trash_restore_to(entry_id, None, None).await
+    }
+
+    /// The record of trash entry `entry_id`.
+    ///
+    /// # Errors
+    /// `trash.unknown` for no such entry; `store.io` when the trash can't be listed.
+    pub async fn trash_entry(&self, entry_id: &str) -> Result<TrashRecord, StoreError> {
+        self.find_entry(entry_id).await.map(|e| e.record)
+    }
+
+    async fn find_entry(&self, entry_id: &str) -> Result<super::trash::Entry, StoreError> {
         let unknown = || StoreError::TrashUnknown(entry_id.to_string());
         if !is_entry_id(entry_id) {
             return Err(unknown());
         }
-        let entry = self
-            .found()
+        self.found()
             .await?
             .into_iter()
             .find(|e| {
@@ -315,8 +325,31 @@ impl Personal {
                     .file_name()
                     .is_some_and(|n| path_key(&n.to_string_lossy()) == path_key(entry_id))
             })
-            .ok_or_else(unknown)?;
-        let rel = WsPath::parse(&entry.record.original_path)?;
+            .ok_or_else(unknown)
+    }
+
+    /// Moves trash entry `entry_id` back and returns the restored path: to its original path,
+    /// or with `to` to the name `to` in the original's folder (CORE-037). With `rewrite`, the
+    /// payload (a file) is read, rewritten (a resource's new id) and written as a new file at
+    /// the target, and the entry goes only after that. Nothing is replaced.
+    ///
+    /// # Errors
+    /// `trash.unknown` for no such entry; `trash.restore_conflict` when something is at the
+    /// target now; `params.invalid` for a bad `to` or the rewrite's refusal;
+    /// `store.path_invalid` for a record (edited by hand) that names the trash or a path
+    /// through a link; `store.io` when a file call fails.
+    pub async fn trash_restore_to(
+        &self,
+        entry_id: &str,
+        to: Option<&str>,
+        rewrite: Option<RestoreRewrite>,
+    ) -> Result<WsPath, StoreError> {
+        let entry = self.find_entry(entry_id).await?;
+        let original = WsPath::parse(&entry.record.original_path)?;
+        let rel = match to {
+            None => original.clone(),
+            Some(name) => restore_name(&original, name)?,
+        };
         self.refusal(&rel).await?;
         let payload = {
             let dir = entry.dir.join(PAYLOAD);
@@ -327,7 +360,7 @@ impl Personal {
             })
             .await
             .map_err(|e| StoreError::io(&rel, &e))?;
-            let wanted = path_key(rel.file_name());
+            let wanted = path_key(original.file_name());
             match items.iter().find(|i| path_key(&i.name) == wanted) {
                 Some(item) => item.path.clone(),
                 None if items.len() == 1 => items[0].path.clone(),
@@ -340,17 +373,69 @@ impl Personal {
             }
         };
         let target = rel.abs(&self.root);
-        let (from, to) = (payload, target);
-        let moved = blocking(move || {
-            if lil_platform::fs::attributes(&to).is_ok() {
-                return Err(io::Error::from_raw_os_error(183));
+        let (from, to_abs) = (payload.clone(), target);
+        let mut claimed_at: Option<PathBuf> = None;
+        let moved = match rewrite {
+            None => {
+                blocking(move || {
+                    if lil_platform::fs::attributes(&to_abs).is_ok() {
+                        return Err(io::Error::from_raw_os_error(183));
+                    }
+                    if let Some(parent) = to_abs.parent() {
+                        fsops::ensure_dir(parent)?;
+                    }
+                    fsops::move_new(&from, &to_abs)
+                })
+                .await
             }
-            if let Some(parent) = to.parent() {
-                fsops::ensure_dir(parent)?;
+            Some(rewrite) => {
+                if lil_platform::fs::attributes(&to_abs).is_ok() {
+                    return Err(StoreError::RestoreConflict(rel));
+                }
+                // Claimed first, as the workspace trash does (review M-3): a held payload is
+                // `store.busy` with nothing changed.
+                let claimed = claimed_payload(&payload);
+                let (held, claim) = (payload.clone(), claimed.clone());
+                blocking(move || fsops::move_new(&held, &claim))
+                    .await
+                    .map_err(|e| StoreError::io(&original, &e))?;
+                claimed_at = Some(claimed.clone());
+                let from = claimed.clone();
+                let back = payload.clone();
+                let probe = self.probe.clone();
+                let read = blocking(move || match see(probe.as_ref(), &from, read_all)? {
+                    Seen::Found(bytes) => Ok(bytes),
+                    _ => Err(io::Error::other(
+                        "the payload is not a file that can be read",
+                    )),
+                })
+                .await
+                .map_err(|e| StoreError::io(&rel, &e));
+                let bytes = read.and_then(|read| rewrite(&read).map_err(StoreError::Invalid));
+                let written = match bytes {
+                    Ok(bytes) => {
+                        let tmp = format!(".{}.tmp", self.ids.id("tmp"));
+                        blocking(move || {
+                            if lil_platform::fs::attributes(&to_abs).is_ok() {
+                                return Err(io::Error::from_raw_os_error(183));
+                            }
+                            fsops::write_new_file(&to_abs, &tmp, &bytes, &FailPoints::none())
+                        })
+                        .await
+                    }
+                    Err(e) => {
+                        let _ = blocking(move || fsops::move_new(&claimed, &back)).await;
+                        return Err(e);
+                    }
+                };
+                if written.is_err() {
+                    // Nothing restored: the payload goes back under its name.
+                    let (claim, back) = (claimed_at.clone().unwrap_or_default(), payload.clone());
+                    let _ = blocking(move || fsops::move_new(&claim, &back)).await;
+                }
+                written
             }
-            fsops::move_new(&from, &to)
-        })
-        .await;
+        };
         match moved {
             Ok(()) => {}
             Err(e) if e.raw_os_error().is_some_and(|c| c == 80 || c == 183) => {
@@ -358,8 +443,13 @@ impl Personal {
             }
             Err(e) => return Err(StoreError::io(&rel, &e)),
         }
+        let rewritten = claimed_at;
         let (dir, day) = (entry.dir.clone(), entry.day.clone());
-        let cleaned = blocking(move || drop_empty_entry(&dir, &day)).await;
+        let cleaned = blocking(move || match rewritten {
+            Some(claimed) => drop_rewritten_entry(&claimed, &dir, &day),
+            None => drop_empty_entry(&dir, &day),
+        })
+        .await;
         if let Err(e) = cleaned {
             tracing::warn!(entry = %entry_id, error = %e, "a restored trash entry's record stays");
         }

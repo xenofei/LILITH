@@ -115,6 +115,10 @@ pub enum StoreError {
     GitBusy,
     ReadOnly,
     NeedsRepair(WsPath),
+    /// A manifest that doesn't parse in an asset folder a trash would move from: the locks it
+    /// may hold can't be read, so nothing under its folder is moved (`manifest.needs_repair`,
+    /// its own message; re-review N-3).
+    LocksUnreadable(WsPath),
     YamlUnsupported(String),
     VersionExists(String),
     /// A status change the status machine refuses (CORE-048), with why.
@@ -224,7 +228,7 @@ impl StoreError {
             StoreError::Locked(path) => (&STORE_LOCKED, Some(json!({ "path": path.as_str() }))),
             StoreError::GitBusy => (&STORE_GIT_BUSY, None),
             StoreError::ReadOnly => (&WORKSPACE_READ_ONLY, None),
-            StoreError::NeedsRepair(path) => (
+            StoreError::NeedsRepair(path) | StoreError::LocksUnreadable(path) => (
                 &MANIFEST_NEEDS_REPAIR,
                 Some(json!({ "path": path.as_str() })),
             ),
@@ -305,6 +309,12 @@ impl std::fmt::Display for StoreError {
             StoreError::NeedsRepair(path) => write!(
                 f,
                 "`{path}` needs repair: it can't be edited as a manifest, so it was left as it is"
+            ),
+            StoreError::LocksUnreadable(path) => write!(
+                f,
+                "`{path}` doesn't parse, so the locks it may hold can't be read, and nothing \
+                 under its folder is moved to the trash. Fix it by hand or take it back from git \
+                 (project.status lists it), then try again."
             ),
             StoreError::YamlUnsupported(why) => write!(f, "this YAML edit isn't supported: {why}"),
             StoreError::VersionExists(v) => write!(f, "version {v} already exists"),

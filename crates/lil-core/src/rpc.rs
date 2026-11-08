@@ -50,7 +50,8 @@
 //!   ([`Router::panicked`]).
 //!
 //! **An app's cap prompts** (APP-029; Appendix G "Connections"). A `ui:*` session's pending
-//! cap confirmations end with its app's process, not with one of its connections, so a
+//! cap confirmations, and the `asset.trash` confirmations its own calls made (CORE-157; Task 10
+//! review M5), end with its app's process, not with one of its connections, so a
 //! reconnect keeps them: the process is opened at the hello, and when the connection closes
 //! the confirmations are cancelled once the process exits. They are cancelled at once instead
 //! when there is no process to wait for (it could not be opened), and on a switch: the same

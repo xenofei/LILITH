@@ -15,6 +15,7 @@
 //! | `asset.mark` | write | `{project?, asset_id, run_id?, take?, file?, tags?, add_tags?, remove_tags?, rating?, label?, flag?, review_view?}` | `{tags, rating, label, take?: {run_id, take, flag, rating}}` |
 //! | `asset.accept_move` | write | `{project?, asset_id}` | `{project, asset_id, redirect: {from, to}, warnings}` |
 //! | `asset.make_independent` | write | `{project?, asset_id}` | `{creation_uuid}` |
+//! | `asset.trash` | destructive | `{project?, asset_id}` | `{entry_id, dependents: [ref]}` |
 //!
 //! - **`asset.import`, `copy`**: an asset without a manifest gets `Manifest::new` with a fresh
 //!   `creation_uuid` (CORE-047). Each file (an absolute path) is copied into a staging handle
@@ -105,6 +106,30 @@
 //!   `make_independent` publishes `{kind: "manifest"}` on the asset's topic. Neither runs by
 //!   itself: no reconcile, watch event or restart changes a moved or copied asset.
 //!
+//! - **`asset.trash`** (CORE-157, CORE-037; P4b-R9, P4b-R24; Appendix H "Trash an asset")
+//!   moves exactly the folder `projects/<project>/assets/<asset_id>/` its arguments name (the
+//!   project falls back to the call's, as the confirmation's `files` does) to the trash as one
+//!   entry with `Store::trash` and the reason `asset.trash`, sealed versions included and
+//!   unmodified. It never follows a redirect: a name that isn't a live asset folder is refused
+//!   as the resolver answers for it (`asset.unknown`, also for a name that only redirects
+//!   elsewhere; `asset.trashed`; `ref.redirect_broken`), and nothing moves. Its meta
+//!   ([`trash_meta`]) is `ConfirmPolicy::EveryCaller` (it asks every caller, your own app too),
+//!   the touch `projects/{project}/assets/{asset_id}/` (`delete`) and its facts: the asset's
+//!   dependents (the index's edges to it and to every name that resolves to it, as
+//!   `asset.get`'s `used_by`; `<project>/<asset_id>`, full and sorted) and its sealed versions,
+//!   always present (empty lists for none). The facts function also checks, before the
+//!   confirmation is made and again at the approved retry, that the asset is live and not in
+//!   use (`tools::services::AssetUse`): an empty `AssetServices.asset_use` slot is
+//!   `state.unavailable`, an `in_use` error refuses with that error, and a job, a sign-off or a
+//!   document hold is `asset.in_use` (`data: {by: "job" | "signoff" | "hold"}`). An asset whose
+//!   manifest `locks` paths is trashed too, its locked files moved unmodified (owner decision
+//!   2026-11-07, the one exception to ruling P3-R7): the facts list them (`locked`, the
+//!   manifest's entries as workspace-relative paths, sorted), so the card warns, and they are
+//!   part of the facts' hash. The run checks liveness and use once more, then takes the asset's version lock without waiting (held: `asset.in_use`,
+//!   a sign-off), and under it recomputes the dependents, moves the folder and returns them as
+//!   found at the move. It publishes `{kind: "trashed", entry_id}` on the asset's topic and
+//!   `{kind: "trashed", asset_id, entry_id}` on `project:<slug>`.
+//!
 //! Every status change goes through `lil_schema::change_status`, which logs one status-log
 //! entry in the same manifest edit, `by` the caller (`pipeline::status_by`).
 //!
@@ -118,9 +143,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use lil_protocol::app::{ConfirmFacts, TouchAccess};
 use lil_protocol::codes::{
-    ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, MANIFEST_NEEDS_REPAIR, PARAMS_INVALID, REF_HASH_MISMATCH,
-    REF_INVALID, STATUS_INVALID_TRANSITION,
+    ASSET_IN_USE, ASSET_IN_USE_MESSAGE, ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, MANIFEST_NEEDS_REPAIR,
+    PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID, STATE_UNAVAILABLE, STATUS_INVALID_TRANSITION,
+    WORKSPACE_REQUIRED,
 };
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
@@ -132,7 +159,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::registry::{CallCtx, Registry, typed_tool};
+use super::registry::{
+    CallCtx, ConfirmPolicy, Registry, ToolMeta, TouchDecl, facts_fn, typed_tool,
+};
+use super::services::{AssetServices, InUse};
+use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::{
     Chosen, HandOff, RecordBranch, RecordPlan, asset_topic, chosen_files, plan_signoff,
@@ -144,8 +175,8 @@ use crate::projects::{
     ProjectFile, REDIRECTS_YAML, Resolver, project_yaml_path, read_project, unknown_project,
 };
 use crate::store::{
-    CommitOp, ManifestEdit, OutputMove, SNAPSHOT, SealRequest, Store, StoreError, Written, WsPath,
-    path_key,
+    ASSET_TRASH_REASON, CommitOp, ManifestEdit, OutputMove, SNAPSHOT, SealRequest, Store,
+    StoreError, Written, WsPath, path_key,
 };
 use crate::workspace::OpenWorkspace;
 
@@ -192,6 +223,14 @@ const MAKE_INDEPENDENT_DESCRIPTION: &str = "Make a copied asset folder independe
     (project.status lists folders that share a creation UUID under duplicates): gives it a new \
     creation_uuid and sets its manifest's project and asset_id to its folder; the other folder \
     keeps its UUID. On an asset that isn't such a copy it fails with repair.not_needed.";
+const TRASH_DESCRIPTION: &str = "Move a whole asset to the trash: its folder, sealed versions \
+    included, as one trash entry that trash.restore brings back (with to, under another asset \
+    id, old refs following through a redirect). It always asks for your confirmation, also from \
+    your own app, listing what uses the asset and its sealed versions. Refused with \
+    asset.in_use while a job, a sign-off or an open document uses the asset. The name must be \
+    the asset's own folder: a redirect is never followed. To retire an asset but keep it \
+    working, deprecate it instead.";
+
 const PIN_INPUT_DESCRIPTION: &str = "Pin an input of an asset, so a newer version of it \
     doesn't make the asset stale: ref is a link (<asset_id>@<v>, proj:<slug>/<asset_id>@<v>, \
     lib:<item>@<v>, style@<n>) or a lil:// ref to a sealed version; its target need not exist \
@@ -827,8 +866,18 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
 /// now reach this asset), or that it couldn't be checked: for an import that creates the asset
 /// and for an accepted move onto that name.
 async fn takeover_warnings(a: &Asset) -> Vec<String> {
-    let name = (a.project.clone(), a.asset_id.clone());
-    match read_redirects(a.store()).await {
+    takeover_warnings_for(a.store(), &a.project, &a.asset_id).await
+}
+
+/// [`takeover_warnings`] for `project`/`asset_id` of `store`: also for a whole asset restored
+/// under a new id (`trash.restore {to}`, audit L-2).
+pub(super) async fn takeover_warnings_for(
+    store: &Store,
+    project: &str,
+    asset_id: &str,
+) -> Vec<String> {
+    let name = (project.to_string(), asset_id.to_string());
+    match read_redirects(store).await {
         Ok(redirects) if redirects.iter().any(|r| r.from == name) => vec![format!(
             "Old refs to {} will now reach this asset ({REDIRECTS_YAML}).",
             name_of(&name)
@@ -2086,12 +2135,273 @@ async fn pin_input(ctx: &CallCtx, args: PinArgs) -> Result<(PinResult, String), 
     Ok((PinResult { pinned_inputs }, summary))
 }
 
+// ---------------------------------------------------------------------------------------------
+// asset.trash (CORE-157).
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TrashResult {
+    entry_id: String,
+    /// What used the asset when it moved (`<project>/<asset_id>`, sorted).
+    dependents: Vec<String>,
+}
+
+/// The project and asset id an `asset.trash` call names: `project`, else the call's project
+/// (as the confirmation's touch fills `{project}`), both checked as names.
+fn trash_names(args: &Value, call_project: Option<&str>) -> Result<(String, String), ErrorBody> {
+    let invalid = |why: String| ErrorBody::new(&PARAMS_INVALID, why, "");
+    let project = args
+        .get("project")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| call_project.map(str::to_string))
+        .unwrap_or_else(|| crate::projects::DEFAULT_PROJECT.to_string());
+    let asset_id = args
+        .get("asset_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !is_slug(&project) {
+        return Err(invalid(format!("{project:?} is not a project slug")));
+    }
+    if !is_asset_id(&asset_id) {
+        return Err(invalid(format!("{asset_id:?} is not an asset id")));
+    }
+    Ok((project, asset_id))
+}
+
+/// Refuses unless `projects/<project>/assets/<asset_id>/` is a live asset folder: the
+/// resolver's answer for the name (`asset.unknown`, `asset.trashed`, `ref.redirect_broken`,
+/// …), and `asset.unknown` for a name that is no folder but redirects to one (a redirect is
+/// never followed, ruling L4).
+async fn live_folder(open: &OpenWorkspace, project: &str, asset_id: &str) -> Result<(), ErrorBody> {
+    let resolver = Resolver::load(&open.index, &open.store).await?;
+    let resolution = resolver.resolve_name(project, asset_id).await?;
+    if resolution.redirected_from.is_empty() {
+        return Ok(());
+    }
+    let mut e = ErrorBody::new(
+        &ASSET_UNKNOWN,
+        format!(
+            "There is no asset folder `{asset_id}` in the project `{project}`: that name only \
+             redirects to {}/{}. asset.trash moves an asset's own folder and never follows a \
+             redirect; name that asset to trash it.",
+            resolution.project, resolution.asset_id
+        ),
+        "",
+    );
+    e.data = Some(json!({
+        "project": project,
+        "asset_id": asset_id,
+        "redirects_to": format!("{}/{}", resolution.project, resolution.asset_id),
+    }));
+    Err(e)
+}
+
+/// `asset.in_use` naming what uses the asset.
+fn in_use_error(by: InUse) -> ErrorBody {
+    let by = match by {
+        InUse::Job => "job",
+        InUse::Signoff => "signoff",
+        InUse::Hold => "hold",
+    };
+    let mut e = ErrorBody::new(&ASSET_IN_USE, ASSET_IN_USE_MESSAGE, "");
+    e.data = Some(json!({ "by": by }));
+    e
+}
+
+/// `state.unavailable` for an empty `asset_use` slot (fail closed, PF-11).
+fn unwired() -> ErrorBody {
+    ErrorBody::new(
+        &STATE_UNAVAILABLE,
+        "Whether this asset is in use can't be told yet (the core is still starting), so it \
+         isn't moved to the trash; retry in a moment.",
+        "",
+    )
+}
+
+/// The in-use check through the wired [`crate::tools::AssetUse`] (P4b-R24, PF-11): an empty
+/// slot is `state.unavailable` (fail closed), its error refuses, and a use is `asset.in_use`.
+async fn not_in_use(
+    services: &AssetServices,
+    open: &OpenWorkspace,
+    project: &str,
+    asset_id: &str,
+) -> Result<(), ErrorBody> {
+    let Some(asset_use) = services.asset_use.get().cloned() else {
+        return Err(unwired());
+    };
+    match asset_use.in_use(open, project, asset_id).await? {
+        None => Ok(()),
+        Some(by) => Err(in_use_error(by)),
+    }
+}
+
+/// The asset's dependents (`asset.get`'s `used_by`: the index's edges to it and to every name
+/// that resolves to it), as `<project>/<asset_id>`, deduplicated and sorted. It waits for the
+/// index's first run, as every reader of index data does (audit M-1): during a cold rebuild the
+/// edges aren't there yet, and "no dependents" would be wrong. An index whose first run failed
+/// refuses with its error (`store.io`), never "none".
+async fn dependents_of(
+    open: &OpenWorkspace,
+    project: &str,
+    asset_id: &str,
+) -> Result<Vec<String>, ErrorBody> {
+    open.index
+        .ready_result()
+        .await
+        .map_err(|e| e.to_error(""))?;
+    let resolver = Resolver::load(&open.index, &open.store).await?;
+    let found: BTreeSet<String> = resolver
+        .edges_to(project, asset_id)
+        .await?
+        .into_iter()
+        .map(|e| format!("{}/{}", e.from_project, e.from_asset))
+        .collect();
+    Ok(found.into_iter().collect())
+}
+
+/// `asset.trash`'s facts (Appendix H): every dependent and every sealed version, after the
+/// liveness and in-use checks (module docs). Always `Some`.
+async fn trash_facts(
+    services: &AssetServices,
+    i: &ConfirmInput<'_>,
+) -> Result<Option<ConfirmFacts>, ErrorBody> {
+    let Some(open) = i.workspace else {
+        return Err(ErrorBody::new(
+            &WORKSPACE_REQUIRED,
+            "asset.trash works in a workspace, and the session has none.",
+            "",
+        ));
+    };
+    let (project, asset_id) = trash_names(i.args, i.project)?;
+    // An unwired slot refuses before anything else is looked at (fail closed, PF-11).
+    if services.asset_use.get().is_none() {
+        return Err(unwired());
+    }
+    live_folder(open, &project, &asset_id).await?;
+    not_in_use(services, open, &project, &asset_id).await?;
+    let locked = locked_paths(open, &project, &asset_id).await?;
+    let dependents = dependents_of(open, &project, &asset_id).await?;
+    let versions = open
+        .store
+        .versions(&project, &asset_id)
+        .await
+        .map_err(|e| e.to_error(""))?
+        .into_iter()
+        .map(|v| v.version.to_string())
+        .collect();
+    Ok(Some(ConfirmFacts {
+        dependents_total: u32::try_from(dependents.len()).unwrap_or(u32::MAX),
+        dependents,
+        versions,
+        locked_total: u32::try_from(locked.len()).unwrap_or(u32::MAX),
+        locked,
+    }))
+}
+
+/// The paths the asset's manifests `locks`, workspace-relative under the folder as it is now,
+/// sorted and deduplicated (owner decision 2026-11-07: the card's warning). Every manifest of
+/// the folder counts, found as the index finds them (`Store::asset_locks`), so a folder renamed
+/// outside the suite still warns (review I-1). A manifest that doesn't parse refuses
+/// (`manifest.needs_repair`): the facts would be wrong.
+async fn locked_paths(
+    open: &OpenWorkspace,
+    project: &str,
+    asset_id: &str,
+) -> Result<Vec<String>, ErrorBody> {
+    let folder = format!("projects/{project}/assets/{asset_id}");
+    let found: BTreeSet<String> = open
+        .store
+        .asset_locks(&folder, None)
+        .await
+        .map_err(|e| e.to_error(""))?
+        .into_iter()
+        .flat_map(|(_, locks)| locks)
+        .map(|entry| {
+            let entry = entry.replace('\\', "/");
+            format!("{folder}/{}", entry.trim_start_matches('/'))
+        })
+        .collect();
+    Ok(found.into_iter().collect())
+}
+
+/// `asset.trash`'s core-internal meta (P4b-R9, P4b-R33; Appendix H): it asks every caller, it
+/// touches the asset's folder (`delete`), and its facts are [`trash_facts`].
+fn trash_meta(services: &AssetServices) -> ToolMeta {
+    let services = services.clone();
+    ToolMeta {
+        confirm_policy: ConfirmPolicy::EveryCaller,
+        touches: vec![TouchDecl {
+            template: "projects/{project}/assets/{asset_id}/",
+            access: TouchAccess::Delete,
+        }],
+        facts: Some(facts_fn(move |i| {
+            let services = services.clone();
+            Box::pin(async move { trash_facts(&services, i).await })
+        })),
+    }
+}
+
+async fn trash(
+    ctx: &CallCtx,
+    services: &AssetServices,
+    args: AssetArgs,
+) -> Result<(TrashResult, String), ErrorBody> {
+    let a = asset_of(ctx, args.project, &args.asset_id).await?;
+    let open = a.open.clone();
+    // Checked again at the run: the approved retry's facts check passed moments ago, but the
+    // run is what moves (P4b-R24).
+    live_folder(&open, &a.project, &a.asset_id)
+        .await
+        .map_err(|e| traced(ctx, e))?;
+    not_in_use(services, &open, &a.project, &a.asset_id)
+        .await
+        .map_err(|e| traced(ctx, e))?;
+    // The version lock without waiting: held means a sign-off (or a repair) is working on the
+    // asset now.
+    let guard = a
+        .store()
+        .version_lock(&a.project, &a.asset_id)
+        .try_lock_owned()
+        .map_err(|_| traced(ctx, in_use_error(InUse::Signoff)))?;
+    // The dependents at the move (Task 10 audit L6): one added since the facts were checked
+    // is reported here.
+    let dependents = dependents_of(&open, &a.project, &a.asset_id)
+        .await
+        .map_err(|e| traced(ctx, e))?;
+    let record = a
+        .store()
+        .trash(&a.dir, ASSET_TRASH_REASON)
+        .await
+        .map_err(|e| e.to_error(&ctx.trace_id))?;
+    drop(guard);
+    ctx.events.publish(
+        &a.topic(),
+        json!({"kind": "trashed", "entry_id": record.entry_id}),
+    );
+    ctx.events.publish(
+        &format!("project:{}", a.project),
+        json!({"kind": "trashed", "asset_id": a.asset_id, "entry_id": record.entry_id}),
+    );
+    let summary = format!(
+        "moved {} to the trash (entry {})",
+        a.asset_id, record.entry_id
+    );
+    Ok((
+        TrashResult {
+            entry_id: record.entry_id,
+            dependents,
+        },
+        summary,
+    ))
+}
+
 /// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,
-/// `asset.pin_input`, `asset.deprecate`, `asset.mark`, `asset.accept_move` and
-/// `asset.make_independent` (module `workspace`). `services` are the late-bound asset services
-/// (P4b-R32); none of these tools uses them yet (Tasks 11 and 12 do).
-pub fn register_asset_tools(reg: &mut Registry, services: &super::AssetServices) {
-    let _ = services;
+/// `asset.pin_input`, `asset.deprecate`, `asset.mark`, `asset.accept_move`,
+/// `asset.make_independent` and `asset.trash` (module `workspace`). `services` are the
+/// late-bound asset services (P4b-R32): `asset.trash` checks its asset's use through them.
+pub fn register_asset_tools(reg: &mut Registry, services: &AssetServices) {
     reg.register(typed_tool(
         "asset.import",
         IMPORT_DESCRIPTION,
@@ -2155,4 +2465,18 @@ pub fn register_asset_tools(reg: &mut Registry, services: &super::AssetServices)
         WORKSPACE_MODULE,
         |ctx, args: AssetArgs| Box::pin(make_independent(ctx, args)),
     ));
+    let trashing = services.clone();
+    reg.register_with(
+        typed_tool(
+            "asset.trash",
+            TRASH_DESCRIPTION,
+            EffectClass::Destructive,
+            WORKSPACE_MODULE,
+            move |ctx, args: AssetArgs| {
+                let services = trashing.clone();
+                Box::pin(async move { trash(ctx, &services, args).await })
+            },
+        ),
+        trash_meta(services),
+    );
 }

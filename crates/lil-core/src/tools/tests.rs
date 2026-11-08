@@ -1016,6 +1016,66 @@ fn the_repair_tools_are_pinned() {
     }
 }
 
+/// The plan-4b trash rows (CORE-157, CORE-037; P4b-R9; Appendix H "Trash an asset"):
+/// `asset.trash` is destructive, in `workspace`, takes `{project?, asset_id}`, asks every
+/// caller, touches the asset's folder (`delete`) and has facts; `trash.restore` takes
+/// `{entry_id, scope?, to?}`.
+#[test] // spec: CORE-157, CORE-037, APP-115, CORE-058
+fn the_trash_tools_are_pinned() {
+    use lil_protocol::app::TouchAccess;
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
+    let find = |name: &str| {
+        reg.descriptors()
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} is registered"))
+    };
+    let trash = find("asset.trash");
+    assert_eq!(
+        (trash.effect, trash.module.as_str()),
+        (EffectClass::Destructive, WORKSPACE_MODULE)
+    );
+    let props: Vec<&String> = trash.input_schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(props, ["project", "asset_id"]);
+    assert_eq!(trash.input_schema["required"], json!(["asset_id"]));
+    assert_eq!(trash.input_schema["additionalProperties"], false);
+    let meta = reg.meta("asset.trash");
+    assert_eq!(meta.confirm_policy, ConfirmPolicy::EveryCaller);
+    assert_eq!(
+        meta.touches,
+        [TouchDecl {
+            template: "projects/{project}/assets/{asset_id}/",
+            access: TouchAccess::Delete,
+        }]
+    );
+    assert!(meta.facts.is_some());
+    // Only `asset.trash` (and the test tool) asks every caller.
+    for d in reg.descriptors() {
+        let every = reg.meta(&d.name).confirm_policy == ConfirmPolicy::EveryCaller;
+        assert_eq!(every, d.name == "asset.trash", "{}", d.name);
+    }
+
+    let restore = find("trash.restore");
+    assert_eq!(
+        (restore.effect, restore.module.as_str()),
+        (EffectClass::Write, WORKSPACE_MODULE)
+    );
+    let props: Vec<&String> = restore.input_schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(props, ["entry_id", "scope", "to"]);
+    assert_eq!(restore.input_schema["required"], json!(["entry_id"]));
+    assert_eq!(restore.input_schema["additionalProperties"], false);
+}
+
 /// The plan-4b `ref.resolve` row (CORE-146, P4b-R25; Appendix H "`ref.resolve`"): it reads, in
 /// `workspace`, and takes `ref` or `path`, nothing else.
 #[test] // spec: ARCH-125, APP-019, CORE-146, CORE-058
@@ -1123,9 +1183,9 @@ fn fill_touches_fills_templates_from_the_arguments() {
 }
 
 /// The asset services' slots (P4b-R32) left empty change nothing for the tools there are:
-/// every tool `core_registry` registers is listed and has its meta (only the test tool that
-/// asks every caller has one), and a read tool and a write tool of the asset tools run in a
-/// workspace as before.
+/// every tool `core_registry` registers is listed and has its meta (only the tools that ask
+/// every caller have one: the test tool and `asset.trash`), and a read tool and a write tool
+/// of the asset tools run in a workspace as before.
 #[tokio::test] // spec: CORE-014, CORE-152, CORE-157
 async fn unwired_services_leave_every_existing_tool_working() {
     let fx = fixture(&[]);
@@ -1142,7 +1202,7 @@ async fn unwired_services_leave_every_existing_tool_working() {
     }
     for name in &all {
         let meta = reg.meta(name);
-        let special = name == "test.ask_everyone";
+        let special = name == "test.ask_everyone" || name == "asset.trash";
         assert_eq!(
             meta.confirm_policy == ConfirmPolicy::EveryCaller,
             special,

@@ -41,12 +41,16 @@ pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
 pub use fsops::ensure_dir;
 pub use git_gate::{GIT_WAIT, GitGate};
 pub use logs::{LogKind, append_loose_usage};
+pub use order::asset_manifests;
 pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};
 pub use paths::{WsPath, path_key, writable};
 pub use personal::{Personal, list_files};
 pub use staging::{STAGING_DIR, StagingHandle};
 pub use suite_toml::{register_workspace, set_caps, set_desktop};
-pub use trash::{MaintenanceReport, REJECTED_KEEP_DAYS, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord};
+pub use trash::{
+    ASSET_TRASH_REASON, MaintenanceReport, REJECTED_KEEP_DAYS, RestoreRewrite, TRASH_DIR,
+    TRASH_KEEP_DAYS, TrashRecord,
+};
 pub use versions::{SNAPSHOT, SealRequest, Sealed, VersionDir};
 pub use write::{
     Access, ChangeKind, ChangeSink, Expect, Pending, Phase, RecoveryReport, RowsFuture, Step,

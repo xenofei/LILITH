@@ -154,12 +154,24 @@ pub struct Touch {
 }
 
 /// A confirmation's facts (Appendix H "Trash an asset"): the refs of the dependents shown (at
-/// most 50), how many there are in all, and the sealed versions.
+/// most 50), how many there are in all, and the sealed versions; and (owner decision
+/// 2026-11-07) the locked paths the asset holds, for the card's warning "This asset holds N
+/// locked files: <paths>", at most 50 shown, with how many there are in all. `locked` and
+/// `locked_total` are absent when there are none.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ConfirmFacts {
     pub dependents: Vec<String>,
     pub dependents_total: u32,
     pub versions: Vec<String>,
+    /// Workspace-relative paths its manifest `locks`, sorted (at most 50).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locked: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub locked_total: u32,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// `app/confirmations.list` result.

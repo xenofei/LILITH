@@ -16,7 +16,7 @@
 //! | `test.trash` | write | `{path}` | `{entry_id}`, through `Store::trash` |
 //! | `test.watch_fence` | read | `{name}` | `{}` once the workspace's first reconcile has finished and the watcher has handled `<ws>\.lilith\fence\<name>` |
 //! | `test.settings` | read | `{project?, settings?}` | the call's resolved `Settings`, `{values, sources}` |
-//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?, estimate_key?, fail_message?}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
+//! | `test.job` | write | `{lane, priority?, gated?, fail?: "transient_2" \| "final" \| "disk_full", vram_need_mib?, expected_secs?, engine?: "comfyui", external_side_effects?, phases?, silent_secs?, batch?, estimate_key?, fail_message?, asset?: {project, asset_id}}` | `{job}`: a job of kind `test.job`; with `batch: n`, `{jobs}`: `n` of them sharing one `batch_id` |
 //! | `test.job_release` | write | `{job_id}` | `{}`: a gated `test.job` goes on |
 //! | `test.hw_tick` | write | `{samples}` (1-3600) | the `Snapshot` after `samples` samples of the fake hardware (`LIL_TEST_FAKE_HW`); the core samples only when called |
 //! | `test.desktop` | write | `{fullscreen?: "no" \| "d3d" \| "busy" \| "presentation", foreground?: "suite" \| "other", shortcut?: bool, handlers?: bool, toasts?: "ready" \| "not_yet_shown" \| "disabled_for_app" \| "disabled_for_user" \| "disabled_by_policy" \| "elevated" \| "no_platform", post_fails?: bool, clear?: bool}` | `{toasts: [{op: "post" \| "remove", tag, group, title?, body?, launch?, silent?, xml?}], power_held, polls}`: sets the test channel's `FakeDesktop` and reads what it recorded (plan 4a's test contract); the server registers it |
@@ -33,6 +33,8 @@
 //! (the stall rule's test, ARCH-072), and `batch: n` (1–500) submits `n` such jobs as one
 //! batch (P4a-R13), each of which `job.retry` runs again alone. Its estimate key is its
 //! `estimate_key` argument, default `"test"` (Appendix G), for the tool and the handler alike.
+//! With `asset` (plan 4b's test contract) the job's stored arguments, project and asset id name
+//! that asset, so while it is unfinished `asset.trash` of it is `asset.in_use`.
 //!
 //! `test.comfy_submit` (a `comfy.prompt` job) lives with the engines (`engines::tools`), which
 //! the server registers on test channels.
@@ -303,6 +305,18 @@ struct TestJobArgs {
     /// The message of a `final` failure (default "test.job was asked to fail").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fail_message: Option<String>,
+    /// The asset the job's stored arguments name (plan 4b, Task 11): while it is unfinished,
+    /// `asset.trash` of that asset is refused with `asset.in_use`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    asset: Option<TestJobAsset>,
+}
+
+/// `test.job`'s `asset`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TestJobAsset {
+    project: String,
+    asset_id: String,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -353,8 +367,12 @@ async fn test_job(
             .unwrap_or_else(|| Priority::for_caller(&ctx.session.caller, false)),
         module: TEST_MODULE.to_string(),
         args: raw.clone(),
-        project: ctx.project.clone(),
-        asset_id: None,
+        project: args
+            .asset
+            .as_ref()
+            .map(|a| a.project.clone())
+            .or_else(|| ctx.project.clone()),
+        asset_id: args.asset.as_ref().map(|a| a.asset_id.clone()),
         doc_id: None,
         expected_secs: args.expected_secs.unwrap_or(10),
         expected_output_bytes: 0,

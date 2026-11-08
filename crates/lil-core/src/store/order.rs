@@ -93,6 +93,60 @@ pub(super) struct Listed {
     pub(super) path: PathBuf,
 }
 
+/// The manifest files of the asset folder `dir`, as the index finds them (CORE-154):
+/// `<id>.manifest.json` for each of `ids` that is there (in that order), then every other
+/// `*.manifest.json` directly in it, sorted. Files only, never a link (a reparse point that
+/// names another file, or whose tag can't be read). The first is the asset's manifest (a folder
+/// moved, copied or restored under another name keeps its manifest's file name); every one of
+/// them may hold `locks`. The resolver, the restore's re-sealing, `asset.trash`'s card and the
+/// trash's lock refusal all look a folder's manifest up through this.
+///
+/// # Errors
+/// The folder can't be listed (a folder that doesn't exist has none).
+pub fn asset_manifests(probe: &dyn Probe, dir: &Path, ids: &[&str]) -> io::Result<Vec<String>> {
+    const DIRECTORY: u32 = 0x10;
+    const REPARSE_POINT: u32 = 0x400;
+    let is_file = |path: &Path| {
+        probe.identity(path).is_ok_and(|id| {
+            id.attributes & DIRECTORY == 0
+                && (id.attributes & REPARSE_POINT == 0
+                    || probe
+                        .reparse_tag(path)
+                        .is_ok_and(|tag| !tag.is_some_and(lil_platform::fs::is_name_surrogate)))
+        })
+    };
+    let entries = match probe.read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut others = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.to_ascii_lowercase().ends_with(".manifest.json") && is_file(&dir.join(&name)) {
+            others.push(name);
+        }
+    }
+    others.sort();
+    let mut found: Vec<String> = Vec::new();
+    for id in ids {
+        let canonical = format!("{id}.manifest.json");
+        if let Some(i) = others
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&canonical))
+            && !found.iter().any(|f| f.eq_ignore_ascii_case(&canonical))
+        {
+            found.push(others[i].clone());
+        }
+    }
+    for name in others {
+        if !found.iter().any(|f| f.eq_ignore_ascii_case(&name)) {
+            found.push(name);
+        }
+    }
+    Ok(found)
+}
+
 /// The entries of `dir` (none when it doesn't exist). Links are listed as non-folders, so
 /// nothing is ever followed through one.
 pub(super) fn list(dir: &Path) -> io::Result<Vec<Listed>> {

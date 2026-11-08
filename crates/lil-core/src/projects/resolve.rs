@@ -13,8 +13,12 @@
 //!    doesn't parse sorts before any that does), and the next name is resolved the same way,
 //!    to at most 64 redirects;
 //! 3. a name seen twice is `ref.redirect_broken` with `reason: "cycle"` and the names visited
-//!    as `chain` (the repeated name last). A chain that needs a 65th redirect is broken the
-//!    same way: the limit exists to stop loops, and Appendix D's `reason` is closed;
+//!    as `chain` (the repeated name last), unless the trash holds a name of the loop: then
+//!    the loop is where an asset went into the trash, and the answer is `asset.trashed` with
+//!    the newest such entry (ruling T8 A-L1, carried to Task 11: a `trash.restore {to}` round
+//!    trip, A → B and back B → A, then a trash, makes such a loop, and no name of it needs
+//!    repair). A chain that needs a 65th redirect is broken the same way as a loop without a
+//!    trash entry: the limit exists to stop loops, and Appendix D's `reason` is closed;
 //! 4. a name that ends with no live folder and no redirect: the trash is listed (only now,
 //!    once per resolver), and the newest entry whose original path is that asset's folder is
 //!    `asset.trashed` with its `entry_id`; else, after at least one redirect,
@@ -26,8 +30,9 @@
 //! `ref.hash_mismatch` when they differ. A redirect never blocks anything; it is only read.
 //!
 //! [`Resolver::load`] reads the redirects once, and checks liveness on disk once for every
-//! name the file mentions, so [`Resolver::names_resolving_to`] and [`Resolver::broken_from`]
-//! need no I/O. A name the file doesn't mention is checked when it is first resolved.
+//! name the file mentions, so [`Resolver::names_resolving_to`] needs no I/O, and
+//! [`Resolver::broken_from`] lists the trash only when a name loops. A name the file doesn't
+//! mention is checked when it is first resolved.
 //!
 //! **A redirects file that can't be read or parsed** blocks only what needs it: `load` keeps
 //! its error aside ([`Resolver::file_error`]: `manifest.needs_repair` for one that doesn't
@@ -220,34 +225,14 @@ fn on_disk(probe: &dyn Probe, root: &Path, name: &Name) -> bool {
     manifest_in(probe, &dir, a).is_some()
 }
 
-/// The manifest file of the asset folder `dir` (of `asset_id`) as the index finds it:
-/// `<asset_id>.manifest.json`, else the first `*.manifest.json` directly in it; a file, not a
-/// link.
+/// The manifest file of the asset folder `dir` (of `asset_id`) as the index finds it
+/// ([`crate::store::asset_manifests`]: `<asset_id>.manifest.json`, else the first
+/// `*.manifest.json` directly in it; a file, not a link).
 fn manifest_in(probe: &dyn Probe, dir: &Path, asset_id: &str) -> Option<String> {
-    let is_file = |path: &Path| {
-        probe
-            .identity(path)
-            .is_ok_and(|id| id.attributes & DIRECTORY == 0 && !is_link(probe, path, id.attributes))
-    };
-    let canonical = format!("{asset_id}.manifest.json");
-    if is_file(&dir.join(&canonical)) {
-        return Some(canonical);
-    }
-    let mut found: Vec<String> = probe
-        .read_dir(dir)
+    crate::store::asset_manifests(probe, dir, &[asset_id])
         .ok()?
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .ends_with(".manifest.json")
-                && is_file(&e.path())
-        })
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    found.sort();
-    found.into_iter().next()
+        .into_iter()
+        .next()
 }
 
 /// `names`' liveness, checked on a blocking thread.
@@ -496,6 +481,11 @@ impl<'a> Resolver<'a> {
 
     /// The trash entry holding `name`'s folder, the newest when several do.
     async fn trash_entry(&self, name: &Name) -> Result<Option<String>, ErrorBody> {
+        self.trash_entry_of_any(std::slice::from_ref(name)).await
+    }
+
+    /// The newest trash entry holding the folder of one of `names`.
+    async fn trash_entry_of_any(&self, names: &[Name]) -> Result<Option<String>, ErrorBody> {
         let list = self
             .trash
             .get_or_try_init(|| async {
@@ -503,18 +493,30 @@ impl<'a> Resolver<'a> {
                 self.store.trash_list().await.map_err(|e| e.to_error(""))
             })
             .await?;
-        let folder = format!("projects/{}/assets/{}", name.0, name.1);
+        let folders: Vec<String> = names
+            .iter()
+            .map(|n| format!("projects/{}/assets/{}", n.0, n.1))
+            .collect();
         Ok(list
             .iter()
             .enumerate()
             .filter(|(_, r)| {
-                r.original_path
+                let path = r
+                    .original_path
                     .trim_end_matches(['/', '\\'])
-                    .replace('\\', "/")
-                    .eq_ignore_ascii_case(&folder)
+                    .replace('\\', "/");
+                folders.iter().any(|f| path.eq_ignore_ascii_case(f))
             })
             .max_by_key(|(i, r)| (instant(&r.moved_utc), *i))
             .map(|(_, r)| r.entry_id.clone()))
+    }
+
+    /// The names of the loop a [`Walk::Cycle`] chain ends in: from the first visit of the
+    /// repeated name to just before its second.
+    fn loop_of(chain: &[Name]) -> &[Name] {
+        let repeat = chain.last().expect("a chain is never empty");
+        let first = chain.iter().position(|n| n == repeat).unwrap_or(0);
+        &chain[first..chain.len() - 1]
     }
 
     /// Resolves `project`/`asset_id` (module docs).
@@ -545,6 +547,10 @@ impl<'a> Resolver<'a> {
                 })
             }
             Walk::Cycle(chain) => {
+                // A loop through a trashed name ends in the trash (module docs, step 3).
+                if let Some(entry) = self.trash_entry_of_any(Self::loop_of(&chain)).await? {
+                    return Err(trashed(&entry));
+                }
                 let repeat = name_of(chain.last().expect("a chain is never empty"));
                 Err(broken(
                     &chain,
@@ -613,15 +619,24 @@ impl<'a> Resolver<'a> {
 
     /// The redirect entries of `project` whose name loops or needs a 65th redirect, as
     /// `registry/redirects.yaml#<from>`, sorted (`project.status.needs_repair`). A `from` with
-    /// a live folder isn't followed, so it never is.
-    pub fn broken_from(&self, project: &str) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .newest
-            .keys()
-            .filter(|from| from.0 == project)
-            .filter(|from| matches!(self.walk(from), Walk::Cycle(_) | Walk::TooLong(_)))
-            .map(|from| format!("{REDIRECTS_YAML}#{}", name_of(from)))
-            .collect();
+    /// a live folder isn't followed, so it never is; nor is a loop through a trashed name,
+    /// which resolves to `asset.trashed` (module docs, step 3). When the trash can't be listed,
+    /// such a loop is listed.
+    pub async fn broken_from(&self, project: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for from in self.newest.keys().filter(|from| from.0 == project) {
+            let broken = match self.walk(from) {
+                Walk::TooLong(_) => true,
+                Walk::Cycle(chain) => !matches!(
+                    self.trash_entry_of_any(Self::loop_of(&chain)).await,
+                    Ok(Some(_))
+                ),
+                Walk::Live(_) | Walk::DeadEnd(_) => false,
+            };
+            if broken {
+                out.push(format!("{REDIRECTS_YAML}#{}", name_of(from)));
+            }
+        }
         out.sort();
         out
     }
