@@ -1086,16 +1086,33 @@ impl Confirm {
     }
 
     /// Learns the pending confirmations of `db` (the suite database, or an open workspace's),
-    /// as a core does at start: they survive a restart.
+    /// as a core does at start: an agent's survive a restart (the agent retries with its
+    /// token). A pending one a `ui:*` session made that this core doesn't know of (a cap prompt,
+    /// an `EveryCaller` question) was made in an earlier core run, whose sessions ended with it:
+    /// it is cancelled and published as `cancelled` (audit L-3), as its app's exit would have
+    /// done. Returns how many stay pending.
     ///
     /// # Errors
     /// The database failed.
     pub async fn load(&self, db: &StateDb) -> Result<usize, StateError> {
         let rows = store::pending(db).await?;
+        let mut kept = 0;
         for row in &rows {
+            let known = self.tracked().contains_key(&row.id);
+            if row.caller_kind.starts_with("ui:") && !known {
+                let ended =
+                    store::end(db, &row.id, ConfState::Cancelled, None, None, None, None).await?;
+                if let Some(ended) = ended {
+                    tracing::info!(confirmation = %row.id, "an app's confirmation of an earlier core run is cancelled");
+                    lock(&self.ended).add(&row.id);
+                    self.publish("cancelled", &ended);
+                }
+                continue;
+            }
             self.track(row);
+            kept += 1;
         }
-        Ok(rows.len())
+        Ok(kept)
     }
 
     /// `tools` (of `reg`) as `caller` sees them in `tools/list`: with

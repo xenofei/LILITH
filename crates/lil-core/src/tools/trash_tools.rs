@@ -4,7 +4,7 @@
 //! | Tool | Effect | Arguments | `structured` result |
 //! |---|---|---|---|
 //! | `trash.list` | read | `{scope?}` | `{entries: [restore record + scope]}` |
-//! | `trash.restore` | write | `{entry_id, scope?, to?}` | `{path}` |
+//! | `trash.restore` | write | `{entry_id, scope?, to?}` | `{path, warnings?}` |
 //!
 //! A restore record is the entry's `restore.json` (`entry_id`, `original_path`, `moved_utc`,
 //! `purge_after`, `reason`, `sha256`?); `original_path` and the restored `path` are relative
@@ -31,7 +31,9 @@
 //!   manifest to `<to>.manifest.json` and sets its `asset_id` to `to`. A crash after the move
 //!   leaves an asset the index lists as `moved`, which `asset.accept_move` finishes without a
 //!   second redirect. `{kind: "moved", from, to}` is published on the asset's topic at its new
-//!   name and on `project:<p>`;
+//!   name and on `project:<p>`. When `<p>/<to>` is some redirect's `from`, the result's
+//!   `warnings` say old refs to that name will now reach this asset (ARCH-125, as for an import;
+//!   it never blocks);
 //! - a resource file (`<kind>/<id>.json`, under `library/resources/` in a workspace): `to` is
 //!   the new resource id; the file comes back as `<kind>/<to>.json` with `to` as its `id`
 //!   inside, a targeted edit by the `ResourceIds` service `server` wires (`state.unavailable`
@@ -52,6 +54,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::asset_tools::takeover_warnings_for;
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::services::{AssetServices, ResourceIds};
 use super::workspace_tools::WORKSPACE_MODULE;
@@ -133,6 +136,10 @@ struct RestoreArgs {
 struct RestoreResult {
     /// The restored path, relative to the scope's root, with `/` separators.
     path: String,
+    /// ARCH-125's warning for a whole asset restored under a new id that is a redirect's
+    /// `from`, as `asset.import` and `asset.accept_move` give it (audit L-2); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// The scope a call without one works in.
@@ -203,9 +210,10 @@ async fn restore(
     services: &AssetServices,
     args: RestoreArgs,
 ) -> Result<(RestoreResult, String), ErrorBody> {
+    let mut warnings = Vec::new();
     let (restored, scope) = match scope_of(ctx, args.scope) {
         TrashScope::Workspace => {
-            let found = restore_workspace(ctx, services, &args).await;
+            let found = restore_workspace(ctx, services, &args, &mut warnings).await;
             match found {
                 // Without a scope, a personal resource's entry is found too.
                 Err(Refused::Store(StoreError::TrashUnknown(_))) if args.scope.is_none() => (
@@ -244,6 +252,7 @@ async fn restore(
     Ok((
         RestoreResult {
             path: path.as_str().to_string(),
+            warnings,
         },
         summary,
     ))
@@ -328,10 +337,13 @@ fn resource_rewrite(services: &AssetServices, to: &str) -> Result<RestoreRewrite
     }))
 }
 
+/// A workspace restore; a whole asset restored under a new id adds ARCH-125's takeover warning
+/// to `warnings` (audit L-2).
 async fn restore_workspace(
     ctx: &CallCtx,
     services: &AssetServices,
     args: &RestoreArgs,
+    warnings: &mut Vec<String>,
 ) -> Result<WsPath, Refused> {
     let open = ctx
         .workspace()
@@ -392,6 +404,9 @@ async fn restore_workspace(
             ctx.events
                 .publish(&asset_topic(&open.ws.id, &project, to), event.clone());
             ctx.events.publish(&format!("project:{project}"), event);
+            // Old refs to the new name (a redirect's `from`) now reach this asset: warn, as an
+            // import onto it does (ARCH-125). The redirect just written leaves from the old id.
+            warnings.extend(takeover_warnings_for(store, &project, to).await);
             Ok(path)
         }
         EntryKind::Resource => {

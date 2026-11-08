@@ -1833,6 +1833,17 @@ struct AssetFx {
 impl AssetFx {
     /// With `services` wired (or not) as given.
     async fn with(setup: impl FnOnce(&Path), services: AssetServices) -> AssetFx {
+        AssetFx::with_probe(setup, services, Arc::new(SystemProbe), true).await
+    }
+
+    /// [`AssetFx::with`], the store and the index seeing the disk through `probe`; `wait_ready`
+    /// waits for the index's first run (a gated probe may hold it).
+    async fn with_probe(
+        setup: impl FnOnce(&Path),
+        services: AssetServices,
+        probe: Arc<dyn Probe>,
+        wait_ready: bool,
+    ) -> AssetFx {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("asset-trash");
         setup(&ws);
@@ -1848,7 +1859,6 @@ impl AssetFx {
         let clock: Arc<dyn Clock> = FakeClock::new();
         let events = Arc::new(EventBus::new(clock.clone()));
         let ids: Arc<dyn lil_platform::IdSource> = Arc::new(SeqIds::new());
-        let probe: Arc<dyn Probe> = Arc::new(SystemProbe);
         let hub = WorkspaceHub::new(
             env.env.clone(),
             states.clone(),
@@ -1905,7 +1915,11 @@ impl AssetFx {
             states,
             env,
         };
-        fx.open().await.index.ready().await;
+        if wait_ready {
+            fx.open().await.index.ready().await;
+        } else {
+            fx.open().await;
+        }
         fx
     }
 
@@ -2901,9 +2915,11 @@ async fn the_accept_move_refusal_advice_holds_after_asset_trash() {
     assert_eq!(e.code, "repair.not_needed", "{e:?}");
     assert!(
         e.message
-            .contains(&format!("empty trash entry {entry_id} first"))
+            .contains(&format!("in the trash (entry {entry_id})"))
             && e.message
-                .contains("Restoring that entry with trash.restore"),
+                .contains("Restoring that entry with trash.restore puts")
+            && e.message.contains("wait until the trash purges the entry")
+            && !e.message.contains("empty trash entry"),
         "{}",
         e.message
     );
@@ -3784,4 +3800,359 @@ fn a_hold_through_a_junction_out_of_the_folder_counts_as_in_use() {
     );
     let ran = app_trash(&mut app);
     assert_eq!(ran["status"], "ok", "{ran}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 11, audit fix round 1 (M-1, L-1 to L-3; L-4 above, in the accept-move tests).
+// ---------------------------------------------------------------------------------------------
+
+/// A probe that holds the index's walk of one folder (`prop_signal_lamp\prompts`) until
+/// released, or fails its walk of the workspace root. The workspace open walks the tree once
+/// before the index does (recovery and orphans), so the first listing of that folder passes.
+#[derive(Debug, Default)]
+struct GatedIndexWalk {
+    seen: Mutex<u32>,
+    open: Mutex<bool>,
+    opened: Condvar,
+    reached: Mutex<bool>,
+    fail_root: Mutex<Option<PathBuf>>,
+}
+
+impl GatedIndexWalk {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    fn wait_reached(&self) -> bool {
+        let reached = self.reached.lock().unwrap();
+        let (reached, _) = self
+            .opened
+            .wait_timeout_while(reached, DEADLINE, |r| !*r)
+            .unwrap();
+        *reached
+    }
+}
+
+impl Probe for GatedIndexWalk {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        SystemProbe.open_read(path)
+    }
+
+    fn read_dir(&self, dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+        if let Some(root) = self.fail_root.lock().unwrap().as_ref()
+            && dir == root
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        if dir.ends_with(Path::new(LAMP).join("prompts")) && {
+            let mut seen = self.seen.lock().unwrap();
+            *seen += 1;
+            *seen > 1
+        } {
+            *self.reached.lock().unwrap() = true;
+            self.opened.notify_all();
+            let open = self.open.lock().unwrap();
+            let _open = self
+                .opened
+                .wait_timeout_while(open, DEADLINE, |o| !*o)
+                .unwrap();
+        }
+        SystemProbe.read_dir(dir)
+    }
+}
+
+/// Audit M-1: `asset.trash`'s card waits for the index's first run before it reads the
+/// dependents (as every reader of index data does), so a card made during a cold rebuild never
+/// says "used by 0 assets" of a used asset.
+#[tokio::test] // spec: CORE-157
+async fn the_card_waits_for_the_index_before_it_lists_dependents() {
+    let gate = Arc::new(GatedIndexWalk::default());
+    let fake = Arc::new(FakeUse::default());
+    let services = AssetServices::unwired();
+    let wired: Arc<dyn AssetUse> = fake.clone();
+    let _ = services.asset_use.set(wired);
+    let fx = AssetFx::with_probe(lamp_uses_crane, services, gate.clone(), false).await;
+    let waiter = gate.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || waiter.wait_reached())
+            .await
+            .unwrap(),
+        "the index's walk reached the gate"
+    );
+    let app = fx.app();
+    let p = {
+        let mut asked =
+            std::pin::pin!(fx.call_as(&app, "asset.trash", trash_args(CRANE), Some("k-index")));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut asked)
+                .await
+                .is_err(),
+            "the question waits for the index"
+        );
+        gate.release();
+        pending_of(&asked.await)
+    };
+    assert_eq!(
+        fx.pending_view(&p.confirmation_id).await["facts"]["dependents"],
+        json!([format!("{P4}/{LAMP}")])
+    );
+    fx.shutdown().await;
+}
+
+/// Audit M-1: an index whose first run failed refuses `asset.trash` with that error, never "no
+/// dependents"; nothing is asked and nothing moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-157
+async fn asset_trash_is_refused_while_the_index_cant_be_built() {
+    let gate = Arc::new(GatedIndexWalk::default());
+    gate.release();
+    let fake = Arc::new(FakeUse::default());
+    let services = AssetServices::unwired();
+    let wired: Arc<dyn AssetUse> = fake.clone();
+    let _ = services.asset_use.set(wired);
+    let probe = gate.clone();
+    let fx = AssetFx::with_probe(
+        move |ws| {
+            lamp_uses_crane(ws);
+            let canonical = std::fs::canonicalize(ws).unwrap();
+            let text = canonical.to_string_lossy().into_owned();
+            *probe.fail_root.lock().unwrap() =
+                Some(PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)));
+        },
+        services,
+        gate.clone(),
+        false,
+    )
+    .await;
+    let e = err_of(
+        &fx.call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&tkey()))
+            .await,
+        "an index that can't be built",
+    );
+    assert_eq!(e.code, "store.io", "{e:?}");
+    assert_eq!(fx.pending_count().await, 0, "nothing was asked");
+    assert!(asset_path(&fx.ws, CRANE).is_dir());
+    fx.shutdown().await;
+}
+
+/// A probe that records, the first time the restored crane's manifest is read (the re-seal
+/// reads it for the sealed files' hashes), whether the trash entry's `restore.json` was still
+/// there.
+#[derive(Debug, Default)]
+struct WatchReseal {
+    record: Mutex<Option<PathBuf>>,
+    seen: Mutex<Option<bool>>,
+}
+
+impl Probe for WatchReseal {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        SystemProbe.identity(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        let text = path.to_string_lossy();
+        if text.ends_with(r"\crane\crane.manifest.json") && !text.contains(".trash") {
+            let record = self.record.lock().unwrap().clone();
+            if let Some(record) = record {
+                self.seen.lock().unwrap().get_or_insert(record.exists());
+            }
+        }
+        SystemProbe.open_read(path)
+    }
+}
+
+/// Audit L-1: a whole asset's restore takes its entry out of the trash right after the move,
+/// before the re-seal (which hashes every listed sealed file, seconds for a large asset), so a
+/// crash during the re-seal never leaves a listed entry with no payload to block
+/// `asset.accept_move`. The re-seal still runs after.
+#[tokio::test(start_paused = true)] // spec: CORE-157, CORE-037, ARCH-058
+async fn a_restore_takes_its_entry_out_before_it_reseals() {
+    let ws = workspace();
+    let probe = Arc::new(WatchReseal::default());
+    let store = Arc::new(
+        Store::new(
+            ws.root.clone(),
+            ws.state.clone(),
+            FailPoints::none(),
+            ws.clock.clone(),
+            Arc::new(SeqIds::new()),
+            probe.clone(),
+        )
+        .with_machine("testmachine"),
+    );
+    sealed_version(&ws, &store).await;
+    let record = store.trash(&p(ASSET), ASSET_TRASH_REASON).await.unwrap();
+    *probe.record.lock().unwrap() = Some(entry_dir(&ws, &record).join("restore.json"));
+    store.trash_restore(&record.entry_id).await.unwrap();
+    assert_eq!(
+        *probe.seen.lock().unwrap(),
+        Some(false),
+        "the record was gone when the re-seal read the manifest"
+    );
+    assert!(
+        read_only(&ws.file(&format!("{ASSET}/v1.0.0/a.png"))),
+        "re-sealed"
+    );
+    assert!(store.trash_list().await.unwrap().is_empty());
+}
+
+/// Audit L-2 (ARCH-125): restoring a whole asset under a new id that is some redirect's `from`
+/// warns that old refs to that name will now reach the restored asset, as an import or an
+/// accepted move onto that name does; it never blocks.
+#[tokio::test] // spec: ARCH-125, CORE-037
+async fn restore_to_a_redirected_name_warns() {
+    let (fx, _fake) = AssetFx::faked(|ws| {
+        write_file(
+            &ws_file(ws, "registry/redirects.yaml"),
+            format!(
+                "redirects:\n  - from: {P4}/lamp_old\n    to: {P4}/{LAMP}\n    moved_utc: 2026-11-01T10:00:00Z\n    by: cli\n"
+            )
+            .as_bytes(),
+        );
+    })
+    .await;
+    let entry_id = fx.trash_ok(CRANE).await;
+    let restored = fx
+        .ok(
+            "trash.restore",
+            json!({"entry_id": entry_id, "to": "lamp_old"}),
+        )
+        .await;
+    assert_eq!(restored["path"], format!("projects/{P4}/assets/lamp_old"));
+    assert_eq!(
+        restored["warnings"],
+        json!([format!(
+            "Old refs to {P4}/lamp_old will now reach this asset (registry/redirects.yaml)."
+        )]),
+        "{restored}"
+    );
+    // A restore onto a name no redirect leaves from has no warnings.
+    let again = fx.trash_ok("lamp_old").await;
+    let plain = fx
+        .ok("trash.restore", json!({"entry_id": again, "to": ORIGAMI}))
+        .await;
+    assert!(plain.get("warnings").is_none(), "{plain}");
+    fx.shutdown().await;
+}
+
+/// Audit L-3: a core that starts finds the pending confirmations an app's sessions made in
+/// the previous core run (an `EveryCaller` question, a cap prompt) and cancels them: those
+/// sessions ended with that core, so no approvable question is left that would do nothing.
+/// An agent's question stays: the agent retries with its token.
+#[tokio::test] // spec: CORE-157, APP-044, ARCH-055
+async fn a_core_restart_cancels_the_apps_pending_questions() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).expect("the suite state.db"));
+    let clock: Arc<dyn Clock> = FakeClock::new();
+    let events = Arc::new(EventBus::new(clock.clone()));
+    let ids: Arc<dyn lil_platform::IdSource> = Arc::new(SeqIds::new());
+    let confirm = |ids: Arc<dyn lil_platform::IdSource>| {
+        Confirm::new(
+            states.clone(),
+            events.clone(),
+            clock.clone(),
+            ids,
+            UiPresence::new(),
+            Arc::new(NoNotificationPath),
+            Duration::from_secs(30 * 60),
+            McpConfirmation::Core,
+            FailPoints::none(),
+        )
+    };
+    let request = |caller: &str, session: &str, covers: Vec<lil_protocol::Cover>| {
+        lil_core::confirm::ConfirmRequest {
+            scope: format!("{caller}|none"),
+            idem_key: tkey(),
+            tool: "asset.trash".into(),
+            args_hash: "h".into(),
+            arguments: json!({}),
+            caller_kind: caller.into(),
+            session_id: session.into(),
+            project: None,
+            covers,
+            cap: None,
+            files: None,
+            facts: None,
+            facts_sha256: None,
+        }
+    };
+    let before = confirm(ids.clone());
+    let app_question = before
+        .request(request(
+            "ui:test",
+            "s_app",
+            vec![lil_protocol::Cover::Confirm],
+        ))
+        .await
+        .unwrap();
+    let app_cap = before
+        .request(request("ui:test", "s_app", vec![lil_protocol::Cover::Cap]))
+        .await
+        .unwrap();
+    let agent = before
+        .request(request("cli", "s_cli", vec![lil_protocol::Cover::Confirm]))
+        .await
+        .unwrap();
+    drop(before);
+
+    // The next core run (the same id source, so its ids stay new).
+    let after = confirm(ids.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    events.attach(9, tx);
+    events
+        .subscribe(9, &["confirmations".to_string()], &Default::default())
+        .await;
+    after.load(states.suite()).await.unwrap();
+    let pending: Vec<String> = after
+        .list(ListState::Pending, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(
+        pending,
+        std::slice::from_ref(&agent.confirmation_id),
+        "only the agent's stays"
+    );
+    let history = after.list(ListState::History, 50).await.unwrap();
+    for id in [&app_question.confirmation_id, &app_cap.confirmation_id] {
+        let row = history
+            .iter()
+            .find(|r| &r.id == id)
+            .unwrap_or_else(|| panic!("{id}"));
+        assert_eq!(row.state.wire(), "cancelled", "{id}");
+    }
+    let mut cancelled = Vec::new();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while cancelled.len() < 2 && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(line)) => {
+                let v: Value = serde_json::from_str(&line).unwrap();
+                if v["params"]["data"]["kind"] == "cancelled" {
+                    let id = &v["params"]["data"]["confirmation"]["id"];
+                    cancelled.push(id.as_str().unwrap().to_string());
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    cancelled.sort();
+    let mut want = vec![app_question.confirmation_id, app_cap.confirmation_id];
+    want.sort();
+    assert_eq!(cancelled, want, "each published as cancelled");
+    states.close();
 }

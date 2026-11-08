@@ -1950,12 +1950,16 @@ async fn accept_move_never_redirects_a_trashed_assets_old_name() {
     let e = error(fx.accept(ORIGAMI).await);
     assert_eq!(e.code, "repair.not_needed", "{e:?}");
     assert!(
-        e.message.contains(&format!(
-            "To accept this move, empty trash entry {entry} first"
-        )) && e.message.contains(&format!(
-            "Restoring that entry with trash.restore instead puts that older asset back at \
+        e.message.contains(&format!("in the trash (entry {entry})"))
+            && e.message.contains(&format!(
+                "Restoring that entry with trash.restore puts that older asset back at \
                  {P}/{CRANE}, and this folder is then a copy of it"
-        )),
+            ))
+            && e.message.contains(
+                "Otherwise wait until the trash purges the entry (30 days after it was \
+                 trashed), then call asset.accept_move again."
+            )
+            && !e.message.contains("empty trash entry"),
         "names the trash entry: {}",
         e.message
     );
@@ -2035,12 +2039,16 @@ async fn accept_move_never_takes_over_a_name_trashed_with_no_redirect() {
     let e = error(fx.accept(ORIGAMI).await);
     assert_eq!(e.code, "repair.not_needed", "{e:?}");
     assert!(
-        e.message.contains(&format!(
-            "To accept this move, empty trash entry {entry} first"
-        )) && e.message.contains(&format!(
-            "Restoring that entry with trash.restore instead puts that older asset back at \
+        e.message.contains(&format!("in the trash (entry {entry})"))
+            && e.message.contains(&format!(
+                "Restoring that entry with trash.restore puts that older asset back at \
                  {P}/{CRANE}, and this folder is then a copy of it"
-        )),
+            ))
+            && e.message.contains(
+                "Otherwise wait until the trash purges the entry (30 days after it was \
+                 trashed), then call asset.accept_move again."
+            )
+            && !e.message.contains("empty trash entry"),
         "names the trash entry: {}",
         e.message
     );

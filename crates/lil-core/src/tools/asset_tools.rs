@@ -866,8 +866,18 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
 /// now reach this asset), or that it couldn't be checked: for an import that creates the asset
 /// and for an accepted move onto that name.
 async fn takeover_warnings(a: &Asset) -> Vec<String> {
-    let name = (a.project.clone(), a.asset_id.clone());
-    match read_redirects(a.store()).await {
+    takeover_warnings_for(a.store(), &a.project, &a.asset_id).await
+}
+
+/// [`takeover_warnings`] for `project`/`asset_id` of `store`: also for a whole asset restored
+/// under a new id (`trash.restore {to}`, audit L-2).
+pub(super) async fn takeover_warnings_for(
+    store: &Store,
+    project: &str,
+    asset_id: &str,
+) -> Vec<String> {
+    let name = (project.to_string(), asset_id.to_string());
+    match read_redirects(store).await {
         Ok(redirects) if redirects.iter().any(|r| r.from == name) => vec![format!(
             "Old refs to {} will now reach this asset ({REDIRECTS_YAML}).",
             name_of(&name)
@@ -2228,12 +2238,19 @@ async fn not_in_use(
 }
 
 /// The asset's dependents (`asset.get`'s `used_by`: the index's edges to it and to every name
-/// that resolves to it), as `<project>/<asset_id>`, deduplicated and sorted.
+/// that resolves to it), as `<project>/<asset_id>`, deduplicated and sorted. It waits for the
+/// index's first run, as every reader of index data does (audit M-1): during a cold rebuild the
+/// edges aren't there yet, and "no dependents" would be wrong. An index whose first run failed
+/// refuses with its error (`store.io`), never "none".
 async fn dependents_of(
     open: &OpenWorkspace,
     project: &str,
     asset_id: &str,
 ) -> Result<Vec<String>, ErrorBody> {
+    open.index
+        .ready_result()
+        .await
+        .map_err(|e| e.to_error(""))?;
     let resolver = Resolver::load(&open.index, &open.store).await?;
     let found: BTreeSet<String> = resolver
         .edges_to(project, asset_id)

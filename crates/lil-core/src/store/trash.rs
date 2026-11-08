@@ -11,7 +11,10 @@
 //! that is there now (`trash.restore_conflict`), and sets the read-only attribute again on
 //! every restored file under `projects/*/assets/*/v<semver>/` (CORE-026); for a whole asset
 //! folder, a sealed file its manifest's `hashes` lists is made read-only only where its SHA-256
-//! still matches (CORE-157), and a mismatch is logged and left as it is.
+//! still matches (CORE-157), and a mismatch is logged and left as it is. The entry leaves the
+//! trash right after the move (the commit point), and read-only is re-applied after that, so a
+//! crash while re-sealing never leaves a listed entry without a payload (audit L-1); a crash
+//! there leaves some sealed files writable, unmodified, as a re-seal that fails does (logged).
 //! [`Store::trash_restore_to`] restores under another name in the same folder ("restore as…",
 //! CORE-037), optionally rewriting a restored file's bytes (a resource's new id): the payload is
 //! first claimed (moved to `.restoring-<name>` in its entry, retried while something holds it,
@@ -969,6 +972,22 @@ impl Store {
             }
             Err(e) => return Err(StoreError::io(&rel, &e)),
         }
+        // The commit point: the entry leaves the trash right after the move, before the
+        // re-seal (audit L-1). The re-seal hashes every listed sealed file, seconds for a large
+        // asset, and a crash in it must never leave a listed entry with no payload (which would
+        // block `asset.accept_move`); it only sets attributes, so it can run after. A rewritten
+        // restore leaves the payload behind: it goes with the entry, now that its bytes are at
+        // the target with the new id.
+        let rewritten = claimed_at;
+        let (dir, day) = (entry.dir.clone(), entry.day.clone());
+        let cleaned = blocking(move || match rewritten {
+            Some(file) => drop_rewritten_entry(&file, &dir, &day),
+            None => drop_empty_entry(&dir, &day),
+        })
+        .await;
+        if let Err(e) = cleaned {
+            tracing::warn!(entry = %entry_id, error = %e, "a restored trash entry's record stays");
+        }
         // Every restored file in a sealed version folder is read-only again, whether the
         // restored path is the file, its version folder, or a folder above it; a whole asset
         // folder's listed sealed files only where their hashes match (module docs).
@@ -999,18 +1018,6 @@ impl Store {
         .await;
         if let Err(e) = sealed {
             tracing::warn!(path = %rel, error = %e, "a restored sealed file couldn't be made read-only again");
-        }
-        // A rewritten restore leaves the payload behind: it goes with the entry, now that its
-        // bytes are at the target with the new id.
-        let rewritten = claimed_at;
-        let (dir, day) = (entry.dir.clone(), entry.day.clone());
-        let cleaned = blocking(move || match rewritten {
-            Some(file) => drop_rewritten_entry(&file, &dir, &day),
-            None => drop_empty_entry(&dir, &day),
-        })
-        .await;
-        if let Err(e) = cleaned {
-            tracing::warn!(entry = %entry_id, error = %e, "a restored trash entry's record stays");
         }
         tracing::info!(path = %rel, entry = %entry_id, "restored from the trash");
         self.emit(vec![StoreEvent {
