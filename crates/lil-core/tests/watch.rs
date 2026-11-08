@@ -1804,3 +1804,71 @@ async fn cli_and_app_reports_never_claim() {
     assert_eq!(edits.len(), 1, "{edits:?}");
     assert_eq!(edits[0]["actor"], tether.to_value(), "{edits:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 15, fix round 2: a deferred claim's window counts to the report (N1); a read parked
+// inside a deferred reconcile keeps its reporter (N2).
+// ---------------------------------------------------------------------------------------------
+
+/// N1 (the re-review's probe 4): the watcher records an agent's write; git starts; the agent's
+/// report comes 1 s later and is deferred; the pause lasts past the window. The claim is
+/// measured at the report, so the edit becomes the agent's once the pause ends.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-083, ARCH-103
+async fn a_deferred_claim_counts_the_window_to_the_report() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let edited = b"written by an agent just before git started";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    assert!(core.crane_edits(CANDIDATE_INSIDE)[0].get("actor").is_none());
+    let ops = GitOps::begin(&core.ws);
+    core.fence().await;
+    assert!(core.open.store.git_gate().is_busy());
+    core.clock.advance(Duration::from_secs(1));
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.clock.advance(Duration::from_secs(20));
+    ops.finish();
+    core.until("git resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// N2: an agent's report waits for a held version lock; when the lock goes, the deferred
+/// reconcile finds the file still held by its writer and parks the read. The decision once the
+/// file is free still records the agent's actor.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079, ARCH-103
+async fn a_read_parked_in_a_deferred_reconcile_keeps_its_reporter() {
+    let core = Core::fixture(WatchConfig {
+        batch: Duration::from_secs(1),
+        ..WatchConfig::default()
+    })
+    .await;
+    core.fence().await;
+    let guard = core
+        .open
+        .store
+        .version_lock("sketchbook", CRANE)
+        .lock_owned()
+        .await;
+    let edited = b"written by an agent, held through a sign-off";
+    edit_outside(&core.path(CANDIDATE), edited);
+    let held = HandleHolder::hold(&core.path(CANDIDATE), Share::None);
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.marker("during the lock.txt").await;
+    drop(guard);
+    // The deferred reconcile runs (and parks the read) before the fence returns.
+    core.fence().await;
+    assert!(core.crane_edits(CANDIDATE_INSIDE).is_empty(), "parked");
+    held.release();
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
