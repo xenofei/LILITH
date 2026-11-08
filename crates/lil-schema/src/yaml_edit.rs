@@ -49,6 +49,20 @@ pub enum YamlEdit {
         path: Vec<String>,
         entries: Vec<(String, YamlValue)>,
     },
+    /// Replaces item `index` (0-based) of the block list at `path` with a block mapping of these
+    /// entries, at the list's indent (`registry/collections.yaml`). The item's own lines are
+    /// rewritten (its first line to its last content line, so comments inside it go); the
+    /// comments and blank lines before and after it stay. A flow list is `Unsupported`. The
+    /// entries may not be empty.
+    SetListItem {
+        path: Vec<String>,
+        index: usize,
+        entries: Vec<(String, YamlValue)>,
+    },
+    /// Removes item `index` (0-based) of the block list at `path`: its first line to its last
+    /// content line; the comments and blank lines around it stay. Removing the only item
+    /// leaves `key: []`. A flow list is `Unsupported`.
+    RemoveListItem { path: Vec<String>, index: usize },
 }
 
 /// A scalar [`YamlEdit::SetMapping`] writes.
@@ -58,9 +72,13 @@ pub enum YamlValue {
     /// otherwise.
     Str(String),
     Int(i64),
+    Bool(bool),
     /// A nested mapping of these entries, in this order (a block mapping below its key, or a
     /// flow mapping inside a flow item).
     Map(Vec<(String, YamlValue)>),
+    /// A list of these values: a block list below its key (`[]` when empty), or a flow list
+    /// inside a flow item or another list.
+    List(Vec<YamlValue>),
 }
 
 /// Why an edit was refused.
@@ -165,7 +183,9 @@ fn unsupported(edit: &YamlEdit, why: String) -> YamlEditError {
         YamlEdit::SetScalar { path, .. }
         | YamlEdit::AppendToList { path, .. }
         | YamlEdit::SetMapping { path, .. }
-        | YamlEdit::AppendMappingToList { path, .. } => path.join("."),
+        | YamlEdit::AppendMappingToList { path, .. }
+        | YamlEdit::SetListItem { path, .. }
+        | YamlEdit::RemoveListItem { path, .. } => path.join("."),
     };
     YamlEditError::Unsupported(format!("`{path}`: {why}"))
 }
@@ -193,6 +213,9 @@ fn edit_value(doc: &mut Yaml, edit: &YamlEdit) -> Result<(), YamlEditError> {
         YamlEdit::AppendToList { path, item } => (path, Yaml::String(item.clone())),
         YamlEdit::SetMapping { path, entries }
         | YamlEdit::AppendMappingToList { path, entries } => (path, mapping_yaml(entries)),
+        YamlEdit::SetListItem { path, index, .. } | YamlEdit::RemoveListItem { path, index } => {
+            return edit_list_item(doc, edit, path, *index);
+        }
     };
     let Some((last, parents)) = path.split_last() else {
         return Err(unsupported(edit, "an empty path".into()));
@@ -236,34 +259,76 @@ fn edit_value(doc: &mut Yaml, edit: &YamlEdit) -> Result<(), YamlEditError> {
         (YamlEdit::AppendToList { .. } | YamlEdit::AppendMappingToList { .. }, None) => {
             h.replace(key, Yaml::Array(vec![new]));
         }
+        (YamlEdit::SetListItem { .. } | YamlEdit::RemoveListItem { .. }, _) => {
+            unreachable!("list item edits return above")
+        }
     }
     Ok(())
+}
+
+/// [`YamlEdit::SetListItem`] and [`YamlEdit::RemoveListItem`] applied to the parsed document.
+fn edit_list_item(
+    doc: &mut Yaml,
+    edit: &YamlEdit,
+    path: &[String],
+    index: usize,
+) -> Result<(), YamlEditError> {
+    let mut cur = doc;
+    for k in path {
+        cur = match cur {
+            Yaml::Hash(h) => h
+                .get_mut(&Yaml::String(k.clone()))
+                .ok_or_else(|| unsupported(edit, format!("no key `{k}`")))?,
+            _ => return Err(unsupported(edit, format!("`{k}` is not in a mapping"))),
+        };
+    }
+    let Yaml::Array(items) = cur else {
+        return Err(unsupported(edit, "the value is not a list".into()));
+    };
+    if index >= items.len() {
+        return Err(unsupported(
+            edit,
+            format!("the list has no item {index} (0-based)"),
+        ));
+    }
+    match edit {
+        YamlEdit::SetListItem { entries, .. } => items[index] = mapping_yaml(entries),
+        _ => {
+            items.remove(index);
+        }
+    }
+    Ok(())
+}
+
+/// The parsed form of `value`.
+fn value_yaml(value: &YamlValue) -> Yaml {
+    match value {
+        YamlValue::Str(s) => Yaml::String(s.clone()),
+        YamlValue::Int(n) => Yaml::Integer(*n),
+        YamlValue::Bool(b) => Yaml::Boolean(*b),
+        YamlValue::Map(inner) => mapping_yaml(inner),
+        YamlValue::List(items) => Yaml::Array(items.iter().map(value_yaml).collect()),
+    }
 }
 
 /// The parsed form of a mapping of `entries`.
 fn mapping_yaml(entries: &[(String, YamlValue)]) -> Yaml {
     let mut mapping = yaml_rust2::yaml::Hash::new();
     for (key, value) in entries {
-        let value = match value {
-            YamlValue::Str(s) => Yaml::String(s.clone()),
-            YamlValue::Int(n) => Yaml::Integer(*n),
-            YamlValue::Map(inner) => mapping_yaml(inner),
-        };
-        mapping.insert(Yaml::String(key.clone()), value);
+        mapping.insert(Yaml::String(key.clone()), value_yaml(value));
     }
     Yaml::Hash(mapping)
 }
 
 /// `entries` as the lines of a block mapping at indent `pad`, each ending with `eol`; a nested
-/// mapping goes below its key, two spaces deeper (an empty one is `{}`).
+/// mapping goes below its key, two spaces deeper (an empty one is `{}`), and a list below its
+/// key as a block list two spaces deeper (an empty one is `[]`).
 fn block_entries(entries: &[(String, YamlValue)], pad: usize, eol: &str) -> String {
     let indent = " ".repeat(pad);
     let mut out = String::new();
     for (key, value) in entries {
         let key = scalar(key);
         match value {
-            YamlValue::Str(s) => out.push_str(&format!("{indent}{key}: {}{eol}", scalar(s))),
-            YamlValue::Int(n) => out.push_str(&format!("{indent}{key}: {n}{eol}")),
             YamlValue::Map(inner) if inner.is_empty() => {
                 out.push_str(&format!("{indent}{key}: {{}}{eol}"));
             }
@@ -271,24 +336,46 @@ fn block_entries(entries: &[(String, YamlValue)], pad: usize, eol: &str) -> Stri
                 out.push_str(&format!("{indent}{key}:{eol}"));
                 out.push_str(&block_entries(inner, pad + 2, eol));
             }
+            YamlValue::List(items) if items.is_empty() => {
+                out.push_str(&format!("{indent}{key}: []{eol}"));
+            }
+            YamlValue::List(items) => {
+                out.push_str(&format!("{indent}{key}:{eol}"));
+                for item in items {
+                    match item {
+                        YamlValue::Map(inner) if !inner.is_empty() => {
+                            out.push_str(&block_item(inner, pad + 2, eol));
+                        }
+                        other => out.push_str(&format!("{indent}  - {}{eol}", flow_value(other))),
+                    }
+                }
+            }
+            other => out.push_str(&format!("{indent}{key}: {}{eol}", flow_value(other))),
         }
     }
     out
 }
 
-/// `entries` as a one-line flow mapping (`{a: b, c: {d: e}}`); [`scalar`] quotes any value
-/// holding a flow indicator.
+/// `value` as it is written on one line: a scalar ([`scalar`] quotes a string holding a flow
+/// indicator), or a flow mapping or list.
+fn flow_value(value: &YamlValue) -> String {
+    match value {
+        YamlValue::Str(s) => scalar(s),
+        YamlValue::Int(n) => n.to_string(),
+        YamlValue::Bool(b) => b.to_string(),
+        YamlValue::Map(inner) => flow_mapping(inner),
+        YamlValue::List(items) => {
+            let items: Vec<String> = items.iter().map(flow_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+    }
+}
+
+/// `entries` as a one-line flow mapping (`{a: b, c: {d: e}}`).
 fn flow_mapping(entries: &[(String, YamlValue)]) -> String {
     let items: Vec<String> = entries
         .iter()
-        .map(|(key, value)| {
-            let value = match value {
-                YamlValue::Str(s) => scalar(s),
-                YamlValue::Int(n) => n.to_string(),
-                YamlValue::Map(inner) => flow_mapping(inner),
-            };
-            format!("{}: {value}", scalar(key))
-        })
+        .map(|(key, value)| format!("{}: {}", scalar(key), flow_value(value)))
         .collect();
     format!("{{{}}}", items.join(", "))
 }
@@ -534,6 +621,9 @@ fn edit_text(text: &str, edit: &YamlEdit) -> Result<String, YamlEditError> {
         YamlEdit::AppendMappingToList { path, entries } => {
             return append_mapping(text, edit, path, entries);
         }
+        YamlEdit::SetListItem { path, index, .. } | YamlEdit::RemoveListItem { path, index } => {
+            return list_item(text, edit, path, *index);
+        }
     };
     let fail = |why: &str| unsupported(edit, why.to_string());
     let Some((last, parents)) = path.split_last() else {
@@ -760,6 +850,94 @@ fn append_mapping(
         return Err(fail("the value is not a list"));
     }
     append_flow_item(text, hit.value, &item).ok_or_else(|| fail("a flow list it can't follow"))
+}
+
+/// [`YamlEdit::SetListItem`] and [`YamlEdit::RemoveListItem`] as line edits (see the variants).
+fn list_item(
+    text: &str,
+    edit: &YamlEdit,
+    path: &[String],
+    index: usize,
+) -> Result<String, YamlEditError> {
+    let fail = |why: &str| unsupported(edit, why.to_string());
+    let Some((last, parents)) = path.split_last() else {
+        return Err(fail("an empty path"));
+    };
+    let lines = lines_of(text);
+    let eol = eol_of(text);
+    let (from, to) = descend(text, &lines, parents, &fail)?;
+    let Some(hit) = find_key(text, &lines, from, to, last) else {
+        return Err(fail("no such key"));
+    };
+    if !hit.empty {
+        return Err(fail("the value is not a block list"));
+    }
+    let end = block_end(text, &lines, hit);
+    // The list's first item: below the key, or at the key's own indent right after it.
+    let first = match (hit.line + 1..end).find(|&i| is_content(text, lines[i])) {
+        Some(i) => i,
+        None if end < lines.len()
+            && indent(text, lines[end]) == hit.indent
+            && is_seq_item(text, lines[end]) =>
+        {
+            end
+        }
+        None => return Err(fail("the value is not a block list")),
+    };
+    if !is_seq_item(text, lines[first]) {
+        return Err(fail("the value is a mapping, not a list"));
+    }
+    let (seq_indent, last_line) = block_list_end(text, &lines, first);
+    let list_end = lines
+        .iter()
+        .position(|l| l.start == last_line.start)
+        .expect("the list's last line")
+        + 1;
+    // Each item: its first line, and its last content line before the next item.
+    let starts: Vec<usize> = (first..list_end)
+        .filter(|&i| {
+            is_content(text, lines[i])
+                && indent(text, lines[i]) == seq_indent
+                && is_seq_item(text, lines[i])
+        })
+        .collect();
+    let Some(&start) = starts.get(index) else {
+        return Err(fail(&format!("the list has no item {index} (0-based)")));
+    };
+    let next = starts.get(index + 1).copied().unwrap_or(list_end);
+    let stop = (start..next)
+        .rev()
+        .find(|&i| is_content(text, lines[i]))
+        .expect("the item's own line");
+    let (cut_from, cut_to) = (lines[start].start, lines[stop].next);
+    let mut out = String::with_capacity(text.len() + 64);
+    match edit {
+        YamlEdit::SetListItem { entries, .. } => {
+            if entries.is_empty() {
+                return Err(fail("an empty mapping"));
+            }
+            out.push_str(&text[..cut_from]);
+            out.push_str(&block_item(entries, seq_indent, eol));
+            out.push_str(&text[cut_to..]);
+        }
+        _ if starts.len() == 1 => {
+            // The only item: the key's line becomes `key: []`, before any comment there.
+            let line = lines[hit.line];
+            let rest = &text[hit.colon..line.end];
+            out.push_str(&text[..hit.colon]);
+            out.push_str(" []");
+            if rest.trim_start().starts_with('#') {
+                out.push_str(rest);
+            }
+            out.push_str(&text[line.end..cut_from]);
+            out.push_str(&text[cut_to..]);
+        }
+        _ => {
+            out.push_str(&text[..cut_from]);
+            out.push_str(&text[cut_to..]);
+        }
+    }
+    Ok(out)
 }
 
 /// `text` with `new` (whole lines) inserted after the line `l`, with a line break first when `l`
@@ -1510,6 +1688,130 @@ tools: {}
                     Err(YamlEditError::Unsupported(_))
                 ),
                 "{text:?}"
+            );
+        }
+    }
+
+    fn item(index: usize, entries: &[(&str, YamlValue)]) -> YamlEdit {
+        YamlEdit::SetListItem {
+            path: vec!["collections".into()],
+            index,
+            entries: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    fn remove(index: usize) -> YamlEdit {
+        YamlEdit::RemoveListItem {
+            path: vec!["collections".into()],
+            index,
+        }
+    }
+
+    /// An item edit rewrites that item's own lines and a removal takes them out; comments and
+    /// blank lines around them, the other items and their order stay; removing the only item
+    /// leaves `key: []`; a flow list, a missing key or index, and an empty mapping are refused.
+    /// Lists and booleans are written as block lists and plain `true`/`false`.
+    #[test] // spec: ARCH-076, CORE-155
+    fn list_items_are_set_and_removed_in_place() {
+        let text = "\
+# top
+collections:   # entries
+  # first
+  - id: a
+    name: A   # trailing
+    refs:
+      - p/x
+
+  # second
+  - {id: b, name: B}
+  - id: c
+    rule: {type: image}
+# end
+";
+        let out = apply(
+            text,
+            &[item(
+                1,
+                &[
+                    ("id", YamlValue::Str("b".into())),
+                    ("name", YamlValue::Str("B, renamed".into())),
+                    (
+                        "rule",
+                        YamlValue::Map(vec![
+                            (
+                                "type".into(),
+                                YamlValue::List(vec![
+                                    YamlValue::Str("image".into()),
+                                    YamlValue::Str("true".into()),
+                                ]),
+                            ),
+                            ("duplicates".into(), YamlValue::Bool(true)),
+                            ("rating_min".into(), YamlValue::Int(3)),
+                        ]),
+                    ),
+                    ("refs", YamlValue::List(Vec::new())),
+                ],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            text.replace(
+                "  - {id: b, name: B}\n",
+                "  - id: b\n    name: \"B, renamed\"\n    rule:\n      type:\n        - image\n        - \"true\"\n      duplicates: true\n      rating_min: 3\n    refs: []\n"
+            )
+        );
+        let out = apply(text, &[remove(0)]).unwrap();
+        assert_eq!(
+            out,
+            text.replace(
+                "  - id: a\n    name: A   # trailing\n    refs:\n      - p/x\n",
+                ""
+            )
+        );
+        let out = apply(text, &[remove(2)]).unwrap();
+        assert_eq!(
+            out,
+            text.replace("  - id: c\n    rule: {type: image}\n", "")
+        );
+        let out = apply(text, &[remove(2), remove(1), remove(0)]).unwrap();
+        assert_eq!(
+            out,
+            "# top\ncollections: []   # entries\n  # first\n\n  # second\n# end\n"
+        );
+        // A list at the key's own indent, CRLF line ends.
+        let out = apply(
+            "l:\r\n- id: a\r\n- id: b\r\n",
+            &[remove(0)].map(|e| match e {
+                YamlEdit::RemoveListItem { index, .. } => YamlEdit::RemoveListItem {
+                    path: vec!["l".into()],
+                    index,
+                },
+                e => e,
+            }),
+        )
+        .unwrap();
+        assert_eq!(out, "l:\r\n- id: b\r\n");
+        for (text, edit) in [
+            ("collections: [{id: a}]\n", remove(0)),
+            ("collections:\n  - id: a\n", remove(1)),
+            ("other: 1\n", remove(0)),
+            ("collections:\n  a: b\n", remove(0)),
+            ("collections:\n  - id: a\n", item(0, &[])),
+            (
+                "collections:\n  - id: a\n",
+                item(3, &[("id", YamlValue::Str("a".into()))]),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    apply(text, std::slice::from_ref(&edit)),
+                    Err(YamlEditError::Unsupported(_))
+                ),
+                "{text:?} {edit:?}"
             );
         }
     }

@@ -599,61 +599,7 @@ impl Store {
                 });
             }
         };
-        let now = self.now_utc();
-        let day = self
-            .root()
-            .join(TRASH_DIR)
-            .join(lil_schema::time::date(now));
-        let mut made = None;
-        for _ in 0..16 {
-            let entry_id = self.ids().id("te");
-            let record = TrashRecord {
-                entry_id: entry_id.clone(),
-                original_path: rel.as_str().to_string(),
-                moved_utc: lil_schema::time::rfc3339(now),
-                purge_after: lil_schema::time::rfc3339(now + TRASH_KEEP_DAYS * DAY),
-                reason: reason.to_string(),
-                sha256: sha256.clone(),
-            };
-            let text = serde_json::to_string_pretty(&record).map_err(|e| StoreError::Io {
-                path: rel.as_str().to_string(),
-                why: format!("the restore record can't be written: {e}"),
-            })? + "\n";
-            let (day_dir, dir, fp) = (day.clone(), day.join(&entry_id), self.failpoints().clone());
-            let probe = self.probe().clone();
-            let created = blocking(move || {
-                fsops::ensure_dir(&day_dir)?;
-                refuse_link_at(&day_dir, probe.as_ref())?;
-                fsops::create_dir_new(&dir)?;
-                fsops::ensure_dir(&dir.join(PAYLOAD))?;
-                fsops::write_temp(&dir, RECORD, text.as_bytes(), &fp)?;
-                Ok(dir)
-            })
-            .await;
-            match created {
-                Ok(dir) => {
-                    made = Some((dir, record));
-                    break;
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    let dir = day.join(&entry_id);
-                    let _ = blocking(move || {
-                        remove_if_empty(&dir.join(PAYLOAD));
-                        remove_if_empty(&dir);
-                        Ok(())
-                    })
-                    .await;
-                    return Err(StoreError::io(rel, &e));
-                }
-            }
-        }
-        let Some((dir, record)) = made else {
-            return Err(StoreError::Io {
-                path: TRASH_DIR.to_string(),
-                why: "no free trash entry name".to_string(),
-            });
-        };
+        let (dir, day, record) = self.new_entry(rel, reason, sha256).await?;
         let to = dir.join(PAYLOAD).join(rel.file_name());
         let (from, target) = (abs.clone(), to.clone());
         // A folder (a rejected run, a trashed folder) also retries error 5 (ruling Q19).
@@ -696,6 +642,203 @@ impl Store {
         }])
         .await;
         Ok(record)
+    }
+
+    /// A new trash entry for `rel` (module docs): its folder `<day>\<te_16hex>\` with an empty
+    /// `payload` folder and its `restore.json`, written first; returns the entry's folder, the
+    /// day's folder and the record. The payload is the caller's to put in.
+    async fn new_entry(
+        &self,
+        rel: &WsPath,
+        reason: &str,
+        sha256: Option<String>,
+    ) -> Result<(PathBuf, PathBuf, TrashRecord), StoreError> {
+        let now = self.now_utc();
+        let day = self
+            .root()
+            .join(TRASH_DIR)
+            .join(lil_schema::time::date(now));
+        for _ in 0..16 {
+            let entry_id = self.ids().id("te");
+            let record = TrashRecord {
+                entry_id: entry_id.clone(),
+                original_path: rel.as_str().to_string(),
+                moved_utc: lil_schema::time::rfc3339(now),
+                purge_after: lil_schema::time::rfc3339(now + TRASH_KEEP_DAYS * DAY),
+                reason: reason.to_string(),
+                sha256: sha256.clone(),
+            };
+            let text = serde_json::to_string_pretty(&record).map_err(|e| StoreError::Io {
+                path: rel.as_str().to_string(),
+                why: format!("the restore record can't be written: {e}"),
+            })? + "\n";
+            let (day_dir, dir, fp) = (day.clone(), day.join(&entry_id), self.failpoints().clone());
+            let probe = self.probe().clone();
+            let created = blocking(move || {
+                fsops::ensure_dir(&day_dir)?;
+                refuse_link_at(&day_dir, probe.as_ref())?;
+                fsops::create_dir_new(&dir)?;
+                fsops::ensure_dir(&dir.join(PAYLOAD))?;
+                fsops::write_temp(&dir, RECORD, text.as_bytes(), &fp)?;
+                Ok(dir)
+            })
+            .await;
+            match created {
+                Ok(dir) => return Ok((dir, day, record)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    let dir = day.join(&entry_id);
+                    let _ = blocking(move || {
+                        remove_if_empty(&dir.join(PAYLOAD));
+                        remove_if_empty(&dir);
+                        Ok(())
+                    })
+                    .await;
+                    return Err(StoreError::io(rel, &e));
+                }
+            }
+        }
+        Err(StoreError::Io {
+            path: TRASH_DIR.to_string(),
+            why: "no free trash entry name".to_string(),
+        })
+    }
+
+    /// Puts generated `bytes` in the trash as the file `name` of a new entry whose
+    /// `original_path` is `original` and whose `reason` is `reason` (a deleted saved search or
+    /// collection, `payload/collection-<id>.yaml`, CORE-155): [`Store::trash`]'s entry layout,
+    /// record (`sha256` the bytes'), purge and restore listing, only the payload is written
+    /// instead of moved. The record is written first; a payload write that fails takes it back
+    /// out. Nothing in the workspace changes, and the payload's name is the store's own, so
+    /// no workspace path is written (no write check applies to it). It waits at the git gate
+    /// like every write (ARCH-083).
+    ///
+    /// # Errors
+    /// `workspace.read_only`; `params.invalid` for a `name` that isn't one plain file name;
+    /// `store.git_busy`; `store.io` when a file call fails (`store.disk_full`).
+    pub async fn trash_bytes(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        original: &WsPath,
+        reason: &str,
+    ) -> Result<TrashRecord, StoreError> {
+        self.writable_store()?;
+        if name.is_empty()
+            || name.starts_with('.')
+            || name.contains(['/', '\\', ':'])
+            || name == RECORD
+        {
+            return Err(StoreError::Invalid(format!(
+                "{name:?} is not a plain file name for a trash payload"
+            )));
+        }
+        self.git_gate().wait_clear(GIT_WAIT).await?;
+        let (root, probe) = (self.root().to_path_buf(), self.probe().clone());
+        blocking(move || refuse_linked_trash(&root, probe.as_ref()))
+            .await
+            .map_err(|e| StoreError::io(original, &e))?;
+        let sha256 = lil_schema::sha256_hex(bytes);
+        let (dir, day, record) = self.new_entry(original, reason, Some(sha256)).await?;
+        let tmp = format!(".{}.tmp", self.ids().id("tmp"));
+        let (to, payload, fp) = (
+            dir.join(PAYLOAD).join(name),
+            bytes.to_vec(),
+            self.failpoints().clone(),
+        );
+        let written = blocking(move || fsops::write_new_file(&to, &tmp, &payload, &fp)).await;
+        if let Err(e) = written {
+            // Nothing in the trash: the record goes, and the empty folders with it.
+            let _ = blocking(move || drop_empty_entry(&dir, &day)).await;
+            return Err(StoreError::io(original, &e));
+        }
+        tracing::info!(original = %original, entry = %record.entry_id, "generated bytes put in the trash");
+        Ok(record)
+    }
+
+    /// The record and bytes of trash entry `entry_id`'s payload, which must be one file (a
+    /// restore that merges the bytes into a file, CORE-155).
+    ///
+    /// # Errors
+    /// `trash.unknown` for no such entry; `params.invalid` when the payload isn't one file;
+    /// `store.io` when it can't be read (a cloud-only payload is never read).
+    pub async fn trash_payload(
+        &self,
+        entry_id: &str,
+    ) -> Result<(TrashRecord, Vec<u8>), StoreError> {
+        let entry = self.find_entry(entry_id).await?;
+        let (file, _) = self.payload_file(&entry).await?;
+        let (probe, at) = (self.probe().clone(), file.clone());
+        let original = WsPath::from_disk(entry.record.original_path.clone());
+        let bytes = blocking(move || match see(probe.as_ref(), &at, read_all)? {
+            Seen::Found(bytes) => Ok(bytes),
+            _ => Err(io::Error::other("the payload can't be read")),
+        })
+        .await
+        .map_err(|e| StoreError::io(&original, &e))?;
+        Ok((entry.record, bytes))
+    }
+
+    /// Takes trash entry `entry_id` out of the trash after its payload's bytes were merged
+    /// back into the workspace ([`Store::trash_payload`]; CORE-155): its payload file, which
+    /// must still hold `sha256`, then its record and empty folders. This is the restore's
+    /// commit point, as the move is for [`Store::trash_restore_to`].
+    ///
+    /// # Errors
+    /// `trash.unknown` for no such entry; `store.hash_conflict` when the payload's bytes
+    /// changed; `store.io` when a file call fails.
+    pub async fn trash_drop_merged(&self, entry_id: &str, sha256: &str) -> Result<(), StoreError> {
+        self.writable_store()?;
+        let entry = self.find_entry(entry_id).await?;
+        let (file, rel) = self.payload_file(&entry).await?;
+        let (probe, at, want) = (self.probe().clone(), file.clone(), sha256.to_string());
+        let (dir, day) = (entry.dir.clone(), entry.day.clone());
+        blocking(move || {
+            match see(probe.as_ref(), &at, hash_file)? {
+                Seen::Found(h) if h.sha256 == want => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the payload changed since it was read",
+                    ));
+                }
+            }
+            drop_rewritten_entry(&at, &dir, &day)
+        })
+        .await
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidData {
+                StoreError::Changed {
+                    path: rel.clone(),
+                    expected: sha256.to_string(),
+                    found: String::new(),
+                }
+            } else {
+                StoreError::io(&rel, &e)
+            }
+        })?;
+        tracing::info!(entry = %entry_id, "a merged trash entry left the trash");
+        Ok(())
+    }
+
+    /// The payload file of `entry`, which must be its one item and a file, and its original
+    /// path.
+    async fn payload_file(&self, entry: &Entry) -> Result<(PathBuf, WsPath), StoreError> {
+        let rel = WsPath::from_disk(entry.record.original_path.clone());
+        let (dir, probe) = (entry.dir.join(PAYLOAD), self.probe().clone());
+        let items = blocking(move || {
+            refuse_link_at(&dir, probe.as_ref())?;
+            list(&dir)
+        })
+        .await
+        .map_err(|e| StoreError::io(&rel, &e))?;
+        match items.as_slice() {
+            [one] if !one.folder => Ok((one.path.clone(), rel)),
+            _ => Err(StoreError::Invalid(format!(
+                "the trash entry {} doesn't hold one file",
+                entry.record.entry_id
+            ))),
+        }
     }
 
     /// After a crash between `asset.trash`'s move and the index hearing of it (the fail point

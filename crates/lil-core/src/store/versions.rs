@@ -319,6 +319,14 @@ impl Store {
         ))
     }
 
+    /// The lock of `registry/collections.yaml`'s entries, in the same map under its own key.
+    /// `collection.save`, `collection.delete` and the restore of a deleted entry take it around
+    /// their read, trash and edit (CORE-155), so two of them never both decide on one view;
+    /// the store's hash-checked edit still re-applies over an outside change.
+    pub fn collections_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.keyed_lock("collections:registry/collections.yaml".to_string())
+    }
+
     /// The shared lock of `key` in the version-lock map.
     fn keyed_lock(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = lock(&self.version_locks);
