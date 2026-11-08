@@ -959,3 +959,215 @@ async fn list_reports_missing_trashed_and_redirected_refs() {
     );
     fx.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1 (review C-1, I-1, M-1, M-3, M-4, M-6).
+// ---------------------------------------------------------------------------------------------
+
+/// Review C-1: once the last entry is deleted (`collections: []`), the next entries are written
+/// as a block list again, so the B key on the quick collection keeps working, as do its later
+/// edits and a delete.
+#[tokio::test] // spec: CORE-155, ARCH-076
+async fn the_list_stays_editable_after_it_empties() {
+    let fx = Fx::new(|_| {}).await;
+    let a = fx
+        .save_id(json!({"name": "A", "rule": {"type": "image"}}))
+        .await;
+    fx.ok("collection.delete", json!({"id": a})).await;
+    assert_eq!(fx.file().unwrap(), "collections: []\n");
+    // The B key twice, then once more to take one out.
+    fx.save(json!({"id": QUICK, "add": [CRANE_REF]})).await;
+    let quick = fx.save(json!({"id": QUICK, "add": [LAMP_REF]})).await;
+    assert_eq!(refs_of(&quick), [CRANE_REF, LAMP_REF]);
+    let quick = fx.save(json!({"id": QUICK, "remove": [CRANE_REF]})).await;
+    assert_eq!(refs_of(&quick), [LAMP_REF]);
+    let b = fx.save_id(json!({"name": "B", "refs": []})).await;
+    fx.save(json!({"id": b, "name": "B2"})).await;
+    fx.ok("collection.delete", json!({"id": b})).await;
+    let file = fx.file().unwrap();
+    assert!(file.starts_with("collections:\n  - id: "), "{file}");
+    assert!(!file.contains(&b), "{file}");
+    fx.shutdown().await;
+}
+
+/// Review C-1: the only entry, deleted and restored, can be renamed and deleted again.
+#[tokio::test] // spec: CORE-155, CORE-037, ARCH-076
+async fn a_restored_only_entry_can_be_renamed_and_deleted() {
+    let fx = Fx::new(|_| {}).await;
+    let only = fx
+        .save_id(json!({"name": "Only", "refs": [CRANE_REF]}))
+        .await;
+    let entry = fx.ok("collection.delete", json!({"id": only})).await["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.ok("trash.restore", json!({"entry_id": entry})).await;
+    let renamed = fx.save(json!({"id": only, "name": "Only, renamed"})).await;
+    assert_eq!(renamed["name"], "Only, renamed");
+    fx.ok("collection.delete", json!({"id": only})).await;
+    assert!(fx.listed(&only).await.is_none());
+    assert_eq!(fx.file().unwrap(), "collections: []\n");
+    fx.shutdown().await;
+}
+
+/// Review I-1, Appendix H: the cursor hashes `collection` as given, its id, so a change to the
+/// collection between pages (a ref taken out, the B key) keeps an outstanding cursor valid.
+#[tokio::test] // spec: CORE-155, APP-138
+async fn a_cursor_survives_a_change_to_its_collection() {
+    let fx = Fx::new(|_| {}).await;
+    let picks = fx
+        .save_id(json!({"name": "Picks", "refs": [CRANE_REF, LAMP_REF]}))
+        .await;
+    fx.save(json!({"id": QUICK, "add": [CRANE_REF, LAMP_REF]}))
+        .await;
+    for (id, change) in [
+        (picks.as_str(), json!({"id": picks, "remove": [CRANE_REF]})),
+        (QUICK, json!({"id": QUICK, "remove": [CRANE_REF]})),
+    ] {
+        let first = fx
+            .ok("assets.query", json!({"collection": id, "limit": 1}))
+            .await;
+        assert_eq!(first["assets"][0]["asset_id"], CRANE, "{first}");
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+        fx.save(change).await;
+        let next = fx
+            .ok(
+                "assets.query",
+                json!({"collection": id, "limit": 1, "cursor": cursor}),
+            )
+            .await;
+        assert_eq!(next["assets"][0]["asset_id"], LAMP, "{next}");
+        // The B key back on: the cursor still pages.
+        fx.save(json!({"id": id, "add": [CRANE_REF]})).await;
+        let again = fx
+            .call(
+                "assets.query",
+                json!({"collection": id, "limit": 1, "cursor": cursor}),
+            )
+            .await;
+        ok_of(&again, "the cursor after the B key");
+    }
+    fx.shutdown().await;
+}
+
+/// Review M-1: a save that changes nothing writes nothing and publishes nothing, the quick
+/// collection before its first save included.
+#[tokio::test] // spec: CORE-155
+async fn a_save_that_changes_nothing_writes_nothing() {
+    let fx = Fx::new(|_| {}).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(9, tx);
+    fx.events
+        .subscribe(9, &["workspace".to_string()], &Default::default())
+        .await;
+    let quick = fx
+        .save(json!({"id": QUICK, "remove": ["sketchbook/not_there"]}))
+        .await;
+    assert_eq!(quick["id"], QUICK);
+    assert_eq!(fx.file(), None, "nothing written");
+    let picks = fx
+        .save_id(json!({"name": "Picks", "refs": [CRANE_REF]}))
+        .await;
+    let before = fx.file().unwrap();
+    fx.save(json!({"id": picks, "add": [CRANE_REF]})).await;
+    assert_eq!(fx.file().unwrap(), before);
+    // A later change: its event follows the new entry's, with nothing between them.
+    fx.save(json!({"id": picks, "name": "Picks 2"})).await;
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while seen.len() < 2 && tokio::time::Instant::now() < deadline {
+        while let Ok(line) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["params"]["data"]["kind"] == "collection" {
+                seen.push(v["params"]["data"].clone());
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[0], json!({"kind": "collection", "id": picks}));
+    assert_eq!(seen[1]["previous"]["name"], "Picks", "{seen:?}");
+    fx.shutdown().await;
+}
+
+/// Review M-4: a rule holding a null is `params.invalid`, naming the key; nothing is written.
+#[tokio::test] // spec: CORE-155
+async fn a_rule_with_a_null_is_params_invalid() {
+    let fx = Fx::new(|_| {}).await;
+    let e = fx
+        .err(
+            "collection.save",
+            json!({"name": "Nulls", "rule": {"label": null, "type": "image"}}),
+        )
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(e.message.contains("label"), "{e:?}");
+    assert_eq!(fx.file(), None);
+    fx.shutdown().await;
+}
+
+/// Review M-3: an entry changed by an outside edit after the delete read it (here at the fail
+/// point, between the payload and the YAML edit) is never taken out: `store.hash_conflict`,
+/// the file as the outside edit left it, and the payload out of the trash again.
+#[tokio::test] // spec: CORE-155, ARCH-058
+async fn a_delete_refuses_an_entry_changed_meanwhile() {
+    let fx = Fx::new(|_| {}).await;
+    let id = fx
+        .save_id(json!({"name": "Before", "refs": [CRANE_REF]}))
+        .await;
+    {
+        let ws = fx.ws.clone();
+        fx.failpoints.on(
+            "collections.after_payload",
+            Box::new(move || {
+                let path = ws_file(&ws, FILE);
+                let text = std::fs::read_to_string(&path).unwrap();
+                write_file(
+                    &path,
+                    text.replace("name: Before", "name: After").as_bytes(),
+                );
+                Ok(())
+            }),
+        );
+    }
+    let e = fx.err("collection.delete", json!({"id": id})).await;
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    let listed = fx.listed(&id).await.expect("the newer entry stays");
+    assert_eq!(listed["name"], "After");
+    assert!(
+        fx.trash_entries().await.is_empty(),
+        "the payload went again"
+    );
+    fx.shutdown().await;
+}
+
+/// Review M-6: a restore cut short after its merge edit (the entry back in the file exactly as
+/// it was, the trash entry still there) finishes on the retry: the entry leaves the trash and
+/// the file is left as it is.
+#[tokio::test] // spec: CORE-155, CORE-037
+async fn a_restore_cut_short_after_its_edit_finishes() {
+    let fx = Fx::new(|_| {}).await;
+    let id = fx
+        .save_id(json!({"name": "Back", "refs": [CRANE_REF]}))
+        .await;
+    let entry = fx.ok("collection.delete", json!({"id": id})).await["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The merge edit as a cut-short restore left it: the one-entry file's entry in the file.
+    let payload = std::fs::read_to_string(fx.payload_of(&entry)).unwrap();
+    fx.write_file(FILE, &payload);
+    let restored = fx.ok("trash.restore", json!({"entry_id": entry})).await;
+    assert_eq!(restored["path"], FILE, "{restored}");
+    assert!(restored.get("warnings").is_none(), "{restored}");
+    assert_eq!(fx.file().unwrap(), payload, "left as it is");
+    assert!(fx.trash_entries().await.is_empty());
+    let ids: Vec<Value> = fx
+        .list()
+        .await
+        .into_iter()
+        .map(|e| e["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(QUICK), json!(id)]);
+    fx.shutdown().await;
+}

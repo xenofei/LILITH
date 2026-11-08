@@ -370,6 +370,8 @@ async fn query(ctx: &CallCtx, mut args: QueryArgs) -> Result<(QueryResult, Strin
             e.trace_id.clone_from(&ctx.trace_id);
             e
         })?);
+        // The cursor hashes the id as given (Appendix H), never what it resolved to.
+        q.collection_id = Some(id.clone());
     }
     if let Some(cursor) = &args.cursor {
         q.after = Some(decode_cursor(&q, cursor).map_err(|why| invalid(ctx, why))?);

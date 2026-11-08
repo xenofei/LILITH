@@ -362,7 +362,7 @@ async fn restore_workspace(
     if let Ok(record) = store.trash_entry(&args.entry_id).await
         && record.reason == collections::DELETE_REASON
     {
-        return restore_collection(ctx, &open, args).await;
+        return restore_collection(ctx, &open, args, warnings).await;
     }
     let Some(to) = args.to.as_deref() else {
         return Ok(store.trash_restore(&args.entry_id).await?);
@@ -447,11 +447,13 @@ async fn restore_workspace(
 /// CORE-155): its entry merges back into `registry/collections.yaml` by id
 /// (`pipeline::collections::restore`; `trash.restore_conflict` when its id or name is in
 /// use). `to` doesn't apply (`params.invalid`). Published on `workspace` as
-/// `{kind: "collection", id}`.
+/// `{kind: "collection", id}`. A trash entry that can't be removed after the merge is a
+/// warning, not an error (the merge is the commit).
 async fn restore_collection(
     ctx: &CallCtx,
     open: &OpenWorkspace,
     args: &RestoreArgs,
+    warnings: &mut Vec<String>,
 ) -> Result<WsPath, Refused> {
     if args.to.is_some() {
         return Err(params_invalid(format!(
@@ -461,9 +463,10 @@ async fn restore_collection(
             collections::COLLECTIONS_YAML
         )));
     }
-    let back = collections::restore(&open.store, &args.entry_id)
+    let (back, after) = collections::restore(&open.store, &args.entry_id)
         .await
         .map_err(|e| Refused::Body(Box::new(e)))?;
+    warnings.extend(after);
     ctx.events
         .publish("workspace", json!({"kind": "collection", "id": back.id}));
     Ok(collections::collections_path())

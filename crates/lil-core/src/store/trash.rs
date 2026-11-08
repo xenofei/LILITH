@@ -780,9 +780,10 @@ impl Store {
     }
 
     /// Takes trash entry `entry_id` out of the trash after its payload's bytes were merged
-    /// back into the workspace ([`Store::trash_payload`]; CORE-155): its payload file, which
-    /// must still hold `sha256`, then its record and empty folders. This is the restore's
-    /// commit point, as the move is for [`Store::trash_restore_to`].
+    /// back into the workspace ([`Store::trash_payload`]; CORE-155), or after a delete that put
+    /// them there was refused: its payload file, which must still hold `sha256`, then its record
+    /// and empty folders. For a merge, the merge's edit is the commit point and this is a
+    /// best-effort step after it (Appendix E): its caller reports a failure as a warning.
     ///
     /// # Errors
     /// `trash.unknown` for no such entry; `store.hash_conflict` when the payload's bytes
