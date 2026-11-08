@@ -28,7 +28,7 @@ mod reconcile;
 pub mod repair;
 mod schema;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -592,6 +592,12 @@ impl Index {
         }
     }
 
+    /// Whether a cold rebuild of the whole workspace is running now: the thumbnail cache's
+    /// clean-up skips its pass meanwhile (APP-038; P4b-R36).
+    pub fn rebuilding(&self) -> bool {
+        lock(&self.cold_log).is_some()
+    }
+
     /// Whether the first whole-workspace run failed and none has succeeded since.
     pub fn failed(&self) -> bool {
         matches!(*self.ready.borrow(), Readiness::Failed(_))
@@ -952,6 +958,24 @@ impl Index {
                 .optional()
                 .map(|row| row.map(reconcile::DbFile::into_row))
                 .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
+    /// Every SHA-256 the index's files hold, unverified rows included (a row can stay
+    /// unverified indefinitely): what the thumbnail cache's clean-up keeps (APP-038; P4b-R36).
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn file_hashes(&self) -> Result<HashSet<String>, IndexError> {
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT sha256 FROM files WHERE sha256 IS NOT NULL")
+                    .map_err(|e| sql(&e))?;
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .and_then(|rows| rows.collect::<rusqlite::Result<HashSet<_>>>())
+                    .map_err(|e| sql(&e))
             })
             .await
     }

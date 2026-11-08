@@ -222,6 +222,206 @@ pub fn remove_suite_cache_file(env: &lil_platform::Env, path: &Path) -> std::io:
     remove_file(path)
 }
 
+/// The folders below a workspace's local data folder that [`write_workspace_local_file`]
+/// writes in: the thumbnail cache and the pick log's thumbnails (APP-038, CORE-176).
+const LOCAL_WRITE_DIRS: [&[&str]; 2] = [&["thumbs"], &["picks", "thumbs"]];
+/// The one folder [`remove_workspace_local_file`] removes from: the thumbnail cache (P4b-R36).
+const LOCAL_REMOVE_DIRS: [&[&str]; 1] = [&["thumbs"]];
+
+/// Writes `bytes` as the file `path` of a workspace's local data folder `local_dir`
+/// (ARCH-097): only below `<local dir>\thumbs\` or `<local dir>\picks\thumbs\` (APP-038,
+/// CORE-176). The folders are made; the data goes to a new temp file beside the target
+/// (flushed to disk) and is moved to the target's name without replacing anything. The cache
+/// is keyed by content, so a plain file already there holds the same bytes and is kept: the
+/// temp file is removed and the write succeeds. Anything else at that name (a link, a folder)
+/// is refused, never written through. Temp files of this function older than a day are
+/// removed from the folder first.
+///
+/// # Errors
+/// `PermissionDenied` before anything is written or made: a relative path, a path with a `.`
+/// or `..` part, a path not below one of the two folders (names compared without regard to
+/// case), a folder on the way that is a link or not a folder, or a file name Windows would
+/// read as something else (as [`write_suite_cache_file`]); then the write's errors.
+pub fn write_workspace_local_file(
+    local_dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let (dir, name) = check_local_path(local_dir, path, &LOCAL_WRITE_DIRS)?;
+    ensure_dir(dir)?;
+    // The folders made just now are checked again: none on the way may be a link.
+    check_local_path(local_dir, path, &LOCAL_WRITE_DIRS)?;
+    sweep_leftovers(dir);
+    let mut tries = 0;
+    let temp = loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let stem = format!(".{}.{}-{n}", name.to_string_lossy(), std::process::id());
+        match write_temp(dir, &format!("{stem}.tmp"), bytes, &FailPoints::none()) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 1000 => {
+                tries += 1;
+            }
+            written => break written?,
+        }
+    };
+    match move_new(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = remove_file(&temp);
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+            let meta = std::fs::symlink_metadata(long_path(path))?;
+            if meta.is_file() && !meta.file_type().is_symlink() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is there, but not as a plain file", path.display()),
+                ))
+            }
+        }
+    }
+}
+
+/// Sets the last-write time of the file `path` of the thumbnail cache `<local dir>\thumbs\`
+/// to `when`: a cache hit counts as a touch for clean-up (APP-038, "untouched for 7 days").
+/// The checks of [`remove_workspace_local_file`]; the file must be a plain file with one name
+/// (a hard link planted there could reach a file outside), and it is opened for its
+/// attributes only, without following a link, so no data is written.
+///
+/// # Errors
+/// `PermissionDenied` for a path outside `<local dir>\thumbs\`, anything but a plain file, or
+/// a file with more than one name; the open's or the update's error.
+#[allow(clippy::disallowed_methods)]
+pub fn touch_workspace_local_file(
+    local_dir: &Path,
+    path: &Path,
+    when: std::time::SystemTime,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES`: enough to count its names and set its
+    /// times, nothing else.
+    const ATTRIBUTES: u32 = 0x0080 | 0x0100;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`: a link is opened itself, never followed.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    check_local_path(local_dir, path, &LOCAL_REMOVE_DIRS)?;
+    let meta = std::fs::symlink_metadata(long_path(path))?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a plain file", path.display()),
+        ));
+    }
+    let file = OpenOptions::new()
+        .access_mode(ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(long_path(path))?;
+    if lil_platform::fs::link_count(&file)? > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} has more than one name (a hard link)", path.display()),
+        ));
+    }
+    file.set_modified(when)
+}
+
+/// Removes the file `path` of the thumbnail cache `<local dir>\thumbs\` (P4b-R36): a hard
+/// delete of a local cache file, with the checks of [`write_workspace_local_file`] restricted
+/// to that one folder, as [`remove_suite_cache_file`] is to its own.
+///
+/// # Errors
+/// `PermissionDenied` for a path outside `<local dir>\thumbs\` (or reached through a link);
+/// the removal's error.
+pub fn remove_workspace_local_file(local_dir: &Path, path: &Path) -> std::io::Result<()> {
+    check_local_path(local_dir, path, &LOCAL_REMOVE_DIRS)?;
+    if std::fs::symlink_metadata(long_path(path))?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is a folder", path.display()),
+        ));
+    }
+    remove_file(path)
+}
+
+/// `path`'s folder and file name when it is a file below one of `allowed` (each a folder of
+/// `local_dir`, by its parts), named without `.` or `..`, with a plain file name, and reached
+/// through no link: each folder on the way that exists must be a folder and not a link.
+fn check_local_path<'p>(
+    local_dir: &Path,
+    path: &'p Path,
+    allowed: &[&[&str]],
+) -> std::io::Result<(&'p Path, &'p std::ffi::OsStr)> {
+    use std::path::Component;
+    let refuse = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a file of the workspace's local cache folders: {why}",
+                path.display()
+            ),
+        )
+    };
+    if !path.is_absolute() || !local_dir.is_absolute() {
+        return Err(refuse("the path is relative"));
+    }
+    // Read from the text: `Path::components` drops a `.` in the middle.
+    if path
+        .to_string_lossy()
+        .split(['\\', '/'])
+        .any(|part| part == "." || part == "..")
+    {
+        return Err(refuse("its name holds `.` or `..`"));
+    }
+    let key = |c: Component<'_>| lil_platform::paths::upcase_name(&c.as_os_str().to_string_lossy());
+    let mut base = local_dir.components();
+    let mut rest = path.components();
+    for want in base.by_ref() {
+        match rest.next() {
+            Some(got) if key(got) == key(want) => {}
+            _ => return Err(refuse("it is outside the workspace's local folder")),
+        }
+    }
+    let rest: Vec<Component<'_>> = rest.collect();
+    if rest.iter().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(refuse("its name holds `.` or `..`"));
+    }
+    if !allowed.iter().any(|dirs| {
+        rest.len() > dirs.len()
+            && dirs
+                .iter()
+                .zip(&rest)
+                .all(|(want, got)| key(*got) == lil_platform::paths::upcase_name(want))
+    }) {
+        return Err(refuse("it is not below one of its cache folders"));
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refuse("it names no file"));
+    };
+    if let Some(why) = name
+        .to_str()
+        .map_or(Some("its name is not Unicode"), odd_file_name)
+    {
+        return Err(refuse(why));
+    }
+    // Every folder from the cache folder down: a link would lead the write elsewhere.
+    let mut at = local_dir.to_path_buf();
+    for part in &rest[..rest.len() - 1] {
+        at.push(part.as_os_str());
+        match std::fs::symlink_metadata(long_path(&at)) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(refuse("a folder on its way is a link or not a folder"));
+            }
+            Ok(_) => {}
+            // Not made yet: the write makes it, then checks again.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((dir, name))
+}
+
 /// The checks of [`write_suite_cache_file`], then `bytes` in a new temp file beside `path`
 /// (the folder made, a day's leftovers swept first): the folder and the temp file.
 fn cache_temp<'p>(

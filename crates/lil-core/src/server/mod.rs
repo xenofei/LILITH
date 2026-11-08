@@ -58,6 +58,11 @@
 //!   workspace first used later, posts one toast for them (the jobs' restart-hold sink). After
 //!   each confirmation load (the suite's at start, the default workspace's once it opens) the
 //!   notifier reconciles the confirmation toasts with the pending confirmations.
+//! - The thumbnail cache ([`crate::interchange::thumbs::ThumbService`], APP-038; P4b-R32) is
+//!   built with the hub, before the registry: it fills the asset services' `thumbs` slot and
+//!   serves the router's `app/thumbs.request`. Its clean-up runs after the default workspace's
+//!   first finished reconcile and every 24 h, until the drain. Each render waits
+//!   `LIL_TEST_THUMB_SLOW_MS` first on a test channel.
 //! - The diagnostics ([`crate::diagnostics`], P4a-R24) are built with the telemetry and the
 //!   engines' slot before the dispatcher; they are its error sink (each error outcome is a
 //!   recent error) and a router observer (the apps' build ids for the bundle).
@@ -86,6 +91,7 @@ use crate::docs::{Holds, TestHolds, register_doc_tools, register_test_hold};
 use crate::engines::Engines;
 use crate::engines::tools::{EnginesSlot, register_engine_test_tools, register_engine_tools};
 use crate::events::EventBus;
+use crate::interchange::thumbs::{ThumbOptions, ThumbService};
 use crate::interchange::{Interchange, Notifier, NotifierParts, register_interchange_tools};
 use crate::jobs::Estimator;
 use crate::jobs::scheduler::GpuScheduler;
@@ -314,9 +320,17 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let telemetry = start_telemetry(&cfg, &events).await;
     telemetry::register_snapshot(&events, &telemetry);
     // The asset services' late-bound slots (P4b-R32): the asset tools keep them; `asset_use`
-    // is filled once the jobs exist and `thumbs` once the thumbnail service does (Tasks 11
-    // and 12). Until then both are empty.
+    // is filled once the jobs exist (Task 11), and `thumbs` here, with the thumbnail cache.
     let asset_services = AssetServices::unwired();
+    let thumbs = ThumbService::new(
+        hub.clone(),
+        events.clone(),
+        ThumbOptions {
+            slow: cfg.thumb_slow,
+            ..ThumbOptions::default()
+        },
+    );
+    let _ = asset_services.thumbs.set(thumbs.clone());
     let mut registry = core_registry(
         cfg.test_tools,
         &test_gates,
@@ -638,6 +652,7 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     let mut router = RpcRouter::new(&cfg, &pipe, dispatcher, confirm.clone())
         .with_caps(caps.clone())
         .with_desktop(desktop_settings.clone())
+        .with_thumbs(thumbs.clone())
         .with_observer(ui_apps.clone())
         .with_observer(holds)
         .with_observer(interchange)
@@ -693,6 +708,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
             }
         });
     }
+    // The thumbnail clean-up: its first pass waits for the default workspace's first reconcile.
+    thumbs.spawn_clean_up(lifecycle.drain_token());
     let mut helpers = vec![
         tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after)),
         tokio::spawn(sweep_confirmations(confirm.clone())),

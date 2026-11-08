@@ -1,11 +1,13 @@
-//! The `interchange` module (CORE-014; APP-022, APP-061, APP-063–066, APP-146): the app
-//! handler registry, `open_in` and `ui.show`, and the notifier. `lil:` activation and
-//! thumbnails are the apps'.
+//! The `interchange` module (CORE-014; APP-022, APP-038, APP-061, APP-063–066, APP-146): the
+//! app handler registry, `open_in` and `ui.show`, the notifier, and the thumbnail cache
+//! (P4b-R6: the core owns thumbnails, the apps draw them). `lil:` activation is the apps'.
 //!
 //! - `handlers`: registrations (`apps\<app>.toml`), targets and which app handles what;
 //! - `notify`: the notifier, the core's toasts and the notification path (plan 4a);
 //! - `toast_xml`: the toast XML (Appendix G "Toast XML");
 //! - `lilref`: the `.lilref` files of `lilref.write` (APP-021);
+//! - `thumbs`: the renderer registry, the fixed tiers, the content-keyed cache and its
+//!   clean-up, behind `app/thumbs.request` (APP-038; P4b-R12, P4b-R36);
 //! - `tools`: `handlers.for`, `open_in`, `ui.show`, `lilref.write` and `notify.claude_code`.
 //!
 //! An agent's `open_in` or `ui.show` that names an app posts an `agent_activity` toast
@@ -32,6 +34,7 @@
 pub mod handlers;
 pub mod lilref;
 pub mod notify;
+pub mod thumbs;
 pub mod toast_xml;
 pub mod tools;
 
