@@ -3514,7 +3514,10 @@ async fn a_plain_trash_of_a_renamed_locked_asset_folder_is_refused() {
         b"{ not json",
     );
     let refused = store.trash(&p(renamed), "test").await.unwrap_err();
-    assert!(matches!(refused, StoreError::NeedsRepair(_)), "{refused:?}");
+    assert!(
+        matches!(refused, StoreError::LocksUnreadable(_)),
+        "{refused:?}"
+    );
     assert_eq!(files_of(&ws.file(renamed)).len(), before.len());
     assert!(store.trash_list().await.unwrap().is_empty());
 }
@@ -3674,6 +3677,111 @@ fn holds_through_aliases_of_the_folder_count_as_in_use() {
         wait_no_holds(&mut pipe);
     }
     remove_empty_outside(&link);
+    let ran = app_trash(&mut app);
+    assert_eq!(ran["status"], "ok", "{ran}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 11, fix round 2 (re-review N-1, N-3).
+// ---------------------------------------------------------------------------------------------
+
+/// Re-review N-3: a manifest that doesn't parse beside a good one blocks every trash in its
+/// asset folder (its locks can't be read) with its own message, the code
+/// `manifest.needs_repair` and `data: {path}`; but it never blocks the trash of itself (a
+/// manifest is never locked by its own list), so a stray broken manifest can be cleaned up.
+#[tokio::test(start_paused = true)] // spec: CORE-035, ARCH-058
+async fn a_broken_manifest_blocks_its_folder_but_not_its_own_trash() {
+    let ws = workspace();
+    let store = ws.store();
+    sealed_version(&ws, &store).await;
+    write_file(&ws.file(&format!("{ASSET}/notes.txt")), b"notes");
+    let stray = format!("{ASSET}/backup.manifest.json");
+    write_file(&ws.file(&stray), b"{ half written");
+
+    let refused = store
+        .trash(&p(&format!("{ASSET}/notes.txt")), "test")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, StoreError::LocksUnreadable(path) if path.as_str() == stray),
+        "{refused:?}"
+    );
+    let body = refused.to_error("t");
+    assert_eq!(body.code, "manifest.needs_repair");
+    assert_eq!(body.data.as_ref().unwrap()["path"], stray.as_str());
+    assert!(
+        body.message
+            .contains("doesn't parse, so the locks it may hold can't be read")
+            && body
+                .message
+                .contains("nothing under its folder is moved to the trash")
+            && body.message.contains("project.status lists it"),
+        "{}",
+        body.message
+    );
+    assert!(ws.exists(&format!("{ASSET}/notes.txt")));
+
+    // The broken manifest itself goes to the trash; then its folder is unblocked.
+    store
+        .trash(&p(&stray), "test")
+        .await
+        .expect("its own trash");
+    assert!(!ws.exists(&stray));
+    store
+        .trash(&p(&format!("{ASSET}/notes.txt")), "test")
+        .await
+        .expect("unblocked");
+}
+
+/// Re-review N-1: a hold whose path runs through the asset folder counts as a use even when a
+/// junction inside the folder leads outside the workspace (its final path is elsewhere): by its
+/// plain path, relative or absolute.
+#[test] // spec: CORE-157
+fn a_hold_through_a_junction_out_of_the_folder_counts_as_in_use() {
+    let env = TestEnv::new();
+    let ws = served_workspace(&env, "hold-junction");
+    let _core = app_core(&env, FailPoints::none());
+    let mut pipe = cli_pipe(&env, &ws);
+    let mut app = TestApp::start(&env, Some(&ws), &[]);
+    let crane = asset_path(&ws, CRANE);
+    let outside = env.root().join("outside_docs");
+    write_file(&outside.join("doc.lil"), b"a document kept elsewhere");
+    let work = crane.join("work");
+    write_file(&work.join("keep.txt"), b"keep");
+    let link = work.join("ext");
+    junction(&link, &outside);
+    let canonical = std::fs::canonicalize(&ws).unwrap();
+    let text = canonical.to_string_lossy().into_owned();
+    let absolute = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+        .join("projects")
+        .join(P4)
+        .join("assets")
+        .join(CRANE)
+        .join("work")
+        .join("ext")
+        .join("doc.lil");
+    for path in [
+        format!("projects/{P4}/assets/{CRANE}/work/ext/doc.lil"),
+        absolute.to_string_lossy().into_owned(),
+    ] {
+        let mut holder = TestApp::start(&env, Some(&ws), &[]);
+        let held = holder.tool(
+            "test.hold",
+            json!({"doc_id": "doc_ext", "path": path}),
+            Some(&tkey()),
+        );
+        assert_eq!(held["status"], "ok", "{held}");
+        let out = app_trash(&mut app);
+        assert_eq!(out["error"]["code"], "asset.in_use", "{path}: {out}");
+        assert!(crane.is_dir(), "{path}: nothing moved");
+        drop(holder);
+        wait_no_holds(&mut pipe);
+    }
+    remove_empty_outside(&link);
+    assert!(
+        outside.join("doc.lil").exists(),
+        "the outside document is untouched"
+    );
     let ran = app_trash(&mut app);
     assert_eq!(ran["status"], "ok", "{ran}");
 }

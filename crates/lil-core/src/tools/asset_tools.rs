@@ -2296,7 +2296,7 @@ async fn locked_paths(
     let folder = format!("projects/{project}/assets/{asset_id}");
     let found: BTreeSet<String> = open
         .store
-        .asset_locks(&folder)
+        .asset_locks(&folder, None)
         .await
         .map_err(|e| e.to_error(""))?
         .into_iter()

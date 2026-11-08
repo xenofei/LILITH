@@ -117,9 +117,10 @@ use crate::workspace::WorkspaceHub;
 ///   the asset; a job's own project stands in for arguments that name none;
 /// - a hold: a document hold whose path, as the hold keeps it, reaches the asset folder or
 ///   something under it: a relative path of a hold the workspace's sessions can see (its own and
-///   loose ones), taken under the workspace, or an absolute path of any hold. Both are resolved
-///   to their final form first ([`final_form`]: trailing dots and spaces, 8.3 names and
-///   junctions, review M-1), as is the workspace's root, then compared.
+///   loose ones), taken under the workspace, or an absolute path of any hold. It counts when its
+///   plain form or its final form ([`final_form`]: trailing dots and spaces, 8.3 names and
+///   junctions, review M-1) lies under the folder ([`hold_uses_folder`], re-review N-1), and
+///   when the root or the path can't be resolved (fail closed).
 ///
 /// Names compare without regard to case, as Windows paths do. A `state.db` that can't be read
 /// is an error, so the trash is refused (fail closed).
@@ -145,12 +146,14 @@ fn job_names_asset(job: &crate::jobs::record::JobRow, project: &str, asset_id: &
         || (same(job.asset_id.as_deref(), asset_id) && same(job.project.as_deref(), project))
 }
 
-/// `path` as Windows reaches it: lexically normalised (`/` as `\`, the `\\?\` prefix, `.` and
-/// `..` parts), each component's trailing dots and spaces stripped as Win32 strips them, then
-/// the deepest part that exists replaced by its final path (`std::fs::canonicalize`, through
-/// `GetFinalPathNameByHandleW`), so 8.3 short names and junctions resolve to the folder they
-/// name (review M-1). A relative `path` is taken under `root`. `None` when no part of it exists.
-fn final_form(root: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+/// How a path's existing part is resolved to its final path: `std::fs::canonicalize` in the
+/// core (through `GetFinalPathNameByHandleW`), a fake in tests.
+type Canonicalize<'a> = &'a dyn Fn(&std::path::Path) -> std::io::Result<std::path::PathBuf>;
+
+/// `path` lexically normalised: under `root` when relative, `/` as `\`, the `\\?\` prefix gone,
+/// `.` and `..` parts applied, each component's trailing dots and spaces stripped as Win32 strips
+/// them. The head (prefix and root) and the names. `None` for a `..` above the head.
+fn lexical(root: &std::path::Path, path: &str) -> Option<(std::path::PathBuf, Vec<String>)> {
     use std::path::{Component, PathBuf};
     let text = path.replace('/', "\\");
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
@@ -178,21 +181,47 @@ fn final_form(root: &std::path::Path, path: &str) -> Option<std::path::PathBuf> 
             }
         }
     }
+    Some((head, parts))
+}
+
+/// `path` as Windows reaches it ([`lexical`], then the deepest part that exists replaced by
+/// its final path through `canonicalize`), so 8.3 short names and junctions resolve to the
+/// folder they name (review M-1). `Ok(None)` when no part of it exists.
+///
+/// # Errors
+/// A part that exists can't be resolved (any error but "not found"): the caller fails closed.
+fn final_form(
+    root: &std::path::Path,
+    path: &str,
+    canonicalize: Canonicalize<'_>,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    use std::path::PathBuf;
+    let Some((head, parts)) = lexical(root, path) else {
+        return Ok(None);
+    };
     for keep in (0..=parts.len()).rev() {
         let mut existing = head.clone();
         existing.extend(&parts[..keep]);
-        if let Ok(found) = std::fs::canonicalize(&existing) {
-            let text = found.to_string_lossy().into_owned();
-            let mut out = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
-            out.extend(&parts[keep..]);
-            return Some(out);
+        match canonicalize(&existing) {
+            Ok(found) => {
+                let text = found.to_string_lossy().into_owned();
+                let mut out = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
+                out.extend(&parts[keep..]);
+                return Ok(Some(out));
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(e),
         }
     }
-    None
+    Ok(None)
 }
 
-/// `held`, a hold's path in its final form ([`final_form`]), relative to `root`'s final form,
-/// with `/` separators, when it is inside it; compared without regard to case.
+/// `held` relative to `root`, with `/` separators, when it is inside it; compared without
+/// regard to case.
 fn workspace_relative(root: &std::path::Path, held: &std::path::Path) -> Option<String> {
     let key = |c: std::path::Component| c.as_os_str().to_string_lossy().to_lowercase();
     let root_parts: Vec<String> = root.components().map(key).collect();
@@ -212,6 +241,44 @@ fn workspace_relative(root: &std::path::Path, held: &std::path::Path) -> Option<
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+/// Whether the hold path `hold` uses the asset folder `folder` (workspace-relative, lower case)
+/// of the workspace at `root`: its plain form ([`lexical`]) or its final form ([`final_form`])
+/// is the folder or lies under it (re-review N-1: a junction inside the folder that leads out of
+/// the workspace still counts by its plain path). Fails closed: `true` when the workspace root,
+/// or a part of the hold path that exists, can't be resolved.
+fn hold_uses_folder(
+    root: &std::path::Path,
+    folder: &str,
+    hold: &str,
+    canonicalize: Canonicalize<'_>,
+) -> bool {
+    let under = |base: &std::path::Path, path: &std::path::Path| {
+        workspace_relative(base, path).is_some_and(|rel| {
+            let rel = rel.to_lowercase();
+            rel == folder || rel.starts_with(&format!("{folder}/"))
+        })
+    };
+    let joined = |(head, parts): (std::path::PathBuf, Vec<String>)| {
+        let mut path = head;
+        path.extend(parts);
+        path
+    };
+    if let (Some(plain_root), Some(plain)) = (lexical(root, ""), lexical(root, hold))
+        && under(&joined(plain_root), &joined(plain))
+    {
+        return true;
+    }
+    let final_root = match final_form(root, "", canonicalize) {
+        Ok(Some(found)) => found,
+        _ => return true,
+    };
+    match final_form(&final_root, hold, canonicalize) {
+        Ok(Some(found)) => under(&final_root, &found),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 impl crate::tools::AssetUse for ServerAssetUse {
@@ -266,17 +333,9 @@ impl crate::tools::AssetUse for ServerAssetUse {
             let paths: Vec<String> = own.into_iter().chain(absolute).collect();
             let root = workspace.ws.path.clone();
             let held = tokio::task::spawn_blocking(move || {
-                let Some(root) = final_form(&root, "") else {
-                    return false;
-                };
-                paths.iter().any(|p| {
-                    final_form(&root, p)
-                        .and_then(|held| workspace_relative(&root, &held))
-                        .is_some_and(|rel| {
-                            let rel = rel.to_lowercase();
-                            rel == folder || rel.starts_with(&format!("{folder}/"))
-                        })
-                })
+                paths
+                    .iter()
+                    .any(|p| hold_uses_folder(&root, &folder, p, &|at| std::fs::canonicalize(at)))
             })
             .await
             .unwrap_or(true);
@@ -1347,5 +1406,108 @@ pub fn start_in_thread(cfg: CoreConfig) -> CoreThread {
     CoreThread {
         core: Some(core),
         rt: Some(rt),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    const ROOT: &str = r"C:\ws";
+    const FOLDER: &str = "projects/sketchbook/assets/chr_paper_crane";
+
+    /// A fake `canonicalize`: everything under `C:\ws` exists as written, except what `missing`
+    /// names; `denied` can't be resolved; `link` leads to `target`.
+    fn fake<'a>(
+        missing: &'a [&'a str],
+        denied: &'a [&'a str],
+        link: Option<(&'a str, &'a str)>,
+    ) -> impl Fn(&Path) -> io::Result<PathBuf> + 'a {
+        move |at: &Path| {
+            let text = at.to_string_lossy().to_lowercase();
+            if denied.iter().any(|d| text == d.to_lowercase()) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            if missing.iter().any(|m| text.starts_with(&m.to_lowercase())) {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            if let Some((from, to)) = link
+                && text.starts_with(&from.to_lowercase())
+            {
+                let rest = &at.to_string_lossy()[from.len()..];
+                return Ok(PathBuf::from(format!("{to}{rest}")));
+            }
+            Ok(at.to_path_buf())
+        }
+    }
+
+    #[test] // spec: CORE-157
+    fn a_hold_counts_by_its_plain_or_its_final_path() {
+        let root = Path::new(ROOT);
+        let none = fake(&[], &[], None);
+        assert!(hold_uses_folder(
+            root,
+            FOLDER,
+            &format!("{FOLDER}/work/a.lil"),
+            &none
+        ));
+        assert!(!hold_uses_folder(
+            root,
+            FOLDER,
+            "projects/sketchbook/assets/other/a.lil",
+            &none
+        ));
+        assert!(!hold_uses_folder(
+            root,
+            FOLDER,
+            &format!("{FOLDER}_2/a.lil"),
+            &none
+        ));
+        // A junction inside the folder that leads outside the workspace: the final path is
+        // elsewhere, the plain path is inside (re-review N-1).
+        let ext = format!(r"{ROOT}\projects\sketchbook\assets\chr_paper_crane\work\ext");
+        let out = fake(&[], &[], Some((&ext, r"D:\docs")));
+        assert!(hold_uses_folder(
+            root,
+            FOLDER,
+            &format!("{FOLDER}/work/ext/doc.lil"),
+            &out
+        ));
+        assert!(hold_uses_folder(
+            root,
+            FOLDER,
+            &format!(r"{ext}\doc.lil"),
+            &out
+        ));
+        // A junction from outside into the folder counts by its final path.
+        let target = format!(r"{ROOT}\{}", FOLDER.replace('/', "\\"));
+        let into = fake(&[], &[], Some((r"D:\alias", &target)));
+        assert!(hold_uses_folder(root, FOLDER, r"D:\alias\doc.lil", &into));
+        // A hold on a path where nothing exists: not this workspace's.
+        let gone = fake(&[r"Q:\"], &[], None);
+        assert!(!hold_uses_folder(root, FOLDER, r"Q:\nowhere\a.lil", &gone));
+    }
+
+    #[test] // spec: CORE-157
+    fn a_hold_that_cant_be_resolved_counts_as_a_use() {
+        let root = Path::new(ROOT);
+        // The workspace root can't be resolved: every hold counts.
+        let root_denied = fake(&[], &[ROOT], None);
+        assert!(hold_uses_folder(
+            root,
+            FOLDER,
+            r"D:\elsewhere\a.lil",
+            &root_denied
+        ));
+        // Resolution stops partway (a folder on the way can't be resolved): it counts.
+        let partway = fake(&[r"D:\docs\deep"], &[r"D:\docs"], None);
+        assert!(hold_uses_folder(
+            root,
+            FOLDER,
+            r"D:\docs\deep\a.lil",
+            &partway
+        ));
     }
 }

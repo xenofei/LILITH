@@ -483,7 +483,9 @@ impl Store {
         };
         let target = long.key();
         for asset in assets {
-            for (manifest, locks) in self.asset_locks(&asset).await? {
+            // The path being trashed is never locked by its own list: a stray manifest that
+            // doesn't parse can still be cleaned up (re-review N-3).
+            for (manifest, locks) in self.asset_locks(&asset, Some(&[rel, long])).await? {
                 let longs = self.long_lock_entries(&asset, &manifest, &locks).await?;
                 for entry in longs {
                     let key = entry.key();
@@ -502,8 +504,10 @@ impl Store {
     /// The `locks` of every manifest of the asset folder `asset` (workspace-relative), each
     /// with its manifest's path: the folder's manifests as the index finds them
     /// ([`super::order::asset_manifests`], so a folder renamed outside the suite counts too,
-    /// review I-1). A manifest that doesn't parse is `manifest.needs_repair`: its locks can't be
-    /// known, so whatever asks fails closed.
+    /// review I-1). A manifest that doesn't parse is `manifest.needs_repair` with its own
+    /// message ([`StoreError::LocksUnreadable`]): its locks can't be known, so whatever asks
+    /// fails closed. A manifest that is one of `skip` (the path being trashed) isn't read: it is
+    /// never locked by its own list (re-review N-3).
     ///
     /// # Errors
     /// `manifest.needs_repair`; the store's read errors; `store.io` when the folder can't be
@@ -511,6 +515,7 @@ impl Store {
     pub(crate) async fn asset_locks(
         &self,
         asset: &str,
+        skip: Option<&[&WsPath]>,
     ) -> Result<Vec<(WsPath, Vec<String>)>, StoreError> {
         let at = WsPath::from_disk(asset.to_string());
         let (probe, dir) = (self.probe().clone(), at.abs(self.root()));
@@ -520,6 +525,9 @@ impl Store {
         let mut found = Vec::new();
         for name in names {
             let manifest = WsPath::from_disk(format!("{asset}/{name}"));
+            if skip.is_some_and(|skip| skip.iter().any(|s| s.key() == manifest.key())) {
+                continue;
+            }
             let Some(bytes) = self.read(&manifest).await? else {
                 continue;
             };
@@ -528,7 +536,7 @@ impl Store {
                 .and_then(|t| Manifest::parse(t).ok())
             else {
                 tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known, so its folder isn't trashed");
-                return Err(StoreError::NeedsRepair(manifest));
+                return Err(StoreError::LocksUnreadable(manifest));
             };
             found.push((manifest, m.view().locks));
         }
