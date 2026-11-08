@@ -35,7 +35,10 @@
 //! - [`restored_as`] (P4b-R39; CORE-037): after `trash.restore {to}` moved a whole asset's
 //!   folder from the trash to `projects/<p>/assets/<to>/`, the same three steps as an accepted
 //!   move, in the same order (P4b-R34): (1) appends the redirect `<p>/<old id>` →
-//!   `<p>/<to>`, unless the newest redirect from the old id already leads there; (2) renames
+//!   `<p>/<to>`, unless the newest redirect from the old id already leads there, or old refs to
+//!   the old id already reach a live asset with another creation UUID (FR1, the accept-move
+//!   chain check [`old_refs`]: then no redirect is written and the asset is restored all the
+//!   same); (2) renames
 //!   the manifest file to `<to>.manifest.json`; (3) sets the manifest's `asset_id` to `to`
 //!   (only while it is still the old id). Each step is skipped when done. The folder moves
 //!   first, so a crash at any point after it leaves an asset whose manifest names its old place:
@@ -423,6 +426,70 @@ fn changed(rel: &WsPath) -> StoreError {
     }
 }
 
+/// Where old refs to `from` lead now, for a redirect from it to the folder `to` (FR1: a
+/// redirect never sends one asset's refs to another; rulings T8 A-H1, A-RM2, A-R2M1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OldRefs {
+    /// Nowhere that matters: no live asset, a loop or a missing end, or this very folder or
+    /// an asset with its creation UUID.
+    Free,
+    /// An asset in the trash: its entry.
+    Trashed(String),
+    /// A live asset with another creation UUID (or none where `to` has one): its name.
+    Elsewhere(Name),
+}
+
+/// The chain check of `asset.accept_move` (module docs), shared with a whole asset's
+/// `trash.restore {to}` ([`restored_as`]): `from` resolved through the redirects as they are
+/// now. `uuid` is the creation UUID of the folder at `to` (lower case). The caller holds the
+/// old name's redirect lock and has checked that the redirects file reads.
+///
+/// # Errors
+/// The index's error.
+pub async fn old_refs(
+    index: &Index,
+    resolver: &Resolver<'_>,
+    from: &Name,
+    to: &Name,
+    uuid: Option<&str>,
+) -> Result<OldRefs, ErrorBody> {
+    match resolver.resolve_name(&from.0, &from.1).await {
+        Err(e) if e.code == ASSET_TRASHED.code => Ok(OldRefs::Trashed(
+            e.data
+                .as_ref()
+                .and_then(|d| d.get("entry_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+        )),
+        Err(_) => Ok(OldRefs::Free),
+        Ok(end) => {
+            let same_folder =
+                end.project.eq_ignore_ascii_case(&to.0) && end.asset_id.eq_ignore_ascii_case(&to.1);
+            let end_uuid = index
+                .asset(&end.project, &end.asset_id)
+                .await
+                .map_err(|e| e.to_error(""))?
+                .and_then(|r| uuid_key(&r));
+            Ok(if !same_folder && end_uuid.as_deref() != uuid {
+                OldRefs::Elsewhere((end.project, end.asset_id))
+            } else {
+                OldRefs::Free
+            })
+        }
+    }
+}
+
+/// What [`restored_as`] did with the redirect from the old id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredAs {
+    /// Whether this call appended `<p>/<old>` → `<p>/<to>`.
+    pub redirect_written: bool,
+    /// The live asset with another creation UUID that old refs keep reaching, when the redirect
+    /// was left out for it (FR1).
+    pub kept_by: Option<Name>,
+}
+
 /// `asset.accept_move` of the folder `projects/<project>/assets/<asset_id>` (module docs). The
 /// caller holds the asset's version lock and has checked the folder ([`check_folder`]). `by`
 /// and `actor` are the redirect's. The errors carry an empty trace id.
@@ -500,21 +567,12 @@ pub async fn accept_move(
     // or loops (`cycle`) is fine.
     // Resolved also with no redirect from the old name: an asset trashed there through the
     // suite answers `asset.trashed` too (one rule for both trashed cases, ruling T8 A-R2M1).
-    let end = if !present {
-        Some(resolver.resolve_name(&from.0, &from.1).await)
+    let end = if present {
+        OldRefs::Free
     } else {
-        None
+        old_refs(index, &resolver, &from, &to, uuid.as_deref()).await?
     };
-    if let Some(Err(e)) = &end
-        && e.code == ASSET_TRASHED.code
-    {
-        let entry = e
-            .data
-            .as_ref()
-            .and_then(|d| d.get("entry_id"))
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_string();
+    if let OldRefs::Trashed(entry) = &end {
         return Err(not_needed(&format!(
             "Old refs to {}/{} lead to an asset in the trash (entry {entry}), so this folder \
              can't take them over by a move. Restoring that entry with trash.restore puts that \
@@ -524,23 +582,14 @@ pub async fn accept_move(
             from.0, from.1, from.0, from.1
         )));
     }
-    if let Some(Ok(end)) = end {
-        let same_folder =
-            end.project.eq_ignore_ascii_case(&to.0) && end.asset_id.eq_ignore_ascii_case(&to.1);
-        let end_uuid = index
-            .asset(&end.project, &end.asset_id)
-            .await
-            .map_err(|e| e.to_error(""))?
-            .and_then(|r| uuid_key(&r));
-        if !same_folder && end_uuid != uuid {
-            return Err(not_needed(&format!(
-                "Old refs to {}/{} already lead to {}/{}, another asset (its creation UUID \
-                 differs), so this folder can't take them over by a move. If this folder is the \
-                 asset that name had, rename this folder back to {}/{}'s name ({}); \
-                 asset.make_independent doesn't apply, as it isn't a copy.",
-                from.0, from.1, end.project, end.asset_id, from.0, from.1, from.1
-            )));
-        }
+    if let OldRefs::Elsewhere(end) = &end {
+        return Err(not_needed(&format!(
+            "Old refs to {}/{} already lead to {}/{}, another asset (its creation UUID \
+             differs), so this folder can't take them over by a move. If this folder is the \
+             asset that name had, rename this folder back to {}/{}'s name ({}); \
+             asset.make_independent doesn't apply, as it isn't a copy.",
+            from.0, from.1, end.0, end.1, from.0, from.1, from.1
+        )));
     }
     drop(resolver);
 
@@ -615,10 +664,41 @@ pub async fn restored_as(
     new_id: &str,
     by: &str,
     actor: Option<Actor>,
-) -> Result<bool, ErrorBody> {
+) -> Result<RestoredAs, ErrorBody> {
     let from: Name = (project.to_string(), old_id.to_string());
     let to: Name = (project.to_string(), new_id.to_string());
-    // (1) The redirect, under the old name's lock, as an accepted move appends it.
+    let dir = dir_of(&to)?;
+    // The restored folder's creation UUID, for the chain check (FR1).
+    let uuid = {
+        let names = {
+            let (probe, at) = (store.probe().clone(), dir.abs(store.root()));
+            tokio::task::spawn_blocking(move || {
+                crate::store::asset_manifests(probe.as_ref(), &at, &[]).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let mut found = None;
+        for name in names {
+            let rel = dir.join(&name).map_err(|e| store_error(&e))?;
+            if let Ok(Some(bytes)) = store.read(&rel).await
+                && let Some((m, _)) = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|t| Manifest::parse(t).ok())
+            {
+                found = m
+                    .view()
+                    .creation_uuid
+                    .filter(|u| !u.is_empty())
+                    .map(|u| u.to_ascii_lowercase());
+                break;
+            }
+        }
+        found
+    };
+    // (1) The redirect, under the old name's lock, as an accepted move appends it, unless old
+    // refs to the old name already reach another live asset (FR1, the accept-move check).
+    let mut kept_by = None;
     let written = {
         let from_lock = store.redirect_from_lock(&from.0, &from.1);
         let _from_held = from_lock.lock().await;
@@ -627,8 +707,14 @@ pub async fn restored_as(
             return Err(e.clone());
         }
         let present = resolver.newest_from(&from.0, &from.1).map(|r| &r.to) == Some(&to);
+        if !present
+            && let OldRefs::Elsewhere(end) =
+                old_refs(index, &resolver, &from, &to, uuid.as_deref()).await?
+        {
+            kept_by = Some(end);
+        }
         drop(resolver);
-        if !present {
+        if !present && kept_by.is_none() {
             let r = Redirect {
                 from: from.clone(),
                 to: to.clone(),
@@ -640,10 +726,9 @@ pub async fn restored_as(
                 .await
                 .map_err(|e| store_error(&e))?;
         }
-        !present
+        !present && kept_by.is_none()
     };
     // (2) The manifest's file name, then (3) its `asset_id`.
-    let dir = dir_of(&to)?;
     let canonical = dir
         .join(&format!("{new_id}.manifest.json"))
         .map_err(|e| store_error(&e))?;
@@ -681,7 +766,10 @@ pub async fn restored_as(
         .await
         .map_err(|e| e.to_error(""))?;
     index.refresh_repairs().await.map_err(|e| e.to_error(""))?;
-    Ok(written)
+    Ok(RestoredAs {
+        redirect_written: written,
+        kept_by,
+    })
 }
 
 /// `asset.make_independent` of the folder `projects/<project>/assets/<asset_id>` (module

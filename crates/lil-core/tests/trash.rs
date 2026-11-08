@@ -4038,10 +4038,11 @@ async fn restore_to_a_redirected_name_warns() {
         )]),
         "{restored}"
     );
-    // A restore onto a name no redirect leaves from has no warnings.
-    let again = fx.trash_ok("lamp_old").await;
+    // An asset whose old id no redirect leaves from, restored onto a name no redirect leaves
+    // from: no warnings.
+    let lamp = fx.trash_ok(LAMP).await;
     let plain = fx
-        .ok("trash.restore", json!({"entry_id": again, "to": ORIGAMI}))
+        .ok("trash.restore", json!({"entry_id": lamp, "to": ORIGAMI}))
         .await;
     assert!(plain.get("warnings").is_none(), "{plain}");
     fx.shutdown().await;
@@ -4155,4 +4156,87 @@ async fn a_core_restart_cancels_the_apps_pending_questions() {
     want.sort();
     assert_eq!(cancelled, want, "each published as cancelled");
     states.close();
+}
+
+/// FR1 (the coordinator's ruling on audit L-2): a whole asset restored under a new id gets no
+/// redirect from its old id when old refs to that id already reach another live asset (another
+/// creation UUID): the crane moved to `chr_heron` (redirect crane → heron), then another asset
+/// trashed under the crane's name is restored as `chr_origami`. Refs to the crane still reach
+/// the heron, no crane → origami redirect is added, the restore goes through with its
+/// `asset_id` set, and a warning says so.
+#[tokio::test] // spec: ARCH-125, CORE-037, CORE-154
+async fn restore_to_never_takes_over_refs_that_reach_another_asset() {
+    const HERON: &str = "chr_heron";
+    let (fx, _fake) = AssetFx::faked(|ws| {
+        // The crane moved to the heron, as an accepted move leaves it.
+        explorer_rename(&asset_path(ws, CRANE), &asset_path(ws, HERON));
+        explorer_rename(
+            &asset_path(ws, HERON).join(format!("{CRANE}.manifest.json")),
+            &asset_path(ws, HERON).join(format!("{HERON}.manifest.json")),
+        );
+        edit_by_hand(ws, HERON, |m| m["asset_id"] = json!(HERON));
+        write_file(
+            &ws_file(ws, "registry/redirects.yaml"),
+            format!(
+                "redirects:\n  - from: {P4}/{CRANE}\n    to: {P4}/{HERON}\n    moved_utc: 2026-11-01T10:00:00Z\n    by: cli\n"
+            )
+            .as_bytes(),
+        );
+        // Another asset (its own creation UUID) under the crane's old name.
+        explorer_copy(&asset_path(ws, LAMP), &asset_path(ws, CRANE));
+        explorer_rename(
+            &asset_path(ws, CRANE).join(format!("{LAMP}.manifest.json")),
+            &asset_path(ws, CRANE).join(format!("{CRANE}.manifest.json")),
+        );
+        edit_by_hand(ws, CRANE, |m| {
+            m["asset_id"] = json!(CRANE);
+            m["creation_uuid"] = json!("0b5e6a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b");
+        });
+    })
+    .await;
+    let entry_id = fx.trash_ok(CRANE).await;
+    // While it is in the trash, refs to the crane follow the redirect to the heron.
+    let r = fx
+        .ok("ref.resolve", json!({ "ref": fx.sealed(CRANE) }))
+        .await;
+    assert_eq!(r["asset_id"], HERON, "{r}");
+
+    let restored = fx
+        .ok(
+            "trash.restore",
+            json!({"entry_id": entry_id, "to": ORIGAMI}),
+        )
+        .await;
+    assert_eq!(restored["path"], format!("projects/{P4}/assets/{ORIGAMI}"));
+    assert_eq!(
+        restored["warnings"],
+        json!([format!(
+            "Old refs to {P4}/{CRANE} keep reaching {P4}/{HERON}; no redirect was added for the \
+             restored asset."
+        )]),
+        "{restored}"
+    );
+    let redirects = fx.redirects().unwrap();
+    assert_eq!(
+        redirects.matches("- from:").count(),
+        1,
+        "no crane → origami: {redirects}"
+    );
+    assert!(
+        !redirects.contains(&format!("to: {P4}/{ORIGAMI}")),
+        "{redirects}"
+    );
+    let r = fx
+        .ok("ref.resolve", json!({ "ref": fx.sealed(CRANE) }))
+        .await;
+    assert_eq!(
+        r["asset_id"], HERON,
+        "refs to the crane still reach the heron: {r}"
+    );
+    let origami = asset_path(&fx.ws, ORIGAMI);
+    assert_eq!(
+        read_json_file(&origami.join(format!("{ORIGAMI}.manifest.json")))["asset_id"],
+        ORIGAMI
+    );
+    fx.shutdown().await;
 }

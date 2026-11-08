@@ -26,7 +26,9 @@
 //!   first (its error, `manifest.needs_repair` for one that doesn't parse, and nothing moves;
 //!   review M-4). Holding the version lock of `<p>/<to>`, the
 //!   folder moves to `projects/<p>/assets/<to>/`, read-only re-applied where hashes match, and
-//!   `projects::repair::restored_as` appends the redirect `<p>/<a>` → `<p>/<to>` (`by` the
+//!   `projects::repair::restored_as` appends the redirect `<p>/<a>` → `<p>/<to>` (unless old
+//!   refs to `<p>/<a>` already reach a live asset with another creation UUID: then none, and
+//!   `warnings` says so; FR1) (`by` the
 //!   caller, as `asset.accept_move` writes one; no `actor` until attribution), renames the
 //!   manifest to `<to>.manifest.json` and sets its `asset_id` to `to`. A crash after the move
 //!   leaves an asset the index lists as `moved`, which `asset.accept_move` finishes without a
@@ -386,7 +388,7 @@ async fn restore_workspace(
                 .trash_restore_to(&args.entry_id, Some(to), None)
                 .await?;
             let by = status_by(&ctx.session.caller);
-            restored_as(&open.index, store, &project, &old_id, to, by.as_str(), None)
+            let done = restored_as(&open.index, store, &project, &old_id, to, by.as_str(), None)
                 .await
                 .map_err(|mut e| {
                     // The folder is back already: say so, and how the rest gets done.
@@ -407,6 +409,14 @@ async fn restore_workspace(
             // Old refs to the new name (a redirect's `from`) now reach this asset: warn, as an
             // import onto it does (ARCH-125). The redirect just written leaves from the old id.
             warnings.extend(takeover_warnings_for(store, &project, to).await);
+            // FR1: old refs to the old id already reach another live asset, so no redirect
+            // was added (`projects::repair::restored_as`).
+            if let Some((p, a)) = &done.kept_by {
+                warnings.push(format!(
+                    "Old refs to {project}/{old_id} keep reaching {p}/{a}; no redirect was added \
+                     for the restored asset."
+                ));
+            }
             Ok(path)
         }
         EntryKind::Resource => {
