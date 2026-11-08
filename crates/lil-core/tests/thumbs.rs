@@ -234,6 +234,49 @@ fn webp_frame_bomb() -> Vec<u8> {
     out
 }
 
+/// A `VP8 ` key frame's chunk data claiming `w` x `h` px, padded with zeros to `len` bytes.
+fn vp8_frame(w: u16, h: u16, len: usize) -> Vec<u8> {
+    let mut frame = vec![0x50, 0x01, 0x00, 0x9d, 0x01, 0x2a];
+    frame.extend_from_slice(&w.to_le_bytes());
+    frame.extend_from_slice(&h.to_le_bytes());
+    frame.resize(len, 0);
+    frame
+}
+
+/// A RIFF chunk: `fourcc`, its size, its data, padded to an even length.
+fn riff_chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = fourcc.to_vec();
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
+    out
+}
+
+/// An animated WebP (`VP8X` with the animation flag) whose canvas is 64 x 64: a small decoy
+/// `VP8 ` frame first, then an `ANIM` chunk and an `ANMF` frame claiming 16,383² px (its own
+/// size fields and its `VP8 ` frame header both).
+fn webp_animated_decoy() -> Vec<u8> {
+    let mut vp8x = vec![0x02, 0, 0, 0];
+    vp8x.extend_from_slice(&63u32.to_le_bytes()[..3]);
+    vp8x.extend_from_slice(&63u32.to_le_bytes()[..3]);
+    let mut anmf = vec![0u8; 6];
+    anmf.extend_from_slice(&16_382u32.to_le_bytes()[..3]);
+    anmf.extend_from_slice(&16_382u32.to_le_bytes()[..3]);
+    anmf.extend_from_slice(&[100, 0, 0, 0]);
+    anmf.extend(riff_chunk(b"VP8 ", &vp8_frame(16_383, 16_383, 64)));
+    let mut body = b"WEBP".to_vec();
+    body.extend(riff_chunk(b"VP8X", &vp8x));
+    body.extend(riff_chunk(b"VP8 ", &vp8_frame(16, 16, 32)));
+    body.extend(riff_chunk(b"ANIM", &[0u8; 6]));
+    body.extend(riff_chunk(b"ANMF", &anmf));
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
 /// `main` (a JPEG) with an APP1 EXIF segment right after its SOI, carrying a whole small
 /// JPEG as its thumbnail: that thumbnail's `FF DA` and `FF D9` come before the main scan.
 fn with_exif_thumbnail(main: &[u8]) -> Vec<u8> {
@@ -915,6 +958,22 @@ async fn bomb_header_is_refused_before_allocating() {
     assert!(
         largest < SMALL,
         "webp frame: refused only after allocating {largest} bytes"
+    );
+    // Audit fix round 2, N-2: an animated WebP whose first (top-level) frame is a small decoy
+    // and whose ANMF frame claims 16,383² is refused too: every frame header the walk sees is
+    // checked against the canvas.
+    let decoy = webp_animated_decoy();
+    let (result, largest) = largest_allocation(|| ImageRenderer.render(&decoy, 256));
+    assert!(
+        matches!(
+            result,
+            Err(RenderError::TooLarge(_) | RenderError::Damaged(_))
+        ),
+        "webp decoy: {result:?}"
+    );
+    assert!(
+        largest < SMALL,
+        "webp decoy: refused only after allocating {largest} bytes"
     );
     // The control: a real 1024 × 1024 decode allocates its pixels, and the probe sees it.
     let real = picture(1024, 1024);
@@ -1812,6 +1871,55 @@ async fn the_first_clean_up_pass_does_not_hold_the_workspace_open() {
     probe.release();
     tokio::time::timeout(DEADLINE, pass).await.unwrap().unwrap();
     drop(open);
+    r.shutdown().await;
+}
+
+/// `image@1`, each render taking 80 ms first: a healthy but slow decoder.
+struct Slow80;
+
+impl Renderer for Slow80 {
+    fn id(&self) -> &'static str {
+        "image"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
+    fn renders(&self, kind: MediaKind) -> bool {
+        kind == MediaKind::Image
+    }
+    fn render(&self, bytes: &[u8], px: u32) -> Result<Vec<u8>, RenderError> {
+        std::thread::sleep(Duration::from_millis(80));
+        ImageRenderer.render(bytes, px)
+    }
+}
+
+/// Audit fix round 2, N-1: an item waits for a slot as long as slots keep coming back. With
+/// one permit, a 300 ms deadline and 80 ms renders, ten valid images asked at once queue for
+/// about 800 ms in all, yet every one comes back `ready`: no slot is held by a stuck thread.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn slots_held_by_healthy_renders_never_turn_an_item_into_an_icon() {
+    let r = Rig::new(ThumbOptions {
+        renderers: with_renderer(Arc::new(Slow80)),
+        permits: 1,
+        deadline: Duration::from_millis(300),
+        ..fast()
+    });
+    let files: Vec<(WsPath, String)> = (0..10u8)
+        .map(|i| {
+            let name = work(&format!("q{i}.png"));
+            let bytes = picture_seeded(40, 40, 50 + i);
+            r.put(&name, &bytes);
+            (ws_path(&name), sha256_bytes(&bytes))
+        })
+        .collect();
+    let _open = r.open().await;
+    let all =
+        futures_util::future::join_all(files.iter().map(|(p, _)| r.thumbs.ensure(p, None, 96)));
+    let states = tokio::time::timeout(DEADLINE, all).await.expect("answered");
+    for ((_, sha), state) in files.iter().zip(&states) {
+        assert_ready_at(&r.local(), state, sha, 96);
+    }
+    drop(_open);
     r.shutdown().await;
 }
 

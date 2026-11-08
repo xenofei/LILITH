@@ -189,10 +189,11 @@ fn le24(b: &[u8], at: usize) -> Option<u32> {
 /// The width and height `bytes`' header claims, read without decoding anything: a PNG's
 /// `IHDR` (which must be its first chunk), a JPEG's first start-of-frame marker before its
 /// first scan, a WebP's `VP8 `, `VP8L` or `VP8X` chunk. `None` when there is none to read. A
-/// `VP8X` canvas comes with its first frame's own header (a `VP8 `/`VP8L` chunk, at the top or
-/// in the first `ANMF`): a frame larger than the canvas on either side is `None` too, since a
-/// decoder sizes the frame's planes from it before it compares it with the canvas (audit fix
-/// round 1, L-1).
+/// `VP8X` canvas is checked against every frame header a bounded walk of its chunks sees (each
+/// `VP8 `/`VP8L` chunk, at the top or inside an `ANMF`, and each `ANMF`'s own frame size): a
+/// frame larger than the canvas on either side is `None` too, since a decoder sizes the
+/// frame's planes from it before it compares it with the canvas (audit fix rounds 1 and 2,
+/// L-1, N-2).
 pub fn header_size(bytes: &[u8], format: Sniffed) -> Option<(u32, u32)> {
     match format {
         Sniffed::Png => {
@@ -215,10 +216,9 @@ pub fn header_size(bytes: &[u8], format: Sniffed) -> Option<(u32, u32)> {
                         usize::try_from(u32::from_le_bytes(bytes.get(16..20)?.try_into().ok()?))
                             .ok()?;
                     let next = data.checked_add(size)?.checked_add(size & 1)?;
-                    match webp_frame(bytes, next, bytes.len(), 2) {
-                        Some((w, h)) if w > canvas.0 || h > canvas.1 => None,
-                        _ => Some(canvas),
-                    }
+                    let mut budget = WEBP_CHUNKS;
+                    webp_frames_fit(bytes, next, bytes.len(), canvas, 2, &mut budget)
+                        .then_some(canvas)
                 }
                 _ => None,
             }
@@ -244,29 +244,64 @@ fn vp8l_size(bytes: &[u8], data: usize) -> Option<(u32, u32)> {
     Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
 }
 
-/// The first frame's size among the RIFF chunks from `at` to `end`: a `VP8 ` or `VP8L` chunk,
-/// or the first one inside an `ANMF` chunk (whose frame data starts 16 bytes in); `depth`
-/// bounds the nesting. `None` when there is none.
-fn webp_frame(bytes: &[u8], mut at: usize, end: usize, depth: u32) -> Option<(u32, u32)> {
-    while at.checked_add(8)? <= end {
-        let fourcc = bytes.get(at..at + 4)?;
-        let size = usize::try_from(u32::from_le_bytes(
-            bytes.get(at + 4..at + 8)?.try_into().ok()?,
-        ))
-        .ok()?;
+/// How many RIFF chunks the frame walk of a `VP8X` WebP looks at, at most.
+const WEBP_CHUNKS: u32 = 10_000;
+
+/// Whether every frame header among the RIFF chunks from `at` to `end` fits `canvas`: each
+/// `VP8 ` or `VP8L` chunk's frame, and each `ANMF` chunk's own frame size and the chunks inside
+/// it (whose frame data starts 16 bytes in); `depth` bounds the nesting and `budget` the
+/// chunks walked. A header that can't be read is left to the decoder.
+fn webp_frames_fit(
+    bytes: &[u8],
+    mut at: usize,
+    end: usize,
+    canvas: (u32, u32),
+    depth: u32,
+    budget: &mut u32,
+) -> bool {
+    let fits = |size: Option<(u32, u32)>| size.is_none_or(|(w, h)| w <= canvas.0 && h <= canvas.1);
+    while at.saturating_add(8) <= end && *budget > 0 {
+        *budget -= 1;
+        let (Some(fourcc), Some(size)) = (
+            bytes.get(at..at + 4),
+            bytes
+                .get(at + 4..at + 8)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_le_bytes)
+                .and_then(|n| usize::try_from(n).ok()),
+        ) else {
+            break;
+        };
         let data = at + 8;
-        match fourcc {
-            b"VP8 " => return vp8_size(bytes, data),
-            b"VP8L" => return vp8l_size(bytes, data),
+        let ok = match fourcc {
+            b"VP8 " => fits(vp8_size(bytes, data)),
+            b"VP8L" => fits(vp8l_size(bytes, data)),
             b"ANMF" if depth > 0 => {
-                let stop = data.checked_add(size)?.min(end);
-                return webp_frame(bytes, data.checked_add(16)?, stop, depth - 1);
+                // Position (3 + 3 bytes), then 24 bits each of width - 1 and height - 1.
+                let own = le24(bytes, data + 6)
+                    .zip(le24(bytes, data + 9))
+                    .map(|(w, h)| (w + 1, h + 1));
+                fits(own)
+                    && webp_frames_fit(
+                        bytes,
+                        data.saturating_add(16),
+                        data.saturating_add(size).min(end),
+                        canvas,
+                        depth - 1,
+                        budget,
+                    )
             }
-            _ => {}
+            _ => true,
+        };
+        if !ok {
+            return false;
         }
-        at = data.checked_add(size)?.checked_add(size & 1)?;
+        let Some(next) = data.checked_add(size).and_then(|n| n.checked_add(size & 1)) else {
+            break;
+        };
+        at = next;
     }
-    None
+    true
 }
 
 /// A JPEG's frame size: the first start-of-frame marker (`FF C0`–`FF CF` but `C4`, `C8` and

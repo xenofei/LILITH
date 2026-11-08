@@ -40,9 +40,12 @@
 //!    its capacity slot until its thread ends, so running plus abandoned decodes never pass
 //!    twice the permits: new decodes wait meanwhile (their items answer `pending`).
 //!
-//! **Deadlines and stops** (audit fix round 1, M-1, M-4): each slot (a hasher, a capacity
-//! slot, a decode permit) is acquired under the item's [`DECODE_DEADLINE`]; an item that gets
-//! none in time answers `icon`, with its known hash or `null`, and is announced as any other.
+//! **Deadlines and stops** (audit fix rounds 1 and 2, M-1, M-4, N-1): an item waits for a slot
+//! (a hasher, a capacity slot, a decode permit) as long as slots keep coming back: each slot
+//! given back restarts its wait of one [`DECODE_DEADLINE`]. It answers `icon` for want of a slot
+//! only when no slot came back during a whole deadline, or when every slot is held by a thread
+//! already past its own deadline (stuck or abandoned); with its known hash or `null`, and
+//! announced as any other.
 //! A step past its deadline sets its job's stop flag, as the drain sets every job's
 //! ([`ThumbService::stop_on`]): the hash and the read check it between 64 KiB chunks, and the
 //! render before it starts, so an abandoned thread ends at its next check and gives its slot
@@ -78,7 +81,7 @@ use lil_protocol::app::ThumbItem;
 use lil_schema::display::{media_kind_of, renderable};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -167,11 +170,11 @@ pub struct ThumbService {
     events: Arc<EventBus>,
     renderers: Vec<Arc<dyn Renderer>>,
     /// Decodes in their deadline: `permit_count`.
-    permits: Arc<Semaphore>,
+    permits: Arc<Pool>,
     /// Decodes whose thread hasn't ended, abandoned ones included: 2 × `permit_count`.
-    capacity: Arc<Semaphore>,
+    capacity: Arc<Pool>,
     /// Files being hashed before their decode: 2 × `permit_count`.
-    hashers: Arc<Semaphore>,
+    hashers: Arc<Pool>,
     permit_count: usize,
     deadline: Duration,
     slow: Option<Duration>,
@@ -320,9 +323,9 @@ impl ThumbService {
             hub,
             events,
             renderers: options.renderers,
-            permits: Arc::new(Semaphore::new(permit_count)),
-            capacity: Arc::new(Semaphore::new(2 * permit_count)),
-            hashers: Arc::new(Semaphore::new(2 * permit_count)),
+            permits: Pool::new(permit_count),
+            capacity: Pool::new(2 * permit_count),
+            hashers: Pool::new(2 * permit_count),
             permit_count,
             deadline: options.deadline,
             slow: options.slow,
@@ -627,13 +630,12 @@ impl ThumbService {
     async fn run(&self, job: Job, inflight: &Inflight) -> Outcome {
         let mut known = job.expected.clone();
         if known.is_none() {
-            let until = Instant::now() + self.deadline;
-            let Ok(Ok(hasher)) =
-                tokio::time::timeout_at(until, self.hashers.clone().acquire_owned()).await
-            else {
-                tracing::warn!(path = %job.path, deadline = ?self.deadline, "no hash slot within the deadline; the item gets the icon");
+            let Some(hasher) = self.hashers.acquire(self.deadline).await else {
+                tracing::warn!(path = %job.path, deadline = ?self.deadline, "no hash slot came back within the deadline, or every one is stuck; the item gets the icon");
                 return self.icon_outcome(&job, None);
             };
+            let until = Instant::now() + self.deadline;
+            let abandon = hasher.marker();
             let stop = self.stop();
             let (abs, root, probe, check) = (
                 job.abs.clone(),
@@ -650,6 +652,7 @@ impl ThumbService {
                 Ok(hashed) => hashed.ok().flatten(),
                 Err(_) => {
                     stop.job.store(true, Ordering::Relaxed);
+                    abandon.abandon();
                     tracing::warn!(path = %job.path, deadline = ?self.deadline, "a thumbnail's hash passed its deadline; the item gets the icon");
                     None
                 }
@@ -670,18 +673,17 @@ impl ThumbService {
             }
             known = Some(sha);
         }
-        // The slots, under the item's deadline: a slot held by stuck threads never holds it.
-        let acquire_until = Instant::now() + self.deadline;
+        // The slots: waited for while they keep coming back, never for stuck threads (N-1).
         let slots = async {
-            let capacity = self.capacity.clone().acquire_owned().await.ok()?;
-            let permit = self.permits.clone().acquire_owned().await.ok()?;
+            let capacity = self.capacity.acquire(self.deadline).await?;
+            let permit = self.permits.acquire(self.deadline).await?;
             Some((capacity, permit))
         };
-        let Ok(Some((capacity, permit))) = tokio::time::timeout_at(acquire_until, slots).await
-        else {
-            tracing::warn!(path = %job.path, deadline = ?self.deadline, "no decode slot within the deadline; the item gets the icon");
+        let Some((capacity, permit)) = slots.await else {
+            tracing::warn!(path = %job.path, deadline = ?self.deadline, "no decode slot came back within the deadline, or every one is stuck; the item gets the icon");
             return self.icon_outcome(&job, known);
         };
+        let abandon = capacity.marker();
         let stop = self.stop();
         let (slow, renderer, check) = (self.slow, job.renderer.clone(), stop.clone());
         let (abs, root, probe, local, px, expect) = (
@@ -720,6 +722,7 @@ impl ThumbService {
             }
             Err(_) => {
                 stop.job.store(true, Ordering::Relaxed);
+                abandon.abandon();
                 tracing::warn!(path = %job.path, deadline = ?self.deadline, "a thumbnail render passed its deadline; the item gets the icon and its late result is discarded");
                 return self.icon_outcome(&job, known);
             }
@@ -1041,6 +1044,115 @@ fn recheck(open: Weak<OpenWorkspace>, path: WsPath) {
             }
         }
     });
+}
+
+/// Slots whose holders may outlive their deadline (a hash's or a decode's thread): the slots,
+/// how many are held by threads already past their deadline, and a signal each time a slot
+/// comes back (or one more is abandoned).
+struct Pool {
+    slots: Arc<Semaphore>,
+    total: usize,
+    abandoned: Mutex<usize>,
+    changed: Notify,
+}
+
+/// One slot of a [`Pool`]. Dropping it gives the slot back and signals the pool; a holder past
+/// its deadline is marked with [`Held::abandon`] until it ends.
+struct Held {
+    permit: Option<OwnedSemaphorePermit>,
+    pool: Arc<Pool>,
+    mark: Arc<Mutex<Mark>>,
+}
+
+#[derive(Default)]
+struct Mark {
+    ended: bool,
+    abandoned: bool,
+}
+
+impl Pool {
+    fn new(total: usize) -> Arc<Pool> {
+        Arc::new(Pool {
+            slots: Arc::new(Semaphore::new(total)),
+            total,
+            abandoned: Mutex::new(0),
+            changed: Notify::new(),
+        })
+    }
+
+    fn held(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> Held {
+        Held {
+            permit: Some(permit),
+            pool: self.clone(),
+            mark: Arc::default(),
+        }
+    }
+
+    /// A slot, waiting while slots keep coming back: each one given back (to anyone) restarts
+    /// the wait of `window`. `None` when none came back during a whole `window`, or when every
+    /// slot is held by a thread already past its deadline (N-1).
+    async fn acquire(self: &Arc<Self>, window: Duration) -> Option<Held> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+                return Some(self.held(permit));
+            }
+            if *lock(&self.abandoned) >= self.total {
+                return None;
+            }
+            tokio::select! {
+                permit = self.slots.clone().acquire_owned() => {
+                    return permit.ok().map(|p| self.held(p));
+                }
+                () = &mut changed => {}
+                () = tokio::time::sleep(window) => return None,
+            }
+        }
+    }
+}
+
+impl Held {
+    /// The handle that marks this slot's holder as past its deadline.
+    fn marker(&self) -> Abandon {
+        Abandon {
+            pool: self.pool.clone(),
+            mark: self.mark.clone(),
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        {
+            let mut mark = lock(&self.mark);
+            mark.ended = true;
+            if mark.abandoned {
+                *lock(&self.pool.abandoned) -= 1;
+            }
+        }
+        drop(self.permit.take());
+        self.pool.changed.notify_waiters();
+    }
+}
+
+/// Marks a slot's holder as past its deadline (while it hasn't ended).
+struct Abandon {
+    pool: Arc<Pool>,
+    mark: Arc<Mutex<Mark>>,
+}
+
+impl Abandon {
+    fn abandon(&self) {
+        let mut mark = lock(&self.mark);
+        if !mark.ended && !mark.abandoned {
+            mark.abandoned = true;
+            *lock(&self.pool.abandoned) += 1;
+        }
+        drop(mark);
+        self.pool.changed.notify_waiters();
+    }
 }
 
 /// When a blocking step stops early: its job passed its deadline, or the core drains.
