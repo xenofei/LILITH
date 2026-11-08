@@ -232,8 +232,9 @@ const LOCAL_REMOVE_DIRS: [&[&str]; 1] = [&["thumbs"]];
 /// (ARCH-097): only below `<local dir>\thumbs\` or `<local dir>\picks\thumbs\` (APP-038,
 /// CORE-176). The folders are made; the data goes to a new temp file beside the target
 /// (flushed to disk) and is moved to the target's name without replacing anything. The cache
-/// is keyed by content, so a file already there holds the same bytes and is kept: the temp
-/// file is removed and the write succeeds. Temp files of this function older than a day are
+/// is keyed by content, so a plain file already there holds the same bytes and is kept: the
+/// temp file is removed and the write succeeds. Anything else at that name (a link, a folder)
+/// is refused, never written through. Temp files of this function older than a day are
 /// removed from the folder first.
 ///
 /// # Errors
@@ -268,13 +269,54 @@ pub fn write_workspace_local_file(
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = remove_file(&temp);
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+            let meta = std::fs::symlink_metadata(long_path(path))?;
+            if meta.is_file() && !meta.file_type().is_symlink() {
                 Ok(())
             } else {
-                Err(e)
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is there, but not as a plain file", path.display()),
+                ))
             }
         }
     }
+}
+
+/// Sets the last-write time of the file `path` of the thumbnail cache `<local dir>\thumbs\`
+/// to `when`: a cache hit counts as a touch for clean-up (APP-038, "untouched for 7 days").
+/// The checks of [`remove_workspace_local_file`]; the file must be a plain file, and it is
+/// opened for its attributes only, without following a link, so no data is written.
+///
+/// # Errors
+/// `PermissionDenied` for a path outside `<local dir>\thumbs\` or anything but a plain file;
+/// the open's or the update's error.
+#[allow(clippy::disallowed_methods)]
+pub fn touch_workspace_local_file(
+    local_dir: &Path,
+    path: &Path,
+    when: std::time::SystemTime,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_WRITE_ATTRIBUTES`: enough to set the times, nothing else.
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`: a link is opened itself, never followed.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    check_local_path(local_dir, path, &LOCAL_REMOVE_DIRS)?;
+    let meta = std::fs::symlink_metadata(long_path(path))?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a plain file", path.display()),
+        ));
+    }
+    let file = OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(long_path(path))?;
+    file.set_modified(when)
 }
 
 /// Removes the file `path` of the thumbnail cache `<local dir>\thumbs\` (P4b-R36): a hard

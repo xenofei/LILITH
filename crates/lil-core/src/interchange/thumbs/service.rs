@@ -9,35 +9,55 @@
 //! **One item.** The media kind comes from the extension; a kind without a renderer of its
 //! own, or an image `image@1` doesn't decode (a `.gif`), gets `icon@1`. The expected hash is
 //! the index's for the path (`app/thumbs.request`) or the caller's (`ensure`). A known hash
-//! whose cache entry exists is `ready` at once, without reading the file; an `icon@1` item
-//! with a known hash is `icon` at once. Anything else is a **job** on a blocking thread, which
-//! opens the file (never a cloud placeholder, and only when it really is inside the
-//! workspace), checks its size, reads it, hashes the bytes it read and renders those, under a
-//! permit of [`default_permits`] and the [`DECODE_DEADLINE`]; a renderer runs under
-//! `catch_unwind`. Its PNG is filed under the hash of the bytes read
-//! (`fsops::write_workspace_local_file`). When that hash differs from the expected one, the
-//! answer is `pending`, the index is asked to re-check the file (the watcher's `lil notify`
-//! path), and the result is announced. Any failure, a passed deadline among them, gives the
-//! `icon@1` state, never an error; a late result is discarded.
+//! whose cache entry is a plain file is `ready` at once, without reading the file (a hit; it
+//! counts as a touch, below); an `icon@1` item with a known hash is `icon` at once. A cache
+//! name that isn't a plain file (a link planted there) is a miss, never served. Anything else
+//! is a **job**, keyed by the workspace's local folder, the path, the renderer and the size, so
+//! every waiter's answer is built from its own item (its path and media kind) and only the
+//! job's result (hash, state, file) is shared:
 //!
-//! **Waiting.** Jobs of one cache key are shared. `app/thumbs.request` waits for its jobs up to
-//! [`INLINE_WAIT`] in all; an item not done by then answers `pending`, and its result is
-//! published on topic `thumbs` as `{kind: "ready", sha256, renderer, px, file}` or
+//! 1. **Hash** (a path without a known hash): on a blocking thread under one of
+//!    [`ThumbService::hashers`] (not a decode permit), the file is opened (never a cloud
+//!    placeholder, only when it really is inside the workspace) and streamed through SHA-256
+//!    in fixed 64 KiB chunks. The hash is known to the waiters from then on, so a `pending`
+//!    answer carries it and the app can match the `thumbs` event (I2). Over 256 MiB, or an
+//!    `icon@1` kind: the `icon` with that hash. A hit under that hash: `ready`.
+//! 2. **Decode**: under a capacity slot (2 × the permits, held until the blocking thread really
+//!    ends) and a decode permit of [`default_permits`] (held until the [`DECODE_DEADLINE`]),
+//!    the file is opened again, its size taken from its metadata (over 256 MiB: hashed only,
+//!    the `icon`), then read into a buffer reserved at exactly its size + 1 with `take(size +
+//!    1)`, so a file that grows during the read is caught and nothing is ever doubled; the
+//!    bytes read are hashed and rendered under `catch_unwind`. Its PNG is filed under the hash
+//!    of the bytes read (`fsops::write_workspace_local_file`, which refuses to write through
+//!    anything but a plain file). When that hash differs from the expected one (or from the
+//!    one step 1 read), the answer is `pending`, the index is asked to re-check the file (the
+//!    watcher's `lil notify` path), and the result is announced. Any failure, a passed
+//!    deadline among them, gives the `icon@1` state, never an error; a late result is
+//!    discarded. A decode past its deadline gives its permit back at once (P4b-R36) but keeps
+//!    its capacity slot until its thread ends, so running plus abandoned decodes never pass
+//!    twice the permits: new decodes wait meanwhile (their items answer `pending`).
+//!
+//! **Waiting.** `app/thumbs.request` waits for its jobs up to [`INLINE_WAIT`] in all; an item
+//! not done by then answers `pending` with its hash (waiting on for step 1 if needed), and its
+//! result is published on topic `thumbs` as `{kind: "ready", sha256, renderer, px, file}` or
 //! `{kind: "icon", sha256, media_kind}` once it comes. `ensure` waits for its job.
 //!
-//! **Clean-up** ([`ThumbService::clean_up`], [`ThumbService::spawn_clean_up`]): after the
-//! default workspace's first finished reconcile of each core run and every 24 h, skipped while
-//! the index rebuilds; an entry whose hash neither the index's files (unverified rows
-//! included) nor a [`LiveSource`] (the inbox, Task 18) hold, and whose file was last written
-//! more than [`KEEP_UNTOUCHED`] ago on the core's clock, is removed through
-//! `fsops::remove_workspace_local_file`.
+//! **Touches.** A hit sets the entry's last write to the core's clock (at most once a day per
+//! entry, `fsops::touch_workspace_local_file`), so "untouched for 7 days" counts use.
+//!
+//! **Clean-up** ([`ThumbService::clean_up`], [`ThumbService::spawn_clean_up`]): the first pass
+//! runs once a default workspace exists (whenever it appears) and its index has finished its
+//! first reconcile, then every 24 h on the core's clock, skipped while the index rebuilds; an
+//! entry whose hash neither the index's files (unverified rows included) nor a [`LiveSource`]
+//! (the inbox, Task 18) hold, and that was untouched for more than [`KEEP_UNTOUCHED`] on the
+//! core's clock, is removed through `fsops::remove_workspace_local_file`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures_util::future::BoxFuture;
 use lil_platform::fs::Probe;
@@ -62,8 +82,14 @@ use crate::workspace::{OpenWorkspace, WorkspaceHub};
 pub const DECODE_DEADLINE: Duration = Duration::from_secs(10);
 /// How long `app/thumbs.request` waits for its renders before it answers `pending`.
 pub const INLINE_WAIT: Duration = Duration::from_millis(150);
-/// How often clean-up runs while the core serves (after its first pass).
+/// How often clean-up runs while the core serves (after its first pass), on the core's clock.
 pub const CLEAN_UP_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the clean-up loop looks at the core's clock and the default workspace.
+pub const CLEAN_UP_TICK: Duration = Duration::from_secs(1);
+/// A hit refreshes its entry's last write when that is older than this.
+pub const TOUCH_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// The chunk a file is hashed in.
+const HASH_CHUNK: usize = 64 * 1024;
 /// The topic the results of `pending` items are announced on.
 pub const THUMBS_TOPIC: &str = "thumbs";
 
@@ -109,7 +135,12 @@ pub struct ThumbService {
     hub: Arc<WorkspaceHub>,
     events: Arc<EventBus>,
     renderers: Vec<Arc<dyn Renderer>>,
+    /// Decodes in their deadline: `permit_count`.
     permits: Arc<Semaphore>,
+    /// Decodes whose thread hasn't ended, abandoned ones included: 2 × `permit_count`.
+    capacity: Arc<Semaphore>,
+    /// Files being hashed before their decode: 2 × `permit_count`.
+    hashers: Arc<Semaphore>,
     permit_count: usize,
     deadline: Duration,
     slow: Option<Duration>,
@@ -128,7 +159,7 @@ impl std::fmt::Debug for ThumbService {
     }
 }
 
-/// A running job's result, shared by everyone waiting for it.
+/// A running job's hash and result, shared by everyone waiting for it.
 #[derive(Default)]
 struct Inflight {
     slot: Mutex<Slot>,
@@ -137,32 +168,64 @@ struct Inflight {
 
 #[derive(Default)]
 struct Slot {
+    /// The hash a `pending` answer carries: the expected one, or the one step 1 read.
+    hash: Option<String>,
     outcome: Option<Outcome>,
     /// Someone answered `pending` for it: its result is published.
     announce: bool,
 }
 
-/// A job's result: the item's final state, and whether the bytes read had another hash than
-/// the expected one (then the answer is `pending` and the result is published anyway).
+impl Inflight {
+    fn set_hash(&self, sha: &str) {
+        lock(&self.slot).hash = Some(sha.to_string());
+        self.done.notify_waiters();
+    }
+}
+
+/// A job's result. Each waiter's answer takes its own path, media kind and size from its own
+/// item ([`Outcome::answer`]); only these are the job's.
 #[derive(Debug, Clone)]
 struct Outcome {
-    state: ThumbState,
+    sha256: Option<String>,
+    /// `ready` or `icon`.
+    state: &'static str,
+    renderer: String,
+    file: Option<PathBuf>,
+    /// The bytes read had another hash than the expected one: the answer is `pending`, and
+    /// the result is published anyway.
     mismatch: bool,
+    /// For the `thumbs` event (the job's path is every waiter's path).
+    media_kind: String,
+    px: u32,
 }
 
 impl Outcome {
-    /// What a caller is answered: the state, or `pending` after a mismatch.
-    fn answer(&self) -> ThumbState {
+    /// What the item `mine` (its `pending` state) is answered.
+    fn answer(&self, mine: &ThumbState) -> ThumbState {
         if self.mismatch {
             ThumbState {
+                sha256: self.sha256.clone(),
                 state: "pending".to_string(),
                 file: None,
-                ..self.state.clone()
+                ..mine.clone()
             }
         } else {
-            self.state.clone()
+            ThumbState {
+                sha256: self.sha256.clone(),
+                state: self.state.to_string(),
+                renderer: self.renderer.clone(),
+                file: self.file.clone(),
+                ..mine.clone()
+            }
         }
     }
+}
+
+/// What [`wait_for`] saw.
+enum Waited {
+    Done(Outcome),
+    /// Not done by the deadline: `pending`, with this hash.
+    Pending(String),
 }
 
 /// What a blocking job found.
@@ -171,8 +234,8 @@ enum Work {
     Unreadable,
     /// No image: the hash of the bytes read.
     Icon(String),
-    /// The cache already has the entry of the hash read.
-    Cached(String),
+    /// The cache already has the entry of the hash read (a plain file).
+    Cached(String, PathBuf),
     /// The rendered PNG of the bytes of this hash.
     Rendered(String, Vec<u8>),
 }
@@ -222,6 +285,8 @@ impl ThumbService {
             events,
             renderers: options.renderers,
             permits: Arc::new(Semaphore::new(permit_count)),
+            capacity: Arc::new(Semaphore::new(2 * permit_count)),
+            hashers: Arc::new(Semaphore::new(2 * permit_count)),
             permit_count,
             deadline: options.deadline,
             slow: options.slow,
@@ -289,18 +354,51 @@ impl ThumbService {
             .ok()
     }
 
-    /// The `icon@1` state of `path`, with `sha256` if known.
-    fn icon(&self, path: &str, sha256: Option<String>, px: u32) -> ThumbState {
-        let icon = self
-            .renderers
+    /// The `icon@1` renderer's label.
+    fn icon_label(&self) -> String {
+        self.renderers
             .iter()
             .find(|r| r.id() == ICON)
-            .map_or_else(|| "icon@1".to_string(), |r| label(r.as_ref()));
+            .map_or_else(|| "icon@1".to_string(), |r| label(r.as_ref()))
+    }
+
+    /// The cache entry of `sha256` drawn by `renderer` at `px` when it is a plain file (a link or
+    /// anything else there is a miss), touched if it was last written more than
+    /// [`TOUCH_EVERY`] ago on the core's clock.
+    async fn hit(
+        &self,
+        local: &Path,
+        sha256: &str,
+        renderer: &dyn Renderer,
+        px: u32,
+    ) -> Option<PathBuf> {
+        let entry = entry_path(local, sha256, renderer.id(), renderer.version(), px);
+        let modified = plain_file(&entry)?;
+        let now = self.hub.clock().utc_now();
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > TOUCH_EVERY)
+        {
+            let (dir, path) = (local.to_path_buf(), entry.clone());
+            let touched = tokio::task::spawn_blocking(move || {
+                fsops::touch_workspace_local_file(&dir, &path, now)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+            if let Err(e) = touched {
+                tracing::debug!(file = %entry.display(), error = %e, "a thumbnail cache hit could not be touched");
+            }
+        }
+        Some(entry)
+    }
+
+    /// The `icon@1` state of `path`, with `sha256` if known.
+    fn icon(&self, path: &str, sha256: Option<String>, px: u32) -> ThumbState {
         ThumbState {
             path: path.to_string(),
             sha256,
             media_kind: media_kind_of(path).as_str().to_string(),
-            renderer: icon,
+            renderer: self.icon_label(),
             state: "icon".to_string(),
             file: None,
             px,
@@ -329,9 +427,13 @@ impl ThumbService {
         for plan in plans {
             out.push(match plan {
                 Plan::Done(state) => state,
-                Plan::Wait { inflight, pending } => wait_for(&inflight, until)
-                    .await
-                    .map_or(pending, |o| o.answer()),
+                Plan::Wait { inflight, pending } => match wait_for(&inflight, until).await {
+                    Waited::Done(outcome) => outcome.answer(&pending),
+                    Waited::Pending(sha) => ThumbState {
+                        sha256: Some(sha),
+                        ..pending
+                    },
+                },
             });
         }
         out
@@ -370,29 +472,27 @@ impl ThumbService {
         if icon_only && let Some(sha) = &expected {
             return Plan::Done(self.icon(path, Some(sha.clone()), px));
         }
-        let key = match &expected {
-            Some(sha) => {
-                let entry = entry_path(&ctx.local, sha, renderer.id(), renderer.version(), px);
-                if entry.is_file() {
-                    return Plan::Done(ThumbState {
-                        path: path.to_string(),
-                        sha256: Some(sha.clone()),
-                        media_kind: media_kind_of(path).as_str().to_string(),
-                        renderer: label(renderer.as_ref()),
-                        state: "ready".to_string(),
-                        file: Some(entry),
-                        px,
-                    });
-                }
-                format!("{sha}.{}@{}.{px}", renderer.id(), renderer.version())
-            }
-            None => format!(
-                "path:{}:{}@{}.{px}",
-                path_key(ws_path.as_str()),
-                renderer.id(),
-                renderer.version()
-            ),
-        };
+        if let Some(sha) = &expected
+            && let Some(entry) = self.hit(&ctx.local, sha, renderer.as_ref(), px).await
+        {
+            return Plan::Done(ThumbState {
+                path: path.to_string(),
+                sha256: Some(sha.clone()),
+                media_kind: media_kind_of(path).as_str().to_string(),
+                renderer: label(renderer.as_ref()),
+                state: "ready".to_string(),
+                file: Some(entry),
+                px,
+            });
+        }
+        // One job per workspace, path, renderer and size (I1): never shared across paths.
+        let key = format!(
+            "{}|{}|{}@{}|{px}",
+            path_key(&ctx.local.to_string_lossy()),
+            path_key(ws_path.as_str()),
+            renderer.id(),
+            renderer.version()
+        );
         let pending = ThumbState {
             path: path.to_string(),
             sha256: expected.clone(),
@@ -408,6 +508,9 @@ impl ThumbService {
                 Some(running) => (running.clone(), false),
                 None => {
                     let made = Arc::new(Inflight::default());
+                    if let Some(sha) = &expected {
+                        made.set_hash(sha);
+                    }
                     map.insert(key.clone(), made.clone());
                     (made, true)
                 }
@@ -428,17 +531,48 @@ impl ThumbService {
             };
             let inflight = inflight.clone();
             tokio::spawn(async move {
-                let outcome = me.run(job).await;
+                let outcome = me.run(job, &inflight).await;
                 me.finish(&key, &inflight, outcome);
             });
         }
         Plan::Wait { inflight, pending }
     }
 
-    /// Runs `job` under a permit and the deadline, then files its PNG.
-    async fn run(&self, job: Job) -> Outcome {
+    /// Runs `job`: its hash first when it has none (step 1), then its decode under a capacity
+    /// slot, a permit and the deadline (step 2), then files its PNG.
+    async fn run(&self, job: Job, inflight: &Inflight) -> Outcome {
+        let mut known = job.expected.clone();
+        if known.is_none() {
+            let hashed = {
+                let Ok(_hasher) = self.hashers.acquire().await else {
+                    return self.icon_outcome(&job, None);
+                };
+                let (abs, root, probe) = (job.abs.clone(), job.root.clone(), job.probe.clone());
+                tokio::task::spawn_blocking(move || hash_file(&abs, &root, probe.as_ref()))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let Some((sha, len)) = hashed else {
+                return self.icon_outcome(&job, None);
+            };
+            inflight.set_hash(&sha);
+            if job.renderer.id() == ICON || len > MAX_FILE_BYTES {
+                return self.icon_outcome(&job, Some(sha));
+            }
+            if let Some(entry) = self
+                .hit(&job.local, &sha, job.renderer.as_ref(), job.px)
+                .await
+            {
+                return self.ready_outcome(&job, sha, entry, false);
+            }
+            known = Some(sha);
+        }
+        let Ok(capacity) = self.capacity.clone().acquire_owned().await else {
+            return self.icon_outcome(&job, known);
+        };
         let Ok(permit) = self.permits.clone().acquire_owned().await else {
-            return self.failed(&job, None);
+            return self.icon_outcome(&job, known);
         };
         let (slow, renderer) = (self.slow, job.renderer.clone());
         let (abs, root, probe, local, px) = (
@@ -449,6 +583,8 @@ impl ThumbService {
             job.px,
         );
         let blocking = tokio::task::spawn_blocking(move || {
+            // The capacity slot goes back only when this thread ends, past its deadline too.
+            let _capacity = capacity;
             work(
                 &abs,
                 &root,
@@ -466,26 +602,17 @@ impl ThumbService {
             Ok(Ok(work)) => work,
             Ok(Err(e)) => {
                 tracing::warn!(path = %job.path, error = %e, "a thumbnail render stopped; the item gets the icon");
-                return self.failed(&job, job.expected.clone());
+                return self.icon_outcome(&job, known);
             }
             Err(_) => {
                 tracing::warn!(path = %job.path, deadline = ?self.deadline, "a thumbnail render passed its deadline; the item gets the icon and its late result is discarded");
-                return self.failed(&job, job.expected.clone());
+                return self.icon_outcome(&job, known);
             }
         };
         let (sha, file) = match work {
-            Work::Unreadable => return self.failed(&job, None),
+            Work::Unreadable => return self.icon_outcome(&job, None),
             Work::Icon(sha) => (sha, None),
-            Work::Cached(sha) => {
-                let entry = entry_path(
-                    &job.local,
-                    &sha,
-                    job.renderer.id(),
-                    job.renderer.version(),
-                    job.px,
-                );
-                (sha, Some(entry))
-            }
+            Work::Cached(sha, entry) => (sha, Some(entry)),
             Work::Rendered(sha, png) => {
                 let entry = entry_path(
                     &job.local,
@@ -509,30 +636,41 @@ impl ThumbService {
                 }
             }
         };
-        let mismatch = job.expected.as_ref().is_some_and(|e| *e != sha);
+        let mismatch = known.as_ref().is_some_and(|k| *k != sha);
         if mismatch {
-            tracing::info!(path = %job.path, expected = ?job.expected, read = %sha, "a file's bytes differ from the index's hash; the index re-checks it");
+            tracing::info!(path = %job.path, expected = ?known, read = %sha, "a file's bytes differ from the hash expected; the index re-checks it");
             recheck(job.open.clone(), job.ws_path.clone());
         }
-        let state = match file {
-            Some(file) => ThumbState {
-                path: job.path.clone(),
-                sha256: Some(sha),
-                media_kind: media_kind_of(&job.path).as_str().to_string(),
-                renderer: label(job.renderer.as_ref()),
-                state: "ready".to_string(),
-                file: Some(file),
-                px: job.px,
+        match file {
+            Some(entry) => self.ready_outcome(&job, sha, entry, mismatch),
+            None => Outcome {
+                mismatch,
+                ..self.icon_outcome(&job, Some(sha))
             },
-            None => self.icon(&job.path, Some(sha), job.px),
-        };
-        Outcome { state, mismatch }
+        }
     }
 
-    fn failed(&self, job: &Job, sha256: Option<String>) -> Outcome {
+    fn icon_outcome(&self, job: &Job, sha256: Option<String>) -> Outcome {
         Outcome {
-            state: self.icon(&job.path, sha256, job.px),
+            sha256,
+            state: "icon",
+            renderer: self.icon_label(),
+            file: None,
             mismatch: false,
+            media_kind: media_kind_of(&job.path).as_str().to_string(),
+            px: job.px,
+        }
+    }
+
+    fn ready_outcome(&self, job: &Job, sha256: String, file: PathBuf, mismatch: bool) -> Outcome {
+        Outcome {
+            sha256: Some(sha256),
+            state: "ready",
+            renderer: label(job.renderer.as_ref()),
+            file: Some(file),
+            mismatch,
+            media_kind: media_kind_of(&job.path).as_str().to_string(),
+            px: job.px,
         }
     }
 
@@ -555,19 +693,19 @@ impl ThumbService {
         }
         inflight.done.notify_waiters();
         if announce {
-            let s = &outcome.state;
-            let data = match &s.file {
-                Some(file) if s.state == "ready" => json!({
+            let o = &outcome;
+            let data = match &o.file {
+                Some(file) if o.state == "ready" => json!({
                     "kind": "ready",
-                    "sha256": s.sha256,
-                    "renderer": s.renderer,
-                    "px": s.px,
+                    "sha256": o.sha256,
+                    "renderer": o.renderer,
+                    "px": o.px,
                     "file": file.to_string_lossy(),
                 }),
                 _ => json!({
                     "kind": "icon",
-                    "sha256": s.sha256,
-                    "media_kind": s.media_kind,
+                    "sha256": o.sha256,
+                    "media_kind": o.media_kind,
                 }),
             };
             self.events.publish(THUMBS_TOPIC, data);
@@ -671,53 +809,70 @@ impl ThumbService {
         Some(remove_entries(&local, doomed).await)
     }
 
-    /// Runs [`ThumbService::clean_up_pass`] in the background: at once (it waits for the first
-    /// reconcile), then every [`CLEAN_UP_PERIOD`] (on tokio's clock), until `stop`.
+    /// Runs [`ThumbService::clean_up_pass`] in the background until `stop`: every
+    /// [`CLEAN_UP_TICK`] it looks at the core's clock, and a pass is due until the first one has
+    /// run (so it runs once a default workspace exists and its index has finished its first
+    /// reconcile, even one that appears after the start), then [`CLEAN_UP_PERIOD`] after the
+    /// last on the core's clock (or at once if the clock went back before it).
     pub fn spawn_clean_up(self: &Arc<Self>, stop: CancellationToken) {
         let me = Arc::downgrade(self);
+        let clock = self.hub.clock().clone();
         tokio::spawn(async move {
-            let mut ticks = tokio::time::interval(CLEAN_UP_PERIOD);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last: Option<SystemTime> = None;
             loop {
-                tokio::select! {
-                    () = stop.cancelled() => break,
-                    _ = ticks.tick() => {}
+                let now = clock.utc_now();
+                let due = last.is_none_or(|t| {
+                    now.duration_since(t)
+                        .map_or(true, |since| since >= CLEAN_UP_PERIOD)
+                });
+                if due {
+                    let Some(service) = me.upgrade() else {
+                        break;
+                    };
+                    tokio::select! {
+                        () = stop.cancelled() => break,
+                        done = service.clean_up_pass() => {
+                            if done.is_some() {
+                                last = Some(now);
+                            }
+                        }
+                    }
                 }
-                let Some(service) = me.upgrade() else {
-                    break;
-                };
                 tokio::select! {
                     () = stop.cancelled() => break,
-                    _ = service.clean_up_pass() => {}
+                    () = tokio::time::sleep(CLEAN_UP_TICK) => {}
                 }
             }
         });
     }
 }
 
-/// Waits for `inflight`'s outcome until `until` (`None`: until it comes). On the deadline the
-/// caller answers `pending`, so the outcome is marked to be published; both are decided under
-/// the slot's lock, so no outcome is missed between them.
-async fn wait_for(inflight: &Inflight, until: Option<Instant>) -> Option<Outcome> {
+/// Waits for `inflight`'s outcome until `until` (`None`: until it comes). Past `until`, the
+/// caller answers `pending` with the job's hash, waiting on for the hash if step 1 hasn't read
+/// it yet (bounded by one file's read); the outcome is then marked to be published. Both are
+/// decided under the slot's lock, so no outcome is missed between them.
+async fn wait_for(inflight: &Inflight, until: Option<Instant>) -> Waited {
     loop {
         let notified = inflight.done.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(outcome) = &lock(&inflight.slot).outcome {
-            return Some(outcome.clone());
+        {
+            let mut slot = lock(&inflight.slot);
+            if let Some(outcome) = &slot.outcome {
+                return Waited::Done(outcome.clone());
+            }
+            if until.is_some_and(|u| Instant::now() >= u)
+                && let Some(sha) = slot.hash.clone()
+            {
+                slot.announce = true;
+                return Waited::Pending(sha);
+            }
         }
         match until {
-            None => notified.await,
-            Some(until) => {
-                if tokio::time::timeout_at(until, notified).await.is_err() {
-                    let mut slot = lock(&inflight.slot);
-                    if let Some(outcome) = &slot.outcome {
-                        return Some(outcome.clone());
-                    }
-                    slot.announce = true;
-                    return None;
-                }
+            Some(u) if Instant::now() < u => {
+                let _ = tokio::time::timeout_at(u, notified).await;
             }
+            _ => notified.await,
         }
     }
 }
@@ -781,7 +936,40 @@ fn hex(digest: &[u8]) -> String {
     })
 }
 
-/// The blocking half of a render (module docs "One item").
+/// The modified time of `path` when it is a plain file (not a link, a folder or anything else).
+fn plain_file(path: &Path) -> Option<SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    meta.modified().ok()
+}
+
+/// Feeds the rest of `reader` to `hasher` in [`HASH_CHUNK`]s; `None` on a read error.
+fn hash_rest(reader: &mut impl std::io::Read, mut hasher: Sha256) -> Option<String> {
+    let mut buf = vec![0u8; HASH_CHUNK];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(hex(&hasher.finalize()))
+}
+
+/// Step 1: the SHA-256 and size of `abs`, streamed in fixed chunks (nothing kept); `None` when
+/// it can't be opened or read, or isn't inside the workspace.
+fn hash_file(abs: &Path, root: &Path, probe: &dyn Probe) -> Option<(String, u64)> {
+    let mut file = open_inside(abs, root, probe)?;
+    let len = file.metadata().ok()?.len();
+    Some((hash_rest(&mut file, Sha256::new())?, len))
+}
+
+/// Step 2, the blocking half of a render (module docs "One item"): the size from the metadata
+/// first, then the bytes into a buffer of exactly that size + 1, their hash, a hit check, then
+/// the render.
 fn work(
     abs: &Path,
     root: &Path,
@@ -791,39 +979,42 @@ fn work(
     px: u32,
     slow: Option<Duration>,
 ) -> Work {
-    let Some(file) = open_inside(abs, root, probe) else {
+    let Some(mut file) = open_inside(abs, root, probe) else {
         return Work::Unreadable;
     };
-    let mut hasher = Sha256::new();
-    let mut reader = std::io::BufReader::new(file);
-    // At most one byte more than the limit is kept in memory; the rest is only hashed.
-    let mut bytes = Vec::new();
-    let keep = if renderer.id() == ICON {
-        0
-    } else {
-        MAX_FILE_BYTES + 1
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Work::Unreadable;
     };
-    if (&mut reader).take(keep).read_to_end(&mut bytes).is_err() {
+    // The size guard, before any buffer: over the limit, the file is only hashed.
+    if len > MAX_FILE_BYTES {
+        return hash_rest(&mut file, Sha256::new()).map_or(Work::Unreadable, Work::Icon);
+    }
+    let mut bytes = Vec::new();
+    // At most 256 MiB + 1, so the conversion can't fail on a 64-bit target.
+    let Ok(want) = usize::try_from(len + 1) else {
+        return Work::Unreadable;
+    };
+    if bytes.try_reserve_exact(want).is_err() {
         return Work::Unreadable;
     }
+    // One byte more than the size: a file that grew during the read is caught, and the buffer
+    // never grows past what was reserved.
+    if (&mut file).take(len + 1).read_to_end(&mut bytes).is_err() {
+        return Work::Unreadable;
+    }
+    let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Work::Unreadable,
-        }
+    if bytes.len() > want - 1 {
+        // It grew while read: only hashed, the icon.
+        return hash_rest(&mut file, hasher).map_or(Work::Unreadable, Work::Icon);
     }
     let sha = hex(&hasher.finalize());
-    // The size guard comes first: the file as read, never what a header says.
-    let over = u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE_BYTES;
-    if renderer.id() == ICON || over {
+    if renderer.id() == ICON {
         return Work::Icon(sha);
     }
-    if entry_path(local, &sha, renderer.id(), renderer.version(), px).is_file() {
-        return Work::Cached(sha);
+    let entry = entry_path(local, &sha, renderer.id(), renderer.version(), px);
+    if plain_file(&entry).is_some() {
+        return Work::Cached(sha, entry);
     }
     if let Some(slow) = slow {
         std::thread::sleep(slow);

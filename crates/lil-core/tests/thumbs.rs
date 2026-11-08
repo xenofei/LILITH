@@ -52,13 +52,15 @@ const SEALED: &str = "projects/sketchbook/assets/chr_paper_crane/v1.0.0/crane_b.
 struct Probing;
 
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
+/// Notes every thread's allocations, not just the probing one's.
+static TRACK_ALL: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
 }
 
 fn note(size: usize) {
-    if TRACK.try_with(Cell::get).unwrap_or(false) {
+    if TRACK_ALL.load(Ordering::Relaxed) || TRACK.try_with(Cell::get).unwrap_or(false) {
         LARGEST.fetch_max(size, Ordering::Relaxed);
     }
 }
@@ -98,6 +100,15 @@ fn largest_allocation<T>(f: impl FnOnce() -> T) -> (T, usize) {
     TRACK.with(|t| t.set(true));
     let out = f();
     TRACK.with(|t| t.set(false));
+    (out, LARGEST.load(Ordering::Relaxed))
+}
+
+/// `f`'s result and the largest single allocation any thread made while it ran.
+async fn largest_allocation_anywhere<T>(f: impl std::future::Future<Output = T>) -> (T, usize) {
+    LARGEST.store(0, Ordering::Relaxed);
+    TRACK_ALL.store(true, Ordering::Relaxed);
+    let out = f.await;
+    TRACK_ALL.store(false, Ordering::Relaxed);
     (out, LARGEST.load(Ordering::Relaxed))
 }
 
@@ -237,9 +248,17 @@ struct Rig {
 
 impl Rig {
     fn new(options: ThumbOptions) -> Rig {
+        Rig::with(options, true)
+    }
+
+    /// A rig whose workspace becomes the default only when `default` (else later, with
+    /// [`Rig::make_default`]).
+    fn with(options: ThumbOptions, default: bool) -> Rig {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("thumbs");
-        env.register_workspace(&ws, true);
+        if default {
+            env.register_workspace(&ws, true);
+        }
         let states = Arc::new(
             StateRegistry::open(
                 &env.env,
@@ -271,6 +290,12 @@ impl Rig {
             clock,
             thumbs,
         }
+    }
+
+    /// Registers the rig's workspace as the default, as a switch does.
+    fn make_default(&self) {
+        self.env.register_workspace(&self.ws, true);
+        self.hub.refresh_default();
     }
 
     /// Another service over the same hub.
@@ -533,6 +558,48 @@ impl Renderer for Gated {
     }
 }
 
+/// `image@1`, but every render hangs until [`HangAll::release`]; counts how many started and
+/// how many ran at once.
+#[derive(Default)]
+struct HangAll {
+    open: Mutex<bool>,
+    opened: Condvar,
+    started: AtomicUsize,
+    now: AtomicUsize,
+    most: AtomicUsize,
+}
+
+impl HangAll {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl Renderer for HangAll {
+    fn id(&self) -> &'static str {
+        "image"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
+    fn renders(&self, kind: MediaKind) -> bool {
+        kind == MediaKind::Image
+    }
+    fn render(&self, bytes: &[u8], px: u32) -> Result<Vec<u8>, RenderError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let running = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(running, Ordering::SeqCst);
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+        drop(open);
+        self.now.fetch_sub(1, Ordering::SeqCst);
+        ImageRenderer.render(bytes, px)
+    }
+}
+
 fn with_renderer(renderer: Arc<dyn Renderer>) -> Vec<Arc<dyn Renderer>> {
     let mut all: Vec<Arc<dyn Renderer>> = vec![renderer];
     all.extend(default_renderers().into_iter().filter(|r| r.id() == ICON));
@@ -687,7 +754,11 @@ async fn same_bytes_share_one_cache_entry() {
         assert_eq!(t.sha256.as_deref(), Some(sha.as_str()));
     }
     next_event(&mut rx, "ready", &sha).await;
-    let again = r.thumbs.request(&items, 96).await;
+    let waiting = r.service(ThumbOptions {
+        inline_wait: DEADLINE,
+        ..ThumbOptions::default()
+    });
+    let again = waiting.request(&items, 96).await;
     let a = assert_ready_at(&r.local(), &again[0], &sha, 96);
     let b = assert_ready_at(&r.local(), &again[1], &sha, 96);
     assert_eq!(a, b, "same bytes, one cache entry");
@@ -1056,6 +1127,328 @@ async fn a_malformed_expected_hash_is_hashed_on_demand() {
     r.shutdown().await;
 }
 
+/// Fix round 1, I1: each item is answered with its own path, never with the path of an item
+/// whose render it shares; two paths with the same bytes in one request.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038, CORE-168
+async fn duplicate_bytes_in_one_request_answer_each_item_with_its_own_path() {
+    let r = Rig::new(ThumbOptions {
+        inline_wait: DEADLINE,
+        ..ThumbOptions::default()
+    });
+    let bytes = picture(64, 48);
+    let sha = sha256_bytes(&bytes);
+    let paths = [work("dup_a.png"), work("dup_b.png")];
+    for p in &paths {
+        r.put(p, &bytes);
+    }
+    let _open = r.open().await;
+    let items: Vec<ThumbItem> = paths.iter().map(|p| item(p)).collect();
+    let states = r.thumbs.request(&items, 256).await;
+    for (path, state) in paths.iter().zip(&states) {
+        assert_eq!(
+            &state.path, path,
+            "each item echoes its own path: {state:?}"
+        );
+        assert_ready_at(&r.local(), state, &sha, 256);
+    }
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, I1: `a` was changed (its caller still expects `x`); `b` really holds `x`. Asked
+/// together, `a` answers `pending` with its new hash and `b` is `ready` under `x`, each under
+/// its own path.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn a_stale_hash_equal_to_another_files_bytes_does_not_leak_between_items() {
+    let r = Rig::new(ThumbOptions {
+        slow: Some(Duration::from_millis(300)),
+        ..fast()
+    });
+    let x = picture_seeded(40, 40, 11);
+    let y = picture_seeded(40, 40, 12);
+    let (sha_x, sha_y) = (sha256_bytes(&x), sha256_bytes(&y));
+    let (a, b) = (ws_path(&work("stale_a.png")), ws_path(&work("holds_x.png")));
+    r.put(a.as_str(), &x);
+    r.put(b.as_str(), &x);
+    let _open = r.open().await;
+    r.put(a.as_str(), &y);
+    let (sa, sb) = tokio::join!(
+        r.thumbs.ensure(&a, Some(&sha_x), 96),
+        r.thumbs.ensure(&b, Some(&sha_x), 96)
+    );
+    assert_eq!(sa.path, a.as_str(), "{sa:?}");
+    assert_eq!(sa.state, "pending", "{sa:?}");
+    assert_eq!(sa.sha256.as_deref(), Some(sha_y.as_str()), "{sa:?}");
+    assert_eq!(sb.path, b.as_str(), "{sb:?}");
+    assert_ready_at(&r.local(), &sb, &sha_x, 96);
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, I1 and ruling 2: the default workspace switches while a render of the same
+/// path in the old one runs; the new workspace's item is answered from its own bytes and
+/// cache.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038, ARCH-097
+async fn a_default_switch_during_a_render_answers_from_the_new_workspace() {
+    let r = Rig::new(ThumbOptions {
+        slow: Some(Duration::from_millis(500)),
+        ..fast()
+    });
+    let first = picture_seeded(50, 50, 21);
+    let second = picture_seeded(50, 50, 22);
+    let path = work("switch.png");
+    r.put(&path, &first);
+    let _open = r.open().await;
+    let other = r.env.copy_fixture_workspace("other");
+    write_file(
+        &path.split('/').fold(other.clone(), |p, c| p.join(c)),
+        &second,
+    );
+    let thumbs = r.thumbs.clone();
+    let wp = ws_path(&path);
+    let old = tokio::spawn(async move { thumbs.ensure(&wp, None, 96).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    r.env.register_workspace(&other, true);
+    r.hub.refresh_default();
+    let other_local = r.env.workspace_local_dir(&other);
+    let state = r.thumbs.ensure(&ws_path(&path), None, 96).await;
+    assert_ready_at(&other_local, &state, &sha256_bytes(&second), 96);
+    let old = old.await.unwrap();
+    assert_ready_at(&r.local(), &old, &sha256_bytes(&first), 96);
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, I2: a file the index doesn't hold is hashed before its decode waits, so its
+/// `pending` answer carries the hash its `thumbs` event names. (`.git` is a folder the index
+/// never enters.)
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn an_unindexed_pending_item_carries_the_hash_its_event_names() {
+    let r = Rig::new(ThumbOptions {
+        slow: Some(Duration::from_millis(400)),
+        ..fast()
+    });
+    let bytes = picture(60, 30);
+    let sha = sha256_bytes(&bytes);
+    let path = work(".git/fresh.png");
+    r.put(&path, &bytes);
+    let open = r.open().await;
+    assert_eq!(
+        open.index.files_of_path(&ws_path(&path)).await.unwrap(),
+        None
+    );
+    let mut rx = listen(&r.events).await;
+    let states = r.thumbs.request(&[item(&path)], 96).await;
+    assert_eq!(states[0].state, "pending", "{:?}", states[0]);
+    assert_eq!(
+        states[0].sha256.as_deref(),
+        Some(sha.as_str()),
+        "{:?}",
+        states[0]
+    );
+    let ready = next_event(&mut rx, "ready", &sha).await;
+    assert_eq!(ready["sha256"], sha.as_str());
+    drop(open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, I3: the size guard comes before any buffer. A file over 256 MiB is only
+/// hashed, in fixed chunks; one of exactly 256 MiB is read into one buffer of its size plus
+/// one byte, never a doubled one. The probe watches every thread while `ensure` runs. The
+/// files are made with `set_len` (no data written) and go with the test's folder.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+#[allow(clippy::disallowed_methods)] // makes the large files
+async fn the_size_guard_comes_before_any_buffer() {
+    const MIB: u64 = 1024 * 1024;
+    let r = Rig::new(fast());
+    for (name, len) in [("over.png", 300 * MIB), ("at.png", 256 * MIB)] {
+        let file = work(name).split('/').fold(r.ws.clone(), |p, c| p.join(c));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let f = std::fs::File::create(&file).unwrap();
+        // A PNG signature, then zeros: no header to read, so nothing is decoded.
+        use std::io::Write as _;
+        (&f).write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+        f.set_len(len).unwrap();
+    }
+    let _open = r.open().await;
+    let (over, largest) =
+        largest_allocation_anywhere(r.thumbs.ensure(&ws_path(&work("over.png")), None, 96)).await;
+    assert_icon(&over);
+    assert!(over.sha256.is_some(), "it is hashed: {over:?}");
+    assert!(
+        largest < MIB as usize,
+        "{largest} bytes for a file over the limit"
+    );
+    let (at, largest) =
+        largest_allocation_anywhere(r.thumbs.ensure(&ws_path(&work("at.png")), None, 96)).await;
+    assert_icon(&at);
+    assert!(
+        largest <= (256 * MIB + 1) as usize,
+        "{largest} bytes for a file of exactly 256 MiB"
+    );
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, M1: decodes that passed their deadline still hold their memory until their
+/// thread ends, so new decodes wait while running plus abandoned ones reach twice the
+/// permits. Their items answer `pending` meanwhile, then resolve once capacity returns.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn abandoned_decodes_are_capped_at_twice_the_permits() {
+    let hang = Arc::new(HangAll::default());
+    let r = Rig::new(ThumbOptions {
+        renderers: with_renderer(hang.clone()),
+        permits: 1,
+        deadline: Duration::from_millis(100),
+        ..fast()
+    });
+    // Released however the test ends, so no thread stays hung.
+    struct Release(Arc<HangAll>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let _release = Release(hang.clone());
+    let names: Vec<String> = (0..5u8)
+        .map(|i| {
+            let name = work(&format!("h{i}.png"));
+            r.put(&name, &picture_seeded(24, 24, 100 + i));
+            name
+        })
+        .collect();
+    let _open = r.open().await;
+    let jobs: Vec<_> = names
+        .iter()
+        .map(|n| {
+            let (thumbs, path) = (r.thumbs.clone(), ws_path(n));
+            tokio::spawn(async move { thumbs.ensure(&path, None, 96).await })
+        })
+        .collect();
+    let until = Instant::now() + DEADLINE;
+    while hang.started.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < until, "no decode started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Several deadlines pass: no third decode starts while two hang.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(hang.started.load(Ordering::SeqCst), 2, "2 x 1 permit");
+    hang.release();
+    let mut states = Vec::new();
+    for job in jobs {
+        states.push(tokio::time::timeout(DEADLINE, job).await.unwrap().unwrap());
+    }
+    assert!(hang.most.load(Ordering::SeqCst) <= 2);
+    assert_eq!(
+        states.iter().filter(|s| s.state == "icon").count(),
+        2,
+        "{states:?}"
+    );
+    assert_eq!(
+        states.iter().filter(|s| s.state == "ready").count(),
+        3,
+        "{states:?}"
+    );
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, M2: a cache name that isn't a plain file (a junction planted there) is a miss:
+/// never served, never written through; the write is refused and the item gets the icon.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038, ARCH-112
+#[allow(clippy::disallowed_methods)] // makes the junction and its target
+async fn a_junction_at_a_cache_entry_is_a_miss() {
+    let r = Rig::new(fast());
+    let bytes = picture(32, 32);
+    let sha = sha256_bytes(&bytes);
+    let path = ws_path(&work("j.png"));
+    r.put(path.as_str(), &bytes);
+    let outside = r.env.root().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let entry = r
+        .local()
+        .join("thumbs")
+        .join(&sha[..2])
+        .join(entry_name(&sha, "image", 1, 96));
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    lil_platform::fs::create_junction(&entry, &outside).unwrap();
+    let _open = r.open().await;
+    for expected in [Some(sha.as_str()), None] {
+        let state = r.thumbs.ensure(&path, expected, 96).await;
+        assert_icon(&state);
+        assert_eq!(state.sha256.as_deref(), Some(sha.as_str()));
+    }
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing written through"
+    );
+    std::fs::remove_dir(&entry).unwrap();
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, M3: a cache hit counts as a touch, so an entry written 8 days ago and used
+/// today survives clean-up even when nothing live holds its hash.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn a_cache_hit_counts_as_a_touch() {
+    let r = Rig::new(fast());
+    let bytes = picture(36, 36);
+    let sha = sha256_bytes(&bytes);
+    let path = ws_path(&work("touched.png"));
+    r.put(path.as_str(), &bytes);
+    let _open = r.open().await;
+    let made = r.thumbs.ensure(&path, None, 96).await;
+    let file = assert_ready_at(&r.local(), &made, &sha, 96);
+    age(&file, &r.clock, 8 * DAY);
+    let hit = r.thumbs.ensure(&path, Some(&sha), 96).await;
+    assert_ready_at(&r.local(), &hit, &sha, 96);
+    assert_eq!(r.thumbs.clean_up(&|_| false, true).await, 0);
+    assert!(file.exists(), "used today");
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 1, M4: with no default workspace at start, clean-up's first pass runs once one
+/// becomes the default and its index has finished its first reconcile; the next pass waits 24 h
+/// on the core's clock (the fake one here), not on tokio's.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn clean_up_runs_after_the_default_appears_and_daily_on_the_core_clock() {
+    let r = Rig::with(fast(), false);
+    let stop = tokio_util::sync::CancellationToken::new();
+    r.thumbs.spawn_clean_up(stop.clone());
+    let local = r.local();
+    let first = plant(&local, &r.clock, &sha256_bytes(b"first"), 8 * DAY);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(first.exists(), "no default workspace: no pass");
+    r.make_default();
+    let until = Instant::now() + DEADLINE;
+    while first.exists() {
+        assert!(
+            Instant::now() < until,
+            "no first pass after the default appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let second = plant(&local, &r.clock, &sha256_bytes(b"second"), 8 * DAY);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        second.exists(),
+        "the next pass waits 24 h on the core's clock"
+    );
+    r.clock.advance(DAY);
+    let until = Instant::now() + DEADLINE;
+    while second.exists() {
+        assert!(
+            Instant::now() < until,
+            "no pass 24 h later on the core's clock"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop.cancel();
+    r.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")] // spec: APP-038
 async fn a_hung_decode_answers_icon_after_its_deadline_and_frees_its_permit() {
     let gated = Arc::new(Gated::default());
@@ -1368,6 +1761,28 @@ fn writes_go_only_under_the_thumbs_folder() {
         ),
         "a dot-dot path",
     );
+    // A touch (a cache hit): only below thumbs\, only a plain file.
+    let when = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    fsops::touch_workspace_local_file(&local, &local.join(r"thumbs\ab\x.png"), when).unwrap();
+    assert_eq!(
+        std::fs::metadata(local.join(r"thumbs\ab\x.png"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        when
+    );
+    assert_eq!(
+        std::fs::read(local.join(r"thumbs\ab\x.png")).unwrap(),
+        b"png"
+    );
+    for (bad, what) in [
+        (local.join(r"picks\thumbs\x.png"), "a pick log thumbnail"),
+        (local.join(r"thumbs\ab"), "a folder"),
+        (local.join(r"thumbs\ln"), "a junction"),
+        (outside.join(r"thumbs\x.png"), "another folder"),
+    ] {
+        denied(fsops::touch_workspace_local_file(&local, &bad, when), what);
+    }
     fsops::remove_workspace_local_file(&local, &local.join(r"thumbs\ab\x.png")).unwrap();
     assert!(!local.join(r"thumbs\ab\x.png").exists());
     std::fs::remove_dir(local.join(r"thumbs\ln")).unwrap();
