@@ -137,9 +137,19 @@ async fn warm_reconcile_of_10000_assets_fits_the_budget() {
     let report = index.reconcile(Scope::All).await.expect("the reconcile");
     let took = started.elapsed().as_secs_f64();
     let budget = params::budget("index_warm_reconcile_10000_assets_s");
+    // The setup is most of this test's time: with the reconcile it stays within half of the cap,
+    // so a slower machine fails here, with its times, before nextest stops the test. Both
+    // numbers are printed before either is checked, the cap's first.
+    let whole = setup.elapsed().as_secs_f64();
+    let cap = test_cap_s();
     println!(
         "warm reconcile of 10,000 assets: {took:.3} s (budget {budget} s); unchanged {}",
         report.unchanged
+    );
+    println!("setup and warm reconcile: {whole:.1} s (per-test cap {cap} s)");
+    assert!(
+        whole <= cap / 2.0,
+        "the setup and the warm reconcile took {whole:.1} s, over half of the {cap} s per-test cap"
     );
     assert_eq!(
         report.hashed, 0,
@@ -149,15 +159,6 @@ async fn warm_reconcile_of_10000_assets_fits_the_budget() {
     assert!(
         took <= budget,
         "the warm reconcile took {took:.3} s; the budget is {budget} s"
-    );
-    // The setup is most of this test's time: with the reconcile it stays within half of the cap,
-    // so a slower machine fails here, with its times, before nextest stops the test.
-    let whole = setup.elapsed().as_secs_f64();
-    let cap = test_cap_s();
-    println!("setup and warm reconcile: {whole:.1} s (per-test cap {cap} s)");
-    assert!(
-        whole <= cap / 2.0,
-        "the setup and the warm reconcile took {whole:.1} s, over half of the {cap} s per-test cap"
     );
 }
 

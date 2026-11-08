@@ -1045,12 +1045,12 @@ async fn run_folder_uses_the_last_candidates_segment() {
     );
 }
 
-/// Ruling Q28's exemption needs the run's folder to be confirmed absent (`NotFound`). Any other
-/// error taking its identity (access denied, …) says the folder may well be there, so it is
-/// unknown, not absent: the run's files the walk didn't find are `missing`, as everywhere else,
-/// instead of being left out of the index.
+/// Ruling Q28's exemption needs the run's folder to be confirmed absent (`NotFound`). A run
+/// folder that can't be looked at (any other error taking its identity: access denied, …) gets
+/// no exemption: its expected files the walk didn't find are listed as `missing`, as anywhere
+/// else, instead of being left out of the index.
 #[tokio::test] // spec: CORE-038, ARCH-079
-async fn runs_elsewhere_treats_identity_errors_as_unknown_not_absent() {
+async fn runs_elsewhere_exempts_only_absent_run_folders() {
     let fx = fx();
     let (denied, away) = ("r_20270101_0800", "r_20270102_0800");
     fx.write(
@@ -1073,6 +1073,83 @@ async fn runs_elsewhere_treats_identity_errors_as_unknown_not_absent() {
         [format!("{ASSET}/candidates/{denied}/c.png")],
         "a folder that can't be looked at isn't a folder that is absent"
     );
+}
+
+/// A removal the store reports (an asset folder moved to the trash, a run moved away) takes
+/// the conflict copies under it out of the orphans at once, as it takes the file rows: no
+/// reconcile has to see them gone first.
+#[tokio::test] // spec: CORE-038
+async fn store_removal_clears_its_conflict_copies() {
+    let fx = fx();
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json("p", "a", json!({})),
+    );
+    let copy = format!("{ASSET}/work/s.blend.lil-conflict-20270101T080000Z");
+    fx.write(&copy, b"an outside save");
+    fx.write(&format!("{ASSET}/work/s.blend"), b"the core's");
+    let index = fx.open(Arc::new(SystemProbe));
+    index.rebuild().await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap(), [p(&copy)]);
+
+    outside_move(&fx.file(ASSET), &fx.file(".trash/e_1/payload/a"));
+    index
+        .applied(&[StoreEvent {
+            path: p(ASSET),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        }])
+        .await;
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+}
+
+/// After a project folder is renamed only in case, a manifest change read with the folder's new
+/// spelling (a run and a version added) leaves one asset row for the folder, not a second one
+/// beside the stale row, so nothing it records is called an orphan.
+#[tokio::test] // spec: CORE-038, CORE-047
+async fn a_case_only_rename_then_a_manifest_change_keeps_one_asset_row() {
+    let fx = fx();
+    let (r1, r2) = ("r_20270101_0800", "r_20270102_0800");
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"candidate_runs": [open_run("p", "a", r1)]}),
+        ),
+    );
+    fx.write(&format!("{ASSET}/candidates/{r1}/c.png"), b"r1");
+    let index = fx.open(Arc::new(SystemProbe));
+    index.rebuild().await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+
+    outside_move(&fx.file("projects/p"), &fx.file("projects/P"));
+    index.reconcile(Scope::All).await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+
+    // The manifest records a second run and a sealed version, written the new way.
+    let signed = json!({"by": "user", "date": "2027-01-02", "version": "1.0.0"});
+    let mut second = open_run("p", "a", r2);
+    second["status"] = json!("selected");
+    second["signed_off"] = signed;
+    fx.write(
+        "projects/P/assets/a/a.manifest.json",
+        &manifest_json(
+            "p",
+            "a",
+            json!({"approved_version": "1.0.0",
+                   "candidate_runs": [open_run("p", "a", r1), second]}),
+        ),
+    );
+    fx.write(&format!("projects/P/assets/a/candidates/{r2}/c.png"), b"r2");
+    fx.write("projects/P/assets/a/v1.0.0/manifest.snapshot.json", b"{}");
+    index.reconcile(Scope::All).await.unwrap();
+
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+    let rows =
+        index.assets_of("p").await.unwrap().len() + index.assets_of("P").await.unwrap().len();
+    assert_eq!(rows, 1, "one asset row for the folder");
 }
 
 /// `project.status`'s orphans (CORE-038) come from the index's rows, not from a walk of the disk:
@@ -3397,4 +3474,398 @@ async fn status_and_type_take_lists() {
     );
     drop(open);
     hub.close_all().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// `orphans_of` against a walk of the disk (CORE-038), over random sequences of changes.
+// ---------------------------------------------------------------------------------------------
+
+/// One step of [`orphans_follow_the_disk`]. `asset` picks `a` or `b`; every step tells the
+/// index of its change the way the suite would: a reconcile (whole, or scoped to what changed)
+/// for an outside change, the store's `Removed` event for the store's own move.
+#[derive(Debug, Clone)]
+enum OrphanOp {
+    /// A conflict copy appears, in the asset's `work/` or at the project's root.
+    Conflict {
+        asset: usize,
+        name: usize,
+        root: bool,
+    },
+    /// A conflict copy is removed (if it is there).
+    RemoveConflict {
+        asset: usize,
+        name: usize,
+        root: bool,
+    },
+    /// A file in `candidates/r_2027010<run>_0800/`.
+    RunFile { asset: usize, run: usize },
+    /// `v<ver>.0.0/manifest.snapshot.json`.
+    Snapshot { asset: usize, ver: usize },
+    /// The manifest is rewritten: the runs and versions of the two bit masks (the first version
+    /// approved, the others signed off), or text that doesn't parse.
+    Manifest {
+        asset: usize,
+        runs: u8,
+        versions: u8,
+        parses: bool,
+        whole: bool,
+    },
+    /// The project folder is renamed in case only (`p` ↔ `P`).
+    RenameProject { whole: bool },
+    /// The asset folder is renamed in case only (`a` ↔ `A`).
+    RenameAsset { asset: usize, whole: bool },
+    /// The store moves the asset folder (or one of its run folders) away and says so.
+    StoreRemove { asset: usize, run: Option<usize> },
+    /// A whole reconcile.
+    Reconcile,
+}
+
+fn orphan_op() -> impl proptest::strategy::Strategy<Value = OrphanOp> {
+    use proptest::prelude::*;
+    prop_oneof![
+        (0..2usize, 0..2usize, any::<bool>()).prop_map(|(asset, name, root)| OrphanOp::Conflict {
+            asset,
+            name,
+            root
+        }),
+        (0..2usize, 0..2usize, any::<bool>())
+            .prop_map(|(asset, name, root)| OrphanOp::RemoveConflict { asset, name, root }),
+        (0..2usize, 1..4usize).prop_map(|(asset, run)| OrphanOp::RunFile { asset, run }),
+        (0..2usize, 1..4usize).prop_map(|(asset, ver)| OrphanOp::Snapshot { asset, ver }),
+        (
+            0..2usize,
+            0..8u8,
+            0..8u8,
+            prop::bool::weighted(0.85),
+            any::<bool>()
+        )
+            .prop_map(
+                |(asset, runs, versions, parses, whole)| OrphanOp::Manifest {
+                    asset,
+                    runs,
+                    versions,
+                    parses,
+                    whole
+                }
+            ),
+        any::<bool>().prop_map(|whole| OrphanOp::RenameProject { whole }),
+        (0..2usize, any::<bool>())
+            .prop_map(|(asset, whole)| OrphanOp::RenameAsset { asset, whole }),
+        (0..2usize, proptest::option::of(1..4usize))
+            .prop_map(|(asset, run)| OrphanOp::StoreRemove { asset, run }),
+        Just(OrphanOp::Reconcile),
+    ]
+}
+
+/// The disk side of [`orphans_follow_the_disk`]: the spellings of the project and asset
+/// folders as they are now.
+struct OrphanDisk {
+    project: &'static str,
+    assets: [&'static str; 2],
+    trashed: usize,
+}
+
+impl OrphanDisk {
+    fn asset(&self, asset: usize) -> String {
+        format!("projects/{}/assets/{}", self.project, self.assets[asset])
+    }
+
+    fn conflict(&self, asset: usize, name: usize, root: bool) -> String {
+        let file = format!("n{name}.txt.lil-conflict-20270101T080000Z");
+        if root {
+            format!("projects/{}/{file}", self.project)
+        } else {
+            format!("{}/work/{file}", self.asset(asset))
+        }
+    }
+}
+
+/// `project.status`'s orphans of project `p`, from a walk of the disk (the rules of
+/// `Index::orphans_of`, with the manifest read now), case-folded and sorted.
+#[allow(clippy::disallowed_methods)]
+fn walked_orphans(root: &Path) -> Vec<String> {
+    fn entries(dir: &Path) -> Vec<(String, PathBuf, bool)> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.map(|e| {
+                    let e = e.unwrap();
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    (name, e.path(), e.file_type().unwrap().is_dir())
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn conflicts(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        for (name, path, is_dir) in entries(dir) {
+            let rel = format!("{rel}/{name}");
+            if is_dir {
+                conflicts(&path, &rel, out);
+            } else if name.contains(".lil-conflict-") {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (project, project_dir, _) in entries(&root.join("projects"))
+        .into_iter()
+        .filter(|(n, _, d)| *d && n.eq_ignore_ascii_case("p"))
+    {
+        conflicts(&project_dir, &format!("projects/{project}"), &mut out);
+        for (asset, asset_dir, _) in entries(&project_dir.join("assets"))
+            .into_iter()
+            .filter(|e| e.2)
+        {
+            let base = format!("projects/{project}/assets/{asset}");
+            let manifest = entries(&asset_dir)
+                .into_iter()
+                .find(|(n, _, d)| !d && n.eq_ignore_ascii_case(&format!("{asset}.manifest.json")));
+            // `None`: the manifest doesn't parse, nothing is judged.
+            let recorded: Option<(Vec<String>, Vec<String>)> = match manifest {
+                None => Some((Vec::new(), Vec::new())),
+                Some((_, path, _)) => {
+                    serde_json::from_slice::<Value>(&std::fs::read(path).unwrap())
+                        .ok()
+                        .map(|m| {
+                            let runs = m["candidate_runs"].as_array().cloned().unwrap_or_default();
+                            let mut versions: Vec<String> = m["approved_version"]
+                                .as_str()
+                                .map(str::to_string)
+                                .into_iter()
+                                .collect();
+                            versions.extend(runs.iter().filter_map(|r| {
+                                r["signed_off"]["version"].as_str().map(str::to_string)
+                            }));
+                            let runs = runs
+                                .iter()
+                                .filter_map(|r| r["run_id"].as_str().map(str::to_lowercase))
+                                .collect();
+                            (runs, versions)
+                        })
+                }
+            };
+            let Some((runs, versions)) = recorded else {
+                continue;
+            };
+            for (run, run_dir, is_dir) in entries(&asset_dir.join("candidates")) {
+                if is_dir && !entries(&run_dir).is_empty() && !runs.contains(&run.to_lowercase()) {
+                    out.push(format!("{base}/candidates/{run}"));
+                }
+            }
+            for (folder, folder_dir, is_dir) in entries(&asset_dir) {
+                let Some(version) = folder.strip_prefix(['v', 'V']) else {
+                    continue;
+                };
+                if is_dir
+                    && folder_dir.join("manifest.snapshot.json").is_file()
+                    && !versions.iter().any(|v| v == version)
+                {
+                    out.push(format!("{base}/{folder}"));
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = out.iter().map(|o| o.to_lowercase()).collect();
+    out.sort();
+    out
+}
+
+/// Applies `op` to the disk and tells the index of it.
+async fn apply_orphan_op(fx: &Fx, index: &Index, disk: &mut OrphanDisk, op: &OrphanOp) {
+    let scoped = |rel: String| Scope::Paths(vec![p(&rel)]);
+    match *op {
+        OrphanOp::Conflict { asset, name, root } => {
+            let rel = disk.conflict(asset, name, root);
+            fx.write(&rel, b"an outside save");
+            index.reconcile(scoped(rel)).await.unwrap();
+        }
+        OrphanOp::RemoveConflict { asset, name, root } => {
+            let rel = disk.conflict(asset, name, root);
+            if fx.file(&rel).is_file() {
+                outside_remove(&fx.file(&rel));
+            }
+            index.reconcile(scoped(rel)).await.unwrap();
+        }
+        OrphanOp::RunFile { asset, run } => {
+            let rel = format!("{}/candidates/r_2027010{run}_0800/c.png", disk.asset(asset));
+            fx.write(&rel, b"take");
+            index.reconcile(scoped(disk.asset(asset))).await.unwrap();
+        }
+        OrphanOp::Snapshot { asset, ver } => {
+            let rel = format!("{}/v{ver}.0.0/manifest.snapshot.json", disk.asset(asset));
+            fx.write(&rel, b"{}");
+            index.reconcile(scoped(disk.asset(asset))).await.unwrap();
+        }
+        OrphanOp::Manifest {
+            asset,
+            runs,
+            versions,
+            parses,
+            whole,
+        } => {
+            let id = ["a", "b"][asset];
+            let rel = format!("{}/{id}.manifest.json", disk.asset(asset));
+            let bytes = if parses {
+                let chosen: Vec<String> = (1..4usize)
+                    .filter(|v| versions & (1 << (v - 1)) != 0)
+                    .map(|v| format!("{v}.0.0"))
+                    .collect();
+                let mut list: Vec<Value> = (1..4usize)
+                    .filter(|r| runs & (1 << (r - 1)) != 0)
+                    .map(|r| open_run("p", id, &format!("r_2027010{r}_0800")))
+                    .collect();
+                // Each version after the first is a sign-off of a run of its own.
+                for (k, version) in chosen.iter().enumerate().skip(1) {
+                    let mut run = open_run("p", id, &format!("r_2027020{k}_0800"));
+                    run["status"] = json!("selected");
+                    run["signed_off"] =
+                        json!({"by": "user", "date": "2027-02-01", "version": version});
+                    list.push(run);
+                }
+                let mut extra = json!({"candidate_runs": list});
+                if let Some(first) = chosen.first() {
+                    extra["approved_version"] = json!(first);
+                }
+                manifest_json("p", id, extra)
+            } else {
+                b"{not json".to_vec()
+            };
+            fx.write(&rel, &bytes);
+            let scope = if whole { Scope::All } else { scoped(rel) };
+            index.reconcile(scope).await.unwrap();
+        }
+        OrphanOp::RenameProject { whole } => {
+            let to = if disk.project == "p" { "P" } else { "p" };
+            let from = format!("projects/{}", disk.project);
+            if fx.file(&from).is_dir() {
+                outside_move(&fx.file(&from), &fx.file(&format!("projects/{to}")));
+                disk.project = to;
+            }
+            let scope = if whole {
+                Scope::All
+            } else {
+                scoped(format!("projects/{}", disk.project))
+            };
+            index.reconcile(scope).await.unwrap();
+        }
+        OrphanOp::RenameAsset { asset, whole } => {
+            let names = [["a", "A"], ["b", "B"]][asset];
+            let to = if disk.assets[asset] == names[0] {
+                names[1]
+            } else {
+                names[0]
+            };
+            let from = disk.asset(asset);
+            if fx.file(&from).is_dir() {
+                outside_move(
+                    &fx.file(&from),
+                    &fx.file(&format!("projects/{}/assets/{to}", disk.project)),
+                );
+                disk.assets[asset] = to;
+            }
+            let scope = if whole {
+                Scope::All
+            } else {
+                scoped(disk.asset(asset))
+            };
+            index.reconcile(scope).await.unwrap();
+        }
+        OrphanOp::StoreRemove { asset, run } => {
+            let rel = match run {
+                Some(run) => format!("{}/candidates/r_2027010{run}_0800", disk.asset(asset)),
+                None => disk.asset(asset),
+            };
+            if fx.file(&rel).is_dir() {
+                disk.trashed += 1;
+                outside_move(
+                    &fx.file(&rel),
+                    &fx.file(&format!(".trash/e_{}/payload/x", disk.trashed)),
+                );
+                // The store names the path with the slug's spelling.
+                let ids = ["a", "b"];
+                let said = match run {
+                    Some(run) => format!(
+                        "projects/p/assets/{}/candidates/r_2027010{run}_0800",
+                        ids[asset]
+                    ),
+                    None => format!("projects/p/assets/{}", ids[asset]),
+                };
+                index
+                    .applied(&[StoreEvent {
+                        path: p(&said),
+                        kind: ChangeKind::Removed,
+                        sha256: None,
+                        identity: None,
+                    }])
+                    .await;
+            }
+        }
+        OrphanOp::Reconcile => {
+            index.reconcile(Scope::All).await.unwrap();
+        }
+    }
+}
+
+/// How many sequences [`orphans_follow_the_disk`] runs: each one works on real files and a
+/// real `index.db`, so far fewer than `[proptest] cases`; the seed is fixed, so every run
+/// (CI's too) tries the same sequences.
+const ORPHAN_CASES: u32 = 24;
+
+/// After every step of a random sequence (conflict copies made and removed, case-only renames
+/// of the project and asset folders, manifests that add or drop runs and versions or stop
+/// parsing, run folders and sealed snapshots appearing, the store's removals, scoped and whole
+/// reconciles), `orphans_of` agrees with a walk of the disk.
+#[test] // spec: CORE-038, CORE-041
+fn orphans_follow_the_disk() {
+    use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
+    let config = Config {
+        cases: ORPHAN_CASES,
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let mut runner =
+        TestRunner::new_with_rng(config, TestRng::from_seed(RngAlgorithm::ChaCha, &[21; 32]));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runner.run(&proptest::collection::vec(orphan_op(), 1..10), |ops| {
+        rt.block_on(async {
+            let fx = fx();
+            let mut disk = OrphanDisk {
+                project: "p",
+                assets: ["a", "b"],
+                trashed: 0,
+            };
+            for id in ["a", "b"] {
+                fx.write(
+                    &format!("projects/p/assets/{id}/{id}.manifest.json"),
+                    &manifest_json("p", id, json!({})),
+                );
+            }
+            let index = fx.open(Arc::new(SystemProbe));
+            index.rebuild().await.unwrap();
+            for (step, op) in ops.iter().enumerate() {
+                apply_orphan_op(&fx, &index, &mut disk, op).await;
+                let mut got: Vec<String> = index
+                    .orphans_of("p")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|o| o.as_str().to_lowercase())
+                    .collect();
+                got.sort();
+                let want = walked_orphans(&fx.root);
+                if got != want {
+                    return Err(TestCaseError::fail(format!(
+                        "after step {step} ({op:?}): index {got:?}, disk {want:?}"
+                    )));
+                }
+            }
+            Ok(())
+        })
+    });
+    if let Err(e) = result {
+        panic!("{e}");
+    }
 }

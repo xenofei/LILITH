@@ -899,7 +899,10 @@ impl Index {
                 // Each orphan folder spelled as the first indexed file under it is.
                 let mut orphans = Vec::with_capacity(folders.len());
                 let mut spell = conn
-                    .prepare_cached("SELECT path FROM files WHERE key > ?1 || '/' LIMIT 1")
+                    .prepare_cached(
+                        "SELECT path FROM files WHERE key > ?1 || '/' AND key < ?1 || '0'
+                         ORDER BY key LIMIT 1",
+                    )
                     .map_err(|e| sql(&e))?;
                 for folder in folders {
                     let path: String = spell

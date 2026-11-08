@@ -1030,6 +1030,21 @@ fn folder_key(parsed: &Parsed) -> String {
 }
 
 fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
+    // One row per asset folder: a row of the same folder spelled in other capitals (a folder
+    // renamed only in case) goes, with everything that hangs off it.
+    let stale: Vec<(i64, String, String)> = tx
+        .prepare_cached(
+            "SELECT id, project, asset_id FROM assets WHERE folder_key = ?1
+             AND NOT (project = ?2 AND asset_id = ?3)",
+        )?
+        .query_map(
+            params![folder_key(parsed), parsed.project, parsed.asset_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, project, asset_id) in stale {
+        delete_asset(tx, id, &project, &asset_id)?;
+    }
     let Some(fields) = &parsed.fields else {
         // It doesn't parse: flag the row and keep its last values, edges and expected files, but
         // not the runs and versions it recorded: its folders aren't judged for orphans.
@@ -1336,8 +1351,9 @@ fn run_folder(path: &str) -> Option<&str> {
 /// `candidates/` is gitignored (CORE-032), so on a fresh clone a manifest lists runs whose
 /// files were never on this machine. A cold rebuild doesn't call those `missing`; a file gone
 /// from a run folder that is there still is, and `hashes` entries always are. Only `NotFound`
-/// (a missing parent folder gives it too) confirms a folder absent; any other error taking its
-/// identity (access denied, …) leaves it unknown, and its files are judged as anywhere else.
+/// (a missing parent folder gives it too) confirms a folder absent. A run folder that can't be
+/// looked at (any other error taking its identity: access denied, …) gets no exemption: its
+/// expected files the walk didn't find are listed as `missing`, as anywhere else.
 async fn runs_elsewhere(index: &Index, parsed: &[Parsed]) -> Result<HashSet<String>, IndexError> {
     let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
     for e in parsed
@@ -1385,23 +1401,35 @@ fn delete_assets_under(tx: &Transaction<'_>, key: &str) -> rusqlite::Result<()> 
         .collect();
     drop(stmt);
     for (id, project, asset_id) in doomed {
-        tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
-        tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id])?;
-        for table in ["asset_tags", "take_marks"] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE project = ?1 AND asset_id = ?2"),
-                params![project, asset_id],
-            )?;
-        }
+        delete_asset(tx, id, &project, &asset_id)?;
+    }
+    Ok(())
+}
+
+/// Removes the asset row `id` (`project`/`asset_id` as that row spells them) with its tags,
+/// takes, edges, text and expected files.
+fn delete_asset(
+    tx: &Transaction<'_>,
+    id: i64,
+    project: &str,
+    asset_id: &str,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
+    tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id])?;
+    for table in ["asset_tags", "take_marks"] {
         tx.execute(
-            "DELETE FROM edges WHERE from_project = ?1 AND from_asset = ?2",
-            params![project, asset_id],
-        )?;
-        tx.execute(
-            "DELETE FROM expected WHERE project = ?1 AND asset_id = ?2",
+            &format!("DELETE FROM {table} WHERE project = ?1 AND asset_id = ?2"),
             params![project, asset_id],
         )?;
     }
+    tx.execute(
+        "DELETE FROM edges WHERE from_project = ?1 AND from_asset = ?2",
+        params![project, asset_id],
+    )?;
+    tx.execute(
+        "DELETE FROM expected WHERE project = ?1 AND asset_id = ?2",
+        params![project, asset_id],
+    )?;
     Ok(())
 }
 
@@ -1897,8 +1925,8 @@ fn write_conflicts(
     Ok(())
 }
 
-/// The store's changes in one transaction: removals (with everything under them), then rows,
-/// then asset rows.
+/// The store's changes in one transaction: removals (with everything under them, conflict
+/// copies included), then rows, then asset rows.
 fn store_changes(
     tx: &Transaction<'_>,
     removed: &[String],
@@ -1907,6 +1935,10 @@ fn store_changes(
 ) -> rusqlite::Result<()> {
     for key in removed {
         tx.execute(&format!("DELETE FROM files WHERE {UNDER}"), params![key])?;
+        tx.execute(
+            &format!("DELETE FROM conflicts WHERE {UNDER}"),
+            params![key],
+        )?;
         delete_assets_under(tx, key)?;
     }
     for row in rows {
