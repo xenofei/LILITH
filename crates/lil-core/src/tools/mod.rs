@@ -5,6 +5,7 @@
 
 pub mod asset_read_tools;
 pub mod asset_tools;
+pub mod collection_tools;
 pub mod desktop_tools;
 pub mod dispatcher;
 pub mod doctor_tools;
@@ -30,6 +31,7 @@ use std::sync::{Arc, OnceLock};
 
 pub use asset_read_tools::register_asset_read_tools;
 pub use asset_tools::register_asset_tools;
+pub use collection_tools::register_collection_tools;
 pub use desktop_tools::register_desktop_tools;
 pub use dispatcher::{Dispatcher, ErrorSink, Redispatch};
 pub use doctor_tools::{DoctorArgs, DoctorCheck, register_doctor_tools};
@@ -96,6 +98,7 @@ pub fn core_registry(
     register_trash_tools(&mut reg, &personal, services);
     register_asset_read_tools(&mut reg);
     register_asset_tools(&mut reg, services);
+    register_collection_tools(&mut reg);
     register_ref_tools(&mut reg);
     register_watch_tools(&mut reg);
     register_job_tools(&mut reg);

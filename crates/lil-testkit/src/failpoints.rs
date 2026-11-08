@@ -37,6 +37,8 @@ pub const NAMES: &[&str] = &[
     "workspace.after_create",
     // Plan 4b, Task 11: after `asset.trash` moved the asset folder, before the index hears.
     "store.after_asset_trash",
+    // Plan 4b, Task 9: after `collection.delete` put the entry in the trash, before the YAML edit.
+    "collections.after_payload",
 ];
 
 /// Every fail point action, a closed list.
@@ -83,7 +85,7 @@ mod tests {
             "store.between_renames=abort,watch.start=unsupported,store.write_temp=disk_full"
         );
         // Every name and action of the closed lists is accepted.
-        assert_eq!((NAMES.len(), ACTIONS.len()), (23, 5));
+        assert_eq!((NAMES.len(), ACTIONS.len()), (24, 5));
         for name in NAMES {
             for action in ACTIONS {
                 assert_eq!(spec(&[(name, action)]), format!("{name}={action}"));

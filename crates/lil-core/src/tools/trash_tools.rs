@@ -46,6 +46,11 @@
 //!
 //! A `to` that is the entry's own name (its asset id, resource id or file name) is a plain
 //! restore.
+//!
+//! **A deleted saved search or collection** (`reason: "collection.delete"`, CORE-155) isn't
+//! moved back: its entry merges into `registry/collections.yaml` by id, `trash.restore_conflict`
+//! when its id or name is in use there (nothing is replaced), and `to` doesn't apply
+//! (`params.invalid`).
 
 use std::sync::Arc;
 
@@ -60,10 +65,11 @@ use super::asset_tools::takeover_warnings_for;
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::services::{AssetServices, ResourceIds};
 use super::workspace_tools::WORKSPACE_MODULE;
-use crate::pipeline::{asset_topic, status_by};
+use crate::pipeline::{asset_topic, collections, status_by};
 use crate::projects::Resolver;
 use crate::projects::repair::restored_as;
 use crate::store::{Personal, RestoreRewrite, Store, StoreError, TrashRecord, WsPath};
+use crate::workspace::OpenWorkspace;
 
 const LIST_DESCRIPTION: &str = "List the entries in the trash, oldest first: each with its \
     entry_id, the path it came from, when it was moved, when it is purged (30 days later) and \
@@ -352,6 +358,12 @@ async fn restore_workspace(
         .map_err(|e| Refused::Body(Box::new(e)))?
         .clone();
     let store: &Store = &open.store;
+    // A deleted saved search or collection merges back into its file by id (CORE-155).
+    if let Ok(record) = store.trash_entry(&args.entry_id).await
+        && record.reason == collections::DELETE_REASON
+    {
+        return restore_collection(ctx, &open, args, warnings).await;
+    }
     let Some(to) = args.to.as_deref() else {
         return Ok(store.trash_restore(&args.entry_id).await?);
     };
@@ -429,6 +441,35 @@ async fn restore_workspace(
             .trash_restore_to(&args.entry_id, Some(to), None)
             .await?),
     }
+}
+
+/// The restore of a deleted saved search or collection (`reason: "collection.delete"`;
+/// CORE-155): its entry merges back into `registry/collections.yaml` by id
+/// (`pipeline::collections::restore`; `trash.restore_conflict` when its id or name is in
+/// use). `to` doesn't apply (`params.invalid`). Published on `workspace` as
+/// `{kind: "collection", id}`. A trash entry that can't be removed after the merge is a
+/// warning, not an error (the merge is the commit).
+async fn restore_collection(
+    ctx: &CallCtx,
+    open: &OpenWorkspace,
+    args: &RestoreArgs,
+    warnings: &mut Vec<String>,
+) -> Result<WsPath, Refused> {
+    if args.to.is_some() {
+        return Err(params_invalid(format!(
+            "{} is a deleted saved search or collection: it merges back into {} by its id, so \
+             to doesn't apply; leave it out (rename the entry that holds its name first)",
+            args.entry_id,
+            collections::COLLECTIONS_YAML
+        )));
+    }
+    let (back, after) = collections::restore(&open.store, &args.entry_id)
+        .await
+        .map_err(|e| Refused::Body(Box::new(e)))?;
+    warnings.extend(after);
+    ctx.events
+        .publish("workspace", json!({"kind": "collection", "id": back.id}));
+    Ok(collections::collections_path())
 }
 
 async fn restore_personal(

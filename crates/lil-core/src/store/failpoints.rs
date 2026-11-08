@@ -58,6 +58,9 @@ pub const NAMES: &[&str] = &[
     // After `asset.trash` moved the whole asset folder to the trash, before the index hears
     // of it (plan 4b, Task 11; CORE-157).
     "store.after_asset_trash",
+    // After `collection.delete` put the deleted entry in the trash, before the YAML edit takes
+    // it out of `registry/collections.yaml` (plan 4b, Task 9; CORE-155).
+    "collections.after_payload",
 ];
 
 /// The exit code of the `abort` action.

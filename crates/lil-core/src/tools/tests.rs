@@ -1076,6 +1076,68 @@ fn the_trash_tools_are_pinned() {
     assert_eq!(restore.input_schema["additionalProperties"], false);
 }
 
+/// The plan-4b collection rows (CORE-155; Appendix H "Organising tools"): `collections.list`
+/// reads, `collection.save` writes and `collection.delete` is destructive, all in `workspace`,
+/// with the arguments Appendix H names; `collection.delete` asks agents only (ARCH-052, as
+/// `resource.delete` does) and touches `registry/collections.yaml` (`write`).
+#[test] // spec: CORE-155, CORE-146, CORE-058, APP-115
+fn the_collection_tools_are_pinned() {
+    use lil_protocol::app::TouchAccess;
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
+    for (name, effect, props, required) in [
+        ("collections.list", EffectClass::Read, vec![], json!(null)),
+        (
+            "collection.save",
+            EffectClass::Write,
+            vec!["id", "name", "rule", "refs", "add", "remove"],
+            json!(null),
+        ),
+        (
+            "collection.delete",
+            EffectClass::Destructive,
+            vec!["id"],
+            json!(["id"]),
+        ),
+    ] {
+        let d = reg
+            .descriptors()
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} is registered"));
+        assert_eq!(
+            (d.effect, d.module.as_str()),
+            (effect, WORKSPACE_MODULE),
+            "{name}"
+        );
+        let found: Vec<&str> = d.input_schema["properties"]
+            .as_object()
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(found, props, "{name}");
+        assert_eq!(
+            d.input_schema
+                .get("required")
+                .cloned()
+                .unwrap_or(json!(null)),
+            required,
+            "{name}"
+        );
+        assert_eq!(d.input_schema["additionalProperties"], false, "{name}");
+    }
+    let meta = reg.meta("collection.delete");
+    assert_eq!(meta.confirm_policy, ConfirmPolicy::AgentsOnly);
+    assert_eq!(
+        meta.touches,
+        [TouchDecl {
+            template: "registry/collections.yaml",
+            access: TouchAccess::Write,
+        }]
+    );
+    assert!(meta.facts.is_none());
+}
+
 /// The plan-4b `ref.resolve` row (CORE-146, P4b-R25; Appendix H "`ref.resolve`"): it reads, in
 /// `workspace`, and takes `ref` or `path`, nothing else.
 #[test] // spec: ARCH-125, APP-019, CORE-146, CORE-058
@@ -1184,8 +1246,9 @@ fn fill_touches_fills_templates_from_the_arguments() {
 
 /// The asset services' slots (P4b-R32) left empty change nothing for the tools there are:
 /// every tool `core_registry` registers is listed and has its meta (only the tools that ask
-/// every caller have one: the test tool and `asset.trash`), and a read tool and a write tool
-/// of the asset tools run in a workspace as before.
+/// every caller have one: the test tool and `asset.trash`; `collection.delete` declares its
+/// touch only), and a read tool and a write tool of the asset tools run in a workspace as
+/// before.
 #[tokio::test] // spec: CORE-014, CORE-152, CORE-157
 async fn unwired_services_leave_every_existing_tool_working() {
     let fx = fixture(&[]);
@@ -1208,7 +1271,11 @@ async fn unwired_services_leave_every_existing_tool_working() {
             special,
             "{name}"
         );
-        assert_eq!(!meta.touches.is_empty(), special, "{name}");
+        assert_eq!(
+            !meta.touches.is_empty(),
+            special || name == "collection.delete",
+            "{name}"
+        );
         assert_eq!(meta.facts.is_some(), special, "{name}");
     }
 

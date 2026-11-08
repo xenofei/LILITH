@@ -8,13 +8,16 @@
 //!   [`start_candidate_run`];
 //! - [`signoff`]: [`plan_signoff`] (with [`Chosen`] and [`chosen_files`]), [`signed_off_by`]
 //!   and [`auto_pick`];
-//! - [`status`]: [`status_by`], the status log's `by` for a caller.
+//! - [`status`]: [`status_by`], the status log's `by` for a caller;
+//! - [`collections`]: `registry/collections.yaml`'s saved searches and collections (CORE-155).
 
+pub mod collections;
 pub mod detail;
 pub mod record;
 pub mod signoff;
 pub mod status;
 
+pub use collections::QUICK_COLLECTION_ID;
 pub use detail::{
     AssetDetail, AssetSummary, DisplayEntry, FileEntry, LastChange, NextVersions, UseEntry,
     UseError, UsedByEntry, VersionEntry, asset_detail, asset_summary, file_state_wire,
