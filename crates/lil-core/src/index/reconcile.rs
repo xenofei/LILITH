@@ -1022,8 +1022,9 @@ fn is_folder_manifest(root: &Path, rel: &WsPath) -> bool {
 }
 
 /// Keeps one asset row per folder when `parsed` spells its folder in other capitals than a row
-/// already does (a folder renamed only in case). With no row of the new spelling yet, the
-/// oldest row of the folder is moved to it, with everything that hangs off it, so the upsert
+/// already does (a folder renamed only in case). With no row of the new spelling yet, the most
+/// recently updated row of the folder (its values the likeliest to be current) is moved to it,
+/// with everything that hangs off it, so the upsert
 /// that follows overwrites it (a manifest that parses) or keeps its last values (one that
 /// doesn't). Any other row of the folder first hands its expected files to the kept row, then
 /// goes: a recorded file never stops being expected because its folder's spelling changed.
@@ -1031,7 +1032,7 @@ fn respell_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> 
     let others: Vec<(i64, String, String)> = tx
         .prepare_cached(
             "SELECT id, project, asset_id FROM assets WHERE folder_key = ?1
-             AND NOT (project = ?2 AND asset_id = ?3) ORDER BY id",
+             AND NOT (project = ?2 AND asset_id = ?3) ORDER BY updated DESC, id",
         )?
         .query_map(
             params![folder_key(parsed), parsed.project, parsed.asset_id],

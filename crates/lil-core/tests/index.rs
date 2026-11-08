@@ -3988,7 +3988,7 @@ fn orphans_follow_the_disk() {
     let result = runner.run(&proptest::collection::vec(orphan_op(), 1..13), |ops| {
         rt.block_on(async {
             let fx = fx();
-            // Both assets start with every run recorded and its file on disk.
+            // Both assets start with every run recorded and its file on disk, and a conflict copy.
             let all = u8::try_from((1 << RUNS) - 1).unwrap();
             let mut disk = OrphanDisk {
                 project: "p",
@@ -4005,6 +4005,9 @@ fn orphans_follow_the_disk() {
                 for run in 1..=RUNS {
                     fx.write(&disk.run_file(asset, run), b"take");
                 }
+                // A conflict copy in each asset's `work/`, so a store removal of the asset has
+                // one to take with it.
+                fx.write(&disk.conflict(asset, 0, false), b"an outside save");
             }
             let index = fx.open(Arc::new(SystemProbe));
             index.rebuild().await.unwrap();
