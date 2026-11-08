@@ -710,6 +710,8 @@ pub async fn start_claimed(cfg: CoreConfig, listener: Listener) -> Result<Runnin
     }
     // The thumbnail clean-up: its first pass waits for the default workspace's first reconcile.
     thumbs.spawn_clean_up(lifecycle.drain_token());
+    // At the drain, thumbnail reads, hashes and renders stop at their next check.
+    thumbs.stop_on(lifecycle.drain_token());
     let mut helpers = vec![
         tokio::spawn(tick_idle(lifecycle.clone(), cfg.idle_after)),
         tokio::spawn(sweep_confirmations(confirm.clone())),

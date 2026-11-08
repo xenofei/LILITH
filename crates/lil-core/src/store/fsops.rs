@@ -329,17 +329,41 @@ pub fn touch_workspace_local_file(
 
 /// Removes the file `path` of the thumbnail cache `<local dir>\thumbs\` (P4b-R36): a hard
 /// delete of a local cache file, with the checks of [`write_workspace_local_file`] restricted
-/// to that one folder, as [`remove_suite_cache_file`] is to its own.
+/// to that one folder, as [`remove_suite_cache_file`] is to its own. A name with more than one
+/// link (a hard link planted there, perhaps to a sealed file) is refused: the removal would
+/// clear the read-only flag the names share (audit fix round 1, L-2).
 ///
 /// # Errors
-/// `PermissionDenied` for a path outside `<local dir>\thumbs\` (or reached through a link);
-/// the removal's error.
+/// `PermissionDenied` for a path outside `<local dir>\thumbs\` (or reached through a link), a
+/// folder, or a file with more than one name; the removal's error.
+#[allow(clippy::disallowed_methods)]
 pub fn remove_workspace_local_file(local_dir: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_READ_ATTRIBUTES`: enough to count its names.
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`: a link is opened itself, never followed.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     check_local_path(local_dir, path, &LOCAL_REMOVE_DIRS)?;
     if std::fs::symlink_metadata(long_path(path))?.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("{} is a folder", path.display()),
+        ));
+    }
+    let links = {
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(long_path(path))?;
+        lil_platform::fs::link_count(&file)?
+    };
+    if links > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} has more than one name (a hard link); it is left as it is",
+                path.display()
+            ),
         ));
     }
     remove_file(path)

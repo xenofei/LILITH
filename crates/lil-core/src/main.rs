@@ -12,6 +12,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use lil_core::{CoreConfig, CoreExit, claim_pipe, start_claimed};
 use lil_platform::Env;
@@ -26,6 +27,11 @@ fn main() -> ExitCode {
     }
 }
 
+/// How long the runtime waits, after the core has stopped, for blocking threads still
+/// running (a thumbnail read stuck past its deadline): such threads are left behind rather
+/// than keeping the process alive (APP-038; audit fix round 1, M-4).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 fn run() -> Result<u8, CoreExit> {
     let env = Env::from_process().map_err(|e| CoreExit::Startup(e.to_string()))?;
     let cfg = CoreConfig::for_env(env).map_err(|e| CoreExit::Startup(e.to_string()))?;
@@ -33,12 +39,14 @@ fn run() -> Result<u8, CoreExit> {
         .enable_all()
         .build()
         .map_err(|e| CoreExit::Startup(format!("cannot build the runtime: {e}")))?;
-    rt.block_on(async {
+    let result = rt.block_on(async {
         let listener = claim_pipe(&cfg.env.pipe_name())?;
         init_logs(&cfg.env)?;
         let report = start_claimed(cfg, listener).await?.wait().await;
         Ok(report.exit_code())
-    })
+    });
+    rt.shutdown_timeout(SHUTDOWN_GRACE);
+    result
 }
 
 /// The shared log setup (ARCH-117, ARCH-119; P4a-R20): JSON lines to
