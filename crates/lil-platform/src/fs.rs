@@ -483,6 +483,17 @@ pub fn identity(path: &Path) -> io::Result<FileIdentity> {
     })
 }
 
+/// How many hard links (names) the open `file` has: `FILE_STANDARD_INFO.NumberOfLinks`. A
+/// file with more than one can be reached from outside the folder it was opened in.
+///
+/// # Errors
+/// When Windows can't say.
+pub fn link_count(file: &File) -> io::Result<u32> {
+    // SAFETY: the class is read into its documented structure.
+    let standard: FILE_STANDARD_INFO = unsafe { info(file, FileStandardInfo) }?;
+    Ok(standard.NumberOfLinks)
+}
+
 /// Where an open file really is, once every link on the way has been followed
 /// (`GetFinalPathNameByHandleW`): `\\?\C:\…`, or `\\?\UNC\server\share\…` on a share.
 ///
@@ -1307,6 +1318,16 @@ mod tests {
         assert!(is_name_surrogate(0xA000_0003), "IO_REPARSE_TAG_MOUNT_POINT");
         assert!(!is_name_surrogate(0x9000_101A), "IO_REPARSE_TAG_CLOUD_1");
         assert!(!is_name_surrogate(0x8000_0013), "IO_REPARSE_TAG_DEDUP");
+    }
+
+    #[test] // spec: ARCH-112
+    fn link_count_counts_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.bin");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(link_count(&File::open(&path).unwrap()).unwrap(), 1);
+        std::fs::hard_link(&path, dir.path().join("two.bin")).unwrap();
+        assert_eq!(link_count(&File::open(&path).unwrap()).unwrap(), 2);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use lil_core::store::{WsPath, fsops};
 use lil_core::tools::{ThumbState, Thumbnails, thumbs_request_px};
 use lil_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_core::{CoreConfig, start_in_thread};
-use lil_platform::fs::SystemProbe;
+use lil_platform::fs::{FileIdentity, Probe, SystemProbe, VolumeInfo};
 use lil_platform::{Clock, IdSource};
 use lil_protocol::app::{ThumbItem, ThumbsRequestParams};
 use lil_schema::MediaKind;
@@ -254,6 +254,11 @@ impl Rig {
     /// A rig whose workspace becomes the default only when `default` (else later, with
     /// [`Rig::make_default`]).
     fn with(options: ThumbOptions, default: bool) -> Rig {
+        Rig::with_probe(options, default, Arc::new(SystemProbe))
+    }
+
+    /// [`Rig::with`], the store (and the service) seeing the disk through `probe`.
+    fn with_probe(options: ThumbOptions, default: bool, probe: Arc<dyn Probe>) -> Rig {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("thumbs");
         if default {
@@ -277,7 +282,7 @@ impl Rig {
             dyn_clock,
             ids,
             lil_core::store::FailPoints::none(),
-            Arc::new(SystemProbe),
+            probe,
             lil_core::watch::WatchConfig::default(),
         );
         let thumbs = ThumbService::new(hub.clone(), events.clone(), options);
@@ -832,17 +837,15 @@ async fn non_images_get_the_icon_state() {
             "{name}: the index's hash"
         );
     }
-    // An unindexed one is hashed on demand.
+    // One without a known hash isn't read: nothing is drawn from it (`sha256: null`, "not
+    // read or not hashed").
     r.put("inbox/in_0123456789abcdef/late.txt", b"later");
     let state = r
         .thumbs
         .ensure(&ws_path("inbox/in_0123456789abcdef/late.txt"), None, 96)
         .await;
     assert_icon(&state);
-    assert_eq!(
-        state.sha256.as_deref(),
-        Some(sha256_bytes(b"later").as_str())
-    );
+    assert_eq!(state.sha256, None);
     assert!(!r.local().join("thumbs").exists(), "nothing was cached");
     drop(_open);
     r.shutdown().await;
@@ -1274,7 +1277,7 @@ async fn the_size_guard_comes_before_any_buffer() {
     let (over, largest) =
         largest_allocation_anywhere(r.thumbs.ensure(&ws_path(&work("over.png")), None, 96)).await;
     assert_icon(&over);
-    assert!(over.sha256.is_some(), "it is hashed: {over:?}");
+    assert_eq!(over.sha256, None, "never hashed: {over:?}");
     assert!(
         largest < MIB as usize,
         "{largest} bytes for a file over the limit"
@@ -1446,6 +1449,124 @@ async fn clean_up_runs_after_the_default_appears_and_daily_on_the_core_clock() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     stop.cancel();
+    r.shutdown().await;
+}
+
+/// The real probe, but opening a file named `hung.png` to read it blocks until
+/// [`HangingProbe::release`]: a read that stalls (a dying disk, a network volume).
+#[derive(Debug, Default)]
+struct HangingProbe {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl HangingProbe {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl Probe for HangingProbe {
+    fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
+        SystemProbe.identity(path)
+    }
+    fn volume_info(&self, path: &Path) -> std::io::Result<VolumeInfo> {
+        SystemProbe.volume_info(path)
+    }
+    fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        if path.file_name().is_some_and(|n| n == "hung.png") {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+        SystemProbe.open_read(path)
+    }
+}
+
+/// Fix round 2, N1 part 1: without a known hash, only what can become a thumbnail is hashed. An
+/// icon-only kind (a big video) and an image over 256 MiB answer `icon` at once with
+/// `sha256: null`, never `pending` on a hash. (`.git` is a folder the index never enters; the
+/// large files are made with `set_len` and removed at the end.)
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+#[allow(clippy::disallowed_methods)] // makes and removes the large files
+async fn unindexed_icon_kinds_and_oversized_images_answer_icon_without_hashing() {
+    const MIB: u64 = 1024 * 1024;
+    let r = Rig::new(fast());
+    let big = [
+        (work(".git/clip.mp4"), 300 * MIB),
+        (work(".git/huge.png"), 300 * MIB),
+    ];
+    for (rel, len) in &big {
+        let file = rel.split('/').fold(r.ws.clone(), |p, c| p.join(c));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let f = std::fs::File::create(&file).unwrap();
+        use std::io::Write as _;
+        (&f).write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+        f.set_len(*len).unwrap();
+    }
+    r.put(&work(".git/notes.txt"), b"notes");
+    let _open = r.open().await;
+    let paths = [big[0].0.clone(), big[1].0.clone(), work(".git/notes.txt")];
+    let items: Vec<ThumbItem> = paths.iter().map(|p| item(p)).collect();
+    let states = r.thumbs.request(&items, 96).await;
+    for state in &states {
+        assert_icon(state);
+        assert_eq!(state.sha256, None, "not hashed: {state:?}");
+    }
+    assert_eq!(states[0].media_kind, "video");
+    assert_eq!(states[1].media_kind, "image");
+    for (rel, _) in &big {
+        std::fs::remove_file(rel.split('/').fold(r.ws.clone(), |p, c| p.join(c))).unwrap();
+    }
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Fix round 2, N1 part 3: hashing has the decode deadline too. A hash whose read stalls
+/// answers `icon` with `sha256: null` after the deadline, and the request is free; the next
+/// request is answered meanwhile.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn a_hung_hash_answers_icon_after_its_deadline_and_frees_the_request() {
+    let probe = Arc::new(HangingProbe::default());
+    // Released however the test ends, so no thread stays hung.
+    struct Release(Arc<HangingProbe>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let _release = Release(probe.clone());
+    let r = Rig::with_probe(
+        ThumbOptions {
+            deadline: Duration::from_millis(300),
+            ..fast()
+        },
+        true,
+        probe.clone(),
+    );
+    let ok = picture(20, 20);
+    r.put(&work(".git/hung.png"), &picture(20, 20));
+    r.put(&work(".git/ok.png"), &ok);
+    let _open = r.open().await;
+    let states = tokio::time::timeout(
+        Duration::from_secs(10),
+        r.thumbs.request(&[item(&work(".git/hung.png"))], 96),
+    )
+    .await
+    .expect("the hash's deadline frees the request");
+    assert_icon(&states[0]);
+    assert_eq!(states[0].sha256, None, "couldn't be hashed");
+    let state = tokio::time::timeout(
+        Duration::from_secs(10),
+        r.thumbs.ensure(&ws_path(&work(".git/ok.png")), None, 96),
+    )
+    .await
+    .expect("another item is answered meanwhile");
+    assert_ready_at(&r.local(), &state, &sha256_bytes(&ok), 96);
+    probe.release();
+    drop(_open);
     r.shutdown().await;
 }
 
@@ -1761,6 +1882,11 @@ fn writes_go_only_under_the_thumbs_folder() {
         ),
         "a dot-dot path",
     );
+    // A hard link planted in thumbs\ to a file outside: never touched (fix round 2, N2).
+    let victim = outside.join("victim.bin");
+    write_file(&victim, b"outside");
+    let victim_time = std::fs::metadata(&victim).unwrap().modified().unwrap();
+    std::fs::hard_link(&victim, local.join(r"thumbs\ab\h.png")).unwrap();
     // A touch (a cache hit): only below thumbs\, only a plain file.
     let when = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     fsops::touch_workspace_local_file(&local, &local.join(r"thumbs\ab\x.png"), when).unwrap();
@@ -1780,9 +1906,16 @@ fn writes_go_only_under_the_thumbs_folder() {
         (local.join(r"thumbs\ab"), "a folder"),
         (local.join(r"thumbs\ln"), "a junction"),
         (outside.join(r"thumbs\x.png"), "another folder"),
+        (local.join(r"thumbs\ab\h.png"), "a hard link"),
     ] {
         denied(fsops::touch_workspace_local_file(&local, &bad, when), what);
     }
+    assert_eq!(
+        std::fs::metadata(&victim).unwrap().modified().unwrap(),
+        victim_time,
+        "the outside file's time is untouched"
+    );
+    std::fs::remove_file(local.join(r"thumbs\ab\h.png")).unwrap();
     fsops::remove_workspace_local_file(&local, &local.join(r"thumbs\ab\x.png")).unwrap();
     assert!(!local.join(r"thumbs\ab\x.png").exists());
     std::fs::remove_dir(local.join(r"thumbs\ln")).unwrap();

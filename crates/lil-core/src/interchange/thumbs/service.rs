@@ -16,12 +16,15 @@
 //! every waiter's answer is built from its own item (its path and media kind) and only the
 //! job's result (hash, state, file) is shared:
 //!
-//! 1. **Hash** (a path without a known hash): on a blocking thread under one of
-//!    [`ThumbService::hashers`] (not a decode permit), the file is opened (never a cloud
+//! 1. **Hash** (a path without a known hash). Only what can become a thumbnail is hashed: an
+//!    `icon@1` kind, or an image over 256 MiB by its metadata, answers `icon` at once with
+//!    `sha256: null` ("not read or not hashed"; nothing is drawn from it). An image is hashed
+//!    on a blocking thread under a hasher slot (2 × the permits, held until the thread ends,
+//!    not a decode permit) and the [`DECODE_DEADLINE`]: the file is opened (never a cloud
 //!    placeholder, only when it really is inside the workspace) and streamed through SHA-256
 //!    in fixed 64 KiB chunks. The hash is known to the waiters from then on, so a `pending`
-//!    answer carries it and the app can match the `thumbs` event (I2). Over 256 MiB, or an
-//!    `icon@1` kind: the `icon` with that hash. A hit under that hash: `ready`.
+//!    answer carries it and the app can match the `thumbs` event. A hash past its deadline
+//!    answers `icon` with `sha256: null`. A hit under the hash read: `ready`.
 //! 2. **Decode**: under a capacity slot (2 × the permits, held until the blocking thread really
 //!    ends) and a decode permit of [`default_permits`] (held until the [`DECODE_DEADLINE`]),
 //!    the file is opened again, its size taken from its metadata (over 256 MiB: hashed only,
@@ -71,6 +74,24 @@ use tokio_util::sync::CancellationToken;
 
 use super::cache::{Entry, KEEP_UNTOUCHED, entry_path, is_sha256, list_entries};
 use super::renderers::{ICON, MAX_FILE_BYTES, Renderer, default_renderers};
+
+/// The longest wait between two clean-up tries while the default workspace can't be opened.
+pub const CLEAN_UP_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// The wait after a clean-up try that couldn't open the default workspace, given the last one:
+/// doubled, up to [`CLEAN_UP_BACKOFF_MAX`].
+pub fn clean_up_backoff(last: Duration) -> Duration {
+    (last * 2).min(CLEAN_UP_BACKOFF_MAX)
+}
+
+/// What one clean-up try did.
+enum Pass {
+    Ran(u64),
+    /// No default workspace, or its index rebuilds, failed or can't be read.
+    Skipped,
+    /// The default workspace exists but can't be opened.
+    Unopened,
+}
 use crate::events::EventBus;
 use crate::index::{FileState, Scope};
 use crate::store::{WsPath, fsops, path_key};
@@ -468,9 +489,16 @@ impl ThumbService {
                 }
             },
         };
-        let icon_only = renderer.id() == ICON;
-        if icon_only && let Some(sha) = &expected {
-            return Plan::Done(self.icon(path, Some(sha.clone()), px));
+        if renderer.id() == ICON {
+            // Nothing is drawn from it: never read for a hash.
+            return Plan::Done(self.icon(path, expected, px));
+        }
+        if expected.is_none()
+            && std::fs::metadata(ws_path.abs(&ctx.open.ws.path))
+                .is_ok_and(|m| m.len() > MAX_FILE_BYTES)
+        {
+            // Over the size guard: it can't become a thumbnail, so it isn't hashed either.
+            return Plan::Done(self.icon(path, None, px));
         }
         if let Some(sha) = &expected
             && let Some(entry) = self.hit(&ctx.local, sha, renderer.as_ref(), px).await
@@ -543,21 +571,28 @@ impl ThumbService {
     async fn run(&self, job: Job, inflight: &Inflight) -> Outcome {
         let mut known = job.expected.clone();
         if known.is_none() {
-            let hashed = {
-                let Ok(_hasher) = self.hashers.acquire().await else {
-                    return self.icon_outcome(&job, None);
-                };
-                let (abs, root, probe) = (job.abs.clone(), job.root.clone(), job.probe.clone());
-                tokio::task::spawn_blocking(move || hash_file(&abs, &root, probe.as_ref()))
-                    .await
-                    .ok()
-                    .flatten()
+            let Ok(hasher) = self.hashers.clone().acquire_owned().await else {
+                return self.icon_outcome(&job, None);
+            };
+            let (abs, root, probe) = (job.abs.clone(), job.root.clone(), job.probe.clone());
+            let blocking = tokio::task::spawn_blocking(move || {
+                // The hasher slot goes back only when this thread ends, past its deadline too.
+                let _hasher = hasher;
+                hash_file(&abs, &root, probe.as_ref())
+            });
+            let hashed = match tokio::time::timeout(self.deadline, blocking).await {
+                Ok(hashed) => hashed.ok().flatten(),
+                Err(_) => {
+                    tracing::warn!(path = %job.path, deadline = ?self.deadline, "a thumbnail's hash passed its deadline; the item gets the icon");
+                    None
+                }
             };
             let Some((sha, len)) = hashed else {
                 return self.icon_outcome(&job, None);
             };
             inflight.set_hash(&sha);
-            if job.renderer.id() == ICON || len > MAX_FILE_BYTES {
+            if len > MAX_FILE_BYTES {
+                // It grew past the guard since the plan read its size.
                 return self.icon_outcome(&job, Some(sha));
             }
             if let Some(entry) = self
@@ -784,18 +819,30 @@ impl ThumbService {
     /// [`LiveSource`]'s as live. `None` when it was skipped: no default workspace, an index
     /// that rebuilds or failed, or hashes that can't be read.
     pub async fn clean_up_pass(&self) -> Option<u64> {
-        let ctx = self.ctx().await?;
+        match self.pass().await {
+            Pass::Ran(removed) => Some(removed),
+            Pass::Skipped | Pass::Unopened => None,
+        }
+    }
+
+    async fn pass(&self) -> Pass {
+        if self.hub.default_ref().is_none() {
+            return Pass::Skipped;
+        }
+        let Some(ctx) = self.ctx().await else {
+            return Pass::Unopened;
+        };
         let index = ctx.open.index.clone();
         index.ready().await;
         if index.failed() || index.rebuilding() {
             tracing::info!("the thumbnail clean-up skips this pass: the index rebuilds or failed");
-            return None;
+            return Pass::Skipped;
         }
         let mut live = match index.file_hashes().await {
             Ok(live) => live,
             Err(e) => {
                 tracing::warn!(error = %e, "the thumbnail clean-up skips this pass: the index's hashes can't be read");
-                return None;
+                return Pass::Skipped;
             }
         };
         let sources = lock(&self.live_sources).clone();
@@ -806,19 +853,22 @@ impl ThumbService {
         drop(ctx);
         let entries = entries_of(&local).await;
         let doomed = self.doomed(entries, &|sha| live.contains(sha));
-        Some(remove_entries(&local, doomed).await)
+        Pass::Ran(remove_entries(&local, doomed).await)
     }
 
     /// Runs [`ThumbService::clean_up_pass`] in the background until `stop`: every
     /// [`CLEAN_UP_TICK`] it looks at the core's clock, and a pass is due until the first one has
     /// run (so it runs once a default workspace exists and its index has finished its first
     /// reconcile, even one that appears after the start), then [`CLEAN_UP_PERIOD`] after the
-    /// last on the core's clock (or at once if the clock went back before it).
+    /// last on the core's clock (or at once if the clock went back before it). While the
+    /// default workspace exists but can't be opened, the tries back off ([`clean_up_backoff`],
+    /// up to a minute); any other outcome goes back to the tick.
     pub fn spawn_clean_up(self: &Arc<Self>, stop: CancellationToken) {
         let me = Arc::downgrade(self);
         let clock = self.hub.clock().clone();
         tokio::spawn(async move {
             let mut last: Option<SystemTime> = None;
+            let mut wait = CLEAN_UP_TICK;
             loop {
                 let now = clock.utc_now();
                 let due = last.is_none_or(|t| {
@@ -831,16 +881,19 @@ impl ThumbService {
                     };
                     tokio::select! {
                         () = stop.cancelled() => break,
-                        done = service.clean_up_pass() => {
-                            if done.is_some() {
+                        done = service.pass() => match done {
+                            Pass::Ran(_) => {
                                 last = Some(now);
+                                wait = CLEAN_UP_TICK;
                             }
+                            Pass::Skipped => wait = CLEAN_UP_TICK,
+                            Pass::Unopened => wait = clean_up_backoff(wait),
                         }
                     }
                 }
                 tokio::select! {
                     () = stop.cancelled() => break,
-                    () = tokio::time::sleep(CLEAN_UP_TICK) => {}
+                    () = tokio::time::sleep(wait) => {}
                 }
             }
         });
@@ -1009,9 +1062,6 @@ fn work(
         return hash_rest(&mut file, hasher).map_or(Work::Unreadable, Work::Icon);
     }
     let sha = hex(&hasher.finalize());
-    if renderer.id() == ICON {
-        return Work::Icon(sha);
-    }
     let entry = entry_path(local, &sha, renderer.id(), renderer.version(), px);
     if plain_file(&entry).is_some() {
         return Work::Cached(sha, entry);
@@ -1053,5 +1103,23 @@ impl Thumbnails for ThumbService {
                 .pop()
                 .unwrap_or_else(|| self.icon(path.as_str(), None, px))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix round 2: while the default workspace can't be opened, clean-up's tries back off,
+    /// doubling from the tick up to a minute.
+    #[test] // spec: APP-038
+    fn clean_up_backoff_doubles_up_to_a_minute() {
+        let mut wait = CLEAN_UP_TICK;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            wait = clean_up_backoff(wait);
+            seen.push(wait.as_secs());
+        }
+        assert_eq!(seen, [2, 4, 8, 16, 32, 60, 60, 60]);
     }
 }
