@@ -82,6 +82,10 @@ struct CollectionView {
 #[derive(Debug, Serialize, JsonSchema)]
 struct ListResult {
     collections: Vec<CollectionView>,
+    /// Why some refs are shown as `missing` (a redirects file that doesn't read); absent when
+    /// none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -106,6 +110,10 @@ struct SaveArgs {
 #[derive(Debug, Serialize, JsonSchema)]
 struct SaveResult {
     collection: CollectionView,
+    /// As `collections.list`'s, and why the saved entry's ref states couldn't be read (the save
+    /// itself was made); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -119,6 +127,10 @@ struct DeleteArgs {
 struct DeleteResult {
     /// The trash entry it went to.
     entry_id: String,
+    /// An error the store reported after the entry was already out of the file (the delete
+    /// was made); absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 fn invalid(why: String) -> ErrorBody {
@@ -130,12 +142,24 @@ fn traced(ctx: &CallCtx, mut e: ErrorBody) -> ErrorBody {
     e
 }
 
-/// `c` as listed, its refs' states read through `resolver`.
-async fn view(resolver: &Resolver<'_>, c: Collection) -> Result<CollectionView, ErrorBody> {
+/// `c` as listed, its refs' states read through `resolver`; their warnings go to `warnings`.
+async fn view(
+    resolver: &Resolver<'_>,
+    c: Collection,
+    warnings: &mut Vec<String>,
+) -> Result<CollectionView, ErrorBody> {
     let kind = c.kind();
     let (rule, refs) = match c.body {
         Body::Rule(rule) => (Some(rule), None),
-        Body::Refs(refs) => (None, Some(collections::ref_states(resolver, &refs).await?)),
+        Body::Refs(refs) => {
+            let (states, more) = collections::ref_states(resolver, &refs).await?;
+            for w in more {
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            (None, Some(states))
+        }
     };
     Ok(CollectionView {
         id: c.id,
@@ -147,6 +171,34 @@ async fn view(resolver: &Resolver<'_>, c: Collection) -> Result<CollectionView, 
     })
 }
 
+/// `c` as listed when its refs' states can't be read: each `missing` (audit M-2).
+fn view_unresolved(c: Collection) -> CollectionView {
+    let kind = c.kind();
+    let (rule, refs) = match c.body {
+        Body::Rule(rule) => (Some(rule), None),
+        Body::Refs(refs) => (
+            None,
+            Some(
+                refs.into_iter()
+                    .map(|r| RefState {
+                        r#ref: r,
+                        state: "missing",
+                        to: None,
+                    })
+                    .collect(),
+            ),
+        ),
+    };
+    CollectionView {
+        id: c.id,
+        name: c.name,
+        kind,
+        builtin: c.builtin,
+        rule,
+        refs,
+    }
+}
+
 async fn list(ctx: &CallCtx, _args: ListArgs) -> Result<(ListResult, String), ErrorBody> {
     let open = ctx.workspace()?;
     let file = collections::read_collections(&open.store)
@@ -156,8 +208,13 @@ async fn list(ctx: &CallCtx, _args: ListArgs) -> Result<(ListResult, String), Er
         .await
         .map_err(|e| traced(ctx, e))?;
     let mut out = Vec::new();
+    let mut warnings = Vec::new();
     for c in collections::listed(file) {
-        out.push(view(&resolver, c).await.map_err(|e| traced(ctx, e))?);
+        out.push(
+            view(&resolver, c, &mut warnings)
+                .await
+                .map_err(|e| traced(ctx, e))?,
+        );
     }
     let summary = format!(
         "{} saved search{} and collection{}",
@@ -165,7 +222,13 @@ async fn list(ctx: &CallCtx, _args: ListArgs) -> Result<(ListResult, String), Er
         if out.len() == 1 { "" } else { "es" },
         if out.len() == 1 { "" } else { "s" }
     );
-    Ok((ListResult { collections: out }, summary))
+    Ok((
+        ListResult {
+            collections: out,
+            warnings,
+        },
+        summary,
+    ))
 }
 
 /// `refs` checked as `<project>/<asset_id>` names, each once, in order.
@@ -320,12 +383,35 @@ async fn save(ctx: &CallCtx, args: SaveArgs) -> Result<(SaveResult, String), Err
         }
         ctx.events.publish("workspace", event);
     }
-    let resolver = Resolver::load(&open.index, &open.store)
-        .await
-        .map_err(|e| traced(ctx, e))?;
+    // The save is made: its view never turns it into an error (audit M-2).
     let summary = format!("saved {} ({})", saved.name, saved.id);
-    let collection = view(&resolver, saved).await.map_err(|e| traced(ctx, e))?;
-    Ok((SaveResult { collection }, summary))
+    let mut warnings = Vec::new();
+    let collection = match Resolver::load(&open.index, &open.store).await {
+        Ok(resolver) => match view(&resolver, saved.clone(), &mut warnings).await {
+            Ok(view) => view,
+            Err(e) => {
+                warnings.push(format!(
+                    "Saved; its refs' states couldn't be read, so they are shown as missing: {}",
+                    e.message
+                ));
+                view_unresolved(saved)
+            }
+        },
+        Err(e) => {
+            warnings.push(format!(
+                "Saved; its refs' states couldn't be read, so they are shown as missing: {}",
+                e.message
+            ));
+            view_unresolved(saved)
+        }
+    };
+    Ok((
+        SaveResult {
+            collection,
+            warnings,
+        },
+        summary,
+    ))
 }
 
 async fn delete(ctx: &CallCtx, args: DeleteArgs) -> Result<(DeleteResult, String), ErrorBody> {
@@ -336,7 +422,7 @@ async fn delete(ctx: &CallCtx, args: DeleteArgs) -> Result<(DeleteResult, String
             invalid(format!("id is {:?}, not a lowercase UUID", args.id)),
         ));
     }
-    let (record, deleted) = collections::delete(&open.store, &args.id)
+    let (record, deleted, warnings) = collections::delete(&open.store, &args.id)
         .await
         .map_err(|e| traced(ctx, e))?;
     ctx.events.publish(
@@ -350,6 +436,7 @@ async fn delete(ctx: &CallCtx, args: DeleteArgs) -> Result<(DeleteResult, String
     Ok((
         DeleteResult {
             entry_id: record.entry_id,
+            warnings,
         },
         summary,
     ))
@@ -381,9 +468,11 @@ pub async fn collection_filter(
             }),
         Body::Refs(refs) => {
             let resolver = Resolver::load(&open.index, &open.store).await?;
-            Ok(CollectionFilter::Refs(
-                collections::live_refs(&resolver, &refs).await?,
-            ))
+            let (live, warnings) = collections::live_refs(&resolver, &refs).await?;
+            for w in warnings {
+                tracing::warn!(collection = %c.id, warning = %w, "assets.query by a collection");
+            }
+            Ok(CollectionFilter::Refs(live))
         }
     }
 }

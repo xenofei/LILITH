@@ -72,7 +72,12 @@ pub enum YamlValue {
     /// otherwise.
     Str(String),
     Int(i64),
+    /// A float, written as this text (`1.5`); an edit whose text doesn't read back as that
+    /// float is refused.
+    Float(String),
     Bool(bool),
+    /// A null, written `~`.
+    Null,
     /// A nested mapping of these entries, in this order (a block mapping below its key, or a
     /// flow mapping inside a flow item).
     Map(Vec<(String, YamlValue)>),
@@ -305,7 +310,9 @@ fn value_yaml(value: &YamlValue) -> Yaml {
     match value {
         YamlValue::Str(s) => Yaml::String(s.clone()),
         YamlValue::Int(n) => Yaml::Integer(*n),
+        YamlValue::Float(f) => Yaml::Real(f.clone()),
         YamlValue::Bool(b) => Yaml::Boolean(*b),
+        YamlValue::Null => Yaml::Null,
         YamlValue::Map(inner) => mapping_yaml(inner),
         YamlValue::List(items) => Yaml::Array(items.iter().map(value_yaml).collect()),
     }
@@ -362,7 +369,9 @@ fn flow_value(value: &YamlValue) -> String {
     match value {
         YamlValue::Str(s) => scalar(s),
         YamlValue::Int(n) => n.to_string(),
+        YamlValue::Float(f) => f.clone(),
         YamlValue::Bool(b) => b.to_string(),
+        YamlValue::Null => "~".to_string(),
         YamlValue::Map(inner) => flow_mapping(inner),
         YamlValue::List(items) => {
             let items: Vec<String> = items.iter().map(flow_value).collect();
@@ -906,13 +915,16 @@ fn list_item(
     if !is_seq_item(text, lines[first]) {
         return Err(fail("the value is a mapping, not a list"));
     }
-    let (seq_indent, last_line) = block_list_end(text, &lines, first);
-    let list_end = lines
-        .iter()
-        .position(|l| l.start == last_line.start)
-        .expect("the list's last line")
-        + 1;
-    // Each item: its first line, and its last content line before the next item.
+    let seq_indent = indent(text, lines[first]);
+    // The list ends at the first content line that is no longer inside it.
+    let list_end = (first + 1..lines.len())
+        .find(|&i| {
+            let l = lines[i];
+            is_content(text, l)
+                && (indent(text, l) < seq_indent
+                    || (indent(text, l) == seq_indent && !is_seq_item(text, l)))
+        })
+        .unwrap_or(lines.len());
     let starts: Vec<usize> = (first..list_end)
         .filter(|&i| {
             is_content(text, lines[i])
@@ -923,10 +935,17 @@ fn list_item(
     let Some(&start) = starts.get(index) else {
         return Err(fail(&format!("the list has no item {index} (0-based)")));
     };
+    // Each item runs to the next item's start (or the list's end), less the trailing blank
+    // lines and comments at or below the list's indent: those belong around the items. A line
+    // indented deeper (a block scalar's line that looks like a comment) goes with its item.
     let next = starts.get(index + 1).copied().unwrap_or(list_end);
     let stop = (start..next)
         .rev()
-        .find(|&i| is_content(text, lines[i]))
+        .find(|&i| {
+            let l = lines[i];
+            is_content(text, l)
+                || (!body(text, l).trim().is_empty() && indent(text, l) > seq_indent)
+        })
         .expect("the item's own line");
     let (cut_from, cut_to) = (lines[start].start, lines[stop].next);
     let mut out = String::with_capacity(text.len() + 64);
@@ -1870,5 +1889,60 @@ collections:   # entries
                 "{text:?} {edit:?}"
             );
         }
+    }
+
+    /// Task 9 audit L-3: an item's cut runs to the next item (or the list's end), less the
+    /// trailing blank lines and comments at or below the list's indent, so a block scalar's line
+    /// that looks like a comment goes with its item, for a removal and a rewrite alike.
+    #[test] // spec: ARCH-076, CORE-155
+    fn a_block_scalars_comment_like_line_goes_with_its_item() {
+        let text = "collections:\n  - id: a\n    note: |\n      one\n      # two\n  - id: b\n";
+        assert_eq!(
+            apply(text, &[remove(0)]).unwrap(),
+            "collections:\n  - id: b\n"
+        );
+        assert_eq!(
+            apply(text, &[item(0, &[("id", YamlValue::Str("a2".into()))])]).unwrap(),
+            "collections:\n  - id: a2\n  - id: b\n"
+        );
+        // The last item too; a comment at the list's indent after it stays.
+        let last = "collections:\n  - id: b\n  - id: a\n    note: |\n      one\n      # two\n  # after\n# end\n";
+        assert_eq!(
+            apply(last, &[remove(1)]).unwrap(),
+            "collections:\n  - id: b\n  # after\n# end\n"
+        );
+    }
+
+    /// Task 9 audit L-2: a null is written `~` and a float as its text, both reading back as
+    /// they were; a float text that doesn't read back as that float is refused.
+    #[test] // spec: ARCH-076, CORE-155
+    fn nulls_and_floats_are_written_and_read_back() {
+        let out = apply(
+            "collections:\n  - id: a\n",
+            &[item(
+                0,
+                &[
+                    ("id", YamlValue::Str("a".into())),
+                    ("note", YamlValue::Null),
+                    ("weight", YamlValue::Float("1.5".into())),
+                    (
+                        "list",
+                        YamlValue::List(vec![YamlValue::Null, YamlValue::Float("2.0".into())]),
+                    ),
+                ],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "collections:\n  - id: a\n    note: ~\n    weight: 1.5\n    list:\n      - ~\n      - 2.0\n"
+        );
+        assert!(matches!(
+            apply(
+                "collections:\n  - id: a\n",
+                &[item(0, &[("weight", YamlValue::Float("x".into()))])]
+            ),
+            Err(YamlEditError::Unsupported(_))
+        ));
     }
 }

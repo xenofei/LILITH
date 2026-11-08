@@ -25,10 +25,15 @@
 //! the entry as a one-entry file `payload/collection-<id>.yaml`, `original_path`
 //! `registry/collections.yaml`, `reason` `collection.delete`, then the fail point
 //! `collections.after_payload`, then the edit. A retry after a failure between them finds the
-//! earlier payload of that entry (same reason, original path and SHA-256 of the same bytes) and
-//! reuses it, so one trash entry is left. When the entry changed in the file since it was read
-//! (an outside edit), the delete is refused (`store.hash_conflict`), the file is left as it is,
-//! and the payload this call made leaves the trash again.
+//! earlier payload of that entry and reuses it, so one trash entry is left: same reason,
+//! original path and SHA-256, moved within the last day by the store's clock (so its purge is
+//! still about 30 days off), and its payload read back as exactly these bytes (a record whose
+//! payload a crash left missing is never reused). When the entry changed in the file since it
+//! was read (an outside edit), the delete is refused (`store.hash_conflict`), the file is left
+//! as it is, and the payload this call made leaves the trash again. On any other error of the
+//! edit the file is read again first: a payload is dropped only while the entry is still there
+//! unchanged; when the entry is gone (the store failed after its replace), the delete has
+//! committed, and it answers with the trash record and a warning.
 //!
 //! **Restore** ([`restore`]) merges the payload's entry back by `id`, appended after the
 //! entries there: refused with `trash.restore_conflict` when its `id` or its name (compared
@@ -37,6 +42,7 @@
 //! already back exactly as it was (a restore cut short after its edit) just leaves the trash.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lil_protocol::ErrorBody;
 use lil_protocol::codes::{
@@ -51,6 +57,7 @@ use serde_json::{Map, Value};
 
 use crate::projects::Resolver;
 use crate::projects::redirects::parse_name;
+use crate::store::trash::parse_rfc3339;
 use crate::store::{Store, StoreError, TrashRecord, WsPath};
 
 /// The collections file, workspace-relative.
@@ -311,7 +318,9 @@ fn yaml_value(key: &str, v: &Value) -> Result<YamlValue, StoreError> {
                 .map(|(k, v)| Ok((k.clone(), yaml_value(key, v)?)))
                 .collect::<Result<_, StoreError>>()?,
         ),
-        Value::Null | Value::Number(_) => {
+        Value::Null => YamlValue::Null,
+        Value::Number(n) if n.is_f64() => YamlValue::Float(n.to_string()),
+        Value::Number(_) => {
             return Err(StoreError::YamlUnsupported(format!(
                 "`{key}` holds {v}, which the entry's rewrite can't keep; edit \
                  {COLLECTIONS_YAML} by hand"
@@ -475,13 +484,55 @@ pub async fn save(
         .expect("the edit ran"))
 }
 
+/// How long an earlier delete's trash entry may be reused by a retry (audit L-1): a day by the
+/// store's clock, so a reused entry never purges much sooner than 30 days after the delete.
+const REUSE_WITHIN_SECS: i64 = 86_400;
+
+/// The trash entry an earlier attempt of this delete left (module docs): same reason, original
+/// path and SHA-256, moved within the last day by the store's clock, and its payload exactly
+/// `bytes` (audit M-1: a record whose payload is missing or different is never reused).
+async fn earlier_payload(
+    store: &Store,
+    sha256: &str,
+    bytes: &[u8],
+) -> Result<Option<TrashRecord>, StoreError> {
+    let now = store.now_utc();
+    let mut candidates: Vec<TrashRecord> = store
+        .trash_list()
+        .await?
+        .into_iter()
+        .filter(|r| {
+            r.reason == DELETE_REASON
+                && r.original_path == COLLECTIONS_YAML
+                && r.sha256.as_deref() == Some(sha256)
+                && parse_rfc3339(&r.moved_utc)
+                    .is_some_and(|moved| moved <= now && now - moved <= REUSE_WITHIN_SECS)
+        })
+        .collect();
+    // The newest first.
+    candidates.reverse();
+    for record in candidates {
+        if let Ok((_, held)) = store.trash_payload(&record.entry_id).await
+            && held == bytes
+        {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
 /// Deletes entry `id` (module docs): the trash payload first, then the YAML edit. Returns the
-/// trash record and the deleted entry.
+/// trash record, the deleted entry and the warnings: an error the store reported after the
+/// edit had already taken the entry out of the file (the delete committed; audit H-1).
 ///
 /// # Errors
-/// `params.invalid` for the quick collection; `collection.unknown`; the file's and the store's
-/// errors (`store.io` for the fail point).
-pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection), ErrorBody> {
+/// `params.invalid` for the quick collection; `collection.unknown`; `store.hash_conflict` for
+/// an entry changed in the file since it was read; the file's and the store's errors
+/// (`store.io` for the fail point).
+pub async fn delete(
+    store: &Store,
+    id: &str,
+) -> Result<(TrashRecord, Collection, Vec<String>), ErrorBody> {
     if id == QUICK_COLLECTION_ID {
         return Err(invalid(
             "The quick collection is never deleted; remove its refs with collection.save \
@@ -500,16 +551,9 @@ pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection)
     let bytes = one_entry_file(&entry).map_err(error)?;
     let sha256 = lil_schema::sha256_hex(&bytes);
     // A retry after a failure past the payload reuses it (module docs).
-    let earlier = store
-        .trash_list()
+    let earlier = earlier_payload(store, &sha256, &bytes)
         .await
-        .map_err(error)?
-        .into_iter()
-        .find(|r| {
-            r.reason == DELETE_REASON
-                && r.original_path == COLLECTIONS_YAML
-                && r.sha256.as_deref() == Some(sha256.as_str())
-        });
+        .map_err(error)?;
     let made_now = earlier.is_none();
     let record = match earlier {
         Some(record) => record,
@@ -531,6 +575,7 @@ pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection)
             why: e.to_string(),
         })
         .map_err(error)?;
+    let refused = AtomicBool::new(false);
     let edit = |text: &str| -> Result<String, StoreError> {
         let file = entries_in(text)?;
         match file.iter().position(|c| c.id == id) {
@@ -538,12 +583,15 @@ pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection)
             None => Ok(text.to_string()),
             // Changed meanwhile by an outside edit: the trash holds the entry as it was read,
             // so the newer one is never taken out (review M-3).
-            Some(index) if file[index] != entry => Err(StoreError::HashConflict {
-                path: collections_path(),
-                backup: None,
-                cloud_only: false,
-                kept: Vec::new(),
-            }),
+            Some(index) if file[index] != entry => {
+                refused.store(true, Ordering::SeqCst);
+                Err(StoreError::HashConflict {
+                    path: collections_path(),
+                    backup: None,
+                    cloud_only: false,
+                    kept: Vec::new(),
+                })
+            }
             Some(index) => edited(
                 text,
                 YamlEdit::RemoveListItem {
@@ -553,15 +601,34 @@ pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection)
             ),
         }
     };
-    if let Err(e) = store.edit_text(&collections_path(), &edit).await {
-        // Nothing changed in the file: the payload this call put in the trash goes again (one
-        // reused from an earlier attempt stays, as that attempt left it).
-        if made_now && let Err(dropped) = store.trash_drop_merged(&record.entry_id, &sha256).await {
-            tracing::warn!(entry = %record.entry_id, error = %dropped, "a refused delete's trash entry stays");
+    let Err(e) = store.edit_text(&collections_path(), &edit).await else {
+        return Ok((record, entry, Vec::new()));
+    };
+    // The store may fail after its replace (audit H-1): the file is read again before anything
+    // is dropped, and the payload goes only while the entry is still in the file, unchanged
+    // (or the edit itself refused it).
+    match read_collections(store).await {
+        Ok(now) if now.iter().any(|c| c.id == id) => {
+            if made_now
+                && (refused.load(Ordering::SeqCst) || now.contains(&entry))
+                && let Err(dropped) = store.trash_drop_merged(&record.entry_id, &sha256).await
+            {
+                tracing::warn!(entry = %record.entry_id, error = %dropped, "a refused delete's trash entry stays");
+            }
+            Err(error(e))
         }
-        return Err(error(e));
+        Ok(_) => {
+            tracing::warn!(entry = %record.entry_id, error = %e, "a delete committed though the store reported an error after its edit");
+            let warning = format!(
+                "{} went to the trash (entry {}) and is out of {COLLECTIONS_YAML}, but the \
+                 store reported an error after the edit: {e}",
+                entry.name, record.entry_id
+            );
+            Ok((record, entry, vec![warning]))
+        }
+        // The file can't be read now: nothing is dropped, so nothing can be lost.
+        Err(_) => Err(error(e)),
     }
-    Ok((record, entry))
 }
 
 /// Restores trash entry `entry_id`, a deleted entry, by merging it back by id (module docs).
@@ -668,6 +735,7 @@ pub struct RefState {
 async fn resolve_one(
     resolver: &Resolver<'_>,
     r: &str,
+    warnings: &mut Vec<String>,
 ) -> Result<(&'static str, Option<(String, String)>), ErrorBody> {
     let Some((project, asset_id)) = parse_name(r) else {
         return Ok(("missing", None));
@@ -685,6 +753,19 @@ async fn resolve_one(
         Err(e) if e.code == ASSET_UNKNOWN.code || e.code == REF_REDIRECT_BROKEN.code => {
             Ok(("missing", None))
         }
+        // A redirects file that doesn't read answers for every name with no live folder: such a
+        // ref is `missing` here, with a warning, and the file is reported where it needs repair
+        // (`project.status`), so one damaged file never takes the collections down (audit M-2).
+        Err(e) if resolver.is_file_error(&e) => {
+            let warning = format!(
+                "Refs with no asset folder of their own are shown as missing: {}",
+                e.message
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+            Ok(("missing", None))
+        }
         Err(e) => Err(e),
     }
 }
@@ -695,19 +776,20 @@ async fn preload(resolver: &Resolver<'_>, refs: &[String]) {
     resolver.preload_live(&names).await;
 }
 
-/// The state of each of `refs`, in order (Appendix H).
+/// The state of each of `refs`, in order (Appendix H), and the warnings (a redirects file that
+/// doesn't read: the refs it would answer for are `missing`).
 ///
 /// # Errors
-/// What the resolver can't answer for a ref: the redirects file's `manifest.needs_repair`,
-/// `store.io`.
+/// What the resolver can't answer for a ref (`store.io` when the trash can't be listed).
 pub async fn ref_states(
     resolver: &Resolver<'_>,
     refs: &[String],
-) -> Result<Vec<RefState>, ErrorBody> {
+) -> Result<(Vec<RefState>, Vec<String>), ErrorBody> {
     preload(resolver, refs).await;
+    let mut warnings = Vec::new();
     let mut out = Vec::with_capacity(refs.len());
     for r in refs {
-        let (state, live) = resolve_one(resolver, r).await?;
+        let (state, live) = resolve_one(resolver, r, &mut warnings).await?;
         let to = (state == "redirected")
             .then(|| live.map(|(p, a)| format!("{p}/{a}")))
             .flatten();
@@ -717,28 +799,29 @@ pub async fn ref_states(
             to,
         });
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 
-/// The live assets `refs` lead to, through the redirects, each once, in order; a ref that
-/// leads nowhere (missing or trashed) is left out.
+/// The live assets `refs` lead to, through the redirects, each once, in order, and the warnings
+/// (as [`ref_states`]); a ref that leads nowhere (missing or trashed) is left out.
 ///
 /// # Errors
 /// As [`ref_states`].
 pub async fn live_refs(
     resolver: &Resolver<'_>,
     refs: &[String],
-) -> Result<Vec<(String, String)>, ErrorBody> {
+) -> Result<(Vec<(String, String)>, Vec<String>), ErrorBody> {
     preload(resolver, refs).await;
+    let mut warnings = Vec::new();
     let mut out: Vec<(String, String)> = Vec::new();
     for r in refs {
-        if let (_, Some(live)) = resolve_one(resolver, r).await?
+        if let (_, Some(live)) = resolve_one(resolver, r, &mut warnings).await?
             && !out.contains(&live)
         {
             out.push(live);
         }
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 
 #[cfg(test)]
@@ -811,8 +894,14 @@ mod tests {
             bytes,
             "the same bytes every time"
         );
+        // A hand-written null and float are kept (audit L-2).
         let mut odd = c;
-        odd.extra = vec![("weight".into(), serde_json::json!(1.5))];
-        assert!(one_entry_file(&odd).is_err());
+        odd.extra = vec![
+            ("weight".into(), serde_json::json!(1.5)),
+            ("note".into(), Value::Null),
+        ];
+        let text = String::from_utf8(one_entry_file(&odd).unwrap()).unwrap();
+        assert!(text.contains("weight: 1.5\n    note: ~\n"), "{text}");
+        assert_eq!(parse_collections(&text).unwrap(), [odd]);
     }
 }
