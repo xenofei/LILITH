@@ -193,7 +193,8 @@ impl Store {
     /// the store never writes, or one under a linked folder; `store.locked` for a target a
     /// manifest `locks` entry covers (nothing has moved then); `store.hash_conflict` when a file
     /// is already at an output's target; any error of steps 1 and 2. An error after step 1
-    /// leaves the outputs in place (orphans until the manifest records them).
+    /// leaves the outputs in place (orphans until the manifest records them), and the index
+    /// still hears of them.
     pub async fn commit(&self, op: CommitOp) -> Result<CommitReport, StoreError> {
         self.writable_store()?;
         let subject = op
@@ -224,58 +225,71 @@ impl Store {
             let long = self.writable_on_disk(&out.to).await?;
             self.check_long_locks(&out.to, &long).await?;
         }
-        let mut outputs = Vec::with_capacity(op.outputs.len());
-        for out in &op.outputs {
-            // The move checks only its target: a linked folder above it is refused here.
-            self.refuse_links(&out.to).await?;
-            let _held = self.lock_path(&out.to).await;
-            let target = out.to.abs(self.root());
-            let (from, to) = (out.from.clone(), target.clone());
-            self.fs_retry(None, move || {
-                if let Some(dir) = to.parent() {
-                    fsops::ensure_dir(dir)?;
-                }
-                fsops::move_new(&from, &to)
-            })
-            .await
-            .map_err(|e| match classify(&e) {
-                RetryClass::TargetExists => StoreError::HashConflict {
+        // An error in steps 1 and 2 still tells the index of the outputs already moved: they
+        // stay, as orphans, and `project.status` lists orphans from the index's rows.
+        let moved = async {
+            let mut outputs = Vec::with_capacity(op.outputs.len());
+            for out in &op.outputs {
+                // The move checks only its target: a linked folder above it is refused here.
+                self.refuse_links(&out.to).await?;
+                let _held = self.lock_path(&out.to).await;
+                let target = out.to.abs(self.root());
+                let (from, to) = (out.from.clone(), target.clone());
+                self.fs_retry(None, move || {
+                    if let Some(dir) = to.parent() {
+                        fsops::ensure_dir(dir)?;
+                    }
+                    fsops::move_new(&from, &to)
+                })
+                .await
+                .map_err(|e| match classify(&e) {
+                    RetryClass::TargetExists => StoreError::HashConflict {
+                        path: out.to.clone(),
+                        backup: None,
+                        cloud_only: false,
+                        kept: Vec::new(),
+                    },
+                    _ => StoreError::io(&out.to, &e),
+                })?;
+                let sha256 = match self.see_hash(&target).await {
+                    Ok(Seen::Found(h)) => h.sha256,
+                    Ok(_) => {
+                        return Err(StoreError::Io {
+                            path: out.to.as_str().to_string(),
+                            why: "the output is no longer there after its move".to_string(),
+                        });
+                    }
+                    Err(e) => return Err(StoreError::io(&out.to, &e)),
+                };
+                let written = Written {
                     path: out.to.clone(),
-                    backup: None,
-                    cloud_only: false,
-                    kept: Vec::new(),
-                },
-                _ => StoreError::io(&out.to, &e),
-            })?;
-            let sha256 = match self.see_hash(&target).await {
-                Ok(Seen::Found(h)) => h.sha256,
-                Ok(_) => {
-                    return Err(StoreError::Io {
-                        path: out.to.as_str().to_string(),
-                        why: "the output is no longer there after its move".to_string(),
-                    });
-                }
-                Err(e) => return Err(StoreError::io(&out.to, &e)),
-            };
-            let written = Written {
-                path: out.to.clone(),
-                sha256,
-                identity: self.identity(&out.to).await?,
-            };
-            events.push(event(&written, ChangeKind::Created));
-            outputs.push(written);
-        }
-        self.point("store.after_output", &subject).await?;
-
-        // 2. Manifest.
-        let mut manifest = None;
-        if let Some((rel, edit)) = &op.manifest {
-            let (edited, written, kind) = self.edit_manifest_quiet(rel, &**edit).await?;
-            if let Some(kind) = kind {
-                events.push(event(&written, kind));
+                    sha256,
+                    identity: self.identity(&out.to).await?,
+                };
+                events.push(event(&written, ChangeKind::Created));
+                outputs.push(written);
             }
-            manifest = Some(edited);
+            self.point("store.after_output", &subject).await?;
+
+            // 2. Manifest.
+            let mut manifest = None;
+            if let Some((rel, edit)) = &op.manifest {
+                let (edited, written, kind) = self.edit_manifest_quiet(rel, &**edit).await?;
+                if let Some(kind) = kind {
+                    events.push(event(&written, kind));
+                }
+                manifest = Some(edited);
+            }
+            Ok::<_, StoreError>((outputs, manifest))
         }
+        .await;
+        let (outputs, manifest) = match moved {
+            Ok(done) => done,
+            Err(e) => {
+                self.emit(events).await;
+                return Err(e);
+            }
+        };
         // From here on the operation is recorded: what fails is a warning (ruling Q31).
         let mut warnings = Vec::new();
         let mut warn = |step: &str, e: &StoreError| {
@@ -391,37 +405,6 @@ impl Store {
         }
         found.extend(self.staging_orphans().await?);
         found.extend(conflicts);
-        Ok(found.into_iter().collect())
-    }
-
-    /// [`Store::orphans`] of one project, sorted: the orphan run folders and sealed versions of
-    /// `projects/<project>/assets/*`, and the `*.lil-conflict-*` files under
-    /// `projects/<project>/`. Only that folder is walked (`project.status`); staging handles
-    /// and conflict files elsewhere are not the project's. A project folder that doesn't exist
-    /// has none.
-    ///
-    /// # Errors
-    /// `store.path_invalid` for a project name that isn't a valid path segment; `store.io`
-    /// when the project's folder can't be listed.
-    pub async fn orphans_in(&self, project: &str) -> Result<Vec<WsPath>, StoreError> {
-        let rel = WsPath::parse(&format!("projects/{project}"))?;
-        if rel.as_str().matches('/').count() != 1 {
-            return Err(StoreError::PathInvalid {
-                path: rel.as_str().to_string(),
-                why: "a project name is one path segment".to_string(),
-            });
-        }
-        let mut found: BTreeSet<WsPath> = BTreeSet::new();
-        let dir = rel.abs(self.root());
-        self.project_asset_orphans(project, &dir, &mut found)
-            .await?;
-        let conflicts = {
-            let (root, start, probe) = (self.root().to_path_buf(), dir, self.probe().clone());
-            blocking(move || conflict_files(&root, &start, probe.as_ref()))
-                .await
-                .map_err(|e| StoreError::io(&rel, &e))?
-        };
-        found.extend(conflicts.iter().map(|path| self.rel_of(path)));
         Ok(found.into_iter().collect())
     }
 

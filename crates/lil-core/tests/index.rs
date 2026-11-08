@@ -197,6 +197,8 @@ struct Behaviour {
     locked: HashSet<String>,
     /// Every identity call reports a later last write.
     unstable: HashSet<String>,
+    /// `identity` fails with error 5 (access denied): the path is there, but can't be looked at.
+    denied: HashSet<String>,
 }
 
 impl Default for Behaviour {
@@ -210,6 +212,7 @@ impl Default for Behaviour {
             placeholders: HashSet::new(),
             locked: HashSet::new(),
             unstable: HashSet::new(),
+            denied: HashSet::new(),
         }
     }
 }
@@ -269,6 +272,11 @@ impl FakeProbe {
         self.reads.lock().unwrap().get(name).copied().unwrap_or(0)
     }
 
+    /// The names `identity` was asked about since the last call, in order.
+    fn take_order(&self) -> Vec<String> {
+        std::mem::take(&mut *self.order.lock().unwrap())
+    }
+
     fn gated() -> Arc<FakeProbe> {
         let probe = FakeProbe::new();
         probe.gated.store(true, Ordering::SeqCst);
@@ -297,6 +305,9 @@ impl Probe for FakeProbe {
         self.order.lock().unwrap().push(name.clone());
         if let Some(hook) = self.hook.get() {
             hook(path);
+        }
+        if self.b.lock().unwrap().denied.contains(&name) {
+            return Err(std::io::Error::from_raw_os_error(5));
         }
         let mut id = SystemProbe.identity(path)?;
         let b = self.b.lock().unwrap();
@@ -982,6 +993,210 @@ async fn removed_recorded_files_are_missing_and_recover() {
         report.missing.is_empty(),
         "missing is reported once: {report:?}"
     );
+}
+
+/// An open run of the asset `<project>/<asset>` whose one file, `c.png`, has a recorded hash.
+fn open_run(project: &str, asset: &str, run_id: &str) -> Value {
+    json!({"run_id": run_id, "status": "open", "path": format!("candidates/{run_id}/"),
+           "files": [{"path": format!("candidates/{run_id}/c.png"), "role": "candidate",
+                      "sha256": sha256_bytes(format!("{project}/{asset}/{run_id}").as_bytes())}]})
+}
+
+/// The paths of a cold rebuild's `missing`, sorted.
+async fn rebuilt_missing(index: &Index) -> Vec<String> {
+    let report = index.rebuild().await.unwrap();
+    let mut missing: Vec<String> = report
+        .missing
+        .iter()
+        .map(|m| m.as_str().to_string())
+        .collect();
+    missing.sort();
+    missing
+}
+
+/// Ruling Q28 finds a run's folder from its files' paths: the `candidates` segment of the asset's
+/// own layout, the last one before the run (`projects/<p>/assets/<a>/candidates/<run>`), not the
+/// first in the path. With a project and an asset both called `candidates`, the first one is
+/// `projects/candidates/`, so the "folder" was `projects/candidates/assets`, which is there: the
+/// files of a run that was never on this machine were called `missing`.
+#[tokio::test] // spec: CORE-038, ARCH-079
+async fn run_folder_uses_the_last_candidates_segment() {
+    let fx = fx();
+    let asset = "projects/candidates/assets/candidates";
+    let away = "r_20270101_0800";
+    let here = "r_20270102_0800";
+    fx.write(
+        &format!("{asset}/candidates.manifest.json"),
+        &manifest_json(
+            "candidates",
+            "candidates",
+            json!({"candidate_runs": [open_run("candidates", "candidates", away),
+                                      open_run("candidates", "candidates", here)]}),
+        ),
+    );
+    // `here`'s folder is on this machine, without its file; `away`'s isn't.
+    fx.write(&format!("{asset}/candidates/{here}/other.png"), b"other");
+    let index = fx.open(Arc::new(SystemProbe));
+
+    assert_eq!(
+        rebuilt_missing(&index).await,
+        [format!("{asset}/candidates/{here}/c.png")],
+        "only the file gone from a run folder that is there is missing"
+    );
+}
+
+/// Ruling Q28's exemption needs the run's folder to be confirmed absent (`NotFound`). Any other
+/// error taking its identity (access denied, …) says the folder may well be there, so it is
+/// unknown, not absent: the run's files the walk didn't find are `missing`, as everywhere else,
+/// instead of being left out of the index.
+#[tokio::test] // spec: CORE-038, ARCH-079
+async fn runs_elsewhere_treats_identity_errors_as_unknown_not_absent() {
+    let fx = fx();
+    let (denied, away) = ("r_20270101_0800", "r_20270102_0800");
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"candidate_runs": [open_run("p", "a", denied), open_run("p", "a", away)]}),
+        ),
+    );
+    // `denied`'s folder is there, without its file, and can't be looked at; `away`'s isn't there.
+    fx.write(&format!("{ASSET}/candidates/{denied}/other.png"), b"other");
+    let probe = FakeProbe::with(|b| {
+        b.denied.insert(denied.to_string());
+    });
+    let index = fx.open(probe);
+
+    assert_eq!(
+        rebuilt_missing(&index).await,
+        [format!("{ASSET}/candidates/{denied}/c.png")],
+        "a folder that can't be looked at isn't a folder that is absent"
+    );
+}
+
+/// `project.status`'s orphans (CORE-038) come from the index's rows, not from a walk of the disk:
+/// the `candidates/<run>` folders holding an indexed file whose run the asset's manifest doesn't
+/// list, and the `v<semver>` folders holding an indexed `manifest.snapshot.json` whose version is
+/// neither the manifest's `approved_version` nor a run's `signed_off.version`. An asset folder
+/// without a manifest records nothing; one whose manifest doesn't parse is skipped. Conflict
+/// copies (`*.lil-conflict-*`) under the project's folder are listed too. Run ids and the
+/// project compare without regard to case. The disk changing unseen changes nothing until the
+/// index hears of it.
+#[tokio::test] // spec: CORE-038, ARCH-075
+async fn orphans_come_from_index_rows() {
+    let fx = fx();
+    let signed = json!({"by": "user", "date": "2027-01-01", "version": "1.1.0"});
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({
+                "approved_version": "1.0.0",
+                "candidate_runs": [
+                    {"run_id": "r_20270101_0800", "status": "selected", "signed_off": signed,
+                     "files": [{"path": "candidates/r_20270101_0800/chosen.png",
+                                "role": "candidate"}]},
+                    open_run("p", "a", "r_20270102_0800"),
+                ],
+            }),
+        ),
+    );
+    let on_disk = [
+        // Recorded: the approved version, the signed-off one, and both runs (one folder spelled
+        // in other capitals).
+        "a/v1.0.0/manifest.snapshot.json",
+        "a/v1.0.0/s.png",
+        "a/v1.1.0/manifest.snapshot.json",
+        "a/candidates/r_20270101_0800/rest.png",
+        "a/candidates/R_20270102_0800/c.png",
+        // Orphans: a run and a version the manifest doesn't list.
+        "a/candidates/r_20270103_0800/left.png",
+        "a/candidates/r_20270103_0800/sub/deeper.png",
+        "a/v2.0.0/manifest.snapshot.json",
+        "a/v2.0.0/s.png",
+        // Not a sealed version: no snapshot.
+        "a/v3.0.0/s.png",
+        // An asset folder without a manifest: everything in it is an orphan.
+        "b/candidates/r_20270101_0800/x.png",
+        "b/v1.0.0/manifest.snapshot.json",
+        // A manifest that doesn't parse: its folders aren't judged.
+        "c/c.manifest.json",
+        "c/candidates/r_20270101_0800/x.png",
+        "c/v1.0.0/manifest.snapshot.json",
+        // A conflict copy (never indexed as a file) is an orphan wherever it is.
+        "a/work/scene.blend.lil-conflict-20270101T080000Z",
+    ];
+    for rel in on_disk {
+        let bytes: &[u8] = if rel.ends_with("c.manifest.json") {
+            b"{not json"
+        } else {
+            rel.as_bytes()
+        };
+        fx.write(&format!("projects/p/assets/{rel}"), bytes);
+    }
+    // Other projects' folders, one whose name starts with this one's.
+    fx.write(
+        "projects/pp/assets/d/candidates/r_20270101_0800/x.png",
+        b"pp",
+    );
+    fx.write("projects/q/assets/d/v1.0.0/manifest.snapshot.json", b"q");
+    fx.write(
+        "projects/p/notes.txt.lil-conflict-20270101T080000Z",
+        b"notes",
+    );
+    fx.write("projects/q/notes.txt.lil-conflict-20270101T080000Z", b"q");
+    let index = fx.open(Arc::new(SystemProbe));
+    index.rebuild().await.unwrap();
+
+    let want = [
+        "projects/p/assets/a/candidates/r_20270103_0800",
+        "projects/p/assets/a/v2.0.0",
+        "projects/p/assets/a/work/scene.blend.lil-conflict-20270101T080000Z",
+        "projects/p/assets/b/candidates/r_20270101_0800",
+        "projects/p/assets/b/v1.0.0",
+        "projects/p/notes.txt.lil-conflict-20270101T080000Z",
+    ];
+    let orphans = |project: &'static str| {
+        let index = index.clone();
+        async move {
+            index
+                .orphans_of(project)
+                .await
+                .unwrap()
+                .iter()
+                .map(|o| o.as_str().to_string())
+                .collect::<Vec<String>>()
+        }
+    };
+    assert_eq!(orphans("p").await, want);
+    assert_eq!(orphans("P").await, want, "the project in any case");
+    assert_eq!(
+        orphans("pp").await,
+        ["projects/pp/assets/d/candidates/r_20270101_0800"]
+    );
+
+    // From the rows: what changes on disk unseen changes nothing until the index hears of it.
+    outside_remove(&fx.file("projects/p/assets/a/v2.0.0/manifest.snapshot.json"));
+    let late = "projects/p/assets/b/work/b.txt.lil-conflict-20270102T080000Z";
+    fx.write(late, b"late");
+    assert_eq!(orphans("p").await, want);
+    // A scoped reconcile that names the new conflict copy lists it.
+    index.reconcile(Scope::Paths(vec![p(late)])).await.unwrap();
+    let mut with_late: Vec<&str> = want.to_vec();
+    with_late.push(late);
+    with_late.sort_unstable();
+    assert_eq!(orphans("p").await, with_late);
+    // A whole one sees the snapshot gone: no sealed version there any more.
+    index.reconcile(Scope::All).await.unwrap();
+    with_late.retain(|o| *o != want[1]);
+    assert_eq!(orphans("p").await, with_late);
+    // A conflict copy removed is gone at the next reconcile of its path.
+    outside_remove(&fx.file(late));
+    index.reconcile(Scope::Paths(vec![p(late)])).await.unwrap();
+    with_late.retain(|o| *o != late);
+    assert_eq!(orphans("p").await, with_late);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-097, CORE-005, ARCH-028
@@ -2105,8 +2320,13 @@ async fn scoped_reconciles_keep_the_scan_start() {
     assert_eq!(report.changed, [p("notes/recent.txt")], "{report:?}");
 }
 
+/// `verify_pending` examines at most `max_files` rows per call, in key order from where the last
+/// call stopped, and a row it skips (a mismatch already reported, unchanged since) counts too.
+/// The files each call looks at are asserted, not only what it returns: before the bound counted
+/// every examined row, the second call looked at `x` again (skipping it) and then read `y`, and
+/// returned the same results.
 #[tokio::test] // spec: CORE-041
-async fn verify_pending_examines_at_most_max_files_and_moves_on() {
+async fn verify_pending_max_files_fails_on_the_old_code() {
     let fx = fx();
     let (x, y) = (b"x bytes".as_slice(), b"y bytes".as_slice());
     fx.write(&format!("{ASSET}/v1.0.0/x.png"), x);
@@ -2126,16 +2346,24 @@ async fn verify_pending_examines_at_most_max_files_and_moves_on() {
     let index = fx.open(probe.clone());
     index.rebuild().await.unwrap();
     fx.write(&format!("{ASSET}/v1.0.0/x.png"), b"edited x");
+    probe.take_order();
 
-    // One row per call: x (a mismatch, reported once), then y, then x again (skipped: it
-    // hasn't changed since it was reported).
+    // Each read takes the identity before and after it.
+    let read = |name: &str| vec![name.to_string(), name.to_string()];
+    // 1. x: read, a mismatch, reported.
     let first = index.verify_pending(1).await.unwrap();
     assert_eq!(first.len(), 1, "{first:?}");
-    assert_eq!((probe.reads("x.png"), probe.reads("y.png")), (1, 0));
+    assert_eq!(probe.take_order(), read("x.png"), "only x is looked at");
+    // 2. y, after x: read and verified; x isn't looked at again.
     assert!(index.verify_pending(1).await.unwrap().is_empty());
-    assert_eq!((probe.reads("x.png"), probe.reads("y.png")), (1, 1));
+    assert_eq!(probe.take_order(), read("y.png"), "only y is looked at");
+    // 3. Nothing after y: an empty batch, and the next call starts from the first row.
     assert!(index.verify_pending(1).await.unwrap().is_empty());
+    assert_eq!(probe.take_order(), Vec::<String>::new());
+    // 4. x again: its identity is taken, it hasn't changed since it was reported, so it isn't
+    // read; that counts as the call's one row.
     assert!(index.verify_pending(1).await.unwrap().is_empty());
+    assert_eq!(probe.take_order(), ["x.png"]);
     assert_eq!(
         (probe.reads("x.png"), probe.reads("y.png")),
         (1, 1),

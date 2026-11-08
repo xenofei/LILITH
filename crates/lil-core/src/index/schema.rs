@@ -7,10 +7,13 @@
 //!
 //! Tables: `files` (one row per file, keyed by the path's case-folded key, with its `kind`:
 //! `sealed`, `candidate`, `work` or `other`), `assets` (one row per asset folder, with its marks
-//! and tile fields, its `repair`, and the manifest's own `project` and `asset_id`), `asset_tags` (each asset's tags, their fold and their place in the
+//! and tile fields, its `repair`, the manifest's own `project` and `asset_id`, and, keyed by its
+//! folder's case-folded path, the runs and versions it records, which `project.status`'s
+//! orphans are judged against), `asset_tags` (each asset's tags, their fold and their place in the
 //! manifest's list), `take_marks` (the takes of
 //! every run not trashed, with their flag and rating), `edges` (manifest inputs), `assets_fts`
-//! (FTS5 over each asset's text), and two of the index's own: `expected` (the hash each manifest
+//! (FTS5 over each asset's text), `conflicts` (the conflict copies, `*.lil-conflict-*`, which are
+//! never indexed as files), and two of the index's own: `expected` (the hash each manifest
 //! records for a file, and whether the suite still expects that file on disk) and `meta` (the
 //! last scan's start).
 //!
@@ -72,11 +75,15 @@ CREATE TABLE assets (
     manifest_project TEXT,
     manifest_asset_id TEXT,
     manifest_parses INTEGER NOT NULL DEFAULT 1,
+    folder_key TEXT,
+    run_keys TEXT,
+    versions TEXT,
     UNIQUE (project, asset_id)
 );
 CREATE INDEX assets_by_status ON assets(COALESCE(status, ''), project, asset_id);
 CREATE INDEX assets_by_type ON assets(COALESCE(asset_type, ''), project, asset_id);
 CREATE INDEX assets_by_updated ON assets(updated, project, asset_id);
+CREATE INDEX assets_folder_key ON assets(folder_key);
 CREATE TABLE asset_tags (
     project TEXT NOT NULL,
     asset_id TEXT NOT NULL,
@@ -116,6 +123,10 @@ CREATE TABLE expected (
     tracked INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX expected_asset ON expected(project, asset_id);
+CREATE TABLE conflicts (
+    key TEXT PRIMARY KEY,
+    path TEXT NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE meta (
     key TEXT PRIMARY KEY,
     value INTEGER
@@ -130,7 +141,7 @@ fn sql(e: &rusqlite::Error) -> IndexError {
 const CACHE_KIB: i64 = -65_536;
 
 /// The tables [`open_existing`] checks for.
-const TABLES: [&str; 8] = [
+const TABLES: [&str; 9] = [
     "files",
     "assets",
     "asset_tags",
@@ -138,6 +149,7 @@ const TABLES: [&str; 8] = [
     "edges",
     "assets_fts",
     "expected",
+    "conflicts",
     "meta",
 ];
 
@@ -241,6 +253,8 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
         .map_err(|e| format!("asset_tags.pos: {e}"))?;
     conn.prepare("SELECT manifest_project, manifest_asset_id, manifest_parses FROM assets LIMIT 0")
         .map_err(|e| format!("assets' repair inputs: {e}"))?;
+    conn.prepare("SELECT folder_key, run_keys, versions FROM assets LIMIT 0")
+        .map_err(|e| format!("assets' recorded runs and versions: {e}"))?;
     configure(&conn, true).map_err(|e| e.to_string())?;
     Ok(conn)
 }

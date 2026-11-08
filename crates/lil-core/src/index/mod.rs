@@ -205,6 +205,42 @@ impl FileKind {
     }
 }
 
+/// [`Index::orphans_of`]'s orphan run folders: the keys of the `candidates/<run>` folders under
+/// `?1`..`?2` (`PROJECTS/<P>/ASSETS/`, whose length in characters is `?3`) holding a file row,
+/// whose asset folder has no asset row (no manifest records the run) or one whose manifest
+/// parses and has no run of that key. Keys are case-folded, so a project folder renamed only in
+/// case compares the same.
+const ORPHAN_RUNS: &str = "
+    SELECT DISTINCT r.folder FROM (
+        SELECT substr(key, 1, ?3 + a - 1) AS asset,
+               substr(key, ?3 + a + 12, instr(substr(key, ?3 + a + 12), '/') - 1) AS run,
+               substr(key, 1, ?3 + a + 10 + instr(substr(key, ?3 + a + 12), '/')) AS folder
+        FROM (SELECT key, instr(substr(key, ?3 + 1), '/') AS a FROM files
+              WHERE key >= ?1 AND key < ?2 AND kind = 'candidate' AND state <> 'missing')
+    ) r LEFT JOIN assets x ON x.folder_key = r.asset
+    WHERE x.folder_key IS NULL
+       OR (x.run_keys IS NOT NULL
+           AND instr('/' || x.run_keys || '/', '/' || r.run || '/') = 0)";
+
+/// [`Index::orphans_of`]'s orphan versions: the keys of the `v<semver>` folders under `?1`..`?2`
+/// (as [`ORPHAN_RUNS`]) holding a `manifest.snapshot.json` row, whose asset folder has no asset
+/// row or one whose manifest parses and records neither that `approved_version` nor a run's
+/// `signed_off.version`.
+const ORPHAN_VERSIONS: &str = "
+    SELECT DISTINCT substr(s.key, 1, length(s.key) - 23) FROM (
+        SELECT key,
+               substr(key, 1, ?3 + a - 1) AS asset,
+               substr(key, ?3 + a + 2, instr(substr(key, ?3 + a + 1), '/') - 2) AS version,
+               substr(key, ?3 + a + 1) AS tail
+        FROM (SELECT key, instr(substr(key, ?3 + 1), '/') AS a FROM files
+              WHERE key >= ?1 AND key < ?2 AND kind = 'sealed' AND state <> 'missing'
+                AND key LIKE '%/MANIFEST.SNAPSHOT.JSON')
+    ) s LEFT JOIN assets x ON x.folder_key = s.asset
+    WHERE substr(s.tail, instr(s.tail, '/')) = '/MANIFEST.SNAPSHOT.JSON'
+      AND (x.folder_key IS NULL
+           OR (x.versions IS NOT NULL
+               AND instr(',' || x.versions || ',', ',' || s.version || ',') = 0))";
+
 /// The asset folder a path is in: `projects/<p>/assets/<a>/…` → `(p, a)`.
 pub(crate) fn asset_of(path: &str) -> Option<(&str, &str)> {
     let mut parts = path.split('/');
@@ -819,6 +855,112 @@ impl Index {
                 stmt.query_map(params![project], query::asset_row)
                     .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
                     .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
+    /// `project.status`'s orphans of `project` (CORE-038), from the index's rows, not a walk of
+    /// the disk: the `candidates/<run>` folders holding an indexed file whose asset's manifest
+    /// has no run of that id; the `v<semver>` folders holding an indexed
+    /// `manifest.snapshot.json` whose version is neither the manifest's `approved_version` nor a
+    /// run's `signed_off.version`; and the conflict copies (`*.lil-conflict-*`) anywhere under
+    /// `projects/<project>/`. An asset folder without a manifest records none; one whose
+    /// manifest doesn't parse is skipped. Run ids, version folders and the project compare
+    /// without regard to case, so a project folder renamed only in case has the same orphans.
+    /// Sorted, one path per folder or copy, spelled as indexed.
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn orphans_of(&self, project: &str) -> Result<Vec<WsPath>, IndexError> {
+        // Every key under a folder: from `<KEY>/` to the same text with its last `/` raised to
+        // `0`, the next character.
+        let under = |folder: String| {
+            let from = path_key(&format!("{folder}/"));
+            let to = format!("{}0", &from[..from.len() - 1]);
+            (from, to)
+        };
+        let (from, to) = under(format!("projects/{project}/assets"));
+        // SQLite's `substr` and `instr` count characters.
+        let prefix = i64::try_from(from.chars().count()).unwrap_or(i64::MAX);
+        let (copies_from, copies_to) = under(format!("projects/{project}"));
+        self.db
+            .call(move |conn| {
+                let mut folders: Vec<String> = Vec::new();
+                for query in [ORPHAN_RUNS, ORPHAN_VERSIONS] {
+                    let found: Vec<String> = conn
+                        .prepare_cached(query)
+                        .and_then(|mut stmt| {
+                            stmt.query_map(params![from, to, prefix], |r| r.get(0))?
+                                .collect::<rusqlite::Result<_>>()
+                        })
+                        .map_err(|e| sql(&e))?;
+                    folders.extend(found);
+                }
+                // Each orphan folder spelled as the first indexed file under it is.
+                let mut orphans = Vec::with_capacity(folders.len());
+                let mut spell = conn
+                    .prepare_cached("SELECT path FROM files WHERE key > ?1 || '/' LIMIT 1")
+                    .map_err(|e| sql(&e))?;
+                for folder in folders {
+                    let path: String = spell
+                        .query_row(params![folder], |r| r.get(0))
+                        .map_err(|e| sql(&e))?;
+                    let depth = folder.split('/').count();
+                    let spelled: Vec<&str> = path.split('/').take(depth).collect();
+                    orphans.push(WsPath::from_disk(spelled.join("/")));
+                }
+                drop(spell);
+                let copies: Vec<String> = conn
+                    .prepare_cached("SELECT path FROM conflicts WHERE key >= ?1 AND key < ?2")
+                    .and_then(|mut stmt| {
+                        stmt.query_map(params![copies_from, copies_to], |r| r.get(0))?
+                            .collect::<rusqlite::Result<_>>()
+                    })
+                    .map_err(|e| sql(&e))?;
+                orphans.extend(copies.into_iter().map(WsPath::from_disk));
+                orphans.sort();
+                orphans.dedup();
+                Ok(orphans)
+            })
+            .await
+    }
+
+    /// `project.status`'s counts of `project`: its assets by manifest status (`none` for one
+    /// whose manifest has no status), and the manifests of those that need repair, by asset id.
+    /// Two lean reads, not every column of every asset ([`Index::assets_of`]).
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn status_counts(
+        &self,
+        project: &str,
+    ) -> Result<(BTreeMap<String, u64>, Vec<WsPath>), IndexError> {
+        let project = project.to_string();
+        self.db
+            .call(move |conn| {
+                let counts = conn
+                    .prepare_cached(
+                        "SELECT COALESCE(status, 'none'), COUNT(*) FROM assets
+                         WHERE project = ?1 GROUP BY 1",
+                    )
+                    .and_then(|mut stmt| {
+                        stmt.query_map(params![project], |r| {
+                            Ok((r.get(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
+                        })?
+                        .collect::<rusqlite::Result<_>>()
+                    })
+                    .map_err(|e| sql(&e))?;
+                let repair: Vec<String> = conn
+                    .prepare_cached(
+                        "SELECT manifest FROM assets WHERE project = ?1 AND needs_repair = 1
+                         ORDER BY asset_id",
+                    )
+                    .and_then(|mut stmt| {
+                        stmt.query_map(params![project], |r| r.get(0))?
+                            .collect::<rusqlite::Result<_>>()
+                    })
+                    .map_err(|e| sql(&e))?;
+                Ok((counts, repair.into_iter().map(WsPath::from_disk).collect()))
             })
             .await
     }

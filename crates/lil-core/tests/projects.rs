@@ -1303,11 +1303,12 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
         "an orphan is never deleted"
     );
 
-    // A conflict copy that appears after the workspace was opened is found at the next call,
-    // anywhere under the project's folder.
+    // A conflict copy that appears after the workspace was opened is found once the index has
+    // heard of it, anywhere under the project's folder (orphans come from the index's rows).
     let late =
         "projects/sketchbook/assets/env_stone/work/scene.blend.lil-conflict-20270115T080000Z";
     write_file(&file(&ws, late), b"outside version");
+    fx.ok("s_1", "watch.notify", json!({"paths": [late]})).await;
     let status = fx.ok("s_1", "project.status", json!({})).await;
     assert_eq!(
         status["orphans"],
@@ -1339,6 +1340,100 @@ async fn project_status_lists_orphans_needs_repair_and_missing() {
             .await,
         "params.invalid"
     );
+    fx.shutdown().await;
+    assert_removed(env);
+}
+
+/// Renames a folder as an outside program (Explorer) would.
+#[allow(clippy::disallowed_methods)]
+fn outside_rename(from: &Path, to: &Path) {
+    std::fs::rename(from, to)
+        .unwrap_or_else(|e| panic!("cannot rename {} to {}: {e}", from.display(), to.display()));
+}
+
+/// `project.status`'s orphans, case-folded (a path is given as the index has it).
+async fn folded_orphans(fx: &Fx) -> Vec<String> {
+    let status = fx
+        .ok("s_1", "project.status", json!({"project": "sketchbook"}))
+        .await;
+    let mut orphans: Vec<String> = status["orphans"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{status}"))
+        .iter()
+        .map(|o| o.as_str().unwrap().to_lowercase())
+        .collect();
+    orphans.sort();
+    orphans
+}
+
+/// Orphans come from the index's rows (CORE-038), so a project folder renamed only in case
+/// (`sketchbook` to `Sketchbook`, as Explorer allows) gives the same orphans, and none spurious,
+/// a copied asset folder's included (Task 8's review, N6): the walk this replaced read only a
+/// manifest named after the folder, so it listed every run and sealed version of a copy, whose
+/// manifest still has the original's name.
+#[tokio::test] // spec: CORE-038, CORE-047
+async fn a_case_only_project_rename_gives_the_same_orphans() {
+    let env = TestEnv::new();
+    let asset = "projects/sketchbook/assets/env_stone";
+    let ws = workspace(&env, |ws| {
+        let mut stone: Value =
+            serde_json::from_slice(&approved("env_stone", "approved", json!([]), json!([])))
+                .unwrap();
+        stone["candidate_runs"] = json!([
+            {"run_id": "r_20261001_1000", "status": "selected", "path": "candidates/r_20261001_1000/",
+             "signed_off": {"by": "user", "date": "2026-10-01", "version": "1.0.0"},
+             "files": [{"path": "candidates/r_20261001_1000/stone.png", "role": "candidate"}]},
+        ]);
+        let stone = serde_json::to_vec_pretty(&stone).unwrap();
+        write_file(&file(ws, &manifest_rel("sketchbook", "env_stone")), &stone);
+        // A copy of the folder, made outside the suite: its manifest keeps its name.
+        write_file(
+            &file(
+                ws,
+                "projects/sketchbook/assets/env_stone_copy/env_stone.manifest.json",
+            ),
+            &stone,
+        );
+        for (rel, bytes) in [
+            // On record: the version and the run.
+            ("v1.0.0/manifest.snapshot.json", b"{}".as_slice()),
+            ("v1.0.0/stone.png", b"sealed"),
+            ("candidates/r_20261001_1000/other.png", b"the other take"),
+            // Orphans: a run and a version the manifest doesn't list.
+            ("candidates/r_20261002_1000/left.png", b"left behind"),
+            ("v2.0.0/manifest.snapshot.json", b"{}"),
+        ] {
+            write_file(&file(ws, &format!("{asset}/{rel}")), bytes);
+            write_file(&file(ws, &format!("{asset}_copy/{rel}")), bytes);
+        }
+    });
+    let want = [
+        format!("{asset}/candidates/r_20261002_1000"),
+        format!("{asset}/v2.0.0"),
+        format!("{asset}_copy/candidates/r_20261002_1000"),
+        format!("{asset}_copy/v2.0.0"),
+    ];
+
+    let fx = fx_with(&env, &ws, None);
+    assert_eq!(folded_orphans(&fx).await, want);
+    fx.shutdown().await;
+
+    // Renamed in case while no core runs, then opened again.
+    outside_rename(
+        &file(&ws, "projects/sketchbook"),
+        &file(&ws, "projects/Sketchbook"),
+    );
+    let fx = fx_with(&env, &ws, None);
+    assert_eq!(folded_orphans(&fx).await, want, "the same orphans");
+    fx.shutdown().await;
+
+    // And back.
+    outside_rename(
+        &file(&ws, "projects/Sketchbook"),
+        &file(&ws, "projects/sketchbook"),
+    );
+    let fx = fx_with(&env, &ws, None);
+    assert_eq!(folded_orphans(&fx).await, want);
     fx.shutdown().await;
     assert_removed(env);
 }

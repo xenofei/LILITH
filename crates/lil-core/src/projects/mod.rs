@@ -136,7 +136,9 @@ pub struct ProjectStatus {
     /// The number of the project's assets in each manifest status; an asset whose manifest
     /// has no status counts as `none`.
     pub assets_by_status: BTreeMap<String, u64>,
-    /// Orphans under the project's folder (CORE-038): never deleted, only listed.
+    /// Orphans under the project's folder (CORE-038): never deleted, only listed. They come
+    /// from the index's rows ([`Index::orphans_of`](crate::index::Index::orphans_of)): run
+    /// folders and sealed versions the manifest doesn't record, and conflict copies.
     pub orphans: Vec<String>,
     /// The manifests of assets that need repair (one that doesn't parse or disagrees with its
     /// folder, CORE-047; a folder moved or sharing its creation UUID, CORE-154), files in state
@@ -186,19 +188,12 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
         }
     };
     ws.index.ready_result().await.map_err(|e| e.to_error(""))?;
-    let assets = ws
+    let (assets_by_status, repair) = ws
         .index
-        .assets_of(project)
+        .status_counts(project)
         .await
         .map_err(|e| e.to_error(""))?;
-    let mut assets_by_status: BTreeMap<String, u64> = BTreeMap::new();
-    for asset in &assets {
-        let status = asset.status.clone().unwrap_or_else(|| "none".to_string());
-        *assets_by_status.entry(status).or_default() += 1;
-        if asset.needs_repair {
-            needs_repair.push(asset.manifest.as_str().to_string());
-        }
-    }
+    needs_repair.extend(repair.iter().map(|m| m.as_str().to_string()));
     let files = ws
         .index
         .files_in_states(project, &[FileState::NeedsRepair, FileState::Missing])
@@ -229,10 +224,11 @@ pub async fn project_status(ws: &OpenWorkspace, project: &str) -> Result<Project
     needs_repair.sort();
     needs_repair.dedup();
     let (moved, duplicates) = moves_and_copies(ws, project).await?;
-    // Only the project's own folder is walked, never the whole workspace.
+    // From the index's rows, never a walk of the disk, whatever the case of the project
+    // folder's name.
     let orphans = ws
-        .store
-        .orphans_in(project)
+        .index
+        .orphans_of(project)
         .await
         .map_err(|e| e.to_error(""))?
         .into_iter()

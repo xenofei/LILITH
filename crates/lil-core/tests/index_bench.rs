@@ -1,7 +1,10 @@
 //! The index budgets (CORE-042, APP-138): a cold rebuild of 2,000 assets and a warm reconcile
-//! of 10,000 assets with nothing changed, and `assets.query {limit: 200, facets: true}` at
-//! 10,000 and 50,000 assets (P4b-R23), each against its budget in `test-params.toml`
-//! (`[budgets]`, read through `lil_testkit::params::budget`).
+//! of 10,000 assets with nothing changed, `assets.query {limit: 200, facets: true}` at 10,000 and
+//! 50,000 assets (P4b-R23), and `project.status` of a project of 10,000 assets, each against its
+//! budget in `test-params.toml` (`[budgets]`, read through `lil_testkit::params::budget`). The
+//! warm reconcile's setup and run together also stay within half of nextest's per-test cap
+//! (`[timeouts] e2e_s`), so a slower machine fails it with its times printed before the cap
+//! stops it.
 //!
 //! These are the suite's only wall-clock measurements, the stated exception to QA-031: they
 //! are performance gates, not correctness assertions. Each prints its measured time. The facet
@@ -9,17 +12,25 @@
 //! `cargo nextest run -p lil-core --run-ignored only -E 'binary(index_bench) & test(/facets/)'`.
 //! They time the index read (`Index::assets`: the page, `total` and the facets in one read
 //! transaction), which is what the facet budgets cover; the tool layer (argument parsing, the
-//! cursor, the summaries and the result's JSON) is outside them.
+//! cursor, the summaries and the result's JSON) is outside them. The `project.status` bench is
+//! ignored too (`-E 'binary(index_bench) & test(/project_status/)'`); it times
+//! `projects::project_status` on an open workspace: all of the tool's work but its JSON.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use lil_core::events::EventBus;
 use lil_core::index::{AssetQuery, Choice, Index, Scope};
+use lil_core::state::StateRegistry;
+use lil_core::store::FailPoints;
+use lil_core::workspace::{WorkspaceHub, WorkspaceRef};
+use lil_platform::clock::SystemClock;
 use lil_platform::fs::SystemProbe;
+use lil_platform::{Clock, Env};
 use lil_schema::{Flag, Label};
 use lil_testkit::files::write_file;
-use lil_testkit::{TestEnv, params, sha256_bytes};
+use lil_testkit::{SeqIds, TestEnv, params, sha256_bytes};
 use serde_json::json;
 
 /// Creates a folder as an outside program would.
@@ -139,6 +150,32 @@ async fn warm_reconcile_of_10000_assets_fits_the_budget() {
         took <= budget,
         "the warm reconcile took {took:.3} s; the budget is {budget} s"
     );
+    // The setup is most of this test's time: with the reconcile it stays within half of the cap,
+    // so a slower machine fails here, with its times, before nextest stops the test.
+    let whole = setup.elapsed().as_secs_f64();
+    let cap = test_cap_s();
+    println!("setup and warm reconcile: {whole:.1} s (per-test cap {cap} s)");
+    assert!(
+        whole <= cap / 2.0,
+        "the setup and the warm reconcile took {whole:.1} s, over half of the {cap} s per-test cap"
+    );
+}
+
+/// nextest's per-test cap for `lil-core`'s tests, in seconds: `[timeouts] e2e_s` of
+/// `test-params.toml`, the record of `.config/nextest.toml`'s value.
+fn test_cap_s() -> f64 {
+    let path = params::file();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let table: toml::Table = text
+        .parse()
+        .unwrap_or_else(|e| panic!("{} is not TOML: {e}", path.display()));
+    table
+        .get("timeouts")
+        .and_then(|t| t.get("e2e_s"))
+        .and_then(toml::Value::as_integer)
+        .map(|s| s as f64)
+        .unwrap_or_else(|| panic!("{} has no [timeouts] e2e_s", path.display()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -356,4 +393,181 @@ async fn assets_query_with_facets_10000() {
 #[ignore = "bench"]
 async fn assets_query_with_facets_50000() {
     facet_bench(50_000, "assets_query_facets_50000_ms").await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// `project.status` (CORE-038, CORE-042): its orphans come from the index's rows, so a project of
+// 10,000 assets answers within `project_status_10000_assets_ms`.
+// ---------------------------------------------------------------------------------------------
+
+/// The orphans [`status_workspace`] makes: an orphan run folder in every 100th asset, an orphan
+/// version in every 1,000th.
+fn bench_orphans(assets: usize) -> usize {
+    assets.div_ceil(100) + assets.div_ceil(1000)
+}
+
+/// The fixture workspace with `assets` more assets in its `sketchbook` project, each as the
+/// store leaves a signed-off asset: a manifest whose approved version 1.0.0 was signed off from
+/// a selected run, `v1.0.0/` with its snapshot and image, and the run's folder with its other
+/// take; a third also have an open run with two takes. Every 100th asset has an orphan run
+/// folder, every 1,000th an orphan version.
+fn status_workspace(env: &TestEnv, assets: usize) -> PathBuf {
+    let ws = env.copy_fixture_workspace("status");
+    let ws = std::fs::canonicalize(&ws).unwrap();
+    let ws = PathBuf::from(
+        ws.to_string_lossy()
+            .strip_prefix(r"\\?\")
+            .map(str::to_string)
+            .unwrap_or_else(|| ws.to_string_lossy().into_owned()),
+    );
+    let (signed, open, orphan) = ("r_20261001_1000", "r_20261002_1000", "r_20261003_1000");
+    let make = |i: usize| {
+        let asset = format!("bench_{i:05}");
+        let dir: PathBuf = ["projects", "sketchbook", "assets", &asset]
+            .iter()
+            .fold(ws.clone(), |p, c| p.join(c));
+        let put = |rel: &str, bytes: &[u8]| {
+            let path = rel.split('/').fold(dir.clone(), |p, c| p.join(c));
+            write_file(&path, bytes);
+        };
+        let take = |run: &str, n: u32| json!({"path": format!("candidates/{run}/take_{n}.png"), "role": "candidate"});
+        let image = format!("image {i}").into_bytes();
+        let mut runs = vec![json!({
+            "run_id": signed, "path": format!("candidates/{signed}/"),
+            "status": "selected", "created": "2026-10-01T10:00:00Z", "selected": ["take_1.png"],
+            "signed_off": {"by": "user", "date": "2026-10-01", "version": "1.0.0"},
+            "files": [take(signed, 1), take(signed, 2)],
+        })];
+        put("v1.0.0/image.png", &image);
+        put("v1.0.0/manifest.snapshot.json", b"{}");
+        put(&format!("candidates/{signed}/take_2.png"), b"take 2");
+        if i.is_multiple_of(3) {
+            runs.push(json!({
+                "run_id": open, "path": format!("candidates/{open}/"),
+                "status": "open", "created": "2026-10-02T10:00:00Z",
+                "files": [take(open, 1), take(open, 2)],
+            }));
+            put(&format!("candidates/{open}/take_1.png"), b"open 1");
+            put(&format!("candidates/{open}/take_2.png"), b"open 2");
+        }
+        if i.is_multiple_of(100) {
+            put(&format!("candidates/{orphan}/left.png"), b"left behind");
+        }
+        if i.is_multiple_of(1000) {
+            put("v2.0.0/manifest.snapshot.json", b"{}");
+        }
+        let manifest = json!({
+            "schema_version": 1,
+            "asset_id": asset,
+            "project": "sketchbook",
+            "creation_uuid": format!("00000000-0000-4000-8000-{i:012x}"),
+            "type": "image",
+            "status": "approved",
+            "version": "1.0.0",
+            "approved_version": "1.0.0",
+            "candidate_runs": runs,
+            "hashes": {"v1.0.0/image.png": format!("sha256:{}", sha256_bytes(&image))},
+        });
+        put(
+            &format!("{asset}.manifest.json"),
+            manifest.to_string().as_bytes(),
+        );
+    };
+    // Written by eight threads: the setup is most of the bench's time.
+    std::thread::scope(|scope| {
+        for first in 0..8 {
+            let make = &make;
+            scope.spawn(move || (first..assets).step_by(8).for_each(make));
+        }
+    });
+    ws
+}
+
+/// Removes the asset folders under `dir` from eight threads, as an outside program would, so the
+/// bench's clean-up stays well inside the per-test cap.
+#[allow(clippy::disallowed_methods)]
+fn remove_assets(dir: &Path) {
+    let folders: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    std::thread::scope(|scope| {
+        for first in 0..8 {
+            let folders = &folders;
+            scope.spawn(move || {
+                for folder in folders.iter().skip(first).step_by(8) {
+                    std::fs::remove_dir_all(folder).unwrap();
+                }
+            });
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-038, CORE-042
+#[ignore = "bench"]
+async fn project_status_10000() {
+    const ASSETS: usize = 10_000;
+    let env = TestEnv::new();
+    let setup = Instant::now();
+    let ws = status_workspace(&env, ASSETS);
+    println!("{ASSETS} assets written: {:.2?}", setup.elapsed());
+    let states = Arc::new(
+        StateRegistry::open(
+            &env.env,
+            Arc::new(|what: &str| panic!("unexpected fatal report: {what}")),
+        )
+        .expect("the suite state.db"),
+    );
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let hub = WorkspaceHub::new(
+        env.env.clone(),
+        states.clone(),
+        Arc::new(EventBus::new(clock.clone())),
+        clock,
+        Arc::new(SeqIds::new()),
+        FailPoints::none(),
+        Arc::new(SystemProbe),
+        lil_core::watch::WatchConfig::default(),
+    );
+    let ws_ref = WorkspaceRef {
+        id: Env::workspace_hash(&ws),
+        path: ws.clone(),
+    };
+    let open = hub.open(&ws_ref).await.expect("the workspace opens");
+    open.index.ready().await;
+    println!(
+        "setup of {ASSETS} assets, opened and indexed: {:.2?}",
+        setup.elapsed()
+    );
+
+    let status = || lil_core::projects::project_status(&open, "sketchbook");
+    let first = status().await.expect("project.status");
+    let ours = first
+        .orphans
+        .iter()
+        .filter(|o| o.starts_with("projects/sketchbook/assets/bench_"))
+        .count();
+    assert_eq!(ours, bench_orphans(ASSETS), "{:?}", first.orphans);
+    for _ in 0..5 {
+        status().await.unwrap();
+    }
+    let mut ms = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        let got = status().await.unwrap();
+        ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(got.orphans.len(), first.orphans.len());
+    }
+    let p = p95(ms);
+    hub.close_all().await;
+    states.close();
+    drop(open);
+    remove_assets(&ws.join("projects").join("sketchbook").join("assets"));
+    println!("project.status of {ASSETS} assets: p95 {p:.1} ms");
+    let budget = params::budget("project_status_10000_assets_ms");
+    println!("budget {budget} ms");
+    assert!(
+        p <= budget,
+        "project.status's p95 is {p:.1} ms; the budget is {budget} ms"
+    );
 }
