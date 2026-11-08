@@ -42,13 +42,23 @@
 //! cleared, and only then the actions that write or publish, so a human edit the rescan finds is
 //! recorded at once rather than after the gate's 60 s wait.
 //!
-//! **Actions.** `HumanEdit` pushes `{path, sha256, previous_sha256, date}` to the manifest's
-//! `human_edits` (asset-relative path, bare hex, UTC date of the detection) and publishes
-//! `asset:` `{kind:"human_edit"}`; `NeedsRepair` and `Missing` set the file's state and publish
-//! `{kind:"needs_repair"}` and `{kind:"missing", path}`. Every decision runs under one lock, and
+//! **Actions.** `HumanEdit` pushes `{path, sha256, previous_sha256, date, actor?}` to the
+//! manifest's `human_edits` (asset-relative path, bare hex, UTC date of the detection; `actor`
+//! when the change was reported with one, below) and publishes `asset:` `{kind:"human_edit"}`;
+//! `NeedsRepair` and `Missing` set the file's state and publish `{kind:"needs_repair"}` and
+//! `{kind:"missing", path}`. Every decision runs under one lock, and
 //! a hash equal to the latest human edit is recorded already, so an edit is pushed once
 //! however often it is seen (a batch, `lil notify`, an overflow rescan, the verification after a
 //! cold rebuild).
+//!
+//! **Who made a change** (CORE-034; P4b-R16). Only a report names one: [`Watcher::notify`]
+//! takes the reporter's actor (`watch.notify` computes it; the watcher never maps a caller).
+//! The human edits its own reconcile records get that `actor`; then, for each file given whose
+//! latest `human_edits` entry has the file's current hash and no `actor` (the watcher's own
+//! batch saw the change first), the actor is filled in. An entry that has an actor keeps it:
+//! an agent edit is never later made a human one. What the watcher sees by itself, the
+//! verification and the post-git rescan record no actor; a path a report gives that waits for
+//! git or for a version lock is decided later without one.
 
 pub mod git;
 pub mod reconcile;
@@ -62,7 +72,7 @@ use std::time::Duration;
 
 use lil_platform::names::WORKSPACE_DIR;
 use lil_platform::watcher::{DirChange, DirWatcher};
-use lil_schema::{Manifest, SCHEME};
+use lil_schema::{Actor, Manifest, SCHEME, bare_sha256};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc::UnboundedReceiver, watch};
 use tokio::time::Instant;
@@ -150,6 +160,8 @@ struct Decided {
     /// It came from the index's verification: the row still holds the hash it trusted, so a
     /// `Reindex` records the observed hash.
     verify: bool,
+    /// Who made the change, when a report named them (a `HumanEdit` records it).
+    actor: Option<Actor>,
 }
 
 /// What the watcher's tasks share.
@@ -191,6 +203,40 @@ fn asset_folder_of(path: &WsPath) -> Option<(&str, &str)> {
             Some((project, asset))
         }
         _ => None,
+    }
+}
+
+/// The latest `human_edits` entry of `m` whose path's key is `key`, as written.
+fn latest_edit<'a>(m: &'a Manifest, key: &str) -> Option<&'a serde_json::Map<String, Value>> {
+    m.get("human_edits")?
+        .as_array()?
+        .iter()
+        .rev()
+        .filter_map(Value::as_object)
+        .find(|e| {
+            e.get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| path_key(p) == key)
+        })
+}
+
+/// Sets `actor` on the latest `human_edits` entry of `m` whose path's key is `key`.
+fn set_latest_actor(m: &mut Manifest, key: &str, actor: &Actor) {
+    let Some(Value::Array(mut edits)) = m.get("human_edits").cloned() else {
+        return;
+    };
+    let latest = edits
+        .iter_mut()
+        .rev()
+        .filter_map(Value::as_object_mut)
+        .find(|e| {
+            e.get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| path_key(p) == key)
+        });
+    if let Some(entry) = latest {
+        entry.insert("actor".into(), actor.to_value());
+        m.set("human_edits", Value::Array(edits));
     }
 }
 
@@ -348,10 +394,10 @@ impl Watcher {
     }
 
     /// Reconciles `paths` (files, or folders with their subtrees) and decides what changed:
-    /// `lil notify` (ARCH-016, ARCH-073). Paths the watcher doesn't watch are `ignored`. While
-    /// git works the paths are deferred to the post-git rescan. Waits for the workspace's first
-    /// reconcile.
-    pub async fn notify(&self, paths: Vec<WsPath>) -> NotifyReport {
+    /// `lil notify` (ARCH-016, ARCH-073), reported by `actor` (module docs, "Who made a
+    /// change"). Paths the watcher doesn't watch are `ignored`. While git works the paths are
+    /// deferred to the post-git rescan. Waits for the workspace's first reconcile.
+    pub async fn notify(&self, paths: Vec<WsPath>, actor: Option<Actor>) -> NotifyReport {
         let s = &self.shared;
         s.index.ready().await;
         let mut report = NotifyReport::default();
@@ -375,7 +421,7 @@ impl Watcher {
             }
             return report;
         }
-        s.reconcile_paths(keep).await;
+        s.reconcile_paths(keep, actor.as_ref()).await;
         report
     }
 
@@ -413,6 +459,7 @@ impl Watcher {
                 obs,
                 rec,
                 verify: true,
+                actor: None,
             })
             .await;
         }
@@ -690,7 +737,7 @@ impl Shared {
             self.apply_all(decided).await;
             self.events.publish("workspace", json!({"kind": "rescan"}));
         } else {
-            self.reconcile_paths(paths).await;
+            self.reconcile_paths(paths, None).await;
         }
         self.fences.send_modify(|s| s.seen.extend(fences));
 
@@ -737,7 +784,9 @@ impl Shared {
     /// Reconciles `paths`, re-checks the parked paths, and decides and applies what changed.
     /// A path in (or of) an asset folder whose version lock is held waits for the lock: the
     /// sign-off moves files there, and a reconcile meanwhile would take its moves for removals.
-    async fn reconcile_paths(self: &Arc<Self>, all: Vec<WsPath>) {
+    /// With a reporter's `actor`, the human edits the reconcile of `paths` records get it, and
+    /// each file of `paths` whose latest human edit has none gets it then ([`Shared::claim`]).
+    async fn reconcile_paths(self: &Arc<Self>, all: Vec<WsPath>, actor: Option<&Actor>) {
         let mut paths = Vec::with_capacity(all.len());
         let mut seen = HashSet::new();
         for path in all {
@@ -752,9 +801,12 @@ impl Shared {
             }
         }
         if !paths.is_empty() {
-            match self.index.reconcile(Scope::Paths(paths)).await {
+            match self.index.reconcile(Scope::Paths(paths.clone())).await {
                 Ok(report) => {
-                    let decided = self.decide_report(&report, &[]).await;
+                    let mut decided = self.decide_report(&report, &[]).await;
+                    for d in &mut decided {
+                        d.actor = actor.cloned();
+                    }
                     self.apply_all(decided).await;
                 }
                 Err(e) => {
@@ -768,6 +820,60 @@ impl Shared {
                 self.apply_all(decided).await;
             }
             Err(e) => tracing::warn!(error = %e, "parked paths couldn't be re-checked"),
+        }
+        if let Some(actor) = actor {
+            for path in &paths {
+                self.claim(path, actor).await;
+            }
+        }
+    }
+
+    /// Fills `actor` into the latest `human_edits` entry of the file `path` when that entry has
+    /// the file's current hash and no actor (module docs, "Who made a change"). Anything else
+    /// (another kind of file, no human edit now, an entry with an actor) is left as it is.
+    async fn claim(&self, path: &WsPath, actor: &Actor) {
+        if !matches!(kind_of(path), FileKind::Candidate | FileKind::Sealed) {
+            return;
+        }
+        let row = match self.index.files_of_path(path).await {
+            Ok(Some(row)) if row.state == FileState::HumanEdit => row,
+            _ => return,
+        };
+        let (Some(sha256), Some(manifest)) = (row.sha256, self.manifest_path(path).await) else {
+            return;
+        };
+        let key = path_key(&Self::in_asset(path));
+        let unclaimed = |m: &Manifest| {
+            latest_edit(m, &key).is_some_and(|e| {
+                e.get("sha256")
+                    .and_then(Value::as_str)
+                    .and_then(bare_sha256)
+                    == Some(sha256.as_str())
+                    && e.get("actor").is_none_or(Value::is_null)
+            })
+        };
+        let Some(bytes) = self.store.read(&manifest).await.ok().flatten() else {
+            return;
+        };
+        let current = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|t| Manifest::parse(t).ok());
+        if !current.is_some_and(|(m, _)| unclaimed(&m)) {
+            return;
+        }
+        let edit = |m: &mut Manifest| -> Result<(), StoreError> {
+            if unclaimed(m) {
+                set_latest_actor(m, &key, actor);
+            }
+            Ok(())
+        };
+        match self.store.edit_manifest(&manifest, &edit).await {
+            Ok(_) => {
+                tracing::info!(path = %path, kind = actor.kind.as_str(), "a recorded human edit was reported by its actor");
+            }
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "the actor of a recorded human edit couldn't be written");
+            }
         }
     }
 
@@ -831,6 +937,7 @@ impl Shared {
                 obs,
                 rec,
                 verify: false,
+                actor: None,
             });
         }
         out
@@ -1021,7 +1128,10 @@ impl Shared {
                 path,
                 sha256,
                 previous,
-            } => self.human_edit(&manifest, &path, &sha256, &previous).await,
+            } => {
+                self.human_edit(&manifest, &path, &sha256, &previous, d.actor.as_ref())
+                    .await;
+            }
             Action::NeedsRepair(path) => {
                 if let Err(e) = self.index.set_state(&path, FileState::NeedsRepair).await {
                     tracing::warn!(path = %path, error = %e, "a manifest's needs-repair state couldn't be recorded");
@@ -1065,9 +1175,10 @@ impl Shared {
         }
     }
 
-    /// Pushes `{path, sha256, previous_sha256, date}` to the manifest's `human_edits`, unless
-    /// its latest entry for the path already has this hash; the file itself is never touched
-    /// (CORE-034). Then `asset:` `{kind:"human_edit"}`.
+    /// Pushes `{path, sha256, previous_sha256, date, actor?}` to the manifest's `human_edits`,
+    /// unless its latest entry for the path already has this hash (then only an `actor` it
+    /// lacks is filled in); the file itself is never touched (CORE-034). Then `asset:`
+    /// `{kind:"human_edit"}`.
     ///
     /// It runs under the decision lock, and the manifest edit waits at the store's git gate
     /// (write step 2). Should git take `index.lock` again between the decision and the write,
@@ -1075,7 +1186,14 @@ impl Shared {
     /// with `store.git_busy` and is logged. That fails safe: nothing is overwritten, and the
     /// file stays different from its manifest, so the rescan after git or the next
     /// verification finds it again.
-    async fn human_edit(&self, manifest: &WsPath, path: &WsPath, sha256: &str, previous: &str) {
+    async fn human_edit(
+        &self,
+        manifest: &WsPath,
+        path: &WsPath,
+        sha256: &str,
+        previous: &str,
+        actor: Option<&Actor>,
+    ) {
         match self.store.read(manifest).await {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -1089,12 +1207,15 @@ impl Shared {
         }
         let inside = Self::in_asset(path);
         let date = lil_schema::time::date(self.store.now_utc());
-        let entry = json!({
+        let mut entry = json!({
             "path": inside,
             "sha256": sha256,
             "previous_sha256": previous,
             "date": date,
         });
+        if let Some(actor) = actor {
+            entry["actor"] = actor.to_value();
+        }
         let key = path_key(&inside);
         let edit = |m: &mut Manifest| -> Result<(), StoreError> {
             let recorded = m
@@ -1105,6 +1226,12 @@ impl Shared {
                 .find(|e| path_key(&e.path) == key)
                 .is_some_and(|e| e.sha256 == sha256);
             if recorded {
+                if let Some(actor) = actor
+                    && latest_edit(m, &key)
+                        .is_some_and(|e| e.get("actor").is_none_or(Value::is_null))
+                {
+                    set_latest_actor(m, &key, actor);
+                }
                 return Ok(());
             }
             m.push("human_edits", entry.clone())
@@ -1214,6 +1341,7 @@ impl Shared {
                 obs,
                 rec,
                 verify: true,
+                actor: None,
             });
         }
         let (now, queued): (Vec<Decided>, Vec<Decided>) = decided

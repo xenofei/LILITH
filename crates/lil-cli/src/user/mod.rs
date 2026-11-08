@@ -116,6 +116,13 @@ pub enum UserCommand {
     /// Tell the core's watcher that files changed (for folders it can't watch). Prints nothing
     /// on success.
     Notify {
+        /// Who made the changes, when not you: an agent's kind (claude_code, tether, director).
+        /// Without it the change is recorded as made by this caller.
+        #[arg(long, value_name = "KIND")]
+        by: Option<String>,
+        /// The session id of the agent that made the changes (with --by).
+        #[arg(long, value_name = "ID", requires = "by")]
+        session: Option<String>,
         /// The changed files or folders, inside the workspace.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
@@ -208,7 +215,9 @@ pub fn run(cmd: UserCommand, global: &GlobalArgs) -> i32 {
         UserCommand::Workspace(WorkspaceCommand::Use { path }) => {
             workspace::use_default(global, &path)
         }
-        UserCommand::Notify { paths } => notify::run(global, &paths),
+        UserCommand::Notify { by, session, paths } => {
+            notify::run(global, &paths, by.as_deref(), session.as_deref())
+        }
         UserCommand::Doctor => doctor::run(global),
         UserCommand::ConfirmWindow { id } => confirm_window::run(global, id.as_deref()),
         UserCommand::Hook { event } => Ok(hook::run(event, global)),
@@ -572,13 +581,16 @@ mod tests {
             r"C:\ws\Ünïcödé space\a.png",
             "rel/b.png",
         ])) {
-            UserCommand::Notify { paths } => assert_eq!(
-                paths,
-                [
-                    PathBuf::from(r"C:\ws\Ünïcödé space\a.png"),
-                    PathBuf::from("rel/b.png")
-                ]
-            ),
+            UserCommand::Notify { paths, by, session } => {
+                assert_eq!(
+                    paths,
+                    [
+                        PathBuf::from(r"C:\ws\Ünïcödé space\a.png"),
+                        PathBuf::from("rel/b.png")
+                    ]
+                );
+                assert_eq!((by, session), (None, None));
+            }
             other => panic!("not notify: {other:?}"),
         }
         assert!(matches!(
@@ -589,6 +601,41 @@ mod tests {
             Cli::try_parse_from(["lil", "notify"]).is_err(),
             "notify needs a path"
         );
+    }
+
+    #[test] // spec: CORE-034, ARCH-103
+    fn notify_cli_parses_by_and_session() {
+        match user(parse(&[
+            "lil",
+            "--no-start",
+            "notify",
+            "--by",
+            "claude_code",
+            "--session",
+            "s1",
+            "a.png",
+        ])) {
+            UserCommand::Notify { paths, by, session } => {
+                assert_eq!(paths, [PathBuf::from("a.png")]);
+                assert_eq!(by.as_deref(), Some("claude_code"));
+                assert_eq!(session.as_deref(), Some("s1"));
+            }
+            other => panic!("not notify: {other:?}"),
+        }
+        match user(parse(&["lil", "notify", "a.png", "--by", "tether"])) {
+            UserCommand::Notify { by, session, .. } => {
+                assert_eq!(by.as_deref(), Some("tether"));
+                assert_eq!(session, None);
+            }
+            other => panic!("not notify: {other:?}"),
+        }
+        for bad in [
+            &["lil", "notify", "--session", "s1", "a.png"][..],
+            &["lil", "notify", "--by", "claude_code"],
+            &["lil", "notify", "a.png", "--by"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?} parsed");
+        }
     }
 
     #[test] // spec: CORE-004, CORE-040

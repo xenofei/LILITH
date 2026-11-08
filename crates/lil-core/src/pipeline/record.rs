@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lil_schema::{
-    Bump, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy, StatusEvent, Version,
-    change_status,
+    Actor, Bump, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy, StatusEvent,
+    Version, change_status,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -487,7 +487,8 @@ fn manifest_rel_of(view: &ManifestView) -> WsPath {
 
 /// Starts a candidate run on `m` (CORE-023, CORE-027; I5 "Version fields"): appends `run`
 /// (its `created` filled from `now_utc` when it has none) and moves the status by
-/// `change_status(…, CandidateRun)`, logged as changed `by`.
+/// `change_status(…, CandidateRun)`, logged as changed `by`. `actor` (who made the run,
+/// P4b-R16) is set on the run and on each of its files (its takes' files) that names none.
 ///
 /// The run's `target_version` (set in place when `run` has the key, else appended): when the
 /// manifest has an `approved_version` and no open run targets a newer one, new work starts,
@@ -503,6 +504,7 @@ pub fn start_candidate_run(
     m: &mut Manifest,
     mut run: Map<String, Value>,
     by: &StatusBy,
+    actor: &Actor,
     now_utc: i64,
 ) -> Result<(), StoreError> {
     let view = m.view();
@@ -543,6 +545,12 @@ pub fn start_candidate_run(
         m.set("version", Value::from(target.to_string()));
     }
     run.insert("target_version".into(), Value::from(target.to_string()));
+    run.insert("actor".into(), actor.to_value());
+    if let Some(Value::Array(files)) = run.get_mut("files") {
+        for file in files.iter_mut().filter_map(Value::as_object_mut) {
+            file.entry("actor").or_insert_with(|| actor.to_value());
+        }
+    }
     if !run.contains_key("created") {
         run.insert(
             "created".into(),
@@ -557,6 +565,15 @@ pub fn start_candidate_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cli() -> Actor {
+        Actor {
+            kind: lil_schema::ActorKind::Cli,
+            task_id: None,
+            conversation_id: None,
+            session_id: None,
+        }
+    }
 
     fn run(id: &str) -> Map<String, Value> {
         let Value::Object(map) = json!({
@@ -592,7 +609,7 @@ mod tests {
     #[test] // spec: CORE-023, CORE-027
     fn a_new_asset_targets_its_version_and_becomes_candidate() {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
-        start_candidate_run(&mut m, run("r_20261016_1200"), &StatusBy::Cli, 0).unwrap();
+        start_candidate_run(&mut m, run("r_20261016_1200"), &StatusBy::Cli, &cli(), 0).unwrap();
         let v = m.view();
         assert_eq!(v.status, Some(Status::Candidate));
         assert_eq!(v.version, Some(Version::new(1, 0, 0)));
@@ -615,10 +632,10 @@ mod tests {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
         m.set("approved_version", json!("1.0.0"));
         m.set("status", json!("approved"));
-        start_candidate_run(&mut m, run("r_1"), &StatusBy::Cli, 0).unwrap();
+        start_candidate_run(&mut m, run("r_1"), &StatusBy::Cli, &cli(), 0).unwrap();
         assert_eq!(m.view().version, Some(Version::new(1, 1, 0)));
         // A second run while the first still targets 1.1.0 doesn't bump again.
-        start_candidate_run(&mut m, run("r_2"), &StatusBy::Cli, 0).unwrap();
+        start_candidate_run(&mut m, run("r_2"), &StatusBy::Cli, &cli(), 0).unwrap();
         let v = m.view();
         assert_eq!(v.version, Some(Version::new(1, 1, 0)));
         assert_eq!(
@@ -630,10 +647,10 @@ mod tests {
     #[test] // spec: CORE-047
     fn a_duplicate_run_id_is_refused() {
         let mut m = Manifest::new("sketchbook", "prop_kite", "image", "u");
-        start_candidate_run(&mut m, run("r_20261016_1200"), &StatusBy::Cli, 0).unwrap();
+        start_candidate_run(&mut m, run("r_20261016_1200"), &StatusBy::Cli, &cli(), 0).unwrap();
         let before = m.clone();
         assert!(matches!(
-            start_candidate_run(&mut m, run("R_20261016_1200"), &StatusBy::Cli, 0),
+            start_candidate_run(&mut m, run("R_20261016_1200"), &StatusBy::Cli, &cli(), 0),
             Err(StoreError::HashConflict { .. })
         ));
         assert_eq!(m.view().candidate_runs.len(), 1);
@@ -649,7 +666,7 @@ mod tests {
         m.set("approved_version", json!("1.0.0"));
         let before = m.clone();
         assert!(matches!(
-            start_candidate_run(&mut m, run("r_1"), &StatusBy::Cli, 0),
+            start_candidate_run(&mut m, run("r_1"), &StatusBy::Cli, &cli(), 0),
             Err(StoreError::InvalidTransition(_))
         ));
         assert!(m.view().candidate_runs.is_empty());
