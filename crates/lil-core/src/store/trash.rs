@@ -13,9 +13,11 @@
 //! folder, a sealed file its manifest's `hashes` lists is made read-only only where its SHA-256
 //! still matches (CORE-157), and a mismatch is logged and left as it is.
 //! [`Store::trash_restore_to`] restores under another name in the same folder ("restore as…",
-//! CORE-037), optionally rewriting a restored file's bytes (a resource's new id): the rewritten
-//! bytes are written as a new file at the target (never over one), and only then does the
-//! entry go.
+//! CORE-037), optionally rewriting a restored file's bytes (a resource's new id): the payload is
+//! first claimed (moved to `.restoring-<name>` in its entry, retried while something holds it,
+//! else `store.busy` with nothing changed), the rewritten bytes are written as a new file at the
+//! target (never over one), and only then does the entry go; a failed write moves the payload
+//! back.
 //!
 //! **A whole asset** (CORE-157, ruling PF-12): `asset.trash` moves `projects/<p>/assets/<a>`
 //! with [`Store::trash`] and the reason [`ASSET_TRASH_REASON`], as one entry, sealed version
@@ -285,18 +287,11 @@ fn is_asset_folder(rel: &WsPath) -> bool {
         && parts[2].eq_ignore_ascii_case("assets")
 }
 
-/// The manifest of the asset folder `dir` as found on disk: `<asset_id>.manifest.json` for
-/// one of `ids` (tried in order), else the first `*.manifest.json` directly in it; parsed.
+/// The manifest of the asset folder `dir` as found on disk ([`super::order::asset_manifests`]:
+/// `<asset_id>.manifest.json` for one of `ids`, tried in order, else the first
+/// `*.manifest.json` directly in it), the first that parses.
 fn folder_manifest(probe: &dyn Probe, dir: &Path, ids: &[&str]) -> Option<ManifestView> {
-    let mut names: Vec<String> = ids.iter().map(|id| format!("{id}.manifest.json")).collect();
-    let mut others: Vec<String> = list(dir)
-        .ok()?
-        .into_iter()
-        .filter(|e| !e.folder && e.name.to_ascii_lowercase().ends_with(".manifest.json"))
-        .map(|e| e.name)
-        .collect();
-    others.sort();
-    names.extend(others);
+    let names = super::order::asset_manifests(probe, dir, ids).ok()?;
     names.into_iter().find_map(|name| {
         let Ok(Seen::Found(bytes)) = see(probe, &dir.join(name), read_all) else {
             return None;
@@ -392,6 +387,17 @@ pub(super) fn drop_empty_entry(dir: &Path, day: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The name a rewritten restore moves its payload to before it writes anything (review M-3):
+/// `.restoring-<name>` beside it, in the entry's `payload` folder. A plain restore of an entry
+/// left so by a crash still finds it (the entry's only payload).
+pub(super) fn claimed_payload(payload: &Path) -> PathBuf {
+    let name = payload
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    payload.with_file_name(format!(".restoring-{name}"))
+}
+
 /// Takes an entry restored with a rewrite out of the trash: its payload file `payload`, whose
 /// bytes are now at the target with the new id, then the record and the empty folders.
 pub(super) fn drop_rewritten_entry(payload: &Path, dir: &Path, day: &Path) -> io::Result<()> {
@@ -477,8 +483,43 @@ impl Store {
         };
         let target = long.key();
         for asset in assets {
-            let asset_id = asset.rsplit('/').next().unwrap_or_default().to_string();
-            let manifest = WsPath::from_disk(format!("{asset}/{asset_id}.manifest.json"));
+            for (manifest, locks) in self.asset_locks(&asset).await? {
+                let longs = self.long_lock_entries(&asset, &manifest, &locks).await?;
+                for entry in longs {
+                    let key = entry.key();
+                    if key == target || key.starts_with(&format!("{target}/")) {
+                        return Err(StoreError::Locked(entry));
+                    }
+                    if target.starts_with(&format!("{key}/")) {
+                        return Err(StoreError::Locked(rel.clone()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `locks` of every manifest of the asset folder `asset` (workspace-relative), each
+    /// with its manifest's path: the folder's manifests as the index finds them
+    /// ([`super::order::asset_manifests`], so a folder renamed outside the suite counts too,
+    /// review I-1). A manifest that doesn't parse is `manifest.needs_repair`: its locks can't be
+    /// known, so whatever asks fails closed.
+    ///
+    /// # Errors
+    /// `manifest.needs_repair`; the store's read errors; `store.io` when the folder can't be
+    /// listed.
+    pub(crate) async fn asset_locks(
+        &self,
+        asset: &str,
+    ) -> Result<Vec<(WsPath, Vec<String>)>, StoreError> {
+        let at = WsPath::from_disk(asset.to_string());
+        let (probe, dir) = (self.probe().clone(), at.abs(self.root()));
+        let names = blocking(move || super::order::asset_manifests(probe.as_ref(), &dir, &[]))
+            .await
+            .map_err(|e| StoreError::io(&at, &e))?;
+        let mut found = Vec::new();
+        for name in names {
+            let manifest = WsPath::from_disk(format!("{asset}/{name}"));
             let Some(bytes) = self.read(&manifest).await? else {
                 continue;
             };
@@ -486,23 +527,12 @@ impl Store {
                 .ok()
                 .and_then(|t| Manifest::parse(t).ok())
             else {
-                tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known");
-                continue;
+                tracing::warn!(manifest = %manifest, "a manifest that doesn't parse; its locks aren't known, so its folder isn't trashed");
+                return Err(StoreError::NeedsRepair(manifest));
             };
-            let longs = self
-                .long_lock_entries(&asset, &manifest, &m.view().locks)
-                .await?;
-            for entry in longs {
-                let key = entry.key();
-                if key == target || key.starts_with(&format!("{target}/")) {
-                    return Err(StoreError::Locked(entry));
-                }
-                if target.starts_with(&format!("{key}/")) {
-                    return Err(StoreError::Locked(rel.clone()));
-                }
-            }
+            found.push((manifest, m.view().locks));
         }
-        Ok(())
+        Ok(found)
     }
 
     /// The asset folders, workspace-relative, under `parts`: `projects`, `projects/<p>` or
@@ -725,6 +755,42 @@ impl Store {
         self.trash_restore_to(entry_id, None, None).await
     }
 
+    /// A rewritten restore's write (module docs): the claimed payload `claimed` read, rewritten
+    /// and written as the new file `to_abs` (never over one); its SHA-256.
+    async fn write_rewritten(
+        &self,
+        claimed: &Path,
+        to_abs: &Path,
+        rel: &WsPath,
+        rewrite: &RestoreRewrite,
+    ) -> Result<String, StoreError> {
+        let (probe, at) = (self.probe().clone(), claimed.to_path_buf());
+        let read = blocking(move || match see(probe.as_ref(), &at, read_all)? {
+            Seen::Found(bytes) => Ok(bytes),
+            _ => Err(io::Error::other("the payload can't be read")),
+        })
+        .await
+        .map_err(|e| StoreError::io(rel, &e))?;
+        let bytes = rewrite(&read).map_err(StoreError::Invalid)?;
+        let sha256 = lil_schema::sha256_hex(&bytes);
+        let tmp = format!(".{}.tmp", self.ids().id("tmp"));
+        let (fp, to) = (self.failpoints().clone(), to_abs.to_path_buf());
+        let written = blocking(move || {
+            if lil_platform::fs::attributes(&to).is_ok() {
+                return Err(io::Error::from_raw_os_error(183));
+            }
+            fsops::write_new_file(&to, &tmp, &bytes, &fp)
+        })
+        .await;
+        match written {
+            Ok(()) => Ok(sha256),
+            Err(e) if e.raw_os_error().is_some_and(|c| c == 80 || c == 183) => {
+                Err(StoreError::RestoreConflict(rel.clone()))
+            }
+            Err(e) => Err(StoreError::io(rel, &e)),
+        }
+    }
+
     /// The record of trash entry `entry_id`.
     ///
     /// # Errors
@@ -842,6 +908,7 @@ impl Store {
         let _held = self.lock_path(&rel).await;
         let (from, to_abs) = (payload.clone(), target.clone());
         let mut written_sha256 = None;
+        let mut claimed_at: Option<PathBuf> = None;
         let moved = match rewrite {
             // A restored folder also retries error 5 (ruling Q19).
             None => {
@@ -857,24 +924,34 @@ impl Store {
                 .await
             }
             Some(rewrite) => {
-                let probe = self.probe().clone();
-                let read = blocking(move || match see(probe.as_ref(), &from, read_all)? {
-                    Seen::Found(bytes) => Ok(bytes),
-                    _ => Err(io::Error::other("the payload can't be read")),
-                })
-                .await
-                .map_err(|e| StoreError::io(&rel, &e))?;
-                let bytes = rewrite(&read).map_err(StoreError::Invalid)?;
-                written_sha256 = Some(lil_schema::sha256_hex(&bytes));
-                let tmp = format!(".{}.tmp", self.ids().id("tmp"));
-                let fp = self.failpoints().clone();
-                blocking(move || {
-                    if lil_platform::fs::attributes(&to_abs).is_ok() {
-                        return Err(io::Error::from_raw_os_error(183));
+                if lil_platform::fs::attributes(&to_abs).is_ok() {
+                    return Err(StoreError::RestoreConflict(rel));
+                }
+                // The payload is claimed first (review M-3): moved to the store's own name in
+                // the entry, retried while something holds it, then `store.busy` with nothing
+                // changed. Held, it could otherwise not go once the rewritten file is written,
+                // and the entry would stay to be restored a second time.
+                let claimed = claimed_payload(&payload);
+                let (held, claim) = (payload.clone(), claimed.clone());
+                self.fs_retry_move(None, &payload, move || fsops::move_new(&held, &claim))
+                    .await
+                    .map_err(|e| StoreError::io(&original, &e))?;
+                claimed_at = Some(claimed.clone());
+                let written = self
+                    .write_rewritten(&claimed, &to_abs, &rel, &rewrite)
+                    .await;
+                match written {
+                    Ok(sha256) => {
+                        written_sha256 = Some(sha256);
+                        Ok(())
                     }
-                    fsops::write_new_file(&to_abs, &tmp, &bytes, &fp)
-                })
-                .await
+                    Err(e) => {
+                        // Nothing restored: the payload goes back under its name.
+                        let (claim, back) = (claimed.clone(), payload.clone());
+                        let _ = blocking(move || fsops::move_new(&claim, &back)).await;
+                        return Err(e);
+                    }
+                }
             }
         };
         match moved {
@@ -917,7 +994,7 @@ impl Store {
         }
         // A rewritten restore leaves the payload behind: it goes with the entry, now that its
         // bytes are at the target with the new id.
-        let rewritten = written_sha256.is_some().then(|| payload.clone());
+        let rewritten = claimed_at;
         let (dir, day) = (entry.dir.clone(), entry.day.clone());
         let cleaned = blocking(move || match rewritten {
             Some(file) => drop_rewritten_entry(&file, &dir, &day),

@@ -21,7 +21,7 @@ use super::fsops;
 use super::order::list_with;
 use super::paths::{WsPath, path_key};
 use super::trash::{
-    DAY, PAYLOAD, RECORD, RestoreRewrite, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord,
+    DAY, PAYLOAD, RECORD, RestoreRewrite, TRASH_DIR, TRASH_KEEP_DAYS, TrashRecord, claimed_payload,
     drop_empty_entry, drop_rewritten_entry, entries, is_entry_id, parse_rfc3339, purge_entry,
     refuse_link_at, refuse_linked_trash, remove_if_empty, restore_name,
 };
@@ -374,7 +374,7 @@ impl Personal {
         };
         let target = rel.abs(&self.root);
         let (from, to_abs) = (payload.clone(), target);
-        let rewritten = rewrite.is_some();
+        let mut claimed_at: Option<PathBuf> = None;
         let moved = match rewrite {
             None => {
                 blocking(move || {
@@ -389,6 +389,19 @@ impl Personal {
                 .await
             }
             Some(rewrite) => {
+                if lil_platform::fs::attributes(&to_abs).is_ok() {
+                    return Err(StoreError::RestoreConflict(rel));
+                }
+                // Claimed first, as the workspace trash does (review M-3): a held payload is
+                // `store.busy` with nothing changed.
+                let claimed = claimed_payload(&payload);
+                let (held, claim) = (payload.clone(), claimed.clone());
+                blocking(move || fsops::move_new(&held, &claim))
+                    .await
+                    .map_err(|e| StoreError::io(&original, &e))?;
+                claimed_at = Some(claimed.clone());
+                let from = claimed.clone();
+                let back = payload.clone();
                 let probe = self.probe.clone();
                 let read = blocking(move || match see(probe.as_ref(), &from, read_all)? {
                     Seen::Found(bytes) => Ok(bytes),
@@ -397,16 +410,30 @@ impl Personal {
                     )),
                 })
                 .await
-                .map_err(|e| StoreError::io(&rel, &e))?;
-                let bytes = rewrite(&read).map_err(StoreError::Invalid)?;
-                let tmp = format!(".{}.tmp", self.ids.id("tmp"));
-                blocking(move || {
-                    if lil_platform::fs::attributes(&to_abs).is_ok() {
-                        return Err(io::Error::from_raw_os_error(183));
+                .map_err(|e| StoreError::io(&rel, &e));
+                let bytes = read.and_then(|read| rewrite(&read).map_err(StoreError::Invalid));
+                let written = match bytes {
+                    Ok(bytes) => {
+                        let tmp = format!(".{}.tmp", self.ids.id("tmp"));
+                        blocking(move || {
+                            if lil_platform::fs::attributes(&to_abs).is_ok() {
+                                return Err(io::Error::from_raw_os_error(183));
+                            }
+                            fsops::write_new_file(&to_abs, &tmp, &bytes, &FailPoints::none())
+                        })
+                        .await
                     }
-                    fsops::write_new_file(&to_abs, &tmp, &bytes, &FailPoints::none())
-                })
-                .await
+                    Err(e) => {
+                        let _ = blocking(move || fsops::move_new(&claimed, &back)).await;
+                        return Err(e);
+                    }
+                };
+                if written.is_err() {
+                    // Nothing restored: the payload goes back under its name.
+                    let (claim, back) = (claimed_at.clone().unwrap_or_default(), payload.clone());
+                    let _ = blocking(move || fsops::move_new(&claim, &back)).await;
+                }
+                written
             }
         };
         match moved {
@@ -416,13 +443,11 @@ impl Personal {
             }
             Err(e) => return Err(StoreError::io(&rel, &e)),
         }
+        let rewritten = claimed_at;
         let (dir, day) = (entry.dir.clone(), entry.day.clone());
-        let cleaned = blocking(move || {
-            if rewritten {
-                drop_rewritten_entry(&payload, &dir, &day)
-            } else {
-                drop_empty_entry(&dir, &day)
-            }
+        let cleaned = blocking(move || match rewritten {
+            Some(claimed) => drop_rewritten_entry(&claimed, &dir, &day),
+            None => drop_empty_entry(&dir, &day),
         })
         .await;
         if let Err(e) = cleaned {

@@ -22,7 +22,9 @@
 //! restored under the name `to` in the folder it came from, never over anything
 //! (`trash.restore_conflict` for a taken name). What `to` is depends on the entry:
 //! - a whole asset folder (`projects/<p>/assets/<a>`, as `asset.trash` leaves it): `to` is a
-//!   free asset id (`params.invalid` otherwise). Holding the version lock of `<p>/<to>`, the
+//!   free asset id (`params.invalid` otherwise). `registry/redirects.yaml` must be readable
+//!   first (its error, `manifest.needs_repair` for one that doesn't parse, and nothing moves;
+//!   review M-4). Holding the version lock of `<p>/<to>`, the
 //!   folder moves to `projects/<p>/assets/<to>/`, read-only re-applied where hashes match, and
 //!   `projects::repair::restored_as` appends the redirect `<p>/<a>` → `<p>/<to>` (`by` the
 //!   caller, as `asset.accept_move` writes one; no `actor` until attribution), renames the
@@ -54,6 +56,7 @@ use super::registry::{CallCtx, Registry, typed_tool};
 use super::services::{AssetServices, ResourceIds};
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::{asset_topic, status_by};
+use crate::projects::Resolver;
 use crate::projects::repair::restored_as;
 use crate::store::{Personal, RestoreRewrite, Store, StoreError, TrashRecord, WsPath};
 
@@ -299,7 +302,8 @@ fn current_name(kind: &EntryKind, original: &str) -> String {
 
 fn inside_asset(original: &str) -> Refused {
     params_invalid(format!(
-        "{original} is inside an asset folder, whose manifest names it, so it is restored only          under its own name: leave out to"
+        "{original} is inside an asset folder, whose manifest names it, so it is restored only \
+         under its own name: leave out to"
     ))
 }
 
@@ -353,30 +357,35 @@ async fn restore_workspace(
                      characters)"
                 )));
             }
+            // The redirects file must be readable before anything moves (review M-4): the
+            // restore appends to it. A crash after the move is still finished by
+            // `asset.accept_move` (module docs).
+            {
+                let resolver = Resolver::load(&open.index, store)
+                    .await
+                    .map_err(|e| Refused::Body(Box::new(e)))?;
+                if let Some(e) = resolver.file_error() {
+                    return Err(Refused::Body(Box::new(e.clone())));
+                }
+            }
             // The new name's version lock, as a sign-off or a repair of it would hold it.
             let guard = store.version_lock(&project, to).lock_owned().await;
             let path = store
                 .trash_restore_to(&args.entry_id, Some(to), None)
                 .await?;
             let by = status_by(&ctx.session.caller);
-            restored_as(
-                &open.index,
-                store,
-                &project,
-                &old_id,
-                to,
-                by.as_str(),
-                None,
-            )
-            .await
-            .map_err(|mut e| {
-                // The folder is back already: say so, and how the rest gets done.
-                e.message = format!(
-                    "The asset was restored as {path}, but its redirect and manifest weren't                      updated: {} Once that is fixed, asset.accept_move {{asset_id: {to}}}                      finishes it.",
-                    e.message
-                );
-                Refused::Body(Box::new(e))
-            })?;
+            restored_as(&open.index, store, &project, &old_id, to, by.as_str(), None)
+                .await
+                .map_err(|mut e| {
+                    // The folder is back already: say so, and how the rest gets done.
+                    e.message = format!(
+                        "The asset was restored as {path}, but its redirect and manifest weren't \
+                     updated: {} Once that is fixed, asset.accept_move {{asset_id: {to}}} \
+                     finishes it.",
+                        e.message
+                    );
+                    Refused::Body(Box::new(e))
+                })?;
             drop(guard);
             let (from, to_name) = (format!("{project}/{old_id}"), format!("{project}/{to}"));
             let event = json!({"kind": "moved", "from": from, "to": to_name});

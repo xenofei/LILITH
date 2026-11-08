@@ -225,34 +225,14 @@ fn on_disk(probe: &dyn Probe, root: &Path, name: &Name) -> bool {
     manifest_in(probe, &dir, a).is_some()
 }
 
-/// The manifest file of the asset folder `dir` (of `asset_id`) as the index finds it:
-/// `<asset_id>.manifest.json`, else the first `*.manifest.json` directly in it; a file, not a
-/// link.
+/// The manifest file of the asset folder `dir` (of `asset_id`) as the index finds it
+/// ([`crate::store::asset_manifests`]: `<asset_id>.manifest.json`, else the first
+/// `*.manifest.json` directly in it; a file, not a link).
 fn manifest_in(probe: &dyn Probe, dir: &Path, asset_id: &str) -> Option<String> {
-    let is_file = |path: &Path| {
-        probe
-            .identity(path)
-            .is_ok_and(|id| id.attributes & DIRECTORY == 0 && !is_link(probe, path, id.attributes))
-    };
-    let canonical = format!("{asset_id}.manifest.json");
-    if is_file(&dir.join(&canonical)) {
-        return Some(canonical);
-    }
-    let mut found: Vec<String> = probe
-        .read_dir(dir)
+    crate::store::asset_manifests(probe, dir, &[asset_id])
         .ok()?
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .ends_with(".manifest.json")
-                && is_file(&e.path())
-        })
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    found.sort();
-    found.into_iter().next()
+        .into_iter()
+        .next()
 }
 
 /// `names`' liveness, checked on a blocking thread.

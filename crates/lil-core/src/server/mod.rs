@@ -115,9 +115,11 @@ use crate::workspace::WorkspaceHub;
 /// - a job: an unfinished (`queued` or `running`) job in the workspace's `state.db` whose row,
 ///   or whose stored arguments (`project`/`asset_id`, or `asset: {project, asset_id}`), name
 ///   the asset; a job's own project stands in for arguments that name none;
-/// - a hold: a document hold the workspace's sessions can see (its own and loose ones) whose
-///   path, absolute or relative as the hold keeps it, normalised to the workspace-relative
-///   form, is the asset folder or lies under it.
+/// - a hold: a document hold whose path, as the hold keeps it, reaches the asset folder or
+///   something under it: a relative path of a hold the workspace's sessions can see (its own and
+///   loose ones), taken under the workspace, or an absolute path of any hold. Both are resolved
+///   to their final form first ([`final_form`]: trailing dots and spaces, 8.3 names and
+///   junctions, review M-1), as is the workspace's root, then compared.
 ///
 /// Names compare without regard to case, as Windows paths do. A `state.db` that can't be read
 /// is an error, so the trash is refused (fail closed).
@@ -143,45 +145,73 @@ fn job_names_asset(job: &crate::jobs::record::JobRow, project: &str, asset_id: &
         || (same(job.asset_id.as_deref(), asset_id) && same(job.project.as_deref(), project))
 }
 
-/// `path` (a hold's, absolute or relative) as a workspace-relative path with `/` separators
-/// and no `.` or `..` parts, when it is inside the workspace `root`.
-fn workspace_relative(root: &std::path::Path, path: &str) -> Option<String> {
-    use std::path::Component;
-    let strip = |text: &str| -> String {
-        let text = text.replace('/', "\\");
-        text.strip_prefix(r"\\?\")
-            .map_or(text.clone(), str::to_string)
-    };
-    let held = std::path::PathBuf::from(strip(path));
-    let mut parts: Vec<String> = Vec::new();
-    let relative = if held.is_absolute() {
-        let root = std::path::PathBuf::from(strip(&root.to_string_lossy()));
-        let (held_parts, root_parts): (Vec<_>, Vec<_>) =
-            (held.components().collect(), root.components().collect());
-        let key = |c: &Component| c.as_os_str().to_string_lossy().to_lowercase();
-        if held_parts.len() < root_parts.len()
-            || held_parts
-                .iter()
-                .zip(&root_parts)
-                .any(|(a, b)| key(a) != key(b))
-        {
-            return None;
-        }
-        held_parts[root_parts.len()..].to_vec()
+/// `path` as Windows reaches it: lexically normalised (`/` as `\`, the `\\?\` prefix, `.` and
+/// `..` parts), each component's trailing dots and spaces stripped as Win32 strips them, then
+/// the deepest part that exists replaced by its final path (`std::fs::canonicalize`, through
+/// `GetFinalPathNameByHandleW`), so 8.3 short names and junctions resolve to the folder they
+/// name (review M-1). A relative `path` is taken under `root`. `None` when no part of it exists.
+fn final_form(root: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    let text = path.replace('/', "\\");
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
+    let given = PathBuf::from(&text);
+    let joined = if given.is_absolute() {
+        given
     } else {
-        held.components().collect()
+        root.join(given)
     };
-    for c in relative {
+    let mut head = PathBuf::new();
+    let mut parts: Vec<String> = Vec::new();
+    for c in joined.components() {
         match c {
-            Component::Normal(name) => parts.push(name.to_string_lossy().into_owned()),
+            Component::Prefix(_) | Component::RootDir => head.push(c.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
                 parts.pop()?;
             }
-            Component::Prefix(_) | Component::RootDir => return None,
+            Component::Normal(name) => {
+                let name = name.to_string_lossy();
+                let trimmed = name.trim_end_matches(['.', ' ']);
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
         }
     }
-    Some(parts.join("/"))
+    for keep in (0..=parts.len()).rev() {
+        let mut existing = head.clone();
+        existing.extend(&parts[..keep]);
+        if let Ok(found) = std::fs::canonicalize(&existing) {
+            let text = found.to_string_lossy().into_owned();
+            let mut out = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
+            out.extend(&parts[keep..]);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// `held`, a hold's path in its final form ([`final_form`]), relative to `root`'s final form,
+/// with `/` separators, when it is inside it; compared without regard to case.
+fn workspace_relative(root: &std::path::Path, held: &std::path::Path) -> Option<String> {
+    let key = |c: std::path::Component| c.as_os_str().to_string_lossy().to_lowercase();
+    let root_parts: Vec<String> = root.components().map(key).collect();
+    let held_parts: Vec<std::path::Component> = held.components().collect();
+    if held_parts.len() < root_parts.len()
+        || held_parts
+            .iter()
+            .zip(&root_parts)
+            .any(|(a, b)| key(*a) != *b)
+    {
+        return None;
+    }
+    Some(
+        held_parts[root_parts.len()..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 impl crate::tools::AssetUse for ServerAssetUse {
@@ -219,15 +249,37 @@ impl crate::tools::AssetUse for ServerAssetUse {
                 return Ok(Some(InUse::Job));
             }
             let folder = format!("projects/{project}/assets/{asset_id}").to_lowercase();
-            let held = self
+            // A relative path is a hold of this workspace (or a loose one); an absolute path
+            // counts from any workspace's hold (review M-1): it names the folder it reaches.
+            let own: Vec<String> = self
                 .holds
                 .list_for(Some(&workspace.ws.id))
                 .into_iter()
-                .filter_map(|h| workspace_relative(&workspace.ws.path, &h.path))
-                .any(|rel| {
-                    let rel = rel.to_lowercase();
-                    rel == folder || rel.starts_with(&format!("{folder}/"))
-                });
+                .map(|h| h.path)
+                .collect();
+            let absolute = self
+                .holds
+                .list()
+                .into_iter()
+                .map(|h| h.path)
+                .filter(|p| std::path::Path::new(&p.replace('/', "\\")).is_absolute());
+            let paths: Vec<String> = own.into_iter().chain(absolute).collect();
+            let root = workspace.ws.path.clone();
+            let held = tokio::task::spawn_blocking(move || {
+                let Some(root) = final_form(&root, "") else {
+                    return false;
+                };
+                paths.iter().any(|p| {
+                    final_form(&root, p)
+                        .and_then(|held| workspace_relative(&root, &held))
+                        .is_some_and(|rel| {
+                            let rel = rel.to_lowercase();
+                            rel == folder || rel.starts_with(&format!("{folder}/"))
+                        })
+                })
+            })
+            .await
+            .unwrap_or(true);
             if held {
                 return Ok(Some(InUse::Hold));
             }

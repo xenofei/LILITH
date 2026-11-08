@@ -2204,7 +2204,8 @@ fn in_use_error(by: InUse) -> ErrorBody {
 fn unwired() -> ErrorBody {
     ErrorBody::new(
         &STATE_UNAVAILABLE,
-        "Whether this asset is in use can't be told yet (the core is still starting), so it          isn't moved to the trash; retry in a moment.",
+        "Whether this asset is in use can't be told yet (the core is still starting), so it \
+         isn't moved to the trash; retry in a moment.",
         "",
     )
 }
@@ -2218,12 +2219,7 @@ async fn not_in_use(
     asset_id: &str,
 ) -> Result<(), ErrorBody> {
     let Some(asset_use) = services.asset_use.get().cloned() else {
-        return Err(ErrorBody::new(
-            &STATE_UNAVAILABLE,
-            "Whether this asset is in use can't be told yet (the core is still starting), so it \
-             isn't moved to the trash; retry in a moment.",
-            "",
-        ));
+        return Err(unwired());
     };
     match asset_use.in_use(open, project, asset_id).await? {
         None => Ok(()),
@@ -2287,34 +2283,27 @@ async fn trash_facts(
     }))
 }
 
-/// The paths the asset's manifest `locks`, workspace-relative, sorted and deduplicated (owner
-/// decision 2026-11-07: the card's warning). A manifest that can't be read refuses (the facts
-/// would be wrong).
+/// The paths the asset's manifests `locks`, workspace-relative under the folder as it is now,
+/// sorted and deduplicated (owner decision 2026-11-07: the card's warning). Every manifest of
+/// the folder counts, found as the index finds them (`Store::asset_locks`), so a folder renamed
+/// outside the suite still warns (review I-1). A manifest that doesn't parse refuses
+/// (`manifest.needs_repair`): the facts would be wrong.
 async fn locked_paths(
     open: &OpenWorkspace,
     project: &str,
     asset_id: &str,
 ) -> Result<Vec<String>, ErrorBody> {
-    let rel = WsPath::parse(&format!(
-        "projects/{project}/assets/{asset_id}/{asset_id}.manifest.json"
-    ))
-    .map_err(|e| e.to_error(""))?;
-    let Some(manifest) = read_manifest(&open.store, &rel)
+    let folder = format!("projects/{project}/assets/{asset_id}");
+    let found: BTreeSet<String> = open
+        .store
+        .asset_locks(&folder)
         .await
         .map_err(|e| e.to_error(""))?
-    else {
-        return Ok(Vec::new());
-    };
-    let found: BTreeSet<String> = manifest
-        .view()
-        .locks
-        .iter()
+        .into_iter()
+        .flat_map(|(_, locks)| locks)
         .map(|entry| {
             let entry = entry.replace('\\', "/");
-            format!(
-                "projects/{project}/assets/{asset_id}/{}",
-                entry.trim_start_matches('/')
-            )
+            format!("{folder}/{}", entry.trim_start_matches('/'))
         })
         .collect();
     Ok(found.into_iter().collect())

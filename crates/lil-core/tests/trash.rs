@@ -3451,3 +3451,229 @@ fn crash_after_the_move_restores_cleanly() {
     let detail = pipe.tool_ok("asset.get", trash_args(CRANE), None);
     assert_eq!(detail["approved_version"], "1.0.0", "{detail}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 11, fix round 1 (review I-1, M-1 to M-4).
+// ---------------------------------------------------------------------------------------------
+
+/// The crane's folder renamed in Explorer to `chr_origami`: its manifest keeps its file name,
+/// `chr_paper_crane.manifest.json`, and its `locks` (CORE-154's `moved` state).
+fn crane_folder_renamed(ws: &Path) {
+    explorer_rename(&asset_path(ws, CRANE), &asset_path(ws, ORIGAMI));
+}
+
+/// Review I-1 (PL-1): an asset folder whose manifest isn't `<asset_id>.manifest.json` (renamed
+/// in Explorer) is found as the resolver finds it, so the card still warns about its locked
+/// files, with their paths under the folder as it is now.
+#[tokio::test] // spec: CORE-157, CORE-035, CORE-154
+async fn a_renamed_locked_asset_still_warns_on_the_card() {
+    let (fx, _fake) = AssetFx::faked(crane_folder_renamed).await;
+    let p = pending_of(
+        &fx.call_as(&fx.app(), "asset.trash", trash_args(ORIGAMI), Some(&tkey()))
+            .await,
+    );
+    let facts = fx.pending_view(&p.confirmation_id).await["facts"].clone();
+    assert_eq!(
+        facts["locked"],
+        json!([format!("projects/{P4}/assets/{ORIGAMI}/prompts/crane.txt")]),
+        "{facts}"
+    );
+    assert_eq!(facts["locked_total"], 1, "{facts}");
+    fx.shutdown().await;
+}
+
+/// Review I-1, the store side: any other trash of a renamed asset folder holding a locked path
+/// is refused with `store.locked` (ruling P3-R7), its manifest found under its own name, and
+/// nothing moves; a folder whose manifest doesn't parse is refused too (its locks can't be
+/// known: fail closed).
+#[tokio::test(start_paused = true)] // spec: CORE-035, CORE-154, ARCH-058
+async fn a_plain_trash_of_a_renamed_locked_asset_folder_is_refused() {
+    let ws = workspace();
+    let store = ws.store();
+    sealed_version(&ws, &store).await;
+    let mut m: Value = serde_json::from_slice(&ws.read(MANIFEST)).unwrap();
+    m["locks"] = json!(["notes.txt"]);
+    write_file(
+        &ws.file(MANIFEST),
+        serde_json::to_vec_pretty(&m).unwrap().as_slice(),
+    );
+    write_file(&ws.file(&format!("{ASSET}/notes.txt")), b"locked");
+    let renamed = "projects/sketchbook/assets/heron";
+    explorer_rename(&ws.file(ASSET), &ws.file(renamed));
+    let before = files_of(&ws.file(renamed));
+    let refused = store.trash(&p(renamed), "test").await.unwrap_err();
+    assert!(
+        matches!(&refused, StoreError::Locked(path) if path.as_str() == format!("{renamed}/notes.txt")),
+        "{refused:?}"
+    );
+    assert_eq!(files_of(&ws.file(renamed)), before, "nothing moved");
+
+    // A manifest that doesn't parse: its locks can't be known, so the folder isn't trashed.
+    write_file(
+        &ws.file(&format!("{renamed}/crane.manifest.json")),
+        b"{ not json",
+    );
+    let refused = store.trash(&p(renamed), "test").await.unwrap_err();
+    assert!(matches!(refused, StoreError::NeedsRepair(_)), "{refused:?}");
+    assert_eq!(files_of(&ws.file(renamed)).len(), before.len());
+    assert!(store.trash_list().await.unwrap().is_empty());
+}
+
+/// Review M-3 (PC-3): a resource restored under a new id while its payload is held (Defender,
+/// Search) is `store.busy` after the store's retries, and nothing changes: no new file, the
+/// entry still in the trash. Once released, the restore finishes and the entry is gone, so no
+/// later restore can make the resource twice.
+#[tokio::test(start_paused = true)] // spec: CORE-037, ARCH-074
+async fn a_held_payload_makes_a_restore_with_a_new_id_busy_and_keeps_the_entry() {
+    let ws = workspace();
+    let store = ws.store();
+    let original = "library/resources/swatch/res_dawn.json";
+    write_file(
+        &ws.file(original),
+        b"{\n  \"schema_version\": 1,\n  \"kind\": \"swatch\",\n  \"id\": \"res_dawn\"\n}\n",
+    );
+    let record = store.trash(&p(original), "resource.delete").await.unwrap();
+    let rewrite: lil_core::store::RestoreRewrite = Arc::new(|bytes: &[u8]| {
+        Ok(String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .replace("res_dawn", "res_dusk")
+            .into_bytes())
+    });
+    let payload = entry_dir(&ws, &record)
+        .join("payload")
+        .join("res_dawn.json");
+    let holder = HandleHolder::hold(&payload, Share::Read);
+    let refused = store
+        .trash_restore_to(
+            &record.entry_id,
+            Some("res_dusk.json"),
+            Some(rewrite.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, StoreError::Busy(_)), "{refused:?}");
+    assert!(
+        !ws.exists("library/resources/swatch/res_dusk.json"),
+        "nothing written"
+    );
+    assert_eq!(
+        store.trash_list().await.unwrap().len(),
+        1,
+        "the entry stays"
+    );
+    holder.release();
+
+    let restored = store
+        .trash_restore_to(&record.entry_id, Some("res_dusk.json"), Some(rewrite))
+        .await
+        .unwrap();
+    assert_eq!(restored.as_str(), "library/resources/swatch/res_dusk.json");
+    assert!(
+        ws.read("library/resources/swatch/res_dusk.json")
+            .ends_with(b"\"res_dusk\"\n}\n")
+    );
+    assert!(
+        store.trash_list().await.unwrap().is_empty(),
+        "the entry is gone"
+    );
+    assert!(matches!(
+        store.trash_restore(&record.entry_id).await,
+        Err(StoreError::TrashUnknown(_))
+    ));
+    assert!(!ws.exists(original), "never restored twice");
+}
+
+/// Review M-4 (PC-1): a whole asset's `trash.restore {to}` checks the redirects file before
+/// anything moves: a file that doesn't parse refuses the restore, and the entry stays.
+#[tokio::test] // spec: CORE-037, ARCH-125
+async fn restore_to_with_unreadable_redirects_moves_nothing() {
+    let (fx, _fake) = AssetFx::faked(|_| {}).await;
+    let entry_id = fx.trash_ok(CRANE).await;
+    write_file(
+        &ws_file(&fx.ws, "registry/redirects.yaml"),
+        b"redirects: [\n",
+    );
+    let e = fx
+        .err(
+            "trash.restore",
+            json!({"entry_id": entry_id, "to": ORIGAMI}),
+        )
+        .await;
+    assert_eq!(e.code, "manifest.needs_repair", "{e:?}");
+    assert!(!e.message.contains("  "), "readable: {}", e.message);
+    assert!(!asset_path(&fx.ws, ORIGAMI).exists(), "nothing moved");
+    assert_eq!(fx.trash_entries().await.len(), 1, "the entry stays");
+    fx.shutdown().await;
+}
+
+/// Review M-2: the messages of `trash.restore {to}` inside an asset folder and of an unwired
+/// in-use check read as text (no runs of spaces from a lost line continuation).
+#[tokio::test] // spec: CORE-037, CORE-157
+async fn trash_messages_have_no_runs_of_spaces() {
+    let fx = AssetFx::with(|_| {}, AssetServices::unwired()).await;
+    let e = err_of(
+        &fx.call_as(&fx.app(), "asset.trash", trash_args(CRANE), Some(&tkey()))
+            .await,
+        "unwired",
+    );
+    assert!(!e.message.contains("  "), "{}", e.message);
+    let inside = format!("projects/{P4}/assets/{LAMP}/prompts/signal_lamp.txt");
+    let trashed = fx.ok("test.trash", json!({ "path": inside })).await;
+    let e = fx
+        .err(
+            "trash.restore",
+            json!({"entry_id": trashed["entry_id"], "to": "other.txt"}),
+        )
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(!e.message.contains("  "), "{}", e.message);
+    fx.shutdown().await;
+}
+
+/// Review M-1 (PH-1): a document hold that names the asset folder through an alias counts as a
+/// use too: a trailing dot (Win32 strips it), the 8.3 form of the workspace's path, and a
+/// junction to the workspace. Each is resolved to the folder's final path before it is compared.
+#[test] // spec: CORE-157
+fn holds_through_aliases_of_the_folder_count_as_in_use() {
+    let env = TestEnv::new();
+    let ws = served_workspace(&env, "hold-aliases");
+    let _core = app_core(&env, FailPoints::none());
+    let mut pipe = cli_pipe(&env, &ws);
+    let mut app = TestApp::start(&env, Some(&ws), &[]);
+    let crane = asset_path(&ws, CRANE);
+    let short = lil_platform::fs::short_name(&ws).expect("the 8.3 form of the workspace");
+    let link = env.root().join("ws_link");
+    junction(&link, &ws);
+    let under = |root: &Path| {
+        root.join("projects")
+            .join(P4)
+            .join("assets")
+            .join(CRANE)
+            .join("work")
+            .join("a.lil")
+            .to_string_lossy()
+            .into_owned()
+    };
+    for path in [
+        format!("projects/{P4}/assets/{CRANE}./work/a.lil"),
+        format!("projects/{P4}/assets/{CRANE} /work/a.lil"),
+        under(&short),
+        under(&link),
+    ] {
+        let mut holder = TestApp::start(&env, Some(&ws), &[]);
+        let held = holder.tool(
+            "test.hold",
+            json!({"doc_id": "doc_alias", "path": path}),
+            Some(&tkey()),
+        );
+        assert_eq!(held["status"], "ok", "{held}");
+        let out = app_trash(&mut app);
+        assert_eq!(out["error"]["code"], "asset.in_use", "{path}: {out}");
+        assert!(crane.is_dir(), "{path}: nothing moved");
+        drop(holder);
+        wait_no_holds(&mut pipe);
+    }
+    remove_empty_outside(&link);
+    let ran = app_trash(&mut app);
+    assert_eq!(ran["status"], "ok", "{ran}");
+}
