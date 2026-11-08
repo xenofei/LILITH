@@ -4056,7 +4056,8 @@ async fn restore_to_a_redirected_name_warns() {
 async fn a_core_restart_cancels_the_apps_pending_questions() {
     let env = TestEnv::new();
     let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).expect("the suite state.db"));
-    let clock: Arc<dyn Clock> = FakeClock::new();
+    let fake = FakeClock::new();
+    let clock: Arc<dyn Clock> = fake.clone();
     let events = Arc::new(EventBus::new(clock.clone()));
     let ids: Arc<dyn lil_platform::IdSource> = Arc::new(SeqIds::new());
     let confirm = |ids: Arc<dyn lil_platform::IdSource>| {
@@ -4108,7 +4109,8 @@ async fn a_core_restart_cancels_the_apps_pending_questions() {
         .unwrap();
     drop(before);
 
-    // The next core run (the same id source, so its ids stay new).
+    // The next core run, a second later (the same id source, so its ids stay new).
+    fake.advance(Duration::from_secs(1));
     let after = confirm(ids.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     events.attach(9, tx);
@@ -4239,4 +4241,219 @@ async fn restore_to_never_takes_over_refs_that_reach_another_asset() {
         ORIGAMI
     );
     fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 11, audit fix round 2 (re-check RL-1, RL-2).
+// ---------------------------------------------------------------------------------------------
+
+/// Re-check RL-2: FR1 also holds between two legacy assets (no `creation_uuid`): a live end at
+/// another folder counts as another asset unless both creation UUIDs are present and equal. A
+/// legacy asset restored under a new id gets no redirect from its old id when old refs to that
+/// id already reach another live legacy asset, and a warning says so.
+#[tokio::test] // spec: ARCH-125, CORE-037, CORE-047
+async fn restore_to_between_legacy_assets_never_takes_over_refs() {
+    const HERON: &str = "chr_heron";
+    let (fx, _fake) = AssetFx::faked(|ws| {
+        // The crane, without its creation UUID, moved to the heron by hand, with a redirect.
+        edit_by_hand(ws, CRANE, |m| {
+            lil_schema::remove_key(m.as_object_mut().unwrap(), "creation_uuid");
+        });
+        explorer_rename(&asset_path(ws, CRANE), &asset_path(ws, HERON));
+        explorer_rename(
+            &asset_path(ws, HERON).join(format!("{CRANE}.manifest.json")),
+            &asset_path(ws, HERON).join(format!("{HERON}.manifest.json")),
+        );
+        edit_by_hand(ws, HERON, |m| m["asset_id"] = json!(HERON));
+        write_file(
+            &ws_file(ws, "registry/redirects.yaml"),
+            format!(
+                "redirects:\n  - from: {P4}/{CRANE}\n    to: {P4}/{HERON}\n    moved_utc: 2026-11-01T10:00:00Z\n    by: cli\n"
+            )
+            .as_bytes(),
+        );
+        // Another legacy asset under the crane's old name.
+        explorer_copy(&asset_path(ws, LAMP), &asset_path(ws, CRANE));
+        explorer_rename(
+            &asset_path(ws, CRANE).join(format!("{LAMP}.manifest.json")),
+            &asset_path(ws, CRANE).join(format!("{CRANE}.manifest.json")),
+        );
+        edit_by_hand(ws, CRANE, |m| {
+            m["asset_id"] = json!(CRANE);
+            lil_schema::remove_key(m.as_object_mut().unwrap(), "creation_uuid");
+        });
+    })
+    .await;
+    let entry_id = fx.trash_ok(CRANE).await;
+    let restored = fx
+        .ok(
+            "trash.restore",
+            json!({"entry_id": entry_id, "to": ORIGAMI}),
+        )
+        .await;
+    assert_eq!(
+        restored["warnings"],
+        json!([format!(
+            "Old refs to {P4}/{CRANE} keep reaching {P4}/{HERON}; no redirect was added for the \
+             restored asset."
+        )]),
+        "{restored}"
+    );
+    let redirects = fx.redirects().unwrap();
+    assert_eq!(
+        redirects.matches("- from:").count(),
+        1,
+        "no crane → origami: {redirects}"
+    );
+    let r = fx
+        .ok("ref.resolve", json!({ "ref": fx.sealed(CRANE) }))
+        .await;
+    assert_eq!(r["asset_id"], HERON, "{r}");
+    fx.shutdown().await;
+}
+
+/// The two runs of a core's confirmations over one `state.db` registry, on one fake clock:
+/// `before` makes rows, then the clock moves on, then `after` starts.
+fn confirm_of(
+    states: &Arc<StateRegistry>,
+    clock: &Arc<FakeClock>,
+    ids: &Arc<dyn lil_platform::IdSource>,
+) -> Arc<Confirm> {
+    let dyn_clock: Arc<dyn Clock> = clock.clone();
+    Confirm::new(
+        states.clone(),
+        Arc::new(EventBus::new(dyn_clock.clone())),
+        dyn_clock,
+        ids.clone(),
+        UiPresence::new(),
+        Arc::new(NoNotificationPath),
+        Duration::from_secs(30 * 60),
+        McpConfirmation::Core,
+        FailPoints::none(),
+    )
+}
+
+fn ui_request(scope_ws: &str, key: &str) -> lil_core::confirm::ConfirmRequest {
+    lil_core::confirm::ConfirmRequest {
+        scope: format!("ui:test|{scope_ws}"),
+        idem_key: key.into(),
+        tool: "asset.trash".into(),
+        args_hash: "h".into(),
+        arguments: json!({}),
+        caller_kind: "ui:test".into(),
+        session_id: "s_app".into(),
+        project: None,
+        covers: vec![lil_protocol::Cover::Confirm],
+        cap: None,
+        files: None,
+        facts: None,
+        facts_sha256: None,
+    }
+}
+
+/// Re-check RL-1: an app's question made in a workspace the new core never `load`s (not the
+/// default) is cancelled the first time this core sees it: by a list, or by the app's retry
+/// with its key (`confirm.expired`, cancelled).
+#[tokio::test] // spec: CORE-157, APP-044
+async fn an_earlier_runs_app_question_in_another_workspace_ends_when_first_seen() {
+    let (fx, _fake) = AssetFx::faked(|_| {}).await;
+    let ws_id = fx.ws_id();
+    let clock = FakeClock::new();
+    let ids: Arc<dyn lil_platform::IdSource> = Arc::new(SeqIds::new());
+    let before = confirm_of(&fx.states, &clock, &ids);
+    let listed_one = before
+        .request(ui_request(&ws_id, "k-listed"))
+        .await
+        .unwrap();
+    let retried_one = before
+        .request(ui_request(&ws_id, "k-retried"))
+        .await
+        .unwrap();
+    drop(before);
+    clock.advance(Duration::from_secs(1));
+    let after = confirm_of(&fx.states, &clock, &ids);
+
+    let pending = after.list(ListState::Pending, 50).await.unwrap();
+    assert!(
+        pending.is_empty(),
+        "{:?}",
+        pending.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+    let history = after.list(ListState::History, 50).await.unwrap();
+    let state_of = |id: &str| history.iter().find(|r| r.id == id).map(|r| r.state.wire());
+    assert_eq!(state_of(&listed_one.confirmation_id), Some("cancelled"));
+    assert_eq!(state_of(&retried_one.confirmation_id), Some("cancelled"));
+    drop(after);
+
+    // And through a retry first, in a third run.
+    let third_run = {
+        let again = confirm_of(&fx.states, &clock, &ids);
+        let row = again
+            .request(ui_request(&ws_id, "k-retry-first"))
+            .await
+            .unwrap();
+        drop(again);
+        clock.advance(Duration::from_secs(1));
+        (confirm_of(&fx.states, &clock, &ids), row)
+    };
+    let (third, row) = third_run;
+    let db = fx
+        .states
+        .workspace_db(&ws_id)
+        .expect("the workspace's state.db");
+    let scope = format!("ui:test|{ws_id}");
+    let replay = third
+        .on_replay(
+            &db,
+            lil_core::tools::IdemRef {
+                scope: &scope,
+                key: "k-retry-first",
+                args_hash: "h",
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay, lil_core::confirm::Replay::Cancelled),
+        "{replay:?}"
+    );
+    let history = third.list(ListState::History, 50).await.unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .find(|r| r.id == row.confirmation_id)
+            .map(|r| r.state.wire()),
+        Some("cancelled")
+    );
+    drop(third);
+    fx.shutdown().await;
+}
+
+/// Re-check RL-1: a question an app makes while the core starts (its row written before the
+/// workspace's `load` reads the table, not yet tracked) is this run's, and `load` keeps it.
+#[tokio::test] // spec: CORE-157, APP-044
+async fn an_app_question_made_while_the_core_starts_survives_load() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).expect("the suite state.db"));
+    let clock = FakeClock::new();
+    let ids: Arc<dyn lil_platform::IdSource> = Arc::new(SeqIds::new());
+    // This core run starts; another handle writes the app's row at the same instant, as
+    // `request` does before it tracks the row.
+    let core = confirm_of(&states, &clock, &ids);
+    let writer = confirm_of(&states, &clock, &ids);
+    let made = writer
+        .request(ui_request("none", "k-startup"))
+        .await
+        .unwrap();
+    core.load(states.suite()).await.unwrap();
+    let pending: Vec<String> = core
+        .list(ListState::Pending, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(pending, [made.confirmation_id], "kept");
+    drop((core, writer));
+    states.close();
 }

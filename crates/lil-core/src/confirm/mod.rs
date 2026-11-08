@@ -410,6 +410,9 @@ pub struct Confirm {
     ended: Mutex<Ended>,
     /// The caps: stage 5's cap half and a cap answer's `raise`.
     caps: std::sync::OnceLock<Arc<Caps>>,
+    /// When this core's confirmations started (Unix seconds, the core's clock): an app's
+    /// pending confirmation made before it belongs to an earlier core run (re-check RL-1).
+    started_utc: i64,
 }
 
 impl std::fmt::Debug for Confirm {
@@ -437,7 +440,12 @@ impl Confirm {
         mcp: McpConfirmation,
         failpoints: Arc<FailPoints>,
     ) -> Arc<Confirm> {
+        let started_utc = clock
+            .utc_now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         Arc::new(Confirm {
+            started_utc,
             states,
             events,
             clock,
@@ -709,6 +717,12 @@ impl Confirm {
             ConfState::Pending if row.expires_utc <= self.now() => {
                 self.expire(db, &row.id).await?;
                 Replay::Expired
+            }
+            // An app's question of an earlier core run, first seen now (another workspace):
+            // its session ended with that run (re-check RL-1).
+            ConfState::Pending if self.made_in_an_earlier_run(&row) => {
+                self.cancel_earlier_run(db, &row).await?;
+                Replay::Cancelled
             }
             ConfState::Pending => {
                 // Known only now (a workspace opened after the start): its toast too.
@@ -1021,6 +1035,20 @@ impl Confirm {
                         .map_err(|e| state_error(&e))?;
                     continue;
                 }
+                if self.made_in_an_earlier_run(&row) {
+                    // An app's question of an earlier core run, first seen now: it ends, and
+                    // a history list shows it cancelled (re-check RL-1).
+                    let ended = self
+                        .cancel_earlier_run(&db, &row)
+                        .await
+                        .map_err(|e| state_error(&e))?;
+                    if state == ListState::History
+                        && let Some(ended) = ended
+                    {
+                        rows.push(ended);
+                    }
+                    continue;
+                }
                 if row.state == ConfState::Pending {
                     self.track(&row);
                 }
@@ -1087,10 +1115,8 @@ impl Confirm {
 
     /// Learns the pending confirmations of `db` (the suite database, or an open workspace's),
     /// as a core does at start: an agent's survive a restart (the agent retries with its
-    /// token). A pending one a `ui:*` session made that this core doesn't know of (a cap prompt,
-    /// an `EveryCaller` question) was made in an earlier core run, whose sessions ended with it:
-    /// it is cancelled and published as `cancelled` (audit L-3), as its app's exit would have
-    /// done. Returns how many stay pending.
+    /// token); an app's made in an earlier core run are cancelled ([`Confirm::made_in_an_earlier_run`]).
+    /// Returns how many stay pending.
     ///
     /// # Errors
     /// The database failed.
@@ -1098,21 +1124,42 @@ impl Confirm {
         let rows = store::pending(db).await?;
         let mut kept = 0;
         for row in &rows {
-            let known = self.tracked().contains_key(&row.id);
-            if row.caller_kind.starts_with("ui:") && !known {
-                let ended =
-                    store::end(db, &row.id, ConfState::Cancelled, None, None, None, None).await?;
-                if let Some(ended) = ended {
-                    tracing::info!(confirmation = %row.id, "an app's confirmation of an earlier core run is cancelled");
-                    lock(&self.ended).add(&row.id);
-                    self.publish("cancelled", &ended);
-                }
+            if self.made_in_an_earlier_run(row) {
+                self.cancel_earlier_run(db, row).await?;
                 continue;
             }
             self.track(row);
             kept += 1;
         }
         Ok(kept)
+    }
+
+    /// Whether `row` is a pending confirmation a `ui:*` session made before this core started
+    /// (a cap prompt, an `EveryCaller` question): that session ended with the earlier core run,
+    /// so nothing will end the question but its expiry (audit L-3, re-check RL-1). Decided by
+    /// the row's creation time against this core's start, so a question an app makes while
+    /// this core starts is never taken for one.
+    fn made_in_an_earlier_run(&self, row: &ConfirmationRow) -> bool {
+        row.state == ConfState::Pending
+            && row.caller_kind.starts_with("ui:")
+            && row.created_utc < self.started_utc
+    }
+
+    /// Cancels `row` of `db`, an app's question of an earlier core run, as its app's exit
+    /// would have; published `cancelled` if this ended it. Returns the ended row.
+    async fn cancel_earlier_run(
+        &self,
+        db: &StateDb,
+        row: &ConfirmationRow,
+    ) -> Result<Option<ConfirmationRow>, StateError> {
+        self.untrack(&row.id);
+        let ended = store::end(db, &row.id, ConfState::Cancelled, None, None, None, None).await?;
+        lock(&self.ended).add(&row.id);
+        if let Some(ended) = &ended {
+            tracing::info!(confirmation = %row.id, "an app's confirmation of an earlier core run is cancelled");
+            self.publish("cancelled", ended);
+        }
+        Ok(ended)
     }
 
     /// `tools` (of `reg`) as `caller` sees them in `tools/list`: with

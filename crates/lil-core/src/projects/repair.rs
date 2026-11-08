@@ -435,7 +435,8 @@ pub enum OldRefs {
     Free,
     /// An asset in the trash: its entry.
     Trashed(String),
-    /// A live asset with another creation UUID (or none where `to` has one): its name.
+    /// A live asset that isn't known to be this one (its creation UUID differs, or either has
+    /// none): its name.
     Elsewhere(Name),
 }
 
@@ -471,7 +472,13 @@ pub async fn old_refs(
                 .await
                 .map_err(|e| e.to_error(""))?
                 .and_then(|r| uuid_key(&r));
-            Ok(if !same_folder && end_uuid.as_deref() != uuid {
+            // The same asset only when both creation UUIDs are there and equal: two legacy
+            // assets (none) are never taken for one (re-check RL-2).
+            let same_asset = matches!(
+                (end_uuid.as_deref(), uuid),
+                (Some(end), Some(here)) if end == here
+            );
+            Ok(if !same_folder && !same_asset {
                 OldRefs::Elsewhere((end.project, end.asset_id))
             } else {
                 OldRefs::Free
@@ -672,8 +679,10 @@ pub async fn restored_as(
     let uuid = {
         let names = {
             let (probe, at) = (store.probe().clone(), dir.abs(store.root()));
+            let old_for_lookup = old_id.to_string();
             tokio::task::spawn_blocking(move || {
-                crate::store::asset_manifests(probe.as_ref(), &at, &[]).unwrap_or_default()
+                crate::store::asset_manifests(probe.as_ref(), &at, &[&old_for_lookup])
+                    .unwrap_or_default()
             })
             .await
             .unwrap_or_default()
