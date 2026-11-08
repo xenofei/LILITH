@@ -1138,11 +1138,14 @@ impl Confirm {
     /// (a cap prompt, an `EveryCaller` question): that session ended with the earlier core run,
     /// so nothing will end the question but its expiry (audit L-3, re-check RL-1). Decided by
     /// the row's creation time against this core's start, so a question an app makes while
-    /// this core starts is never taken for one.
+    /// this core starts is never taken for one; and never for a row this core tracks, which it
+    /// made itself (a wall clock moved back after the start makes this run's rows look older,
+    /// re-check 2 RL2-1). `load`, `list` and a retry all decide through this.
     fn made_in_an_earlier_run(&self, row: &ConfirmationRow) -> bool {
         row.state == ConfState::Pending
             && row.caller_kind.starts_with("ui:")
             && row.created_utc < self.started_utc
+            && !self.tracked().contains_key(&row.id)
     }
 
     /// Cancels `row` of `db`, an app's question of an earlier core run, as its app's exit

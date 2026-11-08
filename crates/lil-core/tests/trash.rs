@@ -4457,3 +4457,55 @@ async fn an_app_question_made_while_the_core_starts_survives_load() {
     drop((core, writer));
     states.close();
 }
+
+/// Re-check 2 RL2-1: a question an app makes in this run after the wall clock was moved back
+/// (so its creation time is before this core's start) is this run's: this core tracks it, so a
+/// list keeps it pending and it can be approved.
+#[tokio::test] // spec: CORE-157, APP-044
+async fn an_app_question_made_after_the_clock_moved_back_survives_a_list() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).expect("the suite state.db"));
+    let clock = FakeClock::new();
+    let ids: Arc<dyn lil_platform::IdSource> = Arc::new(SeqIds::new());
+    let core = confirm_of(&states, &clock, &ids);
+    clock.shift_utc(-60);
+    let made = core
+        .request(ui_request("none", "k-clock-back"))
+        .await
+        .unwrap();
+    let pending: Vec<String> = core
+        .list(ListState::Pending, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(pending, std::slice::from_ref(&made.confirmation_id), "kept");
+    let app = Session {
+        id: "s_app".into(),
+        caller: CallerKind::Ui("test".into()),
+        non_interactive: false,
+        workspace: None,
+        capabilities: lil_protocol::CAPABILITIES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+        client_pid: 1,
+        profile_id: None,
+    };
+    let answered = core
+        .answer(
+            &app,
+            ConfirmationAnswerParams {
+                confirmation_id: made.confirmation_id.clone(),
+                answer: Answer::Approve,
+                toast_token: None,
+                cap: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("it can be approved: {e:?}"));
+    assert_eq!(answered.state.wire(), "approved");
+    drop(core);
+    states.close();
+}
