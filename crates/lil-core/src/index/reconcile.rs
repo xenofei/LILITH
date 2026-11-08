@@ -1021,6 +1021,61 @@ fn is_folder_manifest(root: &Path, rel: &WsPath) -> bool {
     lil_platform::fs::attributes(&beside).is_err()
 }
 
+/// Keeps one asset row per folder when `parsed` spells its folder in other capitals than a row
+/// already does (a folder renamed only in case). With no row of the new spelling yet, the
+/// oldest row of the folder is moved to it, with everything that hangs off it, so the upsert
+/// that follows overwrites it (a manifest that parses) or keeps its last values (one that
+/// doesn't). Any other row of the folder first hands its expected files to the kept row, then
+/// goes: a recorded file never stops being expected because its folder's spelling changed.
+fn respell_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
+    let others: Vec<(i64, String, String)> = tx
+        .prepare_cached(
+            "SELECT id, project, asset_id FROM assets WHERE folder_key = ?1
+             AND NOT (project = ?2 AND asset_id = ?3) ORDER BY id",
+        )?
+        .query_map(
+            params![folder_key(parsed), parsed.project, parsed.asset_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let (new_project, new_asset) = (parsed.project.as_str(), parsed.asset_id.as_str());
+    let mut others = others.into_iter();
+    let has_own: bool = tx
+        .prepare_cached("SELECT 1 FROM assets WHERE project = ?1 AND asset_id = ?2")?
+        .query_row(params![new_project, new_asset], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !has_own && let Some((id, project, asset_id)) = others.next() {
+        tx.execute(
+            "UPDATE assets SET project = ?2, asset_id = ?3 WHERE id = ?1",
+            params![id, new_project, new_asset],
+        )?;
+        for table in ["asset_tags", "take_marks", "expected"] {
+            tx.execute(
+                &format!(
+                    "UPDATE OR REPLACE {table} SET project = ?3, asset_id = ?4
+                     WHERE project = ?1 AND asset_id = ?2"
+                ),
+                params![project, asset_id, new_project, new_asset],
+            )?;
+        }
+        tx.execute(
+            "UPDATE edges SET from_project = ?3, from_asset = ?4
+             WHERE from_project = ?1 AND from_asset = ?2",
+            params![project, asset_id, new_project, new_asset],
+        )?;
+    }
+    for (id, project, asset_id) in others {
+        // `expected` is keyed by the file, so the kept row has none of these yet.
+        tx.execute(
+            "UPDATE expected SET project = ?3, asset_id = ?4 WHERE project = ?1 AND asset_id = ?2",
+            params![project, asset_id, new_project, new_asset],
+        )?;
+        delete_asset(tx, id, &project, &asset_id)?;
+    }
+    Ok(())
+}
+
 /// The case-folded key of the asset folder `projects/<p>/assets/<a>` (`assets.folder_key`).
 fn folder_key(parsed: &Parsed) -> String {
     path_key(&format!(
@@ -1030,21 +1085,7 @@ fn folder_key(parsed: &Parsed) -> String {
 }
 
 fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
-    // One row per asset folder: a row of the same folder spelled in other capitals (a folder
-    // renamed only in case) goes, with everything that hangs off it.
-    let stale: Vec<(i64, String, String)> = tx
-        .prepare_cached(
-            "SELECT id, project, asset_id FROM assets WHERE folder_key = ?1
-             AND NOT (project = ?2 AND asset_id = ?3)",
-        )?
-        .query_map(
-            params![folder_key(parsed), parsed.project, parsed.asset_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?
-        .collect::<rusqlite::Result<_>>()?;
-    for (id, project, asset_id) in stale {
-        delete_asset(tx, id, &project, &asset_id)?;
-    }
+    respell_asset(tx, parsed)?;
     let Some(fields) = &parsed.fields else {
         // It doesn't parse: flag the row and keep its last values, edges and expected files, but
         // not the runs and versions it recorded: its folders aren't judged for orphans.
