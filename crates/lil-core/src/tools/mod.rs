@@ -41,7 +41,10 @@ pub use registry::{
     CallCtx, ConfirmPolicy, FactsFn, FactsFuture, Registry, Tool, ToolFuture, ToolMeta, TouchDecl,
     facts_fn, fill_touches, typed_tool, with_estimate_key,
 };
-pub use services::{AssetServices, AssetUse, InUse, ThumbState, Thumbnails};
+pub use services::{
+    AssetServices, AssetUse, InUse, THUMB_LARGE_PX, THUMB_MAX_ITEMS, THUMB_MAX_PX, THUMB_SCALES,
+    THUMB_TIERS, ThumbState, Thumbnails, thumbs_request_px, tier_px,
+};
 pub use stages::{
     AllowOnce, Approval, BillingBasis, CapHit, CascadeSettings, ConfirmDecision, ConfirmInput,
     ConfirmStage, ConfirmedVia, Estimate, EstimateStage, FACTS_SHOWN, IdemRef, MeterStage,

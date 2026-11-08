@@ -33,8 +33,10 @@
 //!   `app/confirmation.answer`'s `toast_token` (a deny from a toast, P4a-R9),
 //!   `app/set_context` goes to the dispatcher, which keeps the sessions' projects (it needs
 //!   `context.v1`, else `caller.not_allowed`; ARCH-088), protocol 1.4's `app/thumbs.request`,
-//!   `app/asset.trust` and `app/asset.ai_edit` need `assets.v1` (else `caller.not_allowed`)
-//!   and are -32601 until their tasks route them, and any
+//!   `app/asset.trust` and `app/asset.ai_edit` need `assets.v1` (else `caller.not_allowed`);
+//!   `app/thumbs.request` goes to the [`Thumbnails`] (a request that isn't one, or a path that
+//!   isn't workspace-relative, is `params.invalid`; APP-038), and the other two are -32601
+//!   until their tasks route them, and any
 //!   other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   `app/*` methods are admitted as `tools/call` is (APP-041): a draining core answers them
@@ -127,7 +129,8 @@ use crate::jobs::{Lane, PauseReason};
 use crate::lifecycle::{DrainReason, Lifecycle};
 use crate::meter::Caps;
 use crate::session::Session;
-use crate::tools::Dispatcher;
+use crate::store::WsPath;
+use crate::tools::{Dispatcher, ThumbState, Thumbnails, thumbs_request_px};
 use crate::transport::{ConnCtx, ConnObserver, Router};
 use crate::workspace::{WorkspaceRef, resolve_workspace};
 
@@ -193,6 +196,8 @@ pub struct RpcRouter {
     caps: Option<Arc<Caps>>,
     /// The desktop settings `app/desktop.set` changes; `None`: the method is -32601.
     desktop: Option<Arc<DesktopSettingsStore>>,
+    /// The thumbnail cache `app/thumbs.request` asks; `None`: the method is -32601.
+    thumbs: Option<Arc<dyn Thumbnails>>,
     /// Told when a session is established and when its connection ends.
     observers: Vec<Arc<dyn ConnObserver>>,
     /// Unit tests only: requests with this method panic (`CoreConfig::panic_on_method`).
@@ -233,6 +238,7 @@ impl RpcRouter {
             confirm,
             caps: None,
             desktop: None,
+            thumbs: None,
             observers: Vec::new(),
             #[cfg(test)]
             panic_on_method: cfg.panic_on_method,
@@ -250,6 +256,13 @@ impl RpcRouter {
     #[must_use]
     pub fn with_desktop(mut self, store: Arc<DesktopSettingsStore>) -> RpcRouter {
         self.desktop = Some(store);
+        self
+    }
+
+    /// Serves `app/thumbs.request` with `thumbs` (APP-038; P4b-R32).
+    #[must_use]
+    pub fn with_thumbs(mut self, thumbs: Arc<dyn Thumbnails>) -> RpcRouter {
+        self.thumbs = Some(thumbs);
         self
     }
 
@@ -649,8 +662,9 @@ impl RpcRouter {
             }
             return outcome(id, into_outcome(store.set(p).await));
         }
-        // Protocol 1.4's three (APP-039; Appendix D): each needs `assets.v1`, and each is -32601
-        // until its own task routes it (Tasks 12, 15 and 16).
+        // Protocol 1.4's three (APP-039; Appendix D): each needs `assets.v1`;
+        // `app/thumbs.request` goes to the thumbnail cache, and the other two are -32601 until
+        // their own tasks route them (Tasks 15 and 16).
         if matches!(
             m,
             app::THUMBS_REQUEST | app::ASSET_TRUST | app::ASSET_AI_EDIT
@@ -663,6 +677,22 @@ impl RpcRouter {
                 return refuse(format!(
                     "{m} needs the assets.v1 capability, and this session's core/hello did not offer it."
                 ));
+            }
+            if m == app::THUMBS_REQUEST
+                && let Some(thumbs) = &self.thumbs
+            {
+                let p: app::ThumbsRequestParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        return Response::Error {
+                            id: Some(id),
+                            error,
+                        };
+                    }
+                };
+                let trace_id = self.ids.id("t");
+                let answered = thumbs_request(thumbs.as_ref(), &p, &trace_id).await;
+                return outcome(id, into_outcome(answered));
             }
             return not_found(id);
         }
@@ -1265,6 +1295,65 @@ fn hello_stopped(e: &tokio::task::JoinError, trace_id: String) -> ErrorBody {
     )
 }
 
+/// `app/thumbs.request` (Appendix H "Thumbnails"): the request's size ([`thumbs_request_px`])
+/// and each item's workspace-relative path are checked, then the cache answers each item.
+///
+/// # Errors
+/// `params.invalid` for a request that isn't one or a path outside the workspace;
+/// `core.bug` for a state the wire doesn't have.
+async fn thumbs_request(
+    thumbs: &dyn Thumbnails,
+    p: &app::ThumbsRequestParams,
+    trace_id: &str,
+) -> Result<app::ThumbsRequestResult, ErrorBody> {
+    let invalid = |why: String| ErrorBody::new(&codes::PARAMS_INVALID, why, trace_id);
+    let px = thumbs_request_px(p).map_err(invalid)?;
+    for item in &p.items {
+        if let Err(e) = WsPath::parse(&item.path) {
+            return Err(invalid(format!(
+                "{:?} is not a workspace-relative path: {e}",
+                item.path
+            )));
+        }
+    }
+    let states = thumbs.request(&p.items, px).await;
+    let thumbs = states
+        .into_iter()
+        .map(|s| thumb_view(s, trace_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(app::ThumbsRequestResult { thumbs })
+}
+
+/// One item on the wire (ruling 3): `state` must be `ready`, `pending` or `icon`; any other is
+/// the core's bug, never sent as it is.
+///
+/// # Errors
+/// `core.bug` for another state.
+fn thumb_view(s: ThumbState, trace_id: &str) -> Result<app::ThumbView, ErrorBody> {
+    let state = match s.state.as_str() {
+        "ready" => app::ThumbStateWire::Ready,
+        "pending" => app::ThumbStateWire::Pending,
+        "icon" => app::ThumbStateWire::Icon,
+        other => {
+            tracing::error!(state = other, path = %s.path, "a thumbnail state the wire doesn't have");
+            return Err(ErrorBody::new(
+                &codes::CORE_BUG,
+                format!("The thumbnail cache answered the state {other:?}, which isn't one."),
+                trace_id,
+            ));
+        }
+    };
+    Ok(app::ThumbView {
+        path: s.path,
+        sha256: s.sha256,
+        media_kind: s.media_kind,
+        renderer: s.renderer,
+        state,
+        file: s.file.map(|f| f.to_string_lossy().into_owned()),
+        px: s.px,
+    })
+}
+
 fn fault(id: Id, code: i64, message: &str) -> Response {
     Response::Error {
         id: Some(id),
@@ -1294,6 +1383,38 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn thumb(state: &str) -> ThumbState {
+        ThumbState {
+            path: "work/a.png".into(),
+            sha256: Some("ab".repeat(32)),
+            media_kind: "image".into(),
+            renderer: "image@1".into(),
+            state: state.into(),
+            file: (state == "ready").then(|| PathBuf::from(r"C:\local\thumbs\ab\x.png")),
+            px: 96,
+        }
+    }
+
+    /// Ruling 3 (Task 12): each of the three states maps to its wire value; any other string is
+    /// `core.bug`, never sent as it is.
+    #[test] // spec: APP-038
+    fn thumb_states_map_to_the_wire_and_others_are_a_bug() {
+        for (state, wire) in [
+            ("ready", app::ThumbStateWire::Ready),
+            ("pending", app::ThumbStateWire::Pending),
+            ("icon", app::ThumbStateWire::Icon),
+        ] {
+            let view = thumb_view(thumb(state), "t_test").unwrap();
+            assert_eq!(view.state, wire);
+            assert_eq!(view.file.is_some(), state == "ready", "{view:?}");
+        }
+        for other in ["queued", "Ready", ""] {
+            let error = thumb_view(thumb(other), "t_test").unwrap_err();
+            assert_eq!(error.code, "core.bug", "{other:?}");
+            assert_eq!(error.trace_id, "t_test");
+        }
+    }
 
     #[test] // spec: QA-010, ARCH-029
     fn params_failures_are_invalid_params() {

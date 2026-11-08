@@ -76,6 +76,9 @@ cxx = "1.0.205"
 cxx-qt = "=0.10.0"
 cxx-qt-lib = "=0.10.0"
 cxx-qt-build = "=0.10.0"
+# Plan 4b (Task 12): the `image@1` thumbnail renderer (APP-038; P4b-R12), lil-core only. The
+# PNG, JPEG and WebP decoders and the PNG encoder, nothing else; the release spike 12 measured.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # The reviewer key's scrypt (N = 2^18) takes minutes unoptimised; optimise just the KDF so
 # `lil dev reviewer-setup` / `approve` and their tests stay quick in dev and test builds.

@@ -22,17 +22,6 @@ tests = [
     { name = "lil-spec-tests::trash_4b::trash_refused_while_in_use", rule = "CORE-157", file = "tests/trash_4b.rs" },
     # CORE-037, ARCH-125
     { name = "lil-spec-tests::trash_4b::restore_to_a_free_name", rule = "CORE-037", file = "tests/trash_4b.rs" },
-    # Task 12
-    # APP-038
-    { name = "lil-spec-tests::thumbs_4b::thumbs_request_returns_ready_or_pending_then_ready", rule = "APP-038", file = "tests/thumbs_4b.rs" },
-    # APP-038
-    { name = "lil-spec-tests::thumbs_4b::same_bytes_share_one_cache_entry", rule = "APP-038", file = "tests/thumbs_4b.rs" },
-    # APP-038
-    { name = "lil-spec-tests::thumbs_4b::non_images_get_the_icon_state", rule = "APP-038", file = "tests/thumbs_4b.rs" },
-    # APP-038, APP-039
-    { name = "lil-spec-tests::thumbs_4b::thumbs_need_assets_v1", rule = "APP-038", file = "tests/thumbs_4b.rs" },
-    # APP-038
-    { name = "lil-spec-tests::thumbs_4b::handlers_for_says_no_studio_opens_this_yet", rule = "APP-038", file = "tests/thumbs_4b.rs" },
     # Task 13
     # CORE-176
     { name = "lil-spec-tests::picks_4b::review_picks_from_the_app_are_logged", rule = "CORE-176", file = "tests/picks_4b.rs" },
