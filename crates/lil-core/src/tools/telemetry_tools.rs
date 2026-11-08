@@ -4,8 +4,8 @@
 //! |---|---|---|---|
 //! | `telemetry.snapshot` | read | `{}` | the [`Snapshot`](crate::telemetry::Snapshot) |
 //! | `telemetry.series` | read | `{metrics, from, to, resolution?}` | `{series: [{metric, points: [[ts, min, avg, max]]}]}` |
-//! | `telemetry.jobs` | read | `{job_ids?, from?, to?, limit?}` | `{jobs: [JobEnergy]}` (newest first) |
-//! | `telemetry.energy` | read | `{from, to}` | `{from, to, gpu_mj, cpu_mj, system_mj, measured: {gpu, cpu}, energy_cost?}` (APP-131) |
+//! | `telemetry.jobs` | read | `{job_ids?, from?, to?, limit?}` | `{jobs: [JobEnergy]}` (newest first; each with its `fit` or `null`) |
+//! | `telemetry.energy` | read | `{from, to}` | `{from, to, gpu_mj, cpu_mj, system_mj, measured: {gpu, cpu}, samples, partly_measured, energy_cost?}` (APP-131) |
 //!
 //! They live in `tools`, not in `telemetry`, so that `telemetry` depends on no `tools` type
 //! (CORE-010). `meter` writes the `JobEnergy` rows `telemetry.jobs` reads.
@@ -26,7 +26,9 @@ use crate::telemetry::{
 struct NoArgs {}
 
 const SNAPSHOT_DESCRIPTION: &str = "Returns the hardware state now: the GPU (utilisation, power, \
-    energy counter, temperature, clocks, fan, throttle reasons, VRAM), the engine processes and \
+    energy counter, temperature, clocks, fan, throttle reasons, VRAM, the adapter's dedicated and \
+    shared memory and each engine type's load, null when unreadable, and the headline load: the \
+    busiest engine's, else NVML's), the engine processes and \
     any process using the GPU, the CPU, RAM, disks, network, the whole-system power estimate with \
     each part labelled measured, estimated or unknown, and the active alerts. A part that can't \
     be measured is unknown, never guessed. There is no CPU temperature: Windows doesn't expose it \
@@ -34,7 +36,7 @@ const SNAPSHOT_DESCRIPTION: &str = "Returns the hardware state now: the GPU (uti
 
 const SERIES_DESCRIPTION: &str = "Returns hardware metrics over time: gpu.util, gpu.power, \
     gpu.energy, gpu.temp, gpu.vram_used, cpu.util, cpu.power, cpu.energy, ram.used, system.power, \
-    net.rx, net.tx. `from` and `to` are RFC 3339 UTC times and both are included. `resolution` is \
+    net.rx, net.tx, gpu.mem.dedicated_mib, gpu.mem.shared_mib, gpu.engine.busiest_permille. `from` and `to` are RFC 3339 UTC times and both are included. `resolution` is \
     1s, 1m or 1h (default: the finest with at most 3,600 points; more than 3,600 points of a \
     metric is params.invalid). Each point is [time, min, average, max]; for gpu.energy and \
     cpu.energy they are all the interval's summed energy in mJ, so the points of a range add up \
@@ -44,16 +46,20 @@ const SERIES_DESCRIPTION: &str = "Returns hardware metrics over time: gpu.util, 
 const JOBS_DESCRIPTION: &str = "Returns the energy of finished jobs, newest first: for each, \
     the job id, its workspace (or loose), from and to (RFC 3339 UTC: its first and last \
     telemetry samples), GPU and CPU energy gross and above idle in mJ, the whole-system energy, \
-    SM-weighted GPU-seconds (milli), whether the GPU and CPU parts were measured, and \
-    idle_unknown when no idle baseline existed. Jobs of every workspace and loose ones are \
+    SM-weighted GPU-seconds (milli), whether the GPU and CPU parts were measured, \
+    idle_unknown when no idle baseline existed, and fit: {shared_idle_mib, \
+    shared_above_idle_max_mib} (the engine's shared GPU memory idle level and its largest rise \
+    during the job), null without one. Jobs of every workspace and loose ones are \
     listed. `job_ids` picks jobs; `from` and `to` (RFC 3339 UTC) keep jobs that ended at or \
     after `from` and began at or before `to`; `limit` is 1-500 (default 100).";
 
 const ENERGY_DESCRIPTION: &str = "Returns the energy used between `from` and `to` (RFC 3339 \
     UTC times, both included): the GPU's and the CPU package's in mJ, the whole-system estimate \
     ((GPU + CPU + the rest-of-system baseline) / PSU efficiency), whether the GPU and CPU parts \
-    were measured, and its cost at the electricity rate when one is set. Older ranges are read \
-    from the minute or hourly rows, whose totals stay exact.";
+    were measured, partly_measured when a part was measured for some samples but not all, \
+    samples (the count of 1-second samples, or null when the range was read from a roll-up), \
+    and its cost at the electricity rate when one is set. Older ranges are read from the minute \
+    or quarter-hour rows, whose totals stay exact.";
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct JobsResult {

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use futures_util::future::BoxFuture;
 use lil_core::config::ScriptedSockets;
 use lil_core::engines::comfyui::install::{self, ExactVersion, INSTALL_TOOL, NodeId};
+use lil_core::engines::comfyui::prompt_spec;
 use lil_core::engines::comfyui::{ComfyClient, ComfyError};
 use lil_core::engines::tools::{EnginesSlot, register_engine_tools};
 use lil_core::engines::{ComfyConfig, EngineClass, EngineState, Engines, Listen, scrubbed_env};
@@ -30,7 +31,7 @@ use lil_core::jobs::{
 use lil_core::meter::{UsageCtx, UsageDraft, UsageSink, UsageStatus};
 use lil_core::state::StateRegistry;
 use lil_core::store::{FailPoints, fsops};
-use lil_core::telemetry::{HwSources, PowerSettings, Telemetry, TickMode};
+use lil_core::telemetry::{Fit, HwSources, PowerSettings, Snapshot, Telemetry, TickMode};
 use lil_core::tools::{BillingBasis, Registry};
 use lil_core::workspace::WorkspaceHub;
 use lil_core::{CoreConfig, start_in_thread};
@@ -40,7 +41,8 @@ use lil_platform::sockets::{OsSockets, SocketTable};
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{CallerKind, EffectClass};
 use lil_testkit::{
-    CoreFixture, FakeClock, FakeComfy, RawPipe, SeqIds, TestApp, TestEnv, ensure_built,
+    CoreFixture, FakeClock, FakeComfy, FakeHwScript, RawPipe, SeqIds, TestApp, TestEnv,
+    ensure_built,
 };
 use serde_json::{Value, json};
 
@@ -237,6 +239,11 @@ struct Rig {
 
 impl Rig {
     fn new(env: TestEnv) -> Rig {
+        Rig::with_hw(env, HwSources::none())
+    }
+
+    /// [`Rig::new`] with the telemetry on `hw`.
+    fn with_hw(env: TestEnv, hw: HwSources) -> Rig {
         let states = Arc::new(
             StateRegistry::open(&env.env, Arc::new(|what: &str| panic!("fatal: {what}"))).unwrap(),
         );
@@ -263,7 +270,7 @@ impl Rig {
             FailPoints::none(),
         );
         let telemetry = Telemetry::start(
-            HwSources::none(),
+            hw,
             env.env.local_dir().join("telemetry.db"),
             dyn_clock,
             PowerSettings::default(),
@@ -2170,4 +2177,170 @@ async fn other_4xx_and_unreadable_answers_are_probed_again() {
     rig.clock.advance(Duration::from_secs(60));
     engines.tick().await;
     assert_eq!(probes(&fake), 1, "an answer without assets stands");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fit signal and the spill alert through a real ComfyUI job (ARCH-071, APP-132; plan 4b
+// Task 19).
+// ---------------------------------------------------------------------------------------------
+
+/// Fake hardware whose per-process GPU memory lists the attached fake's listener (this test
+/// process, the engine's process) at `shared` MiB of `Shared Usage`, one reading per sample (the
+/// last repeated), with the adapter counters readable.
+fn shared_usage_hw(shared: &[u64]) -> HwSources {
+    let me = std::process::id();
+    let mem: Vec<Value> = shared
+        .iter()
+        .map(|s| json!([{"pid": me, "local_mib": 4000, "committed_mib": 4100, "shared_mib": s}]))
+        .collect();
+    HwSources::from_fake(
+        FakeHwScript::new(json!({
+            "gpu": null, "gpu_mem": mem, "cpu_energy": null,
+            "gpu_adapter": [{"dedicated_mib": 4000, "shared_mib": 100}],
+            "gpu_engines": [[{"engtype": "3D", "util_permille": 900}]],
+            "sys": [{}]}))
+        .sources(),
+    )
+}
+
+/// The attached engine is ready.
+async fn ready_engine(engines: &Arc<Engines>) {
+    let deadline = Instant::now() + DEADLINE;
+    while engines.status().await.remove(0).state != EngineState::Ready {
+        assert!(Instant::now() < deadline, "the engine never became ready");
+        engines.tick().await;
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Submits a one-image ComfyUI job (the fake holds it running) and waits until its prompt
+/// executes.
+async fn executing_prompt(rig: &Rig, fake: &FakeComfy) -> String {
+    fake.hold_prompts(true);
+    let graph = json!({
+        "1": {"class_type": "EmptyImage",
+              "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}},
+        "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0], "filename_prefix": "x"}},
+    });
+    let spec = prompt_spec(json!({"graph": graph}), Priority::Agent, "test", None, 60);
+    let id = rig.jobs.submit(&rig.caller(), spec).await.unwrap().job_id;
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let job = rig
+            .jobs
+            .get(&rig.caller(), &JobId(id.clone()))
+            .await
+            .unwrap();
+        if job.substatus.as_deref() == Some("executing") {
+            return id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the prompt never executed: {job:?}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Lets the held prompt finish and waits for its job.
+async fn finish_prompt(rig: &Rig, fake: &FakeComfy, id: &str) {
+    fake.hold_prompts(false);
+    let (job, done) = rig
+        .jobs
+        .wait(&rig.caller(), &JobId(id.to_string()), DEADLINE)
+        .await
+        .unwrap();
+    assert!(done && job.status == JobStatus::Succeeded, "{job:?}");
+}
+
+fn spill_job(snap: &Snapshot) -> Option<String> {
+    snap.alerts
+        .iter()
+        .find(|a| a.id == "gpu_spill")
+        .and_then(|a| a.job_id.clone())
+}
+
+/// The real wiring: the supervisor tells the telemetry the engine's processes and readiness,
+/// the ComfyUI handler its job's `execution_start` and end, so a job whose engine's `Shared
+/// Usage` rises 5000 MiB above its idle level raises `gpu_spill` naming it and records its fit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-071, APP-132
+async fn a_comfyui_job_records_its_fit_and_raises_gpu_spill() {
+    let fake = FakeComfy::start();
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    let mut shared = vec![200];
+    shared.extend([5200; 11]);
+    let rig = Rig::with_hw(env, shared_usage_hw(&shared));
+    let engines = rig.engines(Arc::new(OsSockets));
+    ready_engine(&engines).await;
+    rig.telemetry.set_busy(true);
+    rig.telemetry.tick(1).await;
+
+    let id = executing_prompt(&rig, &fake).await;
+    let snap = rig.telemetry.tick(11).await;
+    assert_eq!(
+        spill_job(&snap).as_deref(),
+        Some(id.as_str()),
+        "{:?}",
+        snap.alerts
+    );
+    finish_prompt(&rig, &fake, &id).await;
+    assert_eq!(
+        rig.telemetry.job_fit(&id),
+        Some(Fit {
+            shared_idle_mib: 200,
+            shared_above_idle_max_mib: 5000
+        })
+    );
+    let after = rig.telemetry.tick(1).await;
+    assert_eq!(spill_job(&after), None, "cleared with its job");
+}
+
+/// One failed `/system_stats` poll between two jobs is no engine restart: the idle level stays
+/// the lowest since the engine became ready, so the second job, with ComfyUI still holding the
+/// first one's shared memory, still raises `gpu_spill` (P4b-R37 as Appendix H states it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-071, APP-132
+async fn a_failed_status_poll_keeps_the_engines_idle_level() {
+    let fake = FakeComfy::start();
+    let env = TestEnv::new();
+    attach(&env, fake.port(), &fake.root());
+    let mut shared = vec![200];
+    shared.extend([5200; 11]);
+    let rig = Rig::with_hw(env, shared_usage_hw(&shared));
+    let engines = rig.engines(Arc::new(OsSockets));
+    ready_engine(&engines).await;
+    rig.telemetry.set_busy(true);
+    rig.telemetry.tick(1).await;
+
+    let first = executing_prompt(&rig, &fake).await;
+    let snap = rig.telemetry.tick(11).await;
+    assert_eq!(spill_job(&snap).as_deref(), Some(first.as_str()));
+    finish_prompt(&rig, &fake, &first).await;
+    rig.telemetry.tick(2).await;
+
+    // ComfyUI misses one poll and answers again; it still holds 5200 MiB.
+    fake.refuse_http(true);
+    engines.tick().await;
+    assert_ne!(engines.status().await.remove(0).state, EngineState::Ready);
+    rig.telemetry.tick(1).await;
+    fake.refuse_http(false);
+    ready_engine(&engines).await;
+    rig.telemetry.tick(1).await;
+
+    let second = executing_prompt(&rig, &fake).await;
+    let snap = rig.telemetry.tick(11).await;
+    assert_eq!(
+        spill_job(&snap).as_deref(),
+        Some(second.as_str()),
+        "{:?}",
+        snap.alerts
+    );
+    finish_prompt(&rig, &fake, &second).await;
+    assert_eq!(
+        rig.telemetry.job_fit(&second),
+        Some(Fit {
+            shared_idle_mib: 200,
+            shared_above_idle_max_mib: 5000
+        })
+    );
 }

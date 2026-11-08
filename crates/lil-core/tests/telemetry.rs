@@ -19,8 +19,9 @@ use lil_core::events::EventBus;
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::telemetry::{
-    HwSources, JobEnergy, JobEnergyQuery, JobStatsRow, Measured, PowerSettings, SeriesQuery, Sizes,
-    Snapshot, Telemetry, TickMode, format_ts, parse_ts, profile_check,
+    EngineState, Fit, HwSources, JobEnergy, JobEnergyQuery, JobStatsRow, Measured, PowerSettings,
+    SPILL_MARGIN_MIB, SeriesQuery, Sizes, Snapshot, Telemetry, TickMode, format_ts, parse_ts,
+    profile_check,
 };
 use lil_core::workspace::{WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::SystemProbe;
@@ -280,6 +281,7 @@ async fn rates_follow_core_061() {
         gpu_mem: Some(Box::new(CountingMem(mem.clone()))),
         cpu_energy: None,
         sys: Box::new(CountingSys(sys_reads.clone(), disk_reads.clone())),
+        gpu_counters: None,
     };
     let rig = Rig::over(
         sources,
@@ -837,7 +839,8 @@ fn kinds(events: &[Value]) -> Vec<&str> {
     events.iter().map(|e| e["kind"].as_str().unwrap()).collect()
 }
 
-/// 84, 85, 90, 84 °C: one `alert` at the second sample, one `alert_cleared` at the fourth.
+/// 84, 85, 90, then 82 °C: one `alert` at the second sample, one `alert_cleared` once it has
+/// been 30 s at 82 °C (LT-04).
 #[tokio::test] // spec: CORE-066
 async fn alerts_raise_once_and_clear_once() {
     let hot = |temp: u64| {
@@ -845,7 +848,7 @@ async fn alerts_raise_once_and_clear_once() {
         g["temp_c"] = json!(temp);
         g
     };
-    let rig = Rig::new(&script([84, 85, 90, 84].map(hot).to_vec(), vec![sys(100)]));
+    let rig = Rig::new(&script([84, 85, 90, 82].map(hot).to_vec(), vec![sys(100)]));
     let one = rig.run(1).await;
     assert!(one.alerts.is_empty());
     let two = rig.run(1).await;
@@ -863,25 +866,25 @@ async fn alerts_raise_once_and_clear_once() {
         three.alerts[0].since, alert.since,
         "since is when it was raised"
     );
-    let four = rig.run(1).await;
-    assert!(four.alerts.is_empty());
+    let four = rig.run(30).await;
+    assert_eq!(four.alerts.len(), 1, "not yet 30 s at 82");
+    let five = rig.run(1).await;
+    assert!(five.alerts.is_empty());
 
     let events = rig.events().await;
     assert_eq!(
-        kinds(&events),
-        [
-            "sample",
-            "alert",
-            "sample",
-            "sample",
-            "alert_cleared",
-            "sample"
-        ],
+        kinds(&events[..3]),
+        ["sample", "alert", "sample"],
         "the alert comes just before the sample that raised it"
     );
+    assert_eq!(
+        kinds(&events[events.len() - 2..]),
+        ["alert_cleared", "sample"]
+    );
+    assert_eq!(kinds(&events).iter().filter(|k| **k != "sample").count(), 2);
     assert_eq!(events[1]["alert"]["id"], "gpu_temperature");
     assert_eq!(events[1]["alert"]["value"], 85);
-    assert_eq!(events[4]["id"], "gpu_temperature");
+    assert_eq!(events[events.len() - 2]["id"], "gpu_temperature");
     assert_eq!(events[2]["snapshot"]["alerts"][0]["id"], "gpu_temperature");
 }
 
@@ -917,8 +920,12 @@ async fn throttle_reasons_raise_their_own_alerts() {
         ]
     );
     let three = rig.run(1).await;
-    assert_eq!(three.alerts.len(), 1);
-    rig.run(1).await;
+    assert_eq!(
+        three.alerts.len(),
+        2,
+        "a throttle alert clears after 30 s without its bit"
+    );
+    rig.run(31).await;
     let events = rig.events().await;
     let alerts: Vec<(&str, &str)> = events
         .iter()
@@ -1286,6 +1293,7 @@ fn job(id: &str, from: i64, to: i64, idle_unknown: bool) -> JobEnergy {
             cpu: false,
         },
         idle_unknown,
+        fit: None,
     }
 }
 
@@ -1320,8 +1328,9 @@ async fn job_energy_round_trips_the_appendix_f_shape() {
                "from": "2027-01-15T08:00:00.000Z", "to": "2027-01-15T08:00:10.000Z",
                "gpu_mj_gross": 1_500_000, "gpu_mj_above_idle": 1_200_000,
                "cpu_mj_gross": 75_000, "cpu_mj_above_idle": 50_000, "system_mj": 1_900_000,
-               "gpu_seconds_milli": 7_500, "measured": {"gpu": true, "cpu": false}}),
-        "no idle_unknown key when it is false"
+               "gpu_seconds_milli": 7_500, "measured": {"gpu": true, "cpu": false},
+               "fit": null}),
+        "no idle_unknown key when it is false; fit is null without a fit signal"
     );
     let b = serde_json::to_value(&all[0]).unwrap();
     assert_eq!(b["idle_unknown"], true);
@@ -2096,11 +2105,21 @@ async fn version_1_migrates_to_2_keeping_rows() {
     let energy = first.total("gpu.energy", "1s").await;
     assert_eq!(energy, 2000.0);
     first.telemetry.shutdown().await;
-    // What a plan-3 core left: version 1, without the history table.
+    // What a plan-3 core left: version 1, without the history table (nor version 3's
+    // columns and quarter-hour rows).
     {
         let conn = rusqlite::Connection::open(&first.db).unwrap();
-        conn.execute_batch("DROP TABLE job_stats; PRAGMA user_version = 1;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE job_stats; DROP TABLE e15;
+             ALTER TABLE s1 DROP COLUMN gpu_mem_dedicated;
+             ALTER TABLE s1 DROP COLUMN gpu_mem_shared;
+             ALTER TABLE s1 DROP COLUMN gpu_engine_busiest;
+             ALTER TABLE proc_s1 DROP COLUMN vram_shared;
+             ALTER TABLE job_energy DROP COLUMN shared_idle_mib;
+             ALTER TABLE job_energy DROP COLUMN shared_above_idle_max_mib;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
     }
     let second = Rig::at(
         HwSources::from_fake(FakeHwScript::new(hw).sources()),
@@ -2113,7 +2132,7 @@ async fn version_1_migrates_to_2_keeping_rows() {
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3, "through version 2 to the current one");
     second
         .telemetry
         .put_job_stats(&stats("j_0000000000000001", "k", T0_MS, 1000))
@@ -2326,12 +2345,12 @@ async fn energy_picks_the_finest_table_that_holds_the_range() {
     assert_eq!(minutes.cpu_mj, fresh.cpu_mj);
     assert!(minutes.measured.gpu);
 
-    // Past 30 days only the hourly rows hold it: their bucket is the whole hour, both
-    // minutes.
+    // Past 30 days only the quarter-hour rows hold it: their bucket is the quarter hour,
+    // both minutes.
     rig.clock.advance(Duration::from_secs(31 * 86_400));
     rig.run(1).await;
     let hours = rig.telemetry.energy(range.0, range.1).await.unwrap();
-    assert_eq!(hours.gpu_mj, 400_000, "from h1");
+    assert_eq!(hours.gpu_mj, 400_000, "from e15");
 }
 
 /// An estimate stays an estimate when its samples are gone: without the Energy Meter the CPU's
@@ -2459,5 +2478,802 @@ fn a_ui_connection_is_tracked_as_app_until_it_closes() {
         !snap.processes.iter().any(|p| p.pid == pid),
         "{:?}",
         snap.processes
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 4b: the adapter counters, the fit signal, the spill alert, LT-04 (CORE-059, ARCH-071,
+// APP-127, APP-131, APP-132; P4b-R19, P4b-R20, P4b-R37 as Appendix H states it).
+// ---------------------------------------------------------------------------------------------
+
+/// The engine's process in the fit tests (another program is pid 99).
+const ENGINE_PID: u32 = 4242;
+
+/// A per-process GPU memory reading: the engine at `engine_shared` MiB of `Shared Usage`,
+/// another program at 50.
+fn engine_mem(engine_shared: u64) -> Value {
+    json!([{"pid": ENGINE_PID, "local_mib": 4000, "committed_mib": 4100,
+            "shared_mib": engine_shared},
+           {"pid": 99, "local_mib": 100, "committed_mib": 100, "shared_mib": 50}])
+}
+
+/// A GPU whose engine's `Shared Usage` follows `shared` (the last value repeated), with the
+/// adapter counters readable.
+fn spill_script(shared: &[u64]) -> Value {
+    json!({"gpu": [gpu(100_000, 1000)],
+           "gpu_mem": shared.iter().map(|s| engine_mem(*s)).collect::<Vec<_>>(),
+           "cpu_energy": null,
+           "gpu_adapter": [{"dedicated_mib": 4500, "shared_mib": 300}],
+           "gpu_engines": [[{"engtype": "3D", "util_permille": 900}]],
+           "sys": [sys(100)]})
+}
+
+/// A rig whose per-process memory is read every second (a job runs), with the engine ready.
+fn engine_rig(script: &Value) -> Rig {
+    let rig = Rig::new(script);
+    rig.telemetry.set_busy(true);
+    ready(&rig);
+    rig
+}
+
+/// The engine becomes ready now (a start or a restart).
+fn ready(rig: &Rig) {
+    let now = rig
+        .clock
+        .utc_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    rig.telemetry.set_engine_state(EngineState {
+        engine: "comfyui".into(),
+        pids: vec![ENGINE_PID],
+        ready_at_ms: Some(i64::try_from(now).unwrap()),
+        outside_busy: false,
+    });
+}
+
+fn spill_alert(snap: &Snapshot) -> Option<&lil_core::telemetry::AlertView> {
+    snap.alerts.iter().find(|a| a.id == "gpu_spill")
+}
+
+/// The `alert` and `alert_cleared` events of `id`, in order.
+fn alert_events(events: &[Value], id: &str) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|e| e["kind"] != "sample")
+        .filter(|e| e["alert"]["id"] == id || e["id"] == id)
+        .cloned()
+        .collect()
+}
+
+/// `Snapshot.gpu` carries the adapter's dedicated and shared memory and each engine type's
+/// busiest engine, and the new series store them (CORE-059, APP-127, Appendix H).
+#[tokio::test] // spec: CORE-059, APP-127
+async fn snapshot_carries_adapter_memory_and_engines() {
+    let rig = Rig::new(&json!({
+        "gpu": [gpu(100_000, 1000)], "gpu_mem": [[]], "cpu_energy": null,
+        "gpu_adapter": [{"dedicated_mib": 3000, "shared_mib": 200},
+                        {"dedicated_mib": 3100, "shared_mib": 260}],
+        "gpu_engines": [[{"engtype": "3D", "util_permille": 655},
+                         {"engtype": "Copy", "util_permille": 20}],
+                        [{"engtype": "3D", "util_permille": 400},
+                         {"engtype": "Compute 0", "util_permille": 710}]],
+        "sys": [sys(100)]}));
+    let one = rig.run(1).await;
+    let shown = serde_json::to_value(one.gpu.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        shown["memory"],
+        json!({"dedicated_used_mib": 3000, "shared_used_mib": 200})
+    );
+    assert_eq!(
+        shown["engines"],
+        json!([{"engtype": "3D", "util_permille": 655},
+               {"engtype": "Copy", "util_permille": 20}])
+    );
+    assert_eq!(
+        shown["headline_util"],
+        json!({"permille": 655, "source": "engines"})
+    );
+    rig.run(1).await;
+    let points = |series: Vec<(i64, f64, f64, f64)>| series.iter().map(|p| p.2).collect::<Vec<_>>();
+    assert_eq!(
+        points(rig.series("gpu.mem.dedicated_mib", "1s").await),
+        [3000.0, 3100.0]
+    );
+    assert_eq!(
+        points(rig.series("gpu.mem.shared_mib", "1s").await),
+        [200.0, 260.0]
+    );
+    assert_eq!(
+        points(rig.series("gpu.engine.busiest_permille", "1s").await),
+        [655.0, 710.0]
+    );
+    // Rolled up like every other series.
+    let minute = rig.series("gpu.engine.busiest_permille", "1m").await;
+    assert_eq!((minute[0].1, minute[0].3), (655.0, 710.0));
+}
+
+/// The headline load is the busiest engine type's; when the engine counters can't be read it
+/// is NVML's utilisation, labelled so (APP-127).
+#[tokio::test] // spec: APP-127, CORE-059
+async fn headline_is_the_busiest_engine_else_nvml() {
+    let rig = Rig::new(&json!({
+        "gpu": [gpu(100_000, 1000)], "gpu_mem": [[]], "cpu_energy": null,
+        "gpu_adapter": [{"dedicated_mib": 3000, "shared_mib": 200}],
+        "gpu_engines": [[{"engtype": "3D", "util_permille": 300},
+                         {"engtype": "Compute 0", "util_permille": 700}],
+                        null, []],
+        "sys": [sys(100)]}));
+    let headline =
+        |snap: &Snapshot| serde_json::to_value(snap.gpu.as_ref().unwrap().headline_util).unwrap();
+    let one = rig.run(1).await;
+    assert_eq!(
+        headline(&one),
+        json!({"permille": 700, "source": "engines"})
+    );
+    // Unreadable: NVML's 50 %.
+    let two = rig.run(1).await;
+    assert_eq!(headline(&two), json!({"permille": 500, "source": "nvml"}));
+    assert_eq!(two.gpu.as_ref().unwrap().engines, None);
+    // Readable, but no engine: NVML's too.
+    let three = rig.run(1).await;
+    assert_eq!(headline(&three), json!({"permille": 500, "source": "nvml"}));
+    // No adapter counters at all (no source): NVML's.
+    let plain = Rig::new(&script(vec![gpu(100_000, 1000)], vec![sys(100)]));
+    let snap = plain.run(1).await;
+    assert_eq!(headline(&snap), json!({"permille": 500, "source": "nvml"}));
+}
+
+/// Counters that can't be read are `null` in the snapshot, store no series point, and keep the
+/// spill alert off however far the engine rises (CORE-059's "not shown" path).
+#[tokio::test] // spec: CORE-059, APP-132
+async fn unreadable_counters_send_null_and_no_spill_alert() {
+    let mut hw = spill_script(&[200, 5000]);
+    hw["gpu_adapter"] = Value::Null;
+    hw["gpu_engines"] = Value::Null;
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_unreadable", "comfyui");
+    let snap = rig.run(30).await;
+    let shown = serde_json::to_value(snap.gpu.as_ref().unwrap()).unwrap();
+    assert_eq!(shown["memory"], Value::Null, "present and null: {shown}");
+    assert_eq!(shown["engines"], Value::Null, "present and null: {shown}");
+    assert_eq!(shown["headline_util"]["source"], "nvml");
+    assert!(spill_alert(&snap).is_none(), "{:?}", snap.alerts);
+    assert!(alert_events(&rig.events().await, "gpu_spill").is_empty());
+    assert!(rig.series("gpu.mem.shared_mib", "1s").await.is_empty());
+    assert!(
+        rig.series("gpu.engine.busiest_permille", "1s")
+            .await
+            .is_empty()
+    );
+
+    // A raised alert is held while the counters can't be read, and clears after 30 s of it
+    // (audit L1; the per-process path is review N1's).
+    let mut hw = spill_script(&[200, 5000]);
+    let mut adapter = vec![json!({"dedicated_mib": 1, "shared_mib": 1}); 12];
+    adapter.push(Value::Null);
+    hw["gpu_adapter"] = json!(adapter);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_lost", "comfyui");
+    let raised = rig.run(11).await;
+    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
+    let lost = rig.run(30).await;
+    assert!(spill_alert(&lost).is_some(), "{:?}", lost.alerts);
+    let cleared = rig.run(1).await;
+    assert!(spill_alert(&cleared).is_none(), "{:?}", cleared.alerts);
+}
+
+/// An engine started for the job has a single reading before the job starts: that first
+/// reading after it became ready is the idle level (P4b-R37 as Appendix H states it).
+#[tokio::test] // spec: ARCH-071, APP-132
+async fn idle_falls_back_to_the_first_ready_sample() {
+    let rig = engine_rig(&spill_script(&[300, 450, 800, 600]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_fresh", "comfyui");
+    rig.run(3).await;
+    rig.telemetry.job_ended("j_fresh");
+    assert_eq!(
+        rig.telemetry.job_fit("j_fresh"),
+        Some(Fit {
+            shared_idle_mib: 300,
+            shared_above_idle_max_mib: 500
+        })
+    );
+    assert_eq!(rig.telemetry.job_fit("j_fresh"), None, "taken once");
+}
+
+/// A job that starts before any reading since the engine became ready (or on an engine that
+/// isn't ready) has no idle level: no fit and no spill alert, however high it goes.
+#[tokio::test] // spec: ARCH-071, APP-132
+async fn no_idle_level_means_no_fit_and_no_alert() {
+    let rig = engine_rig(&spill_script(&[5000]));
+    // Ready, but no reading kept yet.
+    rig.telemetry.job_started("j_early", "comfyui");
+    let snap = rig.run(20).await;
+    assert!(spill_alert(&snap).is_none(), "{:?}", snap.alerts);
+    rig.telemetry.job_ended("j_early");
+    assert_eq!(rig.telemetry.job_fit("j_early"), None);
+
+    // An engine that isn't ready keeps no reading.
+    rig.telemetry.set_engine_state(EngineState {
+        engine: "comfyui".into(),
+        pids: vec![ENGINE_PID],
+        ready_at_ms: None,
+        outside_busy: false,
+    });
+    rig.run(2).await;
+    rig.telemetry.job_started("j_stopped", "comfyui");
+    let snap = rig.run(15).await;
+    assert!(spill_alert(&snap).is_none(), "{:?}", snap.alerts);
+    rig.telemetry.job_ended("j_stopped");
+    assert_eq!(rig.telemetry.job_fit("j_stopped"), None);
+    assert!(alert_events(&rig.events().await, "gpu_spill").is_empty());
+}
+
+/// The adapter's shared total and other programs' shared memory may rise by gigabytes: only the
+/// engine's own processes count, so the job fits and nothing is raised (P4b-R37).
+#[tokio::test] // spec: ARCH-071, APP-132
+async fn the_adapter_total_never_feeds_the_fit_signal() {
+    let other = |other_shared: u64| {
+        json!([{"pid": ENGINE_PID, "local_mib": 4000, "shared_mib": 300},
+               {"pid": 99, "local_mib": 100, "shared_mib": other_shared}])
+    };
+    let rig = engine_rig(&json!({
+        "gpu": [gpu(100_000, 1000)], "gpu_mem": [other(50), other(6000)],
+        "cpu_energy": null,
+        "gpu_adapter": [{"dedicated_mib": 4500, "shared_mib": 300},
+                        {"dedicated_mib": 4500, "shared_mib": 9000}],
+        "gpu_engines": [[{"engtype": "3D", "util_permille": 900}]],
+        "sys": [sys(100)]}));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_fits", "comfyui");
+    let snap = rig.run(20).await;
+    assert_eq!(
+        snap.gpu.as_ref().unwrap().memory.unwrap().shared_used_mib,
+        9000,
+        "the adapter's total is shown"
+    );
+    assert!(spill_alert(&snap).is_none(), "{:?}", snap.alerts);
+    rig.telemetry.job_ended("j_fits");
+    assert_eq!(
+        rig.telemetry.job_fit("j_fits"),
+        Some(Fit {
+            shared_idle_mib: 300,
+            shared_above_idle_max_mib: 0
+        })
+    );
+}
+
+/// `gpu_spill` raises once the job's engine has been above its idle level by more than the
+/// margin for 10 s in a row, follows the figure, and clears after 30 s at or below half the
+/// margin; between the two thresholds it stays (APP-132, P4b-R19).
+#[tokio::test] // spec: APP-132
+async fn spill_alert_raises_after_10_s_above_the_margin_and_clears_after_30_s_at_half() {
+    assert_eq!(SPILL_MARGIN_MIB, 512);
+    // Second 0: idle 200. Seconds 1-11: 800 (600 above). Seconds 12-16: 600 (400 above).
+    // From second 17: 450 (250 above, under half the margin).
+    let mut shared = vec![200];
+    shared.extend([800; 11]);
+    shared.extend([600; 5]);
+    shared.push(450);
+    let rig = engine_rig(&spill_script(&shared));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_spill", "comfyui");
+    let before = rig.run(10).await;
+    assert!(
+        spill_alert(&before).is_none(),
+        "not yet 10 s: {:?}",
+        before.alerts
+    );
+    let raised = rig.run(1).await;
+    let alert = spill_alert(&raised).expect("raised after 10 s above the margin");
+    assert_eq!(
+        (
+            alert.kind.as_str(),
+            alert.job_id.as_deref(),
+            alert.pid,
+            alert.above_idle_mib,
+            alert.margin_mib
+        ),
+        (
+            "spill",
+            Some("j_spill"),
+            Some(ENGINE_PID),
+            Some(600),
+            Some(512)
+        )
+    );
+    let between = rig.run(5).await;
+    assert_eq!(spill_alert(&between).unwrap().above_idle_mib, Some(400));
+    let calm = rig.run(30).await;
+    assert_eq!(
+        spill_alert(&calm).map(|a| a.above_idle_mib),
+        Some(Some(250)),
+        "not yet 30 s at half the margin"
+    );
+    let cleared = rig.run(1).await;
+    assert!(spill_alert(&cleared).is_none(), "{:?}", cleared.alerts);
+
+    let events = alert_events(&rig.events().await, "gpu_spill");
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["kind"], "alert");
+    assert_eq!(
+        (
+            &events[0]["alert"]["job_id"],
+            &events[0]["alert"]["pid"],
+            &events[0]["alert"]["above_idle_mib"],
+            &events[0]["alert"]["margin_mib"]
+        ),
+        (
+            &json!("j_spill"),
+            &json!(ENGINE_PID),
+            &json!(600),
+            &json!(512)
+        )
+    );
+    assert_eq!(
+        events[1],
+        json!({"kind": "alert_cleared", "id": "gpu_spill"})
+    );
+    rig.telemetry.job_ended("j_spill");
+    assert_eq!(
+        rig.telemetry.job_fit("j_spill"),
+        Some(Fit {
+            shared_idle_mib: 200,
+            shared_above_idle_max_mib: 600
+        })
+    );
+}
+
+/// A raised spill alert clears at the first sample after its job ends, the figure unchanged.
+#[tokio::test] // spec: APP-132
+async fn spill_alert_clears_when_the_job_ends() {
+    let rig = engine_rig(&spill_script(&[200, 1000]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_end", "comfyui");
+    let raised = rig.run(11).await;
+    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
+    rig.telemetry.job_ended("j_end");
+    let after = rig.run(1).await;
+    assert!(spill_alert(&after).is_none(), "{:?}", after.alerts);
+    let events = alert_events(&rig.events().await, "gpu_spill");
+    assert_eq!(
+        events.iter().map(|e| e["kind"].clone()).collect::<Vec<_>>(),
+        [json!("alert"), json!("alert_cleared")]
+    );
+}
+
+/// ComfyUI keeps a spill's shared memory after the job (S0.4): the idle level is the lowest
+/// since the engine became ready, so a second job in that engine session still raises
+/// `gpu_spill` (Appendix H's known limit); a restart resets the level (P4b-R37 as Appendix H
+/// states it).
+#[tokio::test] // spec: APP-132, ARCH-071
+async fn a_second_spill_in_one_engine_session_is_still_seen() {
+    let rig = engine_rig(&spill_script(&[200, 5000]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_first", "comfyui");
+    let first = rig.run(11).await;
+    assert_eq!(
+        spill_alert(&first)
+            .and_then(|a| a.job_id.clone())
+            .as_deref(),
+        Some("j_first")
+    );
+    rig.telemetry.job_ended("j_first");
+    // The shared memory stays at 5000 MiB between the jobs.
+    let gap = rig.run(5).await;
+    assert!(spill_alert(&gap).is_none(), "cleared with its job");
+
+    rig.telemetry.job_started("j_second", "comfyui");
+    let second = rig.run(11).await;
+    let alert = spill_alert(&second).expect("the second job's spill is seen");
+    assert_eq!(
+        (alert.job_id.as_deref(), alert.above_idle_mib),
+        (Some("j_second"), Some(4800))
+    );
+    rig.telemetry.job_ended("j_second");
+    assert_eq!(
+        rig.telemetry.job_fit("j_second"),
+        Some(Fit {
+            shared_idle_mib: 200,
+            shared_above_idle_max_mib: 4800
+        })
+    );
+
+    // The engine restarts: its level starts again from its first reading.
+    rig.run(1).await;
+    rig.clock.advance(Duration::from_secs(1));
+    ready(&rig);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_third", "comfyui");
+    let third = rig.run(15).await;
+    assert!(spill_alert(&third).is_none(), "{:?}", third.alerts);
+    rig.telemetry.job_ended("j_third");
+    assert_eq!(
+        rig.telemetry.job_fit("j_third"),
+        Some(Fit {
+            shared_idle_mib: 5000,
+            shared_above_idle_max_mib: 0
+        })
+    );
+}
+
+/// LT-04: the temperature alert raises at 85 °C, stays through 84 °C, clears only after 30 s at
+/// or below 82 °C, and doesn't raise again within 60 s of clearing.
+#[tokio::test] // spec: APP-132, CORE-066
+async fn temperature_alert_has_hysteresis() {
+    let at = |temp: u64| {
+        let mut g = gpu(100_000, 1000);
+        g["temp_c"] = json!(temp);
+        g
+    };
+    // Second 0: 85. Seconds 1-60: 84. Seconds 61-91: 82. From second 92: 90.
+    let mut temps = vec![85];
+    temps.extend([84; 60]);
+    temps.extend([82; 31]);
+    temps.push(90);
+    let rig = Rig::new(&script(temps.into_iter().map(at).collect(), vec![sys(100)]));
+    let temperature = |snap: &Snapshot| {
+        snap.alerts
+            .iter()
+            .find(|a| a.id == "gpu_temperature")
+            .map(|a| a.value)
+    };
+    assert_eq!(temperature(&rig.run(1).await), Some(85), "raised at 85");
+    assert_eq!(
+        temperature(&rig.run(60).await),
+        Some(84),
+        "84 for 60 s keeps it"
+    );
+    assert_eq!(
+        temperature(&rig.run(30).await),
+        Some(82),
+        "not yet 30 s at 82"
+    );
+    assert_eq!(temperature(&rig.run(1).await), None, "30 s at 82 clears it");
+    assert_eq!(
+        temperature(&rig.run(59).await),
+        None,
+        "90 within 60 s of clearing doesn't raise it"
+    );
+    assert_eq!(
+        temperature(&rig.run(1).await),
+        Some(90),
+        "60 s later it does"
+    );
+    let kinds: Vec<Value> = alert_events(&rig.events().await, "gpu_temperature")
+        .iter()
+        .map(|e| e["kind"].clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        [json!("alert"), json!("alert_cleared"), json!("alert")]
+    );
+}
+
+/// A throttle alert clears after 30 s without its bit (LT-04).
+#[tokio::test] // spec: APP-132, CORE-066
+async fn throttle_alert_clears_after_30_s() {
+    let with = |bits: u64| {
+        let mut g = gpu(100_000, 1000);
+        g["throttle"] = json!(bits);
+        g
+    };
+    // Second 0: thermal slowdown; then no bit; at second 20, the bit for one sample.
+    let mut bits = vec![0x40];
+    bits.extend([0; 19]);
+    bits.push(0x40);
+    bits.push(0);
+    let rig = Rig::new(&script(
+        bits.into_iter().map(with).collect(),
+        vec![sys(100)],
+    ));
+    let thermal = |snap: &Snapshot| snap.alerts.iter().any(|a| a.id == "gpu_throttle_thermal");
+    assert!(thermal(&rig.run(1).await), "raised");
+    assert!(thermal(&rig.run(19).await), "19 s without the bit");
+    // The bit again: the 30 s start over from the next sample without it.
+    assert!(thermal(&rig.run(1).await));
+    assert!(thermal(&rig.run(30).await), "not yet 30 s since the bit");
+    assert!(
+        !thermal(&rig.run(1).await),
+        "30 s without the bit clears it"
+    );
+}
+
+/// `telemetry.energy` says how many 1-second samples the range held (`null` from a roll-up) and
+/// whether a part was measured for some samples but not all (APP-131, Appendix H).
+#[tokio::test] // spec: APP-131
+async fn energy_reports_samples_and_partly_measured() {
+    let lost = json!({"error": "NVML: the driver was unloaded"});
+    // Seconds 0-1 measured; 2 lost (estimated from the last power); 3 a new baseline after
+    // the gap (estimated); 4-5 measured.
+    let rig = Rig::new(&json!({
+        "gpu": [gpu(100_000, 1000), gpu(100_000, 1100), lost, gpu(100_000, 5000),
+                gpu(100_000, 5100), gpu(100_000, 5200)],
+        "gpu_mem": [[]],
+        "cpu_energy": [{"package_energy_pwh": 0, "package_power_mw": 30_000}],
+        "sys": [sys(100)]}));
+    rig.run(6).await;
+    let whole = rig.telemetry.energy(T0_MS, T0_MS + 5000).await.unwrap();
+    let v = serde_json::to_value(&whole).unwrap();
+    assert_eq!(v["samples"], 6, "{v}");
+    assert_eq!(v["partly_measured"], true, "{v}");
+    assert_eq!(v["measured"], json!({"gpu": false, "cpu": true}), "{v}");
+    let measured = rig.telemetry.energy(T0_MS, T0_MS + 1000).await.unwrap();
+    assert_eq!(
+        (measured.samples, measured.partly_measured),
+        (Some(2), false)
+    );
+    assert!(measured.measured.gpu);
+
+    // Two days on, the range comes from the minute rows: no sample count, the mix kept.
+    rig.clock.advance(Duration::from_secs(2 * 86_400));
+    rig.run(1).await;
+    let rolled = rig.telemetry.energy(T0_MS, T0_MS + 5000).await.unwrap();
+    let v = serde_json::to_value(&rolled).unwrap();
+    assert_eq!(v["samples"], Value::Null, "present and null: {v}");
+    assert_eq!(v["partly_measured"], true, "{v}");
+    assert_eq!(rolled.gpu_mj, whole.gpu_mj);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 19 fix round 1 (review M1, M2, M3, M5).
+// ---------------------------------------------------------------------------------------------
+
+/// Per-process memory that stops reading leaves the engine's figure unknown: a single high
+/// reading never becomes a spill alert (review M1).
+#[tokio::test] // spec: APP-132, CORE-059
+async fn a_lost_process_reading_leaves_the_spill_figure_unknown() {
+    let lost = json!({"error": "PDH: the counter set went away"});
+    let mut hw = spill_script(&[200, 900]);
+    hw["gpu_mem"] = json!([engine_mem(200), engine_mem(900), lost.clone()]);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_stale", "comfyui");
+    let snap = rig.run(40).await;
+    assert!(spill_alert(&snap).is_none(), "{:?}", snap.alerts);
+    rig.telemetry.job_ended("j_stale");
+    // A raised alert across a lost reading is held: see
+    // `a_raised_spill_survives_one_unknown_reading_and_clears_after_30_s` (review N1).
+}
+
+/// A retry after the engine restarted takes the new session's idle level, not its first
+/// attempt's (review M2); a retry in the same session keeps the first attempt's.
+#[tokio::test] // spec: ARCH-071, APP-132
+async fn a_retry_after_an_engine_restart_takes_the_new_sessions_level() {
+    // Session 1 at 1000 MiB; after the restart 100 MiB, then the retry rises to 1000.
+    let rig = engine_rig(&spill_script(&[1000, 1000, 100, 1000]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_retry", "comfyui");
+    rig.run(1).await;
+    rig.telemetry.job_ended("j_retry");
+    ready(&rig);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_retry", "comfyui");
+    let snap = rig.run(11).await;
+    assert_eq!(
+        spill_alert(&snap).and_then(|a| a.above_idle_mib),
+        Some(900),
+        "{:?}",
+        snap.alerts
+    );
+    rig.telemetry.job_ended("j_retry");
+    assert_eq!(
+        rig.telemetry.job_fit("j_retry"),
+        Some(Fit {
+            shared_idle_mib: 100,
+            shared_above_idle_max_mib: 900
+        })
+    );
+
+    // In one session a retry keeps the level its first attempt fixed.
+    let rig = engine_rig(&spill_script(&[300, 800, 200, 900]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_same", "comfyui");
+    rig.run(1).await;
+    rig.telemetry.job_ended("j_same");
+    rig.run(1).await;
+    rig.telemetry.job_started("j_same", "comfyui");
+    rig.run(1).await;
+    rig.telemetry.job_ended("j_same");
+    assert_eq!(
+        rig.telemetry.job_fit("j_same"),
+        Some(Fit {
+            shared_idle_mib: 300,
+            shared_above_idle_max_mib: 600
+        })
+    );
+}
+
+/// The spill alert's 10 s belong to one job: job B, started right after job A was 8 s above
+/// the margin, raises only after its own 10 s (review M3).
+#[tokio::test] // spec: APP-132
+async fn the_spill_timers_start_again_for_each_job() {
+    let rig = engine_rig(&spill_script(&[200, 800]));
+    rig.run(1).await;
+    rig.telemetry.job_started("j_a", "comfyui");
+    let a = rig.run(8).await;
+    assert!(spill_alert(&a).is_none());
+    rig.telemetry.job_ended("j_a");
+    rig.telemetry.job_started("j_b", "comfyui");
+    let b = rig.run(10).await;
+    assert!(
+        spill_alert(&b).is_none(),
+        "not 10 s of j_b yet: {:?}",
+        b.alerts
+    );
+    let raised = rig.run(1).await;
+    assert_eq!(
+        spill_alert(&raised)
+            .and_then(|a| a.job_id.clone())
+            .as_deref(),
+        Some("j_b")
+    );
+}
+
+/// A range old enough to come from the quarter-hour rows gives the whole system's energy those
+/// rows stored, as it was measured with that day's `[power]` settings, not recomputed with
+/// today's (Appendix H; review M5).
+#[tokio::test] // spec: APP-131, CORE-062, CORE-064
+async fn energy_reads_the_stored_system_energy_of_old_ranges() {
+    let then = PowerSettings {
+        psu_efficiency_permille: 500,
+        ..PowerSettings::default()
+    };
+    let first = Rig::with(&metered(), then);
+    first.run(6).await;
+    let measured = first.telemetry.energy(T0_MS, T0_MS + 5000).await.unwrap();
+    assert_eq!(
+        measured.system_mj,
+        (measured.gpu_mj + measured.cpu_mj) * 2,
+        "at 500 permille"
+    );
+    first.telemetry.shutdown().await;
+
+    // Today's settings differ; 40 days on, the range comes from e15.
+    let later = Rig::at(
+        HwSources::none(),
+        PowerSettings::default(),
+        first.db.clone(),
+        None,
+    );
+    later.clock.advance(Duration::from_secs(40 * 86_400));
+    let old = later.telemetry.energy(T0_MS, T0_MS + 5000).await.unwrap();
+    assert_eq!(old.samples, None, "from a roll-up");
+    assert_eq!(
+        (old.gpu_mj, old.cpu_mj, old.system_mj),
+        (measured.gpu_mj, measured.cpu_mj, measured.system_mj)
+    );
+}
+
+/// A raised `gpu_spill` is held while one per-process reading fails, so a spill that never
+/// stopped doesn't flap; it clears only after 30 s with the figure unknown, as when the
+/// counters can't be read (Appendix H; review N1).
+#[tokio::test] // spec: APP-132
+async fn a_raised_spill_survives_one_unknown_reading_and_clears_after_30_s() {
+    let lost = json!({"error": "PDH: the counter set went away"});
+    // Second 0: idle 200. Seconds 1-11: 900, raised at 11. Second 12: unknown. Seconds 13-17:
+    // 900 again. From second 18: unknown for good.
+    let mut readings = vec![engine_mem(200)];
+    readings.extend(std::iter::repeat_n(engine_mem(900), 11));
+    readings.push(lost.clone());
+    readings.extend(std::iter::repeat_n(engine_mem(900), 5));
+    readings.push(lost);
+    let mut hw = spill_script(&[200]);
+    hw["gpu_mem"] = json!(readings);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_held", "comfyui");
+    let raised = rig.run(11).await;
+    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
+    let gap = rig.run(1).await;
+    assert!(
+        spill_alert(&gap).is_some(),
+        "one unknown reading holds it: {:?}",
+        gap.alerts
+    );
+    let back = rig.run(5).await;
+    assert_eq!(spill_alert(&back).and_then(|a| a.above_idle_mib), Some(700));
+    let unknown = rig.run(30).await;
+    assert!(
+        spill_alert(&unknown).is_some(),
+        "not yet 30 s unknown: {:?}",
+        unknown.alerts
+    );
+    let cleared = rig.run(1).await;
+    assert!(spill_alert(&cleared).is_none(), "{:?}", cleared.alerts);
+    let kinds: Vec<Value> = alert_events(&rig.events().await, "gpu_spill")
+        .iter()
+        .map(|e| e["kind"].clone())
+        .collect();
+    assert_eq!(kinds, [json!("alert"), json!("alert_cleared")], "no flap");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 19 audit fix round 1 (L1, L4).
+// ---------------------------------------------------------------------------------------------
+
+/// One adapter-counter reading that fails holds a raised `gpu_spill` like an unknown
+/// per-process reading: no flap; 30 s unreadable clears it (audit L1).
+#[tokio::test] // spec: APP-132, CORE-059
+async fn a_raised_spill_survives_one_unreadable_adapter_reading() {
+    // Seconds 1-11 at 900 raise it; second 12 the adapter can't be read; 13-17 it can;
+    // from 18 it can't.
+    let mut adapter = vec![json!({"dedicated_mib": 4500, "shared_mib": 300}); 12];
+    adapter.push(Value::Null);
+    adapter.extend(std::iter::repeat_n(
+        json!({"dedicated_mib": 4500, "shared_mib": 300}),
+        5,
+    ));
+    adapter.push(Value::Null);
+    let mut hw = spill_script(&[200, 900]);
+    hw["gpu_adapter"] = json!(adapter);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_adapter", "comfyui");
+    let raised = rig.run(11).await;
+    assert!(spill_alert(&raised).is_some(), "{:?}", raised.alerts);
+    let gap = rig.run(1).await;
+    assert!(
+        spill_alert(&gap).is_some(),
+        "one unreadable reading holds it: {:?}",
+        gap.alerts
+    );
+    rig.run(5).await;
+    let unreadable = rig.run(30).await;
+    assert!(
+        spill_alert(&unreadable).is_some(),
+        "not yet 30 s: {:?}",
+        unreadable.alerts
+    );
+    let cleared = rig.run(1).await;
+    assert!(spill_alert(&cleared).is_none(), "{:?}", cleared.alerts);
+    let kinds: Vec<Value> = alert_events(&rig.events().await, "gpu_spill")
+        .iter()
+        .map(|e| e["kind"].clone())
+        .collect();
+    assert_eq!(kinds, [json!("alert"), json!("alert_cleared")], "no flap");
+
+    // A job that ends while the adapter can't be read still clears it at once.
+    let mut adapter = vec![json!({"dedicated_mib": 4500, "shared_mib": 300}); 12];
+    adapter.push(Value::Null);
+    let mut hw = spill_script(&[200, 900]);
+    hw["gpu_adapter"] = json!(adapter);
+    let rig = engine_rig(&hw);
+    rig.run(1).await;
+    rig.telemetry.job_started("j_ends", "comfyui");
+    assert!(spill_alert(&rig.run(11).await).is_some());
+    rig.telemetry.job_ended("j_ends");
+    assert!(spill_alert(&rig.run(1).await).is_none());
+}
+
+/// LT-04's 30 s at <= 82 °C count only time the GPU was read: after 40 s without a reading,
+/// one calm reading doesn't clear the temperature alert; 30 s of them do (audit L4).
+#[tokio::test] // spec: APP-132, CORE-066
+async fn lt04_clears_count_only_time_with_a_reading() {
+    let at = |temp: u64| {
+        let mut g = gpu(100_000, 1000);
+        g["temp_c"] = json!(temp);
+        g
+    };
+    let lost = json!({"error": "NVML: the driver was unloaded"});
+    // Second 0: 85. Second 1: 82. Seconds 2-41: no reading. From second 42: 82.
+    let mut readings = vec![at(85), at(82)];
+    readings.extend(std::iter::repeat_n(lost, 40));
+    readings.push(at(82));
+    let rig = Rig::new(&script(readings, vec![sys(100)]));
+    let temperature = |snap: &Snapshot| snap.alerts.iter().any(|a| a.id == "gpu_temperature");
+    assert!(temperature(&rig.run(2).await), "raised");
+    assert!(temperature(&rig.run(40).await), "held through the gap");
+    assert!(
+        temperature(&rig.run(1).await),
+        "one calm reading after the gap doesn't clear it"
+    );
+    assert!(temperature(&rig.run(29).await), "29 s of readings at 82");
+    assert!(
+        !temperature(&rig.run(1).await),
+        "30 s of readings at 82 clear it"
     );
 }

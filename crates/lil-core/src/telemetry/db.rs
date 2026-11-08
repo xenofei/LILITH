@@ -10,7 +10,18 @@
 //!   per-process figures of the processes that matter (tracked ones and any using the GPU),
 //!   24 h. `job_energy` holds the per-job rows `meter` writes when a job completes, and
 //!   `job_stats` (version 2) the history of each succeeded job with an estimate key, which the
-//!   estimator reads (CORE-161, Appendix G).
+//!   estimator reads (CORE-161, Appendix G). `e15` (version 3) holds quarter-hour energy sums,
+//!   kept forever, so a local hour or day in any time zone sums exactly (CORE-062, Appendix H):
+//!   `gpu.energy`, `cpu.energy` and `system.energy` in mJ, and the counts `samples`,
+//!   `gpu.energy.measured`, `cpu.energy.measured` and `system.samples` (the samples whose
+//!   whole-system energy `system.energy` holds). A range older than the minute rows is read
+//!   from `h1` for the whole hours before the first quarter-hour row's hour and from `e15`
+//!   from that hour on, so history from before version 3 still counts and nothing counts
+//!   twice. A quarter whose every sample has its `system.energy` gives the whole system's
+//!   energy as it was measured then (with that day's `[power]` settings and each sample's own
+//!   length); any other part of a range is computed by `telemetry.energy`'s formula. Version 3 also adds the adapter series
+//!   (`gpu.mem.*`, `gpu.engine.busiest_permille`), each process's `Shared Usage`
+//!   (`proc_s1.vram_shared`) and the fit columns of `job_energy`.
 //! - **Metrics.** The twelve series metrics are columns of `s1`; a column is `NULL` when its
 //!   figure was unknown at that sample, and a bucket only counts the samples that had it. For
 //!   the two `*.energy` metrics a sample's value is that interval's energy in mJ, so a bucket's
@@ -36,10 +47,10 @@ use rusqlite::{Connection, OpenFlags, params};
 
 use crate::store::fsops;
 
-use super::{EnergySlice, JobEnergy, JobEnergyQuery, JobStatsRow, Measured};
+use super::{EnergySlice, Fit, JobEnergy, JobEnergyQuery, JobStatsRow, Measured};
 
 /// `PRAGMA user_version` of `telemetry.db`.
-pub(crate) const USER_VERSION: i64 = 2;
+pub(crate) const USER_VERSION: i64 = 3;
 
 /// Version 2 (plan 4a): the estimator's history (Appendix G).
 const JOB_STATS: &str = "
@@ -55,10 +66,56 @@ CREATE TABLE job_stats (
 CREATE INDEX job_stats_key ON job_stats (kind, estimate_key, finished_ms);
 ";
 
+/// Version 3 (plan 4b, Task 19): the adapter series, the processes' shared memory, the fit
+/// columns and the quarter-hour energy rows (Appendix H). The quarter-hour rows of the minute
+/// rows still kept (30 days) are filled in from them, from the first hour the minute rows hold
+/// whole (the same sample count as its `h1` row; an hour retention cut in two stays `h1`'s),
+/// so a range of that time keeps its GPU and CPU energy and its counts, and every older hour is
+/// `h1`'s; `system.energy` starts with the version.
+const V3: &str = "
+ALTER TABLE s1 ADD COLUMN gpu_mem_dedicated INTEGER;
+ALTER TABLE s1 ADD COLUMN gpu_mem_shared INTEGER;
+ALTER TABLE s1 ADD COLUMN gpu_engine_busiest INTEGER;
+ALTER TABLE proc_s1 ADD COLUMN vram_shared INTEGER;
+ALTER TABLE job_energy ADD COLUMN shared_idle_mib INTEGER;
+ALTER TABLE job_energy ADD COLUMN shared_above_idle_max_mib INTEGER;
+CREATE TABLE e15 (
+    ts INTEGER NOT NULL, metric TEXT NOT NULL, sum INTEGER NOT NULL,
+    PRIMARY KEY (ts, metric)
+) WITHOUT ROWID;
+CREATE TEMP TABLE v3_start AS
+    WITH first AS (SELECT MIN(ts) - MIN(ts) % 3600000 AS h FROM m1)
+    SELECT CASE
+        WHEN (SELECT SUM(n) FROM m1 WHERE metric = 'cpu.util'
+                AND ts >= first.h AND ts < first.h + 3600000)
+           = (SELECT n FROM h1 WHERE metric = 'cpu.util' AND ts = first.h)
+        THEN first.h
+        ELSE first.h + 3600000
+    END AS t FROM first;
+INSERT INTO e15 (ts, metric, sum)
+    SELECT ts - ts % 900000, metric, SUM(sum) FROM m1
+    WHERE metric IN ('gpu.energy', 'cpu.energy') AND ts >= (SELECT t FROM v3_start)
+    GROUP BY 1, 2;
+INSERT INTO e15 (ts, metric, sum)
+    SELECT ts - ts % 900000, 'samples', SUM(n) FROM m1
+    WHERE metric = 'cpu.util' AND ts >= (SELECT t FROM v3_start) GROUP BY 1;
+INSERT INTO e15 (ts, metric, sum)
+    SELECT ts - ts % 900000, 'gpu.energy.measured',
+           SUM(CASE metric WHEN 'gpu.energy' THEN n ELSE -n END) FROM m1
+    WHERE metric IN ('gpu.energy', 'gpu.energy.estimated') AND ts >= (SELECT t FROM v3_start)
+    GROUP BY 1;
+INSERT INTO e15 (ts, metric, sum)
+    SELECT ts - ts % 900000, 'cpu.energy.measured',
+           SUM(CASE metric WHEN 'cpu.energy' THEN n ELSE -n END) FROM m1
+    WHERE metric IN ('cpu.energy', 'cpu.energy.estimated') AND ts >= (SELECT t FROM v3_start)
+    GROUP BY 1;
+DROP TABLE v3_start;
+";
+
 /// The forward migrations: entry `i` takes a file from version `i + 1` to `i + 2`, so a file of
 /// any older version reaches [`USER_VERSION`]. A schema change appends its step here, edits
 /// [`SCHEMA`] (what a new file gets) to match, and bumps [`USER_VERSION`].
-const MIGRATIONS: &[&str] = &[JOB_STATS];
+const MIGRATIONS: &[&str] = &[JOB_STATS, V3];
 
 /// What [`open_file`] expects: the schema of a new file, its version, and the steps that bring
 /// an older file to it (production: [`SCHEMA`], [`USER_VERSION`], [`MIGRATIONS`]).
@@ -77,6 +134,8 @@ const LAYOUT: Layout<'static> = Layout {
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
 const MINUTE_MS: i64 = 60_000;
+/// The `e15` buckets.
+const QUARTER_MS: i64 = 900_000;
 const HOUR_MS: i64 = 3_600_000;
 /// 1-second samples are kept 24 h (CORE-062).
 pub(crate) const KEEP_S1_MS: i64 = 24 * HOUR_MS;
@@ -95,6 +154,14 @@ pub(crate) const EST_CPU_ENERGY: i64 = 8;
 const GPU_ENERGY_ESTIMATED: &str = "gpu.energy.estimated";
 const CPU_ENERGY_ESTIMATED: &str = "cpu.energy.estimated";
 
+/// The `e15` rows beside the two energy metrics': the whole system's energy, and the counts of
+/// samples and of samples whose GPU or CPU energy was measured.
+const SYSTEM_ENERGY: &str = "system.energy";
+const SAMPLES: &str = "samples";
+const GPU_ENERGY_MEASURED: &str = "gpu.energy.measured";
+const CPU_ENERGY_MEASURED: &str = "cpu.energy.measured";
+const SYSTEM_SAMPLES: &str = "system.samples";
+
 /// The series metrics (Appendix F).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Metric {
@@ -110,10 +177,16 @@ pub(crate) enum Metric {
     SystemPower,
     NetRx,
     NetTx,
+    GpuMemDedicated,
+    GpuMemShared,
+    GpuEngineBusiest,
 }
 
 impl Metric {
-    pub(crate) const ALL: [Metric; 12] = [
+    /// How many metrics there are.
+    pub(crate) const COUNT: usize = 15;
+
+    pub(crate) const ALL: [Metric; Metric::COUNT] = [
         Metric::GpuUtil,
         Metric::GpuPower,
         Metric::GpuEnergy,
@@ -126,6 +199,9 @@ impl Metric {
         Metric::SystemPower,
         Metric::NetRx,
         Metric::NetTx,
+        Metric::GpuMemDedicated,
+        Metric::GpuMemShared,
+        Metric::GpuEngineBusiest,
     ];
 
     /// The name a caller uses.
@@ -143,6 +219,9 @@ impl Metric {
             Metric::SystemPower => "system.power",
             Metric::NetRx => "net.rx",
             Metric::NetTx => "net.tx",
+            Metric::GpuMemDedicated => "gpu.mem.dedicated_mib",
+            Metric::GpuMemShared => "gpu.mem.shared_mib",
+            Metric::GpuEngineBusiest => "gpu.engine.busiest_permille",
         }
     }
 
@@ -165,6 +244,9 @@ impl Metric {
             Metric::SystemPower => "system_power",
             Metric::NetRx => "net_rx",
             Metric::NetTx => "net_tx",
+            Metric::GpuMemDedicated => "gpu_mem_dedicated",
+            Metric::GpuMemShared => "gpu_mem_shared",
+            Metric::GpuEngineBusiest => "gpu_engine_busiest",
         }
     }
 
@@ -200,6 +282,8 @@ pub(crate) struct ProcRow {
     pub ram_mib: Option<u64>,
     pub vram_local: Option<u64>,
     pub vram_committed: Option<u64>,
+    /// PDH `Shared Usage` (the fit signal's per-process figure).
+    pub vram_shared: Option<u64>,
 }
 
 /// One sample, as stored.
@@ -216,9 +300,11 @@ pub(crate) struct Row {
     pub dt: i64,
     pub est: i64,
     /// By [`Metric::ALL`] order.
-    pub values: [Option<i64>; 12],
+    pub values: [Option<i64>; Metric::COUNT],
     /// CPU time used by every process together over `dt`, ms.
     pub cpu_ms_all: u64,
+    /// The whole system's energy over `dt`, mJ (`e15` only; no `s1` column).
+    pub system_mj: Option<u64>,
     pub procs: Vec<ProcRow>,
 }
 
@@ -252,7 +338,8 @@ CREATE TABLE s1 (
     gpu_vram_used INTEGER,
     cpu_util INTEGER, cpu_power INTEGER, cpu_energy INTEGER,
     ram_used INTEGER, system_power INTEGER, net_rx INTEGER, net_tx INTEGER,
-    cpu_ms_all INTEGER NOT NULL DEFAULT 0
+    cpu_ms_all INTEGER NOT NULL DEFAULT 0,
+    gpu_mem_dedicated INTEGER, gpu_mem_shared INTEGER, gpu_engine_busiest INTEGER
 );
 CREATE INDEX s1_run_mono ON s1 (run, mono);
 CREATE TABLE m1 (
@@ -268,7 +355,7 @@ CREATE TABLE h1 (
 CREATE TABLE proc_s1 (
     ts INTEGER NOT NULL, pid INTEGER NOT NULL,
     sm INTEGER NOT NULL, cpu_ms INTEGER NOT NULL,
-    ram_mib INTEGER, vram_local INTEGER, vram_committed INTEGER,
+    ram_mib INTEGER, vram_local INTEGER, vram_committed INTEGER, vram_shared INTEGER,
     PRIMARY KEY (ts, pid)
 ) WITHOUT ROWID;
 CREATE TABLE job_energy (
@@ -279,7 +366,8 @@ CREATE TABLE job_energy (
     cpu_mj_gross INTEGER NOT NULL, cpu_mj_above_idle INTEGER NOT NULL,
     system_mj INTEGER NOT NULL, gpu_seconds_milli INTEGER NOT NULL,
     gpu_measured INTEGER NOT NULL, cpu_measured INTEGER NOT NULL,
-    idle_unknown INTEGER NOT NULL
+    idle_unknown INTEGER NOT NULL,
+    shared_idle_mib INTEGER, shared_above_idle_max_mib INTEGER
 );
 CREATE INDEX job_energy_to ON job_energy (to_ms);
 CREATE TABLE job_stats (
@@ -292,13 +380,25 @@ CREATE TABLE job_stats (
     system_mj INTEGER NOT NULL
 );
 CREATE INDEX job_stats_key ON job_stats (kind, estimate_key, finished_ms);
+CREATE TABLE e15 (
+    ts INTEGER NOT NULL, metric TEXT NOT NULL, sum INTEGER NOT NULL,
+    PRIMARY KEY (ts, metric)
+) WITHOUT ROWID;
 ";
 
 /// The history rows `job_stats` keeps per kind and estimate key: the ones the estimator reads
 /// (Appendix G).
 pub(crate) const HISTORY_KEPT: u32 = 20;
 
-const TABLES: [&str; 6] = ["s1", "m1", "h1", "proc_s1", "job_energy", "job_stats"];
+const TABLES: [&str; 7] = [
+    "s1",
+    "m1",
+    "h1",
+    "proc_s1",
+    "job_energy",
+    "job_stats",
+    "e15",
+];
 
 /// The open database.
 pub(crate) struct Db {
@@ -485,8 +585,9 @@ impl Db {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO s1 (ts, run, mono, dt, est, gpu_util, gpu_power, gpu_energy, gpu_temp, \
                  gpu_vram_used, cpu_util, cpu_power, cpu_energy, ram_used, system_power, \
-                 net_rx, net_tx, cpu_ms_all) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                 net_rx, net_tx, gpu_mem_dedicated, gpu_mem_shared, gpu_engine_busiest, cpu_ms_all) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                 ?18, ?19, ?20, ?21)",
             )?;
             insert.execute(params![
                 row.ts,
@@ -506,8 +607,38 @@ impl Db {
                 row.values[9],
                 row.values[10],
                 row.values[11],
+                row.values[12],
+                row.values[13],
+                row.values[14],
                 i64::try_from(row.cpu_ms_all).unwrap_or(i64::MAX),
             ])?;
+            let mut quarter = tx.prepare_cached(
+                "INSERT INTO e15 (ts, metric, sum) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (ts, metric) DO UPDATE SET sum = sum + excluded.sum",
+            )?;
+            let bucket = row.ts - row.ts.rem_euclid(QUARTER_MS);
+            let measured = |m: Metric, bit: i64| row.value(m).is_some() && row.est & bit == 0;
+            let big = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+            for (metric, sum) in [
+                (Metric::GpuEnergy.name(), row.value(Metric::GpuEnergy)),
+                (Metric::CpuEnergy.name(), row.value(Metric::CpuEnergy)),
+                // A sample with no figure at all stands for no energy.
+                (SYSTEM_ENERGY, Some(big(row.system_mj.unwrap_or(0)))),
+                (SYSTEM_SAMPLES, Some(1)),
+                (SAMPLES, Some(1)),
+                (
+                    GPU_ENERGY_MEASURED,
+                    measured(Metric::GpuEnergy, EST_GPU_ENERGY).then_some(1),
+                ),
+                (
+                    CPU_ENERGY_MEASURED,
+                    measured(Metric::CpuEnergy, EST_CPU_ENERGY).then_some(1),
+                ),
+            ] {
+                if let Some(sum) = sum {
+                    quarter.execute(params![bucket, metric, sum])?;
+                }
+            }
             for (table, len) in [("m1", MINUTE_MS), ("h1", HOUR_MS)] {
                 let bucket = row.ts - row.ts.rem_euclid(len);
                 let mut upsert = tx.prepare_cached(&format!(
@@ -531,8 +662,9 @@ impl Db {
                 }
             }
             let mut proc = tx.prepare_cached(
-                "INSERT INTO proc_s1 (ts, pid, sm, cpu_ms, ram_mib, vram_local, vram_committed) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (ts, pid) DO NOTHING",
+                "INSERT INTO proc_s1 (ts, pid, sm, cpu_ms, ram_mib, vram_local, vram_committed, \
+                 vram_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT (ts, pid) DO NOTHING",
             )?;
             for p in &row.procs {
                 proc.execute(params![
@@ -544,6 +676,7 @@ impl Db {
                     p.vram_local.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                     p.vram_committed
                         .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                    p.vram_shared.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 ])?;
             }
         }
@@ -551,7 +684,8 @@ impl Db {
     }
 
     /// Drops what is past its retention at `now_ms`: samples and per-process rows older than
-    /// 24 h, minute rows older than 30 days. Hourly rows and job energy stay (CORE-062).
+    /// 24 h, minute rows older than 30 days. Hourly and quarter-hour rows and job energy stay
+    /// (CORE-062).
     pub(crate) fn prune(&self, now_ms: i64) -> rusqlite::Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -734,8 +868,9 @@ impl Db {
         conn.execute(
             "INSERT OR REPLACE INTO job_energy (job_id, workspace, from_ms, to_ms, gpu_mj_gross, \
              gpu_mj_above_idle, cpu_mj_gross, cpu_mj_above_idle, system_mj, gpu_seconds_milli, \
-             gpu_measured, cpu_measured, idle_unknown) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             gpu_measured, cpu_measured, idle_unknown, shared_idle_mib, \
+             shared_above_idle_max_mib) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 e.job_id,
                 e.workspace,
@@ -750,6 +885,8 @@ impl Db {
                 e.measured.gpu,
                 e.measured.cpu,
                 e.idle_unknown,
+                e.fit.map(|f| big(f.shared_idle_mib)),
+                e.fit.map(|f| big(f.shared_above_idle_max_mib)),
             ],
         )?;
         Ok(())
@@ -768,7 +905,8 @@ impl Db {
         let mut stmt = conn.prepare_cached(
             "SELECT job_id, workspace, from_ms, to_ms, gpu_mj_gross, gpu_mj_above_idle, \
              cpu_mj_gross, cpu_mj_above_idle, system_mj, gpu_seconds_milli, gpu_measured, \
-             cpu_measured, idle_unknown FROM job_energy \
+             cpu_measured, idle_unknown, shared_idle_mib, shared_above_idle_max_mib \
+             FROM job_energy \
              WHERE (?1 IS NULL OR to_ms >= ?1) AND (?2 IS NULL OR from_ms <= ?2) \
              ORDER BY to_ms DESC, job_id",
         )?;
@@ -798,6 +936,13 @@ impl Db {
                     cpu: r.get(11)?,
                 },
                 idle_unknown: r.get(12)?,
+                fit: match (r.get::<_, Option<i64>>(13)?, r.get::<_, Option<i64>>(14)?) {
+                    (Some(idle), Some(above)) => Some(Fit {
+                        shared_idle_mib: unsigned(idle),
+                        shared_above_idle_max_mib: unsigned(above),
+                    }),
+                    _ => None,
+                },
             });
             if out.len() >= limit {
                 break;
@@ -866,8 +1011,10 @@ impl Db {
         .collect()
     }
 
-    /// The energy of the samples with `from_ms <= ts <= to_ms`, from table `res` (a coarser
-    /// bucket counts when it holds any millisecond of the range, as in [`Db::series`]).
+    /// The energy of the samples with `from_ms <= ts <= to_ms`, from the table `res` names: `s1`,
+    /// `m1`, or for [`Resolution::Hour`] the quarter-hour rows `e15` (`h1` when `e15` holds no
+    /// sample of the range: history from before version 3). A coarser bucket counts when it
+    /// holds any millisecond of the range, as in [`Db::series`].
     pub(crate) fn energy(
         &self,
         from_ms: i64,
@@ -875,84 +1022,203 @@ impl Db {
         res: Resolution,
     ) -> rusqlite::Result<RangeEnergy> {
         let conn = self.lock();
-        let mut out = RangeEnergy::default();
         match res {
             Resolution::Second => {
                 let mut stmt = conn.prepare_cached(
                     "SELECT est, gpu_energy, cpu_energy, dt FROM s1 WHERE ts BETWEEN ?1 AND ?2",
                 )?;
                 let mut found = stmt.query(params![from_ms, to_ms])?;
-                let (mut gpu_all, mut cpu_all) = (true, true);
+                let mut out = Counted::default();
+                let mut covered_ms = 0;
                 while let Some(r) = found.next()? {
                     let est: i64 = r.get(0)?;
                     let (gpu, cpu): (Option<i64>, Option<i64>) = (r.get(1)?, r.get(2)?);
                     out.samples += 1;
-                    gpu_all &= gpu.is_some() && est & EST_GPU_ENERGY == 0;
-                    cpu_all &= cpu.is_some() && est & EST_CPU_ENERGY == 0;
+                    out.gpu_n += u64::from(gpu.is_some() && est & EST_GPU_ENERGY == 0);
+                    out.cpu_n += u64::from(cpu.is_some() && est & EST_CPU_ENERGY == 0);
                     out.gpu_mj += gpu.map_or(0, |v| u64::try_from(v).unwrap_or(0));
                     out.cpu_mj += cpu.map_or(0, |v| u64::try_from(v).unwrap_or(0));
-                    out.covered_ms += u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0);
+                    covered_ms += u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0);
                 }
-                out.gpu_measured = out.samples > 0 && gpu_all;
-                out.cpu_measured = out.samples > 0 && cpu_all;
+                out.covered_ms = covered_ms;
+                Ok(out.range(false))
             }
-            Resolution::Minute | Resolution::Hour => {
-                let (table, len) = if res == Resolution::Minute {
-                    ("m1", MINUTE_MS)
-                } else {
-                    ("h1", HOUR_MS)
-                };
-                let mut stmt = conn.prepare_cached(&format!(
-                    "SELECT metric, SUM(n), SUM(sum) FROM {table} \
-                     WHERE metric IN (?1, ?2, ?3, ?4, ?5) AND ts > ?7 - ?6 AND ts <= ?8 GROUP BY metric"
-                ))?;
-                let mut found = stmt.query(params![
-                    Metric::GpuEnergy.name(),
-                    Metric::CpuEnergy.name(),
-                    Metric::CpuUtil.name(),
-                    GPU_ENERGY_ESTIMATED,
-                    CPU_ENERGY_ESTIMATED,
-                    len,
-                    from_ms,
-                    to_ms
-                ])?;
-                let (mut gpu_n, mut cpu_n, mut gpu_est, mut cpu_est) = (0, 0, 0, 0);
-                while let Some(r) = found.next()? {
-                    let metric: String = r.get(0)?;
-                    let (n, sum) = (
-                        u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
-                        u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
-                    );
-                    match (metric.as_str(), Metric::parse(&metric)) {
-                        (GPU_ENERGY_ESTIMATED, _) => gpu_est = n,
-                        (CPU_ENERGY_ESTIMATED, _) => cpu_est = n,
-                        (_, Some(Metric::GpuEnergy)) => (out.gpu_mj, gpu_n) = (sum, n),
-                        (_, Some(Metric::CpuEnergy)) => (out.cpu_mj, cpu_n) = (sum, n),
-                        // Every sample has the CPU's utilisation: it counts the samples.
-                        _ => out.samples = n,
-                    }
+            Resolution::Minute => {
+                Ok(rolled_up(&conn, "m1", MINUTE_MS, from_ms, to_ms, i64::MAX)?.range(true))
+            }
+            Resolution::Hour => {
+                // The hour of the first quarter-hour row: `h1` before it, `e15` from it on.
+                let first: Option<i64> =
+                    conn.query_row("SELECT MIN(ts) FROM e15", [], |r| r.get(0))?;
+                let split = first.map_or(i64::MAX, |ts| ts - ts.rem_euclid(HOUR_MS));
+                let mut found = rolled_up(&conn, "h1", HOUR_MS, from_ms, to_ms, split)?;
+                if split != i64::MAX {
+                    found.add(&quarters(&conn, from_ms, to_ms, split)?);
                 }
-                // A nominal second a sample (CORE-061): the rolled-up rows keep no `dt`.
-                out.covered_ms = out.samples * 1000;
-                out.gpu_measured = out.samples > 0 && gpu_n == out.samples && gpu_est == 0;
-                out.cpu_measured = out.samples > 0 && cpu_n == out.samples && cpu_est == 0;
+                Ok(found.range(true))
             }
         }
-        Ok(out)
     }
 }
 
 /// What [`Db::energy`] found: the summed energy, whether every sample had each figure and none
-/// was estimated (rows from before the rolled-up marks count as not estimated), how many samples,
-/// and the time they stand for.
+/// was estimated (rows from before the rolled-up marks count as not estimated), whether some
+/// samples had a part measured and some didn't, how many samples, the time they stand for,
+/// whether the figures came from a roll-up, and the part whose whole-system energy was stored
+/// (`stored_*`: the quarters whose every sample has its `system.energy`; module docs).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RangeEnergy {
     pub gpu_mj: u64,
     pub cpu_mj: u64,
     pub gpu_measured: bool,
     pub cpu_measured: bool,
+    pub partly_measured: bool,
     pub samples: u64,
     pub covered_ms: u64,
+    pub rollup: bool,
+    pub stored_system_mj: u64,
+    pub stored_gpu_mj: u64,
+    pub stored_cpu_mj: u64,
+    pub stored_samples: u64,
+}
+
+/// Energy sums and counts before they become a [`RangeEnergy`]: `gpu_n` and `cpu_n` count the
+/// samples whose figure was measured.
+#[derive(Default)]
+struct Counted {
+    gpu_mj: u64,
+    cpu_mj: u64,
+    samples: u64,
+    gpu_n: u64,
+    cpu_n: u64,
+    covered_ms: u64,
+    stored_system_mj: u64,
+    stored_gpu_mj: u64,
+    stored_cpu_mj: u64,
+    stored_samples: u64,
+}
+
+impl Counted {
+    fn add(&mut self, o: &Counted) {
+        self.gpu_mj += o.gpu_mj;
+        self.cpu_mj += o.cpu_mj;
+        self.samples += o.samples;
+        self.gpu_n += o.gpu_n;
+        self.cpu_n += o.cpu_n;
+        self.covered_ms += o.covered_ms;
+        self.stored_system_mj += o.stored_system_mj;
+        self.stored_gpu_mj += o.stored_gpu_mj;
+        self.stored_cpu_mj += o.stored_cpu_mj;
+        self.stored_samples += o.stored_samples;
+    }
+
+    fn range(self, rollup: bool) -> RangeEnergy {
+        let some = |n: u64| n > 0 && n < self.samples;
+        RangeEnergy {
+            gpu_mj: self.gpu_mj,
+            cpu_mj: self.cpu_mj,
+            gpu_measured: self.samples > 0 && self.gpu_n == self.samples,
+            cpu_measured: self.samples > 0 && self.cpu_n == self.samples,
+            partly_measured: some(self.gpu_n) || some(self.cpu_n),
+            samples: self.samples,
+            covered_ms: self.covered_ms,
+            rollup,
+            stored_system_mj: self.stored_system_mj,
+            stored_gpu_mj: self.stored_gpu_mj,
+            stored_cpu_mj: self.stored_cpu_mj,
+            stored_samples: self.stored_samples,
+        }
+    }
+}
+
+/// [`Db::energy`]'s sums from the minute or hour rows of `table`, whose buckets are `len` long,
+/// over the buckets that start before `before`.
+fn rolled_up(
+    conn: &Connection,
+    table: &str,
+    len: i64,
+    from_ms: i64,
+    to_ms: i64,
+    before: i64,
+) -> rusqlite::Result<Counted> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT metric, SUM(n), SUM(sum) FROM {table} \
+         WHERE metric IN (?1, ?2, ?3, ?4, ?5) AND ts > ?7 - ?6 AND ts <= ?8 AND ts < ?9 \
+         GROUP BY metric"
+    ))?;
+    let mut found = stmt.query(params![
+        Metric::GpuEnergy.name(),
+        Metric::CpuEnergy.name(),
+        Metric::CpuUtil.name(),
+        GPU_ENERGY_ESTIMATED,
+        CPU_ENERGY_ESTIMATED,
+        len,
+        from_ms,
+        to_ms,
+        before
+    ])?;
+    let mut out = Counted::default();
+    let (mut gpu_est, mut cpu_est) = (0, 0);
+    while let Some(r) = found.next()? {
+        let metric: String = r.get(0)?;
+        let (n, sum) = (
+            u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+            u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+        );
+        match (metric.as_str(), Metric::parse(&metric)) {
+            (GPU_ENERGY_ESTIMATED, _) => gpu_est = n,
+            (CPU_ENERGY_ESTIMATED, _) => cpu_est = n,
+            (_, Some(Metric::GpuEnergy)) => (out.gpu_mj, out.gpu_n) = (sum, n),
+            (_, Some(Metric::CpuEnergy)) => (out.cpu_mj, out.cpu_n) = (sum, n),
+            // Every sample has the CPU's utilisation: it counts the samples.
+            _ => out.samples = n,
+        }
+    }
+    out.gpu_n = out.gpu_n.saturating_sub(gpu_est);
+    out.cpu_n = out.cpu_n.saturating_sub(cpu_est);
+    // A nominal second a sample (CORE-061): the rolled-up rows keep no `dt`.
+    out.covered_ms = out.samples * 1000;
+    Ok(out)
+}
+
+/// [`Db::energy`]'s sums from the quarter-hour rows of the range that start at or after `from`
+/// (module docs): a quarter whose every sample has its `system.energy` adds to `stored_*`.
+fn quarters(conn: &Connection, from_ms: i64, to_ms: i64, start: i64) -> rusqlite::Result<Counted> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT ts, metric, sum FROM e15 WHERE ts > ?2 - ?1 AND ts <= ?3 AND ts >= ?4 \
+         ORDER BY ts",
+    )?;
+    let mut found = stmt.query(params![QUARTER_MS, from_ms, to_ms, start])?;
+    let mut by_quarter: std::collections::BTreeMap<i64, (Counted, u64, u64)> =
+        std::collections::BTreeMap::new();
+    while let Some(r) = found.next()? {
+        let ts: i64 = r.get(0)?;
+        let metric: String = r.get(1)?;
+        let sum = u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0);
+        let (q, system_mj, system_n) = by_quarter.entry(ts).or_default();
+        match metric.as_str() {
+            "gpu.energy" => q.gpu_mj = sum,
+            "cpu.energy" => q.cpu_mj = sum,
+            SAMPLES => q.samples = sum,
+            GPU_ENERGY_MEASURED => q.gpu_n = sum,
+            CPU_ENERGY_MEASURED => q.cpu_n = sum,
+            SYSTEM_ENERGY => *system_mj = sum,
+            SYSTEM_SAMPLES => *system_n = sum,
+            _ => {}
+        }
+    }
+    let mut out = Counted::default();
+    for (_, (mut q, system_mj, system_n)) in by_quarter {
+        q.covered_ms = q.samples * 1000;
+        if q.samples > 0 && system_n == q.samples {
+            q.stored_system_mj = system_mj;
+            q.stored_gpu_mj = q.gpu_mj;
+            q.stored_cpu_mj = q.cpu_mj;
+            q.stored_samples = q.samples;
+        }
+        out.add(&q);
+    }
+    Ok(out)
 }
 
 /// The idle power before a window (CORE-065): the median power of the 60 s before it with
@@ -1000,8 +1266,9 @@ mod tests {
             mono: ts,
             dt: 1000,
             est: 0,
-            values: [None; 12],
+            values: [None; Metric::COUNT],
             cpu_ms_all: 0,
+            system_mj: None,
             procs: Vec::new(),
         };
         for (m, v) in values {
@@ -1165,16 +1432,16 @@ mod tests {
 
     /// An older file is migrated forward in place and keeps its history; only a newer version,
     /// version 0 or a migration that fails sets a file aside, and nothing is deleted (CORE-004,
-    /// CORE-062). The layout stands in for a later schema (a version 3 with one more table).
+    /// CORE-062). The layout stands in for a later schema (a version 4 with one more table).
     #[test] // spec: CORE-004
     fn an_older_version_migrates_in_place_and_only_a_newer_or_broken_one_is_set_aside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.db");
-        let v3_schema = format!("{SCHEMA}CREATE TABLE later (x INTEGER);");
-        let v3 = Layout {
-            schema: &v3_schema,
-            version: 3,
-            migrations: &[JOB_STATS, "CREATE TABLE later (x INTEGER);"],
+        let v4_schema = format!("{SCHEMA}CREATE TABLE later (x INTEGER);");
+        let v4 = Layout {
+            schema: &v4_schema,
+            version: 4,
+            migrations: &[JOB_STATS, V3, "CREATE TABLE later (x INTEGER);"],
         };
         let names = || -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(dir.path())
@@ -1189,12 +1456,12 @@ mod tests {
         db.write(&row(1, &[(Metric::RamUsed, 7)])).unwrap();
         drop(db);
 
-        // Version 2 under a core that knows version 3: migrated, every row kept.
-        let conn = open_file(&path, 1_800_000_060, v3).unwrap();
+        // Version 3 under a core that knows version 4: migrated, every row kept.
+        let conn = open_file(&path, 1_800_000_060, v4).unwrap();
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let kept: i64 = conn
             .query_row("SELECT ram_used FROM s1 WHERE ts = 1", [], |r| r.get(0))
             .unwrap();
@@ -1203,7 +1470,7 @@ mod tests {
         drop(conn);
         assert!(names().is_empty(), "{:?}", names());
 
-        // The same file (now version 3) under this core's version 2: newer, so set aside.
+        // The same file (now version 4) under this core's version 3: newer, so set aside.
         let db = Db::open(&path, 1_800_000_120);
         drop(db);
         assert_eq!(names(), ["telemetry.db.damaged-20270115T080200Z"]);
@@ -1216,9 +1483,9 @@ mod tests {
         }
         drop(open_file(&path, 1_800_000_180, LAYOUT).unwrap());
         let broken = Layout {
-            schema: &v3_schema,
-            version: 3,
-            migrations: &[JOB_STATS, "CREATE TABLE s1 (x INTEGER);"],
+            schema: &v4_schema,
+            version: 4,
+            migrations: &[JOB_STATS, V3, "CREATE TABLE s1 (x INTEGER);"],
         };
         drop(open_file(&path, 1_800_000_240, broken).unwrap());
         assert_eq!(
@@ -1234,7 +1501,332 @@ mod tests {
         let version: i64 = aside
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "a failed step is rolled back");
+        assert_eq!(version, 3, "a failed step is rolled back");
+    }
+
+    /// The version 2 schema (plan 4a), as a file of that version holds it.
+    const V2_SCHEMA: &str = "
+CREATE TABLE s1 (
+    ts INTEGER PRIMARY KEY, run INTEGER NOT NULL, mono INTEGER NOT NULL, dt INTEGER NOT NULL,
+    est INTEGER NOT NULL DEFAULT 0,
+    gpu_util INTEGER, gpu_power INTEGER, gpu_energy INTEGER, gpu_temp INTEGER,
+    gpu_vram_used INTEGER,
+    cpu_util INTEGER, cpu_power INTEGER, cpu_energy INTEGER,
+    ram_used INTEGER, system_power INTEGER, net_rx INTEGER, net_tx INTEGER,
+    cpu_ms_all INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX s1_run_mono ON s1 (run, mono);
+CREATE TABLE m1 (
+    ts INTEGER NOT NULL, metric TEXT NOT NULL, n INTEGER NOT NULL,
+    min INTEGER, max INTEGER, sum INTEGER NOT NULL, PRIMARY KEY (ts, metric)
+) WITHOUT ROWID;
+CREATE TABLE h1 (
+    ts INTEGER NOT NULL, metric TEXT NOT NULL, n INTEGER NOT NULL,
+    min INTEGER, max INTEGER, sum INTEGER NOT NULL, PRIMARY KEY (ts, metric)
+) WITHOUT ROWID;
+CREATE TABLE proc_s1 (
+    ts INTEGER NOT NULL, pid INTEGER NOT NULL, sm INTEGER NOT NULL, cpu_ms INTEGER NOT NULL,
+    ram_mib INTEGER, vram_local INTEGER, vram_committed INTEGER, PRIMARY KEY (ts, pid)
+) WITHOUT ROWID;
+CREATE TABLE job_energy (
+    job_id TEXT PRIMARY KEY, workspace TEXT NOT NULL,
+    from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL,
+    gpu_mj_gross INTEGER NOT NULL, gpu_mj_above_idle INTEGER NOT NULL,
+    cpu_mj_gross INTEGER NOT NULL, cpu_mj_above_idle INTEGER NOT NULL,
+    system_mj INTEGER NOT NULL, gpu_seconds_milli INTEGER NOT NULL,
+    gpu_measured INTEGER NOT NULL, cpu_measured INTEGER NOT NULL, idle_unknown INTEGER NOT NULL
+);
+CREATE INDEX job_energy_to ON job_energy (to_ms);
+CREATE TABLE job_stats (
+    job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, estimate_key TEXT NOT NULL,
+    finished_ms INTEGER NOT NULL, wall_ms INTEGER NOT NULL,
+    gpu_seconds_milli INTEGER NOT NULL, system_mj INTEGER NOT NULL
+);
+CREATE INDEX job_stats_key ON job_stats (kind, estimate_key, finished_ms);
+";
+
+    /// A version 2 file is migrated in place to version 3 (Appendix H): its rows stay, the new
+    /// columns are empty, a job without fit columns reads `fit: null`, and the quarter-hour
+    /// rows of the minute rows it holds are filled in, so their energy still sums exactly.
+    #[test] // spec: CORE-062, CORE-004
+    fn version_2_db_migrates_to_3_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        let quarter = 1_800_000_000_000 - 1_800_000_000_000 % QUARTER_MS;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V2_SCHEMA).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute(
+                "INSERT INTO s1 (ts, run, mono, dt, gpu_energy, cpu_util) VALUES (?1, 1, 1, 1000, 40, 5)",
+                [quarter],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO proc_s1 (ts, pid, sm, cpu_ms, vram_local) VALUES (?1, 7, 3, 4, 100)",
+                [quarter],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO job_energy VALUES ('j_old', 'loose', 1, 2, 3, 4, 5, 6, 7, 8, 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            // The hour's h1 rows: the minute rows below hold it whole.
+            for (metric, n, sum) in [
+                ("gpu.energy", 5, 50),
+                ("gpu.energy.estimated", 1, 1),
+                ("cpu.energy", 5, 500),
+                ("cpu.util", 5, 25),
+            ] {
+                conn.execute(
+                    "INSERT INTO h1 (ts, metric, n, min, max, sum) VALUES (?1, ?2, ?3, 0, 0, ?4)",
+                    params![quarter, metric, n, sum],
+                )
+                .unwrap();
+            }
+            // Two minutes of the quarter: 3 samples, one GPU figure estimated, then 2 samples.
+            for (ts, metric, n, sum) in [
+                (quarter, "gpu.energy", 3, 30),
+                (quarter, "gpu.energy.estimated", 1, 1),
+                (quarter, "cpu.energy", 3, 300),
+                (quarter, "cpu.util", 3, 15),
+                (quarter + MINUTE_MS, "gpu.energy", 2, 20),
+                (quarter + MINUTE_MS, "cpu.energy", 2, 200),
+                (quarter + MINUTE_MS, "cpu.util", 2, 10),
+            ] {
+                conn.execute(
+                    "INSERT INTO m1 (ts, metric, n, min, max, sum) VALUES (?1, ?2, ?3, 0, 0, ?4)",
+                    params![ts, metric, n, sum],
+                )
+                .unwrap();
+            }
+        }
+        let db = Db::open(&path, 1_800_000_000);
+        let version: i64 = db
+            .lock()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let kept: (i64, Option<i64>) = db
+            .lock()
+            .query_row("SELECT gpu_energy, gpu_mem_shared FROM s1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            kept,
+            (40, None),
+            "the sample is kept; the new column is empty"
+        );
+        let proc: (i64, Option<i64>) = db
+            .lock()
+            .query_row("SELECT vram_local, vram_shared FROM proc_s1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(proc, (100, None));
+        let jobs = db
+            .job_energy(&JobEnergyQuery::default(), None, None, 10)
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].system_mj, jobs[0].fit), (7, None));
+        // The quarter-hour rows came from the minute rows.
+        let filled: i64 = db
+            .lock()
+            .query_row(
+                "SELECT SUM(sum) FROM e15 WHERE metric = 'samples'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(filled, 5);
+        let e = db
+            .energy(quarter, quarter + QUARTER_MS - 1, Resolution::Hour)
+            .unwrap();
+        assert_eq!((e.gpu_mj, e.cpu_mj, e.samples), (50, 500, 5));
+        assert_eq!(e.stored_samples, 0, "no system energy before version 3");
+        assert!(!e.gpu_measured && e.cpu_measured && e.partly_measured);
+        // New samples are written in the new layout.
+        let mut r = row(quarter + 2 * MINUTE_MS, &[(Metric::GpuMemShared, 64)]);
+        r.procs.push(ProcRow {
+            pid: 7,
+            sm: 0,
+            cpu_ms: 0,
+            ram_mib: None,
+            vram_local: None,
+            vram_committed: None,
+            vram_shared: Some(9),
+        });
+        db.write(&r).unwrap();
+        let shared: i64 = db
+            .lock()
+            .query_row(
+                "SELECT vram_shared FROM proc_s1 WHERE ts = ?1",
+                [quarter + 2 * MINUTE_MS],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared, 9);
+    }
+
+    /// A version 2 file with `rows` (`(table, ts, metric, n, sum)`) of `m1` and `h1`, migrated
+    /// to the current version.
+    fn upgraded(dir: &Path, rows: &[(&str, i64, &str, i64, i64)]) -> Db {
+        let path = dir.join("telemetry.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V2_SCHEMA).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            for (table, ts, metric, n, sum) in rows {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table} (ts, metric, n, min, max, sum) VALUES (?1, ?2, ?3, 0, 0, ?4)"
+                    ),
+                    params![ts, metric, n, sum],
+                )
+                .unwrap();
+            }
+        }
+        Db::open(&path, 1_800_000_000)
+    }
+
+    /// An upgraded database: an hour 60 days old that only `h1` holds, and a minute 10 days old
+    /// in `m1` (filled into `e15`) and `h1`. A range over both sums both, each sample once: the
+    /// hours before the first quarter-hour row from `h1`, the rest from `e15` (CORE-062,
+    /// APP-131; review I1).
+    #[test] // spec: CORE-062, APP-131
+    fn an_old_range_sums_the_hours_before_e15_and_the_quarters_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_000_i64 - 1_800_000_000_000 % HOUR_MS;
+        let (old, recent) = (now - 60 * 24 * HOUR_MS, now - 10 * 24 * HOUR_MS);
+        let db = upgraded(
+            dir.path(),
+            &[
+                ("h1", old, "gpu.energy", 3600, 1_000_000),
+                ("h1", old, "cpu.util", 3600, 0),
+                ("h1", recent, "gpu.energy", 60, 5000),
+                ("h1", recent, "cpu.util", 60, 0),
+                ("m1", recent, "gpu.energy", 60, 5000),
+                ("m1", recent, "cpu.util", 60, 0),
+            ],
+        );
+        let e = db
+            .energy(now - 61 * 24 * HOUR_MS, now, Resolution::Hour)
+            .unwrap();
+        assert_eq!((e.gpu_mj, e.samples), (1_005_000, 3660));
+        // Each part alone.
+        let before = db.energy(old, recent - 1, Resolution::Hour).unwrap();
+        assert_eq!((before.gpu_mj, before.samples), (1_000_000, 3600));
+        let after = db.energy(recent, now, Resolution::Hour).unwrap();
+        assert_eq!((after.gpu_mj, after.samples), (5000, 60));
+    }
+
+    /// The minute rows' oldest hour is partial (pruned mid-hour), so the quarter-hour rows start
+    /// at the next whole hour and `h1` keeps serving the partial one, whole (review I1).
+    #[test] // spec: CORE-062, APP-131
+    fn the_v3_back_fill_starts_on_an_hour_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_000_i64 - 1_800_000_000_000 % HOUR_MS;
+        let partial = now - 10 * 24 * HOUR_MS;
+        let next = partial + HOUR_MS;
+        let db = upgraded(
+            dir.path(),
+            &[
+                // The hour's first half was pruned from m1; h1 holds all of it.
+                ("h1", partial, "gpu.energy", 120, 7000),
+                ("h1", partial, "cpu.util", 120, 0),
+                ("m1", partial + 30 * MINUTE_MS, "gpu.energy", 60, 3000),
+                ("m1", partial + 30 * MINUTE_MS, "cpu.util", 60, 0),
+                ("h1", next, "gpu.energy", 60, 5000),
+                ("h1", next, "cpu.util", 60, 0),
+                ("m1", next, "gpu.energy", 60, 5000),
+                ("m1", next, "cpu.util", 60, 0),
+            ],
+        );
+        let first: i64 = db
+            .lock()
+            .query_row("SELECT MIN(ts) FROM e15", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(first, next, "the quarter-hour rows start on a whole hour");
+        let e = db.energy(partial - HOUR_MS, now, Resolution::Hour).unwrap();
+        assert_eq!((e.gpu_mj, e.samples), (12_000, 180));
+    }
+
+    /// Each sample adds to its quarter-hour's energy rows, which equal the 1-second sums and
+    /// stay when the samples and minute rows are pruned; an old range's energy is read from
+    /// them, not from the hour (CORE-062, Appendix H).
+    #[test] // spec: CORE-062, APP-131
+    fn e15_sums_equal_s1_sums_and_survive_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("telemetry.db"), 1_800_000_000);
+        let hour = 1_800_000_000_000 - 1_800_000_000_000 % HOUR_MS;
+        // One sample per quarter of an hour, at :05, :20, :35 and :50, the last estimated.
+        for q in 0..4 {
+            let mut r = row(
+                hour + q * QUARTER_MS + 5 * MINUTE_MS,
+                &[
+                    (Metric::GpuEnergy, 10 + q),
+                    (Metric::CpuEnergy, 100),
+                    (Metric::CpuUtil, 1),
+                ],
+            );
+            r.system_mj = Some(1000);
+            if q == 3 {
+                r.est = EST_GPU_ENERGY;
+            }
+            db.write(&r).unwrap();
+        }
+        let s1 = db.energy(
+            hour + QUARTER_MS,
+            hour + 3 * QUARTER_MS - 1,
+            Resolution::Second,
+        );
+        db.prune(hour + KEEP_M1_MS + 2 * HOUR_MS).unwrap();
+        let count = |table: &str| -> i64 {
+            db.lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!((count("s1"), count("m1")), (0, 0), "pruned");
+        // The middle half hour (local :15 to :45 in a zone 15 minutes off UTC), exactly.
+        let half = db
+            .energy(
+                hour + QUARTER_MS,
+                hour + 3 * QUARTER_MS - 1,
+                Resolution::Hour,
+            )
+            .unwrap();
+        let s1 = s1.unwrap();
+        assert_eq!(
+            (half.gpu_mj, half.cpu_mj, half.samples),
+            (s1.gpu_mj, s1.cpu_mj, 2)
+        );
+        assert_eq!((half.gpu_mj, half.cpu_mj), (23, 200));
+        assert!(half.rollup && half.gpu_measured && !half.partly_measured);
+        assert_eq!(
+            (
+                half.stored_system_mj,
+                half.stored_samples,
+                half.stored_gpu_mj
+            ),
+            (2000, 2, 23),
+            "each quarter's every sample has its system energy"
+        );
+        let system: i64 = db
+            .lock()
+            .query_row(
+                "SELECT SUM(sum) FROM e15 WHERE metric = 'system.energy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(system, 4000);
+        let whole = db
+            .energy(hour, hour + HOUR_MS - 1, Resolution::Hour)
+            .unwrap();
+        assert_eq!((whole.gpu_mj, whole.samples), (46, 4));
+        assert!(!whole.gpu_measured && whole.partly_measured && whole.cpu_measured);
     }
 
     /// A file that isn't a database, and one of a newer schema version, are set aside whole

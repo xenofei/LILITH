@@ -35,7 +35,8 @@ use lil_core::session::Session;
 use lil_core::state::StateRegistry;
 use lil_core::store::FailPoints;
 use lil_core::telemetry::{
-    EnergySlice, HwSources, JobEnergy, JobEnergyQuery, PowerSettings, Telemetry, TickMode,
+    EnergySlice, EngineState, Fit, HwSources, JobEnergy, JobEnergyQuery, PowerSettings, Telemetry,
+    TickMode,
 };
 use lil_core::tools::{
     BillingBasis, CallCtx, Estimate, MeterStage, Registry, SettleInput, register_telemetry_tools,
@@ -61,16 +62,24 @@ const KIND: &str = "meter.test_job";
 /// cancel), or `interrupt_once` (the handler's first such attempt is interrupted by its engine,
 /// later ones work). A working run with `cached: "all"` was all cached, with `"some"` partly;
 /// with `record: true` it leaves a record, which fails its Record step (the rig has no
-/// workspace).
+/// workspace). With `engine_ticks: n` it runs on the `comfyui` engine for `n` samples, as the
+/// ComfyUI handler tells the telemetry (`job_started` at `execution_start`, `job_ended` after).
 #[derive(Default)]
 struct WindowHandler {
     started: Mutex<Vec<String>>,
     interrupted: std::sync::atomic::AtomicBool,
+    telemetry: Mutex<Option<Arc<Telemetry>>>,
 }
 
 impl WindowHandler {
     async fn attempt(&self, job: &JobCtx) -> Result<JobDone, JobFailure> {
         let args = &job.spec.args;
+        if let Some(ticks) = args["engine_ticks"].as_u64() {
+            let telemetry = self.telemetry.lock().unwrap().clone().unwrap();
+            telemetry.job_started(job.id.as_str(), "comfyui");
+            telemetry.tick(u32::try_from(ticks).unwrap()).await;
+            telemetry.job_ended(job.id.as_str());
+        }
         for w in args["windows"].as_array().into_iter().flatten() {
             job.add_window(ExecWindow {
                 engine_pids: w[2]
@@ -221,6 +230,7 @@ impl Rig {
             TickMode::Manual,
         );
         let handler = Arc::new(WindowHandler::default());
+        *handler.telemetry.lock().unwrap() = Some(telemetry.clone());
         jobs.register(handler.clone());
         let rig = Rig {
             meter: Meter::new(
@@ -1106,6 +1116,78 @@ async fn telemetry_jobs_lists_job_energy() {
         .await
         .unwrap_err();
     assert_eq!(zero.code, "params.invalid");
+}
+
+/// The fit signal (ARCH-071, P4b-R37 as Appendix H states it): the engine processes' `Shared
+/// Usage`, lowest at 200 MiB between the engine becoming ready and the job's start, peaks at
+/// 900 MiB while the job runs: `meter` writes `fit: {shared_idle_mib: 200,
+/// shared_above_idle_max_mib: 700}` with the job's energy, and `telemetry.jobs` lists it. A job
+/// that never ran on an engine has `fit: null`.
+#[tokio::test(flavor = "multi_thread")] // spec: ARCH-071, APP-132
+async fn fit_signal_is_recorded_per_job() {
+    // pid 200 and its child 201 are the engine; pid 300 is another program, whose shared
+    // memory never counts.
+    let reading = |engine: u64, other: u64| {
+        json!([{"pid": 200, "local_mib": 4000, "shared_mib": engine - 20},
+               {"pid": 201, "local_mib": 10, "shared_mib": 20},
+               {"pid": 300, "local_mib": 100, "shared_mib": other}])
+    };
+    let mut mem: Vec<Value> = [260, 230, 200, 240, 210]
+        .iter()
+        .map(|e| reading(*e, 5))
+        .collect();
+    mem.extend([500, 900, 700, 400].iter().map(|e| reading(*e, 3000)));
+    let mut script = busy();
+    script["gpu_mem"] = json!(mem);
+    script["gpu_adapter"] = json!([{"dedicated_mib": 6000, "shared_mib": 100}]);
+    let rig = Rig::new(&script);
+    rig.telemetry.set_busy(true);
+    rig.telemetry.set_engine_state(EngineState {
+        engine: "comfyui".into(),
+        pids: vec![200, 201],
+        ready_at_ms: Some(1),
+        outside_busy: false,
+    });
+    rig.run(5).await;
+    let job = rig
+        .job(json!({"windows": [[0, 5000, [200, 201]]], "engine_ticks": 4}))
+        .await;
+    let e = rig.energy(&job.job_id).await.expect("the job's energy");
+    assert_eq!(
+        e.fit,
+        Some(Fit {
+            shared_idle_mib: 200,
+            shared_above_idle_max_mib: 700
+        })
+    );
+    let mut reg = Registry::new();
+    register_telemetry_tools(&mut reg, &rig.telemetry);
+    let got = common::call(
+        &reg,
+        &call_ctx(&rig, "c_1"),
+        "telemetry.jobs",
+        json!({"job_ids": [job.job_id]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        got["jobs"][0]["fit"],
+        json!({"shared_idle_mib": 200, "shared_above_idle_max_mib": 700}),
+        "{got}"
+    );
+    // A job that never ran on an engine has none.
+    let plain = rig.job(json!({"windows": [[0, 5000, [200]]]})).await;
+    let e = rig.energy(&plain.job_id).await.expect("its energy");
+    assert_eq!(e.fit, None);
+    let got = common::call(
+        &reg,
+        &call_ctx(&rig, "c_2"),
+        "telemetry.jobs",
+        json!({"job_ids": [plain.job_id]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got["jobs"][0]["fit"], Value::Null, "{got}");
 }
 
 // ---------------------------------------------------------------------------------------------

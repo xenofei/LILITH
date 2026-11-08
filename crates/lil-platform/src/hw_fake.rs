@@ -11,13 +11,17 @@
 //! {"gpu": [GpuSample, …] | null,
 //!  "gpu_mem": [[ProcGpuMem, …], …] | null,
 //!  "cpu_energy": [CpuEnergySample, …] | null,
+//!  "gpu_adapter": [{"dedicated_mib", "shared_mib"} | null, …] | null,
+//!  "gpu_engines": [[{"engtype", "util_permille"}, …] | null, …] | null,
 //!  "sys": [SysSample, …]}
 //! ```
 //!
 //! Each list holds one entry per reading of that source: the n-th `sample()` returns entry n,
 //! and once the list runs out its last entry is repeated. A missing or `null` list means the
 //! source is absent (`None`; `sys` is never absent, and a missing `sys` reads as one empty
-//! sample). An entry `{"error": "<text>"}` makes that reading fail with that text (a lost
+//! sample). `gpu_adapter` and `gpu_engines` are the two readings of one `GpuCounters` source,
+//! present when either list is: a missing or `null` list, or a `null` entry, is a reading that
+//! can't be had (CORE-059's "not shown" path). An entry `{"error": "<text>"}` makes that reading fail with that text (a lost
 //! source). The objects use the field names of [`crate::hw`]'s types, every field optional (0,
 //! empty or `None` when missing; `name` defaults to `"Fake GPU"`, `driver` to `"0.0"`), with
 //! these forms for the composite fields: `throttle` is the reason bits as a number, `sm_by_pid`
@@ -35,16 +39,18 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::hw::{
-    CpuEnergySample, CpuEnergySource, GpuFeatures, GpuMemSource, GpuSample, GpuSource, ProcGpuMem,
-    SysSample, SysSource, ThrottleReasons,
+    AdapterMemory, CpuEnergySample, CpuEnergySource, EngineUtil, GpuCounters, GpuFeatures,
+    GpuMemSource, GpuSample, GpuSource, ProcGpuMem, SysSample, SysSource, ThrottleReasons,
 };
 
-/// The GPU, per-process GPU memory, CPU energy and system sources, in that order.
+/// The GPU, per-process GPU memory, CPU energy, system and adapter-counter sources, in that
+/// order.
 pub type FakeHwSources = (
     Option<Box<dyn GpuSource>>,
     Option<Box<dyn GpuMemSource>>,
     Option<Box<dyn CpuEnergySource>>,
     Box<dyn SysSource>,
+    Option<Box<dyn GpuCounters>>,
 );
 
 /// The sources of the script in the file `path`.
@@ -97,7 +103,69 @@ pub fn sources(script: &Value) -> FakeHwSources {
         next: 0,
         features: (),
     }) as Box<dyn SysSource>;
-    (gpu, gpu_mem, cpu_energy, sys)
+    let (adapter, engines) = (list(script, "gpu_adapter"), list(script, "gpu_engines"));
+    let counters = (adapter.is_some() || engines.is_some()).then(|| {
+        Box::new(FakeCounters {
+            adapter: Script {
+                entries: adapter
+                    .unwrap_or_default()
+                    .iter()
+                    .map(adapter_memory)
+                    .collect(),
+                next: 0,
+                features: (),
+            },
+            engines: Script {
+                entries: engines
+                    .unwrap_or_default()
+                    .iter()
+                    .map(engine_utils)
+                    .collect(),
+                next: 0,
+                features: (),
+            },
+        }) as Box<dyn GpuCounters>
+    });
+    (gpu, gpu_mem, cpu_energy, sys, counters)
+}
+
+/// The two readings of the adapter counters, each list read on its own.
+struct FakeCounters {
+    adapter: Script<Option<AdapterMemory>, ()>,
+    engines: Script<Option<Vec<EngineUtil>>, ()>,
+}
+
+impl GpuCounters for FakeCounters {
+    fn adapter_memory(&mut self) -> Option<AdapterMemory> {
+        self.adapter.advance().flatten()
+    }
+
+    fn engines(&mut self) -> Option<Vec<EngineUtil>> {
+        self.engines.advance().flatten()
+    }
+}
+
+fn adapter_memory(v: &Value) -> Option<AdapterMemory> {
+    (!v.is_null()).then(|| AdapterMemory {
+        dedicated_mib: u64_of(v, "dedicated_mib"),
+        shared_mib: u64_of(v, "shared_mib"),
+    })
+}
+
+fn engine_utils(v: &Value) -> Option<Vec<EngineUtil>> {
+    v.as_array().map(|engines| {
+        engines
+            .iter()
+            .map(|e| EngineUtil {
+                engtype: e
+                    .get("engtype")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                util_permille: narrow(u64_of(e, "util_permille"), "util_permille"),
+            })
+            .collect()
+    })
 }
 
 fn list(script: &Value, key: &str) -> Option<Vec<Value>> {
@@ -321,7 +389,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("hw.json");
         std::fs::write(&good, r#"{"gpu": null, "sys": [{"cpu_permille": 7}]}"#).unwrap();
-        let (gpu, _, _, mut sys) = sources_from_file(&good).unwrap();
+        let (gpu, _, _, mut sys, counters) = sources_from_file(&good).unwrap();
+        assert!(counters.is_none(), "no adapter counters without their keys");
         assert!(gpu.is_none());
         assert_eq!(sys.sample(&[], true).cpu_permille, 7);
 

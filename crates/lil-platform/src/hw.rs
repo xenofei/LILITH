@@ -15,7 +15,7 @@ use sysinfo::{
 };
 
 pub use crate::hw_nvml::nvml_gpu;
-pub use crate::hw_pdh::{energy_meter, nvidia_adapter_luid, pdh_gpu_memory};
+pub use crate::hw_pdh::{energy_meter, nvidia_adapter_luid, pdh_gpu_counters, pdh_gpu_memory};
 
 /// NVML's clock event ("throttle") reason bits, as the driver reports them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,6 +91,31 @@ pub struct ProcGpuMem {
 pub trait GpuMemSource: Send {
     /// Every process with GPU memory on the adapter, one entry per pid.
     fn sample(&mut self) -> io::Result<Vec<ProcGpuMem>>;
+}
+
+/// The adapter's memory in use, from PDH `GPU Adapter Memory` (CORE-059): for the Snapshot's
+/// Hardware display only, never the fit signal (ARCH-071).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AdapterMemory {
+    pub dedicated_mib: u64,
+    pub shared_mib: u64,
+}
+
+/// One GPU engine type's load, from PDH `GPU Engine` `Utilization Percentage`: per engine, the
+/// sum over processes; per type, its busiest engine (CORE-059).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineUtil {
+    /// The type as PDH names it (`3D`, `Copy`, `Compute 0`, …).
+    pub engtype: String,
+    pub util_permille: u16,
+}
+
+/// The adapter-wide PDH GPU counters (CORE-059). Each call collects its own reading; `None` is
+/// a reading that can't be had (the figures are then unknown, and the spill alert is off).
+pub trait GpuCounters: Send {
+    fn adapter_memory(&mut self) -> Option<AdapterMemory>;
+    /// Every engine type of the adapter, sorted by type.
+    fn engines(&mut self) -> Option<Vec<EngineUtil>>;
 }
 
 /// One Energy Meter reading for the CPU package.

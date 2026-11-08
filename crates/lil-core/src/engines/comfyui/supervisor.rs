@@ -39,7 +39,7 @@ use crate::events::EventBus;
 use crate::jobs::{EngineKind, Jobs};
 use crate::meter::UsageSink;
 use crate::state::StateDb;
-use crate::telemetry::Telemetry;
+use crate::telemetry::{EngineState as TelemetryEngine, Telemetry};
 
 /// How long after a failed catalogue probe another may be made (plan 4a ruling, 2026-10-24).
 const CATALOGUE_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -152,6 +152,8 @@ pub(crate) struct Comfy {
     sockets: Arc<dyn SocketTable>,
     view: Mutex<View>,
     pids: Mutex<Vec<u32>>,
+    /// The engine session the telemetry's idle level counts from ([`FitSession`]).
+    fit_session: Mutex<FitSession>,
     restart_needed: AtomicBool,
     ops: tokio::sync::Mutex<Option<Owned>>,
     idle: Mutex<Idle>,
@@ -187,6 +189,39 @@ pub(crate) struct Comfy {
     last_inventory: Mutex<Option<Arc<Inventory>>>,
     /// The asset catalogue as probed in a readiness epoch (ARCH-065).
     catalogue: Mutex<Option<CatalogueProbe>>,
+}
+
+/// One engine session for the fit signal (ARCH-071, P4b-R37 as Appendix H states it): when the
+/// engine process (its class and launcher or listener pid) first became ready, and the engine
+/// processes last known. It ends only when that process is gone: an owned engine stopped or
+/// exited, an attached one unanswering for [`RESTART_CLEARS_AFTER`], or another process
+/// ready in its place. A missed status poll (Unreachable, or an attached engine shown stopped
+/// for a moment) keeps it, and its processes, so the idle level and a running job's figure go
+/// on (review I2).
+#[derive(Debug, Default)]
+struct FitSession {
+    ready_at_ms: Option<i64>,
+    process: Option<EngineProcess>,
+    pids: Vec<u32>,
+}
+
+/// An engine process as the fit session knows it: its class and its launcher or listener pid
+/// (`None` when the lookup found none).
+type EngineProcess = (EngineClass, Option<u32>);
+
+/// Whether an engine ready as `now` starts a new fit session over the session's `current`
+/// process, and the process the session then records. Only another known process starts one:
+/// another class, or another known pid. A lookup that found no pid keeps the session and the
+/// pid it knew, and a first known pid joins the session (audit L2: a failed listener lookup
+/// is no restart).
+fn session_process(current: Option<EngineProcess>, now: EngineProcess) -> (bool, EngineProcess) {
+    match current {
+        Some((class, known)) if class == now.0 => match (known, now.1) {
+            (Some(a), Some(b)) if a != b => (true, now),
+            _ => (false, (class, now.1.or(known))),
+        },
+        _ => (true, now),
+    }
 }
 
 /// The asset-catalogue probes of one readiness epoch.
@@ -247,6 +282,7 @@ impl Comfy {
             sockets,
             view: Mutex::new(STOPPED),
             pids: Mutex::new(Vec::new()),
+            fit_session: Mutex::default(),
             restart_needed: AtomicBool::new(false),
             ops: tokio::sync::Mutex::new(None),
             idle: Mutex::new(Idle {
@@ -518,13 +554,57 @@ impl Comfy {
             *was = ready;
             before != (*epoch, *was)
         });
-        if v.state == EngineState::Stopped
+        let session = {
+            let mut fit = lock(&self.fit_session);
+            let before = fit.ready_at_ms;
+            if v.state == EngineState::Stopped && old.class == EngineClass::Owned {
+                *fit = FitSession::default();
+            }
+            if ready {
+                let (new, process) = session_process(fit.process, (v.class, v.pid));
+                if new {
+                    fit.ready_at_ms = Some(self.now_ms());
+                }
+                fit.process = Some(process);
+            }
+            before != fit.ready_at_ms
+        };
+        let outside_cleared = v.state == EngineState::Stopped
             && old.class == EngineClass::Owned
-            && self.outside.clear()
-        {
+            && self.outside.clear();
+        if outside_cleared {
             self.publish("outside_job");
         }
+        if session || outside_cleared {
+            self.push_engine_state();
+        }
         old != v
+    }
+
+    /// Tells the telemetry the engine's processes, when it became ready and whether an
+    /// outside job runs (`engines` uses `telemetry`, never the reverse). The push is made under
+    /// the session's lock, so two pushes land in the order their states were read (audit L3);
+    /// the telemetry takes only its own lock and never calls back.
+    fn push_engine_state(&self) {
+        let outside_busy = self.outside.any();
+        let fit = lock(&self.fit_session);
+        self.telemetry.set_engine_state(TelemetryEngine {
+            engine: COMFYUI_ROLE.to_string(),
+            pids: fit.pids.clone(),
+            ready_at_ms: fit.ready_at_ms,
+            outside_busy,
+        });
+    }
+
+    /// A suite job's prompt began executing (`execution_start`): the telemetry fixes the job's
+    /// idle level for the fit signal and the spill alert (ARCH-071, APP-132).
+    pub(crate) fn job_started(&self, job_id: &str) {
+        self.telemetry.job_started(job_id, COMFYUI_ROLE);
+    }
+
+    /// A suite job's attempt on the engine ended.
+    pub(crate) fn job_ended(&self, job_id: &str) {
+        self.telemetry.job_ended(job_id);
     }
 
     /// The readiness epoch now (see the `ready` field).
@@ -705,6 +785,7 @@ impl Comfy {
             .await;
         if changed {
             self.publish("outside_job");
+            self.push_engine_state();
         }
         // The open `outside_paid` row is the write-ahead record (ruling P3-R27): the line, then
         // the mark. A core that stops in between finds the line in the log and writes no
@@ -741,7 +822,20 @@ impl Comfy {
         for pid in new.iter().filter(|p| !pids.contains(p)) {
             self.telemetry.track(*pid, COMFYUI_ROLE);
         }
+        // The session keeps the last processes known: none listed is a missed poll.
+        let changed = {
+            let mut fit = lock(&self.fit_session);
+            let changed = !new.is_empty() && fit.pids != new;
+            if changed {
+                fit.pids.clone_from(&new);
+            }
+            changed
+        };
         *pids = new;
+        drop(pids);
+        if changed {
+            self.push_engine_state();
+        }
     }
 
     pub(crate) fn set_restart_needed(&self) {
@@ -913,6 +1007,16 @@ impl Comfy {
             }
             gone
         };
+        // Gone for good: its fit session ends with it.
+        let ended = gone && {
+            let mut fit = lock(&self.fit_session);
+            let ended = fit.ready_at_ms.is_some();
+            *fit = FitSession::default();
+            ended
+        };
+        if ended {
+            self.push_engine_state();
+        }
         // Its outside prompts went with it (review M5: not at the first missed answer).
         if gone && self.outside.clear() {
             self.publish("outside_job");
@@ -1500,6 +1604,44 @@ fn start_failed(message: String, tail: Vec<String>) -> ErrorBody {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    /// A new fit session starts only for another known process: a lookup that finds no
+    /// listener keeps the session and the pid it knew, and a first known pid joins the session
+    /// it found (audit L2).
+    #[test] // spec: ARCH-071, APP-132
+    fn a_listener_lookup_that_finds_none_keeps_the_fit_session() {
+        use super::{EngineClass, session_process};
+        let (a, o) = (EngineClass::Attached, EngineClass::Owned);
+        assert_eq!(session_process(None, (a, Some(7))), (true, (a, Some(7))));
+        assert_eq!(
+            session_process(Some((a, Some(7))), (a, None)),
+            (false, (a, Some(7))),
+            "a failed lookup is no new process"
+        );
+        assert_eq!(
+            session_process(Some((a, Some(7))), (a, Some(7))),
+            (false, (a, Some(7)))
+        );
+        assert_eq!(
+            session_process(Some((a, None)), (a, Some(7))),
+            (false, (a, Some(7))),
+            "a first known pid joins the session"
+        );
+        assert_eq!(
+            session_process(Some((a, Some(7))), (a, Some(8))),
+            (true, (a, Some(8))),
+            "another listener"
+        );
+        assert_eq!(
+            session_process(Some((a, Some(7))), (o, Some(7))),
+            (true, (o, Some(7))),
+            "another class"
+        );
+        assert_eq!(
+            session_process(Some((o, None)), (o, None)),
+            (false, (o, None))
+        );
+    }
 
     use lil_platform::fs::SystemProbe;
     use lil_platform::sockets::OsSockets;

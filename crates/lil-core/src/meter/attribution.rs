@@ -72,6 +72,7 @@ pub fn attribute(
             cpu: !windows.is_empty(),
         },
         idle_unknown: false,
+        fit: None,
     };
     let mut rest_mj: u64 = 0;
     for (i, w) in windows.iter().enumerate() {
