@@ -1810,3 +1810,102 @@ async fn ai_edit_relabels_one_entry_from_the_app_only() {
     assert_eq!(fx.manifest(KITE), after);
     fx.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 15, audit fix round 1: a report attributes only the files it names (M1); `by` never
+// names the core, and its ids are capped (L3).
+// ---------------------------------------------------------------------------------------------
+
+const KITE_FOLDER: &str = "projects/sketchbook/assets/prop_kite";
+
+/// M1 (the audit's probe 1a): your hand edit, reported an hour later by an agent that names
+/// only the asset's folder, stays a human edit: a folder report reconciles its subtree but
+/// attributes nothing.
+#[tokio::test] // spec: CORE-034, ARCH-103
+async fn a_folder_report_never_attributes_a_hand_edit() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"your hand edit");
+    fx.clock.advance(Duration::from_secs(3600));
+    let r = fx.notify(CallerKind::Mcp, KITE_FOLDER, None).await;
+    assert_eq!(r["reconciled"], json!([KITE_FOLDER]), "{r}");
+    let entry = fx.edit_with(KITE, &sha).expect("the edit is recorded");
+    assert!(entry.get("actor").is_none(), "still yours: {entry}");
+    fx.shutdown().await;
+}
+
+/// M1 (the audit's probe 1b): an app's report of the asset's folder doesn't make Claude Code's
+/// write yours, and the hook's report of the file, which comes next, still claims it.
+#[tokio::test] // spec: CORE-034, ARCH-103
+async fn a_folder_report_leaves_the_claim_to_the_files_reporter() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"written by Claude Code");
+    fx.notify(ui(), KITE_FOLDER, None).await;
+    let entry = fx.edit_with(KITE, &sha).expect("the edit is recorded");
+    assert!(
+        entry.get("actor").is_none(),
+        "no owner from a folder: {entry}"
+    );
+    let by = json!({"kind": "claude_code", "session_id": "s1"});
+    fx.notify(CallerKind::Cli, &rel, Some(by.clone())).await;
+    assert_eq!(fx.edit_with(KITE, &sha).unwrap()["actor"], by);
+    fx.shutdown().await;
+}
+
+/// M1: a report that names the file still attributes its change, also when it names the
+/// file's folder too.
+#[tokio::test] // spec: CORE-034, ARCH-103
+async fn an_exact_file_report_still_attributes() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"written by Claude Code, named");
+    fx.ok_by(
+        CallerKind::Mcp,
+        "watch.notify",
+        json!({"paths": [KITE_FOLDER, rel]}),
+    )
+    .await;
+    let entry = fx.edit_with(KITE, &sha).expect("the edit is recorded");
+    assert_eq!(entry["actor"], json!({"kind": "claude_code"}), "{entry}");
+    fx.shutdown().await;
+}
+
+/// L3: `by` never names the core, from any caller, and records nothing; each of its ids is
+/// at most 200 characters.
+#[tokio::test] // spec: CORE-034
+async fn by_core_is_refused_and_by_ids_are_capped() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"edited by someone");
+    for (caller, _) in callers() {
+        let e = fx
+            .err_by(
+                caller.clone(),
+                "watch.notify",
+                json!({"paths": [rel], "by": {"kind": "core"}}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{caller}: {e:?}");
+        assert_eq!(fx.edit_count(KITE), 0, "{caller} recorded nothing");
+    }
+    let long = "x".repeat(201);
+    for key in ["task_id", "conversation_id", "session_id"] {
+        let mut by = json!({"kind": "claude_code"});
+        by[key] = json!(long);
+        let e = fx
+            .err_by(
+                CallerKind::Cli,
+                "watch.notify",
+                json!({"paths": [rel], "by": by}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{key}: {e:?}");
+        assert_eq!(fx.edit_count(KITE), 0, "{key}: nothing recorded");
+    }
+    let at_cap = "é".repeat(200);
+    let by = json!({"kind": "claude_code", "session_id": at_cap});
+    fx.notify(CallerKind::Cli, &rel, Some(by.clone())).await;
+    assert_eq!(fx.edit_with(KITE, &sha).unwrap()["actor"], by);
+    fx.shutdown().await;
+}

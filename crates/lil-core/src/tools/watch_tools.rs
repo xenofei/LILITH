@@ -14,15 +14,17 @@
 //!
 //! **Who made the changes** (CORE-034, ARCH-103; P4b-R16, owner decision OD-15). The tool
 //! computes the reporter's [`Actor`] and passes it to the watcher (`watch` never names
-//! `pipeline`), which writes it into each `human_edits[]` entry the call records, and into the
-//! latest entry of a file given when the watcher recorded it already, without an actor: `by`
-//! when given, else the caller's ([`actor_of`]). A change reported with an agent's `by`
+//! `pipeline`): `by` when given, else the caller's ([`actor_of`]). The watcher writes it into
+//! the `human_edits[]` entry of each file the call names exactly, and may claim such a file's
+//! entry the watcher recorded just before (see `watch`). A folder given is reconciled with its
+//! subtree, but the changes found there get no actor: they stay human edits. A change reported with an agent's `by`
 //! (`claude_code`, `tether`, `director`), or by an agent caller (`mcp`, `assistant`) without
 //! one, is an agent edit; from an app (`ui:*`) or `cli` without `by` it stays a human edit.
 //! `by` is asserted by the caller, so it is checked before anything is reconciled, and a
 //! refused call records nothing (`params.invalid`): `by.kind` is never `owner` (a change of
-//! yours needs no `by`), and an agent caller's `by` has its own kind (Claude Code can't report
-//! as the assistant). Known limit: `lil` run from a shell an agent opened connects as `cli`
+//! yours needs no `by`) or `core` (the core never reports through this tool; audit L3), an
+//! agent caller's `by` has its own kind (Claude Code can't report as the assistant), and each
+//! of its ids is at most [`ACTOR_ID_MAX`] characters. Known limit: `lil` run from a shell an agent opened connects as `cli`
 //! (ARCH-047), so its report without `by` is recorded as yours; the plugin's hook passes `by`
 //! for Claude Code's own writes.
 
@@ -44,20 +46,24 @@ const NOTIFY_DESCRIPTION: &str = "Tell the workspace watcher that files changed:
     recorded as a human edit, never overwritten. Paths outside the workspace or in its private \
     folders are returned as ignored. Use it where the folder can't be watched, or after a \
     tool changed files the watcher may have missed. `by` says who made the changes: an agent \
-    gives its own kind (and its session_id); without it, the caller is recorded.";
+    gives its own kind (and its session_id); without it, the caller is recorded. Only the \
+    files named exactly are attributed: a folder's changes stay human edits.";
+
+/// The longest `task_id`, `conversation_id` or `session_id` `by` takes, in characters.
+pub const ACTOR_ID_MAX: usize = 200;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NotifyArgs {
     /// Workspace-relative paths, or absolute paths inside the workspace.
     paths: Vec<String>,
-    /// Who made the changes (never `owner`; an agent caller gives its own kind). Without it,
-    /// the caller.
+    /// Who made the changes to the files named exactly (never `owner` or `core`; an agent
+    /// caller gives its own kind). Without it, the caller.
     by: Option<ActorArg>,
 }
 
 /// `Actor.kind` as `by` takes it (P4b-R16): never `owner`, which a change of yours doesn't
-/// need.
+/// need, nor `core`, which never reports through this tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum ActorKindArg {
@@ -65,16 +71,19 @@ enum ActorKindArg {
     Director,
     ClaudeCode,
     Cli,
-    Core,
 }
 
-/// `Actor`: `{kind, task_id?, conversation_id?, session_id?}`.
+/// `Actor`: `{kind, task_id?, conversation_id?, session_id?}`, each id at most
+/// [`ACTOR_ID_MAX`] characters.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ActorArg {
     kind: ActorKindArg,
+    #[schemars(length(max = 200))]
     task_id: Option<String>,
+    #[schemars(length(max = 200))]
     conversation_id: Option<String>,
+    #[schemars(length(max = 200))]
     session_id: Option<String>,
 }
 
@@ -85,7 +94,6 @@ impl ActorArg {
             ActorKindArg::Director => ActorKind::Director,
             ActorKindArg::ClaudeCode => ActorKind::ClaudeCode,
             ActorKindArg::Cli => ActorKind::Cli,
-            ActorKindArg::Core => ActorKind::Core,
         };
         Actor {
             kind,
@@ -103,12 +111,24 @@ fn reporter(caller: &CallerKind, by: Option<ActorArg>) -> Result<Actor, String> 
     let Some(by) = by.map(ActorArg::into_actor) else {
         return Ok(own);
     };
-    // The schema leaves `owner` out; this guard stays for any other way in.
-    if by.kind == ActorKind::Owner {
-        return Err(
-            "by.kind is never owner: a change of yours, from an app or lil, needs no by"
-                .to_string(),
-        );
+    // The schema leaves `owner` and `core` out; this guard stays for any other way in.
+    if matches!(by.kind, ActorKind::Owner | ActorKind::Core) {
+        return Err(format!(
+            "by.kind is never {}: a change of yours, from an app or lil, needs no by",
+            by.kind.as_str()
+        ));
+    }
+    for (key, id) in [
+        ("task_id", &by.task_id),
+        ("conversation_id", &by.conversation_id),
+        ("session_id", &by.session_id),
+    ] {
+        if id
+            .as_ref()
+            .is_some_and(|id| id.chars().count() > ACTOR_ID_MAX)
+        {
+            return Err(format!("by.{key} is longer than {ACTOR_ID_MAX} characters"));
+        }
     }
     let agent = matches!(caller, CallerKind::Mcp | CallerKind::Assistant);
     if agent && by.kind != own.kind {

@@ -5,7 +5,9 @@
 //!
 //! `--by <kind>` (with `--session <id>`) names who made the changes, as `watch.notify`'s `by`
 //! (CORE-034, ARCH-103; Appendix H "Attribution"): an agent's kind makes them agent edits.
-//! Without it the core records this caller, `cli`, and the changes stay yours.
+//! Without it the core records this caller, `cli`, and the changes stay yours. Only the files
+//! named exactly are attributed: a folder given is reconciled, and its changes stay human
+//! edits.
 //!
 //! Output (Appendix E, "The `lil` commands this plan adds"): nothing on stdout on success. A
 //! path outside the workspace, or one the watcher doesn't watch, is named on stderr and left

@@ -53,15 +53,23 @@
 //!
 //! **Who made a change** (CORE-034; P4b-R16). Only a report names one: [`Watcher::notify`]
 //! takes the reporter's actor (`watch.notify` computes it; the watcher never maps a caller).
-//! - The human edits recorded by the decisions of the paths given (a folder: its subtree) get
-//!   that `actor`. That holds for a decision made later too: the actor goes with a path
-//!   deferred to the post-git rescan, with a path waiting for a held version lock, and with a
-//!   read the index parked (unstable or locked), in the report's own reconcile or in the
-//!   deferred one, until its path is next decided. A later deferral of the same path without
-//!   an actor (the watcher's own batch) never replaces it.
-//! - Known limit (counts as human): the index gives up on a read still unstable after its
-//!   re-checks (`PARKED_RETRIES`); the reporter goes with it, and the later rescan's decision
-//!   of that path records no actor. Your relabel (`app/asset.ai_edit`) is the way back.
+//! - A report attributes only the files it names exactly (by path key; audit fix round 1, M1).
+//!   A folder it names is reconciled with its whole subtree, but the changes found there get
+//!   no actor, as the watcher's own decisions don't: they stay human edits. So naming a
+//!   folder never makes your pending edits an agent's, nor an agent's yours.
+//! - The human edits recorded by the decisions of the files given get that `actor`. That holds
+//!   for a decision made later too: the actor goes with a file deferred to the post-git
+//!   rescan, with a file waiting for a held version lock, and with a read of the file the index
+//!   parked (unstable or locked), in the report's own reconcile or in the deferred one, until
+//!   the file is next decided. A later deferral of the same file without an actor (the
+//!   watcher's own batch) never replaces it, and another report's folder never counts for it.
+//! - Known limits (they count as human; your relabel, `app/asset.ai_edit`, is the way back):
+//!   - the index gives up on a read still unstable after its re-checks (`PARKED_RETRIES`):
+//!     its reporter is dropped right after that re-check, and the later decision of the file
+//!     records no actor;
+//!   - the reporters of deferred and parked files, and the claim records below, live in memory
+//!     only: a core restart during a git pause, a held version lock or a parked read drops
+//!     them, and those changes are then recorded with no actor.
 //! - A **claim** (fix round 1, I2): the watcher's own batch usually records an agent's write
 //!   before the agent's report comes, with no actor. The report's actor is filled into that
 //!   entry only when all of these hold: the actor is an agent's (`claude_code`, `tether`,
@@ -135,18 +143,14 @@ fn is_agent(actor: &Actor) -> bool {
     )
 }
 
-/// The reporter of `path` among `reported` (paths deferred with their reporters): the path
-/// itself, or a folder above it.
+/// The reporter of `path` among `reported` (paths deferred with their reporters): a report
+/// that named `path` itself (by path key). A reported folder gives nothing (module docs).
 fn reporter_of(path: &WsPath, reported: &[Reported]) -> Option<Actor> {
     let key = path_key(path.as_str());
     reported.iter().find_map(|(p, reporter)| {
-        let folder = path_key(p.as_str());
-        let under = key == folder || key.starts_with(&format!("{folder}/"));
-        if under {
-            reporter.as_ref().map(|r| r.actor.clone())
-        } else {
-            None
-        }
+        (path_key(p.as_str()) == key)
+            .then(|| reporter.as_ref().map(|r| r.actor.clone()))
+            .flatten()
     })
 }
 
@@ -845,9 +849,10 @@ impl Shared {
     /// Reconciles `paths`, re-checks the parked paths, and decides and applies what changed.
     /// A path in (or of) an asset folder whose version lock is held waits for the lock: the
     /// sign-off moves files there, and a reconcile meanwhile would take its moves for removals.
-    /// With a reporter's `actor`, the human edits the reconcile of `paths` records get it (also
-    /// later, for a path deferred to a version lock or a read parked), and an agent's actor may
-    /// claim the entry of each file given ([`Shared::claim`]).
+    /// With a reporter's `actor`, the human edits the reconcile records for the files named
+    /// exactly get it (also later, for a file deferred to a version lock or a read parked); the
+    /// changes under a folder given get none. An agent's actor may claim the entry of each file
+    /// given ([`Shared::claim`]).
     async fn reconcile_paths(self: &Arc<Self>, all: Vec<WsPath>, actor: Option<&Actor>) {
         let mut paths = Vec::with_capacity(all.len());
         let mut seen = HashSet::new();
@@ -866,15 +871,23 @@ impl Shared {
         if !paths.is_empty() {
             match self.index.reconcile(Scope::Paths(paths.clone())).await {
                 Ok(report) => {
+                    // Only the files named exactly take the report's actor (module docs).
+                    let named: HashSet<String> =
+                        paths.iter().map(|p| path_key(p.as_str())).collect();
                     if let Some(actor) = actor {
                         let mut parked = lock(&self.parked_actors);
                         for path in &report.parked {
-                            parked.insert(path_key(path.as_str()), actor.clone());
+                            let key = path_key(path.as_str());
+                            if named.contains(&key) {
+                                parked.insert(key, actor.clone());
+                            }
                         }
                     }
                     let mut decided = self.decide_report(&report, &[]).await;
                     for d in &mut decided {
-                        d.actor = actor.cloned();
+                        if named.contains(&path_key(d.obs.path().as_str())) {
+                            d.actor = actor.cloned();
+                        }
                     }
                     self.apply_all(decided).await;
                 }
@@ -887,10 +900,10 @@ impl Shared {
             Ok(report) => {
                 let decided = self.decide_report(&report, &[]).await;
                 self.apply_all(decided).await;
-                // A read no longer parked was decided (and took its reporter) or dropped by the
-                // index: its reporter goes, so it never labels a later edit.
-                let still: HashSet<String> =
-                    report.parked.iter().map(|p| path_key(p.as_str())).collect();
+                // A read the index no longer parks was decided (and took its reporter), or
+                // given up by this re-check (audit L1): its reporter goes, so it never labels a
+                // later edit.
+                let still = self.index.parked_keys();
                 lock(&self.parked_actors).retain(|key, _| still.contains(key));
             }
             Err(e) => tracing::warn!(error = %e, "parked paths couldn't be re-checked"),
@@ -1389,8 +1402,10 @@ impl Shared {
             Ok(_) => {
                 if actor.is_none() && pushed.load(Ordering::SeqCst) {
                     let now = self.store.clock().monotonic();
-                    lock(&self.unclaimed)
-                        .insert(path_key(path.as_str()), (sha256.to_string(), now));
+                    let mut unclaimed = lock(&self.unclaimed);
+                    // Pruned on every insert too (audit L4): it never grows past the window.
+                    unclaimed.retain(|_, (_, at)| now.saturating_sub(*at) <= CLAIM_WINDOW);
+                    unclaimed.insert(path_key(path.as_str()), (sha256.to_string(), now));
                 }
                 self.accept(path, sha256, FileState::HumanEdit).await;
                 tracing::info!(path = %path, sha256, "an outside edit was recorded as a human edit");

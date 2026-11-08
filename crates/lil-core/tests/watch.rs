@@ -1872,3 +1872,96 @@ async fn a_read_parked_in_a_deferred_reconcile_keeps_its_reporter() {
     assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
     assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 15, audit fix round 1: only a file's own report attributes it (M1, L2); a parked read
+// the index gives up on loses its reporter (L1).
+// ---------------------------------------------------------------------------------------------
+
+/// The crane's asset folder.
+const CRANE_FOLDER: &str = "projects/sketchbook/assets/chr_paper_crane";
+
+/// M1, L2 (the audit's probe 3): while git works, the agent reports its file and `lil` reports
+/// the asset's folder; after the pause only the file's own reporter counts.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-083, ARCH-103
+async fn after_a_deferral_only_the_files_own_reporter_counts() {
+    use lil_schema::ActorKind;
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let ops = GitOps::begin(&core.ws);
+    core.fence().await;
+    let edited = b"written by an agent while git works, then the folder reported";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.watch()
+        .notify(vec![p(CRANE_FOLDER)], Some(actor(ActorKind::Cli, None)))
+        .await;
+    ops.finish();
+    core.until("git resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// M1: a folder report deferred by git attributes nothing in the folder once the pause ends.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-083, ARCH-103
+async fn a_git_deferred_folder_report_attributes_nothing() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let ops = GitOps::begin(&core.ws);
+    core.fence().await;
+    let edited = b"your edit while git works";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    core.watch()
+        .notify(vec![p(CRANE_FOLDER)], Some(agent()))
+        .await;
+    ops.finish();
+    core.until("git resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert!(edits[0].get("actor").is_none(), "still yours: {edits:?}");
+}
+
+/// L1 (the audit's probe 2): an agent's report parks a read the writer still holds; the index
+/// gives up on it after its re-checks; then you edit the file. Your edit stays yours: the
+/// reporter went with the given-up read.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079
+async fn a_given_up_parked_read_drops_its_reporter() {
+    // A batch window longer than the test: only the reports below reconcile anything.
+    let core = Core::fixture(WatchConfig {
+        batch: Duration::from_secs(120),
+        ..WatchConfig::default()
+    })
+    .await;
+    edit_outside(&core.path(CANDIDATE), b"written by an agent, held");
+    let held = HandleHolder::hold(&core.path(CANDIDATE), Share::None);
+    // The report parks the read and re-checks it once.
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    // Each later report re-checks it, until the index gives up.
+    write_file(&core.path("notes/unrelated.txt"), b"unrelated");
+    for _ in 1..lil_core::index::PARKED_RETRIES {
+        core.watch()
+            .notify(vec![p("notes/unrelated.txt")], None)
+            .await;
+    }
+    held.release();
+    core.clock.advance(Duration::from_secs(3600));
+    let yours = b"your edit, an hour later";
+    edit_outside(&core.path(CANDIDATE), yours);
+    core.watch().notify(vec![p(CANDIDATE)], None).await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(yours));
+    assert!(edits[0].get("actor").is_none(), "still yours: {edits:?}");
+}
