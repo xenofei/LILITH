@@ -524,7 +524,8 @@ fn queue_methods_need_a_verified_app_and_the_capability() {
 
 /// Protocol 1.4's three `app/*` methods (APP-039; Appendix D): only for a verified app whose
 /// session shares `assets.v1` (else `caller.not_allowed`, the shape of the earlier capability
-/// refusals); with it, each is -32601 until its own task routes it.
+/// refusals); with it, each is -32601 until its own task routes it. `app/asset.ai_edit` is
+/// routed (Task 15): this app has no workspace.
 #[test] // spec: APP-039, APP-040, APP-043
 fn app_assets_methods_need_the_capability() {
     let env = TestEnv::new();
@@ -560,7 +561,7 @@ fn app_assets_methods_need_the_capability() {
     for (m, params) in &methods {
         refused(&older.call(m, params.clone()));
     }
-    // An app that shares it: not routed yet.
+    // An app that shares it: not routed yet, except `app/asset.ai_edit`.
     let mut app =
         lil_testkit::TestApp::start_with_capabilities(&env, None, &[], lil_protocol::CAPABILITIES);
     let shared = app.hello()["capabilities"].clone();
@@ -570,7 +571,14 @@ fn app_assets_methods_need_the_capability() {
     );
     for (m, params) in &methods {
         let response = app.call(m, params.clone());
-        assert_eq!(response["error"]["code"], -32601, "{m}: {response}");
+        if *m == "app/asset.ai_edit" {
+            assert_eq!(
+                response["result"]["error"]["code"], "workspace.required",
+                "{m}: {response}"
+            );
+        } else {
+            assert_eq!(response["error"]["code"], -32601, "{m}: {response}");
+        }
     }
 }
 

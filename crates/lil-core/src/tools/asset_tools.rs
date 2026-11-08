@@ -21,7 +21,8 @@
 //!   `creation_uuid` (CORE-047). Each file (an absolute path) is copied into a staging handle
 //!   with `Store::stage_copy` (never over a file) and the staged copy is hashed; the call then
 //!   leaves a candidate-run [`RecordPlan`] (run id from `Store::next_run_id`, manifest edit
-//!   [`start_candidate_run`], each run file with that `sha256`). The Record stage commits it.
+//!   [`start_candidate_run`], each run file with that `sha256`; the run and its files get the
+//!   caller's `actor`, [`actor_of`], CORE-023). The Record stage commits it.
 //!   The asset's version lock is held from the run id to the end of the Record stage, so two
 //!   imports of one asset in the same minute get different run ids.
 //!   `ref` is the first file's candidate ref, `handoff.refs` every file's.
@@ -100,7 +101,7 @@
 //!   isn't valid, also by case only, is `params.invalid` saying to rename it first, before
 //!   anything is written; an asset that doesn't need the repair is `repair.not_needed`. Each
 //!   holds the asset's version lock around its writes. `accept_move` records the redirect with
-//!   `by` the caller (`pipeline::status_by`; no `actor` until attribution, Task 15), and
+//!   `by` and `actor` the caller's (`pipeline::status_by`, `pipeline::actor_of`), and
 //!   publishes `{kind: "moved", from, to}` (names `<project>/<asset_id>`) on the asset's topic
 //!   at its new name, on `project:<slug>`, and on the old project's topic when that differs.
 //!   `make_independent` publishes `{kind: "manifest"}` on the asset's topic. Neither runs by
@@ -166,8 +167,8 @@ use super::services::{AssetServices, InUse};
 use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::{
-    Chosen, HandOff, RecordBranch, RecordPlan, asset_topic, chosen_files, plan_signoff,
-    signed_off_by, start_candidate_run, status_by,
+    Chosen, HandOff, RecordBranch, RecordPlan, SignedOffBy, actor_of, asset_topic, chosen_files,
+    plan_signoff, signed_off_by, start_candidate_run, status_by,
 };
 use crate::projects::redirects::{name_of, read_redirects};
 use crate::projects::repair as folder_repair;
@@ -763,6 +764,7 @@ async fn stage_candidate_run(
         asset_type.to_string(),
     );
     let by = status_by(&ctx.session.caller);
+    let actor = actor_of(&ctx.session.caller);
     let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&project, &asset_id, &asset_type, &uuid);
@@ -770,7 +772,7 @@ async fn stage_candidate_run(
         let Value::Object(run) = run.clone() else {
             unreachable!("the run is an object");
         };
-        start_candidate_run(m, run, &by, now)?;
+        start_candidate_run(m, run, &by, &actor, now)?;
         if remove_external {
             m.remove("external");
         }
@@ -1194,7 +1196,7 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
     let filled = hash_unrecorded(&a, &m, &args.run_id, &names)
         .await
         .map_err(error)?;
-    let by = signed_off_by(&ctx.session.caller);
+    let by = SignedOffBy::caller(&ctx.session.caller);
     let now = store.now_utc();
     let bump = args.bump.map(Bump::from);
     let (planned, version) = plan_signoff(
@@ -1949,7 +1951,7 @@ async fn accept_move(
         &a.project,
         &a.asset_id,
         by.as_str(),
-        None,
+        Some(actor_of(&ctx.session.caller)),
     )
     .await
     .map_err(|e| traced(ctx, e))?;
@@ -2395,6 +2397,102 @@ async fn trash(
         },
         summary,
     ))
+}
+
+/// `app/asset.ai_edit`'s edit (P4b-R17, LT-01; Appendix H "Attribution"; the router and
+/// `Dispatcher::ai_edit` check the caller): the latest `human_edits[]` entry of
+/// `<project>/<asset_id>` with this asset-relative `path` and SHA-256 (with or without
+/// `sha256:`) gets `actor: {kind: "claude_code"}` and `relabelled: {utc}`, through one
+/// hash-checked manifest edit. Only that entry changes: nothing relabels in bulk, and no other
+/// entry, file or index row is touched. The result is the entry as the manifest now holds it.
+///
+/// # Errors
+/// `params.invalid` for a name that isn't a project slug or an asset id; `project.unknown`;
+/// `asset.unknown` when the asset has no manifest, or no entry has that path and SHA-256
+/// (nothing is written); the store's errors (`manifest.needs_repair`, …).
+pub(crate) async fn ai_edit(
+    open: &OpenWorkspace,
+    project: &str,
+    p: &lil_protocol::app::AiEditParams,
+    trace_id: &str,
+) -> Result<lil_protocol::app::AiEditResult, ErrorBody> {
+    let invalid = |why: String| ErrorBody::new(&PARAMS_INVALID, why, trace_id);
+    if !is_slug(project) {
+        return Err(invalid(format!("{project:?} is not a project slug")));
+    }
+    if !is_asset_id(&p.asset_id) {
+        return Err(invalid(format!("{:?} is not an asset id", p.asset_id)));
+    }
+    let error = |e: StoreError| e.to_error(trace_id);
+    if read_project(&open.store, project).await.map_err(error)? == ProjectFile::Missing {
+        let mut e = unknown_project(project);
+        e.trace_id = trace_id.to_string();
+        return Err(e);
+    }
+    let unknown = |what: &str| {
+        ErrorBody::new(
+            &ASSET_UNKNOWN,
+            format!(
+                "{project}/{} has {what}; asset.get lists its human_edits.",
+                p.asset_id
+            ),
+            trace_id,
+        )
+    };
+    let manifest = WsPath::parse(&format!(
+        "projects/{project}/assets/{0}/{0}.manifest.json",
+        p.asset_id
+    ))
+    .map_err(error)?;
+    if read_manifest(&open.store, &manifest)
+        .await
+        .map_err(error)?
+        .is_none()
+    {
+        return Err(unknown("no manifest"));
+    }
+    let agent = lil_schema::Actor {
+        kind: lil_schema::ActorKind::ClaudeCode,
+        task_id: None,
+        conversation_id: None,
+        session_id: None,
+    };
+    let utc = lil_schema::time::rfc3339(open.store.now_utc());
+    let found = std::sync::atomic::AtomicBool::new(false);
+    let edit = |m: &mut Manifest| -> Result<(), StoreError> {
+        let set = m.set_human_edit_actor(&p.path, &p.sha256, &agent, &utc);
+        found.store(set, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    };
+    let (after, _) = open
+        .store
+        .edit_manifest(&manifest, &edit)
+        .await
+        .map_err(error)?;
+    let want = bare_sha256(&p.sha256);
+    let entry = found
+        .load(std::sync::atomic::Ordering::SeqCst)
+        .then(|| {
+            after
+                .get("human_edits")?
+                .as_array()?
+                .iter()
+                .rev()
+                .find(|e| {
+                    e["path"].as_str() == Some(p.path.as_str())
+                        && e["sha256"].as_str().and_then(bare_sha256) == want
+                })
+        })
+        .flatten();
+    let Some(entry) = entry else {
+        return Err(unknown(&format!(
+            "no human edit of {} with that SHA-256",
+            p.path
+        )));
+    };
+    Ok(lil_protocol::app::AiEditResult {
+        human_edit: entry.clone(),
+    })
 }
 
 /// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,

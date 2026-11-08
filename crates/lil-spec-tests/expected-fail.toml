@@ -30,13 +30,6 @@ tests = [
     { name = "lil-spec-tests::versions_4b::restore_version_seals_a_copy_as_the_next_version", rule = "CORE-177", file = "tests/versions_4b.rs" },
     # CORE-177, APP-141
     { name = "lil-spec-tests::versions_4b::get_version_reads_the_snapshot", rule = "CORE-177", file = "tests/versions_4b.rs" },
-    # Task 15
-    # CORE-034, ARCH-103
-    { name = "lil-spec-tests::attribution_4b::notify_with_by_is_an_agent_edit", rule = "CORE-034", file = "tests/attribution_4b.rs" },
-    # CORE-034
-    { name = "lil-spec-tests::attribution_4b::notify_without_by_stays_a_human_edit", rule = "CORE-034", file = "tests/attribution_4b.rs" },
-    # CORE-034, APP-039
-    { name = "lil-spec-tests::attribution_4b::ai_edit_relabels_one_entry_from_the_app_only", rule = "CORE-034", file = "tests/attribution_4b.rs" },
     # Task 16
     # CORE-168
     { name = "lil-spec-tests::marks_4b::duplicates_finds_assets_sharing_bytes", rule = "CORE-168", file = "tests/marks_4b.rs" },

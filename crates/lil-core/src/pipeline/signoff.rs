@@ -19,8 +19,10 @@
 //!   Appendix H "Takes", P4b-R3): each take's primary, then the takes' companions, takes in
 //!   ascending order, read through `lil_schema::takes_of` (the legacy rule included);
 //! - the run becomes `selected`, with `selected` (the chosen names) and
-//!   `signed_off: {by, date, version}` (`by` is CORE-051's `approved_by`), plus `takes` and
-//!   `companions` for a sign-off by takes;
+//!   `signed_off: {by, date, version, via?}` (`by` is CORE-051's `approved_by`: the caller's
+//!   [`signed_off_by`], or `auto` for a sign-off `auto_approve` makes, which names its rule in
+//!   `via`; no tool argument sets either), plus `takes` and `companions` for a sign-off by takes;
+//!   the status-log entry carries the same `by` and `via`;
 //! - the other open runs for that version (targeting it or an older one, or nothing) become
 //!   `rejected`, with `rejected_at_version`, so their 90 days start at this sign-off; those in
 //!   `keep_runs` stay open with `pinned: true` instead (CORE-032);
@@ -33,8 +35,8 @@ use lil_protocol::codes::{
 };
 use lil_protocol::{CallerKind, CodeSpec, ErrorBody};
 use lil_schema::{
-    Bump, CandidateFile, CandidateRun, Manifest, StatusBy, StatusEvent, Version, change_status,
-    hash_value, takes_of,
+    Bump, CandidateFile, CandidateRun, Manifest, StatusBy, StatusEvent, Version, Via,
+    change_status, hash_value, takes_of,
 };
 use serde_json::{Map, Value, json};
 
@@ -120,6 +122,41 @@ pub fn signed_off_by(caller: &CallerKind) -> String {
     status_by(caller).as_str().to_string()
 }
 
+/// Who a sign-off is by (CORE-051; Appendix H "Manifest fields"): `signed_off.by` and its
+/// optional `via`, which its status-log entry carries too. Only its constructors make one, so
+/// no caller can name `auto` itself (ruling 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedOffBy {
+    /// `user`, `assistant`, `claude-code`, `cli` or `auto`.
+    by: String,
+    via: Option<Via>,
+}
+
+impl SignedOffBy {
+    /// A sign-off by `caller` ([`signed_off_by`]), with no `via`: every sign-off tool's.
+    pub fn caller(caller: &CallerKind) -> SignedOffBy {
+        SignedOffBy {
+            by: signed_off_by(caller),
+            via: None,
+        }
+    }
+
+    /// A sign-off `auto_approve` makes under `rule`: `by: auto`, `via: {rule}`. No tool argument
+    /// asks for it, and until the `auto_approve` caller exists only this crate's tests make one
+    /// (ruling 4).
+    #[cfg(test)]
+    pub(crate) fn auto(rule: &str) -> SignedOffBy {
+        SignedOffBy {
+            by: StatusBy::Auto.as_str().to_string(),
+            via: Some(Via {
+                task_id: None,
+                conversation_id: None,
+                rule: Some(rule.to_string()),
+            }),
+        }
+    }
+}
+
 fn fail(spec: &CodeSpec, message: String) -> ErrorBody {
     ErrorBody::new(spec, message, "")
 }
@@ -130,7 +167,8 @@ fn bare_name(path: &str) -> &str {
 }
 
 /// The manifest after signing off the files `chosen` picks from run `run_id` (module docs),
-/// and the version it seals. The errors carry an empty trace id.
+/// and the version it seals, signed off `by` (`signed_off.by`, and `via` when it has one).
+/// The errors carry an empty trace id.
 ///
 /// # Errors
 /// `asset.unknown` for a run the manifest doesn't have, a run that isn't open, a chosen name
@@ -146,7 +184,7 @@ pub fn plan_signoff(
     chosen: &Chosen,
     bump: Option<Bump>,
     keep_runs: &[String],
-    by: &str,
+    by: &SignedOffBy,
     now_utc: i64,
 ) -> Result<(Manifest, Version), ErrorBody> {
     let view = m.view();
@@ -229,8 +267,8 @@ pub fn plan_signoff(
     change_status(
         &mut out,
         &StatusEvent::Signoff,
-        StatusBy::from_wire(by),
-        None,
+        StatusBy::from_wire(&by.by),
+        by.via.clone(),
         None,
         &lil_schema::time::rfc3339(now_utc),
     )
@@ -262,7 +300,10 @@ pub fn plan_signoff(
 
     let names: Vec<Value> = chosen.iter().map(|(n, _)| Value::from(*n)).collect();
     let date = lil_schema::time::date(now_utc);
-    let mut signed_off = json!({"by": by, "date": date, "version": version.to_string()});
+    let mut signed_off = json!({"by": by.by, "date": date, "version": version.to_string()});
+    if let Some(via) = &by.via {
+        signed_off["via"] = via.to_value();
+    }
     if let Some(takes) = &picked.takes {
         signed_off["takes"] = json!(takes);
         signed_off["companions"] = json!(picked.companions);
@@ -365,6 +406,54 @@ mod tests {
     }
 
     #[test] // spec: CORE-051
+    fn auto_approve_signoff_is_by_auto_with_via_rule() {
+        // The sign-off path with `auto` and its rule, as the `auto_approve` caller will call it.
+        let (signed, version) = plan_signoff(
+            &manifest(),
+            "r_1",
+            &files(&["a.png"]),
+            None,
+            &[],
+            &SignedOffBy::auto("auto_approve:image"),
+            86_400,
+        )
+        .unwrap();
+        let run = &signed.as_map()["candidate_runs"][0];
+        assert_eq!(run["signed_off"]["by"], "auto", "{run}");
+        assert_eq!(
+            run["signed_off"]["via"],
+            json!({"rule": "auto_approve:image"}),
+            "{run}"
+        );
+        assert_eq!(run["signed_off"]["version"], version.to_string());
+        let newest = signed.as_map()["status_log"]
+            .as_array()
+            .and_then(|log| log.last())
+            .cloned()
+            .unwrap();
+        assert_eq!(newest["by"], "auto", "{newest}");
+        assert_eq!(
+            newest["via"],
+            json!({"rule": "auto_approve:image"}),
+            "{newest}"
+        );
+        // A caller's sign-off has no `via`.
+        let (signed, _) = plan_signoff(
+            &manifest(),
+            "r_1",
+            &files(&["a.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Mcp),
+            86_400,
+        )
+        .unwrap();
+        let signed_off = &signed.as_map()["candidate_runs"][0]["signed_off"];
+        assert_eq!(signed_off["by"], "claude-code");
+        assert!(signed_off.get("via").is_none(), "{signed_off}");
+    }
+
+    #[test] // spec: CORE-051
     fn by_follows_the_caller() {
         assert_eq!(signed_off_by(&CallerKind::Ui("studio".into())), "user");
         assert_eq!(signed_off_by(&CallerKind::Assistant), "assistant");
@@ -380,7 +469,7 @@ mod tests {
             &files(&["A.PNG"]),
             None,
             &["r_3".to_string()],
-            "cli",
+            &SignedOffBy::caller(&CallerKind::Cli),
             86_400,
         )
         .unwrap();
@@ -421,12 +510,21 @@ mod tests {
             &files(&["b.png"]),
             Some(Bump::Major),
             &[],
-            "cli",
+            &SignedOffBy::caller(&CallerKind::Cli),
             0,
         )
         .unwrap();
         assert_eq!(v, Version::new(2, 0, 0));
-        let (_, v) = plan_signoff(&m, "r_2", &files(&["b.png"]), None, &[], "cli", 0).unwrap();
+        let (_, v) = plan_signoff(
+            &m,
+            "r_2",
+            &files(&["b.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Cli),
+            0,
+        )
+        .unwrap();
         assert_eq!(v, Version::new(1, 1, 0));
     }
 
@@ -438,18 +536,35 @@ mod tests {
             &files(&["a.png"]),
             None,
             &["r_2".into()],
-            "cli",
+            &SignedOffBy::caller(&CallerKind::Cli),
             0,
         )
         .unwrap();
-        let (again, v) =
-            plan_signoff(&signed, "r_2", &files(&["b.png"]), None, &[], "cli", 0).unwrap();
+        let (again, v) = plan_signoff(
+            &signed,
+            "r_2",
+            &files(&["b.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Cli),
+            0,
+        )
+        .unwrap();
         assert_eq!(v, Version::new(1, 1, 0));
         assert_eq!(again.view().status, Some(Status::Approved));
         let mut stale = signed.clone();
         stale.set("status", json!("stale"));
         stale.set("status_before_stale", json!("approved"));
-        let e = plan_signoff(&stale, "r_2", &files(&["b.png"]), None, &[], "cli", 0).unwrap_err();
+        let e = plan_signoff(
+            &stale,
+            "r_2",
+            &files(&["b.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Cli),
+            0,
+        )
+        .unwrap_err();
         assert_eq!(e.code, "status.invalid_transition");
     }
 
@@ -464,7 +579,7 @@ mod tests {
                 &files(&["a.png"]),
                 None,
                 &[],
-                "cli",
+                &SignedOffBy::caller(&CallerKind::Cli),
                 0
             )),
             "asset.unknown"
@@ -476,13 +591,21 @@ mod tests {
                 &files(&["x.png"]),
                 None,
                 &[],
-                "cli",
+                &SignedOffBy::caller(&CallerKind::Cli),
                 0
             )),
             "asset.unknown"
         );
         assert_eq!(
-            code(plan_signoff(&m, "r_1", &files(&[]), None, &[], "cli", 0)),
+            code(plan_signoff(
+                &m,
+                "r_1",
+                &files(&[]),
+                None,
+                &[],
+                &SignedOffBy::caller(&CallerKind::Cli),
+                0
+            )),
             "params.invalid"
         );
         assert_eq!(
@@ -492,12 +615,21 @@ mod tests {
                 &files(&["a.png"]),
                 None,
                 &["r_9".into()],
-                "cli",
+                &SignedOffBy::caller(&CallerKind::Cli),
                 0
             )),
             "asset.unknown"
         );
-        let (signed, _) = plan_signoff(&m, "r_1", &files(&["a.png"]), None, &[], "cli", 0).unwrap();
+        let (signed, _) = plan_signoff(
+            &m,
+            "r_1",
+            &files(&["a.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Cli),
+            0,
+        )
+        .unwrap();
         // r_1 is selected now, r_2 rejected.
         assert_eq!(
             code(plan_signoff(
@@ -506,7 +638,7 @@ mod tests {
                 &files(&["a.png"]),
                 None,
                 &[],
-                "cli",
+                &SignedOffBy::caller(&CallerKind::Cli),
                 0
             )),
             "asset.unknown"
@@ -520,7 +652,7 @@ mod tests {
                 &files(&["a.png"]),
                 None,
                 &[],
-                "cli",
+                &SignedOffBy::caller(&CallerKind::Cli),
                 0
             )),
             "status.invalid_transition"

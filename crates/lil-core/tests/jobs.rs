@@ -273,7 +273,13 @@ fn record_plan() -> RecordPlan {
         }) else {
             unreachable!()
         };
-        start_candidate_run(m, run, &lil_schema::StatusBy::Cli, 0)
+        start_candidate_run(
+            m,
+            run,
+            &lil_schema::StatusBy::Cli,
+            &lil_core::pipeline::actor_of(&lil_protocol::CallerKind::Cli),
+            0,
+        )
     });
     RecordPlan {
         branch: RecordBranch::CandidateRun {

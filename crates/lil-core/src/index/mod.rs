@@ -738,6 +738,12 @@ impl Index {
         done
     }
 
+    /// The keys (`path_key`) of the paths parked now: the watcher drops the reporter of a read
+    /// the index has given up on.
+    pub(crate) fn parked_keys(&self) -> std::collections::HashSet<String> {
+        lock(&self.parked).keys().cloned().collect()
+    }
+
     /// Re-checks the parked paths. One still unstable after [`PARKED_RETRIES`] re-checks is
     /// logged and dropped from the list; the next rescan picks it up.
     ///

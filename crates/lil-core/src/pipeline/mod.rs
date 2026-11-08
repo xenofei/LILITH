@@ -8,7 +8,8 @@
 //!   [`start_candidate_run`];
 //! - [`signoff`]: [`plan_signoff`] (with [`Chosen`] and [`chosen_files`]), [`signed_off_by`]
 //!   and [`auto_pick`];
-//! - [`status`]: [`status_by`], the status log's `by` for a caller.
+//! - [`status`]: [`status_by`], the status log's `by` for a caller, and [`actor_of`], the
+//!   `actor` of a caller's work.
 
 pub mod detail;
 pub mod record;
@@ -23,5 +24,7 @@ pub use record::{
     HandOff, RecordBranch, RecordOutcome, RecordPlan, RecordSlot, apply_record, asset_topic,
     merge_warnings, start_candidate_run,
 };
-pub use signoff::{Chosen, ChosenFiles, auto_pick, chosen_files, plan_signoff, signed_off_by};
-pub use status::status_by;
+pub use signoff::{
+    Chosen, ChosenFiles, SignedOffBy, auto_pick, chosen_files, plan_signoff, signed_off_by,
+};
+pub use status::{actor_of, status_by};

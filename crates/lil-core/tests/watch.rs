@@ -21,7 +21,7 @@ use lil_core::index::FileState;
 use lil_core::pipeline::asset_detail;
 use lil_core::state::StateRegistry;
 use lil_core::store::{Expect, FailPoints, StoreError, WsPath};
-use lil_core::watch::{WatchConfig, Watcher};
+use lil_core::watch::{CLAIM_WINDOW, WatchConfig, Watcher};
 use lil_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{Probe, Share, SystemProbe};
 use lil_platform::{Clock, Env};
@@ -119,6 +119,8 @@ struct Core {
     hub: Arc<WorkspaceHub>,
     events: Arc<EventBus>,
     open: Arc<OpenWorkspace>,
+    /// The core's clock (the claim window's time).
+    clock: Arc<FakeClock>,
     /// Last: fields drop in order, and the folder cannot go while the hub holds its
     /// databases open.
     env: TestEnv,
@@ -141,7 +143,8 @@ impl Core {
     }
 
     async fn open(env: TestEnv, ws: PathBuf, cfg: WatchConfig, fp: Arc<FailPoints>) -> Core {
-        let clock: Arc<dyn Clock> = FakeClock::new();
+        let fake = FakeClock::new();
+        let clock: Arc<dyn Clock> = fake.clone();
         let events = Arc::new(EventBus::new(clock.clone()));
         let hub = WorkspaceHub::new(
             env.env.clone(),
@@ -164,6 +167,7 @@ impl Core {
             hub,
             events,
             open,
+            clock: fake,
             env,
         }
     }
@@ -422,7 +426,7 @@ async fn staging_trash_and_git_internals_are_not_watched() {
     // Notifying them changes nothing either.
     let report = core
         .watch()
-        .notify(unwatched.iter().map(|r| p(r)).collect())
+        .notify(unwatched.iter().map(|r| p(r)).collect(), None)
         .await;
     assert!(report.reconciled.is_empty(), "{report:?}");
     assert_eq!(report.ignored.len(), unwatched.len(), "{report:?}");
@@ -950,7 +954,7 @@ async fn human_edit_is_recorded_once_across_notify_rescan_and_rebuild() {
     once(&core.detail(CRANE).await);
 
     // lil notify.
-    let report = core.watch().notify(vec![p(SEALED)]).await;
+    let report = core.watch().notify(vec![p(SEALED)], None).await;
     assert_eq!(report.reconciled, [SEALED]);
     once(&core.detail(CRANE).await);
 
@@ -1265,7 +1269,7 @@ async fn stale_verification_never_overrides_a_newer_edit() {
     );
 
     // A batch (here `lil notify`) sees B first and records it ...
-    watcher.notify(vec![p(SEALED)]).await;
+    watcher.notify(vec![p(SEALED)], None).await;
     // ... then the verification's result about A arrives.
     watcher.mismatches(mismatches).await;
 
@@ -1354,7 +1358,7 @@ async fn os_metadata_in_a_sealed_version_is_ignored() {
     // `lil notify` of them changes nothing either.
     let notified = core
         .watch()
-        .notify(vec![p(&format!("{BASE}/v1.0.0/Thumbs.db"))])
+        .notify(vec![p(&format!("{BASE}/v1.0.0/Thumbs.db"))], None)
         .await;
     assert!(notified.ignored.is_empty(), "{notified:?}");
 
@@ -1404,7 +1408,7 @@ async fn a_file_dropped_into_a_sealed_version_is_a_human_edit() {
     assert_eq!(flagged.len(), 1, "{events:?}");
     assert_eq!(flagged[0]["previous_sha256"], "", "{events:?}");
     // Seen again (`lil notify`), it is recorded once; the file itself is never touched.
-    core.watch().notify(vec![p(&extra)]).await;
+    core.watch().notify(vec![p(&extra)], None).await;
     let again = core.detail(CRANE).await;
     assert_eq!(edits_of(&again, "v1.0.0/extra.png").len(), 1, "{again}");
     assert_eq!(
@@ -1520,4 +1524,444 @@ async fn a_gitdir_file_points_the_git_watch_at_the_real_git_folder() {
     })
     .await;
     assert!(!core.open.store.git_gate().is_busy());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Agent edits (CORE-034, ARCH-103; P4b-R16).
+// ---------------------------------------------------------------------------------------------
+
+fn actor(kind: lil_schema::ActorKind, session_id: Option<&str>) -> lil_schema::Actor {
+    lil_schema::Actor {
+        kind,
+        task_id: None,
+        conversation_id: None,
+        session_id: session_id.map(str::to_string),
+    }
+}
+
+/// An agent's edit the watcher saw first (as a human edit, with no actor) becomes the agent's
+/// when the agent reports it; from then on it stays the agent's edit, recorded once, and the
+/// file is never overwritten.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079, ARCH-103
+async fn an_agent_edit_is_never_overwritten() {
+    use lil_schema::ActorKind;
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let edited = b"written by an agent's Edit tool";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    let only = |detail: &Value| {
+        let edits = edits_of(detail, "candidates/r_20261003_1400/crane_c.png");
+        assert_eq!(edits.len(), 1, "{detail}");
+        assert_eq!(edits[0]["sha256"], sha256_bytes(edited), "{detail}");
+        edits[0].clone()
+    };
+    let seen = only(&core.detail(CRANE).await);
+    assert!(
+        seen.get("actor").is_none(),
+        "the watcher knows no actor: {seen}"
+    );
+
+    // The agent's report (the hook's `lil notify --by claude_code`) names it.
+    let agent = actor(ActorKind::ClaudeCode, Some("s1"));
+    let report = core
+        .watch()
+        .notify(vec![p(CANDIDATE)], Some(agent.clone()))
+        .await;
+    assert_eq!(report.reconciled, [CANDIDATE]);
+    let claimed = only(&core.detail(CRANE).await);
+    assert_eq!(claimed["actor"], agent.to_value(), "{claimed}");
+    assert!(claimed.get("relabelled").is_none(), "{claimed}");
+    // Fix round 1, M1: the claim tells the asset's views that its manifest changed.
+    let asset_events = core.published(&core.asset_topic(CRANE)).await;
+    assert!(
+        kinds(&asset_events).contains(&"manifest".to_string()),
+        "{asset_events:?}"
+    );
+
+    // Reported again as someone's own, or seen again by the watcher: still the agent's.
+    core.watch()
+        .notify(vec![p(CANDIDATE)], Some(actor(ActorKind::Cli, None)))
+        .await;
+    core.watch().notify(vec![p(CANDIDATE)], None).await;
+    core.fence().await;
+    assert_eq!(only(&core.detail(CRANE).await), claimed);
+    assert_eq!(
+        core.row(CANDIDATE).await,
+        Some((Some(sha256_bytes(edited)), FileState::HumanEdit))
+    );
+
+    // Never overwritten: a write that expects the recorded content is refused.
+    let refused = core
+        .open
+        .store
+        .write(
+            &p(CANDIDATE),
+            b"the core's".to_vec(),
+            Expect::Hash(CANDIDATE_SHA256.into()),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::HashConflict { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(std::fs::read(core.path(CANDIDATE)).unwrap(), edited);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 15, fix round 1: a report's actor survives every deferral (I1); a claim is bounded (I2).
+// ---------------------------------------------------------------------------------------------
+
+/// The candidate's path inside the crane's folder, as `human_edits` names it.
+const CANDIDATE_INSIDE: &str = "candidates/r_20261003_1400/crane_c.png";
+
+impl Core {
+    /// The `human_edits` entries of `inside` (crane-relative), read from disk.
+    fn crane_edits(&self, inside: &str) -> Vec<Value> {
+        crane_edits_on_disk(self, inside)
+    }
+
+    /// Waits until `notes/<name>` (written now) is indexed: every batch before it has run.
+    async fn marker(&self, name: &str) {
+        let rel = format!("notes/{name}");
+        write_file(&self.path(&rel), name.as_bytes());
+        self.until("the marker indexed", || async {
+            self.row(&rel).await.is_some()
+        })
+        .await;
+    }
+}
+
+fn agent() -> lil_schema::Actor {
+    actor(lil_schema::ActorKind::ClaudeCode, Some("s-agent"))
+}
+
+/// I1: an agent's report made while git works (its path deferred to the post-git rescan, as
+/// the watcher's own batch is) is recorded with the agent's actor once the pause ends.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-083, ARCH-103
+async fn a_reported_actor_survives_the_git_pause() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let ops = GitOps::begin(&core.ws);
+    core.fence().await;
+    assert!(core.open.store.git_gate().is_busy());
+    let edited = b"written by an agent while git works";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    let report = core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    assert_eq!(report.reconciled, [CANDIDATE]);
+    assert!(core.crane_edits(CANDIDATE_INSIDE).is_empty(), "deferred");
+    ops.finish();
+    core.until("git resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// I1: an agent's report of a path under a held version lock (a sign-off between its seal and
+/// its Record stage) is decided after the lock, with the agent's actor.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079, ARCH-103
+async fn a_reported_actor_survives_a_held_version_lock() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let guard = core
+        .open
+        .store
+        .version_lock("sketchbook", CRANE)
+        .lock_owned()
+        .await;
+    let edited = b"written by an agent during a sign-off";
+    edit_outside(&core.path(CANDIDATE), edited);
+    // The watcher's own batch defers the path too, with no actor.
+    core.marker("after the edit.txt").await;
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    assert!(core.crane_edits(CANDIDATE_INSIDE).is_empty(), "deferred");
+    drop(guard);
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// I1: an agent's report of a file still locked by its writer parks the read; the decision
+/// once the file is free (by a later batch, with no report) records the agent's actor.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079, ARCH-103
+async fn a_reported_actor_survives_a_parked_read() {
+    // A long batch window, so the handle is surely taken before a batch reads the file.
+    let core = Core::fixture(WatchConfig {
+        batch: Duration::from_secs(1),
+        ..WatchConfig::default()
+    })
+    .await;
+    core.fence().await;
+    let edited = b"written by an agent, still held";
+    edit_outside(&core.path(CANDIDATE), edited);
+    let held = HandleHolder::hold(&core.path(CANDIDATE), Share::None);
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.fence().await;
+    assert!(core.crane_edits(CANDIDATE_INSIDE).is_empty(), "parked");
+    held.release();
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// I2 (the review's probe 3): your edit of a sealed file, recorded by the watcher, stays yours
+/// when an agent reports the path after the claim window; only your click relabels it.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-103
+async fn a_late_agent_report_leaves_a_hand_edit_human() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let edited = b"your edit of the sealed file";
+    edit_outside(&core.path(SEALED), edited);
+    core.fence().await;
+    assert!(
+        core.crane_edits("v1.0.0/crane_b.png")[0]
+            .get("actor")
+            .is_none()
+    );
+    core.clock.advance(CLAIM_WINDOW + Duration::from_secs(1));
+    core.watch().notify(vec![p(SEALED)], Some(agent())).await;
+    core.fence().await;
+    let edits = core.crane_edits("v1.0.0/crane_b.png");
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert!(edits[0].get("actor").is_none(), "still yours: {edits:?}");
+}
+
+/// I2: an agent's report inside the claim window claims the edit the watcher recorded first.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-103
+async fn an_agent_report_inside_the_window_claims_the_edit() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let edited = b"written by an agent, seen first by the watcher";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    assert!(core.crane_edits(CANDIDATE_INSIDE)[0].get("actor").is_none());
+    core.clock.advance(CLAIM_WINDOW - Duration::from_secs(1));
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// I2: a claim needs the entry's hash to be the file's current one: an earlier edit of the file
+/// is never claimed by a report of its newer content.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-103
+async fn a_claim_needs_the_current_hash() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let (first, second) = (
+        b"your edit".as_slice(),
+        b"the agent's later edit".as_slice(),
+    );
+    edit_outside(&core.path(CANDIDATE), first);
+    core.fence().await;
+    edit_outside(&core.path(CANDIDATE), second);
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(first));
+    assert!(
+        edits[0].get("actor").is_none(),
+        "yours stays yours: {edits:?}"
+    );
+    assert_eq!(edits[1]["sha256"], sha256_bytes(second));
+    assert_eq!(edits[1]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// I2, M4: a `cli` or app report never claims an entry; inside the window the first agent claim
+/// wins, and a later one doesn't change it.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-103
+async fn cli_and_app_reports_never_claim() {
+    use lil_schema::ActorKind;
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let edited = b"recorded by the watcher first";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    for kind in [ActorKind::Cli, ActorKind::Owner, ActorKind::Core] {
+        core.watch()
+            .notify(vec![p(CANDIDATE)], Some(actor(kind.clone(), None)))
+            .await;
+        let edits = core.crane_edits(CANDIDATE_INSIDE);
+        assert!(edits[0].get("actor").is_none(), "{kind:?}: {edits:?}");
+    }
+    let tether = actor(ActorKind::Tether, None);
+    core.watch()
+        .notify(vec![p(CANDIDATE)], Some(tether.clone()))
+        .await;
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["actor"], tether.to_value(), "{edits:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 15, fix round 2: a deferred claim's window counts to the report (N1); a read parked
+// inside a deferred reconcile keeps its reporter (N2).
+// ---------------------------------------------------------------------------------------------
+
+/// N1 (the re-review's probe 4): the watcher records an agent's write; git starts; the agent's
+/// report comes 1 s later and is deferred; the pause lasts past the window. The claim is
+/// measured at the report, so the edit becomes the agent's once the pause ends.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-083, ARCH-103
+async fn a_deferred_claim_counts_the_window_to_the_report() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let edited = b"written by an agent just before git started";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    assert!(core.crane_edits(CANDIDATE_INSIDE)[0].get("actor").is_none());
+    let ops = GitOps::begin(&core.ws);
+    core.fence().await;
+    assert!(core.open.store.git_gate().is_busy());
+    core.clock.advance(Duration::from_secs(1));
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.clock.advance(Duration::from_secs(20));
+    ops.finish();
+    core.until("git resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// N2: an agent's report waits for a held version lock; when the lock goes, the deferred
+/// reconcile finds the file still held by its writer and parks the read. The decision once the
+/// file is free still records the agent's actor.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079, ARCH-103
+async fn a_read_parked_in_a_deferred_reconcile_keeps_its_reporter() {
+    let core = Core::fixture(WatchConfig {
+        batch: Duration::from_secs(1),
+        ..WatchConfig::default()
+    })
+    .await;
+    core.fence().await;
+    let guard = core
+        .open
+        .store
+        .version_lock("sketchbook", CRANE)
+        .lock_owned()
+        .await;
+    let edited = b"written by an agent, held through a sign-off";
+    edit_outside(&core.path(CANDIDATE), edited);
+    let held = HandleHolder::hold(&core.path(CANDIDATE), Share::None);
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.marker("during the lock.txt").await;
+    drop(guard);
+    // The deferred reconcile runs (and parks the read) before the fence returns.
+    core.fence().await;
+    assert!(core.crane_edits(CANDIDATE_INSIDE).is_empty(), "parked");
+    held.release();
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 15, audit fix round 1: only a file's own report attributes it (M1, L2); a parked read
+// the index gives up on loses its reporter (L1).
+// ---------------------------------------------------------------------------------------------
+
+/// The crane's asset folder.
+const CRANE_FOLDER: &str = "projects/sketchbook/assets/chr_paper_crane";
+
+/// M1, L2 (the audit's probe 3): while git works, the agent reports its file and `lil` reports
+/// the asset's folder; after the pause only the file's own reporter counts.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-083, ARCH-103
+async fn after_a_deferral_only_the_files_own_reporter_counts() {
+    use lil_schema::ActorKind;
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let ops = GitOps::begin(&core.ws);
+    core.fence().await;
+    let edited = b"written by an agent while git works, then the folder reported";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    core.watch()
+        .notify(vec![p(CRANE_FOLDER)], Some(actor(ActorKind::Cli, None)))
+        .await;
+    ops.finish();
+    core.until("git resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["actor"], agent().to_value(), "{edits:?}");
+}
+
+/// M1: a folder report deferred by git attributes nothing in the folder once the pause ends.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-083, ARCH-103
+async fn a_git_deferred_folder_report_attributes_nothing() {
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let ops = GitOps::begin(&core.ws);
+    core.fence().await;
+    let edited = b"your edit while git works";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    core.watch()
+        .notify(vec![p(CRANE_FOLDER)], Some(agent()))
+        .await;
+    ops.finish();
+    core.until("git resumed", || async {
+        kinds(&core.published("workspace").await).contains(&"git_resumed".to_string())
+    })
+    .await;
+    core.fence().await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(edited));
+    assert!(edits[0].get("actor").is_none(), "still yours: {edits:?}");
+}
+
+/// L1 (the audit's probe 2): an agent's report parks a read the writer still holds; the index
+/// gives up on it after its re-checks; then you edit the file. Your edit stays yours: the
+/// reporter went with the given-up read.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079
+async fn a_given_up_parked_read_drops_its_reporter() {
+    // A batch window longer than the test: only the reports below reconcile anything.
+    let core = Core::fixture(WatchConfig {
+        batch: Duration::from_secs(120),
+        ..WatchConfig::default()
+    })
+    .await;
+    edit_outside(&core.path(CANDIDATE), b"written by an agent, held");
+    let held = HandleHolder::hold(&core.path(CANDIDATE), Share::None);
+    // The report parks the read and re-checks it once.
+    core.watch().notify(vec![p(CANDIDATE)], Some(agent())).await;
+    // Each later report re-checks it, until the index gives up.
+    write_file(&core.path("notes/unrelated.txt"), b"unrelated");
+    for _ in 1..lil_core::index::PARKED_RETRIES {
+        core.watch()
+            .notify(vec![p("notes/unrelated.txt")], None)
+            .await;
+    }
+    held.release();
+    core.clock.advance(Duration::from_secs(3600));
+    let yours = b"your edit, an hour later";
+    edit_outside(&core.path(CANDIDATE), yours);
+    core.watch().notify(vec![p(CANDIDATE)], None).await;
+    let edits = core.crane_edits(CANDIDATE_INSIDE);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["sha256"], sha256_bytes(yours));
+    assert!(edits[0].get("actor").is_none(), "still yours: {edits:?}");
 }

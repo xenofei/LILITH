@@ -2,7 +2,7 @@
 //!
 //! | Tool | Effect | Arguments | `structured` result |
 //! |---|---|---|---|
-//! | `watch.notify` | write | `{paths: [string]}` | `{reconciled: [string], ignored: [string]}` |
+//! | `watch.notify` | write | `{paths: [string], by?: Actor}` | `{reconciled: [string], ignored: [string]}` |
 //!
 //! Each path is workspace-relative (`/` or `\` separated) or absolute inside the session's
 //! workspace; the index reconciles them (a folder with its whole subtree) and the watcher
@@ -11,13 +11,32 @@
 //! (`.lilith/` and the legacy workspace data folder, `.trash/`, `.git/`) is `ignored`. While
 //! git works the paths wait for the post-git rescan. It works where the workspace has no folder watch too: that is what it is
 //! for.
+//!
+//! **Who made the changes** (CORE-034, ARCH-103; P4b-R16, owner decision OD-15). The tool
+//! computes the reporter's [`Actor`] and passes it to the watcher (`watch` never names
+//! `pipeline`): `by` when given, else the caller's ([`actor_of`]). The watcher writes it into
+//! the `human_edits[]` entry of each file the call names exactly, and may claim such a file's
+//! entry the watcher recorded just before (see `watch`). A folder given is reconciled with its
+//! subtree, but the changes found there get no actor: they stay human edits. A change reported with an agent's `by`
+//! (`claude_code`, `tether`, `director`), or by an agent caller (`mcp`, `assistant`) without
+//! one, is an agent edit; from an app (`ui:*`) or `cli` without `by` it stays a human edit.
+//! `by` is asserted by the caller, so it is checked before anything is reconciled, and a
+//! refused call records nothing (`params.invalid`): `by.kind` is never `owner` (a change of
+//! yours needs no `by`) or `core` (the core never reports through this tool; audit L3), an
+//! agent caller's `by` has its own kind (Claude Code can't report as the assistant), and each
+//! of its ids is at most [`ACTOR_ID_MAX`] characters. Known limit: `lil` run from a shell an agent opened connects as `cli`
+//! (ARCH-047), so its report without `by` is recorded as yours; the plugin's hook passes `by`
+//! for Claude Code's own writes.
 
-use lil_protocol::{EffectClass, ErrorBody};
+use lil_protocol::codes::PARAMS_INVALID;
+use lil_protocol::{CallerKind, EffectClass, ErrorBody};
+use lil_schema::{Actor, ActorKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::workspace_tools::WORKSPACE_MODULE;
+use crate::pipeline::actor_of;
 use crate::store::StoreError;
 use crate::watch::notify_paths;
 
@@ -26,13 +45,99 @@ const NOTIFY_DESCRIPTION: &str = "Tell the workspace watcher that files changed:
     is reconciled with the index, and an outside edit of a candidate or sealed file is \
     recorded as a human edit, never overwritten. Paths outside the workspace or in its private \
     folders are returned as ignored. Use it where the folder can't be watched, or after a \
-    tool changed files the watcher may have missed.";
+    tool changed files the watcher may have missed. `by` says who made the changes: an agent \
+    gives its own kind (and its session_id); without it, the caller is recorded. Only the \
+    files named exactly are attributed: a folder's changes stay human edits.";
+
+/// The longest `task_id`, `conversation_id` or `session_id` `by` takes, in characters.
+pub const ACTOR_ID_MAX: usize = 200;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NotifyArgs {
     /// Workspace-relative paths, or absolute paths inside the workspace.
     paths: Vec<String>,
+    /// Who made the changes to the files named exactly (never `owner` or `core`; an agent
+    /// caller gives its own kind). Without it, the caller.
+    by: Option<ActorArg>,
+}
+
+/// `Actor.kind` as `by` takes it (P4b-R16): never `owner`, which a change of yours doesn't
+/// need, nor `core`, which never reports through this tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ActorKindArg {
+    Tether,
+    Director,
+    ClaudeCode,
+    Cli,
+}
+
+/// `Actor`: `{kind, task_id?, conversation_id?, session_id?}`, each id at most
+/// [`ACTOR_ID_MAX`] characters.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ActorArg {
+    kind: ActorKindArg,
+    #[schemars(length(max = 200))]
+    task_id: Option<String>,
+    #[schemars(length(max = 200))]
+    conversation_id: Option<String>,
+    #[schemars(length(max = 200))]
+    session_id: Option<String>,
+}
+
+impl ActorArg {
+    fn into_actor(self) -> Actor {
+        let kind = match self.kind {
+            ActorKindArg::Tether => ActorKind::Tether,
+            ActorKindArg::Director => ActorKind::Director,
+            ActorKindArg::ClaudeCode => ActorKind::ClaudeCode,
+            ActorKindArg::Cli => ActorKind::Cli,
+        };
+        Actor {
+            kind,
+            task_id: self.task_id,
+            conversation_id: self.conversation_id,
+            session_id: self.session_id,
+        }
+    }
+}
+
+/// The actor of a `watch.notify` by `caller` with `by` (module docs). The error is the
+/// `params.invalid` message.
+fn reporter(caller: &CallerKind, by: Option<ActorArg>) -> Result<Actor, String> {
+    let own = actor_of(caller);
+    let Some(by) = by.map(ActorArg::into_actor) else {
+        return Ok(own);
+    };
+    // The schema leaves `owner` and `core` out; this guard stays for any other way in.
+    if matches!(by.kind, ActorKind::Owner | ActorKind::Core) {
+        return Err(format!(
+            "by.kind is never {}: a change of yours, from an app or lil, needs no by",
+            by.kind.as_str()
+        ));
+    }
+    for (key, id) in [
+        ("task_id", &by.task_id),
+        ("conversation_id", &by.conversation_id),
+        ("session_id", &by.session_id),
+    ] {
+        if id
+            .as_ref()
+            .is_some_and(|id| id.chars().count() > ACTOR_ID_MAX)
+        {
+            return Err(format!("by.{key} is longer than {ACTOR_ID_MAX} characters"));
+        }
+    }
+    let agent = matches!(caller, CallerKind::Mcp | CallerKind::Assistant);
+    if agent && by.kind != own.kind {
+        let own = own.kind.as_str();
+        return Err(format!(
+            "this caller's changes are {own}'s, so by.kind must be {own} (or leave by out)"
+        ));
+    }
+    Ok(by)
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -44,6 +149,8 @@ struct NotifyResult {
 }
 
 async fn notify(ctx: &CallCtx, args: NotifyArgs) -> Result<(NotifyResult, String), ErrorBody> {
+    let actor = reporter(&ctx.session.caller, args.by)
+        .map_err(|why| ErrorBody::new(&PARAMS_INVALID, why, ctx.trace_id.clone()))?;
     let open = ctx.workspace()?;
     let Some(watch) = &open.watch else {
         // Only the core that holds `core.lock` watches (the dispatcher refuses write tools
@@ -51,7 +158,7 @@ async fn notify(ctx: &CallCtx, args: NotifyArgs) -> Result<(NotifyResult, String
         return Err(StoreError::ReadOnly.to_error(&ctx.trace_id));
     };
     let (paths, mut ignored) = notify_paths(&open.ws.path, &args.paths);
-    let report = watch.notify(paths).await;
+    let report = watch.notify(paths, Some(actor)).await;
     ignored.extend(report.ignored);
     let summary = format!(
         "{} path(s) reconciled, {} ignored",
