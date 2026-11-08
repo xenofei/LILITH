@@ -47,11 +47,12 @@ pub type TextEdit = Arc<dyn Fn(&str) -> Result<String, StoreError> + Send + Sync
 pub struct CommitOp {
     pub outputs: Vec<OutputMove>,
     /// Files a caller already moved into place (a sealed version): they reach the index in
-    /// the index step, with the hash and identity given, never before the manifest edit.
+    /// the index step, with the hash and identity given, never before the manifest edit; when
+    /// the commit fails before that edit, as it returns its error (an orphan version folder).
     pub moved: Vec<Written>,
     /// Paths a caller already moved away (the run files a seal took out of
     /// `candidates/<run>/`): they reach the index as removals in the index step, after the
-    /// manifest edit.
+    /// manifest edit, or, when the commit fails before it, as it returns its error.
     pub removed: Vec<WsPath>,
     pub manifest: Option<(WsPath, ManifestEdit)>,
     pub job_line: Option<Map<String, Value>>,
@@ -213,6 +214,20 @@ fn conflict_files(root: &Path, start: &Path, probe: &dyn Probe) -> io::Result<Ve
     Ok(found)
 }
 
+/// The index's events for the files `op`'s caller already moved: a `Removed` per entry of
+/// `op.removed`, then a `Written` per entry of `op.moved`, with its hash and identity as given.
+fn caller_moves(op: &CommitOp) -> impl Iterator<Item = StoreEvent> + '_ {
+    op.removed
+        .iter()
+        .map(|path| StoreEvent {
+            path: path.clone(),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        })
+        .chain(op.moved.iter().map(|w| event(w, ChangeKind::Written)))
+}
+
 /// Whether `name` is a conflict copy's (`*.lil-conflict-*`, or the legacy marker).
 pub(super) fn is_conflict_copy(name: &str) -> bool {
     name.contains(CONFLICT_MARKER) || name.contains(LEGACY_CONFLICT_MARKER)
@@ -246,8 +261,10 @@ impl Store {
     /// after 60 s; `store.path_invalid` for an output that isn't in a staging handle, a target
     /// the store never writes, or one under a linked folder; `store.locked` for a target a
     /// manifest `locks` entry covers (nothing has moved then); `store.hash_conflict` when a file
-    /// is already at an output's target; any error of steps 1 and 2. An error after step 1
-    /// leaves the outputs in place (orphans until the manifest records them).
+    /// is already at an output's target; any error of steps 1 and 2. On any of these errors the
+    /// index still hears of what is on disk: the outputs already moved (orphans until a manifest
+    /// records them; one that couldn't be read back, by its path alone) and the files the
+    /// caller moved (`op.moved`, a seal's orphan version folder, and `op.removed`).
     pub async fn commit(&self, op: CommitOp) -> Result<CommitReport, StoreError> {
         self.writable_store()?;
         let subject = op
@@ -258,78 +275,106 @@ impl Store {
             .unwrap_or_else(|| WsPath::from_disk(String::new()));
         let mut events: Vec<StoreEvent> = Vec::new();
 
-        // 1. Outputs. They wait at the git gate first, as every write does: a run folder
-        // never appears in the middle of a checkout.
-        if !op.outputs.is_empty() {
-            self.git_gate().wait_clear(GIT_WAIT).await?;
-        }
-        let staging = self.staging_root();
-        // Every target is checked before any output moves: a manifest lock (CORE-035) refuses
-        // the commit as it refuses a write, by the path and by its long form.
-        for out in &op.outputs {
-            if !out.from.starts_with(&staging) || out.from == staging {
-                return Err(StoreError::PathInvalid {
-                    path: out.from.display().to_string(),
-                    why: "an output is ingested only from a staging handle".to_string(),
-                });
+        // Steps 1 and 2. On an error the index still hears of what is already on disk, since
+        // `project.status` lists orphans from its rows: the outputs moved so far, and the
+        // files a caller already moved (a seal's version folder, and the run files it took).
+        let moved = async {
+            // 1. Outputs. They wait at the git gate first, as every write does: a run folder
+            // never appears in the middle of a checkout.
+            if !op.outputs.is_empty() {
+                self.git_gate().wait_clear(GIT_WAIT).await?;
             }
-            writable(&out.to)?;
-            self.check_locks(&out.to).await?;
-            let long = self.writable_on_disk(&out.to).await?;
-            self.check_long_locks(&out.to, &long).await?;
-        }
-        let mut outputs = Vec::with_capacity(op.outputs.len());
-        for out in &op.outputs {
-            // The move checks only its target: a linked folder above it is refused here.
-            self.refuse_links(&out.to).await?;
-            let _held = self.lock_path(&out.to).await;
-            let target = out.to.abs(self.root());
-            let (from, to) = (out.from.clone(), target.clone());
-            self.fs_retry(None, move || {
-                if let Some(dir) = to.parent() {
-                    fsops::ensure_dir(dir)?;
-                }
-                fsops::move_new(&from, &to)
-            })
-            .await
-            .map_err(|e| match classify(&e) {
-                RetryClass::TargetExists => StoreError::HashConflict {
-                    path: out.to.clone(),
-                    backup: None,
-                    cloud_only: false,
-                    kept: Vec::new(),
-                },
-                _ => StoreError::io(&out.to, &e),
-            })?;
-            let sha256 = match self.see_hash(&target).await {
-                Ok(Seen::Found(h)) => h.sha256,
-                Ok(_) => {
-                    return Err(StoreError::Io {
-                        path: out.to.as_str().to_string(),
-                        why: "the output is no longer there after its move".to_string(),
+            let staging = self.staging_root();
+            // Every target is checked before any output moves: a manifest lock (CORE-035)
+            // refuses the commit as it refuses a write, by the path and by its long form.
+            for out in &op.outputs {
+                if !out.from.starts_with(&staging) || out.from == staging {
+                    return Err(StoreError::PathInvalid {
+                        path: out.from.display().to_string(),
+                        why: "an output is ingested only from a staging handle".to_string(),
                     });
                 }
-                Err(e) => return Err(StoreError::io(&out.to, &e)),
-            };
-            let written = Written {
-                path: out.to.clone(),
-                sha256,
-                identity: self.identity(&out.to).await?,
-            };
-            events.push(event(&written, ChangeKind::Created));
-            outputs.push(written);
-        }
-        self.point("store.after_output", &subject).await?;
-
-        // 2. Manifest.
-        let mut manifest = None;
-        if let Some((rel, edit)) = &op.manifest {
-            let (edited, written, kind) = self.edit_manifest_quiet(rel, &**edit).await?;
-            if let Some(kind) = kind {
-                events.push(event(&written, kind));
+                writable(&out.to)?;
+                self.check_locks(&out.to).await?;
+                let long = self.writable_on_disk(&out.to).await?;
+                self.check_long_locks(&out.to, &long).await?;
             }
-            manifest = Some(edited);
+            let mut outputs = Vec::with_capacity(op.outputs.len());
+            for out in &op.outputs {
+                // The move checks only its target: a linked folder above it is refused here.
+                self.refuse_links(&out.to).await?;
+                let _held = self.lock_path(&out.to).await;
+                let target = out.to.abs(self.root());
+                let (from, to) = (out.from.clone(), target.clone());
+                self.fs_retry(None, move || {
+                    if let Some(dir) = to.parent() {
+                        fsops::ensure_dir(dir)?;
+                    }
+                    fsops::move_new(&from, &to)
+                })
+                .await
+                .map_err(|e| match classify(&e) {
+                    RetryClass::TargetExists => StoreError::HashConflict {
+                        path: out.to.clone(),
+                        backup: None,
+                        cloud_only: false,
+                        kept: Vec::new(),
+                    },
+                    _ => StoreError::io(&out.to, &e),
+                })?;
+                let seen = match self.see_hash(&target).await {
+                    Ok(Seen::Found(h)) => match self.identity(&out.to).await {
+                        Ok(identity) => Ok(Written {
+                            path: out.to.clone(),
+                            sha256: h.sha256,
+                            identity,
+                        }),
+                        Err(e) => Err(e),
+                    },
+                    Ok(_) => Err(StoreError::Io {
+                        path: out.to.as_str().to_string(),
+                        why: "the output is no longer there after its move".to_string(),
+                    }),
+                    Err(e) => Err(StoreError::io(&out.to, &e)),
+                };
+                let written = match seen {
+                    Ok(written) => written,
+                    Err(e) => {
+                        // Moved, but not read back: the index looks at the path itself.
+                        events.push(StoreEvent {
+                            path: out.to.clone(),
+                            kind: ChangeKind::Created,
+                            sha256: None,
+                            identity: None,
+                        });
+                        return Err(e);
+                    }
+                };
+                events.push(event(&written, ChangeKind::Created));
+                outputs.push(written);
+            }
+            self.point("store.after_output", &subject).await?;
+
+            // 2. Manifest.
+            let mut manifest = None;
+            if let Some((rel, edit)) = &op.manifest {
+                let (edited, written, kind) = self.edit_manifest_quiet(rel, &**edit).await?;
+                if let Some(kind) = kind {
+                    events.push(event(&written, kind));
+                }
+                manifest = Some(edited);
+            }
+            Ok::<_, StoreError>((outputs, manifest))
         }
+        .await;
+        let (outputs, manifest) = match moved {
+            Ok(done) => done,
+            Err(e) => {
+                events.extend(caller_moves(&op));
+                self.emit(events).await;
+                return Err(e);
+            }
+        };
         // From here on the operation is recorded: what fails is a warning (ruling Q31).
         let mut warnings = Vec::new();
         let mut warn = |step: &str, e: &StoreError| {
@@ -377,13 +422,7 @@ impl Store {
         }
 
         // 5. The index, with the files already moved away and into place.
-        events.extend(op.removed.iter().map(|path| StoreEvent {
-            path: path.clone(),
-            kind: ChangeKind::Removed,
-            sha256: None,
-            identity: None,
-        }));
-        events.extend(op.moved.iter().map(|w| event(w, ChangeKind::Written)));
+        events.extend(caller_moves(&op));
         self.emit(events).await;
         if let Err(e) = self.point("store.after_index", &subject).await {
             warn("store.after_index", &e);
@@ -445,37 +484,6 @@ impl Store {
         }
         found.extend(self.staging_orphans().await?);
         found.extend(conflicts);
-        Ok(found.into_iter().collect())
-    }
-
-    /// [`Store::orphans`] of one project, sorted: the orphan run folders and sealed versions of
-    /// `projects/<project>/assets/*`, and the `*.lil-conflict-*` files under
-    /// `projects/<project>/`. Only that folder is walked (`project.status`); staging handles
-    /// and conflict files elsewhere are not the project's. A project folder that doesn't exist
-    /// has none.
-    ///
-    /// # Errors
-    /// `store.path_invalid` for a project name that isn't a valid path segment; `store.io`
-    /// when the project's folder can't be listed.
-    pub async fn orphans_in(&self, project: &str) -> Result<Vec<WsPath>, StoreError> {
-        let rel = WsPath::parse(&format!("projects/{project}"))?;
-        if rel.as_str().matches('/').count() != 1 {
-            return Err(StoreError::PathInvalid {
-                path: rel.as_str().to_string(),
-                why: "a project name is one path segment".to_string(),
-            });
-        }
-        let mut found: BTreeSet<WsPath> = BTreeSet::new();
-        let dir = rel.abs(self.root());
-        self.project_asset_orphans(project, &dir, &mut found)
-            .await?;
-        let conflicts = {
-            let (root, start, probe) = (self.root().to_path_buf(), dir, self.probe().clone());
-            blocking(move || conflict_files(&root, &start, probe.as_ref()))
-                .await
-                .map_err(|e| StoreError::io(&rel, &e))?
-        };
-        found.extend(conflicts.iter().map(|path| self.rel_of(path)));
         Ok(found.into_iter().collect())
     }
 

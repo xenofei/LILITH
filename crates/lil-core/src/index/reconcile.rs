@@ -333,6 +333,23 @@ fn skip_file(name: &str) -> bool {
     (name.starts_with('.') && dot_marker) || conflict || lil_schema::is_os_metadata(name)
 }
 
+/// Whether `name` is a conflict copy's (`*.lil-conflict-*`, or the legacy marker): never indexed
+/// as a file, but listed in `conflicts`, `project.status`'s orphans (CORE-038).
+fn is_conflict_copy(name: &str) -> bool {
+    name.contains(CONFLICT_MARKER) || name.contains(LEGACY_CONFLICT_MARKER)
+}
+
+/// Whether a scoped path is a conflict copy in a folder the walk enters.
+fn conflict_path(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let (name, folders) = parts.split_last().expect("split gives one part at least");
+    is_conflict_copy(name)
+        && !folders
+            .iter()
+            .enumerate()
+            .any(|(i, folder)| skip_folder(folder, i == 0))
+}
+
 /// Whether a scoped path is one the walk never enters.
 fn skipped_path(rel: &str) -> bool {
     let parts: Vec<&str> = rel.split('/').collect();
@@ -349,13 +366,15 @@ struct Walker<'a> {
     closed: &'a AtomicBool,
 }
 
-/// Every file under `dir` (`rel` is its workspace-relative path, empty at the root).
+/// Every file under `dir` (`rel` is its workspace-relative path, empty at the root), and every
+/// conflict copy, apart (`conflicts`, workspace-relative).
 fn walk_dir(
     root: &Path,
     dir: &Path,
     rel: &str,
     walker: &Walker<'_>,
     out: &mut Vec<Walked>,
+    conflicts: &mut Vec<String>,
 ) -> io::Result<()> {
     let mut folders = vec![(dir.to_path_buf(), rel.to_string())];
     while let Some((dir, rel)) = folders.pop() {
@@ -396,6 +415,8 @@ fn walk_dir(
                 if !skip_folder(&name, rel.is_empty()) {
                     folders.push((dir.join(&name), child));
                 }
+            } else if is_conflict_copy(&name) {
+                conflicts.push(child);
             } else if !skip_file(&name) {
                 out.push(walked(root, child));
             }
@@ -404,25 +425,39 @@ fn walk_dir(
     Ok(())
 }
 
-/// The files of `scope`, and the key prefixes inside which a row the walk didn't see is gone
-/// (`None`: every row). Folders are listed through `probe`.
+/// What a walk found.
+type WalkFound = (Vec<Walked>, Vec<String>, Option<Vec<String>>);
+
+/// The files of `scope`, its conflict copies (workspace-relative), and the key prefixes inside
+/// which a row the walk didn't see is gone (`None`: every row). Folders are listed through
+/// `probe`.
 fn walk(
     root: &Path,
     scope: &Scope,
     probe: &dyn Probe,
     closed: &AtomicBool,
-) -> io::Result<(Vec<Walked>, Option<Vec<String>>)> {
+) -> io::Result<WalkFound> {
     let mut out = Vec::new();
+    let mut conflicts = Vec::new();
     let walker = Walker { probe, closed };
     match scope {
         Scope::All => {
-            walk_dir(root, root, "", &walker, &mut out)?;
-            Ok((out, None))
+            walk_dir(root, root, "", &walker, &mut out, &mut conflicts)?;
+            Ok((out, conflicts, None))
         }
         Scope::Paths(paths) => {
             let mut prefixes = Vec::new();
             let mut seen = HashSet::new();
             for path in paths {
+                if conflict_path(path.as_str()) {
+                    // A conflict copy itself: its row follows the disk.
+                    prefixes.push(path_key(path.as_str()));
+                    let abs = lil_platform::fs::long_path(&path.abs(root));
+                    if std::fs::symlink_metadata(abs).is_ok_and(|m| m.is_file()) {
+                        conflicts.push(path.as_str().to_string());
+                    }
+                    continue;
+                }
                 if skipped_path(path.as_str()) {
                     continue;
                 }
@@ -431,7 +466,7 @@ fn walk(
                 match std::fs::symlink_metadata(lil_platform::fs::long_path(&abs)) {
                     Ok(meta) if meta.file_type().is_symlink() => {}
                     Ok(meta) if meta.is_dir() => {
-                        walk_dir(root, &abs, path.as_str(), &walker, &mut out)?;
+                        walk_dir(root, &abs, path.as_str(), &walker, &mut out, &mut conflicts)?;
                     }
                     Ok(_) => out.push(walked(root, path.as_str().to_string())),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -441,7 +476,7 @@ fn walk(
                 }
             }
             out.retain(|w| seen.insert(w.key.clone()));
-            Ok((out, Some(prefixes)))
+            Ok((out, conflicts, Some(prefixes)))
         }
     }
 }
@@ -747,6 +782,12 @@ struct Fields {
     /// JSON `{to, by, utc}`.
     last_change: Option<String>,
     takes: Vec<TakeMark>,
+    /// The keys ([`path_key`]) of every run's id (trashed ones too), joined by `/`:
+    /// `project.status`'s orphan runs are the run folders none of them names.
+    run_keys: String,
+    /// The keys of the versions recorded, joined by `,`: `approved_version` and each run's
+    /// `signed_off.version`.
+    versions: String,
 }
 
 /// A parsed manifest, keyed by its folder.
@@ -944,6 +985,23 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
             display,
             last_change,
             takes,
+            run_keys: view
+                .candidate_runs
+                .iter()
+                .map(|run| path_key(&run.run_id))
+                .collect::<Vec<_>>()
+                .join("/"),
+            versions: view
+                .approved_version
+                .into_iter()
+                .chain(
+                    view.candidate_runs
+                        .iter()
+                        .filter_map(|run| run.signed_off.as_ref().map(|s| s.version)),
+                )
+                .map(|v| path_key(&v.to_string()))
+                .collect::<Vec<_>>()
+                .join(","),
         }),
         needs_repair,
     })
@@ -963,22 +1021,90 @@ fn is_folder_manifest(root: &Path, rel: &WsPath) -> bool {
     lil_platform::fs::attributes(&beside).is_err()
 }
 
+/// Keeps one asset row per folder when `parsed` spells its folder in other capitals than a row
+/// already does (a folder renamed only in case). With no row of the new spelling yet, the most
+/// recently updated row of the folder (its values the likeliest to be current) is moved to it,
+/// with everything that hangs off it, so the upsert
+/// that follows overwrites it (a manifest that parses) or keeps its last values (one that
+/// doesn't). Any other row of the folder first hands its expected files to the kept row, then
+/// goes: a recorded file never stops being expected because its folder's spelling changed.
+fn respell_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
+    let others: Vec<(i64, String, String)> = tx
+        .prepare_cached(
+            "SELECT id, project, asset_id FROM assets WHERE folder_key = ?1
+             AND NOT (project = ?2 AND asset_id = ?3) ORDER BY updated DESC, id",
+        )?
+        .query_map(
+            params![folder_key(parsed), parsed.project, parsed.asset_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let (new_project, new_asset) = (parsed.project.as_str(), parsed.asset_id.as_str());
+    let mut others = others.into_iter();
+    let has_own: bool = tx
+        .prepare_cached("SELECT 1 FROM assets WHERE project = ?1 AND asset_id = ?2")?
+        .query_row(params![new_project, new_asset], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !has_own && let Some((id, project, asset_id)) = others.next() {
+        tx.execute(
+            "UPDATE assets SET project = ?2, asset_id = ?3 WHERE id = ?1",
+            params![id, new_project, new_asset],
+        )?;
+        for table in ["asset_tags", "take_marks", "expected"] {
+            tx.execute(
+                &format!(
+                    "UPDATE OR REPLACE {table} SET project = ?3, asset_id = ?4
+                     WHERE project = ?1 AND asset_id = ?2"
+                ),
+                params![project, asset_id, new_project, new_asset],
+            )?;
+        }
+        tx.execute(
+            "UPDATE edges SET from_project = ?3, from_asset = ?4
+             WHERE from_project = ?1 AND from_asset = ?2",
+            params![project, asset_id, new_project, new_asset],
+        )?;
+    }
+    for (id, project, asset_id) in others {
+        // `expected` is keyed by the file, so the kept row has none of these yet.
+        tx.execute(
+            "UPDATE expected SET project = ?3, asset_id = ?4 WHERE project = ?1 AND asset_id = ?2",
+            params![project, asset_id, new_project, new_asset],
+        )?;
+        delete_asset(tx, id, &project, &asset_id)?;
+    }
+    Ok(())
+}
+
+/// The case-folded key of the asset folder `projects/<p>/assets/<a>` (`assets.folder_key`).
+fn folder_key(parsed: &Parsed) -> String {
+    path_key(&format!(
+        "projects/{}/assets/{}",
+        parsed.project, parsed.asset_id
+    ))
+}
+
 fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
+    respell_asset(tx, parsed)?;
     let Some(fields) = &parsed.fields else {
-        // It doesn't parse: flag the row and keep its last values, edges and expected files.
+        // It doesn't parse: flag the row and keep its last values, edges and expected files, but
+        // not the runs and versions it recorded: its folders aren't judged for orphans.
         tx.prepare_cached(
             "INSERT INTO assets (project, asset_id, manifest, updated, needs_repair,
-                 manifest_parses)
-             VALUES (?1, ?2, ?3, ?4, 1, 0)
+                 manifest_parses, folder_key)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5)
              ON CONFLICT (project, asset_id) DO UPDATE SET
                  manifest = excluded.manifest, updated = excluded.updated, needs_repair = 1,
-                 manifest_parses = 0",
+                 manifest_parses = 0, folder_key = excluded.folder_key, run_keys = NULL,
+                 versions = NULL",
         )?
         .execute(params![
             parsed.project,
             parsed.asset_id,
             parsed.manifest.as_str(),
-            parsed.updated
+            parsed.updated,
+            folder_key(parsed)
         ])?;
         return Ok(());
     };
@@ -987,9 +1113,9 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
             "INSERT INTO assets (project, asset_id, asset_type, status, version, approved_version,
                  manifest, creation_uuid, updated, needs_repair, rating, label, runs_waiting,
                  external, working_doc, display, last_change, manifest_project,
-                 manifest_asset_id, manifest_parses)
+                 manifest_asset_id, manifest_parses, folder_key, run_keys, versions)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20)
+                 ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT (project, asset_id) DO UPDATE SET
                  asset_type = excluded.asset_type, status = excluded.status,
                  version = excluded.version, approved_version = excluded.approved_version,
@@ -1000,7 +1126,9 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
                  working_doc = excluded.working_doc, display = excluded.display,
                  last_change = excluded.last_change, manifest_project = excluded.manifest_project,
                  manifest_asset_id = excluded.manifest_asset_id,
-                 manifest_parses = excluded.manifest_parses
+                 manifest_parses = excluded.manifest_parses, folder_key = excluded.folder_key,
+                 run_keys = excluded.run_keys,
+                 versions = excluded.versions
              RETURNING id",
         )?
         .query_row(
@@ -1025,6 +1153,9 @@ fn upsert_asset(tx: &Transaction<'_>, parsed: &Parsed) -> rusqlite::Result<()> {
                 fields.manifest_project,
                 fields.manifest_asset_id,
                 i64::from(fields.place_strings),
+                folder_key(parsed),
+                fields.run_keys,
+                fields.versions,
             ],
             |r| r.get(0),
         )?;
@@ -1247,17 +1378,24 @@ fn folder_absent(root: &Path, row: &AssetRow) -> bool {
     asset_folder_on_disk(root, &row.project, &row.asset_id) == OnDisk::Absent
 }
 
-/// `projects/<p>/assets/<a>/candidates/<run>` of a run file's path.
+/// `projects/<p>/assets/<a>/candidates/<run>` of a file in a run's folder: the `candidates`
+/// segment of the asset's own layout, the last one before the run, so a project or an asset
+/// called `candidates` is never taken for it.
 fn run_folder(path: &str) -> Option<&str> {
-    let at = path.find("/candidates/")? + "/candidates/".len();
-    let end = path[at..].find('/')? + at;
-    Some(&path[..end])
+    if kind_of(&WsPath::from_disk(path.to_string())) != FileKind::Candidate {
+        return None;
+    }
+    // The sixth `/` ends `projects/<p>/assets/<a>/candidates/<run>`.
+    path.match_indices('/').nth(5).map(|(end, _)| &path[..end])
 }
 
 /// The keys of open-run files whose `candidates/<run>/` folder doesn't exist (ruling Q28):
 /// `candidates/` is gitignored (CORE-032), so on a fresh clone a manifest lists runs whose
 /// files were never on this machine. A cold rebuild doesn't call those `missing`; a file gone
-/// from a run folder that is there still is, and `hashes` entries always are.
+/// from a run folder that is there still is, and `hashes` entries always are. Only `NotFound`
+/// (a missing parent folder gives it too) confirms a folder absent. A run folder that can't be
+/// looked at (any other error taking its identity: access denied, …) gets no exemption: its
+/// expected files the walk didn't find are listed as `missing`, as anywhere else.
 async fn runs_elsewhere(index: &Index, parsed: &[Parsed]) -> Result<HashSet<String>, IndexError> {
     let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
     for e in parsed
@@ -1280,9 +1418,10 @@ async fn runs_elsewhere(index: &Index, parsed: &[Parsed]) -> Result<HashSet<Stri
         by_folder
             .into_iter()
             .filter(|(folder, _)| {
-                probe
-                    .identity(&WsPath::from_disk(folder.clone()).abs(&root))
-                    .is_err()
+                matches!(
+                    probe.identity(&WsPath::from_disk(folder.clone()).abs(&root)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound
+                )
             })
             .flat_map(|(_, keys)| keys)
             .collect()
@@ -1304,23 +1443,35 @@ fn delete_assets_under(tx: &Transaction<'_>, key: &str) -> rusqlite::Result<()> 
         .collect();
     drop(stmt);
     for (id, project, asset_id) in doomed {
-        tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
-        tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id])?;
-        for table in ["asset_tags", "take_marks"] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE project = ?1 AND asset_id = ?2"),
-                params![project, asset_id],
-            )?;
-        }
+        delete_asset(tx, id, &project, &asset_id)?;
+    }
+    Ok(())
+}
+
+/// Removes the asset row `id` (`project`/`asset_id` as that row spells them) with its tags,
+/// takes, edges, text and expected files.
+fn delete_asset(
+    tx: &Transaction<'_>,
+    id: i64,
+    project: &str,
+    asset_id: &str,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
+    tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id])?;
+    for table in ["asset_tags", "take_marks"] {
         tx.execute(
-            "DELETE FROM edges WHERE from_project = ?1 AND from_asset = ?2",
-            params![project, asset_id],
-        )?;
-        tx.execute(
-            "DELETE FROM expected WHERE project = ?1 AND asset_id = ?2",
+            &format!("DELETE FROM {table} WHERE project = ?1 AND asset_id = ?2"),
             params![project, asset_id],
         )?;
     }
+    tx.execute(
+        "DELETE FROM edges WHERE from_project = ?1 AND from_asset = ?2",
+        params![project, asset_id],
+    )?;
+    tx.execute(
+        "DELETE FROM expected WHERE project = ?1 AND asset_id = ?2",
+        params![project, asset_id],
+    )?;
     Ok(())
 }
 
@@ -1528,8 +1679,8 @@ pub(super) struct StoreChanges {
     parsed: Vec<Parsed>,
 }
 
-/// While it lives, a cold rebuild is running: `apply_events` logs what it writes. Dropping it
-/// (the rebuild ended, either way) stops the log.
+/// While it lives, a reconcile or a cold rebuild is running: `apply_events` logs what it
+/// writes. Dropping it (the run ended, either way) stops the log.
 struct ColdLog<'a>(&'a Mutex<Option<Vec<StoreChanges>>>);
 
 impl Drop for ColdLog<'_> {
@@ -1553,10 +1704,8 @@ pub(super) async fn run(
     let whole = scope == Scope::All;
     let mut report = ReconcileReport::default();
     let (stable, fat) = volume_facts(index).await?;
-    let _cold = (mode == Mode::Cold).then(|| {
-        *lock(&index.cold_log) = Some(Vec::new());
-        ColdLog(&index.cold_log)
-    });
+    *lock(&index.cold_log) = Some(Vec::new());
+    let _log = ColdLog(&index.cold_log);
 
     let (rows, known) = match mode {
         Mode::Cold => (HashMap::new(), HashSet::new()),
@@ -1574,7 +1723,7 @@ pub(super) async fn run(
     };
     let rows = Arc::new(rows);
 
-    let (files, prefixes) = {
+    let (files, conflicts, prefixes) = {
         let (root, scope, closed) = (index.root.clone(), scope.clone(), index.closed.clone());
         let probe = index.probe.clone();
         blocking(move || walk(&root, &scope, probe.as_ref(), &closed))
@@ -1658,15 +1807,30 @@ pub(super) async fn run(
         Mode::Warm => HashSet::new(),
     };
     let root = index.root.clone();
+    let conflict_scope = prefixes.clone();
     let removals = index
         .db
         .call(move |conn| {
             let tx = conn.transaction().map_err(|e| sql(&e))?;
+            write_conflicts(&tx, &conflicts, conflict_scope.as_deref()).map_err(|e| sql(&e))?;
             // Taken on the actor, so every store change written before this job is in it; a
-            // later one is written after the rebuild commits.
+            // later one is written after the run commits.
+            let logged = lock(&cold_log).take().unwrap_or_default();
             let replay = match mode {
-                Mode::Cold => lock(&cold_log).take().unwrap_or_default(),
-                Mode::Warm => Vec::new(),
+                Mode::Cold => logged,
+                Mode::Warm => {
+                    // The walk's conflict copies are written whole, not compared and set as
+                    // file rows are: a removal the store applied while the walk ran is applied
+                    // to them once more, so a copy the store moved away isn't put back.
+                    for key in logged.iter().flat_map(|c| &c.removed) {
+                        tx.execute(
+                            &format!("DELETE FROM conflicts WHERE {UNDER}"),
+                            params![key],
+                        )
+                        .map_err(|e| sql(&e))?;
+                    }
+                    Vec::new()
+                }
             };
             let done = finish(
                 &tx,
@@ -1784,12 +1948,45 @@ fn finish(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('scan_start', ?1)",
             params![started],
         )?;
+        // Only a cold rebuild that commits marks the index built (`Index::needs_rebuild`).
+        if mode == Mode::Cold {
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('rebuilt', ?1)",
+                params![started],
+            )?;
+        }
     }
     Ok((removed, missing))
 }
 
-/// The store's changes in one transaction: removals (with everything under them), then rows,
-/// then asset rows.
+/// The walk's conflict copies replace the `conflicts` rows in its scope (`None`: all of them).
+fn write_conflicts(
+    tx: &Transaction<'_>,
+    found: &[String],
+    prefixes: Option<&[String]>,
+) -> rusqlite::Result<()> {
+    match prefixes {
+        None => {
+            tx.execute("DELETE FROM conflicts", [])?;
+        }
+        Some(prefixes) => {
+            for prefix in prefixes {
+                tx.execute(
+                    &format!("DELETE FROM conflicts WHERE {UNDER}"),
+                    params![prefix],
+                )?;
+            }
+        }
+    }
+    for path in found {
+        tx.prepare_cached("INSERT OR REPLACE INTO conflicts (key, path) VALUES (?1, ?2)")?
+            .execute(params![path_key(path), path])?;
+    }
+    Ok(())
+}
+
+/// The store's changes in one transaction: removals (with everything under them, conflict
+/// copies included), then rows, then asset rows.
 fn store_changes(
     tx: &Transaction<'_>,
     removed: &[String],
@@ -1798,6 +1995,10 @@ fn store_changes(
 ) -> rusqlite::Result<()> {
     for key in removed {
         tx.execute(&format!("DELETE FROM files WHERE {UNDER}"), params![key])?;
+        tx.execute(
+            &format!("DELETE FROM conflicts WHERE {UNDER}"),
+            params![key],
+        )?;
         delete_assets_under(tx, key)?;
     }
     for row in rows {

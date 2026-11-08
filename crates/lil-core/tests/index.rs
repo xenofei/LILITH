@@ -197,6 +197,8 @@ struct Behaviour {
     locked: HashSet<String>,
     /// Every identity call reports a later last write.
     unstable: HashSet<String>,
+    /// `identity` fails with error 5 (access denied): the path is there, but can't be looked at.
+    denied: HashSet<String>,
 }
 
 impl Default for Behaviour {
@@ -210,6 +212,7 @@ impl Default for Behaviour {
             placeholders: HashSet::new(),
             locked: HashSet::new(),
             unstable: HashSet::new(),
+            denied: HashSet::new(),
         }
     }
 }
@@ -269,6 +272,11 @@ impl FakeProbe {
         self.reads.lock().unwrap().get(name).copied().unwrap_or(0)
     }
 
+    /// The names `identity` was asked about since the last call, in order.
+    fn take_order(&self) -> Vec<String> {
+        std::mem::take(&mut *self.order.lock().unwrap())
+    }
+
     fn gated() -> Arc<FakeProbe> {
         let probe = FakeProbe::new();
         probe.gated.store(true, Ordering::SeqCst);
@@ -297,6 +305,9 @@ impl Probe for FakeProbe {
         self.order.lock().unwrap().push(name.clone());
         if let Some(hook) = self.hook.get() {
             hook(path);
+        }
+        if self.b.lock().unwrap().denied.contains(&name) {
+            return Err(std::io::Error::from_raw_os_error(5));
         }
         let mut id = SystemProbe.identity(path)?;
         let b = self.b.lock().unwrap();
@@ -500,7 +511,7 @@ async fn fresh_index_is_wal_and_versioned() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(version, lil_core::index::INDEX_SCHEMA_VERSION);
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     drop(db);
     drop(index);
 
@@ -563,7 +574,7 @@ async fn version_mismatch_or_failed_quick_check_rebuilds() {
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 
     // A damaged page: quick_check fails (or SQLite refuses the file).
     {
@@ -982,6 +993,447 @@ async fn removed_recorded_files_are_missing_and_recover() {
         report.missing.is_empty(),
         "missing is reported once: {report:?}"
     );
+}
+
+/// An open run of the asset `<project>/<asset>` whose one file, `c.png`, has a recorded hash.
+fn open_run(project: &str, asset: &str, run_id: &str) -> Value {
+    json!({"run_id": run_id, "status": "open", "path": format!("candidates/{run_id}/"),
+           "files": [{"path": format!("candidates/{run_id}/c.png"), "role": "candidate",
+                      "sha256": sha256_bytes(format!("{project}/{asset}/{run_id}").as_bytes())}]})
+}
+
+/// The paths of a cold rebuild's `missing`, sorted.
+async fn rebuilt_missing(index: &Index) -> Vec<String> {
+    let report = index.rebuild().await.unwrap();
+    let mut missing: Vec<String> = report
+        .missing
+        .iter()
+        .map(|m| m.as_str().to_string())
+        .collect();
+    missing.sort();
+    missing
+}
+
+/// Ruling Q28 finds a run's folder from its files' paths: the `candidates` segment of the asset's
+/// own layout, the last one before the run (`projects/<p>/assets/<a>/candidates/<run>`), not the
+/// first in the path. With a project and an asset both called `candidates`, the first one is
+/// `projects/candidates/`, so the "folder" was `projects/candidates/assets`, which is there: the
+/// files of a run that was never on this machine were called `missing`.
+#[tokio::test] // spec: CORE-038, ARCH-079
+async fn run_folder_uses_the_last_candidates_segment() {
+    let fx = fx();
+    let asset = "projects/candidates/assets/candidates";
+    let away = "r_20270101_0800";
+    let here = "r_20270102_0800";
+    fx.write(
+        &format!("{asset}/candidates.manifest.json"),
+        &manifest_json(
+            "candidates",
+            "candidates",
+            json!({"candidate_runs": [open_run("candidates", "candidates", away),
+                                      open_run("candidates", "candidates", here)]}),
+        ),
+    );
+    // `here`'s folder is on this machine, without its file; `away`'s isn't.
+    fx.write(&format!("{asset}/candidates/{here}/other.png"), b"other");
+    let index = fx.open(Arc::new(SystemProbe));
+
+    assert_eq!(
+        rebuilt_missing(&index).await,
+        [format!("{asset}/candidates/{here}/c.png")],
+        "only the file gone from a run folder that is there is missing"
+    );
+}
+
+/// Ruling Q28's exemption needs the run's folder to be confirmed absent (`NotFound`). A run
+/// folder that can't be looked at (any other error taking its identity: access denied, …) gets
+/// no exemption: its expected files the walk didn't find are listed as `missing`, as anywhere
+/// else, instead of being left out of the index.
+#[tokio::test] // spec: CORE-038, ARCH-079
+async fn runs_elsewhere_exempts_only_absent_run_folders() {
+    let fx = fx();
+    let (denied, away) = ("r_20270101_0800", "r_20270102_0800");
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"candidate_runs": [open_run("p", "a", denied), open_run("p", "a", away)]}),
+        ),
+    );
+    // `denied`'s folder is there, without its file, and can't be looked at; `away`'s isn't there.
+    fx.write(&format!("{ASSET}/candidates/{denied}/other.png"), b"other");
+    let probe = FakeProbe::with(|b| {
+        b.denied.insert(denied.to_string());
+    });
+    let index = fx.open(probe);
+
+    assert_eq!(
+        rebuilt_missing(&index).await,
+        [format!("{ASSET}/candidates/{denied}/c.png")],
+        "a folder that can't be looked at isn't a folder that is absent"
+    );
+}
+
+/// A cold rebuild that never commits (the core stopped, or the rebuild failed) is done again in
+/// full at the next open, even after a whole reconcile ran in between: until one finishes, a
+/// file that a manifest records and that vanished while no core watched is listed `missing`
+/// only by a cold rebuild (CORE-038).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-038, ARCH-089
+async fn an_interrupted_first_rebuild_is_redone_at_the_next_open() {
+    let fx = fx();
+    let x = b"sealed x".as_slice();
+    fx.write(&format!("{ASSET}/v1.0.0/x.png"), x);
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"approved_version": "1.0.0", "hashes": {
+                "v1.0.0/x.png": format!("sha256:{}", sha256_bytes(x)),
+                "v1.0.0/gone.png": format!("sha256:{}", sha256_bytes(b"gone")),
+            }}),
+        ),
+    );
+    {
+        // The first rebuild fails before it commits.
+        let failing = FakeProbe::with(|b| b.volume = Volume::Panics);
+        let index = fx.open(failing.clone());
+        assert!(index.needs_rebuild());
+        assert!(index.rebuild().await.is_err());
+        // A whole reconcile commits meanwhile, but it isn't a rebuild.
+        failing.set(|b| b.volume = Volume::Real);
+        index.reconcile(Scope::All).await.unwrap();
+    }
+
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(index.needs_rebuild(), "no cold rebuild ever finished");
+    let report = index.retry_first().await.unwrap();
+    assert_eq!(
+        report.missing,
+        [p(&format!("{ASSET}/v1.0.0/gone.png"))],
+        "{report:?}"
+    );
+    drop(index);
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(
+        !index.needs_rebuild(),
+        "a finished rebuild is warm from then on"
+    );
+}
+
+/// An `index.db` of schema 2 (a core from before orphans came from the index) is rebuilt, so
+/// neither core writes rows the other doesn't fill.
+#[tokio::test] // spec: ARCH-089
+async fn a_schema_2_index_db_is_rebuilt() {
+    let fx = fx();
+    indexed_once(&fx).await;
+    Connection::open(&fx.db)
+        .unwrap()
+        .pragma_update(None, "user_version", 2)
+        .unwrap();
+    let index = fx.open(Arc::new(SystemProbe));
+    assert!(index.needs_rebuild(), "a schema-2 index.db is rebuilt");
+}
+
+/// A removal the store applies while a reconcile's walk runs isn't undone for the conflict
+/// copies the walk saw: the reconcile writes them whole, then applies the removal once more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: CORE-038
+async fn a_store_removal_during_a_reconcile_keeps_its_conflict_copies_out() {
+    let fx = fx();
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json("p", "a", json!({})),
+    );
+    fx.write(
+        &format!("{ASSET}/work/s.blend.lil-conflict-20270101T080000Z"),
+        b"an outside save",
+    );
+    fx.write("projects/p/assets/z/zz.txt", b"z");
+    let probe = FakeProbe::new();
+    let index = fx.open(probe.clone());
+    index.rebuild().await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap().len(), 1);
+
+    // While the next reconcile looks at zz.txt (the walk has listed the copy), the store moves
+    // asset `a` to the trash and says so.
+    let fired = Arc::new(AtomicBool::new(false));
+    // Weak: the index holds the probe, which holds this hook.
+    let (hook_index, root) = (Arc::downgrade(&index), fx.root.clone());
+    let handle = tokio::runtime::Handle::current();
+    let installed = probe.hook.set(Box::new(move |path: &Path| {
+        if name_of(path) != "zz.txt" || fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(hook_index) = hook_index.upgrade() else {
+            return;
+        };
+        outside_move(
+            &native(&root, ASSET),
+            &native(&root, ".trash/e_1/payload/a"),
+        );
+        handle.block_on(hook_index.applied(&[StoreEvent {
+            path: p(ASSET),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        }]));
+    }));
+    assert!(installed.is_ok());
+    index.reconcile(Scope::All).await.unwrap();
+
+    assert_eq!(index.files_of("p", "a").await.unwrap(), Vec::new());
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+}
+
+/// A removal the store reports (an asset folder moved to the trash, a run moved away) takes
+/// the conflict copies under it out of the orphans at once, as it takes the file rows: no
+/// reconcile has to see them gone first.
+#[tokio::test] // spec: CORE-038
+async fn store_removal_clears_its_conflict_copies() {
+    let fx = fx();
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json("p", "a", json!({})),
+    );
+    let copy = format!("{ASSET}/work/s.blend.lil-conflict-20270101T080000Z");
+    fx.write(&copy, b"an outside save");
+    fx.write(&format!("{ASSET}/work/s.blend"), b"the core's");
+    let index = fx.open(Arc::new(SystemProbe));
+    index.rebuild().await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap(), [p(&copy)]);
+
+    outside_move(&fx.file(ASSET), &fx.file(".trash/e_1/payload/a"));
+    index
+        .applied(&[StoreEvent {
+            path: p(ASSET),
+            kind: ChangeKind::Removed,
+            sha256: None,
+            identity: None,
+        }])
+        .await;
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+}
+
+/// After a folder is renamed only in case (the project's or the asset's), a manifest that stops
+/// parsing (a merge conflict, say) keeps the asset's expected files: a recorded file deleted
+/// afterwards is listed as `missing`, never forgotten.
+#[tokio::test] // spec: CORE-038, ARCH-079
+async fn a_case_only_rename_then_a_broken_manifest_keeps_its_expected_files() {
+    for (from, to) in [("projects/p", "projects/P"), (ASSET, "projects/p/assets/A")] {
+        let fx = fx();
+        let x = b"sealed x".as_slice();
+        fx.write(&format!("{ASSET}/v1.0.0/x.png"), x);
+        fx.write(
+            &format!("{ASSET}/a.manifest.json"),
+            &manifest_json(
+                "p",
+                "a",
+                json!({"approved_version": "1.0.0",
+                       "hashes": {"v1.0.0/x.png": format!("sha256:{}", sha256_bytes(x))}}),
+            ),
+        );
+        let index = fx.open(Arc::new(SystemProbe));
+        index.rebuild().await.unwrap();
+
+        outside_move(&fx.file(from), &fx.file(to));
+        index.reconcile(Scope::All).await.unwrap();
+        let asset = if from == ASSET {
+            to.to_string()
+        } else {
+            format!("{to}/assets/a")
+        };
+        fx.write(
+            &format!("{asset}/a.manifest.json"),
+            b"{not json <<<<<<< HEAD",
+        );
+        index.reconcile(Scope::All).await.unwrap();
+        let sealed = format!("{asset}/v1.0.0/x.png");
+        outside_remove(&fx.file(&sealed));
+        let report = index.reconcile(Scope::All).await.unwrap();
+        let missing: Vec<String> = report
+            .missing
+            .iter()
+            .map(|m| m.as_str().to_lowercase())
+            .collect();
+        assert_eq!(
+            missing,
+            [sealed.to_lowercase()],
+            "{from} renamed to {to}: {report:?}"
+        );
+    }
+}
+
+/// After a project folder is renamed only in case, a manifest change read with the folder's new
+/// spelling (a run and a version added) leaves one asset row for the folder, not a second one
+/// beside the stale row, so nothing it records is called an orphan.
+#[tokio::test] // spec: CORE-038, CORE-047
+async fn a_case_only_rename_then_a_manifest_change_keeps_one_asset_row() {
+    let fx = fx();
+    let (r1, r2) = ("r_20270101_0800", "r_20270102_0800");
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({"candidate_runs": [open_run("p", "a", r1)]}),
+        ),
+    );
+    fx.write(&format!("{ASSET}/candidates/{r1}/c.png"), b"r1");
+    let index = fx.open(Arc::new(SystemProbe));
+    index.rebuild().await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+
+    outside_move(&fx.file("projects/p"), &fx.file("projects/P"));
+    index.reconcile(Scope::All).await.unwrap();
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+
+    // The manifest records a second run and a sealed version, written the new way.
+    let signed = json!({"by": "user", "date": "2027-01-02", "version": "1.0.0"});
+    let mut second = open_run("p", "a", r2);
+    second["status"] = json!("selected");
+    second["signed_off"] = signed;
+    fx.write(
+        "projects/P/assets/a/a.manifest.json",
+        &manifest_json(
+            "p",
+            "a",
+            json!({"approved_version": "1.0.0",
+                   "candidate_runs": [open_run("p", "a", r1), second]}),
+        ),
+    );
+    fx.write(&format!("projects/P/assets/a/candidates/{r2}/c.png"), b"r2");
+    fx.write("projects/P/assets/a/v1.0.0/manifest.snapshot.json", b"{}");
+    index.reconcile(Scope::All).await.unwrap();
+
+    assert_eq!(index.orphans_of("p").await.unwrap(), Vec::<WsPath>::new());
+    let rows =
+        index.assets_of("p").await.unwrap().len() + index.assets_of("P").await.unwrap().len();
+    assert_eq!(rows, 1, "one asset row for the folder");
+}
+
+/// `project.status`'s orphans (CORE-038) come from the index's rows, not from a walk of the disk:
+/// the `candidates/<run>` folders holding an indexed file whose run the asset's manifest doesn't
+/// list, and the `v<semver>` folders holding an indexed `manifest.snapshot.json` whose version is
+/// neither the manifest's `approved_version` nor a run's `signed_off.version`. An asset folder
+/// without a manifest records nothing; one whose manifest doesn't parse is skipped. Conflict
+/// copies (`*.lil-conflict-*`) under the project's folder are listed too. Run ids and the
+/// project compare without regard to case. The disk changing unseen changes nothing until the
+/// index hears of it.
+#[tokio::test] // spec: CORE-038, ARCH-075
+async fn orphans_come_from_index_rows() {
+    let fx = fx();
+    let signed = json!({"by": "user", "date": "2027-01-01", "version": "1.1.0"});
+    fx.write(
+        &format!("{ASSET}/a.manifest.json"),
+        &manifest_json(
+            "p",
+            "a",
+            json!({
+                "approved_version": "1.0.0",
+                "candidate_runs": [
+                    {"run_id": "r_20270101_0800", "status": "selected", "signed_off": signed,
+                     "files": [{"path": "candidates/r_20270101_0800/chosen.png",
+                                "role": "candidate"}]},
+                    open_run("p", "a", "r_20270102_0800"),
+                ],
+            }),
+        ),
+    );
+    let on_disk = [
+        // Recorded: the approved version, the signed-off one, and both runs (one folder spelled
+        // in other capitals).
+        "a/v1.0.0/manifest.snapshot.json",
+        "a/v1.0.0/s.png",
+        "a/v1.1.0/manifest.snapshot.json",
+        "a/candidates/r_20270101_0800/rest.png",
+        "a/candidates/R_20270102_0800/c.png",
+        // Orphans: a run and a version the manifest doesn't list.
+        "a/candidates/r_20270103_0800/left.png",
+        "a/candidates/r_20270103_0800/sub/deeper.png",
+        "a/v2.0.0/manifest.snapshot.json",
+        "a/v2.0.0/s.png",
+        // Not a sealed version: no snapshot.
+        "a/v3.0.0/s.png",
+        // An asset folder without a manifest: everything in it is an orphan.
+        "b/candidates/r_20270101_0800/x.png",
+        "b/v1.0.0/manifest.snapshot.json",
+        // A manifest that doesn't parse: its folders aren't judged.
+        "c/c.manifest.json",
+        "c/candidates/r_20270101_0800/x.png",
+        "c/v1.0.0/manifest.snapshot.json",
+        // A conflict copy (never indexed as a file) is an orphan wherever it is.
+        "a/work/scene.blend.lil-conflict-20270101T080000Z",
+    ];
+    for rel in on_disk {
+        let bytes: &[u8] = if rel.ends_with("c.manifest.json") {
+            b"{not json"
+        } else {
+            rel.as_bytes()
+        };
+        fx.write(&format!("projects/p/assets/{rel}"), bytes);
+    }
+    // Other projects' folders, one whose name starts with this one's.
+    fx.write(
+        "projects/pp/assets/d/candidates/r_20270101_0800/x.png",
+        b"pp",
+    );
+    fx.write("projects/q/assets/d/v1.0.0/manifest.snapshot.json", b"q");
+    fx.write(
+        "projects/p/notes.txt.lil-conflict-20270101T080000Z",
+        b"notes",
+    );
+    fx.write("projects/q/notes.txt.lil-conflict-20270101T080000Z", b"q");
+    let index = fx.open(Arc::new(SystemProbe));
+    index.rebuild().await.unwrap();
+
+    let want = [
+        "projects/p/assets/a/candidates/r_20270103_0800",
+        "projects/p/assets/a/v2.0.0",
+        "projects/p/assets/a/work/scene.blend.lil-conflict-20270101T080000Z",
+        "projects/p/assets/b/candidates/r_20270101_0800",
+        "projects/p/assets/b/v1.0.0",
+        "projects/p/notes.txt.lil-conflict-20270101T080000Z",
+    ];
+    let orphans = |project: &'static str| {
+        let index = index.clone();
+        async move {
+            index
+                .orphans_of(project)
+                .await
+                .unwrap()
+                .iter()
+                .map(|o| o.as_str().to_string())
+                .collect::<Vec<String>>()
+        }
+    };
+    assert_eq!(orphans("p").await, want);
+    assert_eq!(orphans("P").await, want, "the project in any case");
+    assert_eq!(
+        orphans("pp").await,
+        ["projects/pp/assets/d/candidates/r_20270101_0800"]
+    );
+
+    // From the rows: what changes on disk unseen changes nothing until the index hears of it.
+    outside_remove(&fx.file("projects/p/assets/a/v2.0.0/manifest.snapshot.json"));
+    let late = "projects/p/assets/b/work/b.txt.lil-conflict-20270102T080000Z";
+    fx.write(late, b"late");
+    assert_eq!(orphans("p").await, want);
+    // A scoped reconcile that names the new conflict copy lists it.
+    index.reconcile(Scope::Paths(vec![p(late)])).await.unwrap();
+    let mut with_late: Vec<&str> = want.to_vec();
+    with_late.push(late);
+    with_late.sort_unstable();
+    assert_eq!(orphans("p").await, with_late);
+    // A whole one sees the snapshot gone: no sealed version there any more.
+    index.reconcile(Scope::All).await.unwrap();
+    with_late.retain(|o| *o != want[1]);
+    assert_eq!(orphans("p").await, with_late);
+    // A conflict copy removed is gone at the next reconcile of its path.
+    outside_remove(&fx.file(late));
+    index.reconcile(Scope::Paths(vec![p(late)])).await.unwrap();
+    with_late.retain(|o| *o != late);
+    assert_eq!(orphans("p").await, with_late);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // spec: ARCH-097, CORE-005, ARCH-028
@@ -2105,8 +2557,13 @@ async fn scoped_reconciles_keep_the_scan_start() {
     assert_eq!(report.changed, [p("notes/recent.txt")], "{report:?}");
 }
 
+/// `verify_pending` examines at most `max_files` rows per call, in key order from where the last
+/// call stopped, and a row it skips (a mismatch already reported, unchanged since) counts too.
+/// The files each call looks at are asserted, not only what it returns: before the bound counted
+/// every examined row, the second call looked at `x` again (skipping it) and then read `y`, and
+/// returned the same results.
 #[tokio::test] // spec: CORE-041
-async fn verify_pending_examines_at_most_max_files_and_moves_on() {
+async fn verify_pending_max_files_fails_on_the_old_code() {
     let fx = fx();
     let (x, y) = (b"x bytes".as_slice(), b"y bytes".as_slice());
     fx.write(&format!("{ASSET}/v1.0.0/x.png"), x);
@@ -2126,16 +2583,24 @@ async fn verify_pending_examines_at_most_max_files_and_moves_on() {
     let index = fx.open(probe.clone());
     index.rebuild().await.unwrap();
     fx.write(&format!("{ASSET}/v1.0.0/x.png"), b"edited x");
+    probe.take_order();
 
-    // One row per call: x (a mismatch, reported once), then y, then x again (skipped: it
-    // hasn't changed since it was reported).
+    // Each read takes the identity before and after it.
+    let read = |name: &str| vec![name.to_string(), name.to_string()];
+    // 1. x: read, a mismatch, reported.
     let first = index.verify_pending(1).await.unwrap();
     assert_eq!(first.len(), 1, "{first:?}");
-    assert_eq!((probe.reads("x.png"), probe.reads("y.png")), (1, 0));
+    assert_eq!(probe.take_order(), read("x.png"), "only x is looked at");
+    // 2. y, after x: read and verified; x isn't looked at again.
     assert!(index.verify_pending(1).await.unwrap().is_empty());
-    assert_eq!((probe.reads("x.png"), probe.reads("y.png")), (1, 1));
+    assert_eq!(probe.take_order(), read("y.png"), "only y is looked at");
+    // 3. Nothing after y: an empty batch, and the next call starts from the first row.
     assert!(index.verify_pending(1).await.unwrap().is_empty());
+    assert_eq!(probe.take_order(), Vec::<String>::new());
+    // 4. x again: its identity is taken, it hasn't changed since it was reported, so it isn't
+    // read; that counts as the call's one row.
     assert!(index.verify_pending(1).await.unwrap().is_empty());
+    assert_eq!(probe.take_order(), ["x.png"]);
     assert_eq!(
         (probe.reads("x.png"), probe.reads("y.png")),
         (1, 1),
@@ -2214,7 +2679,7 @@ async fn schema_1_index_is_rebuilt_as_2() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     for table in ["asset_tags", "take_marks"] {
         db.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
             .unwrap_or_else(|e| panic!("{table}: {e}"));
@@ -3169,4 +3634,523 @@ async fn status_and_type_take_lists() {
     );
     drop(open);
     hub.close_all().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// `orphans_of` and `missing` against the disk (CORE-038), over random sequences of changes.
+// ---------------------------------------------------------------------------------------------
+
+/// The runs whose `c.png` each asset of [`orphans_follow_the_disk`] can hold:
+/// `r_2027010<run>_0800`, `run` in `1..=RUNS`.
+const RUNS: usize = 3;
+
+/// One step of [`orphans_follow_the_disk`]. `asset` picks `a` or `b`; every step tells the
+/// index of its change the way the suite would: a reconcile (whole, or scoped to what changed)
+/// for an outside change, the store's `Removed` event for the store's own move.
+#[derive(Debug, Clone)]
+enum OrphanOp {
+    /// A conflict copy appears, in the asset's `work/` or at the project's root.
+    Conflict {
+        asset: usize,
+        name: usize,
+        root: bool,
+    },
+    /// A conflict copy is removed (if it is there).
+    RemoveConflict {
+        asset: usize,
+        name: usize,
+        root: bool,
+    },
+    /// `candidates/r_2027010<run>_0800/c.png` is written.
+    RunFile { asset: usize, run: usize },
+    /// `v<ver>.0.0/manifest.snapshot.json`.
+    Snapshot { asset: usize, ver: usize },
+    /// The manifest is rewritten: open runs from the `runs` bit mask (each one records its
+    /// `c.png`), versions from the `versions` one (the first approved, the others signed off), or
+    /// text that doesn't parse.
+    Manifest {
+        asset: usize,
+        runs: u8,
+        versions: u8,
+        parses: bool,
+        whole: bool,
+    },
+    /// The project folder is renamed in case only (`p` ↔ `P`).
+    RenameProject { whole: bool },
+    /// The asset folder is renamed in case only (`a` ↔ `A`).
+    RenameAsset { asset: usize, whole: bool },
+    /// The store moves the asset folder (or one of its run folders) away and says so.
+    StoreRemove { asset: usize, run: Option<usize> },
+    /// A run's `c.png` is deleted outside the suite (if it is there), then a whole reconcile.
+    DeleteFile { asset: usize, run: usize },
+    /// A whole reconcile.
+    Reconcile,
+}
+
+fn orphan_op() -> impl proptest::strategy::Strategy<Value = OrphanOp> {
+    use proptest::prelude::*;
+    let asset = || 0..2usize;
+    let run = || 1..=RUNS;
+    prop_oneof![
+        1 => (asset(), 0..2usize, any::<bool>())
+            .prop_map(|(asset, name, root)| OrphanOp::Conflict { asset, name, root }),
+        1 => (asset(), 0..2usize, any::<bool>())
+            .prop_map(|(asset, name, root)| OrphanOp::RemoveConflict { asset, name, root }),
+        2 => (asset(), run()).prop_map(|(asset, run)| OrphanOp::RunFile { asset, run }),
+        1 => (asset(), 1..4usize).prop_map(|(asset, ver)| OrphanOp::Snapshot { asset, ver }),
+        3 => (asset(), 0..8u8, 0..8u8, prop::bool::weighted(0.5), any::<bool>()).prop_map(
+            |(asset, runs, versions, parses, whole)| OrphanOp::Manifest {
+                asset,
+                runs,
+                versions,
+                parses,
+                whole
+            }
+        ),
+        2 => any::<bool>().prop_map(|whole| OrphanOp::RenameProject { whole }),
+        2 => (asset(), any::<bool>())
+            .prop_map(|(asset, whole)| OrphanOp::RenameAsset { asset, whole }),
+        1 => (asset(), proptest::option::of(run()))
+            .prop_map(|(asset, run)| OrphanOp::StoreRemove { asset, run }),
+        3 => (asset(), run()).prop_map(|(asset, run)| OrphanOp::DeleteFile { asset, run }),
+        1 => Just(OrphanOp::Reconcile),
+    ]
+}
+
+/// The model of [`orphans_follow_the_disk`]: the spellings of the project and asset folders as
+/// they are now, and, for the `missing` oracle, what the index was last told each manifest
+/// records and which run files it has a row for.
+struct OrphanDisk {
+    project: &'static str,
+    assets: [&'static str; 2],
+    trashed: usize,
+    /// The open runs (bit `run - 1`) of each asset's last manifest that parsed; `None` while the
+    /// asset has no row (the store removed it) or only a row that never parsed.
+    recorded: [Option<u8>; 2],
+    /// Whether the index has a row for each asset's run file (`[asset][run - 1]`).
+    rows: [[bool; RUNS]; 2],
+}
+
+impl OrphanDisk {
+    fn asset(&self, asset: usize) -> String {
+        format!("projects/{}/assets/{}", self.project, self.assets[asset])
+    }
+
+    fn run_file(&self, asset: usize, run: usize) -> String {
+        format!("{}/candidates/r_2027010{run}_0800/c.png", self.asset(asset))
+    }
+
+    fn conflict(&self, asset: usize, name: usize, root: bool) -> String {
+        let file = format!("n{name}.txt.lil-conflict-20270101T080000Z");
+        if root {
+            format!("projects/{}/{file}", self.project)
+        } else {
+            format!("{}/work/{file}", self.asset(asset))
+        }
+    }
+
+    fn expects(&self, asset: usize, run: usize) -> bool {
+        self.recorded[asset].is_some_and(|runs| runs & (1 << (run - 1)) != 0)
+    }
+
+    /// A reconcile that covered `asset`'s run files: the row of a file that is gone and no
+    /// longer expected is dropped (one still expected stays, as `missing`).
+    fn settle(&mut self, fx: &Fx, asset: usize) {
+        for run in 1..=RUNS {
+            if !fx.file(&self.run_file(asset, run)).is_file() && !self.expects(asset, run) {
+                self.rows[asset][run - 1] = false;
+            }
+        }
+    }
+
+    fn settle_all(&mut self, fx: &Fx) {
+        self.settle(fx, 0);
+        self.settle(fx, 1);
+    }
+
+    /// The `missing` files of project `p` after a whole reconcile: each run file the index has
+    /// a row for, the last manifest that parsed still expects, and that is gone; case-folded and
+    /// sorted.
+    fn missing(&self, fx: &Fx) -> Vec<String> {
+        let mut out = Vec::new();
+        for asset in 0..2 {
+            for run in 1..=RUNS {
+                let rel = self.run_file(asset, run);
+                if self.rows[asset][run - 1] && self.expects(asset, run) && !fx.file(&rel).is_file()
+                {
+                    out.push(rel.to_lowercase());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
+/// `project.status`'s orphans of project `p`, from a walk of the disk (the rules of
+/// `Index::orphans_of`, with the manifest read now), case-folded and sorted.
+#[allow(clippy::disallowed_methods)]
+fn walked_orphans(root: &Path) -> Vec<String> {
+    fn entries(dir: &Path) -> Vec<(String, PathBuf, bool)> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.map(|e| {
+                    let e = e.unwrap();
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    (name, e.path(), e.file_type().unwrap().is_dir())
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn conflicts(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        for (name, path, is_dir) in entries(dir) {
+            let rel = format!("{rel}/{name}");
+            if is_dir {
+                conflicts(&path, &rel, out);
+            } else if name.contains(".lil-conflict-") {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (project, project_dir, _) in entries(&root.join("projects"))
+        .into_iter()
+        .filter(|(n, _, d)| *d && n.eq_ignore_ascii_case("p"))
+    {
+        conflicts(&project_dir, &format!("projects/{project}"), &mut out);
+        for (asset, asset_dir, _) in entries(&project_dir.join("assets"))
+            .into_iter()
+            .filter(|e| e.2)
+        {
+            let base = format!("projects/{project}/assets/{asset}");
+            let manifest = entries(&asset_dir)
+                .into_iter()
+                .find(|(n, _, d)| !d && n.eq_ignore_ascii_case(&format!("{asset}.manifest.json")));
+            // `None`: the manifest doesn't parse, nothing is judged.
+            let recorded: Option<(Vec<String>, Vec<String>)> = match manifest {
+                None => Some((Vec::new(), Vec::new())),
+                Some((_, path, _)) => {
+                    serde_json::from_slice::<Value>(&std::fs::read(path).unwrap())
+                        .ok()
+                        .map(|m| {
+                            let runs = m["candidate_runs"].as_array().cloned().unwrap_or_default();
+                            let mut versions: Vec<String> = m["approved_version"]
+                                .as_str()
+                                .map(str::to_string)
+                                .into_iter()
+                                .collect();
+                            versions.extend(runs.iter().filter_map(|r| {
+                                r["signed_off"]["version"].as_str().map(str::to_string)
+                            }));
+                            let runs = runs
+                                .iter()
+                                .filter_map(|r| r["run_id"].as_str().map(str::to_lowercase))
+                                .collect();
+                            (runs, versions)
+                        })
+                }
+            };
+            let Some((runs, versions)) = recorded else {
+                continue;
+            };
+            for (run, run_dir, is_dir) in entries(&asset_dir.join("candidates")) {
+                if is_dir && !entries(&run_dir).is_empty() && !runs.contains(&run.to_lowercase()) {
+                    out.push(format!("{base}/candidates/{run}"));
+                }
+            }
+            for (folder, folder_dir, is_dir) in entries(&asset_dir) {
+                let Some(version) = folder.strip_prefix(['v', 'V']) else {
+                    continue;
+                };
+                if is_dir
+                    && folder_dir.join("manifest.snapshot.json").is_file()
+                    && !versions.iter().any(|v| v == version)
+                {
+                    out.push(format!("{base}/{folder}"));
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = out.iter().map(|o| o.to_lowercase()).collect();
+    out.sort();
+    out
+}
+
+/// The manifest of asset `id` with the open runs of the `runs` bit mask and the versions of the
+/// `versions` one (the first approved, each other one signed off from a run of its own).
+fn orphan_manifest(id: &str, runs: u8, versions: u8) -> Vec<u8> {
+    let chosen: Vec<String> = (1..4usize)
+        .filter(|v| versions & (1 << (v - 1)) != 0)
+        .map(|v| format!("{v}.0.0"))
+        .collect();
+    let mut list: Vec<Value> = (1..=RUNS)
+        .filter(|r| runs & (1 << (r - 1)) != 0)
+        .map(|r| open_run("p", id, &format!("r_2027010{r}_0800")))
+        .collect();
+    for (k, version) in chosen.iter().enumerate().skip(1) {
+        let mut run = open_run("p", id, &format!("r_2027020{k}_0800"));
+        run["status"] = json!("selected");
+        run["signed_off"] = json!({"by": "user", "date": "2027-02-01", "version": version});
+        list.push(run);
+    }
+    let mut extra = json!({"candidate_runs": list});
+    if let Some(first) = chosen.first() {
+        extra["approved_version"] = json!(first);
+    }
+    manifest_json("p", id, extra)
+}
+
+/// Applies `op` to the disk, tells the index of it, and keeps the model up to date. Returns
+/// whether the step ended with a whole reconcile (then `missing` is checked too).
+async fn apply_orphan_op(fx: &Fx, index: &Index, disk: &mut OrphanDisk, op: &OrphanOp) -> bool {
+    let scoped = |rel: String| Scope::Paths(vec![p(&rel)]);
+    match *op {
+        OrphanOp::Conflict { asset, name, root } => {
+            let rel = disk.conflict(asset, name, root);
+            fx.write(&rel, b"an outside save");
+            index.reconcile(scoped(rel)).await.unwrap();
+            false
+        }
+        OrphanOp::RemoveConflict { asset, name, root } => {
+            let rel = disk.conflict(asset, name, root);
+            if fx.file(&rel).is_file() {
+                outside_remove(&fx.file(&rel));
+            }
+            index.reconcile(scoped(rel)).await.unwrap();
+            false
+        }
+        OrphanOp::RunFile { asset, run } => {
+            fx.write(&disk.run_file(asset, run), b"take");
+            index.reconcile(scoped(disk.asset(asset))).await.unwrap();
+            disk.rows[asset][run - 1] = true;
+            disk.settle(fx, asset);
+            false
+        }
+        OrphanOp::Snapshot { asset, ver } => {
+            let rel = format!("{}/v{ver}.0.0/manifest.snapshot.json", disk.asset(asset));
+            fx.write(&rel, b"{}");
+            index.reconcile(scoped(disk.asset(asset))).await.unwrap();
+            disk.settle(fx, asset);
+            false
+        }
+        OrphanOp::Manifest {
+            asset,
+            runs,
+            versions,
+            parses,
+            whole,
+        } => {
+            let id = ["a", "b"][asset];
+            let rel = format!("{}/{id}.manifest.json", disk.asset(asset));
+            if parses {
+                fx.write(&rel, &orphan_manifest(id, runs, versions));
+                disk.recorded[asset] = Some(runs);
+            } else {
+                // A manifest that doesn't parse keeps what the last one recorded.
+                fx.write(&rel, b"{not json <<<<<<< HEAD");
+            }
+            if whole {
+                index.reconcile(Scope::All).await.unwrap();
+                disk.settle_all(fx);
+            } else {
+                index.reconcile(scoped(rel)).await.unwrap();
+            }
+            whole
+        }
+        OrphanOp::RenameProject { whole } => {
+            let to = if disk.project == "p" { "P" } else { "p" };
+            let from = format!("projects/{}", disk.project);
+            if fx.file(&from).is_dir() {
+                outside_move(&fx.file(&from), &fx.file(&format!("projects/{to}")));
+                disk.project = to;
+            }
+            let scope = if whole {
+                Scope::All
+            } else {
+                scoped(format!("projects/{}", disk.project))
+            };
+            index.reconcile(scope).await.unwrap();
+            disk.settle_all(fx);
+            whole
+        }
+        OrphanOp::RenameAsset { asset, whole } => {
+            let names = [["a", "A"], ["b", "B"]][asset];
+            let to = if disk.assets[asset] == names[0] {
+                names[1]
+            } else {
+                names[0]
+            };
+            let from = disk.asset(asset);
+            if fx.file(&from).is_dir() {
+                outside_move(
+                    &fx.file(&from),
+                    &fx.file(&format!("projects/{}/assets/{to}", disk.project)),
+                );
+                disk.assets[asset] = to;
+            }
+            if whole {
+                index.reconcile(Scope::All).await.unwrap();
+                disk.settle_all(fx);
+            } else {
+                index.reconcile(scoped(disk.asset(asset))).await.unwrap();
+                disk.settle(fx, asset);
+            }
+            whole
+        }
+        OrphanOp::StoreRemove { asset, run } => {
+            let rel = match run {
+                Some(run) => format!("{}/candidates/r_2027010{run}_0800", disk.asset(asset)),
+                None => disk.asset(asset),
+            };
+            if fx.file(&rel).is_dir() {
+                disk.trashed += 1;
+                outside_move(
+                    &fx.file(&rel),
+                    &fx.file(&format!(".trash/e_{}/payload/x", disk.trashed)),
+                );
+                // The store names the path with the slug's spelling.
+                let ids = ["a", "b"];
+                let said = match run {
+                    Some(run) => format!(
+                        "projects/p/assets/{}/candidates/r_2027010{run}_0800",
+                        ids[asset]
+                    ),
+                    None => format!("projects/p/assets/{}", ids[asset]),
+                };
+                index
+                    .applied(&[StoreEvent {
+                        path: p(&said),
+                        kind: ChangeKind::Removed,
+                        sha256: None,
+                        identity: None,
+                    }])
+                    .await;
+                // The suite's own move: never `missing`, and the rows under it go.
+                match run {
+                    Some(run) => disk.rows[asset][run - 1] = false,
+                    None => {
+                        disk.rows[asset] = [false; RUNS];
+                        disk.recorded[asset] = None;
+                    }
+                }
+            }
+            false
+        }
+        OrphanOp::DeleteFile { asset, run } => {
+            let rel = disk.run_file(asset, run);
+            if fx.file(&rel).is_file() {
+                outside_remove(&fx.file(&rel));
+            }
+            index.reconcile(Scope::All).await.unwrap();
+            disk.settle_all(fx);
+            true
+        }
+        OrphanOp::Reconcile => {
+            index.reconcile(Scope::All).await.unwrap();
+            disk.settle_all(fx);
+            true
+        }
+    }
+}
+
+/// The `missing` files of project `p` the index lists (rows spelled `p` or `P`), case-folded
+/// and sorted.
+async fn indexed_missing(index: &Index) -> Vec<String> {
+    let mut out = Vec::new();
+    for project in ["p", "P"] {
+        for row in index
+            .files_in_states(project, &[FileState::Missing])
+            .await
+            .unwrap()
+        {
+            out.push(row.path.as_str().to_lowercase());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// How many sequences [`orphans_follow_the_disk`] runs: each one works on real files and a
+/// real `index.db`, so far fewer than `[proptest] cases`; the seed is fixed, so every run
+/// (CI's too) tries the same sequences.
+const ORPHAN_CASES: u32 = 64;
+
+/// After every step of a random sequence (conflict copies made and removed, case-only renames
+/// of the project and asset folders, manifests that add or drop runs and versions or stop
+/// parsing, run files and sealed snapshots appearing, recorded files deleted, the store's
+/// removals, scoped and whole reconciles), `orphans_of` agrees with a walk of the disk, and
+/// after every whole reconcile the `missing` files agree with a model of what the manifests
+/// last recorded: a recorded file that is gone is never forgotten.
+#[test] // spec: CORE-038, CORE-041
+fn orphans_follow_the_disk() {
+    use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
+    let config = Config {
+        cases: ORPHAN_CASES,
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let mut runner =
+        TestRunner::new_with_rng(config, TestRng::from_seed(RngAlgorithm::ChaCha, &[21; 32]));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runner.run(&proptest::collection::vec(orphan_op(), 1..13), |ops| {
+        rt.block_on(async {
+            let fx = fx();
+            // Both assets start with every run recorded and its file on disk, and a conflict copy.
+            let all = u8::try_from((1 << RUNS) - 1).unwrap();
+            let mut disk = OrphanDisk {
+                project: "p",
+                assets: ["a", "b"],
+                trashed: 0,
+                recorded: [Some(all); 2],
+                rows: [[true; RUNS]; 2],
+            };
+            for (asset, id) in ["a", "b"].into_iter().enumerate() {
+                fx.write(
+                    &format!("projects/p/assets/{id}/{id}.manifest.json"),
+                    &orphan_manifest(id, all, 0),
+                );
+                for run in 1..=RUNS {
+                    fx.write(&disk.run_file(asset, run), b"take");
+                }
+                // A conflict copy in each asset's `work/`, so a store removal of the asset has
+                // one to take with it.
+                fx.write(&disk.conflict(asset, 0, false), b"an outside save");
+            }
+            let index = fx.open(Arc::new(SystemProbe));
+            index.rebuild().await.unwrap();
+            for (step, op) in ops.iter().enumerate() {
+                let whole = apply_orphan_op(&fx, &index, &mut disk, op).await;
+                let mut got: Vec<String> = index
+                    .orphans_of("p")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|o| o.as_str().to_lowercase())
+                    .collect();
+                got.sort();
+                let want = walked_orphans(&fx.root);
+                if got != want {
+                    return Err(TestCaseError::fail(format!(
+                        "after step {step} ({op:?}): orphans: index {got:?}, disk {want:?}"
+                    )));
+                }
+                if whole {
+                    let (got, want) = (indexed_missing(&index).await, disk.missing(&fx));
+                    if got != want {
+                        return Err(TestCaseError::fail(format!(
+                            "after step {step} ({op:?}): missing: index {got:?}, model {want:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })
+    });
+    if let Err(e) = result {
+        panic!("{e}");
+    }
 }

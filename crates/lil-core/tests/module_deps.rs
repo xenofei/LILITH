@@ -680,3 +680,88 @@ fn the_scan_sees_super_reexports_and_restricted_mods() {
         "a cfg(test) module is not a production edge: {edges:?}"
     );
 }
+
+/// Every module `start` reaches through at least one other module, without a direct edge.
+fn reached_only_indirectly(
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    start: &str,
+) -> BTreeSet<String> {
+    let direct = graph.get(start).cloned().unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    let mut todo: Vec<String> = direct.iter().cloned().collect();
+    while let Some(node) = todo.pop() {
+        for next in graph.get(&node).into_iter().flatten() {
+            if seen.insert(next.clone()) {
+                todo.push(next.clone());
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|m| m != start && !direct.contains(m))
+        .collect()
+}
+
+/// Asserts that `found` is a cycle of `graph`: it starts and ends on one module, and each step
+/// is an edge.
+fn assert_is_cycle(graph: &BTreeMap<String, BTreeSet<String>>, found: &[String], what: &str) {
+    assert!(found.len() >= 2, "{what}: {found:?}");
+    assert_eq!(found.first(), found.last(), "{what}: {found:?}");
+    for step in found.windows(2) {
+        assert!(
+            graph
+                .get(&step[0])
+                .is_some_and(|uses| uses.contains(&step[1])),
+            "{what}: {} -> {} is no edge: {found:?}",
+            step[0],
+            step[1]
+        );
+    }
+}
+
+/// The cycle check finds a cycle through intermediate modules, not only a direct one (two
+/// modules naming each other): one through three made-up modules, and, on the crate's own
+/// graph, the one that each indirect dependency would close if the module it reaches named it
+/// back. It is independent of how many modules the crate has. A diamond (two paths to one
+/// module) is no cycle.
+#[test] // spec: CORE-010, CORE-014
+fn module_deps_finds_indirect_cycles() {
+    let made_up = |edges: &[(&str, &str)]| {
+        let mut g: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (a, b) in edges {
+            g.entry((*a).to_string())
+                .or_default()
+                .insert((*b).to_string());
+            g.entry((*b).to_string()).or_default();
+        }
+        g
+    };
+    let diamond = made_up(&[("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")]);
+    assert_eq!(cycle(&diamond), None);
+    let ring = made_up(&[("a", "b"), ("b", "c"), ("c", "d"), ("d", "a")]);
+    let found = cycle(&ring).expect("a cycle through b and c is found");
+    assert_is_cycle(&ring, &found, "a -> b -> c -> d -> a");
+    assert_eq!(found.len(), 5, "{found:?}");
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let graph = graph(&src);
+    assert_eq!(cycle(&graph), None, "{graph:?}");
+    let mut closed = 0;
+    for start in graph.keys() {
+        for reached in reached_only_indirectly(&graph, start) {
+            let mut with_back_edge = graph.clone();
+            with_back_edge
+                .get_mut(&reached)
+                .expect("a module of the graph")
+                .insert(start.clone());
+            let what =
+                format!("{start} reaches {reached} only through others; {reached} -> {start}");
+            let found = cycle(&with_back_edge).unwrap_or_else(|| panic!("{what}: no cycle found"));
+            assert_is_cycle(&with_back_edge, &found, &what);
+            closed += 1;
+        }
+    }
+    assert!(
+        closed > 0,
+        "the crate has no indirect dependency: {graph:?}"
+    );
+}

@@ -1308,14 +1308,24 @@ impl Store {
     }
 
     /// Moves `from` aside to a free `<dir>\<name>.lil-conflict-<YYYYMMDDTHHMMSSZ>` (a `-<k>`
-    /// suffix when that name is taken) with `move_new`.
+    /// suffix when that name is taken) with `move_new`, and tells the index of the new copy
+    /// (`project.status` lists conflict copies from the index's rows).
     async fn move_aside(&self, from: &Path, dir: &Path, name: &str) -> io::Result<WsPath> {
         let stamp = lil_schema::time::compact(self.now_utc());
         let (from, dir, name) = (from.to_path_buf(), dir.to_path_buf(), name.to_string());
         let to = self
             .fs_retry(None, move || set_aside(&from, &dir, &name, &stamp))
             .await?;
-        Ok(self.rel_of(&to))
+        let kept = self.rel_of(&to);
+        // Without an identity the index looks at the path itself.
+        self.emit(vec![StoreEvent {
+            path: kept.clone(),
+            kind: ChangeKind::Written,
+            sha256: None,
+            identity: None,
+        }])
+        .await;
+        Ok(kept)
     }
 
     /// Ends a failed write before the target changed: the temp file is removed and the pending
@@ -2649,8 +2659,9 @@ impl Store {
             }
         }
 
+        // The conflict copies were reported as they were made (`move_aside`).
         let mut events: Vec<StoreEvent> = Vec::new();
-        for path in report.backups_restored.iter().chain(&report.conflicts_kept) {
+        for path in &report.backups_restored {
             events.push(StoreEvent {
                 path: path.clone(),
                 kind: ChangeKind::Written,
