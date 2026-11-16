@@ -37,6 +37,9 @@ pub const ENV_TEST_FAKE_SOCKETS: &str = "LIL_TEST_FAKE_SOCKETS";
 pub const ENV_TEST_STALL_SECS: &str = "LIL_TEST_STALL_SECS";
 /// Test channels only: the desktop poll's interval in milliseconds instead of 2 s (P4a-R6).
 pub const ENV_TEST_DESKTOP_POLL_MS: &str = "LIL_TEST_DESKTOP_POLL_MS";
+/// Test channels only: each thumbnail render waits this many milliseconds first, so a request
+/// answers `pending` (APP-038; plan 4b's test override).
+pub const ENV_TEST_THUMB_SLOW_MS: &str = "LIL_TEST_THUMB_SLOW_MS";
 
 /// The plan-3 test knobs, all `None` off a test channel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -51,6 +54,8 @@ struct TestKnobs {
     stall_after: Option<Duration>,
     /// `LIL_TEST_DESKTOP_POLL_MS`; a value that does not parse, or 0, is `None`.
     desktop_poll: Option<Duration>,
+    /// `LIL_TEST_THUMB_SLOW_MS`; a value that does not parse, or 0, is `None`.
+    thumb_slow: Option<Duration>,
 }
 
 fn test_knobs(channel: &Channel, var: &dyn Fn(&str) -> Option<String>) -> TestKnobs {
@@ -68,6 +73,10 @@ fn test_knobs(channel: &Channel, var: &dyn Fn(&str) -> Option<String>) -> TestKn
             .and_then(|v| v.trim().parse().ok())
             .map(Duration::from_secs),
         desktop_poll: var(ENV_TEST_DESKTOP_POLL_MS)
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis),
+        thumb_slow: var(ENV_TEST_THUMB_SLOW_MS)
             .and_then(|v| v.trim().parse().ok())
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis),
@@ -161,6 +170,9 @@ pub struct CoreConfig {
     /// How often the desktop's fullscreen state is polled instead of every 2 s (P4a-R6):
     /// `LIL_TEST_DESKTOP_POLL_MS` on a test channel, else `None`.
     pub desktop_poll: Option<Duration>,
+    /// How long each thumbnail render waits before it decodes: `LIL_TEST_THUMB_SLOW_MS` on a
+    /// test channel, else `None` (no wait).
+    pub thumb_slow: Option<Duration>,
     /// Test channels only: the fake hardware script `LIL_TEST_FAKE_HW` names, read instead of
     /// NVML, PDH and `sysinfo`.
     pub fake_hw: Option<PathBuf>,
@@ -239,6 +251,7 @@ impl CoreConfig {
                 .stall_after
                 .unwrap_or(crate::jobs::runner::STALL_AFTER),
             desktop_poll: knobs.desktop_poll,
+            thumb_slow: knobs.thumb_slow,
             fake_hw: knobs.fake_hw,
             sockets,
             test_tools,
@@ -332,8 +345,8 @@ mod tests {
     }
 
     /// `LIL_TEST_FAKE_HW`, `LIL_TEST_CONFIRM_LIFETIME_SECS`, `LIL_TEST_FAKE_SOCKETS`,
-    /// `LIL_TEST_STALL_SECS` and `LIL_TEST_DESKTOP_POLL_MS` count on test channels only; a
-    /// lifetime that does not parse is ignored.
+    /// `LIL_TEST_STALL_SECS`, `LIL_TEST_DESKTOP_POLL_MS` and `LIL_TEST_THUMB_SLOW_MS` count on
+    /// test channels only; a lifetime that does not parse is ignored.
     #[test] // spec: QA-066, CORE-115
     fn test_knobs_are_read_on_test_channels_only() {
         let set = |name: &str| match name {
@@ -342,6 +355,7 @@ mod tests {
             ENV_TEST_FAKE_SOCKETS => Some(r"C:\t\fake-sockets.json".to_string()),
             ENV_TEST_STALL_SECS => Some("2".to_string()),
             ENV_TEST_DESKTOP_POLL_MS => Some("50".to_string()),
+            ENV_TEST_THUMB_SLOW_MS => Some("2000".to_string()),
             _ => None,
         };
         let test = Channel::Test("ab12cd34".into());
@@ -353,6 +367,7 @@ mod tests {
                 fake_sockets: Some(PathBuf::from(r"C:\t\fake-sockets.json")),
                 stall_after: Some(Duration::from_secs(2)),
                 desktop_poll: Some(Duration::from_millis(50)),
+                thumb_slow: Some(Duration::from_millis(2000)),
             }
         );
         let unparsable =

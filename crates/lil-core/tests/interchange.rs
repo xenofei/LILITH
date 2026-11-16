@@ -254,7 +254,8 @@ async fn handlers_for_matches_types_and_formats() {
     );
     // A webp is no error: nothing opens it.
     let webp = for_target(r"C:\pics\knight.webp").await.unwrap();
-    assert_eq!(webp, json!({"handlers": []}));
+    let nothing = json!({"handlers": [], "note": "no studio opens this yet"});
+    assert_eq!(webp, nothing);
     // A candidate is typed by its file; a document is not an image.
     let candidate = for_target("@candidate/r_20261018_0900/out.png")
         .await
@@ -263,7 +264,7 @@ async fn handlers_for_matches_types_and_formats() {
     let doc = for_target("doc:d_1/proposal/r_20261018_0900/1")
         .await
         .unwrap();
-    assert_eq!(doc, json!({"handlers": []}));
+    assert_eq!(doc, nothing);
     // The same through the module's own function.
     assert_eq!(r.interchange.handlers_for(r"C:\pics\a.png").len(), 1);
     assert!(r.interchange.handlers_for("").is_empty());
@@ -448,7 +449,10 @@ async fn a_target_of_unknown_type_has_no_handler() {
     let none = common::call(&r.reg, &agent, "handlers.for", json!({ "target": target }))
         .await
         .unwrap();
-    assert_eq!(none, json!({"handlers": []}));
+    assert_eq!(
+        none,
+        json!({"handlers": [], "note": "no studio opens this yet"})
+    );
     let open = json!({"app": "any", "target": target, "intent": "open"});
     let refused = common::call(&r.reg, &agent, "open_in", open)
         .await
@@ -459,6 +463,35 @@ async fn a_target_of_unknown_type_has_no_handler() {
         .await
         .unwrap();
     assert_eq!(png["handlers"].as_array().unwrap().len(), 2, "{png}");
+}
+
+/// `handlers.for` with no registered handler answers the note instead of a bare empty list
+/// (Appendix H "Thumbnails"); with one, there is no note.
+#[tokio::test] // spec: APP-038, APP-061
+async fn handlers_for_says_no_studio_opens_this_yet() {
+    let r = rig();
+    let agent = r.ctx(CallerKind::Cli);
+    let target = r"C:\work\sketch.png";
+    let none = common::call(&r.reg, &agent, "handlers.for", json!({ "target": target }))
+        .await
+        .unwrap();
+    assert_eq!(
+        none,
+        json!({"handlers": [], "note": "no studio opens this yet"})
+    );
+    register(
+        &r.core_dir,
+        "test",
+        "test.exe",
+        r#""image""#,
+        r#""png""#,
+        r#""open""#,
+    );
+    let one = common::call(&r.reg, &agent, "handlers.for", json!({ "target": target }))
+        .await
+        .unwrap();
+    assert_eq!(one["handlers"].as_array().unwrap().len(), 1, "{one}");
+    assert!(one.get("note").is_none(), "{one}");
 }
 
 /// The target the launch argument `url` carries, read as the app's handler reads it.
