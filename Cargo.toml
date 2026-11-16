@@ -42,7 +42,8 @@ tokio = { version = "1.53.3", default-features = false }
 tokio-util = { version = "0.7.20", default-features = false, features = ["codec"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 # Bundled SQLite (CORE-004): the bundled build compiles in FTS5 and JSON1.
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Raised from 0.40.2 on 2026-11-16 for RUSTSEC-2026-0459 (bundles SQLite 3.54.1).
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 # Tool schemas, JSON Schema 2020-12 (ARCH-037). lil-protocol depends on it (ARCH-111).
 schemars = "1.2.3"
 tracing = "0.1.44"
@@ -61,8 +62,9 @@ nvml-wrapper = "0.13.0"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }
 # ComfyUI's websocket: the client in lil-core, the server in the test kit's fake.
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
-# The stdio MCP server (ARCH-012): lil-mcp only.
-rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
+# The stdio MCP server (ARCH-012): lil-mcp only. Raised from 3.5.1 on 2026-11-16 for
+# RUSTSEC-2026-0457, -0461 and -0462; the protocol facts in the spec still hold.
+rmcp = { version = "3.10.0", default-features = false, features = ["server", "transport-io"] }
 # The fake ComfyUI's HTTP server: lil-testkit only.
 hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "http1"] }
