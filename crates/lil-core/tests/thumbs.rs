@@ -210,6 +210,30 @@ fn webp_bomb(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
+/// A WebP (`VP8X`) whose canvas is 1 x 1 but whose `VP8 ` key frame claims 16,383² px, with a
+/// short first partition: a decoder sizes its planes from the frame before it compares it with
+/// the canvas.
+fn webp_frame_bomb() -> Vec<u8> {
+    let mut vp8x = vec![0u8; 4];
+    vp8x.extend_from_slice(&0u32.to_le_bytes()[..3]);
+    vp8x.extend_from_slice(&0u32.to_le_bytes()[..3]);
+    // A key frame (bit 0 clear), version 0, shown, first partition 10 bytes; the start code;
+    // 14-bit width and height of 16,383 with no scaling.
+    let mut frame = vec![0x50, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0xff, 0x3f, 0xff, 0x3f];
+    frame.resize(74, 0);
+    let mut body = b"WEBP".to_vec();
+    body.extend_from_slice(b"VP8X");
+    body.extend_from_slice(&(vp8x.len() as u32).to_le_bytes());
+    body.extend_from_slice(&vp8x);
+    body.extend_from_slice(b"VP8 ");
+    body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    body.extend_from_slice(&frame);
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
 /// `main` (a JPEG) with an APP1 EXIF segment right after its SOI, carrying a whole small
 /// JPEG as its thumbnail: that thumbnail's `FF DA` and `FF D9` come before the main scan.
 fn with_exif_thumbnail(main: &[u8]) -> Vec<u8> {
@@ -876,6 +900,22 @@ async fn bomb_header_is_refused_before_allocating() {
             "{what}: refused only after allocating {largest} bytes"
         );
     }
+    // Audit fix round 1, L-1: a WebP canvas of 1 x 1 whose frame claims 16,383² is refused by
+    // its frame's header too, before a decoder sizes its planes.
+    let frame_bomb = webp_frame_bomb();
+    assert_eq!(frame_bomb.len(), 112);
+    let (result, largest) = largest_allocation(|| ImageRenderer.render(&frame_bomb, 256));
+    assert!(
+        matches!(
+            result,
+            Err(RenderError::TooLarge(_) | RenderError::Damaged(_))
+        ),
+        "webp frame: {result:?}"
+    );
+    assert!(
+        largest < SMALL,
+        "webp frame: refused only after allocating {largest} bytes"
+    );
     // The control: a real 1024 × 1024 decode allocates its pixels, and the probe sees it.
     let real = picture(1024, 1024);
     let (result, largest) = largest_allocation(|| ImageRenderer.render(&real, 256));
@@ -1295,14 +1335,15 @@ async fn the_size_guard_comes_before_any_buffer() {
 
 /// Fix round 1, M1: decodes that passed their deadline still hold their memory until their
 /// thread ends, so new decodes wait while running plus abandoned ones reach twice the
-/// permits. Their items answer `pending` meanwhile, then resolve once capacity returns.
+/// permits. Audit fix round 1, M-1: they wait only up to their own deadline, then answer
+/// `icon`; once capacity returns, the next ask renders.
 #[tokio::test(flavor = "multi_thread")] // spec: APP-038
 async fn abandoned_decodes_are_capped_at_twice_the_permits() {
     let hang = Arc::new(HangAll::default());
     let r = Rig::new(ThumbOptions {
         renderers: with_renderer(hang.clone()),
         permits: 1,
-        deadline: Duration::from_millis(100),
+        deadline: Duration::from_millis(300),
         ..fast()
     });
     // Released however the test ends, so no thread stays hung.
@@ -1313,45 +1354,41 @@ async fn abandoned_decodes_are_capped_at_twice_the_permits() {
         }
     }
     let _release = Release(hang.clone());
-    let names: Vec<String> = (0..5u8)
+    // Known hashes, so no item waits on a hash: each goes straight to its decode slots.
+    let files: Vec<(WsPath, String)> = (0..4u8)
         .map(|i| {
             let name = work(&format!("h{i}.png"));
-            r.put(&name, &picture_seeded(24, 24, 100 + i));
-            name
+            let bytes = picture_seeded(24, 24, 100 + i);
+            r.put(&name, &bytes);
+            (ws_path(&name), sha256_bytes(&bytes))
         })
         .collect();
     let _open = r.open().await;
-    let jobs: Vec<_> = names
-        .iter()
-        .map(|n| {
-            let (thumbs, path) = (r.thumbs.clone(), ws_path(n));
-            tokio::spawn(async move { thumbs.ensure(&path, None, 96).await })
-        })
-        .collect();
-    let until = Instant::now() + DEADLINE;
-    while hang.started.load(Ordering::SeqCst) < 2 {
-        assert!(Instant::now() < until, "no decode started");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // One after another: the first two take the 2 x 1 capacity slots and hang past their
+    // deadline; the third finds no slot within its deadline. Each answers `icon` in time.
+    for (path, sha) in &files[..3] {
+        let state =
+            tokio::time::timeout(Duration::from_secs(5), r.thumbs.ensure(path, Some(sha), 96))
+                .await
+                .expect("answered within its deadline");
+        assert_icon(&state);
+        assert_eq!(state.sha256.as_deref(), Some(sha.as_str()));
     }
-    // Several deadlines pass: no third decode starts while two hang.
-    tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(hang.started.load(Ordering::SeqCst), 2, "2 x 1 permit");
     hang.release();
-    let mut states = Vec::new();
-    for job in jobs {
-        states.push(tokio::time::timeout(DEADLINE, job).await.unwrap().unwrap());
+    // Once the hung threads end, capacity is back: the next ask renders.
+    let until = Instant::now() + DEADLINE;
+    while hang.now.load(Ordering::SeqCst) > 0 {
+        assert!(Instant::now() < until, "the hung renders never ended");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (path, sha) = &files[3];
+    let state = tokio::time::timeout(DEADLINE, r.thumbs.ensure(path, Some(sha), 96))
+        .await
+        .unwrap();
+    assert_eq!(state.state, "ready", "{state:?}");
     assert!(hang.most.load(Ordering::SeqCst) <= 2);
-    assert_eq!(
-        states.iter().filter(|s| s.state == "icon").count(),
-        2,
-        "{states:?}"
-    );
-    assert_eq!(
-        states.iter().filter(|s| s.state == "ready").count(),
-        3,
-        "{states:?}"
-    );
     drop(_open);
     r.shutdown().await;
 }
@@ -1452,22 +1489,33 @@ async fn clean_up_runs_after_the_default_appears_and_daily_on_the_core_clock() {
     r.shutdown().await;
 }
 
-/// The real probe, but opening a file named `hung.png` to read it blocks until
-/// [`HangingProbe::release`]: a read that stalls (a dying disk, a network volume).
+/// The real probe, but it counts each file's opens to read, and an open of a file whose name
+/// is held ([`TestProbe::hold`]) blocks until [`TestProbe::release`]: a read that stalls (a
+/// dying disk, a network volume) or a file that goes away while its open waits.
 #[derive(Debug, Default)]
-struct HangingProbe {
-    open: Mutex<bool>,
-    opened: Condvar,
+struct TestProbe {
+    held: Mutex<HashSet<String>>,
+    released: Condvar,
+    opens: Mutex<BTreeMap<String, usize>>,
 }
 
-impl HangingProbe {
+impl TestProbe {
+    fn hold(&self, name: &str) {
+        self.held.lock().unwrap().insert(name.to_string());
+    }
+
     fn release(&self) {
-        *self.open.lock().unwrap() = true;
-        self.opened.notify_all();
+        self.held.lock().unwrap().clear();
+        self.released.notify_all();
+    }
+
+    /// How many times a file named `name` was opened to read.
+    fn opens_of(&self, name: &str) -> usize {
+        self.opens.lock().unwrap().get(name).copied().unwrap_or(0)
     }
 }
 
-impl Probe for HangingProbe {
+impl Probe for TestProbe {
     fn identity(&self, path: &Path) -> std::io::Result<FileIdentity> {
         SystemProbe.identity(path)
     }
@@ -1475,13 +1523,26 @@ impl Probe for HangingProbe {
         SystemProbe.volume_info(path)
     }
     fn open_read(&self, path: &Path) -> std::io::Result<std::fs::File> {
-        if path.file_name().is_some_and(|n| n == "hung.png") {
-            let mut open = self.open.lock().unwrap();
-            while !*open {
-                open = self.opened.wait(open).unwrap();
-            }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        *self.opens.lock().unwrap().entry(name.clone()).or_default() += 1;
+        let mut held = self.held.lock().unwrap();
+        while held.contains(&name) {
+            held = self.released.wait(held).unwrap();
         }
+        drop(held);
         SystemProbe.open_read(path)
+    }
+}
+
+/// Releases `probe` however the test ends, so no thread stays blocked.
+struct ReleaseProbe(Arc<TestProbe>);
+
+impl Drop for ReleaseProbe {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -1529,15 +1590,9 @@ async fn unindexed_icon_kinds_and_oversized_images_answer_icon_without_hashing()
 /// request is answered meanwhile.
 #[tokio::test(flavor = "multi_thread")] // spec: APP-038
 async fn a_hung_hash_answers_icon_after_its_deadline_and_frees_the_request() {
-    let probe = Arc::new(HangingProbe::default());
-    // Released however the test ends, so no thread stays hung.
-    struct Release(Arc<HangingProbe>);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-    let _release = Release(probe.clone());
+    let probe = Arc::new(TestProbe::default());
+    probe.hold("hung.png");
+    let _release = ReleaseProbe(probe.clone());
     let r = Rig::with_probe(
         ThumbOptions {
             deadline: Duration::from_millis(300),
@@ -1567,6 +1622,196 @@ async fn a_hung_hash_answers_icon_after_its_deadline_and_frees_the_request() {
     assert_ready_at(&r.local(), &state, &sha256_bytes(&ok), 96);
     probe.release();
     drop(_open);
+    r.shutdown().await;
+}
+
+/// Audit fix round 1, M-1: reads that never end fill every hash slot (2 x 1 permit here);
+/// a later request still answers within its own deadline instead of waiting for a slot.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn stuck_reads_filling_every_slot_never_hold_a_later_request() {
+    let probe = Arc::new(TestProbe::default());
+    probe.hold("hung_a.png");
+    probe.hold("hung_b.png");
+    let _release = ReleaseProbe(probe.clone());
+    let r = Rig::with_probe(
+        ThumbOptions {
+            permits: 1,
+            deadline: Duration::from_millis(300),
+            ..fast()
+        },
+        true,
+        probe.clone(),
+    );
+    for name in ["hung_a.png", "hung_b.png", "ok.png"] {
+        r.put(&work(&format!(".git/{name}")), &picture(20, 20));
+    }
+    let _open = r.open().await;
+    for name in ["hung_a.png", "hung_b.png", "ok.png"] {
+        let states = tokio::time::timeout(
+            Duration::from_secs(3),
+            r.thumbs
+                .request(&[item(&work(&format!(".git/{name}")))], 96),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name}: no answer within its deadline"));
+        assert_icon(&states[0]);
+        assert_eq!(states[0].sha256, None, "{name}: not hashed");
+    }
+    probe.release();
+    drop(_open);
+    r.shutdown().await;
+}
+
+/// Audit fix round 1, M-2: an indexed image over 256 MiB answers `icon` at once with the index's
+/// hash, by its metadata: it is never opened to read, however often it is asked for.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+#[allow(clippy::disallowed_methods)] // makes and removes the large file
+async fn an_indexed_image_over_256_mib_is_never_opened() {
+    let probe = Arc::new(TestProbe::default());
+    let r = Rig::with_probe(fast(), true, probe.clone());
+    let file = work("big.png")
+        .split('/')
+        .fold(r.ws.clone(), |p, c| p.join(c));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    {
+        let f = std::fs::File::create(&file).unwrap();
+        use std::io::Write as _;
+        (&f).write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+        f.set_len(300 * 1024 * 1024).unwrap();
+    }
+    let open = r.open().await;
+    let indexed = open
+        .index
+        .files_of_path(&ws_path(&work("big.png")))
+        .await
+        .unwrap()
+        .and_then(|row| row.sha256)
+        .expect("the index holds it");
+    let before = probe.opens_of("big.png");
+    for _ in 0..2 {
+        let states = r.thumbs.request(&[item(&work("big.png"))], 96).await;
+        assert_icon(&states[0]);
+        assert_eq!(states[0].sha256.as_deref(), Some(indexed.as_str()));
+        let state = r
+            .thumbs
+            .ensure(&ws_path(&work("big.png")), Some(&indexed), 96)
+            .await;
+        assert_icon(&state);
+    }
+    assert_eq!(probe.opens_of("big.png"), before, "never opened to read");
+    drop(open);
+    std::fs::remove_file(&file).unwrap();
+    r.shutdown().await;
+}
+
+/// Audit fix round 1, M-3: an item answered `pending` with its hash whose file then can't be
+/// read (deleted while its open waited) is announced under that hash, so the app can match it.
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+#[allow(clippy::disallowed_methods)] // deletes the file as an outside program would
+async fn a_pending_items_unreadable_file_is_announced_under_its_hash() {
+    let probe = Arc::new(TestProbe::default());
+    let _release = ReleaseProbe(probe.clone());
+    let r = Rig::with_probe(fast(), true, probe.clone());
+    let bytes = picture(30, 30);
+    let sha = sha256_bytes(&bytes);
+    r.put(&work("gone.png"), &bytes);
+    let open = r.open().await;
+    let mut rx = listen(&r.events).await;
+    let before = probe.opens_of("gone.png");
+    probe.hold("gone.png");
+    let states = r.thumbs.request(&[item(&work("gone.png"))], 96).await;
+    assert_eq!(states[0].state, "pending", "{:?}", states[0]);
+    assert_eq!(states[0].sha256.as_deref(), Some(sha.as_str()));
+    let until = Instant::now() + DEADLINE;
+    while probe.opens_of("gone.png") == before {
+        assert!(Instant::now() < until, "the render never opened the file");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::remove_file(
+        work("gone.png")
+            .split('/')
+            .fold(r.ws.clone(), |p, c| p.join(c)),
+    )
+    .unwrap();
+    probe.release();
+    let event = next_event(&mut rx, "icon", &sha).await;
+    assert_eq!(event["media_kind"], "image", "{event}");
+    drop(open);
+    r.shutdown().await;
+}
+
+/// Audit fix round 1, M-4: a render abandoned at its deadline stops at its next check (here
+/// its slow wait), so dropping the runtime, as the core's `main` does at shutdown, doesn't wait
+/// for it.
+#[test] // spec: APP-038, ARCH-021
+fn shutdown_does_not_wait_for_an_abandoned_render() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r = Rig::new(ThumbOptions {
+        slow: Some(Duration::from_secs(8)),
+        deadline: Duration::from_millis(100),
+        ..fast()
+    });
+    let path = work("slow.png");
+    r.put(&path, &picture(24, 24));
+    let Rig {
+        env,
+        states,
+        hub,
+        thumbs,
+        ..
+    } = rt.block_on(async {
+        let _open = r.open().await;
+        let state = r.thumbs.ensure(&ws_path(&path), None, 96).await;
+        assert_icon(&state);
+        drop(_open);
+        r.hub.close_all().await;
+        r
+    });
+    drop(thumbs);
+    let start = Instant::now();
+    drop(rt);
+    let took = start.elapsed();
+    states.close();
+    drop((hub, states));
+    assert!(
+        took < Duration::from_secs(3),
+        "the runtime's drop waited {took:?}"
+    );
+    if let Err(left) = env.close() {
+        panic!("the test's folder was left behind: {left:?}");
+    }
+}
+
+/// Audit fix round 1, L-4: the first clean-up pass waits for the first reconcile without
+/// holding the workspace open (a switch could not close it meanwhile).
+#[tokio::test(flavor = "multi_thread")] // spec: APP-038
+async fn the_first_clean_up_pass_does_not_hold_the_workspace_open() {
+    let probe = Arc::new(TestProbe::default());
+    // The first reconcile hashes this file, and its open waits: the reconcile doesn't finish.
+    probe.hold("slow_index.png");
+    let _release = ReleaseProbe(probe.clone());
+    let r = Rig::with_probe(fast(), true, probe.clone());
+    r.put(&work("slow_index.png"), &picture(8, 8));
+    let open = r.hub.open(&ws_ref(&r.ws)).await.unwrap();
+    let baseline = Arc::strong_count(&open);
+    let thumbs = r.thumbs.clone();
+    let pass = tokio::spawn(async move { thumbs.clean_up_pass().await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !pass.is_finished(),
+        "the pass waits for the first reconcile"
+    );
+    assert_eq!(
+        Arc::strong_count(&open),
+        baseline,
+        "the waiting pass holds no reference to the workspace"
+    );
+    probe.release();
+    tokio::time::timeout(DEADLINE, pass).await.unwrap().unwrap();
+    drop(open);
     r.shutdown().await;
 }
 
@@ -1916,6 +2161,33 @@ fn writes_go_only_under_the_thumbs_folder() {
         "the outside file's time is untouched"
     );
     std::fs::remove_file(local.join(r"thumbs\ab\h.png")).unwrap();
+    // Audit fix round 1, L-2: clean-up never removes (or clears the read-only flag through) a
+    // cache name that is a hard link: a sealed file outside stays read-only and unchanged.
+    let sealed = outside.join("sealed.bin");
+    write_file(&sealed, b"sealed bytes");
+    let mut perms = std::fs::metadata(&sealed).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&sealed, perms).unwrap();
+    let linked = local
+        .join("thumbs")
+        .join("ab")
+        .join(entry_name(&"ab".repeat(32), "image", 1, 96));
+    std::fs::hard_link(&sealed, &linked).unwrap();
+    denied(
+        fsops::remove_workspace_local_file(&local, &linked),
+        "a hard-linked cache name",
+    );
+    assert!(linked.exists(), "the name stays");
+    assert!(
+        std::fs::metadata(&sealed).unwrap().permissions().readonly(),
+        "the sealed file stays read-only"
+    );
+    assert_eq!(std::fs::read(&sealed).unwrap(), b"sealed bytes");
+    let mut perms = std::fs::metadata(&sealed).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)] // the test's own clean-up
+    perms.set_readonly(false);
+    std::fs::set_permissions(&sealed, perms).unwrap();
+    std::fs::remove_file(&linked).unwrap();
     fsops::remove_workspace_local_file(&local, &local.join(r"thumbs\ab\x.png")).unwrap();
     assert!(!local.join(r"thumbs\ab\x.png").exists());
     std::fs::remove_dir(local.join(r"thumbs\ln")).unwrap();

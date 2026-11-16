@@ -74,7 +74,8 @@ pub struct Entry {
 
 /// Every cache file under `<local dir>\thumbs\<shard>\` whose name [`parse_entry`] reads and
 /// whose shard is its hash's first two characters. Links are never followed, and anything
-/// else (temp files, other names) is left out.
+/// else (temp files, other names) is left out. The facts come from the folder listing (no
+/// file is opened).
 pub fn list_entries(local_dir: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
     let Ok(shards) = std::fs::read_dir(thumbs_dir(local_dir)) else {
@@ -92,12 +93,16 @@ pub fn list_entries(local_dir: &Path) -> Vec<Entry> {
             continue;
         };
         for file in files.flatten() {
-            let Ok(meta) = std::fs::symlink_metadata(file.path()) else {
+            // From the listing; neither follows a link.
+            let Ok(kind) = file.file_type() else {
                 continue;
             };
-            if !meta.is_file() {
+            if !kind.is_file() || kind.is_symlink() {
                 continue;
             }
+            let Ok(meta) = file.metadata() else {
+                continue;
+            };
             let name = file.file_name().to_string_lossy().into_owned();
             let Some(sha) = parse_entry(&name) else {
                 continue;

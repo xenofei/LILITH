@@ -40,6 +40,15 @@
 //!    its capacity slot until its thread ends, so running plus abandoned decodes never pass
 //!    twice the permits: new decodes wait meanwhile (their items answer `pending`).
 //!
+//! **Deadlines and stops** (audit fix round 1, M-1, M-4): each slot (a hasher, a capacity
+//! slot, a decode permit) is acquired under the item's [`DECODE_DEADLINE`]; an item that gets
+//! none in time answers `icon`, with its known hash or `null`, and is announced as any other.
+//! A step past its deadline sets its job's stop flag, as the drain sets every job's
+//! ([`ThumbService::stop_on`]): the hash and the read check it between 64 KiB chunks, and the
+//! render before it starts, so an abandoned thread ends at its next check and gives its slot
+//! back (a read blocked inside one call still ends only with that call; the core's `main`
+//! leaves such threads behind after a short grace).
+//!
 //! **Waiting.** `app/thumbs.request` waits for its jobs up to [`INLINE_WAIT`] in all; an item
 //! not done by then answers `pending` with its hash (waiting on for step 1 if needed), and its
 //! result is published on topic `thumbs` as `{kind: "ready", sha256, renderer, px, file}` or
@@ -59,6 +68,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -169,6 +179,9 @@ pub struct ThumbService {
     /// The jobs running, by cache key.
     inflight: Mutex<HashMap<String, Arc<Inflight>>>,
     live_sources: Mutex<Vec<LiveSource>>,
+    /// Set at the drain ([`ThumbService::stop_on`]): every read, hash and render stops at its
+    /// next check.
+    stopping: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ThumbService {
@@ -259,6 +272,8 @@ enum Work {
     Cached(String, PathBuf),
     /// The rendered PNG of the bytes of this hash.
     Rendered(String, Vec<u8>),
+    /// Over the size guard with a known hash: never read.
+    Oversized,
 }
 
 /// What one item needs.
@@ -314,6 +329,7 @@ impl ThumbService {
             inline_wait: options.inline_wait,
             inflight: Mutex::new(HashMap::new()),
             live_sources: Mutex::new(Vec::new()),
+            stopping: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -385,7 +401,7 @@ impl ThumbService {
 
     /// The cache entry of `sha256` drawn by `renderer` at `px` when it is a plain file (a link or
     /// anything else there is a miss), touched if it was last written more than
-    /// [`TOUCH_EVERY`] ago on the core's clock.
+    /// [`TOUCH_EVERY`] ago on the core's clock. On a blocking thread.
     async fn hit(
         &self,
         local: &Path,
@@ -393,24 +409,38 @@ impl ThumbService {
         renderer: &dyn Renderer,
         px: u32,
     ) -> Option<PathBuf> {
-        let entry = entry_path(local, sha256, renderer.id(), renderer.version(), px);
-        let modified = plain_file(&entry)?;
-        let now = self.hub.clock().utc_now();
-        if now
-            .duration_since(modified)
-            .is_ok_and(|age| age > TOUCH_EVERY)
-        {
-            let (dir, path) = (local.to_path_buf(), entry.clone());
-            let touched = tokio::task::spawn_blocking(move || {
-                fsops::touch_workspace_local_file(&dir, &path, now)
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
-            if let Err(e) = touched {
-                tracing::debug!(file = %entry.display(), error = %e, "a thumbnail cache hit could not be touched");
-            }
-        }
-        Some(entry)
+        self.look(None, local, Some(sha256), renderer, px).await.1
+    }
+
+    /// On one blocking thread: the size of `abs` from its metadata (when given), and the hit of
+    /// `sha256` ([`ThumbService::hit`], when given).
+    async fn look(
+        &self,
+        abs: Option<PathBuf>,
+        local: &Path,
+        sha256: Option<&str>,
+        renderer: &dyn Renderer,
+        px: u32,
+    ) -> (Option<u64>, Option<PathBuf>) {
+        let entry = sha256.map(|sha| entry_path(local, sha, renderer.id(), renderer.version(), px));
+        let (dir, now) = (local.to_path_buf(), self.hub.clock().utc_now());
+        tokio::task::spawn_blocking(move || {
+            let size = abs.and_then(|abs| std::fs::metadata(abs).ok()).map(|m| m.len());
+            let hit = entry.and_then(|entry| {
+                let modified = plain_file(&entry)?;
+                if now
+                    .duration_since(modified)
+                    .is_ok_and(|age| age > TOUCH_EVERY)
+                    && let Err(e) = fsops::touch_workspace_local_file(&dir, &entry, now)
+                {
+                    tracing::debug!(file = %entry.display(), error = %e, "a thumbnail cache hit could not be touched");
+                }
+                Some(entry)
+            });
+            (size, hit)
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// The `icon@1` state of `path`, with `sha256` if known.
@@ -493,15 +523,22 @@ impl ThumbService {
             // Nothing is drawn from it: never read for a hash.
             return Plan::Done(self.icon(path, expected, px));
         }
-        if expected.is_none()
-            && std::fs::metadata(ws_path.abs(&ctx.open.ws.path))
-                .is_ok_and(|m| m.len() > MAX_FILE_BYTES)
-        {
-            // Over the size guard: it can't become a thumbnail, so it isn't hashed either.
-            return Plan::Done(self.icon(path, None, px));
+        let (size, hit) = self
+            .look(
+                Some(ws_path.abs(&ctx.open.ws.path)),
+                &ctx.local,
+                expected.as_deref(),
+                renderer.as_ref(),
+                px,
+            )
+            .await;
+        if size.is_some_and(|len| len > MAX_FILE_BYTES) {
+            // Over the size guard, whatever its hash: it can't become a thumbnail, so it is
+            // never read (M-2).
+            return Plan::Done(self.icon(path, expected, px));
         }
         if let Some(sha) = &expected
-            && let Some(entry) = self.hit(&ctx.local, sha, renderer.as_ref(), px).await
+            && let Some(entry) = hit
         {
             return Plan::Done(ThumbState {
                 path: path.to_string(),
@@ -566,23 +603,53 @@ impl ThumbService {
         Plan::Wait { inflight, pending }
     }
 
+    /// A fresh stop check for one blocking step.
+    fn stop(&self) -> Stop {
+        Stop {
+            job: Arc::new(AtomicBool::new(false)),
+            all: self.stopping.clone(),
+        }
+    }
+
+    /// Sets the stop flag every job checks once `token` is cancelled (the core's drain), so
+    /// reads, hashes and renders still running stop at their next check.
+    pub fn stop_on(&self, token: CancellationToken) {
+        let stopping = self.stopping.clone();
+        tokio::spawn(async move {
+            token.cancelled().await;
+            stopping.store(true, Ordering::Relaxed);
+        });
+    }
+
     /// Runs `job`: its hash first when it has none (step 1), then its decode under a capacity
-    /// slot, a permit and the deadline (step 2), then files its PNG.
+    /// slot, a permit and the deadline (step 2), then files its PNG. Every slot is acquired
+    /// under the deadline (M-1).
     async fn run(&self, job: Job, inflight: &Inflight) -> Outcome {
         let mut known = job.expected.clone();
         if known.is_none() {
-            let Ok(hasher) = self.hashers.clone().acquire_owned().await else {
+            let until = Instant::now() + self.deadline;
+            let Ok(Ok(hasher)) =
+                tokio::time::timeout_at(until, self.hashers.clone().acquire_owned()).await
+            else {
+                tracing::warn!(path = %job.path, deadline = ?self.deadline, "no hash slot within the deadline; the item gets the icon");
                 return self.icon_outcome(&job, None);
             };
-            let (abs, root, probe) = (job.abs.clone(), job.root.clone(), job.probe.clone());
+            let stop = self.stop();
+            let (abs, root, probe, check) = (
+                job.abs.clone(),
+                job.root.clone(),
+                job.probe.clone(),
+                stop.clone(),
+            );
             let blocking = tokio::task::spawn_blocking(move || {
                 // The hasher slot goes back only when this thread ends, past its deadline too.
                 let _hasher = hasher;
-                hash_file(&abs, &root, probe.as_ref())
+                hash_file(&abs, &root, probe.as_ref(), &check)
             });
-            let hashed = match tokio::time::timeout(self.deadline, blocking).await {
+            let hashed = match tokio::time::timeout_at(until, blocking).await {
                 Ok(hashed) => hashed.ok().flatten(),
                 Err(_) => {
+                    stop.job.store(true, Ordering::Relaxed);
                     tracing::warn!(path = %job.path, deadline = ?self.deadline, "a thumbnail's hash passed its deadline; the item gets the icon");
                     None
                 }
@@ -603,31 +670,43 @@ impl ThumbService {
             }
             known = Some(sha);
         }
-        let Ok(capacity) = self.capacity.clone().acquire_owned().await else {
+        // The slots, under the item's deadline: a slot held by stuck threads never holds it.
+        let acquire_until = Instant::now() + self.deadline;
+        let slots = async {
+            let capacity = self.capacity.clone().acquire_owned().await.ok()?;
+            let permit = self.permits.clone().acquire_owned().await.ok()?;
+            Some((capacity, permit))
+        };
+        let Ok(Some((capacity, permit))) = tokio::time::timeout_at(acquire_until, slots).await
+        else {
+            tracing::warn!(path = %job.path, deadline = ?self.deadline, "no decode slot within the deadline; the item gets the icon");
             return self.icon_outcome(&job, known);
         };
-        let Ok(permit) = self.permits.clone().acquire_owned().await else {
-            return self.icon_outcome(&job, known);
-        };
-        let (slow, renderer) = (self.slow, job.renderer.clone());
-        let (abs, root, probe, local, px) = (
+        let stop = self.stop();
+        let (slow, renderer, check) = (self.slow, job.renderer.clone(), stop.clone());
+        let (abs, root, probe, local, px, expect) = (
             job.abs.clone(),
             job.root.clone(),
             job.probe.clone(),
             job.local.clone(),
             job.px,
+            known.clone(),
         );
         let blocking = tokio::task::spawn_blocking(move || {
             // The capacity slot goes back only when this thread ends, past its deadline too.
             let _capacity = capacity;
             work(
-                &abs,
-                &root,
-                probe.as_ref(),
-                &local,
-                renderer.as_ref(),
-                px,
-                slow,
+                &Inputs {
+                    abs: &abs,
+                    root: &root,
+                    probe: probe.as_ref(),
+                    local: &local,
+                    renderer: renderer.as_ref(),
+                    px,
+                    slow,
+                    known: expect.as_deref(),
+                },
+                &check,
             )
         });
         let worked = tokio::time::timeout(self.deadline, blocking).await;
@@ -640,12 +719,15 @@ impl ThumbService {
                 return self.icon_outcome(&job, known);
             }
             Err(_) => {
+                stop.job.store(true, Ordering::Relaxed);
                 tracing::warn!(path = %job.path, deadline = ?self.deadline, "a thumbnail render passed its deadline; the item gets the icon and its late result is discarded");
                 return self.icon_outcome(&job, known);
             }
         };
         let (sha, file) = match work {
-            Work::Unreadable => return self.icon_outcome(&job, None),
+            // Announced under the hash its waiters were given (M-3).
+            Work::Unreadable => return self.icon_outcome(&job, known),
+            Work::Oversized => return self.icon_outcome(&job, known),
             Work::Icon(sha) => (sha, None),
             Work::Cached(sha, entry) => (sha, Some(entry)),
             Work::Rendered(sha, png) => {
@@ -832,7 +914,10 @@ impl ThumbService {
         let Some(ctx) = self.ctx().await else {
             return Pass::Unopened;
         };
-        let index = ctx.open.index.clone();
+        // Only the index is kept while the first reconcile runs: the workspace itself is let go
+        // of, so a switch can close it meanwhile (L-4).
+        let (index, ws_id) = (ctx.open.index.clone(), ctx.open.ws.id.clone());
+        drop(ctx);
         index.ready().await;
         if index.failed() || index.rebuilding() {
             tracing::info!("the thumbnail clean-up skips this pass: the index rebuilds or failed");
@@ -845,6 +930,14 @@ impl ThumbService {
                 return Pass::Skipped;
             }
         };
+        drop(index);
+        // The workspace again, for the live sources: still the default one, or no pass.
+        let Some(ctx) = self.ctx().await else {
+            return Pass::Unopened;
+        };
+        if ctx.open.ws.id != ws_id {
+            return Pass::Skipped;
+        }
         let sources = lock(&self.live_sources).clone();
         for source in sources {
             live.extend(source(ctx.open.clone()).await);
@@ -950,6 +1043,19 @@ fn recheck(open: Weak<OpenWorkspace>, path: WsPath) {
     });
 }
 
+/// When a blocking step stops early: its job passed its deadline, or the core drains.
+#[derive(Clone)]
+struct Stop {
+    job: Arc<AtomicBool>,
+    all: Arc<AtomicBool>,
+}
+
+impl Stop {
+    fn stopped(&self) -> bool {
+        self.job.load(Ordering::Relaxed) || self.all.load(Ordering::Relaxed)
+    }
+}
+
 /// One render's inputs.
 struct Job {
     /// As the caller gave it.
@@ -998,10 +1104,14 @@ fn plain_file(path: &Path) -> Option<SystemTime> {
     meta.modified().ok()
 }
 
-/// Feeds the rest of `reader` to `hasher` in [`HASH_CHUNK`]s; `None` on a read error.
-fn hash_rest(reader: &mut impl std::io::Read, mut hasher: Sha256) -> Option<String> {
+/// Feeds the rest of `reader` to `hasher` in [`HASH_CHUNK`]s; `None` on a read error or once
+/// `stop` says so (checked between chunks).
+fn hash_rest(reader: &mut impl std::io::Read, mut hasher: Sha256, stop: &Stop) -> Option<String> {
     let mut buf = vec![0u8; HASH_CHUNK];
     loop {
+        if stop.stopped() {
+            return None;
+        }
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => hasher.update(&buf[..n]),
@@ -1013,70 +1123,103 @@ fn hash_rest(reader: &mut impl std::io::Read, mut hasher: Sha256) -> Option<Stri
 }
 
 /// Step 1: the SHA-256 and size of `abs`, streamed in fixed chunks (nothing kept); `None` when
-/// it can't be opened or read, or isn't inside the workspace.
-fn hash_file(abs: &Path, root: &Path, probe: &dyn Probe) -> Option<(String, u64)> {
+/// it can't be opened or read, isn't inside the workspace, or `stop` says so.
+fn hash_file(abs: &Path, root: &Path, probe: &dyn Probe, stop: &Stop) -> Option<(String, u64)> {
     let mut file = open_inside(abs, root, probe)?;
     let len = file.metadata().ok()?.len();
-    Some((hash_rest(&mut file, Sha256::new())?, len))
+    Some((hash_rest(&mut file, Sha256::new(), stop)?, len))
+}
+
+/// What step 2 reads and renders.
+struct Inputs<'a> {
+    abs: &'a Path,
+    root: &'a Path,
+    probe: &'a dyn Probe,
+    local: &'a Path,
+    renderer: &'a dyn Renderer,
+    px: u32,
+    slow: Option<Duration>,
+    /// The hash the item was given (the expected one, or step 1's).
+    known: Option<&'a str>,
 }
 
 /// Step 2, the blocking half of a render (module docs "One item"): the size from the metadata
-/// first, then the bytes into a buffer of exactly that size + 1, their hash, a hit check, then
-/// the render.
-fn work(
-    abs: &Path,
-    root: &Path,
-    probe: &dyn Probe,
-    local: &Path,
-    renderer: &dyn Renderer,
-    px: u32,
-    slow: Option<Duration>,
-) -> Work {
-    let Some(mut file) = open_inside(abs, root, probe) else {
+/// first, then the bytes, in [`HASH_CHUNK`]s with `stop` checked between them, into a buffer of
+/// exactly that size + 1, their hash, a hit check, then the render.
+fn work(i: &Inputs<'_>, stop: &Stop) -> Work {
+    let Some(mut file) = open_inside(i.abs, i.root, i.probe) else {
         return Work::Unreadable;
     };
     let Ok(len) = file.metadata().map(|m| m.len()) else {
         return Work::Unreadable;
     };
-    // The size guard, before any buffer: over the limit, the file is only hashed.
+    // The size guard, before any buffer: over the limit with a known hash, never read (M-2);
+    // without one, only hashed.
     if len > MAX_FILE_BYTES {
-        return hash_rest(&mut file, Sha256::new()).map_or(Work::Unreadable, Work::Icon);
+        if i.known.is_some() {
+            return Work::Oversized;
+        }
+        return hash_rest(&mut file, Sha256::new(), stop).map_or(Work::Unreadable, Work::Icon);
     }
-    let mut bytes = Vec::new();
     // At most 256 MiB + 1, so the conversion can't fail on a 64-bit target.
     let Ok(want) = usize::try_from(len + 1) else {
         return Work::Unreadable;
     };
+    let mut bytes = Vec::new();
     if bytes.try_reserve_exact(want).is_err() {
         return Work::Unreadable;
     }
     // One byte more than the size: a file that grew during the read is caught, and the buffer
     // never grows past what was reserved.
-    if (&mut file).take(len + 1).read_to_end(&mut bytes).is_err() {
-        return Work::Unreadable;
+    bytes.resize(want, 0);
+    let mut filled = 0;
+    while filled < want {
+        if stop.stopped() {
+            return Work::Unreadable;
+        }
+        let end = (filled + HASH_CHUNK).min(want);
+        match file.read(&mut bytes[filled..end]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Work::Unreadable,
+        }
     }
+    bytes.truncate(filled);
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     if bytes.len() > want - 1 {
         // It grew while read: only hashed, the icon.
-        return hash_rest(&mut file, hasher).map_or(Work::Unreadable, Work::Icon);
+        return hash_rest(&mut file, hasher, stop).map_or(Work::Unreadable, Work::Icon);
     }
+    drop(file);
     let sha = hex(&hasher.finalize());
-    let entry = entry_path(local, &sha, renderer.id(), renderer.version(), px);
+    let renderer = i.renderer;
+    let entry = entry_path(i.local, &sha, renderer.id(), renderer.version(), i.px);
     if plain_file(&entry).is_some() {
         return Work::Cached(sha, entry);
     }
-    if let Some(slow) = slow {
-        std::thread::sleep(slow);
+    if let Some(slow) = i.slow {
+        // The test override's wait, in short steps so a stop ends it.
+        let until = std::time::Instant::now() + slow;
+        while std::time::Instant::now() < until {
+            if stop.stopped() {
+                return Work::Unreadable;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
-    match std::panic::catch_unwind(AssertUnwindSafe(|| renderer.render(&bytes, px))) {
+    if stop.stopped() {
+        return Work::Unreadable;
+    }
+    match std::panic::catch_unwind(AssertUnwindSafe(|| renderer.render(&bytes, i.px))) {
         Ok(Ok(png)) => Work::Rendered(sha, png),
         Ok(Err(e)) => {
-            tracing::debug!(file = %abs.display(), error = %e, "no thumbnail; the item gets the icon");
+            tracing::debug!(file = %i.abs.display(), error = %e, "no thumbnail; the item gets the icon");
             Work::Icon(sha)
         }
         Err(_) => {
-            tracing::warn!(file = %abs.display(), "a thumbnail renderer panicked; the item gets the icon");
+            tracing::warn!(file = %i.abs.display(), "a thumbnail renderer panicked; the item gets the icon");
             Work::Icon(sha)
         }
     }
