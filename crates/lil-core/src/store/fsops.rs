@@ -287,12 +287,13 @@ pub fn write_workspace_local_file(
 
 /// Sets the last-write time of the file `path` of the thumbnail cache `<local dir>\thumbs\`
 /// to `when`: a cache hit counts as a touch for clean-up (APP-038, "untouched for 7 days").
-/// The checks of [`remove_workspace_local_file`]; the file must be a plain file, and it is
-/// opened for its attributes only, without following a link, so no data is written.
+/// The checks of [`remove_workspace_local_file`]; the file must be a plain file with one name
+/// (a hard link planted there could reach a file outside), and it is opened for its
+/// attributes only, without following a link, so no data is written.
 ///
 /// # Errors
-/// `PermissionDenied` for a path outside `<local dir>\thumbs\` or anything but a plain file;
-/// the open's or the update's error.
+/// `PermissionDenied` for a path outside `<local dir>\thumbs\`, anything but a plain file, or
+/// a file with more than one name; the open's or the update's error.
 #[allow(clippy::disallowed_methods)]
 pub fn touch_workspace_local_file(
     local_dir: &Path,
@@ -300,8 +301,9 @@ pub fn touch_workspace_local_file(
     when: std::time::SystemTime,
 ) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
-    /// `FILE_WRITE_ATTRIBUTES`: enough to set the times, nothing else.
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    /// `FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES`: enough to count its names and set its
+    /// times, nothing else.
+    const ATTRIBUTES: u32 = 0x0080 | 0x0100;
     /// `FILE_FLAG_OPEN_REPARSE_POINT`: a link is opened itself, never followed.
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     check_local_path(local_dir, path, &LOCAL_REMOVE_DIRS)?;
@@ -313,9 +315,15 @@ pub fn touch_workspace_local_file(
         ));
     }
     let file = OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .access_mode(ATTRIBUTES)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(long_path(path))?;
+    if lil_platform::fs::link_count(&file)? > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} has more than one name (a hard link)", path.display()),
+        ));
+    }
     file.set_modified(when)
 }
 
