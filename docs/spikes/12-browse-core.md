@@ -21,7 +21,7 @@ Plan 4b, Task 0. Four measurements that later tasks build on (Tasks 1, 5, 12 and
 | GPU | a 16 GB consumer GPU (one discrete adapter), driver 617.42 |
 | CPU and memory | a desktop CPU with 32 logical processors (so `min(4, cores/2)` = 4), and enough RAM that the 1.5 GiB bar isn't near it |
 | Rust | rustc / cargo 1.99.0, `stable-x86_64-pc-windows-msvc`, edition 2024 |
-| Crates | `windows` =0.62.2, `image` =0.25.10 (`png`, `jpeg`, `webp`), `rusqlite` =0.40.2 (`bundled`, the workspace's version), `serde_json` =1.0.154; `spikes/browse-core/Cargo.lock` committed |
+| Crates | `windows` =0.62.2, `image` =0.25.10 (`png`, `jpeg`, `webp`), `rusqlite` =0.40.2 (`bundled`, the workspace's version at the time; the workspace moved to 0.41.1 for RUSTSEC-2026-0459, and this spike, outside the workspace and cargo-deny, keeps its pin as a record), `serde_json` =1.0.154; `spikes/browse-core/Cargo.lock` committed |
 | PowerShell | 7.6.9 |
 | ComfyUI | 0.42.1 (S0.4 only; install folder and Python passed as parameters, never recorded) |
 | Spike code | `spikes/browse-core/`: S0.1's readability part and S0.2 ran at commit `27d580a3`; S0.3 at `7a8a2464` (fix round 1); S0.1's load part and S0.4 at `d1bbe6b9` (Step 3), with S0.4's samples analysed again under PF-26 in the Step 4 commit |
