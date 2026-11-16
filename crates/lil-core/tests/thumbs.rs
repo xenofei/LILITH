@@ -277,6 +277,36 @@ fn webp_animated_decoy() -> Vec<u8> {
     out
 }
 
+/// A `VP8X` WebP whose canvas is 1 x 1, then 10,001 empty padding chunks, then a frame
+/// claiming 16,383² px: a still `VP8 ` chunk, or (`animated`) an `ANIM` chunk and an `ANMF`
+/// whose own size fields and `VP8 ` frame header both claim it.
+fn webp_padded(animated: bool) -> Vec<u8> {
+    let mut vp8x = vec![if animated { 0x02 } else { 0 }, 0, 0, 0];
+    vp8x.extend_from_slice(&0u32.to_le_bytes()[..3]);
+    vp8x.extend_from_slice(&0u32.to_le_bytes()[..3]);
+    let mut body = b"WEBP".to_vec();
+    body.extend(riff_chunk(b"VP8X", &vp8x));
+    for _ in 0..10_001 {
+        body.extend(riff_chunk(b"XPAD", &[]));
+    }
+    let frame = riff_chunk(b"VP8 ", &vp8_frame(16_383, 16_383, 74));
+    if animated {
+        let mut anmf = vec![0u8; 6];
+        anmf.extend_from_slice(&16_382u32.to_le_bytes()[..3]);
+        anmf.extend_from_slice(&16_382u32.to_le_bytes()[..3]);
+        anmf.extend_from_slice(&[100, 0, 0, 0]);
+        anmf.extend(frame);
+        body.extend(riff_chunk(b"ANIM", &[0u8; 6]));
+        body.extend(riff_chunk(b"ANMF", &anmf));
+    } else {
+        body.extend(frame);
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
 /// `main` (a JPEG) with an APP1 EXIF segment right after its SOI, carrying a whole small
 /// JPEG as its thumbnail: that thumbnail's `FF DA` and `FF D9` come before the main scan.
 fn with_exif_thumbnail(main: &[u8]) -> Vec<u8> {
@@ -975,6 +1005,23 @@ async fn bomb_header_is_refused_before_allocating() {
         largest < SMALL,
         "webp decoy: refused only after allocating {largest} bytes"
     );
+    // Audit fix round 3, P-1: a frame behind more chunks than the walk looks at is refused too
+    // (a used-up budget doesn't fit), still and animated. The allocation is checked first.
+    for animated in [false, true] {
+        let padded = webp_padded(animated);
+        let (result, largest) = largest_allocation(|| ImageRenderer.render(&padded, 256));
+        assert!(
+            largest < SMALL,
+            "webp padded (animated {animated}): {largest} bytes allocated; {result:?}"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(RenderError::TooLarge(_) | RenderError::Damaged(_))
+            ),
+            "webp padded (animated {animated}): {result:?}"
+        );
+    }
     // The control: a real 1024 × 1024 decode allocates its pixels, and the probe sees it.
     let real = picture(1024, 1024);
     let (result, largest) = largest_allocation(|| ImageRenderer.render(&real, 256));

@@ -250,7 +250,8 @@ const WEBP_CHUNKS: u32 = 10_000;
 /// Whether every frame header among the RIFF chunks from `at` to `end` fits `canvas`: each
 /// `VP8 ` or `VP8L` chunk's frame, and each `ANMF` chunk's own frame size and the chunks inside
 /// it (whose frame data starts 16 bytes in); `depth` bounds the nesting and `budget` the
-/// chunks walked. A header that can't be read is left to the decoder.
+/// chunks walked. A header that can't be read is left to the decoder; a budget used up before
+/// the chunks end doesn't fit (a frame could hide behind padding; audit fix round 3, P-1).
 fn webp_frames_fit(
     bytes: &[u8],
     mut at: usize,
@@ -260,7 +261,10 @@ fn webp_frames_fit(
     budget: &mut u32,
 ) -> bool {
     let fits = |size: Option<(u32, u32)>| size.is_none_or(|(w, h)| w <= canvas.0 && h <= canvas.1);
-    while at.saturating_add(8) <= end && *budget > 0 {
+    while at.saturating_add(8) <= end {
+        if *budget == 0 {
+            return false;
+        }
         *budget -= 1;
         let (Some(fourcc), Some(size)) = (
             bytes.get(at..at + 4),
