@@ -15,8 +15,18 @@ use tokio::time::Instant;
 
 use crate::store::WsPath;
 
-/// A path deferred with the actor of the report that gave it, if any.
-pub(crate) type Reported = (WsPath, Option<Actor>);
+/// The report that gave a deferred path: its actor, and the hash of the recorded human edit
+/// it may claim, when the claim window was measured at the report (fix round 2, N1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reporter {
+    pub(crate) actor: Actor,
+    /// The hash of an edit the watcher recorded with no actor within `CLAIM_WINDOW` before the
+    /// report: the deferred claim compares with it instead of measuring the window again.
+    pub(crate) claim: Option<String>,
+}
+
+/// A path deferred with the report that gave it, if any.
+pub(crate) type Reported = (WsPath, Option<Reporter>);
 
 /// What an event path is to the watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,12 +119,12 @@ impl GitState {
         )
     }
 
-    /// Defers `path`, reported by `actor`. A later deferral of the same path without an actor
-    /// (the watcher's own batch) keeps the reporter's.
-    pub(crate) fn defer(&mut self, path: WsPath, actor: Option<Actor>) {
+    /// Defers `path`, given by `reporter`. A later deferral of the same path without one (the
+    /// watcher's own batch) keeps the reporter.
+    pub(crate) fn defer(&mut self, path: WsPath, reporter: Option<Reporter>) {
         let key = crate::store::path_key(path.as_str());
-        let actor = actor.or_else(|| self.deferred.get(&key).and_then(|(_, a)| a.clone()));
-        self.deferred.insert(key, (path, actor));
+        let reporter = reporter.or_else(|| self.deferred.get(&key).and_then(|(_, r)| r.clone()));
+        self.deferred.insert(key, (path, reporter));
     }
 }
 
@@ -205,6 +215,10 @@ mod tests {
             task_id: None,
             conversation_id: None,
             session_id: None,
+        };
+        let cli = Reporter {
+            actor: cli,
+            claim: None,
         };
         git.defer(p("notes/a.txt"), Some(cli.clone()));
         git.defer(p("NOTES/A.TXT"), None);
