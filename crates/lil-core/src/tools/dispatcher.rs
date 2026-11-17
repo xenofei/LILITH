@@ -330,7 +330,7 @@ impl Dispatcher {
     /// `app/asset.ai_edit {project?, asset_id, path, sha256}` (P4b-R17, LT-01; Appendix H
     /// "Attribution"): your relabel of one `human_edits[]` entry as an AI edit, in the
     /// session's workspace, its project resolved as a tool call's. The edit is
-    /// `asset_tools::ai_edit`'s.
+    /// `asset_tools::ai_edit`'s; then `{kind: "manifest"}` on the asset's topic.
     ///
     /// # Errors
     /// `caller.not_allowed` unless the session is a verified app's (`ui:*`) that shares
@@ -370,7 +370,13 @@ impl Dispatcher {
             .inner
             .project_of(session, &open, p.project.as_deref())
             .await;
-        super::asset_tools::ai_edit(&open, &project, &p, trace_id).await
+        let relabelled = super::asset_tools::ai_edit(&open, &project, &p, trace_id).await?;
+        // The asset's views re-read it, as after any other manifest edit.
+        self.events().publish(
+            &crate::pipeline::asset_topic(&open.ws.id, &project, &p.asset_id),
+            json!({"kind": "manifest"}),
+        );
+        Ok(relabelled)
     }
 
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is

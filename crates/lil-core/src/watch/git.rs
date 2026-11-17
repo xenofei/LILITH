@@ -10,9 +10,13 @@
 //! and release `index.lock` between their steps). Then the post-git rescan runs.
 
 use lil_platform::names::{WORKSPACE_DIR, is_workspace_dir};
+use lil_schema::Actor;
 use tokio::time::Instant;
 
 use crate::store::WsPath;
+
+/// A path deferred with the actor of the report that gave it, if any.
+pub(crate) type Reported = (WsPath, Option<Actor>);
 
 /// What an event path is to the watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,8 +69,9 @@ pub(crate) struct GitState {
     pub(crate) busy: bool,
     /// The last `index.lock` or `HEAD` event (or the last look that found `index.lock`).
     pub(crate) last: Option<Instant>,
-    /// Paths decided by the rescan after git, by key.
-    pub(crate) deferred: std::collections::BTreeMap<String, WsPath>,
+    /// Paths decided by the rescan after git, by key, each with the actor of the report that
+    /// gave it, if any.
+    pub(crate) deferred: std::collections::BTreeMap<String, Reported>,
     /// What the index's verification found while git worked: the file's content then, which
     /// the post-git rescan may not see change (its row still trusts the old hash).
     pub(crate) observed: Vec<super::Observed>,
@@ -91,9 +96,9 @@ impl GitState {
         Some(self.last.map_or_else(Instant::now, |last| last + quiet))
     }
 
-    /// Takes the deferred paths, the verification's observations and the overflow mark, and
-    /// ends the pause.
-    pub(crate) fn finish(&mut self) -> (Vec<WsPath>, Vec<super::Observed>, bool) {
+    /// Takes the deferred paths (with their reporters), the verification's observations and the
+    /// overflow mark, and ends the pause.
+    pub(crate) fn finish(&mut self) -> (Vec<Reported>, Vec<super::Observed>, bool) {
         self.busy = false;
         self.last = None;
         let deferred = std::mem::take(&mut self.deferred).into_values().collect();
@@ -104,9 +109,12 @@ impl GitState {
         )
     }
 
-    pub(crate) fn defer(&mut self, path: WsPath) {
-        self.deferred
-            .insert(crate::store::path_key(path.as_str()), path);
+    /// Defers `path`, reported by `actor`. A later deferral of the same path without an actor
+    /// (the watcher's own batch) keeps the reporter's.
+    pub(crate) fn defer(&mut self, path: WsPath, actor: Option<Actor>) {
+        let key = crate::store::path_key(path.as_str());
+        let actor = actor.or_else(|| self.deferred.get(&key).and_then(|(_, a)| a.clone()));
+        self.deferred.insert(key, (path, actor));
     }
 }
 
@@ -192,11 +200,22 @@ mod tests {
         assert!(git.activity(t0), "the first activity starts a pause");
         assert!(!git.activity(t0), "later ones extend it");
         assert_eq!(git.quiet_at(quiet), Some(t0 + quiet));
-        git.defer(p("notes/a.txt"));
-        git.defer(p("NOTES/A.TXT"));
+        let cli = Actor {
+            kind: lil_schema::ActorKind::Cli,
+            task_id: None,
+            conversation_id: None,
+            session_id: None,
+        };
+        git.defer(p("notes/a.txt"), Some(cli.clone()));
+        git.defer(p("NOTES/A.TXT"), None);
         git.overflowed = true;
         let (deferred, observed, overflowed) = git.finish();
         assert_eq!(deferred.len(), 1, "one path per key");
+        assert_eq!(
+            deferred[0].1,
+            Some(cli),
+            "a later deferral keeps the reporter"
+        );
         assert!(observed.is_empty());
         assert!(overflowed);
         assert!(!git.busy);
