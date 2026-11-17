@@ -116,8 +116,9 @@ pub enum UserCommand {
     /// Tell the core's watcher that files changed (for folders it can't watch). Prints nothing
     /// on success.
     Notify {
-        /// Who made the changes, when not you: an agent's kind (claude_code, tether, director).
-        /// Without it the change is recorded as made by this caller.
+        /// Who made the changes to the files named, when not you: an agent's kind
+        /// (claude_code, tether, director). Without it the change is recorded as made by this
+        /// caller. A folder named is reconciled, but its changes stay yours.
         #[arg(long, value_name = "KIND")]
         by: Option<String>,
         /// The session id of the agent that made the changes (with --by).
