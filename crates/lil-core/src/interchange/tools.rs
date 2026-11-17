@@ -4,11 +4,14 @@
 //!
 //! | Tool | Effect | Arguments | `structured` |
 //! |---|---|---|---|
-//! | `handlers.for` | read | `{target}` | `{handlers: [{app, intents, external}]}` |
+//! | `handlers.for` | read | `{target}` | `{handlers: [{app, intents, external}], note?}` |
 //! | `open_in` | read | `{app, target, intent: "open" \| "edit" \| "use_as_input"}` | `{running, pid, launch_command}` |
 //! | `ui.show` | read | `{target}` | as `open_in` |
 //! | `lilref.write` | write | `{ref, title?}` (a sealed ref with `#sha256=`) | `{path}` |
 //! | `notify.claude_code` | write | `{message, title?}` (1–2,000 and at most 100 characters) | `{posted, reason?: "category_off" \| "foreground" \| "duplicate" \| "unavailable"}` |
+//!
+//! `handlers.for` with no handler answers `{handlers: [], note: "no studio opens this yet"}`
+//! instead of a bare empty list (Appendix H "Thumbnails").
 //!
 //! The intent set is closed (APP-066): any other value is `params.invalid`. A ref target's type
 //! is looked up where the ref resolves to (`super::resolve`, through `registry/redirects.yaml`),
@@ -51,9 +54,15 @@ struct ForArgs {
     target: String,
 }
 
+/// `handlers.for`'s note when no app opens the target.
+const NO_HANDLER_NOTE: &str = "no studio opens this yet";
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct ForResult {
     handlers: Vec<HandlerView>,
+    /// "no studio opens this yet" when `handlers` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -102,7 +111,8 @@ pub fn register_interchange_tools(reg: &mut Registry, interchange: &Arc<Intercha
         "handlers.for",
         "Lists the registered apps and programs that can open a target (a file path, a lil:// \
          ref, a candidate or a document) and the intents each handles: open, edit or \
-         use_as_input. A target nothing can open has an empty list.",
+         use_as_input. A target nothing can open has an empty list and the note \
+         \"no studio opens this yet\".",
         EffectClass::Read,
         INTERCHANGE_MODULE,
         move |ctx, args: ForArgs| {
@@ -114,7 +124,8 @@ pub fn register_interchange_tools(reg: &mut Registry, interchange: &Arc<Intercha
                     .unwrap_or_default();
                 let handlers = handlers_for_target(&regs, &target);
                 let summary = format!("{} handler(s)", handlers.len());
-                Ok((ForResult { handlers }, summary))
+                let note = handlers.is_empty().then_some(NO_HANDLER_NOTE);
+                Ok((ForResult { handlers, note }, summary))
             })
         },
     ));
