@@ -1035,7 +1035,9 @@ fn recheck(open: Weak<OpenWorkspace>, path: WsPath) {
         };
         match &open.watch {
             Some(watch) => {
-                watch.notify(vec![path]).await;
+                // No actor: the re-check reports nobody's change, so it never claims an edit
+                // (CORE-034; the watcher's "Who made a change").
+                watch.notify(vec![path], None).await;
             }
             None => {
                 if let Err(e) = open.index.reconcile(Scope::Paths(vec![path])).await {
