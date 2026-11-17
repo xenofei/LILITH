@@ -184,3 +184,21 @@ pub fn register_watch_tools(reg: &mut Registry) {
         |ctx, args: NotifyArgs| Box::pin(notify(ctx, args)),
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The schema's `maxLength` (a literal in the attribute) is the limit the core enforces.
+    #[test]
+    fn by_schema_max_length_is_actor_id_max() {
+        let schema = serde_json::to_value(schemars::schema_for!(ActorArg)).unwrap();
+        for key in ["task_id", "conversation_id", "session_id"] {
+            assert_eq!(
+                schema["properties"][key]["maxLength"],
+                serde_json::json!(ACTOR_ID_MAX),
+                "{key}"
+            );
+        }
+    }
+}
