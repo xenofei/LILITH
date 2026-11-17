@@ -29,7 +29,7 @@
 //!   `projects::repair::restored_as` appends the redirect `<p>/<a>` → `<p>/<to>` (unless old
 //!   refs to `<p>/<a>` already reach a live asset with another creation UUID: then none, and
 //!   `warnings` says so; FR1) (`by` the
-//!   caller, as `asset.accept_move` writes one; no `actor` until attribution), renames the
+//!   caller, and `actor` the caller's, as `asset.accept_move` writes one), renames the
 //!   manifest to `<to>.manifest.json` and sets its `asset_id` to `to`. A crash after the move
 //!   leaves an asset the index lists as `moved`, which `asset.accept_move` finishes without a
 //!   second redirect. `{kind: "moved", from, to}` is published on the asset's topic at its new
@@ -60,7 +60,7 @@ use super::asset_tools::takeover_warnings_for;
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::services::{AssetServices, ResourceIds};
 use super::workspace_tools::WORKSPACE_MODULE;
-use crate::pipeline::{asset_topic, status_by};
+use crate::pipeline::{actor_of, asset_topic, status_by};
 use crate::projects::Resolver;
 use crate::projects::repair::restored_as;
 use crate::store::{Personal, RestoreRewrite, Store, StoreError, TrashRecord, WsPath};
@@ -388,7 +388,8 @@ async fn restore_workspace(
                 .trash_restore_to(&args.entry_id, Some(to), None)
                 .await?;
             let by = status_by(&ctx.session.caller);
-            let done = restored_as(&open.index, store, &project, &old_id, to, by.as_str(), None)
+            let who = Some(actor_of(&ctx.session.caller));
+            let done = restored_as(&open.index, store, &project, &old_id, to, by.as_str(), who)
                 .await
                 .map_err(|mut e| {
                     // The folder is back already: say so, and how the rest gets done.

@@ -327,6 +327,52 @@ impl Dispatcher {
         Some(self.inner.project_of(session, &open, None).await)
     }
 
+    /// `app/asset.ai_edit {project?, asset_id, path, sha256}` (P4b-R17, LT-01; Appendix H
+    /// "Attribution"): your relabel of one `human_edits[]` entry as an AI edit, in the
+    /// session's workspace, its project resolved as a tool call's. The edit is
+    /// `asset_tools::ai_edit`'s.
+    ///
+    /// # Errors
+    /// `caller.not_allowed` unless the session is a verified app's (`ui:*`) that shares
+    /// `assets.v1` (the router refuses anyone else first; APP-039); `workspace.required`
+    /// without a workspace, and the session's workspace errors; `workspace.read_only`;
+    /// `asset_tools::ai_edit`'s.
+    pub async fn ai_edit(
+        &self,
+        session: &Session,
+        p: lil_protocol::app::AiEditParams,
+        trace_id: &str,
+    ) -> Result<lil_protocol::app::AiEditResult, ErrorBody> {
+        let app = matches!(session.caller, CallerKind::Ui(_))
+            && session
+                .capabilities
+                .iter()
+                .any(|c| c == lil_protocol::app::ASSETS_CAPABILITY);
+        if !app {
+            return Err(ErrorBody::new(
+                &codes::CALLER_NOT_ALLOWED,
+                "app/asset.ai_edit is for LILITH apps only (with the assets.v1 capability).",
+                trace_id,
+            ));
+        }
+        let Some(open) = self.inner.open_workspace(session, trace_id).await? else {
+            return Err(ErrorBody::new(
+                &codes::WORKSPACE_REQUIRED,
+                "An edit is relabelled within a workspace, and this session has none. Connect \
+                 with a workspace first.",
+                trace_id,
+            ));
+        };
+        if open.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly.to_error(trace_id));
+        }
+        let project = self
+            .inner
+            .project_of(session, &open, p.project.as_deref())
+            .await;
+        super::asset_tools::ai_edit(&open, &project, &p, trace_id).await
+    }
+
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is
     /// an `Outcome::Error`, and each goes to the error sink, also when the caller has gone.
     pub async fn call(&self, session: Arc<Session>, p: ToolCallParams) -> Outcome<ToolOutput> {

@@ -422,7 +422,7 @@ async fn staging_trash_and_git_internals_are_not_watched() {
     // Notifying them changes nothing either.
     let report = core
         .watch()
-        .notify(unwatched.iter().map(|r| p(r)).collect())
+        .notify(unwatched.iter().map(|r| p(r)).collect(), None)
         .await;
     assert!(report.reconciled.is_empty(), "{report:?}");
     assert_eq!(report.ignored.len(), unwatched.len(), "{report:?}");
@@ -950,7 +950,7 @@ async fn human_edit_is_recorded_once_across_notify_rescan_and_rebuild() {
     once(&core.detail(CRANE).await);
 
     // lil notify.
-    let report = core.watch().notify(vec![p(SEALED)]).await;
+    let report = core.watch().notify(vec![p(SEALED)], None).await;
     assert_eq!(report.reconciled, [SEALED]);
     once(&core.detail(CRANE).await);
 
@@ -1265,7 +1265,7 @@ async fn stale_verification_never_overrides_a_newer_edit() {
     );
 
     // A batch (here `lil notify`) sees B first and records it ...
-    watcher.notify(vec![p(SEALED)]).await;
+    watcher.notify(vec![p(SEALED)], None).await;
     // ... then the verification's result about A arrives.
     watcher.mismatches(mismatches).await;
 
@@ -1354,7 +1354,7 @@ async fn os_metadata_in_a_sealed_version_is_ignored() {
     // `lil notify` of them changes nothing either.
     let notified = core
         .watch()
-        .notify(vec![p(&format!("{BASE}/v1.0.0/Thumbs.db"))])
+        .notify(vec![p(&format!("{BASE}/v1.0.0/Thumbs.db"))], None)
         .await;
     assert!(notified.ignored.is_empty(), "{notified:?}");
 
@@ -1404,7 +1404,7 @@ async fn a_file_dropped_into_a_sealed_version_is_a_human_edit() {
     assert_eq!(flagged.len(), 1, "{events:?}");
     assert_eq!(flagged[0]["previous_sha256"], "", "{events:?}");
     // Seen again (`lil notify`), it is recorded once; the file itself is never touched.
-    core.watch().notify(vec![p(&extra)]).await;
+    core.watch().notify(vec![p(&extra)], None).await;
     let again = core.detail(CRANE).await;
     assert_eq!(edits_of(&again, "v1.0.0/extra.png").len(), 1, "{again}");
     assert_eq!(
@@ -1520,4 +1520,80 @@ async fn a_gitdir_file_points_the_git_watch_at_the_real_git_folder() {
     })
     .await;
     assert!(!core.open.store.git_gate().is_busy());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Agent edits (CORE-034, ARCH-103; P4b-R16).
+// ---------------------------------------------------------------------------------------------
+
+fn actor(kind: lil_schema::ActorKind, session_id: Option<&str>) -> lil_schema::Actor {
+    lil_schema::Actor {
+        kind,
+        task_id: None,
+        conversation_id: None,
+        session_id: session_id.map(str::to_string),
+    }
+}
+
+/// An agent's edit the watcher saw first (as a human edit, with no actor) becomes the agent's
+/// when the agent reports it; from then on it stays the agent's edit, recorded once, and the
+/// file is never overwritten.
+#[tokio::test(flavor = "multi_thread")] // spec: CORE-034, ARCH-079, ARCH-103
+async fn an_agent_edit_is_never_overwritten() {
+    use lil_schema::ActorKind;
+    let core = Core::fixture(fast()).await;
+    core.fence().await;
+    let edited = b"written by an agent's Edit tool";
+    edit_outside(&core.path(CANDIDATE), edited);
+    core.fence().await;
+    let only = |detail: &Value| {
+        let edits = edits_of(detail, "candidates/r_20261003_1400/crane_c.png");
+        assert_eq!(edits.len(), 1, "{detail}");
+        assert_eq!(edits[0]["sha256"], sha256_bytes(edited), "{detail}");
+        edits[0].clone()
+    };
+    let seen = only(&core.detail(CRANE).await);
+    assert!(
+        seen.get("actor").is_none(),
+        "the watcher knows no actor: {seen}"
+    );
+
+    // The agent's report (the hook's `lil notify --by claude_code`) names it.
+    let agent = actor(ActorKind::ClaudeCode, Some("s1"));
+    let report = core
+        .watch()
+        .notify(vec![p(CANDIDATE)], Some(agent.clone()))
+        .await;
+    assert_eq!(report.reconciled, [CANDIDATE]);
+    let claimed = only(&core.detail(CRANE).await);
+    assert_eq!(claimed["actor"], agent.to_value(), "{claimed}");
+    assert!(claimed.get("relabelled").is_none(), "{claimed}");
+
+    // Reported again as someone's own, or seen again by the watcher: still the agent's.
+    core.watch()
+        .notify(vec![p(CANDIDATE)], Some(actor(ActorKind::Cli, None)))
+        .await;
+    core.watch().notify(vec![p(CANDIDATE)], None).await;
+    core.fence().await;
+    assert_eq!(only(&core.detail(CRANE).await), claimed);
+    assert_eq!(
+        core.row(CANDIDATE).await,
+        Some((Some(sha256_bytes(edited)), FileState::HumanEdit))
+    );
+
+    // Never overwritten: a write that expects the recorded content is refused.
+    let refused = core
+        .open
+        .store
+        .write(
+            &p(CANDIDATE),
+            b"the core's".to_vec(),
+            Expect::Hash(CANDIDATE_SHA256.into()),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::HashConflict { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(std::fs::read(core.path(CANDIDATE)).unwrap(), edited);
 }
