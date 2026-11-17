@@ -10,9 +10,23 @@
 //! and release `index.lock` between their steps). Then the post-git rescan runs.
 
 use lil_platform::names::{WORKSPACE_DIR, is_workspace_dir};
+use lil_schema::Actor;
 use tokio::time::Instant;
 
 use crate::store::WsPath;
+
+/// The report that gave a deferred path: its actor, and the hash of the recorded human edit
+/// it may claim, when the claim window was measured at the report (fix round 2, N1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reporter {
+    pub(crate) actor: Actor,
+    /// The hash of an edit the watcher recorded with no actor within `CLAIM_WINDOW` before the
+    /// report: the deferred claim compares with it instead of measuring the window again.
+    pub(crate) claim: Option<String>,
+}
+
+/// A path deferred with the report that gave it, if any.
+pub(crate) type Reported = (WsPath, Option<Reporter>);
 
 /// What an event path is to the watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,8 +79,9 @@ pub(crate) struct GitState {
     pub(crate) busy: bool,
     /// The last `index.lock` or `HEAD` event (or the last look that found `index.lock`).
     pub(crate) last: Option<Instant>,
-    /// Paths decided by the rescan after git, by key.
-    pub(crate) deferred: std::collections::BTreeMap<String, WsPath>,
+    /// Paths decided by the rescan after git, by key, each with the actor of the report that
+    /// gave it, if any.
+    pub(crate) deferred: std::collections::BTreeMap<String, Reported>,
     /// What the index's verification found while git worked: the file's content then, which
     /// the post-git rescan may not see change (its row still trusts the old hash).
     pub(crate) observed: Vec<super::Observed>,
@@ -91,9 +106,9 @@ impl GitState {
         Some(self.last.map_or_else(Instant::now, |last| last + quiet))
     }
 
-    /// Takes the deferred paths, the verification's observations and the overflow mark, and
-    /// ends the pause.
-    pub(crate) fn finish(&mut self) -> (Vec<WsPath>, Vec<super::Observed>, bool) {
+    /// Takes the deferred paths (with their reporters), the verification's observations and the
+    /// overflow mark, and ends the pause.
+    pub(crate) fn finish(&mut self) -> (Vec<Reported>, Vec<super::Observed>, bool) {
         self.busy = false;
         self.last = None;
         let deferred = std::mem::take(&mut self.deferred).into_values().collect();
@@ -104,9 +119,12 @@ impl GitState {
         )
     }
 
-    pub(crate) fn defer(&mut self, path: WsPath) {
-        self.deferred
-            .insert(crate::store::path_key(path.as_str()), path);
+    /// Defers `path`, given by `reporter`. A later deferral of the same path without one (the
+    /// watcher's own batch) keeps the reporter.
+    pub(crate) fn defer(&mut self, path: WsPath, reporter: Option<Reporter>) {
+        let key = crate::store::path_key(path.as_str());
+        let reporter = reporter.or_else(|| self.deferred.get(&key).and_then(|(_, r)| r.clone()));
+        self.deferred.insert(key, (path, reporter));
     }
 }
 
@@ -192,11 +210,26 @@ mod tests {
         assert!(git.activity(t0), "the first activity starts a pause");
         assert!(!git.activity(t0), "later ones extend it");
         assert_eq!(git.quiet_at(quiet), Some(t0 + quiet));
-        git.defer(p("notes/a.txt"));
-        git.defer(p("NOTES/A.TXT"));
+        let cli = Actor {
+            kind: lil_schema::ActorKind::Cli,
+            task_id: None,
+            conversation_id: None,
+            session_id: None,
+        };
+        let cli = Reporter {
+            actor: cli,
+            claim: None,
+        };
+        git.defer(p("notes/a.txt"), Some(cli.clone()));
+        git.defer(p("NOTES/A.TXT"), None);
         git.overflowed = true;
         let (deferred, observed, overflowed) = git.finish();
         assert_eq!(deferred.len(), 1, "one path per key");
+        assert_eq!(
+            deferred[0].1,
+            Some(cli),
+            "a later deferral keeps the reporter"
+        );
         assert!(observed.is_empty());
         assert!(overflowed);
         assert!(!git.busy);

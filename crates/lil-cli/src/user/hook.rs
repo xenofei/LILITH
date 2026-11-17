@@ -12,7 +12,9 @@
 //!   does); nothing is started.
 //! - **PostToolUse:** for a Write, Edit or MultiEdit of a file inside the default workspace
 //!   (in `suite.toml`), `lil notify --no-start <file_path>`: `watch.notify` on a core that
-//!   already runs, nothing otherwise.
+//!   already runs, nothing otherwise. It passes `by: {kind: "claude_code", session_id}` (the
+//!   input's `session_id`), so Claude Code's own writes are agent edits, never yours (ARCH-103,
+//!   CORE-034).
 //! - **SessionStart:** while a core runs, `additionalContext` with the active project, the open
 //!   jobs (each `job_id`) and the pending confirmations (each `id`) of the workspace the `cli`
 //!   chain finds from the session's folder; nothing otherwise.
@@ -225,9 +227,22 @@ fn post_tool_use(input: &Value) {
     let Ok(client) = BlockingClient::connect(&cfg) else {
         return;
     };
+    let _ = client.call_tool("watch.notify", post_tool_use_args(&rel, input), None);
+}
+
+/// PostToolUse's `watch.notify` arguments for the workspace path `rel`: `{paths: [rel], by:
+/// {kind: "claude_code", session_id?}}`, the session id the input's (when it is a non-empty
+/// string).
+fn post_tool_use_args(rel: &str, input: &Value) -> Map<String, Value> {
+    let mut by = Map::new();
+    by.insert("kind".into(), json!("claude_code"));
+    if let Some(session) = input["session_id"].as_str().filter(|s| !s.is_empty()) {
+        by.insert("session_id".into(), json!(session));
+    }
     let mut args = Map::new();
     args.insert("paths".into(), json!([rel]));
-    let _ = client.call_tool("watch.notify", args, None);
+    args.insert("by".into(), Value::Object(by));
+    args
 }
 
 /// `s` cut to at most `max` characters.
@@ -381,4 +396,34 @@ fn session_context(client: &BlockingClient) -> String {
         )
     });
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test] // spec: ARCH-103, CORE-034
+    fn post_tool_use_passes_claude_code_and_the_session_id() {
+        let input = json!({"session_id": "cc-session-1", "hook_event_name": "PostToolUse",
+                           "tool_name": "Edit", "tool_input": {"file_path": "a.png"}});
+        let args = post_tool_use_args("projects/p/assets/a/v1.0.0/a.png", &input);
+        assert_eq!(
+            Value::Object(args),
+            json!({"paths": ["projects/p/assets/a/v1.0.0/a.png"],
+                   "by": {"kind": "claude_code", "session_id": "cc-session-1"}})
+        );
+        // Without a session id (or with one that isn't a non-empty string), the kind alone.
+        for input in [
+            json!({"tool_input": {"file_path": "a.png"}}),
+            json!({"session_id": "", "tool_input": {"file_path": "a.png"}}),
+            json!({"session_id": 7, "tool_input": {"file_path": "a.png"}}),
+        ] {
+            let args = post_tool_use_args("notes/a.txt", &input);
+            assert_eq!(
+                Value::Object(args),
+                json!({"paths": ["notes/a.txt"], "by": {"kind": "claude_code"}}),
+                "{input}"
+            );
+        }
+    }
 }

@@ -195,6 +195,18 @@ impl Fx {
         args: Value,
         idem: String,
     ) -> impl Future<Output = Outcome<ToolOutput>> + use<> {
+        self.call_by(CallerKind::Cli, name, args, idem)
+    }
+
+    /// A call from a session of `caller` (with every capability of this protocol), with the
+    /// idempotency key `idem` for a write tool.
+    fn call_by(
+        &self,
+        caller: CallerKind,
+        name: &str,
+        args: Value,
+        idem: String,
+    ) -> impl Future<Output = Outcome<ToolOutput>> + use<> {
         let Value::Object(arguments) = args else {
             panic!("arguments must be an object");
         };
@@ -205,15 +217,7 @@ impl Fx {
                 .map(|t| t.descriptor().effect),
             Some(EffectClass::Read)
         );
-        let session = Arc::new(Session {
-            id: "s_record".into(),
-            caller: CallerKind::Cli,
-            non_interactive: false,
-            workspace: Some(self.ws_ref.clone()),
-            capabilities: Vec::new(),
-            client_pid: 1,
-            profile_id: None,
-        });
+        let session = self.session(caller);
         let params = ToolCallParams {
             name: name.into(),
             arguments,
@@ -222,6 +226,25 @@ impl Fx {
         };
         let dispatcher = self.dispatcher.clone();
         async move { dispatcher.call(session, params).await }
+    }
+
+    fn session(&self, caller: CallerKind) -> Arc<Session> {
+        let capabilities = match caller {
+            CallerKind::Ui(_) => lil_protocol::CAPABILITIES
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+            _ => Vec::new(),
+        };
+        Arc::new(Session {
+            id: "s_record".into(),
+            caller,
+            non_interactive: false,
+            workspace: Some(self.ws_ref.clone()),
+            capabilities,
+            client_pid: 1,
+            profile_id: None,
+        })
     }
 
     async fn ok(&self, name: &str, args: Value) -> Value {
@@ -1400,5 +1423,489 @@ async fn deprecate_publishes_previous() {
         })
         .collect();
     assert_eq!(got, want, "{seen:?}");
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Attribution (CORE-023, CORE-034, CORE-051, ARCH-103; P4b-R16, P4b-R17; Appendix H
+// "Attribution").
+// ---------------------------------------------------------------------------------------------
+
+/// The agent kinds of `Actor`: an entry with one of them is an agent edit, never a human one.
+const AGENT_KINDS: [&str; 3] = ["claude_code", "tether", "director"];
+
+fn ui() -> CallerKind {
+    CallerKind::Ui("test".into())
+}
+
+/// A core whose workspace can't be watched (a fail point): only `watch.notify` records an
+/// outside edit, so a refused call is seen to record nothing.
+fn unwatched() -> Fx {
+    Fx::new(
+        |_| {},
+        |h| h,
+        Arc::new(FailPoints::parse("watch.start=unsupported").unwrap()),
+    )
+}
+
+/// Replaces a workspace file's bytes as an outside program would (its read-only bit cleared
+/// first); returns their SHA-256.
+#[allow(clippy::disallowed_methods)]
+fn edit_outside(path: &Path, bytes: &[u8]) -> String {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows: this clears FILE_ATTRIBUTE_READONLY, as an editor would"
+    )]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).unwrap();
+    write_file(path, bytes);
+    sha256_bytes(bytes)
+}
+
+impl Fx {
+    async fn ok_by(&self, caller: CallerKind, name: &str, args: Value) -> Value {
+        match self
+            .call_by(caller.clone(), name, args.clone(), key())
+            .await
+        {
+            Outcome::Ok(out) => out.structured,
+            other => panic!("{name} {args} by {caller}: {other:?}"),
+        }
+    }
+
+    async fn err_by(&self, caller: CallerKind, name: &str, args: Value) -> ErrorBody {
+        match self
+            .call_by(caller.clone(), name, args.clone(), key())
+            .await
+        {
+            Outcome::Error { error } => error,
+            other => panic!("{name} {args} by {caller} should fail: {other:?}"),
+        }
+    }
+
+    /// A candidate of a new run of `asset` (imported by `cli`): its workspace path.
+    async fn candidate(&self, asset: &str) -> String {
+        let run = self.import_run(asset, "kite.png", b"kite").await;
+        format!("projects/sketchbook/assets/{asset}/candidates/{run}/kite.png")
+    }
+
+    /// The manifest's `human_edits` entry of `asset` with `sha256`, if any.
+    fn edit_with(&self, asset: &str, sha256: &str) -> Option<Value> {
+        self.manifest(asset)["human_edits"]
+            .as_array()
+            .and_then(|edits| edits.iter().find(|e| e["sha256"] == sha256).cloned())
+    }
+
+    fn edit_count(&self, asset: &str) -> usize {
+        self.manifest(asset)["human_edits"]
+            .as_array()
+            .map_or(0, Vec::len)
+    }
+
+    /// `watch.notify {paths: [rel], by?}` from `caller`.
+    async fn notify(&self, caller: CallerKind, rel: &str, by: Option<Value>) -> Value {
+        let mut args = json!({ "paths": [rel] });
+        if let Some(by) = by {
+            args["by"] = by;
+        }
+        self.ok_by(caller, "watch.notify", args).await
+    }
+}
+
+/// Each caller kind and the `actor.kind` it maps to (P4b-R16).
+fn callers() -> [(CallerKind, &'static str); 4] {
+    [
+        (CallerKind::Cli, "cli"),
+        (CallerKind::Mcp, "claude_code"),
+        (CallerKind::Assistant, "tether"),
+        (ui(), "owner"),
+    ]
+}
+
+#[tokio::test] // spec: CORE-023
+async fn runs_and_files_record_the_callers_actor() {
+    let fx = Fx::plain();
+    for (caller, kind) in callers() {
+        let asset = format!("prop_by_{kind}");
+        let r = fx
+            .ok_by(
+                caller,
+                "asset.import",
+                fx.import_args(&asset, "kite.png", b"kite"),
+            )
+            .await;
+        let m = fx.manifest(&asset);
+        let run = m["candidate_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["run_id"] == r["run_id"])
+            .unwrap_or_else(|| panic!("{m}"))
+            .clone();
+        assert_eq!(run["actor"], json!({ "kind": kind }), "{run}");
+        let files = run["files"].as_array().unwrap();
+        assert!(!files.is_empty(), "{run}");
+        for f in files {
+            assert_eq!(f["actor"], json!({ "kind": kind }), "{f}");
+        }
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-034, ARCH-103
+async fn notify_with_by_is_an_agent_edit_and_never_counted_as_human() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"edited by Claude Code");
+    let by = json!({"kind": "claude_code", "session_id": "s1"});
+    let r = fx.notify(CallerKind::Cli, &rel, Some(by.clone())).await;
+    assert_eq!(r["reconciled"], json!([rel]), "{r}");
+    let entry = fx.edit_with(KITE, &sha).expect("the edit is recorded");
+    assert_eq!(entry["actor"], by, "{entry}");
+    assert!(AGENT_KINDS.iter().any(|k| entry["actor"]["kind"] == *k));
+    assert!(entry.get("relabelled").is_none(), "{entry}");
+
+    // Reported again, now without `by` (as yours): it is recorded already, and stays the
+    // agent's edit.
+    fx.notify(CallerKind::Cli, &rel, None).await;
+    fx.notify(ui(), &rel, None).await;
+    assert_eq!(fx.edit_count(KITE), 1, "{}", fx.manifest(KITE));
+    assert_eq!(fx.edit_with(KITE, &sha).unwrap()["actor"], by);
+
+    // An app or `lil` may name any agent.
+    let rel = fx.candidate("prop_by_app").await;
+    let sha = edit_outside(&fx.path(&rel), b"edited by the director");
+    fx.notify(
+        ui(),
+        &rel,
+        Some(json!({"kind": "director", "task_id": "t1"})),
+    )
+    .await;
+    let entry = fx.edit_with("prop_by_app", &sha).unwrap();
+    assert_eq!(
+        entry["actor"],
+        json!({"kind": "director", "task_id": "t1"}),
+        "{entry}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-034
+async fn notify_without_by_stays_a_human_edit() {
+    let fx = unwatched();
+    for (caller, kind) in [(CallerKind::Cli, "cli"), (ui(), "owner")] {
+        let asset = format!("prop_hand_{kind}");
+        let rel = fx.candidate(&asset).await;
+        let sha = edit_outside(&fx.path(&rel), format!("edited by hand, {kind}").as_bytes());
+        fx.notify(caller, &rel, None).await;
+        let entry = fx.edit_with(&asset, &sha).expect("the edit is recorded");
+        assert_eq!(entry["actor"], json!({ "kind": kind }), "{entry}");
+        assert!(
+            !AGENT_KINDS.iter().any(|k| entry["actor"]["kind"] == *k),
+            "{entry}"
+        );
+        assert!(entry.get("relabelled").is_none(), "{entry}");
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-034
+async fn mcp_notify_without_by_is_an_agent_edit() {
+    let fx = unwatched();
+    for (caller, kind) in [
+        (CallerKind::Mcp, "claude_code"),
+        (CallerKind::Assistant, "tether"),
+    ] {
+        let asset = format!("prop_agent_{kind}");
+        let rel = fx.candidate(&asset).await;
+        let sha = edit_outside(&fx.path(&rel), format!("edited by {kind}").as_bytes());
+        fx.notify(caller.clone(), &rel, None).await;
+        let entry = fx.edit_with(&asset, &sha).expect("the edit is recorded");
+        assert_eq!(entry["actor"], json!({ "kind": kind }), "{entry}");
+        // Its own kind with a session is accepted too.
+        let sha = edit_outside(&fx.path(&rel), format!("edited again by {kind}").as_bytes());
+        let by = json!({"kind": kind, "session_id": "s2"});
+        fx.notify(caller, &rel, Some(by.clone())).await;
+        assert_eq!(fx.edit_with(&asset, &sha).unwrap()["actor"], by);
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-034
+async fn an_agent_by_of_another_kind_is_refused() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    edit_outside(&fx.path(&rel), b"edited by an agent");
+    for (caller, kind) in [
+        (CallerKind::Mcp, "tether"),
+        (CallerKind::Mcp, "director"),
+        (CallerKind::Mcp, "cli"),
+        (CallerKind::Mcp, "core"),
+        (CallerKind::Assistant, "claude_code"),
+        (CallerKind::Assistant, "director"),
+        (CallerKind::Assistant, "cli"),
+        (CallerKind::Assistant, "core"),
+    ] {
+        let e = fx
+            .err_by(
+                caller.clone(),
+                "watch.notify",
+                json!({"paths": [rel], "by": {"kind": kind}}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{caller} as {kind}: {e:?}");
+        assert_eq!(
+            fx.edit_count(KITE),
+            0,
+            "{caller} as {kind} recorded nothing"
+        );
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-034
+async fn by_owner_is_refused() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    edit_outside(&fx.path(&rel), b"edited by someone");
+    for (caller, _) in callers() {
+        let e = fx
+            .err_by(
+                caller.clone(),
+                "watch.notify",
+                json!({"paths": [rel], "by": {"kind": "owner"}}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{caller}: {e:?}");
+        assert_eq!(fx.edit_count(KITE), 0, "{caller} recorded nothing");
+    }
+    // An unknown kind, or an unknown key, is no actor either.
+    for by in [
+        json!({"kind": "someone"}),
+        json!({"kind": "claude_code", "name": "x"}),
+    ] {
+        let e = fx
+            .err_by(
+                CallerKind::Cli,
+                "watch.notify",
+                json!({"paths": [rel], "by": by}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{by}: {e:?}");
+    }
+    assert_eq!(fx.edit_count(KITE), 0);
+    fx.shutdown().await;
+}
+
+/// No tool argument signs off as `auto` (ruling 4): `asset.signoff` has no `by`. The sign-off
+/// path with `auto` is `pipeline::signoff`'s unit test
+/// `auto_approve_signoff_is_by_auto_with_via_rule`.
+#[tokio::test] // spec: CORE-051
+async fn no_tool_argument_signs_off_as_auto() {
+    let fx = Fx::plain();
+    let run = fx.import_run(KITE, "kite.png", b"kite").await;
+    let e = fx
+        .err(
+            "asset.signoff",
+            Fx::signoff_args(KITE, &run, "kite.png", json!({"by": "auto"})),
+        )
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    let m = fx.manifest(KITE);
+    assert!(
+        m["candidate_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["signed_off"].is_null()),
+        "{m}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-034, APP-039
+async fn ai_edit_relabels_one_entry_from_the_app_only() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let inside = rel.split_once(&format!("{KITE}/")).unwrap().1.to_string();
+    let one = edit_outside(&fx.path(&rel), b"first outside edit");
+    fx.notify(CallerKind::Cli, &rel, None).await;
+    let two = edit_outside(&fx.path(&rel), b"second outside edit");
+    fx.notify(CallerKind::Cli, &rel, None).await;
+    let before = fx.manifest(KITE);
+
+    let params = |sha256: &str| lil_protocol::app::AiEditParams {
+        project: Some("sketchbook".to_string()),
+        asset_id: KITE.to_string(),
+        path: inside.clone(),
+        sha256: sha256.to_string(),
+    };
+    let app = fx.session(ui());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(15, tx);
+    let topic = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_ref.id);
+    fx.events
+        .subscribe(15, std::slice::from_ref(&topic), &Default::default())
+        .await;
+    drain_events(&mut rx);
+    let r = fx
+        .dispatcher
+        .ai_edit(&app, params(&one), "t_ai_edit")
+        .await
+        .unwrap();
+    // Fix round 1, M1: the asset's views hear that its manifest changed.
+    let manifest_event =
+        |e: &Value| e["topic"] == topic.as_str() && e["data"] == json!({"kind": "manifest"});
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut published = drain_events(&mut rx);
+    while !published.iter().any(manifest_event) && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+        published.extend(drain_events(&mut rx));
+    }
+    assert!(published.iter().any(manifest_event), "{published:?}");
+    let edit = &r.human_edit;
+    assert_eq!(edit["sha256"], one.as_str(), "{edit}");
+    assert_eq!(edit["path"], inside.as_str(), "{edit}");
+    assert_eq!(edit["actor"], json!({"kind": "claude_code"}), "{edit}");
+    assert!(edit["relabelled"]["utc"].is_string(), "{edit}");
+    assert_eq!(fx.edit_with(KITE, &one).as_ref(), Some(edit));
+    // Nothing relabels in bulk: the other entry is as it was.
+    let other = |m: &Value| m["human_edits"].as_array().unwrap()[1].clone();
+    assert_eq!(other(&fx.manifest(KITE)), other(&before));
+    assert_eq!(
+        fx.edit_with(KITE, &two).unwrap()["actor"],
+        json!({"kind": "cli"})
+    );
+
+    // No entry with that path and hash, or no such asset: nothing changes.
+    let after = fx.manifest(KITE);
+    for p in [
+        params(&sha256_bytes(b"never written")),
+        lil_protocol::app::AiEditParams {
+            path: "candidates/elsewhere/kite.png".to_string(),
+            ..params(&two)
+        },
+        lil_protocol::app::AiEditParams {
+            asset_id: "prop_never".to_string(),
+            ..params(&two)
+        },
+    ] {
+        let e = fx
+            .dispatcher
+            .ai_edit(&app, p, "t_ai_edit")
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "asset.unknown", "{e:?}");
+        assert_eq!(e.trace_id, "t_ai_edit");
+    }
+    assert_eq!(fx.manifest(KITE), after);
+    // Only a verified app may relabel: the method's own check, besides the router's.
+    let e = fx
+        .dispatcher
+        .ai_edit(&fx.session(CallerKind::Cli), params(&two), "t_ai_edit")
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "caller.not_allowed", "{e:?}");
+    assert_eq!(fx.manifest(KITE), after);
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 15, audit fix round 1: a report attributes only the files it names (M1); `by` never
+// names the core, and its ids are capped (L3).
+// ---------------------------------------------------------------------------------------------
+
+const KITE_FOLDER: &str = "projects/sketchbook/assets/prop_kite";
+
+/// M1 (the audit's probe 1a): your hand edit, reported an hour later by an agent that names
+/// only the asset's folder, stays a human edit: a folder report reconciles its subtree but
+/// attributes nothing.
+#[tokio::test] // spec: CORE-034, ARCH-103
+async fn a_folder_report_never_attributes_a_hand_edit() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"your hand edit");
+    fx.clock.advance(Duration::from_secs(3600));
+    let r = fx.notify(CallerKind::Mcp, KITE_FOLDER, None).await;
+    assert_eq!(r["reconciled"], json!([KITE_FOLDER]), "{r}");
+    let entry = fx.edit_with(KITE, &sha).expect("the edit is recorded");
+    assert!(entry.get("actor").is_none(), "still yours: {entry}");
+    fx.shutdown().await;
+}
+
+/// M1 (the audit's probe 1b): an app's report of the asset's folder doesn't make Claude Code's
+/// write yours, and the hook's report of the file, which comes next, still claims it.
+#[tokio::test] // spec: CORE-034, ARCH-103
+async fn a_folder_report_leaves_the_claim_to_the_files_reporter() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"written by Claude Code");
+    fx.notify(ui(), KITE_FOLDER, None).await;
+    let entry = fx.edit_with(KITE, &sha).expect("the edit is recorded");
+    assert!(
+        entry.get("actor").is_none(),
+        "no owner from a folder: {entry}"
+    );
+    let by = json!({"kind": "claude_code", "session_id": "s1"});
+    fx.notify(CallerKind::Cli, &rel, Some(by.clone())).await;
+    assert_eq!(fx.edit_with(KITE, &sha).unwrap()["actor"], by);
+    fx.shutdown().await;
+}
+
+/// M1: a report that names the file still attributes its change, also when it names the
+/// file's folder too.
+#[tokio::test] // spec: CORE-034, ARCH-103
+async fn an_exact_file_report_still_attributes() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"written by Claude Code, named");
+    fx.ok_by(
+        CallerKind::Mcp,
+        "watch.notify",
+        json!({"paths": [KITE_FOLDER, rel]}),
+    )
+    .await;
+    let entry = fx.edit_with(KITE, &sha).expect("the edit is recorded");
+    assert_eq!(entry["actor"], json!({"kind": "claude_code"}), "{entry}");
+    fx.shutdown().await;
+}
+
+/// L3: `by` never names the core, from any caller, and records nothing; each of its ids is
+/// at most 200 characters.
+#[tokio::test] // spec: CORE-034
+async fn by_core_is_refused_and_by_ids_are_capped() {
+    let fx = unwatched();
+    let rel = fx.candidate(KITE).await;
+    let sha = edit_outside(&fx.path(&rel), b"edited by someone");
+    for (caller, _) in callers() {
+        let e = fx
+            .err_by(
+                caller.clone(),
+                "watch.notify",
+                json!({"paths": [rel], "by": {"kind": "core"}}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{caller}: {e:?}");
+        assert_eq!(fx.edit_count(KITE), 0, "{caller} recorded nothing");
+    }
+    let long = "x".repeat(201);
+    for key in ["task_id", "conversation_id", "session_id"] {
+        let mut by = json!({"kind": "claude_code"});
+        by[key] = json!(long);
+        let e = fx
+            .err_by(
+                CallerKind::Cli,
+                "watch.notify",
+                json!({"paths": [rel], "by": by}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{key}: {e:?}");
+        assert_eq!(fx.edit_count(KITE), 0, "{key}: nothing recorded");
+    }
+    let at_cap = "é".repeat(200);
+    let by = json!({"kind": "claude_code", "session_id": at_cap});
+    fx.notify(CallerKind::Cli, &rel, Some(by.clone())).await;
+    assert_eq!(fx.edit_with(KITE, &sha).unwrap()["actor"], by);
     fx.shutdown().await;
 }

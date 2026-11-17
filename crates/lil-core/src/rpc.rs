@@ -35,8 +35,8 @@
 //!   `context.v1`, else `caller.not_allowed`; ARCH-088), protocol 1.4's `app/thumbs.request`,
 //!   `app/asset.trust` and `app/asset.ai_edit` need `assets.v1` (else `caller.not_allowed`);
 //!   `app/thumbs.request` goes to the [`Thumbnails`] (a request that isn't one, or a path that
-//!   isn't workspace-relative, is `params.invalid`; APP-038), and the other two are -32601
-//!   until their tasks route them, and any
+//!   isn't workspace-relative, is `params.invalid`; APP-038), `app/asset.ai_edit` goes to the
+//!   dispatcher (P4b-R17), `app/asset.trust` is -32601 until its task routes it, and any
 //!   other `app/*` method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   `app/*` methods are admitted as `tools/call` is (APP-041): a draining core answers them
@@ -694,6 +694,22 @@ impl RpcRouter {
                 let trace_id = self.ids.id("t");
                 let answered = thumbs_request(thumbs.as_ref(), &p, &trace_id).await;
                 return outcome(id, into_outcome(answered));
+            }
+            if m == app::ASSET_AI_EDIT {
+                // Task 15 (P4b-R17): the dispatcher relabels the entry in the session's
+                // workspace.
+                let p: app::AiEditParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        return Response::Error {
+                            id: Some(id),
+                            error,
+                        };
+                    }
+                };
+                let trace_id = self.ids.id("t");
+                let relabelled = self.dispatcher.ai_edit(session, p, &trace_id).await;
+                return outcome(id, into_outcome(relabelled));
             }
             return not_found(id);
         }

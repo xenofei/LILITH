@@ -157,7 +157,9 @@ async fn watcher_failure_drops_to_no_watcher_mode() {
         .await
         .expect("a write without a watcher");
     assert_eq!(written.path, p("notes/a.txt"));
-    let report = watcher.notify(vec![p("notes/a.txt"), p(".git/HEAD")]).await;
+    let report = watcher
+        .notify(vec![p("notes/a.txt"), p(".git/HEAD")], None)
+        .await;
     assert_eq!(report.reconciled, ["notes/a.txt"]);
     assert_eq!(report.ignored, [".git/HEAD"]);
     let all = published(&events, "workspace").await;

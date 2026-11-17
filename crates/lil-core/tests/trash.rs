@@ -381,7 +381,7 @@ async fn legacy_folder_stays_reserved_after_pr_d() {
         .expect("a read-write open has a watcher");
     write_file(&ws.join(LEGACY).join("later.txt"), b"later");
     let report = watcher
-        .notify(vec![p(&inside), p(&format!("{LEGACY}/later.txt"))])
+        .notify(vec![p(&inside), p(&format!("{LEGACY}/later.txt"))], None)
         .await;
     assert!(report.reconciled.is_empty(), "{report:?}");
     assert_eq!(report.ignored.len(), 2, "{report:?}");
@@ -4508,4 +4508,67 @@ async fn an_app_question_made_after_the_clock_moved_back_survives_a_list() {
     assert_eq!(answered.state.wire(), "approved");
     drop(core);
     states.close();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 15: attribution (CORE-023, ARCH-125; P4b-R16).
+// ---------------------------------------------------------------------------------------------
+
+/// Every redirect writer records its caller's actor beside `by`: `asset.accept_move` of a
+/// folder renamed outside, and `trash.restore {to}` of a whole asset (P4b-R39).
+#[tokio::test] // spec: CORE-023, ARCH-125, CORE-154, CORE-037
+async fn redirects_carry_the_actor() {
+    let (fx, _fake) = AssetFx::faked(crane_folder_renamed).await;
+    let session = |caller| fx.session(caller, "s_actor");
+    let accepted = fx
+        .call_as(
+            &session(CallerKind::Mcp),
+            "asset.accept_move",
+            json!({"project": P4, "asset_id": ORIGAMI}),
+            Some(&tkey()),
+        )
+        .await;
+    ok_of(&accepted, "asset.accept_move");
+    let entry_id = fx.trash_ok(ORIGAMI).await;
+    let restored = fx
+        .call_as(
+            &session(CallerKind::Assistant),
+            "trash.restore",
+            json!({"entry_id": entry_id, "to": "chr_crane_two"}),
+            Some(&tkey()),
+        )
+        .await;
+    ok_of(&restored, "trash.restore {to}");
+
+    let open = fx.open().await;
+    let redirects = lil_core::projects::read_redirects(&open.store)
+        .await
+        .expect("registry/redirects.yaml");
+    let got: Vec<(String, String, String, Option<String>)> = redirects
+        .iter()
+        .map(|r| {
+            (
+                format!("{}/{}", r.from.0, r.from.1),
+                format!("{}/{}", r.to.0, r.to.1),
+                r.by.clone(),
+                r.actor.as_ref().map(|a| a.kind.as_str().to_string()),
+            )
+        })
+        .collect();
+    let entry = |from: &str, to: &str, by: &str, kind: &str| {
+        (
+            format!("{P4}/{from}"),
+            format!("{P4}/{to}"),
+            by.to_string(),
+            Some(kind.to_string()),
+        )
+    };
+    assert_eq!(
+        got,
+        [
+            entry(CRANE, ORIGAMI, "claude-code", "claude_code"),
+            entry(ORIGAMI, "chr_crane_two", "assistant", "tether"),
+        ]
+    );
+    fx.shutdown().await;
 }
