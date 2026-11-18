@@ -14,6 +14,11 @@ yanked = "deny"
 id = "RUSTSEC-2026-0374"
 reason = "basic-toml is unmaintained; transitive via age's i18n-embed; no maintained upgrade path; revisit when age drops i18n-embed"
 
+# Owner decision 2026-11-17: time-limited. Remove this entry by 2027-03-31 at the latest.
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono is unmaintained (informational; no known vulnerability); transitive via rmcp 3.10 (lil-mcp) and the schemars chrono04 feature that rmcp turns on. No suite code uses chrono, and no rmcp release drops it yet. Remove when rmcp makes chrono optional (modelcontextprotocol/rust-sdk#1469), or by 2027-03-31"
+
 # Owner decision 2026-10-24: the one recorded exception to "vulnerabilities are always denied".
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0387"
