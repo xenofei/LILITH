@@ -5,13 +5,17 @@
 //!
 //! | Tool | Effect | Arguments | `structured` result |
 //! |---|---|---|---|
-//! | `assets.query` | read | `{project?, status?, type?, text?, tags?, rating_min?, label?, flag?, duplicates?, deprecated?, facets?, sort?, limit?, cursor?}` | `{assets: [AssetSummary], next_cursor: string\|null, total, facets?, tags_more?}` |
+//! | `assets.query` | read | `{project?, status?, type?, text?, tags?, rating_min?, label?, flag?, collection?, duplicates?, deprecated?, facets?, sort?, limit?, cursor?}` | `{assets: [AssetSummary], next_cursor: string\|null, total, facets?, tags_more?}` |
 //! | `asset.get` | read | `{project?, asset_id}` | `AssetDetail` |
 //!
 //! `assets.query`'s `project` is a filter: omitted, it means every project (the session's
 //! active project never narrows it). `status` and `type` take a string or a list (any of);
 //! `label` takes `none` for an unlabelled asset; `deprecated` defaults to `show` (Appendix H
-//! "`assets.query`"; CORE-152, CORE-168, CORE-170, P4b-R10, P4b-R11). With `facets: true` the
+//! "`assets.query`"; CORE-152, CORE-168, CORE-170, P4b-R10, P4b-R11). `collection` is a saved
+//! search's or collection's id (CORE-155): a search adds its rule's filters, a collection its
+//! refs, resolved through the redirects (`collection.unknown` for an id no entry has; the
+//! quick collection is known before its first save). [`rule_query`] validates a saved search's
+//! rule as this filter set. With `facets: true` the
 //! result has `facets: {status, type, tags, rating, label, flag}` and, beside it, `tags_more`
 //! (PR #89 audit, L3). `asset.get`'s omitted `project` is the call's resolved project
 //! (`CallCtx::project`: the session's active project, else the workspace's hint, else
@@ -24,6 +28,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::collection_tools::collection_filter;
 use super::registry::{CallCtx, Registry, typed_tool};
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::index::{
@@ -44,7 +49,8 @@ const QUERY_DESCRIPTION: &str = "List the workspace's assets, a page at a time. 
     project), status and type (a value or a list, any of), text (words matched as prefixes of \
     the asset id, type, status and text fields), tags (any of, case-insensitive), rating_min \
     (0-5), label (any of red, yellow, green, blue, purple, none), flag (pick or reject: assets \
-    with a take so flagged in any run not trashed), duplicates (true: assets sharing a sealed or \
+    with a take so flagged in any run not trashed), collection (a saved search's or \
+    collection's id from collections.list), duplicates (true: assets sharing a sealed or \
     candidate file's bytes with another asset), deprecated (show, the default, hide or only). \
     facets: true also counts status, type, tags (the 100 largest, with tags_more), rating, label \
     and flag, each over every filter but its own. sort is {field: asset_id|updated|status|type, \
@@ -169,6 +175,8 @@ struct QueryArgs {
     /// Assets with a take so flagged in any run not trashed.
     #[schemars(length(max = 256))]
     flag: Option<Vec<FlagArg>>,
+    /// A saved search's or collection's id (`collections.list`).
+    collection: Option<String>,
     /// `true`: assets sharing a sealed or candidate file's bytes with another asset.
     duplicates: Option<bool>,
     /// `show` (default), `hide` or `only`.
@@ -250,22 +258,13 @@ fn invalid(ctx: &CallCtx, why: String) -> ErrorBody {
     ErrorBody::new(&PARAMS_INVALID, why, ctx.trace_id.clone())
 }
 
-async fn query(ctx: &CallCtx, args: QueryArgs) -> Result<(QueryResult, String), ErrorBody> {
-    let open = ctx.workspace()?;
-    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
-    if !(1..=MAX_LIMIT).contains(&limit) {
-        return Err(invalid(
-            ctx,
-            format!("limit is 1 to {MAX_LIMIT}; {limit} is outside that"),
-        ));
-    }
+/// The filters of `args` (`project` to `deprecated`, `collection` left out) as a query, checked
+/// as `assets.query` checks them: `rating_min` 0-5, at most [`MAX_LIST`] values per list.
+fn filters(args: &mut QueryArgs) -> Result<AssetQuery, String> {
     if let Some(r) = args.rating_min
         && r > lil_schema::marks::MAX_RATING
     {
-        return Err(invalid(
-            ctx,
-            format!("rating_min is 0 to 5; {r} is outside that"),
-        ));
+        return Err(format!("rating_min is 0 to 5; {r} is outside that"));
     }
     for (name, len) in [
         ("status", args.status.as_ref().map(OneOrList::len)),
@@ -277,36 +276,23 @@ async fn query(ctx: &CallCtx, args: QueryArgs) -> Result<(QueryResult, String), 
         if let Some(len) = len
             && len > MAX_LIST
         {
-            return Err(invalid(
-                ctx,
-                format!("{name} takes at most {MAX_LIST} values; {len} were given"),
+            return Err(format!(
+                "{name} takes at most {MAX_LIST} values; {len} were given"
             ));
         }
     }
-    let sort = args.sort.map_or((SortField::AssetId, SortDir::Asc), |s| {
-        let field = match s.field {
-            FieldArg::AssetId => SortField::AssetId,
-            FieldArg::Updated => SortField::Updated,
-            FieldArg::Status => SortField::Status,
-            FieldArg::Type => SortField::Type,
-        };
-        let dir = match s.dir {
-            DirArg::Asc => SortDir::Asc,
-            DirArg::Desc => SortDir::Desc,
-        };
-        (field, dir)
-    });
-    let mut q = AssetQuery {
-        project: args.project,
-        status: args.status.map(Choice::from),
-        asset_type: args.asset_type.map(Choice::from),
-        text: args.text,
-        tags: args.tags,
+    Ok(AssetQuery {
+        project: args.project.take(),
+        status: args.status.take().map(Choice::from),
+        asset_type: args.asset_type.take().map(Choice::from),
+        text: args.text.take(),
+        tags: args.tags.take(),
         rating_min: args.rating_min,
         label: args
             .label
+            .take()
             .map(|l| l.into_iter().map(LabelArg::label).collect()),
-        flag: args.flag.map(|f| {
+        flag: args.flag.take().map(|f| {
             f.into_iter()
                 .map(|f| match f {
                     FlagArg::Pick => Flag::Pick,
@@ -321,11 +307,70 @@ async fn query(ctx: &CallCtx, args: QueryArgs) -> Result<(QueryResult, String), 
             DeprecatedArg::Hide => DeprecatedFilter::Hide,
             DeprecatedArg::Only => DeprecatedFilter::Only,
         }),
-        sort,
-        limit,
-        after: None,
-        facets: args.facets == Some(true),
-    };
+        ..AssetQuery::default()
+    })
+}
+
+/// A saved search's `rule` validated as an `assets.query` filter set (Appendix H "Organising
+/// tools"): `assets.query`'s arguments without `sort`, `limit`, `cursor` and `facets`, and
+/// without `collection` (a search is never defined by another entry, so no rule can loop),
+/// each checked as `assets.query` checks it. Returns the filters as a query.
+///
+/// # Errors
+/// Why the rule isn't such a filter set (an unknown key, a value of the wrong type, a rating
+/// outside 0-5, …).
+pub fn rule_query(rule: &serde_json::Map<String, Value>) -> Result<AssetQuery, String> {
+    for key in ["sort", "limit", "cursor", "facets"] {
+        if rule.contains_key(key) {
+            return Err(format!(
+                "a rule is a filter set, so {key} doesn't apply (nor do sort, limit, cursor and \
+                 facets); pass it to assets.query with the collection instead"
+            ));
+        }
+    }
+    if rule.contains_key("collection") {
+        return Err("a rule can't name a collection; use its filters instead".to_string());
+    }
+    let mut args: QueryArgs = serde_json::from_value(Value::Object(rule.clone()))
+        .map_err(|e| format!("the rule isn't an assets.query filter set: {e}"))?;
+    filters(&mut args)
+}
+
+async fn query(ctx: &CallCtx, mut args: QueryArgs) -> Result<(QueryResult, String), ErrorBody> {
+    let open = ctx.workspace()?;
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
+    if !(1..=MAX_LIMIT).contains(&limit) {
+        return Err(invalid(
+            ctx,
+            format!("limit is 1 to {MAX_LIMIT}; {limit} is outside that"),
+        ));
+    }
+    let mut q = filters(&mut args).map_err(|why| invalid(ctx, why))?;
+    q.sort = args.sort.map_or((SortField::AssetId, SortDir::Asc), |s| {
+        let field = match s.field {
+            FieldArg::AssetId => SortField::AssetId,
+            FieldArg::Updated => SortField::Updated,
+            FieldArg::Status => SortField::Status,
+            FieldArg::Type => SortField::Type,
+        };
+        let dir = match s.dir {
+            DirArg::Asc => SortDir::Asc,
+            DirArg::Desc => SortDir::Desc,
+        };
+        (field, dir)
+    });
+    q.limit = limit;
+    q.facets = args.facets == Some(true);
+    if let Some(id) = &args.collection {
+        open.index
+            .ready_result()
+            .await
+            .map_err(|e| e.to_error(&ctx.trace_id))?;
+        q.collection = Some(collection_filter(open, id).await.map_err(|mut e| {
+            e.trace_id.clone_from(&ctx.trace_id);
+            e
+        })?);
+    }
     if let Some(cursor) = &args.cursor {
         q.after = Some(decode_cursor(&q, cursor).map_err(|why| invalid(ctx, why))?);
     }
