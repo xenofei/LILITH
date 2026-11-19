@@ -210,6 +210,12 @@ fn plan(args: &SaveArgs) -> Result<Plan, ErrorBody> {
         ));
     }
     if let Some(rule) = &args.rule {
+        // A null would read as "not given" here but can't be written to the file (review M-4).
+        if let Some((key, _)) = rule.iter().find(|(_, v)| v.is_null()) {
+            return Err(invalid(format!(
+                "rule: {key} is null; leave the key out instead"
+            )));
+        }
         rule_query(rule).map_err(|why| invalid(format!("rule: {why}")))?;
     }
     let refs = args

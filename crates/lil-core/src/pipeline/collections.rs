@@ -26,13 +26,15 @@
 //! `registry/collections.yaml`, `reason` `collection.delete`, then the fail point
 //! `collections.after_payload`, then the edit. A retry after a failure between them finds the
 //! earlier payload of that entry (same reason, original path and SHA-256 of the same bytes) and
-//! reuses it, so one trash entry is left.
+//! reuses it, so one trash entry is left. When the entry changed in the file since it was read
+//! (an outside edit), the delete is refused (`store.hash_conflict`), the file is left as it is,
+//! and the payload this call made leaves the trash again.
 //!
 //! **Restore** ([`restore`]) merges the payload's entry back by `id`, appended after the
 //! entries there: refused with `trash.restore_conflict` when its `id` or its name (compared
-//! case-insensitively) is in use, and nothing is replaced. The entry leaves the trash only
-//! after the edit. An entry already back exactly as it was (a restore cut short after its edit)
-//! just leaves the trash.
+//! case-insensitively) is in use, and nothing is replaced. The merge edit is the commit point;
+//! the entry leaves the trash after it, best effort (a failure there is a warning). An entry
+//! already back exactly as it was (a restore cut short after its edit) just leaves the trash.
 
 use std::sync::Mutex;
 
@@ -402,6 +404,16 @@ pub async fn save(
 ) -> Result<(Collection, Option<Collection>), ErrorBody> {
     let lock = store.collections_lock();
     let _held = lock.lock().await;
+    // A change that changes nothing never reaches the store's edit, which would create the file
+    // for the quick collection before its first save (review M-1).
+    if !create && let Ok(file) = read_collections(store).await {
+        let current = listed(file).into_iter().find(|c| c.id == id);
+        if let Some(current) = current
+            && change(Some(&current)).is_ok_and(|new| new == current)
+        {
+            return Ok((current.clone(), Some(current)));
+        }
+    }
     let refused = Mutex::new(None);
     let saved = Mutex::new(None);
     let edit = |text: &str| -> Result<String, StoreError> {
@@ -430,9 +442,12 @@ pub async fn save(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((new.clone(), current.cloned()));
+        // Nothing changes (the quick collection before its first save included): no write.
+        if current == Some(&new) {
+            return Ok(text.to_string());
+        }
         let entries = yaml_entries(&new)?;
         match at {
-            Some(_) if current == Some(&new) => Ok(text.to_string()),
             Some(index) => edited(
                 text,
                 YamlEdit::SetListItem {
@@ -495,6 +510,7 @@ pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection)
                 && r.original_path == COLLECTIONS_YAML
                 && r.sha256.as_deref() == Some(sha256.as_str())
         });
+    let made_now = earlier.is_none();
     let record = match earlier {
         Some(record) => record,
         None => store
@@ -520,6 +536,14 @@ pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection)
         match file.iter().position(|c| c.id == id) {
             // Gone meanwhile (an outside edit): nothing left to take out.
             None => Ok(text.to_string()),
+            // Changed meanwhile by an outside edit: the trash holds the entry as it was read,
+            // so the newer one is never taken out (review M-3).
+            Some(index) if file[index] != entry => Err(StoreError::HashConflict {
+                path: collections_path(),
+                backup: None,
+                cloud_only: false,
+                kept: Vec::new(),
+            }),
             Some(index) => edited(
                 text,
                 YamlEdit::RemoveListItem {
@@ -529,20 +553,28 @@ pub async fn delete(store: &Store, id: &str) -> Result<(TrashRecord, Collection)
             ),
         }
     };
-    store
-        .edit_text(&collections_path(), &edit)
-        .await
-        .map_err(error)?;
+    if let Err(e) = store.edit_text(&collections_path(), &edit).await {
+        // Nothing changed in the file: the payload this call put in the trash goes again (one
+        // reused from an earlier attempt stays, as that attempt left it).
+        if made_now && let Err(dropped) = store.trash_drop_merged(&record.entry_id, &sha256).await {
+            tracing::warn!(entry = %record.entry_id, error = %dropped, "a refused delete's trash entry stays");
+        }
+        return Err(error(e));
+    }
     Ok((record, entry))
 }
 
 /// Restores trash entry `entry_id`, a deleted entry, by merging it back by id (module docs).
-/// Returns the restored entry.
+/// Returns the restored entry and the warnings of the steps after the commit (the merge edit):
+/// an entry that couldn't leave the trash is logged and named there, never an error.
 ///
 /// # Errors
 /// `trash.unknown`; `trash.restore_conflict` when its id or name is in use; `params.invalid`
 /// when the payload isn't one entry; the file's and the store's errors.
-pub async fn restore(store: &Store, entry_id: &str) -> Result<Collection, ErrorBody> {
+pub async fn restore(
+    store: &Store,
+    entry_id: &str,
+) -> Result<(Collection, Vec<String>), ErrorBody> {
     let error = |e: StoreError| e.to_error("");
     let lock = store.collections_lock();
     let _held = lock.lock().await;
@@ -602,12 +634,21 @@ pub async fn restore(store: &Store, entry_id: &str) -> Result<Collection, ErrorB
         .edit_text(&collections_path(), &edit)
         .await
         .map_err(|e| refusal(&refused, e))?;
-    // The commit point: the entry leaves the trash once the file holds it again.
-    store
+    // The merge edit was the commit point (Appendix E): the entry leaves the trash after it,
+    // best effort.
+    let mut warnings = Vec::new();
+    if let Err(e) = store
         .trash_drop_merged(entry_id, &lil_schema::sha256_hex(&bytes))
         .await
-        .map_err(error)?;
-    Ok(back)
+    {
+        tracing::warn!(entry = %entry_id, error = %e, "a restored collection's trash entry stays");
+        warnings.push(format!(
+            "{} is back in {COLLECTIONS_YAML}, but its trash entry {entry_id} couldn't be \
+             removed ({e}); it is purged with the trash.",
+            back.name
+        ));
+    }
+    Ok((back, warnings))
 }
 
 /// A ref's state in `collections.list` (Appendix H).
@@ -648,6 +689,12 @@ async fn resolve_one(
     }
 }
 
+/// Checks the liveness of every ref's name in one batch (review M-5).
+async fn preload(resolver: &Resolver<'_>, refs: &[String]) {
+    let names: Vec<(String, String)> = refs.iter().filter_map(|r| parse_name(r)).collect();
+    resolver.preload_live(&names).await;
+}
+
 /// The state of each of `refs`, in order (Appendix H).
 ///
 /// # Errors
@@ -657,6 +704,7 @@ pub async fn ref_states(
     resolver: &Resolver<'_>,
     refs: &[String],
 ) -> Result<Vec<RefState>, ErrorBody> {
+    preload(resolver, refs).await;
     let mut out = Vec::with_capacity(refs.len());
     for r in refs {
         let (state, live) = resolve_one(resolver, r).await?;
@@ -681,6 +729,7 @@ pub async fn live_refs(
     resolver: &Resolver<'_>,
     refs: &[String],
 ) -> Result<Vec<(String, String)>, ErrorBody> {
+    preload(resolver, refs).await;
     let mut out: Vec<(String, String)> = Vec::new();
     for r in refs {
         if let (_, Some(live)) = resolve_one(resolver, r).await?

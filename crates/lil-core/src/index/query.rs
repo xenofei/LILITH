@@ -25,7 +25,9 @@
 //! `canonical_json({project, status, type, text, sort})`, each argument in the form it was given
 //! (a `status` or `type` string hashes as before plan 4b, a list as the list), plus each new
 //! filter key that is present (`tags`, `rating_min`, `label`, `flag`, `collection`,
-//! `duplicates`, `deprecated`), so a cursor made before those keys existed stays valid. `limit`
+//! `duplicates`, `deprecated`), so a cursor made before those keys existed stays valid.
+//! `collection` hashes as its id when the query carries it (`collection_id`), so a change to
+//! the collection's members or rule between pages keeps the cursor valid. `limit`
 //! and `facets` aren't part of it: neither changes which assets match, so the page size may
 //! change between pages and the next page needn't ask for facets again. A cursor never
 //! expires: it holds a position, not a snapshot.
@@ -161,6 +163,10 @@ pub struct AssetQuery {
     /// An asset with a take so flagged in any run not trashed.
     pub flag: Option<Vec<Flag>>,
     pub collection: Option<CollectionFilter>,
+    /// The `collection` argument as given (a saved search's or collection's id): when set, the
+    /// cursor's query hash holds it instead of what it resolved to (Appendix H: each argument in
+    /// the form it was given), so a change to the collection between pages keeps a cursor valid.
+    pub collection_id: Option<String>,
     /// `Some(true)`: assets sharing bytes with another asset.
     pub duplicates: Option<bool>,
     /// `None` is `show`.
@@ -186,6 +192,7 @@ impl Default for AssetQuery {
             label: None,
             flag: None,
             collection: None,
+            collection_id: None,
             duplicates: None,
             deprecated: None,
             sort: (SortField::AssetId, SortDir::Asc),
@@ -271,7 +278,9 @@ fn filter_json(q: &AssetQuery) -> serde_json::Map<String, Value> {
         let flags: Vec<&str> = flags.iter().map(|f| f.as_str()).collect();
         f.insert("flag".into(), json!(flags));
     }
-    if let Some(c) = &q.collection {
+    if let Some(id) = &q.collection_id {
+        f.insert("collection".into(), json!(id));
+    } else if let Some(c) = &q.collection {
         let c = match c {
             CollectionFilter::Refs(refs) => {
                 let refs: Vec<String> = refs.iter().map(|(p, a)| format!("{p}/{a}")).collect();

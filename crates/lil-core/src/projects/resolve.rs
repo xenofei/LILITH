@@ -441,6 +441,32 @@ impl<'a> Resolver<'a> {
             .copied()
     }
 
+    /// Checks the liveness of every one of `names` not yet known in one blocking batch, so a
+    /// later [`Resolver::resolve_name`] of each needs no disk check of its own (a collection's
+    /// refs, CORE-155).
+    pub async fn preload_live(&self, names: &[(String, String)]) {
+        let unknown: Vec<Name> = {
+            let cache = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut wanted: Vec<Name> = names
+                .iter()
+                .filter(|n| !cache.contains_key(*n))
+                .cloned()
+                .collect();
+            wanted.sort();
+            wanted.dedup();
+            wanted
+        };
+        if unknown.is_empty() {
+            return;
+        }
+        let found = check_live(self.store, unknown.clone()).await;
+        let mut cache = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        for name in unknown {
+            let live = found.get(&name).copied().unwrap_or(false);
+            cache.entry(name).or_insert(live);
+        }
+    }
+
     /// Whether `name` has a live folder (checked on disk once).
     async fn is_live(&self, name: &Name) -> bool {
         if let Some(live) = self.cached_live(name) {

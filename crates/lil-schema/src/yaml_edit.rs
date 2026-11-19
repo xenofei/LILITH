@@ -838,6 +838,25 @@ fn append_mapping(
     if let Some(why) = refuse_value(first) {
         return Err(fail(why));
     }
+    // An empty flow list (`key: []`, which a removal of the last item leaves) becomes a block
+    // list below the key, so the item can be edited and removed in place later; a comment after
+    // the `[]` stays on the key's line.
+    if let Some(after) = text[hit.value..line.end]
+        .strip_prefix('[')
+        .map(|r| r.trim_start_matches([' ', '\t']))
+        .and_then(|r| r.strip_prefix(']'))
+        && (after.trim().is_empty() || after.trim_start().starts_with('#'))
+    {
+        let mut out = String::with_capacity(text.len() + 64);
+        out.push_str(&text[..hit.colon]);
+        if !after.trim().is_empty() {
+            out.push_str(after);
+        }
+        out.push_str(eol);
+        out.push_str(&block_item(entries, hit.indent + 2, eol));
+        out.push_str(&text[line.next..]);
+        return Ok(out);
+    }
     let item = flow_mapping(entries);
     if first != '[' {
         // yaml-rust2 reads only `~` and `null` as null.
@@ -1659,10 +1678,26 @@ tools: {}
             "redirects:   # none yet\n  - from: a/x\n    to: a/y\n    moved_utc: 2026-11-05T10:00:00Z\n    by: cli\nname: x\n"
         );
         // A flow list and a null: a flow mapping.
+        // An empty flow list becomes a block list below the key (Task 9 fix round 1, C-1),
+        // its comment kept; a list with items stays a flow list.
         let out = apply("redirects: []  # c\n", &[redirect("a/x", "a/y", true)]).unwrap();
         assert_eq!(
             out,
-            "redirects: [{from: a/x, to: a/y, moved_utc: 2026-11-05T10:00:00Z, by: cli, actor: {kind: claude_code, session_id: \"s: 1\"}}]  # c\n"
+            "redirects:  # c\n  - from: a/x\n    to: a/y\n    moved_utc: 2026-11-05T10:00:00Z\n    by: cli\n    actor:\n      kind: claude_code\n      session_id: \"s: 1\"\n"
+        );
+        let out = apply("x: 1\nredirects: [ ]\n", &[redirect("a/x", "a/y", false)]).unwrap();
+        assert_eq!(
+            out,
+            "x: 1\nredirects:\n  - from: a/x\n    to: a/y\n    moved_utc: 2026-11-05T10:00:00Z\n    by: cli\n"
+        );
+        let out = apply(
+            "redirects: [{from: a/w, to: a/z, moved_utc: t, by: cli}]\n",
+            &[redirect("a/x", "a/y", false)],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "redirects: [{from: a/w, to: a/z, moved_utc: t, by: cli}, {from: a/x, to: a/y, moved_utc: 2026-11-05T10:00:00Z, by: cli}]\n"
         );
         let out = apply("redirects: ~\n", &[redirect("a/x", "a/y", false)]).unwrap();
         assert_eq!(
@@ -1781,6 +1816,27 @@ collections:   # entries
         assert_eq!(
             out,
             "# top\ncollections: []   # entries\n  # first\n\n  # second\n# end\n"
+        );
+        // An append to the emptied list writes a block list again, so the item can be set and
+        // removed in place (Task 9 fix round 1, C-1).
+        let id = |v: &str| vec![("id".to_string(), YamlValue::Str(v.into()))];
+        let append = |v: &str| YamlEdit::AppendMappingToList {
+            path: vec!["collections".into()],
+            entries: id(v),
+        };
+        let again = apply(&out, &[append("d"), append("e")]).unwrap();
+        assert_eq!(
+            again,
+            "# top\ncollections:   # entries\n  - id: d\n  - id: e\n  # first\n\n  # second\n# end\n"
+        );
+        let edited = apply(
+            &again,
+            &[item(0, &[("id", YamlValue::Str("d2".into()))]), remove(1)],
+        )
+        .unwrap();
+        assert_eq!(
+            edited,
+            "# top\ncollections:   # entries\n  - id: d2\n  # first\n\n  # second\n# end\n"
         );
         // A list at the key's own indent, CRLF line ends.
         let out = apply(
