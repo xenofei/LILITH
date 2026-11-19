@@ -1171,3 +1171,246 @@ async fn a_restore_cut_short_after_its_edit_finishes() {
     assert_eq!(ids, [json!(QUICK), json!(id)]);
     fx.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit fix round 1 (audit H-1, M-1, M-2, L-1, L-2).
+// ---------------------------------------------------------------------------------------------
+
+/// The `collection.delete` trash entries, newest last.
+async fn delete_entries(fx: &Fx) -> Vec<Value> {
+    fx.trash_entries()
+        .await
+        .into_iter()
+        .filter(|e| e["reason"] == "collection.delete")
+        .collect()
+}
+
+/// Whether `id` is listed, else restored from its newest `collection.delete` trash entry and
+/// listed then.
+async fn listed_or_restorable(fx: &Fx, id: &str) -> bool {
+    if fx.listed(id).await.is_some() {
+        return true;
+    }
+    for entry in delete_entries(fx).await.into_iter().rev() {
+        let out = fx
+            .call("trash.restore", json!({"entry_id": entry["entry_id"]}))
+            .await;
+        if matches!(out, Outcome::Ok(_)) && fx.listed(id).await.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Audit H-1 (probe G): the store fails after its replace during a delete (`store.after_replace`,
+/// once). The entry is in the file or restorable from the trash, also after `Store::recover()`.
+#[tokio::test] // spec: CORE-155, ARCH-058, QA-055
+async fn a_delete_failing_after_its_replace_loses_nothing() {
+    let fx = Fx::new(|_| {}).await;
+    let id = fx
+        .save_id(json!({"name": "Gone", "refs": [CRANE_REF]}))
+        .await;
+    let armed = Arc::new(AtomicBool::new(false));
+    {
+        let armed = armed.clone();
+        fx.failpoints.on(
+            "store.after_replace",
+            Box::new(move || {
+                if armed.swap(false, Ordering::SeqCst) {
+                    return Err(std::io::Error::other("fail point store.after_replace"));
+                }
+                Ok(())
+            }),
+        );
+    }
+    armed.store(true, Ordering::SeqCst);
+    let out = fx.call("collection.delete", json!({"id": id})).await;
+    assert!(!armed.load(Ordering::SeqCst), "the fail point was hit");
+    // The entry left the file, so the delete answers as made, with a warning.
+    let done = ok_of(&out, "a delete whose store failed after the replace");
+    assert!(
+        done["warnings"].as_array().is_some_and(|w| !w.is_empty()),
+        "{done}"
+    );
+    let open = fx.open().await;
+    open.store.recover().await.expect("recovery");
+    assert!(listed_or_restorable(&fx, &id).await, "the entry is lost");
+    fx.shutdown().await;
+}
+
+/// Audit M-1 (probe A): a trash record whose payload is gone (as a crash inside the trash write
+/// leaves it) is never reused: the retry writes a fresh payload, and the entry is restorable.
+#[tokio::test] // spec: CORE-155, ARCH-058
+async fn a_retry_never_reuses_a_record_without_its_payload() {
+    let fx = Fx::new(|_| {}).await;
+    let id = fx
+        .save_id(json!({"name": "Kept", "refs": [CRANE_REF]}))
+        .await;
+    let fail = Arc::new(AtomicBool::new(true));
+    {
+        let fail = fail.clone();
+        fx.failpoints.on(
+            "collections.after_payload",
+            Box::new(move || {
+                if fail.swap(false, Ordering::SeqCst) {
+                    return Err(std::io::Error::other(
+                        "fail point collections.after_payload",
+                    ));
+                }
+                Ok(())
+            }),
+        );
+    }
+    fx.err("collection.delete", json!({"id": id})).await;
+    let first = delete_entries(&fx).await[0]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payload = fx.payload_of(&first);
+    remove_by_hand(&payload);
+    let done = fx.ok("collection.delete", json!({"id": id})).await;
+    assert_ne!(done["entry_id"], first.as_str(), "a fresh entry: {done}");
+    assert!(fx.listed(&id).await.is_none());
+    fx.ok("trash.restore", json!({"entry_id": done["entry_id"]}))
+        .await;
+    assert_eq!(fx.listed(&id).await.unwrap()["name"], "Kept");
+    fx.shutdown().await;
+}
+
+/// Removes a file as an outside program (or a crash) would.
+#[allow(clippy::disallowed_methods)]
+fn remove_by_hand(path: &Path) {
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Audit M-2 (probe B): a `registry/redirects.yaml` that doesn't parse never turns a save into
+/// an error after it is made, the list still lists every entry, and a query by a collection
+/// answers with its live refs.
+#[tokio::test] // spec: CORE-155, ARCH-125
+async fn a_broken_redirects_file_never_breaks_the_collections() {
+    let fx = Fx::new(|ws| {
+        write_file(&ws_file(ws, "registry/redirects.yaml"), b"redirects: 5\n");
+    })
+    .await;
+    let search = fx
+        .save_id(json!({"name": "Search", "rule": {"type": "image"}}))
+        .await;
+    let saved = fx
+        .ok(
+            "collection.save",
+            json!({"id": QUICK, "add": ["sketchbook/never_was", CRANE_REF]}),
+        )
+        .await;
+    assert_eq!(
+        ref_states(&saved["collection"]),
+        [
+            (
+                "sketchbook/never_was".to_string(),
+                "missing".to_string(),
+                None
+            ),
+            (CRANE_REF.to_string(), "ok".to_string(), None),
+        ]
+    );
+    assert!(
+        saved["warnings"].as_array().is_some_and(|w| !w.is_empty()),
+        "{saved}"
+    );
+    let list = fx.ok("collections.list", json!({})).await;
+    let ids: Vec<Value> = list["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(QUICK), json!(search)], "{list}");
+    assert!(
+        list["warnings"].as_array().is_some_and(|w| !w.is_empty()),
+        "{list}"
+    );
+    assert_eq!(fx.query_ids(json!({"collection": QUICK})).await, [CRANE]);
+    fx.shutdown().await;
+}
+
+/// Audit L-1 (probe C): an earlier attempt's trash entry older than a day is never reused, so
+/// the deleted entry is still restorable after a maintenance pass two days on.
+#[tokio::test] // spec: CORE-155, CORE-037, ARCH-058
+async fn an_old_earlier_payload_is_not_reused() {
+    use lil_core::store::trash::parse_rfc3339;
+    let fx = Fx::new(|_| {}).await;
+    let id = fx
+        .save_id(json!({"name": "Aged", "refs": [CRANE_REF]}))
+        .await;
+    let fail = Arc::new(AtomicBool::new(true));
+    {
+        let fail = fail.clone();
+        fx.failpoints.on(
+            "collections.after_payload",
+            Box::new(move || {
+                if fail.swap(false, Ordering::SeqCst) {
+                    return Err(std::io::Error::other(
+                        "fail point collections.after_payload",
+                    ));
+                }
+                Ok(())
+            }),
+        );
+    }
+    fx.err("collection.delete", json!({"id": id})).await;
+    let old = delete_entries(&fx).await[0].clone();
+    let old_id = old["entry_id"].as_str().unwrap().to_string();
+    // Age the earlier attempt's record: moved 29 days ago, purged in a day.
+    let now = parse_rfc3339(old["moved_utc"].as_str().unwrap()).unwrap();
+    let record = fx
+        .payload_of(&old_id)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("restore.json");
+    let mut json: Value = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    json["moved_utc"] = json!(lil_schema::time::rfc3339(now - 29 * 86_400));
+    json["purge_after"] = json!(lil_schema::time::rfc3339(now + 86_400));
+    write_file(
+        &record,
+        serde_json::to_string_pretty(&json).unwrap().as_bytes(),
+    );
+
+    let done = fx.ok("collection.delete", json!({"id": id})).await;
+    assert_ne!(done["entry_id"], old_id.as_str(), "a fresh entry: {done}");
+    let open = fx.open().await;
+    let report = open.store.maintenance(now + 2 * 86_400).await.unwrap();
+    assert_eq!(
+        report.purged,
+        [old_id],
+        "the old entry purges on its own date"
+    );
+    fx.ok("trash.restore", json!({"entry_id": done["entry_id"]}))
+        .await;
+    assert_eq!(fx.listed(&id).await.unwrap()["name"], "Aged");
+    fx.shutdown().await;
+}
+
+/// Audit L-2 (probe F): an entry with a hand-written null (`note:`) and a float deletes,
+/// restores and renames through the tools, those keys kept.
+#[tokio::test] // spec: CORE-155, ARCH-076
+async fn an_entry_with_a_null_or_float_deletes_and_restores() {
+    const ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let start = format!(
+        "collections:\n  - id: {ID}\n    name: Hand\n    refs: []\n    note:\n    weight: 1.5\n"
+    );
+    let fx = Fx::new(|ws| write_file(&ws_file(ws, FILE), start.as_bytes())).await;
+    let entry = fx.ok("collection.delete", json!({"id": ID})).await["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(fx.listed(ID).await.is_none());
+    fx.ok("trash.restore", json!({"entry_id": entry})).await;
+    fx.save(json!({"id": ID, "name": "Hand 2"})).await;
+    let file = fx.file().unwrap();
+    assert!(
+        file.contains("name: Hand 2") && file.contains("note: ~") && file.contains("weight: 1.5"),
+        "{file}"
+    );
+    fx.shutdown().await;
+}
