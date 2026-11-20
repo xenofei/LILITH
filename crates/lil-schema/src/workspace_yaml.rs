@@ -48,6 +48,8 @@ pub struct ProjectYaml {
     pub overrides: Map<String, Value>,
     /// `style_bible`: the style bible's path, when it is a non-empty string.
     pub style_bible: Option<String>,
+    /// `style_bible` as written, for [`ProjectYaml::style_version`]'s check.
+    style_bible_raw: Option<Value>,
     /// `style_version` as written (I4), read through [`ProjectYaml::style_version`].
     style_version_raw: Option<Value>,
 }
@@ -58,11 +60,14 @@ impl ProjectYaml {
     /// it has none.
     ///
     /// # Errors
-    /// With a `style_bible`, a `style_version` that isn't a whole number from 0 to 2^32 - 1:
-    /// the reason.
+    /// A `style_bible` that isn't a string (nor `null`), or, with a `style_bible`, a
+    /// `style_version` that isn't a whole number from 0 to 2^32 - 1: the reason.
     pub fn style_version(&self) -> Result<Option<u32>, String> {
         if self.style_bible.is_none() {
-            return Ok(None);
+            return match &self.style_bible_raw {
+                None | Some(Value::Null | Value::String(_)) => Ok(None),
+                Some(v) => Err(format!("project.yaml's style_bible {v} is not a path")),
+            };
         }
         match &self.style_version_raw {
             None | Some(Value::Null) => Ok(Some(1)),
@@ -145,6 +150,7 @@ pub fn read_project_yaml(text: &str) -> Result<ProjectYaml, String> {
         },
         overrides: cascade_layer(&root),
         style_bible: s("style_bible").filter(|b| !b.trim().is_empty()),
+        style_bible_raw: root.get("style_bible").cloned(),
         style_version_raw: root.get("style_version").cloned(),
     })
 }
@@ -442,5 +448,12 @@ hardware: {gpu: none}
             let text = format!("style_bible: style/bible.md\nstyle_version: {bad}\n");
             assert!(read(&text).is_err(), "{bad}");
         }
+        // A `style_bible` that isn't a path is an error too, not a project without one.
+        assert_eq!(read("style_bible:\nstyle_version: 3\n"), Ok(None));
+        assert_eq!(
+            read("style_bible: [a]\nstyle_version: 3\n"),
+            Err(r#"project.yaml's style_bible ["a"] is not a path"#.to_string())
+        );
+        assert!(read("style_bible: 7\n").is_err());
     }
 }

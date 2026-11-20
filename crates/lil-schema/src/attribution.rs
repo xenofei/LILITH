@@ -272,13 +272,39 @@ pub(crate) fn trust_ptr(path: &str) -> String {
 /// trusted clears one. `from_path`'s record stays: sign-off, restore and copy all leave the
 /// run file records that name it. Both are keys of the `trust` map as spelled there; a caller
 /// that matches file names without regard to case finds the keys first.
+///
+/// The copy is the record as written, its unknown keys and sources of unknown kinds included;
+/// a record that isn't an object is copied as it reads (untrusted).
 pub fn carry_trust(m: &mut Manifest, from_path: &str, to_path: &str) {
     if from_path == to_path {
         return;
     }
-    if let Some(rec) = m.trust(from_path) {
-        m.set_trust(to_path, Some(&rec));
-    }
+    let copy = match m.trust_raw(from_path) {
+        Some(raw) => raw.clone(),
+        None => match m.trust(from_path) {
+            Some(rec) => {
+                let mut map = Map::new();
+                rec.write_into(&mut map);
+                map
+            }
+            None => return,
+        },
+    };
+    m.set_trust_raw(to_path, copy);
+}
+
+/// Gives `to_path` the record of a file derived from `from` ([`derived_trust`]), built on
+/// `from`'s record as written: its unknown keys and sources of unknown kinds stay, and the
+/// `derived` source is appended. Whether `from` had a record to give; when it had none,
+/// nothing changes.
+pub fn carry_derived_trust(m: &mut Manifest, from: &str, to_path: &str) -> bool {
+    let Some(rec) = derived_trust(m, from) else {
+        return false;
+    };
+    let mut map = m.trust_raw(from).cloned().unwrap_or_default();
+    rec.write_into(&mut map);
+    m.set_trust_raw(to_path, map);
+    true
 }
 
 /// The record of a file derived from the asset-relative `from` (P4b-R28, P4b-R41): `from`'s
@@ -560,5 +586,38 @@ mod tests {
             from_marked.marked_trusted.as_deref(),
             Some("2026-11-02T00:00:00Z")
         );
+    }
+
+    #[test] // spec: ARCH-060
+    fn carried_and_derived_records_keep_unknown_keys_and_sources() {
+        let mut m = Manifest::new("sketchbook", "img_dock", "image", "u");
+        let raw = json!({"state": "untrusted",
+                         "sources": [{"kind": "import", "ref": "x"}, {"kind": "web"}],
+                         "origin": {"caller_kind": "mcp", "model": "m"}});
+        let mut trust = Map::new();
+        trust.insert("candidates/r_1/a.png".into(), raw.clone());
+        m.set("trust", Value::Object(trust));
+        carry_trust(&mut m, "candidates/r_1/a.png", "v1.0.0/a.png");
+        assert_eq!(m.get("trust").unwrap()["v1.0.0/a.png"], raw);
+        assert!(carry_derived_trust(
+            &mut m,
+            "candidates/r_1/a.png",
+            "candidates/r_1/a_cut.png"
+        ));
+        assert_eq!(
+            m.get("trust").unwrap()["candidates/r_1/a_cut.png"],
+            json!({"state": "untrusted",
+                   "sources": [{"kind": "import", "ref": "x"}, {"kind": "web"},
+                               {"kind": "derived", "ref": "candidates/r_1/a.png"}],
+                   "origin": {"caller_kind": "mcp", "model": "m"}})
+        );
+        // Nothing to derive from: nothing changes.
+        let before = m.clone();
+        assert!(!carry_derived_trust(
+            &mut m,
+            "candidates/r_1/b.png",
+            "v1.0.0/b.png"
+        ));
+        assert_eq!(m, before);
     }
 }

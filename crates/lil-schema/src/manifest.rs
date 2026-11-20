@@ -461,6 +461,33 @@ impl Manifest {
             }
             return;
         };
+        let trust = self.trust_map_mut();
+        match trust.get_mut(path) {
+            Some(Value::Object(existing)) => rec.write_into(existing),
+            _ => {
+                trust.insert(path.to_string(), rec.to_value());
+            }
+        }
+    }
+
+    /// The trust record of `path` as written, when it is an object: its unknown keys and
+    /// sources of unknown kinds included.
+    pub(crate) fn trust_raw(&self, path: &str) -> Option<&Map<String, Value>> {
+        match self.map.get("trust") {
+            Some(Value::Object(trust)) => trust.get(path).and_then(Value::as_object),
+            _ => None,
+        }
+    }
+
+    /// Sets the trust record of `path` to `record` as it is: in place when it has one, else
+    /// appended to the `trust` map, which is made at the end when missing.
+    pub(crate) fn set_trust_raw(&mut self, path: &str, record: Map<String, Value>) {
+        self.trust_map_mut()
+            .insert(path.to_string(), Value::Object(record));
+    }
+
+    /// The `trust` map, made at the end when missing.
+    fn trust_map_mut(&mut self) -> &mut Map<String, Value> {
         let slot = self
             .map
             .entry("trust")
@@ -472,12 +499,7 @@ impl Manifest {
         let Value::Object(trust) = slot else {
             unreachable!("made an object above")
         };
-        match trust.get_mut(path) {
-            Some(Value::Object(existing)) => rec.write_into(existing),
-            _ => {
-                trust.insert(path.to_string(), rec.to_value());
-            }
-        }
+        trust
     }
 
     /// Sets the flag and rating of take `take` of run `run_id` on the take's primary file

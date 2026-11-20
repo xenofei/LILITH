@@ -42,6 +42,26 @@ pub(crate) fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// The key a run file's `path` or a `from` value is matched by: its bare name, folded by
+/// `fold` (the caller's comparison without regard to case: the core's `path_key`, the store's
+/// own). Every spelling of the folders before the name gives one key: `x.png`, `./x.png`,
+/// `sub/x.png`, `candidates/<run>/x.png` and a `lil://…@candidate/<run>/x.png` ref.
+pub fn name_key(path: &str, fold: impl Fn(&str) -> String) -> String {
+    fold(file_name(path))
+}
+
+/// The file of a run's `files` that a `from` value names: the first with its [`name_key`].
+/// This is the one rule for `from`: the store's seal, the takes reader and the trust records
+/// all match a `from` by its [`name_key`] among the run's files.
+pub fn from_file<'a>(
+    files: &'a [CandidateFile],
+    from: &str,
+    fold: impl Fn(&str) -> String,
+) -> Option<&'a CandidateFile> {
+    let key = name_key(from, &fold);
+    files.iter().find(|f| name_key(&f.path, &fold) == key)
+}
+
 /// The takes of a run, by take number (P4b-R3, the legacy rule included). A take without a
 /// primary file uses its first file; a file without `take` in a run whose other files have
 /// one is in no take; the manifest's read warns of both.
@@ -134,7 +154,7 @@ pub(crate) fn grouped(files: &[CandidateFile]) -> (Vec<(Take, usize)>, Vec<Strin
 /// The legacy rule (a run in which no file has `take`): the indices of the `candidate`-role
 /// files, one take each in file order, and for each file the index into those of its take.
 fn legacy_owners(files: &[CandidateFile]) -> (Vec<usize>, Vec<Option<usize>>) {
-    let key = |name: &str| file_name(name).to_lowercase();
+    let key = |name: &str| name_key(name, str::to_lowercase);
     let primaries: Vec<usize> = (0..files.len())
         .filter(|&i| files[i].role == "candidate")
         .collect();

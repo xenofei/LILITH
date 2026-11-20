@@ -3548,3 +3548,164 @@ async fn signoff_carries_source_records() {
     assert_eq!(m["trust"]["v1.0.0/source/layers/ref.png"], outside, "{m}");
     fx.shutdown().await;
 }
+
+#[tokio::test] // spec: ARCH-060
+async fn every_from_the_seal_accepts_finds_its_record() {
+    // The store's seal finds a derived file's `from` by its bare name among the run's files,
+    // so each of these names the outside `crane_c.png`: the sealed cut-out takes its record.
+    let crane_c = format!("candidates/{CRANE_OPEN_RUN}/crane_c.png");
+    let outside = untrusted_record("import", "crane_c.png");
+    for from in [
+        "./crane_c.png".to_string(),
+        "sub/crane_c.png".to_string(),
+        format!("lil://w/sketchbook/{CRANE}@candidate/{CRANE_OPEN_RUN}/crane_c.png"),
+    ] {
+        let fx = Fx::with(|ws| {
+            crane_run_with(ws, &crane_c, &outside, |files| {
+                files[1]["from"] = json!(from);
+            });
+        });
+        fx.signoff(CRANE, CRANE_OPEN_RUN, &["crane_c.png"], json!({}))
+            .await;
+        assert!(
+            fx.path(&format!(
+                "projects/sketchbook/assets/{CRANE}/v1.1.0/crane_c_cutout.png"
+            ))
+            .exists(),
+            "{from}: the seal copied the cut-out"
+        );
+        let m = fx.manifest(CRANE);
+        assert_eq!(
+            m["trust"]["v1.1.0/crane_c_cutout.png"],
+            derived_from(&outside, &crane_c),
+            "{from}: {m}"
+        );
+        fx.shutdown().await;
+    }
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn a_preview_file_inherits_its_sources_record() {
+    // The seal: the crane's cut-out is a preview of its outside file, a companion of take 1.
+    let crane_c = format!("candidates/{CRANE_OPEN_RUN}/crane_c.png");
+    let outside = untrusted_record("import", "crane_c.png");
+    let fx = Fx::with(|ws| {
+        crane_run_with(ws, &crane_c, &outside, |files| {
+            files[1]["role"] = json!("preview");
+        });
+    });
+    let r = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": CRANE, "run_id": CRANE_OPEN_RUN,
+                   "takes": [1]}),
+        )
+        .await;
+    assert_eq!(r["version"], "1.1.0", "{r}");
+    let m = fx.manifest(CRANE);
+    assert_eq!(
+        m["trust"]["v1.1.0/crane_c_cutout.png"],
+        derived_from(&outside, &crane_c),
+        "{m}"
+    );
+
+    // The Record step: a preview of an imported file.
+    let imported = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let from = format!("candidates/{imported}/kite.png");
+    let record = fx.manifest(KITE)["trust"][&from].clone();
+    let preview = "candidates/r_20261020_0800/kite_preview.png";
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": "r_20261020_0800", "status": "open", "files": [
+            {"path": preview, "role": "preview", "from": from},
+        ]}),
+    )
+    .await;
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"][preview], derived_from(&record, &from), "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn import_refuses_a_manifest_without_asset_id() {
+    let fx = Fx::new();
+    fx.import_run(KITE, "kite.png", b"kite one").await;
+    // A damaged manifest: a hand edit dropped `asset_id`.
+    edit_manifest(&fx.ws, KITE, |m| {
+        m.as_object_mut().unwrap().shift_remove("asset_id");
+    });
+    let manifest = fx.path(&format!("{KITE_DIR}/{KITE}.manifest.json"));
+    let before = std::fs::read(&manifest).unwrap();
+    let runs = || {
+        std::fs::read_dir(fx.path(&format!("{KITE_DIR}/candidates")))
+            .unwrap()
+            .count()
+    };
+    let runs_before = runs();
+    let kite2 = fx.outside("kite2.png", b"kite two");
+    for mode in ["copy", "link_external"] {
+        let e = fx
+            .err(
+                "asset.import",
+                json!({"project": "sketchbook", "asset_id": KITE, "type": "image",
+                       "files": [kite2.to_string_lossy()], "mode": mode}),
+            )
+            .await;
+        assert_eq!(e.code, "manifest.needs_repair", "{mode}: {e:?}");
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            before,
+            "{mode}: nothing written"
+        );
+        assert_eq!(runs(), runs_before, "{mode}: no new run");
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-025
+async fn only_a_style_ref_counts_as_the_style_input() {
+    let fx = Fx::with(|ws| {
+        let project = file(ws, "projects/sketchbook/project.yaml");
+        let mut text = read_text(&project);
+        text.push_str("style_bible: style/bible.md\nstyle_version: 3\n");
+        write_file(&project, text.as_bytes());
+    });
+    // `style@1.0.0` is a ref to an asset called `style`, not to the style bible.
+    let asset = json!({"ref": "style@1.0.0", "role": "reference"});
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": "r_20261020_0800", "status": "open", "files": [],
+               "inputs": [asset.clone()]}),
+    )
+    .await;
+    assert_eq!(
+        run_of(&fx.manifest(KITE), "r_20261020_0800")["inputs"],
+        json!([asset, {"ref": "style@3", "role": "style"}])
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-025
+async fn a_style_bible_that_is_not_a_path_warns() {
+    let fx = Fx::with(|ws| {
+        let project = file(ws, "projects/sketchbook/project.yaml");
+        let mut text = read_text(&project);
+        text.push_str("style_bible: [a]\nstyle_version: 3\n");
+        write_file(&project, text.as_bytes());
+    });
+    let r = fx.import(KITE, &[("kite.png", b"kite")]).await;
+    assert_eq!(
+        r["warnings"],
+        json!([
+            "the run has no style input: the style version of sketchbook can't be read \
+             (project.yaml's style_bible [\"a\"] is not a path)"
+        ]),
+        "{r}"
+    );
+    let m = fx.manifest(KITE);
+    let run = r["run_id"].as_str().unwrap();
+    assert!(run_of(&m, run).get("inputs").is_none(), "{m}");
+    fx.shutdown().await;
+}

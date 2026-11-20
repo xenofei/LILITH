@@ -30,9 +30,10 @@
 //! - trust records go with the files to the version (ARCH-060; P4b-R28): each file the seal
 //!   takes (the chosen ones and, through `from`, the run's `derived` files made from them, as
 //!   the store's seal picks them) gets its run file's record at `v<version>/<name>`
-//!   (`lil_schema::carry_trust`); a file made from another (`derived` or `repair`) without a
-//!   record takes its `from` file's first (`record::inherit_from`). Records are found as the
-//!   seal finds names, without regard to case (`record::trust_key`). Each record under the
+//!   (`lil_schema::carry_trust`); a file made from another (`derived`, `repair` or `preview`)
+//!   without a record takes its `from` file's first (`record::inherit_from`, which finds the
+//!   `from` file as the seal does: by bare name among the run's files). Records are found as
+//!   the seal finds names, without regard to case (`record::trust_key`). Each record under the
 //!   run's `candidates/<run>/source/` goes to the same place under `v<version>/source/`, where
 //!   the seal moves that folder. The run file's record stays (the run still names that path),
 //!   so `app/asset.trust` without `paths` can list a candidate path whose file the seal moved.
@@ -52,7 +53,7 @@ use serde_json::{Map, Value, json};
 
 use super::record::{inherit_from, trust_key};
 use super::status::status_by;
-use crate::store::path_key;
+use crate::store::{name_key, path_key};
 
 /// What a sign-off chooses: the run's files by name (`files`), or takes by number (`takes`;
 /// Appendix H "Takes").
@@ -359,7 +360,7 @@ pub fn plan_signoff(
 
 /// Trust records at the seal (module docs): `sealed` (the chosen records of run `run_id`,
 /// whose records are `files`) and, transitively, the `derived` records made from them, matched
-/// by name as the store's seal matches them ([`path_key`]); then the run's `source/` records.
+/// by name as the store's seal matches them ([`name_key`]); then the run's `source/` records.
 fn carry_to_version<'a>(
     m: &mut Manifest,
     run_id: &str,
@@ -368,18 +369,14 @@ fn carry_to_version<'a>(
     version: Version,
 ) {
     let has = |list: &[&CandidateFile], name: &str| {
-        let key = path_key(bare_name(name));
-        list.iter().any(|f| path_key(bare_name(&f.path)) == key)
+        let key = name_key(name);
+        list.iter().any(|f| name_key(&f.path) == key)
     };
     loop {
         let more: Vec<&CandidateFile> = files
             .iter()
-            .filter(|f| f.role == "derived" && !has(&sealed, bare_name(&f.path)))
-            .filter(|f| {
-                f.from
-                    .as_deref()
-                    .is_some_and(|from| has(&sealed, bare_name(from)))
-            })
+            .filter(|f| f.role == "derived" && !has(&sealed, &f.path))
+            .filter(|f| f.from.as_deref().is_some_and(|from| has(&sealed, from)))
             .collect();
         if more.is_empty() {
             break;
@@ -387,7 +384,7 @@ fn carry_to_version<'a>(
         sealed.extend(more);
     }
     for file in sealed {
-        inherit_from(m, file);
+        inherit_from(m, files, file);
         if let Some(key) = trust_key(m, &file.path) {
             carry_trust(m, &key, &format!("v{version}/{}", bare_name(&file.path)));
         }

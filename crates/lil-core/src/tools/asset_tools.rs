@@ -725,6 +725,9 @@ async fn stage_candidate_run(
         .lock_owned()
         .await;
     let current = read_manifest(&store, &a.manifest).await.map_err(error)?;
+    if current.as_ref().is_some_and(damaged) {
+        return Err(error(StoreError::NeedsRepair(a.manifest.clone())));
+    }
     let now = store.now_utc();
     let run_id = store
         .next_run_id(&a.dir, current.as_ref(), now)
@@ -818,7 +821,11 @@ async fn stage_candidate_run(
     );
     let by = status_by(&ctx.session.caller);
     let actor = actor_of(&ctx.session.caller);
+    let rel = a.manifest.clone();
     let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
+        if damaged(m) {
+            return Err(StoreError::NeedsRepair(rel.clone()));
+        }
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&project, &asset_id, &asset_type, &uuid);
         }
@@ -887,13 +894,16 @@ async fn import(ctx: &CallCtx, args: ImportArgs) -> Result<(ImportResult, String
     let mut warnings = creation_warnings(ctx, &a).await?;
     match args.mode {
         ImportMode::Copy => {
+            // Before `stage_candidate_run` takes the asset's version lock, so the wait never
+            // holds it.
+            let ready = index_ready(&a).await;
             let StagedRun {
                 run_id,
                 refs,
                 names,
                 hashes,
             } = stage_candidate_run(ctx, &a, asset_type, &files, None, false).await?;
-            warnings.extend(same_bytes_warnings(&a, &hashes).await);
+            warnings.extend(same_bytes_warnings(&a, ready, &hashes).await);
             let summary = format!(
                 "importing {} file(s) into {} as candidate run {run_id}",
                 files.len(),
@@ -917,6 +927,15 @@ async fn import(ctx: &CallCtx, args: ImportArgs) -> Result<(ImportResult, String
     }
 }
 
+/// Whether `m`, a manifest an import or a link would write, is damaged: it has keys but no
+/// `asset_id` (a hand edit, a bad merge or a partial write dropped it). Writing a new manifest
+/// over it would lose everything it holds, its trust records included, so the import is
+/// refused with `manifest.needs_repair` instead. A missing file or an empty map is a new
+/// asset's.
+fn damaged(m: &Manifest) -> bool {
+    m.get("asset_id").is_none() && !m.as_map().is_empty()
+}
+
 /// The warning of an import that creates an asset onto a redirect's `from` (module docs).
 async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, ErrorBody> {
     if a.store()
@@ -936,26 +955,35 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
 /// big one is still being indexed isn't held up for it.
 const SAME_BYTES_WAIT: Duration = Duration::from_secs(5);
 
+/// Waits, at most [`SAME_BYTES_WAIT`], for the index's first run of the workspace, for the
+/// same-bytes check. `Err` says why the check can't be made: the run isn't done in time, or the
+/// index failed. A copy import waits before it takes the asset's version lock.
+async fn index_ready(a: &Asset) -> Result<(), String> {
+    match tokio::time::timeout(SAME_BYTES_WAIT, a.open.index.ready_result()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the workspace is still being indexed".to_string()),
+    }
+}
+
 /// CORE-168's warning (Appendix H "Duplicates") for each of `hashes` (bare hex, in file order)
 /// that a sealed or candidate file in the workspace already has: "same bytes as <ref>", the
-/// first such file's ref, a sealed one first (`Index::same_bytes`), once the index's first run
-/// has finished. It never blocks the import: an index whose first run isn't done within
-/// [`SAME_BYTES_WAIT`], or that can't answer, is one warning saying the check wasn't made
-/// (after the warnings already found, when it fails part-way).
-async fn same_bytes_warnings(a: &Asset, hashes: &[String]) -> Vec<String> {
+/// first such file's ref, a sealed one first (`Index::same_bytes`), when the index was `ready`
+/// ([`index_ready`]); this never waits. It never blocks the import: an index that wasn't ready,
+/// or that can't answer, is one warning saying the check wasn't made (after the warnings
+/// already found, when it fails part-way).
+async fn same_bytes_warnings(
+    a: &Asset,
+    ready: Result<(), String>,
+    hashes: &[String],
+) -> Vec<String> {
     let index = &a.open.index;
     let unchecked = |why: String| {
         tracing::warn!(why, "the index can't say whether imported bytes are new");
         format!("whether the workspace already has these files' bytes wasn't checked: {why}")
     };
-    match tokio::time::timeout(SAME_BYTES_WAIT, index.ready_result()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return vec![unchecked(e.to_string())],
-        Err(_) => {
-            return vec![unchecked(
-                "the workspace is still being indexed".to_string(),
-            )];
-        }
+    if let Err(why) = ready {
+        return vec![unchecked(why)];
     }
     let mut warnings = Vec::new();
     for sha256 in hashes {
@@ -1048,7 +1076,8 @@ async fn link_external(
         linked.push((source.display().to_string(), sha256));
     }
     let hashes: Vec<String> = linked.iter().map(|(_, h)| h.clone()).collect();
-    warnings.extend(same_bytes_warnings(a, &hashes).await);
+    let ready = index_ready(a).await;
+    warnings.extend(same_bytes_warnings(a, ready, &hashes).await);
     let uuid = store.ids().uuid();
     let (project, asset_id, asset_type) = (
         a.project.clone(),
@@ -1057,7 +1086,11 @@ async fn link_external(
     );
     let by = status_by(&ctx.session.caller);
     let utc = lil_schema::time::rfc3339(store.now_utc());
+    let rel = a.manifest.clone();
     let edit = move |m: &mut Manifest| {
+        if damaged(m) {
+            return Err(StoreError::NeedsRepair(rel.clone()));
+        }
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&project, &asset_id, &asset_type, &uuid);
         }

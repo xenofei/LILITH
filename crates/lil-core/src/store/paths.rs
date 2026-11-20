@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use lil_platform::names::{LEGACY_WORKSPACE_DIR, is_workspace_dir};
-use lil_schema::{Version, check_rel_path};
+use lil_schema::{CandidateFile, Version, check_rel_path};
 
 use super::trash::TRASH_DIR;
 use super::write::StoreError;
@@ -81,6 +81,18 @@ impl fmt::Display for WsPath {
 /// locks and the `generated` and `generated_pending` rows use this one folding.
 pub fn path_key(rel: &str) -> String {
     lil_platform::paths::upcase_name(rel)
+}
+
+/// The key the store matches a run file's `path` or a `from` value by: its bare name under
+/// [`path_key`] ([`lil_schema::takes::name_key`]).
+pub fn name_key(path: &str) -> String {
+    lil_schema::takes::name_key(path, path_key)
+}
+
+/// The file of a run's `files` that a `from` value names, as the seal finds it
+/// ([`lil_schema::takes::from_file`] under [`path_key`]).
+pub fn from_file<'a>(files: &'a [CandidateFile], from: &str) -> Option<&'a CandidateFile> {
+    lil_schema::takes::from_file(files, from, path_key)
 }
 
 /// `v<major.minor.patch>`, the name of a sealed version folder (the `v` in either case, since
