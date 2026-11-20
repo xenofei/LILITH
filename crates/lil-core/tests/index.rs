@@ -1736,19 +1736,18 @@ async fn import_waits_for_the_first_reconcile_only_so_long() {
         import.run(&call_ctx, args).await
     });
     // The held reconcile is a blocking task, so the paused clock never moves on its own: the
-    // test moves it 100 ms at a time (up to a minute), giving the import's own file work, on
-    // blocking threads, a real millisecond between steps.
-    for _ in 0..600 {
-        if running.is_finished() {
-            break;
-        }
+    // test moves it 100 ms at a time, giving the import's own file work, on blocking threads, a
+    // real millisecond between steps. The loop ends on a real-time deadline, not a step count,
+    // so a loaded machine can't run out of steps before the import reaches its bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !running.is_finished() && std::time::Instant::now() < deadline {
         tokio::time::advance(Duration::from_millis(100)).await;
         std::thread::sleep(Duration::from_millis(1));
         tokio::task::yield_now().await;
     }
     assert!(
         running.is_finished(),
-        "the import was still waiting for the first reconcile a minute later"
+        "the import was still waiting for the first reconcile after 30 s of real time"
     );
     let out = running.await.unwrap().unwrap();
     assert!(started.elapsed() >= SAME_BYTES_WAIT, "it waited first");
