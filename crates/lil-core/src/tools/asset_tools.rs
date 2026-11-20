@@ -31,9 +31,10 @@
 //!   `{kind: "import" | "collect", ref: <the path it came from>}`. Only `app/asset.trust`
 //!   ([`trust`], from a verified app) clears one; sign-off carries them (`pipeline::signoff`).
 //! - **Same bytes** (CORE-168; Appendix H "Duplicates"): `asset.import`, in either mode, adds
-//!   "same bytes as <ref>" to `warnings` for each file whose SHA-256 a sealed or candidate
-//!   file in the workspace already has (the index's first such file, a sealed one first); it
-//!   never blocks the import.
+//!   "same bytes as <ref> (file <n>)" to `warnings` for each file whose SHA-256 a sealed or
+//!   candidate file in the workspace already has (the index's first such file, a sealed one
+//!   first; `n` the file's 1-based position in `files`, never its name: ARCH-060); it never
+//!   blocks the import.
 //! - **Creating onto a redirect** (ARCH-125; Appendix H): the import that creates an asset
 //!   (there is no manifest yet), in either mode, whose `<project>/<asset_id>` is some entry's
 //!   `from` in `registry/redirects.yaml`, adds the warning "Old refs to <name> will now reach
@@ -967,8 +968,9 @@ async fn index_ready(a: &Asset) -> Result<(), String> {
 }
 
 /// CORE-168's warning (Appendix H "Duplicates") for each of `hashes` (bare hex, in file order)
-/// that a sealed or candidate file in the workspace already has: "same bytes as <ref>", the
-/// first such file's ref, a sealed one first (`Index::same_bytes`), when the index was `ready`
+/// that a sealed or candidate file in the workspace already has: "same bytes as <ref> (file
+/// <n>)", the first such file's ref, a sealed one first (`Index::same_bytes`), and `n` the
+/// imported file's 1-based position (its name is untrusted text), when the index was `ready`
 /// ([`index_ready`]); this never waits. It never blocks the import: an index that wasn't ready,
 /// or that can't answer, is one warning saying the check wasn't made (after the warnings
 /// already found, when it fails part-way).
@@ -986,11 +988,11 @@ async fn same_bytes_warnings(
         return vec![unchecked(why)];
     }
     let mut warnings = Vec::new();
-    for sha256 in hashes {
+    for (i, sha256) in hashes.iter().enumerate() {
         match index.same_bytes(sha256).await {
             Ok(Some(path)) => {
                 if let Some(r) = file_ref(&a.open.ws.id, &path) {
-                    warnings.push(format!("same bytes as {r}"));
+                    warnings.push(format!("same bytes as {r} (file {})", i + 1));
                 }
             }
             Ok(None) => {}

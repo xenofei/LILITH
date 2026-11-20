@@ -3364,7 +3364,11 @@ async fn import_warns_about_same_bytes_and_never_blocks() {
 
     // The bytes of the crane's sealed file: named by its sealed ref, and imported all the same.
     let r = fx.import(KITE, &[("kite_b.png", &sealed)]).await;
-    assert_eq!(same(&r), [format!("same bytes as {sealed_ref}")], "{r}");
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {sealed_ref} (file 1)")],
+        "{r}"
+    );
     let run = r["run_id"].as_str().unwrap();
     assert_eq!(
         std::fs::read(fx.path(&format!("{KITE_DIR}/candidates/{run}/kite_b.png"))).unwrap(),
@@ -3377,19 +3381,47 @@ async fn import_warns_about_same_bytes_and_never_blocks() {
     // A candidate of the crane itself has them too, and its path sorts before the sealed
     // file's (`chr_paper_crane/candidates/…` < `chr_paper_crane/v1.0.0/…`).
     let r = fx.import(CRANE, &[("crane_b_copy.png", &sealed)]).await;
-    assert_eq!(same(&r), [format!("same bytes as {sealed_ref}")], "{r}");
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {sealed_ref} (file 1)")],
+        "{r}"
+    );
     // So do candidates of the kite and the crane now: the sealed ref still comes first, not
     // the first path.
     let r = fx.import("prop_crate", &[("crate_b.png", &sealed)]).await;
-    assert_eq!(same(&r), [format!("same bytes as {sealed_ref}")], "{r}");
-    // A candidate's bytes: its candidate ref. One warning per file, in file order.
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {sealed_ref} (file 1)")],
+        "{r}"
+    );
+    // A candidate's bytes: its candidate ref. One warning per file, in file order, each
+    // naming the file by its position in `files`.
     let r = fx
         .import(
             "prop_crate",
             &[("crate_c.png", &candidate), ("crate_new.png", b"crate new")],
         )
         .await;
-    assert_eq!(same(&r), [format!("same bytes as {candidate_ref}")], "{r}");
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {candidate_ref} (file 1)")],
+        "{r}"
+    );
+    // A mixed import whose second file is the duplicate.
+    let r = fx
+        .import(
+            "prop_crate",
+            &[
+                ("crate_newer.png", b"crate newer"),
+                ("crate_c2.png", &candidate),
+            ],
+        )
+        .await;
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {candidate_ref} (file 2)")],
+        "{r}"
+    );
     let r = fx
         .import(
             "prop_box",
@@ -3399,8 +3431,8 @@ async fn import_warns_about_same_bytes_and_never_blocks() {
     assert_eq!(
         same(&r),
         [
-            format!("same bytes as {candidate_ref}"),
-            format!("same bytes as {sealed_ref}")
+            format!("same bytes as {candidate_ref} (file 1)"),
+            format!("same bytes as {sealed_ref} (file 2)")
         ],
         "{r}"
     );
