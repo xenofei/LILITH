@@ -6,7 +6,8 @@
 //! anywhere else, appends nothing, and a failed append is a Diagnostics error that never undoes
 //! the decision. Driven through the dispatcher of an in-process core with the fake clock and ids
 //! (QA-031), on a copy of the spec fixture workspace, and through the pick log's append
-//! (`store::append_local_line`) for the concurrent appends. Images are made in the test with `lil_testkit::png`.
+//! (`store::append_local_line`) for the concurrent appends. Images are made in the test with
+//! `lil_testkit::png`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

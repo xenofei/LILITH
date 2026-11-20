@@ -29,10 +29,11 @@
 //!   clear, writes nothing. A sign-off from Review always logs one line per signed take.
 //! - **The append** goes through `store::append_local_line` (`fsops::append_line_locked`: one
 //!   whole line under the append lock, reading only the file's last byte, into a plain file
-//!   with one name, never through a link), polled under the store's backoff (10 ms doubling)
-//!   while another writer holds the lock or a sharing violation stops it: [`APPEND_BUDGET`]
-//!   (1 s) in all for a mark, [`SIGNOFF_APPEND_BUDGET`] (10 s) for a sign-off. It happens after the decision's Record step (the mark's manifest edit, the
-//!   sign-off's Record stage) and never undoes it: a failed append is logged, and reported to
+//!   with one name, never through a link), polled under the store's backoff (10 ms doubling,
+//!   each pause at most a twentieth of the budget) while another writer holds the lock or a
+//!   sharing violation stops it: [`APPEND_BUDGET`] (1 s) in all for a mark,
+//!   [`SIGNOFF_APPEND_BUDGET`] (10 s) for a sign-off. It happens after the decision's Record
+//!   step (the mark's manifest edit, the sign-off's Record stage) and never undoes it: a failed append is logged, and reported to
 //!   the tools error sink as `pick_log.append_failed` (the Diagnostics' recent errors; not a
 //!   protocol error code), and the call's result is unchanged.
 //! - **When a line is written.** A mark's line is appended before the mark answers, while

@@ -523,6 +523,7 @@ pub(super) struct Backoff {
     start: tokio::time::Instant,
     next: Duration,
     budget: Duration,
+    cap: Duration,
 }
 
 impl Backoff {
@@ -530,12 +531,14 @@ impl Backoff {
         Backoff::within(RETRY_BUDGET)
     }
 
-    /// The same pauses, `budget` in all.
+    /// The same pauses, `budget` in all, each at most a twentieth of the budget (500 ms for
+    /// 10 s, 50 ms for 1 s), so a short budget keeps polling instead of sleeping past it.
     pub(super) fn within(budget: Duration) -> Backoff {
         Backoff {
             start: tokio::time::Instant::now(),
             next: RETRY_FIRST,
             budget,
+            cap: RETRY_CAP.min(budget / 20),
         }
     }
 
@@ -546,7 +549,7 @@ impl Backoff {
             return false;
         }
         tokio::time::sleep(self.next.min(self.budget - spent)).await;
-        self.next = (self.next * 2).min(RETRY_CAP);
+        self.next = (self.next * 2).min(self.cap);
         true
     }
 }
