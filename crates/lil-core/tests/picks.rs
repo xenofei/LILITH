@@ -1,15 +1,17 @@
 //! The pick log (CORE-176; Appendix H "Pick log"; P4b-R13): a Review decision from the app (a
 //! `ui:*` call of `asset.mark` or `asset.signoff` that carries `review_view`) appends one line to
 //! `picks.jsonl` in the workspace's local folder (ARCH-097) and keeps the 96 px thumbnail of a
-//! renderable file under `picks\thumbs\<sha256>.png`; a decision from anywhere else appends
-//! nothing, and a failed append is a Diagnostics error that never undoes the decision. Driven
+//! renderable file under `picks\thumbs\<sha256>.png`, and its run's recipe once under
+//! `picks\recipes\<hex>.json`; a mark that doesn't change the take's flag, or a decision from
+//! anywhere else, appends nothing, and a failed append is a Diagnostics error that never undoes
+//! the decision. Driven
 //! through the dispatcher of an in-process core with the fake clock and ids (QA-031), on a copy
 //! of the spec fixture workspace, and through `log_pick` itself for the concurrent appends.
 //! Images are made in the test with `lil_testkit::png`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +19,7 @@ use lil_core::events::EventBus;
 use lil_core::interchange::thumbs::{ThumbOptions, ThumbService};
 use lil_core::session::Session;
 use lil_core::state::StateRegistry;
+use lil_core::store::FailPoints;
 use lil_core::tools::pick_log::{Decision, PickLine, log_pick};
 use lil_core::tools::{
     AssetServices, CallCtx, Dispatcher, ErrorSink, PipelineHooks, Settings, TestGates, Thumbnails,
@@ -78,6 +81,11 @@ fn take_files() -> Vec<(&'static str, Vec<u8>)> {
 /// The recipe the run records.
 fn recipe() -> Value {
     json!({"tool": "test", "seed": 7})
+}
+
+/// The hex of the run's recipe ref: the SHA-256 of `serde_json::to_vec` of [`recipe`].
+fn recipe_hex() -> String {
+    sha256_bytes(&serde_json::to_vec(&recipe()).unwrap())
 }
 
 /// `asset` in `sketchbook` with one open run, [`RUN`], whose files carry takes
@@ -177,6 +185,11 @@ impl Fx {
     /// The fixture workspace with `assets` written by [`write_take_run`], registered as the
     /// default; the thumbnail service is in its slot when `thumbs`.
     fn new(assets: &[&str], thumbs: bool) -> Fx {
+        Fx::with_fp(assets, thumbs, FailPoints::none())
+    }
+
+    /// [`Fx::new`], with the store's fail points `fp`.
+    fn with_fp(assets: &[&str], thumbs: bool, fp: Arc<FailPoints>) -> Fx {
         let env = TestEnv::new();
         let ws = env.copy_fixture_workspace("assets");
         for asset in assets {
@@ -200,7 +213,7 @@ impl Fx {
             events.clone(),
             clock.clone(),
             ids.clone(),
-            lil_core::store::FailPoints::none(),
+            fp,
             probe.clone(),
             lil_core::watch::WatchConfig::default(),
         );
@@ -319,12 +332,19 @@ impl Fx {
         self.local().join("picks").join("thumbs")
     }
 
-    fn manifest(&self, asset: &str) -> Value {
-        let path = file(
+    fn picks_recipes(&self) -> PathBuf {
+        self.local().join("picks").join("recipes")
+    }
+
+    fn manifest_path(&self, asset: &str) -> PathBuf {
+        file(
             &self.ws,
             &format!("projects/sketchbook/assets/{asset}/{asset}.manifest.json"),
-        );
-        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        )
+    }
+
+    fn manifest(&self, asset: &str) -> Value {
+        serde_json::from_slice(&std::fs::read(self.manifest_path(asset)).unwrap()).unwrap()
     }
 }
 
@@ -400,7 +420,7 @@ async fn app_review_marks_are_logged_with_take_and_hash() {
         take_hash(&["a.png", "a_mask.png"]),
         "{line}"
     );
-    assert_eq!(line["recipe"], recipe(), "{line}");
+    assert_eq!(line["recipe"], format!("sha256:{}", recipe_hex()), "{line}");
     let utc = line["utc"].as_str().expect("utc");
     assert!(utc.ends_with('Z') && utc.contains('T'), "{line}");
     let keys: BTreeSet<&str> = line
@@ -518,9 +538,18 @@ async fn app_marks_without_review_view_are_not_logged() {
 }
 
 #[tokio::test] // spec: CORE-176
-async fn clearing_a_flag_logs_cleared() {
+async fn a_mark_is_logged_only_when_it_changes_the_flag() {
     let fx = Fx::new(&[KITE], false);
-    for flag in [json!("pick"), json!(null), json!("reject"), json!(null)] {
+    // Each mark of take 2, and the decisions logged once it answered.
+    let steps = [
+        (json!(null), vec![]),                            // nothing to clear
+        (json!("pick"), vec!["pick"]),                    // none to pick
+        (json!("pick"), vec!["pick"]),                    // a repeated pick
+        (json!("reject"), vec!["pick", "reject"]),        // pick to reject
+        (json!(null), vec!["pick", "reject", "cleared"]), // reject to cleared
+        (json!(null), vec!["pick", "reject", "cleared"]), // cleared again
+    ];
+    for (flag, logged) in steps {
         fx.ok_as(
             app(),
             "asset.mark",
@@ -530,20 +559,80 @@ async fn clearing_a_flag_logs_cleared() {
             ),
         )
         .await;
+        let decisions: Vec<Value> = jsonl(&fx.log())
+            .iter()
+            .map(|l| l["decision"].clone())
+            .collect();
+        assert_eq!(decisions, logged, "after flag {flag}");
     }
-    let decisions: Vec<Value> = jsonl(&fx.log())
-        .iter()
-        .map(|l| l["decision"].clone())
-        .collect();
-    assert_eq!(
-        decisions,
-        [
-            json!("pick"),
-            json!("cleared"),
-            json!("reject"),
-            json!("cleared")
-        ]
+    // A rating change alongside an unchanged flag isn't a decision either.
+    fx.ok_as(
+        app(),
+        "asset.mark",
+        mark(
+            KITE,
+            json!({"take": 2, "flag": null, "rating": 3, "review_view": "compare"}),
+        ),
+    )
+    .await;
+    assert_eq!(jsonl(&fx.log()).len(), 3);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-176, CORE-032
+async fn the_recipe_is_kept_once_by_its_hash() {
+    const BARE: &str = "prop_kite_bare";
+    let fx = Fx::new(&[KITE, BARE], false);
+    // BARE's run records no recipe.
+    let mut m = fx.manifest(BARE);
+    lil_schema::remove_key(m["candidate_runs"][0].as_object_mut().unwrap(), "recipe");
+    write_file(
+        &fx.manifest_path(BARE),
+        format!("{}\n", serde_json::to_string_pretty(&m).unwrap()).as_bytes(),
     );
+    for take in [1, 2] {
+        fx.ok_as(
+            app(),
+            "asset.mark",
+            mark(
+                KITE,
+                json!({"take": take, "flag": "pick", "review_view": "grid"}),
+            ),
+        )
+        .await;
+    }
+    let lines = jsonl(&fx.log());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let hex = recipe_hex();
+    for line in &lines {
+        assert_eq!(line["recipe"], format!("sha256:{hex}"), "{line}");
+    }
+    // One file, named by the hash of its own bytes, holding the manifest's recipe.
+    let kept: Vec<String> = std::fs::read_dir(fx.picks_recipes())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(kept, [format!("{hex}.json")]);
+    let bytes = std::fs::read(fx.picks_recipes().join(format!("{hex}.json"))).unwrap();
+    assert_eq!(sha256_bytes(&bytes), hex);
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body, fx.manifest(KITE)["candidate_runs"][0]["recipe"]);
+
+    // A run without a recipe: `recipe` is null and nothing more is kept.
+    fx.ok_as(
+        app(),
+        "asset.mark",
+        mark(
+            BARE,
+            json!({"take": 1, "flag": "reject", "review_view": "grid"}),
+        ),
+    )
+    .await;
+    let lines = jsonl(&fx.log());
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines[2]["asset_id"], BARE);
+    assert_eq!(lines[2]["recipe"], Value::Null, "{}", lines[2]);
+    assert_eq!(std::fs::read_dir(fx.picks_recipes()).unwrap().count(), 1);
     fx.shutdown().await;
 }
 
@@ -596,7 +685,7 @@ async fn signoff_from_review_logs_each_signed_take() {
         assert_eq!(line["asset_id"], KITE, "{line}");
         assert_eq!(line["run_id"], RUN, "{line}");
         assert_eq!(line["primary"], true, "{line}");
-        assert_eq!(line["recipe"], recipe(), "{line}");
+        assert_eq!(line["recipe"], format!("sha256:{}", recipe_hex()), "{line}");
         takes.push(line["take"].as_u64().unwrap());
     }
     takes.sort_unstable();
@@ -610,6 +699,12 @@ async fn signoff_from_review_logs_each_signed_take() {
     assert_eq!(two["take_sha256"], take_hash(&["b.png"]));
     // The manifest recorded the sign-off.
     assert_eq!(fx.manifest(KITE)["status"], "approved");
+    // The 96 px copy of each signed take's file, from the signed version.
+    for name in ["a.png", "b.png"] {
+        let copy = fx.picks_thumbs().join(format!("{}.png", sha_of(name)));
+        let bytes = poll("the sign-off's copy", || std::fs::read(&copy).ok()).await;
+        assert_eq!(png::long_side(&bytes), 96, "{name}");
+    }
 
     // A sign-off by files logs the take of each file.
     fx.ok_as(
@@ -639,6 +734,53 @@ async fn signoff_from_review_logs_each_signed_take() {
             .all(|l| l["asset_id"] == KITE || l["asset_id"] == BY_FILES),
         "{lines:?}"
     );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-176
+async fn a_signoff_whose_record_fails_logs_nothing() {
+    // The manifest changes under the sign-off after its seal (the run is rejected meanwhile),
+    // so its Record stage refuses; the lines it left for after the Record are dropped.
+    let fp = FailPoints::none();
+    let armed = Arc::new(AtomicBool::new(false));
+    let target: Arc<Mutex<Option<PathBuf>>> = Arc::default();
+    {
+        let (armed, target) = (armed.clone(), target.clone());
+        fp.on(
+            "store.after_seal",
+            Box::new(move || {
+                if armed.swap(false, Ordering::SeqCst) {
+                    let path = target.lock().unwrap().clone().expect("the manifest");
+                    let mut m: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                    m["candidate_runs"][0]["status"] = json!("rejected");
+                    write_file(
+                        &path,
+                        format!("{}\n", serde_json::to_string_pretty(&m)?).as_bytes(),
+                    );
+                }
+                Ok(())
+            }),
+        );
+    }
+    let fx = Fx::with_fp(&[KITE], true, fp);
+    *target.lock().unwrap() = Some(fx.manifest_path(KITE));
+    armed.store(true, Ordering::SeqCst);
+    let out = fx
+        .call_as(
+            app(),
+            "asset.signoff",
+            signoff(KITE, json!({"takes": [1], "review_view": "grid"})),
+        )
+        .await;
+    assert!(
+        matches!(out, Outcome::Error { .. }),
+        "the Record stage refuses: {out:?}"
+    );
+    assert!(!armed.load(Ordering::SeqCst), "the fail point ran");
+    // A failure deadline for work that must never come, not a measurement (QA-031).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!fx.log().exists(), "{:?}", jsonl(&fx.log()));
+    assert!(!fx.local().join("picks").exists(), "no copy, no recipe");
     fx.shutdown().await;
 }
 
@@ -682,10 +824,7 @@ async fn the_96_px_copy_is_kept_by_hash_for_renderable_kinds_only() {
     )
     .await;
     assert_eq!(jsonl(&fx.log()).len(), 1);
-    assert!(
-        !fx.local().join("picks").exists(),
-        "no copy without the service"
-    );
+    assert!(!fx.picks_thumbs().exists(), "no copy without the service");
     fx.shutdown().await;
 }
 
@@ -769,8 +908,9 @@ async fn lines_are_whole_under_concurrent_appends() {
                     primary: true,
                     take_sha256: None,
                     decision: Decision::Pick,
-                    view: "grid".into(),
-                    recipe: json!({"t": t, "i": i, "padding": padding}),
+                    view: padding.clone(),
+                    recipe: None,
+                    recipe_body: None,
                 };
                 log_pick(&ctx, None, line, None).await;
             }
@@ -781,17 +921,11 @@ async fn lines_are_whole_under_concurrent_appends() {
     }
     let lines = jsonl(&fx.log());
     assert_eq!(lines.len(), TASKS * EACH);
-    let seen: BTreeSet<(u64, u64)> = lines
+    let seen: BTreeSet<String> = lines
         .iter()
         .map(|l| {
-            assert_eq!(
-                l["recipe"]["padding"].as_str().map(str::len),
-                Some(8 * 1024)
-            );
-            (
-                l["recipe"]["t"].as_u64().unwrap(),
-                l["recipe"]["i"].as_u64().unwrap(),
-            )
+            assert_eq!(l["view"].as_str().map(str::len), Some(8 * 1024));
+            l["file"].as_str().unwrap().to_string()
         })
         .collect();
     assert_eq!(seen.len(), TASKS * EACH, "every line once, whole");

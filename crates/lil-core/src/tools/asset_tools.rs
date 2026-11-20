@@ -1916,7 +1916,7 @@ async fn mark(
 ) -> Result<(MarkResult, String), ErrorBody> {
     let project = args.project.clone();
     let asset_id = args.asset_id.clone();
-    let (review_view, flag) = (args.review_view, args.flag);
+    let review_view = args.review_view;
     let req = mark_request(ctx, args)?;
     let a = asset_of(ctx, project, &asset_id).await?;
     let store = a.store().clone();
@@ -1963,6 +1963,7 @@ async fn mark(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
         .expect("the manifest edit ran");
+    let flag_changed = previous.contains_key("flag");
     if !previous.is_empty() {
         let mut event = json!({"kind": "mark", "asset": a.asset_id});
         if let Some(t) = &result.take {
@@ -1973,18 +1974,21 @@ async fn mark(
         ctx.events.publish(&a.topic(), event.clone());
         ctx.events.publish(&format!("project:{}", a.project), event);
     }
-    // After the Record step (the manifest edit): a pick, reject or clear from Review goes to
-    // the pick log (CORE-176), which never fails the mark.
-    if let (Some(view), Some(flag), Some(t), true) =
-        (review_view, flag, &result.take, pick_log::logs_caller(ctx))
-    {
+    // After the Record step (the manifest edit): a pick, reject or clear from Review that
+    // changed the take's flag goes to the pick log (CORE-176), which never fails the mark.
+    if let (Some(view), Some(t), true, true) = (
+        review_view,
+        &result.take,
+        flag_changed,
+        pick_log::logs_caller(ctx),
+    ) {
         let decided = pick_log::Decided {
             utc: lil_schema::time::rfc3339(store.now_utc()),
             project: a.project.clone(),
             asset_id: a.asset_id.clone(),
-            decision: match flag {
-                Some(FlagArg::Pick) => pick_log::Decision::Pick,
-                Some(FlagArg::Reject) => pick_log::Decision::Reject,
+            decision: match t.flag.as_deref() {
+                Some("pick") => pick_log::Decision::Pick,
+                Some(_) => pick_log::Decision::Reject,
                 None => pick_log::Decision::Cleared,
             },
             view: view.as_str(),

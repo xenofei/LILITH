@@ -14,13 +14,25 @@
 //!   primary holds its marks), or for a sign-off by `files` the chosen file of that take
 //!   (its primary when chosen). `primary` says whether it is the take's primary. The take hash
 //!   is `lil_schema::take_sha256` over the take's files, `null` when one of them has no
-//!   recorded SHA-256 (a pre-2b run); `recipe` is the run's `recipe` as the manifest holds it
-//!   (`null` when it has none).
-//! - **The append** goes through `fsops::append_locked`, one whole line under the append lock,
-//!   tried again while another writer holds the lock. It happens after the decision's Record
-//!   step (the mark's manifest edit, the sign-off's Record stage) and never undoes it: a failed
-//!   append is logged, and reported to the tools error sink as `pick_log.append_failed` (the
-//!   Diagnostics' recent errors; not a protocol error code), and the call's result is unchanged.
+//!   recorded SHA-256 (a pre-2b run).
+//! - **The recipe ref.** `recipe` is the run's recipe ref, `sha256:<hex>`: the SHA-256 of
+//!   `serde_json::to_vec` of the run's `recipe` value as the manifest holds it (`null` for a run
+//!   without one). The recipe itself is kept once, those same bytes, as
+//!   `<local dir>\picks\recipes\<hex>.json` (`fsops::write_workspace_local_file`, atomic; a file
+//!   already there is kept), so the log stays usable after the run is purged (CORE-032). It is
+//!   written before the line; a failed write is a `tracing` warning, as a failed thumbnail copy
+//!   is, and the line is written all the same.
+//! - **A decision is a change.** A mark is logged only when it changes the
+//!   take's `flag` (`asset.mark`'s `previous` holds `flag`): none to pick or reject, pick to
+//!   reject and back, or pick or reject to cleared. A repeated pick, or a clear with nothing to
+//!   clear, writes nothing. A sign-off from Review always logs one line per signed take.
+//! - **The append** goes through `store::append_local_line` (`fsops::append_line_locked`: one
+//!   whole line under the append lock, reading only the file's last byte), polled under the
+//!   store's backoff while another writer holds the lock or a sharing violation stops it. It
+//!   happens after the decision's Record step (the mark's manifest edit, the sign-off's Record
+//!   stage) and never undoes it: a failed append is logged, and reported to the tools error
+//!   sink as `pick_log.append_failed` (the Diagnostics' recent errors; not a protocol error
+//!   code), and the call's result is unchanged.
 //! - **The thumbnail copy**: the 96 px tier at scale 1 of a file whose kind has a renderer
 //!   (`lil_schema::renderable`), through `Thumbnails::ensure`, is copied to
 //!   `<local dir>\picks\thumbs\<sha256>.png` (`fsops::write_workspace_local_file`, which keeps a
@@ -32,17 +44,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lil_protocol::CallerKind;
-use lil_schema::{CandidateRun, Manifest, file_takes, renderable, take_sha256, takes_of};
+use lil_schema::content_hash::sha256_hex;
+use lil_schema::{
+    CandidateRun, Manifest, bare_sha256, file_takes, hash_value, renderable, take_sha256, takes_of,
+};
 use serde::Serialize;
 use serde_json::Value;
 
 use super::registry::CallCtx;
 use super::services::Thumbnails;
 use crate::pipeline::Chosen;
-use crate::store::{WsPath, fsops};
+use crate::store::{WsPath, append_local_line, fsops};
 
 /// The log's file name in the workspace's local data folder.
 pub const PICKS_FILE: &str = "picks.jsonl";
@@ -50,8 +65,6 @@ pub const PICKS_FILE: &str = "picks.jsonl";
 pub const APPEND_FAILED: &str = "pick_log.append_failed";
 /// The thumbnail tier the copy keeps, at scale 1 (P4b-R13).
 pub const PICK_THUMB_PX: u32 = 96;
-/// How long an append waits for the append lock before it counts as failed.
-const APPEND_WAIT: Duration = Duration::from_secs(10);
 /// How long the copy waits for its thumbnail.
 const COPY_WAIT: Duration = Duration::from_secs(60);
 
@@ -86,9 +99,17 @@ pub struct PickLine {
     pub decision: Decision,
     /// `grid`, `loupe`, `compare` or `survey`.
     pub view: String,
-    /// The run's `recipe` as the manifest holds it.
-    pub recipe: Value,
+    /// The run's recipe ref, `sha256:<hex>` of `serde_json::to_vec` of its `recipe`; `None`
+    /// for a run without one.
+    pub recipe: Option<String>,
+    /// The recipe `recipe` names: [`log_pick`] keeps it once as
+    /// `<local dir>\picks\recipes\<hex>.json`. Never part of the line.
+    #[serde(skip)]
+    pub recipe_body: Option<Value>,
 }
+
+/// A run's recipe: its ref and the value it names.
+type Recipe = Option<(String, Value)>;
 
 /// What every line of one decision shares.
 #[derive(Debug, Clone)]
@@ -110,8 +131,8 @@ fn bare(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The run `run_id` of `m` and its raw `recipe`.
-fn run_of(m: &Manifest, run_id: &str) -> Option<(CandidateRun, Value)> {
+/// The run `run_id` of `m` and its recipe (module docs "The recipe ref").
+fn run_of(m: &Manifest, run_id: &str) -> Option<(CandidateRun, Recipe)> {
     let run = m
         .view()
         .candidate_runs
@@ -128,8 +149,11 @@ fn run_of(m: &Manifest, run_id: &str) -> Option<(CandidateRun, Value)> {
             })
         })
         .and_then(|r| r.get("recipe"))
-        .cloned()
-        .unwrap_or(Value::Null);
+        .filter(|r| !r.is_null())
+        .and_then(|r| {
+            let bytes = serde_json::to_vec(r).ok()?;
+            Some((hash_value(&sha256_hex(&bytes)), r.clone()))
+        });
     Some((run, recipe))
 }
 
@@ -139,7 +163,7 @@ fn run_of(m: &Manifest, run_id: &str) -> Option<(CandidateRun, Value)> {
 fn take_line(
     d: &Decided,
     run: &CandidateRun,
-    recipe: &Value,
+    recipe: &Recipe,
     n: u32,
     chosen: Option<&[String]>,
 ) -> Option<PickLine> {
@@ -196,7 +220,8 @@ fn take_line(
         take_sha256: take_sha,
         decision: d.decision,
         view: d.view.to_string(),
-        recipe: recipe.clone(),
+        recipe: recipe.as_ref().map(|(r, _)| r.clone()),
+        recipe_body: recipe.as_ref().map(|(_, body)| body.clone()),
     })
 }
 
@@ -244,10 +269,10 @@ pub(crate) fn signoff_lines(
         .collect()
 }
 
-/// Appends `line` to the pick log of `ctx`'s workspace, and copies the 96 px thumbnail of the
-/// file at `thumb` (its workspace path and SHA-256) through `thumbs` in the background (module
-/// docs). Only for a `ui:*` caller; never returns an error: a failed append is reported to the
-/// tools error sink as `pick_log.append_failed`.
+/// Keeps `line`'s recipe, appends `line` to the pick log of `ctx`'s workspace, and copies the
+/// 96 px thumbnail of the file at `thumb` (its workspace path and SHA-256) through `thumbs` in
+/// the background (module docs). Only for a `ui:*` caller; never returns an error: a failed
+/// append is reported to the tools error sink as `pick_log.append_failed`.
 pub async fn log_pick(
     ctx: &CallCtx,
     thumbs: Option<Arc<dyn Thumbnails>>,
@@ -264,6 +289,11 @@ pub async fn log_pick(
         report(ctx, "the workspace has no local data folder");
         return;
     };
+    if let (Some(r), Some(body)) = (line.recipe.as_deref(), line.recipe_body.as_ref())
+        && let Some(hex) = bare_sha256(r)
+    {
+        keep_recipe(&local, hex, body).await;
+    }
     let mut text = match serde_json::to_string(&line) {
         Ok(text) => text,
         Err(e) => {
@@ -272,11 +302,7 @@ pub async fn log_pick(
         }
     };
     text.push('\n');
-    let log = local.join(PICKS_FILE);
-    let appended = tokio::task::spawn_blocking(move || append(&log, &text))
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(format!("the append stopped: {e}"))));
-    if let Err(e) = appended {
+    if let Err(e) = append_local_line(local.join(PICKS_FILE), text).await {
         report(
             ctx,
             &format!("A Review decision couldn't be added to {PICKS_FILE}: {e}"),
@@ -286,29 +312,11 @@ pub async fn log_pick(
     let (Some(thumbs), Some((path, sha))) = (thumbs, thumb) else {
         return;
     };
-    if !renderable(path.as_str()) || !is_sha256(sha) {
+    if !renderable(path.as_str()) || bare_sha256(sha) != Some(sha) {
         return;
     }
     let (path, sha) = (path.clone(), sha.to_string());
     tokio::spawn(async move { copy_thumb(thumbs.as_ref(), &local, &path, &sha).await });
-}
-
-/// Appends `text` (one line) to `log` under the append lock, waiting up to [`APPEND_WAIT`]
-/// while another writer holds it.
-fn append(log: &Path, text: &str) -> std::io::Result<()> {
-    let until = Instant::now() + APPEND_WAIT;
-    loop {
-        if fsops::append_locked(log, &|_| text.to_string())?.is_some() {
-            return Ok(());
-        }
-        if Instant::now() >= until {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "another writer held the log's append lock",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
 }
 
 /// Tells the tools error sink (Diagnostics) of a failed append.
@@ -319,9 +327,26 @@ fn report(ctx: &CallCtx, message: &str) {
     }
 }
 
-/// Whether `s` is a SHA-256 in bare lowercase hex, as a cache name takes it.
-fn is_sha256(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+/// Keeps the recipe `body` (ref hash `hex`) as `<local dir>\picks\recipes\<hex>.json`, the
+/// bytes its ref hashes, unless it is there; a failure is a warning only.
+async fn keep_recipe(local: &Path, hex: &str, body: &Value) {
+    let target = local
+        .join("picks")
+        .join("recipes")
+        .join(format!("{hex}.json"));
+    if target.exists() {
+        return;
+    }
+    let (local, bytes) = (local.to_path_buf(), serde_json::to_vec(body));
+    let kept = tokio::task::spawn_blocking(move || {
+        let bytes = bytes.map_err(std::io::Error::other)?;
+        fsops::write_workspace_local_file(&local, &target, &bytes)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(format!("the write stopped: {e}"))));
+    if let Err(e) = kept {
+        tracing::warn!(recipe = %hex, error = %e, "the pick log's recipe couldn't be kept");
+    }
 }
 
 /// The copy's place: `<local dir>\picks\thumbs\<sha256>.png`.

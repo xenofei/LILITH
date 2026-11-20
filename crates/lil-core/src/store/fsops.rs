@@ -223,23 +223,24 @@ pub fn remove_suite_cache_file(env: &lil_platform::Env, path: &Path) -> std::io:
 }
 
 /// The folders below a workspace's local data folder that [`write_workspace_local_file`]
-/// writes in: the thumbnail cache and the pick log's thumbnails (APP-038, CORE-176).
-const LOCAL_WRITE_DIRS: [&[&str]; 2] = [&["thumbs"], &["picks", "thumbs"]];
+/// writes in: the thumbnail cache, and the pick log's thumbnails and recipes (APP-038,
+/// CORE-176).
+const LOCAL_WRITE_DIRS: [&[&str]; 3] = [&["thumbs"], &["picks", "thumbs"], &["picks", "recipes"]];
 /// The one folder [`remove_workspace_local_file`] removes from: the thumbnail cache (P4b-R36).
 const LOCAL_REMOVE_DIRS: [&[&str]; 1] = [&["thumbs"]];
 
 /// Writes `bytes` as the file `path` of a workspace's local data folder `local_dir`
-/// (ARCH-097): only below `<local dir>\thumbs\` or `<local dir>\picks\thumbs\` (APP-038,
-/// CORE-176). The folders are made; the data goes to a new temp file beside the target
-/// (flushed to disk) and is moved to the target's name without replacing anything. The cache
-/// is keyed by content, so a plain file already there holds the same bytes and is kept: the
-/// temp file is removed and the write succeeds. Anything else at that name (a link, a folder)
-/// is refused, never written through. Temp files of this function older than a day are
+/// (ARCH-097): only below `<local dir>\thumbs\`, `<local dir>\picks\thumbs\` or
+/// `<local dir>\picks\recipes\` (APP-038, CORE-176). The folders are made; the data goes
+/// to a new temp file beside the target (flushed to disk) and is moved to the target's name
+/// without replacing anything. The cache is keyed by content, so a plain file already there
+/// holds the same bytes and is kept: the temp file is removed and the write succeeds. Anything
+/// else at that name (a link, a folder) is refused, never written through. Temp files of this function older than a day are
 /// removed from the folder first.
 ///
 /// # Errors
 /// `PermissionDenied` before anything is written or made: a relative path, a path with a `.`
-/// or `..` part, a path not below one of the two folders (names compared without regard to
+/// or `..` part, a path not below one of the three folders (names compared without regard to
 /// case), a folder on the way that is a link or not a folder, or a file name Windows would
 /// read as something else (as [`write_suite_cache_file`]); then the write's errors.
 pub fn write_workspace_local_file(
@@ -940,6 +941,37 @@ pub fn append_locked(
     Ok(Some(line))
 }
 
+/// Appends `line` (one whole line, ending in `\n`) to the log `path` (created if missing)
+/// under the append lock of [`append_locked`], for a log whose lines need nothing from the
+/// text before them (the pick log, CORE-176). Only the file's last byte is read: when it isn't
+/// `\n` (a torn last line), a `\n` goes before the line. The line goes out in one `write_all`.
+/// `false` at once when another holder has the lock: the caller polls under its retry budget.
+#[allow(clippy::disallowed_methods)]
+pub fn append_line_locked(path: &Path, line: &str) -> std::io::Result<bool> {
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(long_path(path))?;
+    let Some(lock) = lil_platform::fs::try_lock_append(&file)? else {
+        return Ok(false);
+    };
+    let len = file.metadata()?.len();
+    let mut out = Vec::with_capacity(line.len() + 1);
+    if len > 0 {
+        let mut last = [0_u8; 1];
+        (&file).seek(SeekFrom::Start(len - 1))?;
+        (&file).read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            out.push(b'\n');
+        }
+    }
+    out.extend_from_slice(line.as_bytes());
+    (&file).write_all(&out)?;
+    drop(lock);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,5 +1172,28 @@ mod tests {
             std::fs::read_to_string(&log).unwrap(),
             "{\"a\":1}\n{\"b\"\n{\"c\":3}\n"
         );
+    }
+
+    /// The pick log's append reads only the last byte. The earlier content isn't valid UTF-8
+    /// (a whole-file text read would have to replace it), and it stays byte for byte; a torn
+    /// last line is closed, a whole one isn't touched.
+    #[test] // spec: ARCH-081, CORE-176
+    fn append_line_locked_closes_a_torn_line_reading_only_the_last_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("picks.jsonl");
+        let fp = FailPoints::none();
+        let mut before = vec![0xff_u8, 0xfe, 0x80, b'\n'];
+        before.extend(std::iter::repeat_n(0xc3_u8, 1 << 20));
+        before.extend_from_slice(b"{\"torn\"");
+        write_temp(dir.path(), "picks.jsonl", &before, &fp).unwrap();
+        assert!(append_line_locked(&log, "{\"a\":1}\n").unwrap());
+        assert!(append_line_locked(&log, "{\"b\":2}\n").unwrap());
+        let mut want = before.clone();
+        want.extend_from_slice(b"\n{\"a\":1}\n{\"b\":2}\n");
+        assert_eq!(std::fs::read(&log).unwrap(), want);
+        // A missing log is made.
+        let fresh = dir.path().join("new.jsonl");
+        assert!(append_line_locked(&fresh, "{\"c\":3}\n").unwrap());
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"{\"c\":3}\n");
     }
 }

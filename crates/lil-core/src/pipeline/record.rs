@@ -109,8 +109,9 @@ impl std::fmt::Debug for RecordPlan {
 
 /// Where a call's tool leaves its [`RecordPlan`] for the Record stage. At most one plan: a
 /// second `set` replaces the first. A tool may also leave work for after a successful Record
-/// stage ([`RecordSlot::after`]): the stage starts it once [`apply_record`] returned `Ok`, in
-/// its own task, and drops it otherwise.
+/// stage ([`RecordSlot::after`]): the tool path's Record stage (`tools::record_stage`'s
+/// `WorkspaceRecord`) starts it once [`apply_record`] returned `Ok`, in its own task, and drops
+/// it otherwise. A job's Record step (`jobs::runner`) never takes it.
 #[derive(Default)]
 pub struct RecordSlot(Mutex<Option<RecordPlan>>, Mutex<Option<AfterRecord>>);
 
@@ -140,8 +141,10 @@ impl RecordSlot {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 
-    /// Leaves `work` for after a successful Record stage (a second call replaces the first).
-    /// It must not hold this slot: a slot that is never taken would keep it alive.
+    /// Leaves `work` for after a successful Record stage (a second call replaces the first):
+    /// only the tool path's `WorkspaceRecord` (`tools::record_stage`) starts it, never a job's
+    /// Record step (`jobs::runner`). It must not hold this slot: a slot that is never taken
+    /// would keep it alive.
     pub fn after(&self, work: AfterRecord) {
         *self.1.lock().unwrap_or_else(PoisonError::into_inner) = Some(work);
     }
