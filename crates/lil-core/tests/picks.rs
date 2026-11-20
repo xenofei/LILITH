@@ -5,8 +5,8 @@
 //! `picks\recipes\<hex>.json`; a mark that doesn't change the take's flag, or a decision from
 //! anywhere else, appends nothing, and a failed append is a Diagnostics error that never undoes
 //! the decision. Driven through the dispatcher of an in-process core with the fake clock and ids
-//! (QA-031), on a copy of the spec fixture workspace, and through `log_pick` itself for the
-//! concurrent appends. Images are made in the test with `lil_testkit::png`.
+//! (QA-031), on a copy of the spec fixture workspace, and through the pick log's append
+//! (`store::append_local_line`) for the concurrent appends. Images are made in the test with `lil_testkit::png`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -18,11 +18,10 @@ use lil_core::events::EventBus;
 use lil_core::interchange::thumbs::{ThumbOptions, ThumbService};
 use lil_core::session::Session;
 use lil_core::state::StateRegistry;
-use lil_core::store::FailPoints;
-use lil_core::tools::pick_log::{Decision, PickLine, log_pick};
+use lil_core::store::{FailPoints, append_local_line, fsops};
+use lil_core::tools::pick_log::{Decision, PickLine};
 use lil_core::tools::{
-    AssetServices, CallCtx, Dispatcher, ErrorSink, PipelineHooks, Settings, TestGates, Thumbnails,
-    core_registry,
+    AssetServices, Dispatcher, ErrorSink, PipelineHooks, TestGates, Thumbnails, core_registry,
 };
 use lil_core::workspace::{WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{Probe, SystemProbe};
@@ -171,7 +170,6 @@ impl ErrorSink for Errors {
 struct Fx {
     dispatcher: Dispatcher,
     hub: Arc<WorkspaceHub>,
-    events: Arc<EventBus>,
     errors: Arc<Errors>,
     ws_ref: WorkspaceRef,
     ws: PathBuf,
@@ -238,7 +236,7 @@ impl Fx {
             reg,
             PipelineHooks::plan2(),
             states.clone(),
-            events.clone(),
+            events,
             hub.clone(),
             ids,
             clock,
@@ -249,7 +247,6 @@ impl Fx {
         Fx {
             dispatcher,
             hub,
-            events,
             errors,
             ws_ref: ws_ref(&ws),
             ws,
@@ -386,6 +383,36 @@ async fn poll<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
         assert!(tokio::time::Instant::now() < until, "waited for {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The names in the folder `dir` (none when it is missing).
+fn kept_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Opens `path` (created if missing) as another writer of the log would.
+#[allow(clippy::disallowed_methods)] // an outside appender holding the log's append lock
+fn open_log(path: &Path) -> std::fs::File {
+    fsops::ensure_dir(path.parent().unwrap()).unwrap();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .unwrap()
+}
+
+/// Takes the append lock of `file`, the lock the core's append takes.
+#[allow(clippy::disallowed_methods)] // the outside appender's lock
+fn hold_append_lock(file: &std::fs::File) -> lil_platform::fs::AppendLock<'_> {
+    lil_platform::fs::try_lock_append(file)
+        .unwrap()
+        .expect("the lock is free")
 }
 
 #[tokio::test] // spec: CORE-176
@@ -606,12 +633,13 @@ async fn the_recipe_is_kept_once_by_its_hash() {
     for line in &lines {
         assert_eq!(line["recipe"], format!("sha256:{hex}"), "{line}");
     }
-    // One file, named by the hash of its own bytes, holding the manifest's recipe.
-    let kept: Vec<String> = std::fs::read_dir(fx.picks_recipes())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(kept, [format!("{hex}.json")]);
+    // One file, named by the hash of its own bytes, holding the manifest's recipe (written in
+    // its own task, so waited for).
+    let one = [format!("{hex}.json")];
+    poll("the one recipe file", || {
+        (kept_names(&fx.picks_recipes()) == one).then_some(())
+    })
+    .await;
     let bytes = std::fs::read(fx.picks_recipes().join(format!("{hex}.json"))).unwrap();
     assert_eq!(sha256_bytes(&bytes), hex);
     let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -631,7 +659,7 @@ async fn the_recipe_is_kept_once_by_its_hash() {
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert_eq!(lines[2]["asset_id"], BARE);
     assert_eq!(lines[2]["recipe"], Value::Null, "{}", lines[2]);
-    assert_eq!(std::fs::read_dir(fx.picks_recipes()).unwrap().count(), 1);
+    assert_eq!(kept_names(&fx.picks_recipes()), one);
     fx.shutdown().await;
 }
 
@@ -827,6 +855,90 @@ async fn the_96_px_copy_is_kept_by_hash_for_renderable_kinds_only() {
     fx.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: CORE-176
+async fn marks_are_logged_in_the_manifests_order_under_contention() {
+    let fx = Fx::new(&[KITE], false);
+    // Take 2's flag as the manifest holds it (null while the file is being replaced).
+    let flag = || {
+        std::fs::read(fx.manifest_path(KITE))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .map_or(Value::Null, |m| {
+                m["candidate_runs"][0]["files"][2]["flag"].clone()
+            })
+    };
+    let file = open_log(&fx.log());
+    let lock = hold_append_lock(&file);
+    let review = |f: &str| mark(KITE, json!({"take": 2, "flag": f, "review_view": "grid"}));
+    let pick = fx.ok_as(app(), "asset.mark", review("pick"));
+    let reject_after = async {
+        // The pick is in the manifest; its line now waits for the log, under the asset's lock.
+        poll("the pick in the manifest", || {
+            (flag() == "pick").then_some(())
+        })
+        .await;
+        let reject = fx.ok_as(app(), "asset.mark", review("reject"));
+        let release = async {
+            // Well inside the pick's 1 s budget: the reject can't edit before the pick's line.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(flag(), "pick", "the reject waits for the pick's line");
+            drop(lock);
+        };
+        tokio::join!(reject, release)
+    };
+    let (picked, (rejected, ())) = tokio::join!(pick, reject_after);
+    assert_eq!(picked["take"]["flag"], "pick", "{picked}");
+    assert_eq!(rejected["take"]["flag"], "reject", "{rejected}");
+    let decisions: Vec<Value> = jsonl(&fx.log())
+        .iter()
+        .map(|l| l["decision"].clone())
+        .collect();
+    assert_eq!(decisions, [json!("pick"), json!("reject")]);
+    assert_eq!(flag(), "reject", "the log's last word is the manifest's");
+    assert!(fx.errors.0.lock().unwrap().is_empty());
+    drop(file);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: CORE-176, ARCH-121
+async fn a_held_log_delays_a_mark_by_its_short_budget_only() {
+    let fx = Fx::new(&[KITE], false);
+    let file = open_log(&fx.log());
+    let lock = hold_append_lock(&file);
+    let start = tokio::time::Instant::now();
+    let out = fx
+        .ok_as(
+            app(),
+            "asset.mark",
+            mark(
+                KITE,
+                json!({"take": 1, "flag": "pick", "review_view": "loupe"}),
+            ),
+        )
+        .await;
+    let took = start.elapsed();
+    // A bound on the wait, well above the 1 s budget, not a measurement (QA-031).
+    assert!(
+        took < Duration::from_secs(3),
+        "the mark answered after {took:?}"
+    );
+    assert_eq!(out["take"]["flag"], "pick", "{out}");
+    let files = fx.manifest(KITE)["candidate_runs"][0]["files"].clone();
+    assert_eq!(files[0]["flag"], "pick", "the mark stands: {files}");
+    let errors = fx.errors.0.lock().unwrap().clone();
+    assert!(
+        errors
+            .iter()
+            .any(|(code, tool, _)| code == "pick_log.append_failed"
+                && tool.as_deref() == Some("asset.mark")),
+        "{errors:?}"
+    );
+    drop(lock);
+    assert!(jsonl(&fx.log()).is_empty());
+    drop(file);
+    fx.shutdown().await;
+}
+
 #[tokio::test] // spec: CORE-176, ARCH-121
 #[allow(clippy::disallowed_methods)] // makes the folder that stands where the log should be
 async fn a_failed_append_is_a_diagnostics_error_and_the_mark_stands() {
@@ -861,39 +973,12 @@ async fn lines_are_whole_under_concurrent_appends() {
     const TASKS: usize = 8;
     const EACH: usize = 25;
     let fx = Fx::new(&[], false);
-    let open = fx.hub.open(&fx.ws_ref).await.expect("the workspace opens");
-    let ctx = CallCtx {
-        session: Arc::new(Session {
-            id: "s_picks_append".into(),
-            caller: app(),
-            non_interactive: false,
-            workspace: Some(fx.ws_ref.clone()),
-            capabilities: Vec::new(),
-            client_pid: 1,
-            profile_id: None,
-        }),
-        trace_id: "t_picks".into(),
-        settings: Settings::default(),
-        events: fx.events.clone(),
-        workspace: Some(open),
-        project: Some("sketchbook".into()),
-        record: Arc::new(lil_core::pipeline::RecordSlot::new()),
-        jobs: fx.dispatcher.jobs().clone(),
-        submitted: Arc::new(lil_core::jobs::SubmittedSlot::new()),
-        reservation: None,
-        confirmed_via: None,
-        idem_key: None,
-        call_id: String::new(),
-        tool: "asset.mark".into(),
-        arguments: Value::Null,
-        retry_of: None,
-        redispatch: None,
-    };
+    let log = fx.log();
     // Lines longer than a page, so a torn write would show.
     let padding = "x".repeat(8 * 1024);
     let mut tasks = Vec::new();
     for t in 0..TASKS {
-        let (ctx, padding) = (ctx.clone(), padding.clone());
+        let (log, padding) = (log.clone(), padding.clone());
         tasks.push(tokio::spawn(async move {
             for i in 0..EACH {
                 let line = PickLine {
@@ -911,7 +996,13 @@ async fn lines_are_whole_under_concurrent_appends() {
                     recipe: None,
                     recipe_body: None,
                 };
-                log_pick(&ctx, None, line, None).await;
+                let text = format!("{}\n", serde_json::to_string(&line).unwrap());
+                // The pick log's own append, with the store's usual 10 s budget: eight writers
+                // without pause can starve one past the pick log's 1 s, which `log_pick`
+                // reports as `pick_log.append_failed` (`a_held_log_delays_a_mark_by_...`).
+                append_local_line(log.clone(), text, Duration::from_secs(10))
+                    .await
+                    .unwrap();
             }
         }));
     }
@@ -928,7 +1019,5 @@ async fn lines_are_whole_under_concurrent_appends() {
         })
         .collect();
     assert_eq!(seen.len(), TASKS * EACH, "every line once, whole");
-    assert!(fx.errors.0.lock().unwrap().is_empty());
-    drop(ctx);
     fx.shutdown().await;
 }

@@ -19,20 +19,28 @@
 //!   `serde_json::to_vec` of the run's `recipe` value as the manifest holds it (`null` for a run
 //!   without one). The recipe itself is kept once, those same bytes, as
 //!   `<local dir>\picks\recipes\<hex>.json` (`fsops::write_workspace_local_file`, atomic; a file
-//!   already there is kept), so the log stays usable after the run is purged (CORE-032). It is
-//!   written before the line; a failed write is a `tracing` warning, as a failed thumbnail copy
-//!   is, and the line is written all the same.
+//!   already there is kept), so the log stays usable after the run is purged (CORE-032). Its
+//!   write starts in its own task before the line is appended and is never waited for; a
+//!   failed write is a `tracing` warning, as a failed thumbnail copy is, and the line is
+//!   written all the same.
 //! - **A decision is a change.** A mark is logged only when it changes the
 //!   take's `flag` (`asset.mark`'s `previous` holds `flag`): none to pick or reject, pick to
 //!   reject and back, or pick or reject to cleared. A repeated pick, or a clear with nothing to
 //!   clear, writes nothing. A sign-off from Review always logs one line per signed take.
 //! - **The append** goes through `store::append_local_line` (`fsops::append_line_locked`: one
-//!   whole line under the append lock, reading only the file's last byte), polled under the
-//!   store's backoff while another writer holds the lock or a sharing violation stops it. It
-//!   happens after the decision's Record step (the mark's manifest edit, the sign-off's Record
-//!   stage) and never undoes it: a failed append is logged, and reported to the tools error
-//!   sink as `pick_log.append_failed` (the Diagnostics' recent errors; not a protocol error
-//!   code), and the call's result is unchanged.
+//!   whole line under the append lock, reading only the file's last byte, into a plain file
+//!   with one name, never through a link), polled under the store's backoff (10 ms doubling)
+//!   while another writer holds the lock or a sharing violation stops it, [`APPEND_BUDGET`]
+//!   (1 s) in all. It happens after the decision's Record step (the mark's manifest edit, the
+//!   sign-off's Record stage) and never undoes it: a failed append is logged, and reported to
+//!   the tools error sink as `pick_log.append_failed` (the Diagnostics' recent errors; not a
+//!   protocol error code), and the call's result is unchanged.
+//! - **When a line is written.** A mark's line is appended before the mark answers, while
+//!   `asset.mark` still holds the asset's version lock, so marks of one asset are logged in the
+//!   order the manifest took them. Under contention a mark waits at most about 1 s
+//!   ([`APPEND_BUDGET`]) for the log, then records `pick_log.append_failed`, and the decision
+//!   stands. A sign-off's lines are appended in their own task once its Record stage succeeded
+//!   (its run is closed by then).
 //! - **The thumbnail copy**: the 96 px tier at scale 1 of a file whose kind has a renderer
 //!   (`lil_schema::renderable`), through `Thumbnails::ensure`, is copied to
 //!   `<local dir>\picks\thumbs\<sha256>.png` (`fsops::write_workspace_local_file`, which keeps a
@@ -67,6 +75,9 @@ pub const APPEND_FAILED: &str = "pick_log.append_failed";
 pub const PICK_THUMB_PX: u32 = 96;
 /// How long the copy waits for its thumbnail.
 const COPY_WAIT: Duration = Duration::from_secs(60);
+/// How long an append polls for the log's append lock before it counts as failed: a mark waits
+/// for its line (module docs "When a line is written"). The store's other logs keep 10 s.
+pub const APPEND_BUDGET: Duration = Duration::from_secs(1);
 
 /// A logged decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,7 +89,10 @@ pub enum Decision {
     SignedOff,
 }
 
-/// One line of `picks.jsonl` (Appendix H "Pick log"; module docs).
+/// One line of `picks.jsonl` (Appendix H "Pick log"; module docs). A mark's line is written
+/// before the mark answers, in the order the manifest took the marks; when the log stays
+/// locked past [`APPEND_BUDGET`] (about 1 s) the mark records `pick_log.append_failed` instead,
+/// and the decision stands.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PickLine {
     /// RFC 3339 UTC, on the store's clock.
@@ -269,10 +283,11 @@ pub(crate) fn signoff_lines(
         .collect()
 }
 
-/// Keeps `line`'s recipe, appends `line` to the pick log of `ctx`'s workspace, and copies the
-/// 96 px thumbnail of the file at `thumb` (its workspace path and SHA-256) through `thumbs` in
-/// the background (module docs). Only for a `ui:*` caller; never returns an error: a failed
-/// append is reported to the tools error sink as `pick_log.append_failed`.
+/// Appends `line` to the pick log of `ctx`'s workspace, and keeps `line`'s recipe and copies
+/// the 96 px thumbnail of the file at `thumb` (its workspace path and SHA-256) through `thumbs`
+/// in tasks of their own, never waited for (module docs). Only the append is awaited, for at
+/// most [`APPEND_BUDGET`]. Only for a `ui:*` caller; never returns an error: a failed append is
+/// reported to the tools error sink as `pick_log.append_failed`.
 pub async fn log_pick(
     ctx: &CallCtx,
     thumbs: Option<Arc<dyn Thumbnails>>,
@@ -292,7 +307,8 @@ pub async fn log_pick(
     if let (Some(r), Some(body)) = (line.recipe.as_deref(), line.recipe_body.as_ref())
         && let Some(hex) = bare_sha256(r)
     {
-        keep_recipe(&local, hex, body).await;
+        let (local, hex, body) = (local.clone(), hex.to_string(), body.clone());
+        tokio::spawn(async move { keep_recipe(&local, &hex, &body).await });
     }
     let mut text = match serde_json::to_string(&line) {
         Ok(text) => text,
@@ -302,7 +318,7 @@ pub async fn log_pick(
         }
     };
     text.push('\n');
-    if let Err(e) = append_local_line(local.join(PICKS_FILE), text).await {
+    if let Err(e) = append_local_line(local.join(PICKS_FILE), text, APPEND_BUDGET).await {
         report(
             ctx,
             &format!("A Review decision couldn't be added to {PICKS_FILE}: {e}"),

@@ -946,13 +946,48 @@ pub fn append_locked(
 /// text before them (the pick log, CORE-176). Only the file's last byte is read: when it isn't
 /// `\n` (a torn last line), a `\n` goes before the line. The line goes out in one `write_all`.
 /// `false` at once when another holder has the lock: the caller polls under its retry budget.
+/// Only a plain file with one name is written, as [`touch_workspace_local_file`] touches: a
+/// link or a second name planted at `path` could reach a file elsewhere. A missing file is
+/// made.
+///
+/// # Errors
+/// `PermissionDenied`, before anything is written, for anything at `path` but a plain file
+/// (a link, a folder) or a file with more than one name (a hard link); then the open's, the
+/// read's or the write's error.
 #[allow(clippy::disallowed_methods)]
 pub fn append_line_locked(path: &Path, line: &str) -> std::io::Result<bool> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`: a link is opened itself, never followed.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
+    const REPARSE_POINT: u32 = 0x0400;
+    let refused = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} {why}", path.display()),
+        )
+    };
+    match std::fs::symlink_metadata(long_path(path)) {
+        Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+            return Err(refused("is not a plain file"));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     let file = OpenOptions::new()
         .read(true)
         .append(true)
         .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(long_path(path))?;
+    // Again on the open file: a link or a name may have been planted since the check.
+    let meta = file.metadata()?;
+    if meta.file_attributes() & REPARSE_POINT != 0 {
+        return Err(refused("is not a plain file"));
+    }
+    if lil_platform::fs::link_count(&file)? > 1 {
+        return Err(refused("has more than one name (a hard link)"));
+    }
     let Some(lock) = lil_platform::fs::try_lock_append(&file)? else {
         return Ok(false);
     };
@@ -1195,5 +1230,25 @@ mod tests {
         let fresh = dir.path().join("new.jsonl");
         assert!(append_line_locked(&fresh, "{\"c\":3}\n").unwrap());
         assert_eq!(std::fs::read(&fresh).unwrap(), b"{\"c\":3}\n");
+    }
+
+    /// A hard link planted at the log's name is refused: the file its other name holds keeps
+    /// its bytes. A folder there is refused too.
+    #[test] // spec: CORE-176
+    #[allow(clippy::disallowed_methods)] // plants the link and the folder
+    fn append_line_locked_refuses_a_hard_link_or_a_folder_at_the_log_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = FailPoints::none();
+        write_temp(dir.path(), "candidate.txt", b"a candidate", &fp).unwrap();
+        let other = dir.path().join("candidate.txt");
+        let log = dir.path().join("picks.jsonl");
+        std::fs::hard_link(&other, &log).unwrap();
+        let err = append_line_locked(&log, "{\"a\":1}\n").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(std::fs::read(&other).unwrap(), b"a candidate");
+        let folder = dir.path().join("folder.jsonl");
+        std::fs::create_dir(&folder).unwrap();
+        let err = append_line_locked(&folder, "{\"a\":1}\n").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     }
 }

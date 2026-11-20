@@ -517,27 +517,35 @@ pub fn next_step(class: RetryClass, phase: Phase) -> Step {
 // Helpers.
 // ---------------------------------------------------------------------------------------------
 
-/// The retry pauses of one call: 10 ms doubling to 500 ms, 10 s in all, on tokio's clock.
+/// The retry pauses of one call: 10 ms doubling to 500 ms, 10 s in all (or the budget of
+/// [`Backoff::within`]), on tokio's clock.
 pub(super) struct Backoff {
     start: tokio::time::Instant,
     next: Duration,
+    budget: Duration,
 }
 
 impl Backoff {
     pub(super) fn new() -> Backoff {
+        Backoff::within(RETRY_BUDGET)
+    }
+
+    /// The same pauses, `budget` in all.
+    pub(super) fn within(budget: Duration) -> Backoff {
         Backoff {
             start: tokio::time::Instant::now(),
             next: RETRY_FIRST,
+            budget,
         }
     }
 
     /// Pauses before the next attempt; `false` once the budget is spent.
     pub(super) async fn wait(&mut self) -> bool {
         let spent = self.start.elapsed();
-        if spent >= RETRY_BUDGET {
+        if spent >= self.budget {
             return false;
         }
-        tokio::time::sleep(self.next.min(RETRY_BUDGET - spent)).await;
+        tokio::time::sleep(self.next.min(self.budget - spent)).await;
         self.next = (self.next * 2).min(RETRY_CAP);
         true
     }

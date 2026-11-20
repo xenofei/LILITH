@@ -1957,7 +1957,6 @@ async fn mark(
         .edit_manifest(&a.manifest, &edit)
         .await
         .map_err(error)?;
-    drop(guard);
     let Applied { result, previous } = applied
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1975,7 +1974,10 @@ async fn mark(
         ctx.events.publish(&format!("project:{}", a.project), event);
     }
     // After the Record step (the manifest edit): a pick, reject or clear from Review that
-    // changed the take's flag goes to the pick log (CORE-176), which never fails the mark.
+    // changed the take's flag goes to the pick log (CORE-176), which never fails the mark. The
+    // line is appended (stamped and waited for, at most `pick_log::APPEND_BUDGET`) before the
+    // version lock goes, so the log takes one asset's marks in the manifest's order; the recipe
+    // and the thumbnail copy run in tasks of their own.
     if let (Some(view), Some(t), true, true) = (
         review_view,
         &result.take,
@@ -2000,6 +2002,7 @@ async fn mark(
             pick_log::log_pick(ctx, services.thumbs.get().cloned(), line, at).await;
         }
     }
+    drop(guard);
     let summary = match &result.take {
         Some(t) => format!("marked {} take {} of run {}", a.asset_id, t.take, t.run_id),
         None => format!("marked {}", a.asset_id),
