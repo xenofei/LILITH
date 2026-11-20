@@ -235,8 +235,8 @@ const LOCAL_REMOVE_DIRS: [&[&str]; 1] = [&["thumbs"]];
 /// to a new temp file beside the target (flushed to disk) and is moved to the target's name
 /// without replacing anything. The cache is keyed by content, so a plain file already there
 /// holds the same bytes and is kept: the temp file is removed and the write succeeds. Anything
-/// else at that name (a link, a folder) is refused, never written through. Temp files of this function older than a day are
-/// removed from the folder first.
+/// else at that name (a link, a folder) is refused, never written through. Temp files of this
+/// function older than a day are removed from the folder first.
 ///
 /// # Errors
 /// `PermissionDenied` before anything is written or made: a relative path, a path with a `.`
@@ -1174,9 +1174,9 @@ mod tests {
         );
     }
 
-    /// The pick log's append reads only the last byte. The earlier content isn't valid UTF-8
-    /// (a whole-file text read would have to replace it), and it stays byte for byte; a torn
-    /// last line is closed, a whole one isn't touched.
+    /// The pick log's append keeps the earlier content byte for byte, even when it isn't valid
+    /// UTF-8, closes a torn last line, and leaves a whole one as it is. (The one-byte read
+    /// itself is checked by review, not by this test.)
     #[test] // spec: ARCH-081, CORE-176
     fn append_line_locked_closes_a_torn_line_reading_only_the_last_byte() {
         let dir = tempfile::tempdir().unwrap();

@@ -4,10 +4,9 @@
 //! renderable file under `picks\thumbs\<sha256>.png`, and its run's recipe once under
 //! `picks\recipes\<hex>.json`; a mark that doesn't change the take's flag, or a decision from
 //! anywhere else, appends nothing, and a failed append is a Diagnostics error that never undoes
-//! the decision. Driven
-//! through the dispatcher of an in-process core with the fake clock and ids (QA-031), on a copy
-//! of the spec fixture workspace, and through `log_pick` itself for the concurrent appends.
-//! Images are made in the test with `lil_testkit::png`.
+//! the decision. Driven through the dispatcher of an in-process core with the fake clock and ids
+//! (QA-031), on a copy of the spec fixture workspace, and through `log_pick` itself for the
+//! concurrent appends. Images are made in the test with `lil_testkit::png`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
