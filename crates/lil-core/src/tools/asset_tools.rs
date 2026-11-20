@@ -54,8 +54,10 @@
 //!   (ARCH-042). Sign-off isn't destructive, so an agent may do it (CORE-051). It takes
 //!   exactly one of `files` and `takes` (`params.invalid` otherwise; Appendix H "Takes"):
 //!   with `takes`, `pipeline::chosen_files` chooses each take's primary, then the takes'
-//!   companions, and `signed_off` records `takes` and `companions`. `review_view` is validated
-//!   and stored nowhere until the pick log.
+//!   companions, and `signed_off` records `takes` and `companions`. With `review_view`, from a
+//!   `ui:*` caller, the call leaves the pick log's lines (one per signed take,
+//!   `tools::pick_log`) for after its Record stage, which starts them only once the sign-off is
+//!   recorded.
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
 //!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
@@ -93,8 +95,8 @@
 //!   before (a hand-written rating of 7 reads as 5) of each mark that changed: `tags` and
 //!   `label` are the asset's, `flag` is the take's, and `rating` is the take's when the call
 //!   names a run, else the asset's. Nothing changed writes and publishes nothing. No jobs log
-//!   line, no `progress.md` entry, no status change. `review_view` is validated and stored
-//!   nowhere until the pick log.
+//!   line, no `progress.md` entry, no status change. A `flag` (or its clearing) on a take with
+//!   `review_view`, from a `ui:*` caller, is then logged to the pick log (`tools::pick_log`).
 //! - **`asset.accept_move`** and **`asset.make_independent`** (CORE-154; Appendix H "Moved and
 //!   copied folders"; P4b-R34) repair an asset folder moved or copied outside the suite, as
 //!   `projects::repair` does them, on the asset at its folder: a folder (or project) whose name
@@ -160,6 +162,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::pick_log;
 use super::registry::{
     CallCtx, ConfirmPolicy, Registry, ToolMeta, TouchDecl, facts_fn, typed_tool,
 };
@@ -167,8 +170,8 @@ use super::services::{AssetServices, InUse};
 use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::{
-    Chosen, HandOff, RecordBranch, RecordPlan, SignedOffBy, actor_of, asset_topic, chosen_files,
-    plan_signoff, signed_off_by, start_candidate_run, status_by,
+    Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, actor_of, asset_topic,
+    chosen_files, plan_signoff, signed_off_by, start_candidate_run, status_by,
 };
 use crate::projects::redirects::{name_of, read_redirects};
 use crate::projects::repair as folder_repair;
@@ -333,7 +336,6 @@ struct SignoffArgs {
     #[serde(default)]
     keep_runs: Vec<String>,
     /// The Review view the sign-off came from.
-    #[expect(dead_code, reason = "validated now; the pick log (Task 13) records it")]
     review_view: Option<ReviewView>,
 }
 
@@ -346,6 +348,18 @@ enum ReviewView {
     Loupe,
     Compare,
     Survey,
+}
+
+impl ReviewView {
+    /// Its wire name, as the pick log's `view` records it.
+    fn as_str(self) -> &'static str {
+        match self {
+            ReviewView::Grid => "grid",
+            ReviewView::Loupe => "loupe",
+            ReviewView::Compare => "compare",
+            ReviewView::Survey => "survey",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -431,7 +445,6 @@ struct MarkArgs {
     #[serde(default, deserialize_with = "present")]
     flag: Option<Option<FlagArg>>,
     /// The Review view the decision came from.
-    #[expect(dead_code, reason = "validated now; the pick log (Task 13) records it")]
     review_view: Option<ReviewView>,
 }
 
@@ -1146,7 +1159,11 @@ fn conflict(rel: &WsPath) -> StoreError {
     }
 }
 
-async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, String), ErrorBody> {
+async fn signoff(
+    ctx: &CallCtx,
+    services: &AssetServices,
+    args: SignoffArgs,
+) -> Result<(SignoffResult, String), ErrorBody> {
     // Appendix H "Takes": exactly one of `files` and `takes`.
     let chosen = match (args.files, args.takes) {
         (Some(files), None) => Chosen::Files(files),
@@ -1209,6 +1226,21 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         now,
     )
     .map_err(|e| traced(ctx, e))?;
+    // The pick log's lines of a sign-off from Review (CORE-176), one per signed take, written
+    // after the Record stage records the sign-off.
+    let pick_lines = match args.review_view {
+        Some(view) if pick_log::logs_caller(ctx) => {
+            let decided = pick_log::Decided {
+                utc: lil_schema::time::rfc3339(now),
+                project: a.project.clone(),
+                asset_id: a.asset_id.clone(),
+                decision: pick_log::Decision::SignedOff,
+                view: view.as_str(),
+            };
+            pick_log::signoff_lines(&decided, &planned, &args.run_id, &chosen)
+        }
+        _ => Vec::new(),
+    };
     let run = planned
         .view()
         .candidate_runs
@@ -1374,6 +1406,35 @@ async fn signoff(ctx: &CallCtx, args: SignoffArgs) -> Result<(SignoffResult, Str
         sha256: Some(sealed.content_hash.clone()),
     }
     .to_string();
+    if !pick_lines.is_empty() {
+        // The sealed files are in `v<version>/` by then. The work holds a copy of the call
+        // without its record slot, which holds the work.
+        let lines: Vec<_> = pick_lines
+            .into_iter()
+            .map(|line| {
+                let name = line.file.rsplit('/').next().unwrap_or(&line.file);
+                let thumb = a.dir.join(&format!("v{version}/{name}")).ok();
+                (line, thumb)
+            })
+            .collect();
+        let mut later = ctx.clone();
+        later.record = Arc::new(RecordSlot::new());
+        let thumbs = services.thumbs.get().cloned();
+        ctx.record.after(Box::pin(async move {
+            for (line, thumb) in lines {
+                let sha = line.sha256.clone();
+                let at = thumb.as_ref().zip(sha.as_deref());
+                pick_log::log_pick(
+                    &later,
+                    thumbs.clone(),
+                    line,
+                    at,
+                    pick_log::SIGNOFF_APPEND_BUDGET,
+                )
+                .await;
+            }
+        }));
+    }
     ctx.record.set(RecordPlan {
         branch: RecordBranch::SealedVersion { version },
         project: a.project.clone(),
@@ -1855,9 +1916,14 @@ fn apply_mark(m: &mut Manifest, req: &MarkRequest) -> Result<Applied, ErrorBody>
     })
 }
 
-async fn mark(ctx: &CallCtx, args: MarkArgs) -> Result<(MarkResult, String), ErrorBody> {
+async fn mark(
+    ctx: &CallCtx,
+    services: &AssetServices,
+    args: MarkArgs,
+) -> Result<(MarkResult, String), ErrorBody> {
     let project = args.project.clone();
     let asset_id = args.asset_id.clone();
+    let review_view = args.review_view;
     let req = mark_request(ctx, args)?;
     let a = asset_of(ctx, project, &asset_id).await?;
     let store = a.store().clone();
@@ -1894,16 +1960,16 @@ async fn mark(ctx: &CallCtx, args: MarkArgs) -> Result<(MarkResult, String), Err
         Ok(())
     };
     // The manifest, then the index (the store's change sink refreshes it), then the events.
-    store
+    let (after, _) = store
         .edit_manifest(&a.manifest, &edit)
         .await
         .map_err(error)?;
-    drop(guard);
     let Applied { result, previous } = applied
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
         .expect("the manifest edit ran");
+    let flag_changed = previous.contains_key("flag");
     if !previous.is_empty() {
         let mut event = json!({"kind": "mark", "asset": a.asset_id});
         if let Some(t) = &result.take {
@@ -1914,6 +1980,43 @@ async fn mark(ctx: &CallCtx, args: MarkArgs) -> Result<(MarkResult, String), Err
         ctx.events.publish(&a.topic(), event.clone());
         ctx.events.publish(&format!("project:{}", a.project), event);
     }
+    // After the Record step (the manifest edit): a pick, reject or clear from Review that
+    // changed the take's flag goes to the pick log (CORE-176), which never fails the mark. The
+    // line is appended (stamped and waited for, at most `pick_log::APPEND_BUDGET`) before the
+    // version lock goes, so the log takes one asset's marks in the manifest's order; the recipe
+    // and the thumbnail copy run in tasks of their own.
+    if let (Some(view), Some(t), true, true) = (
+        review_view,
+        &result.take,
+        flag_changed,
+        pick_log::logs_caller(ctx),
+    ) {
+        let decided = pick_log::Decided {
+            utc: lil_schema::time::rfc3339(store.now_utc()),
+            project: a.project.clone(),
+            asset_id: a.asset_id.clone(),
+            decision: match t.flag.as_deref() {
+                Some("pick") => pick_log::Decision::Pick,
+                Some(_) => pick_log::Decision::Reject,
+                None => pick_log::Decision::Cleared,
+            },
+            view: view.as_str(),
+        };
+        if let Some(line) = pick_log::mark_line(&decided, &after, &t.run_id, t.take) {
+            let thumb = a.dir.join(&line.file).ok();
+            let sha = line.sha256.clone();
+            let at = thumb.as_ref().zip(sha.as_deref());
+            pick_log::log_pick(
+                ctx,
+                services.thumbs.get().cloned(),
+                line,
+                at,
+                pick_log::APPEND_BUDGET,
+            )
+            .await;
+        }
+    }
+    drop(guard);
     let summary = match &result.take {
         Some(t) => format!("marked {} take {} of run {}", a.asset_id, t.take, t.run_id),
         None => format!("marked {}", a.asset_id),
@@ -2498,7 +2601,8 @@ pub(crate) async fn ai_edit(
 /// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,
 /// `asset.pin_input`, `asset.deprecate`, `asset.mark`, `asset.accept_move`,
 /// `asset.make_independent` and `asset.trash` (module `workspace`). `services` are the
-/// late-bound asset services (P4b-R32): `asset.trash` checks its asset's use through them.
+/// late-bound asset services (P4b-R32): `asset.trash` checks its asset's use through them, and
+/// `asset.mark` and `asset.signoff` give the pick log their `thumbs` (CORE-176).
 pub fn register_asset_tools(reg: &mut Registry, services: &AssetServices) {
     reg.register(typed_tool(
         "asset.import",
@@ -2514,12 +2618,16 @@ pub fn register_asset_tools(reg: &mut Registry, services: &AssetServices) {
         WORKSPACE_MODULE,
         |ctx, args: AssetArgs| Box::pin(collect(ctx, args)),
     ));
+    let signing = services.clone();
     reg.register(typed_tool(
         "asset.signoff",
         SIGNOFF_DESCRIPTION,
         EffectClass::Write,
         WORKSPACE_MODULE,
-        |ctx, args: SignoffArgs| Box::pin(signoff(ctx, args)),
+        move |ctx, args: SignoffArgs| {
+            let services = signing.clone();
+            Box::pin(async move { signoff(ctx, &services, args).await })
+        },
     ));
     reg.register(typed_tool(
         "asset.request_signoff",
@@ -2542,12 +2650,16 @@ pub fn register_asset_tools(reg: &mut Registry, services: &AssetServices) {
         WORKSPACE_MODULE,
         |ctx, args: DeprecateArgs| Box::pin(deprecate(ctx, args)),
     ));
+    let marking = services.clone();
     reg.register(typed_tool(
         "asset.mark",
         MARK_DESCRIPTION,
         EffectClass::Write,
         WORKSPACE_MODULE,
-        |ctx, args: MarkArgs| Box::pin(mark(ctx, args)),
+        move |ctx, args: MarkArgs| {
+            let services = marking.clone();
+            Box::pin(async move { mark(ctx, &services, args).await })
+        },
     ));
     reg.register(typed_tool(
         "asset.accept_move",

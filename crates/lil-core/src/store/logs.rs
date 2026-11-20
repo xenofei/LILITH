@@ -14,6 +14,7 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lil_platform::Env;
 use lil_platform::fs::{RetryClass, classify};
@@ -87,6 +88,44 @@ pub async fn append_loose_usage(env: &Env, record: Map<String, Value>) -> Result
     let path = env.local_dir().join("usage-loose.jsonl");
     let shown = WsPath::from_disk(path.display().to_string());
     append_line(path, env.machine_id(), record, shown).await
+}
+
+/// Appends `line` (one whole line, ending in `\n`) to the machine-local log `path` (the pick
+/// log, CORE-176) with [`fsops::append_line_locked`], polled as [`append_line`] polls: while
+/// another writer holds the append lock or a sharing violation stops the open, under the
+/// store's backoff (10 ms doubling to 500 ms), `budget` in all. Its folder is made.
+///
+/// # Errors
+/// `store.busy` when the lock stayed held past the budget; `store.io` for any other failure
+/// (a link or a second name at `path` included).
+pub async fn append_local_line(
+    path: PathBuf,
+    line: String,
+    budget: Duration,
+) -> Result<(), StoreError> {
+    let shown = WsPath::from_disk(path.display().to_string());
+    let (path, line) = (Arc::new(path), Arc::new(line));
+    let mut backoff = Backoff::within(budget);
+    loop {
+        let (path, line) = (path.clone(), line.clone());
+        let attempt = blocking(move || {
+            if let Some(dir) = path.parent() {
+                fsops::ensure_dir(dir)?;
+            }
+            fsops::append_line_locked(&path, &line)
+        })
+        .await;
+        match attempt {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) if classify(&e) == RetryClass::SharingViolation => {}
+            Err(e) => return Err(StoreError::io(&shown, &e)),
+        }
+        if !backoff.wait().await {
+            tracing::warn!(log = %shown, "the append lock stayed held past the retry budget");
+            return Err(StoreError::Busy(shown));
+        }
+    }
 }
 
 /// One locked append of `record` to `path` as `machine`, polled under the retry budget.

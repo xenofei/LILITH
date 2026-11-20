@@ -455,13 +455,18 @@ impl Inner {
         if refused_before_running && tool.starts_with("diagnostics.") && is_read() {
             return;
         }
+        self.sink_error(&error.code, tool, &error.message);
+    }
+
+    /// Hands `code` and `message`, of a call of `tool`, to the error sink, at the clock's now.
+    fn sink_error(&self, code: &str, tool: &str, message: &str) {
         if let Some(sink) = self.errors.get() {
             let at_ms = self
                 .clock
                 .utc_now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-            sink.record_error(&error.code, Some(tool), &error.message, at_ms);
+            sink.record_error(code, Some(tool), message, at_ms);
         }
     }
 
@@ -1220,6 +1225,15 @@ impl Redispatch {
                 self.idem.as_ref(),
             )
             .await
+    }
+
+    /// Tells the error sink (the Diagnostics' recent errors, ARCH-121) of an error of a call of
+    /// `tool` that isn't its outcome: the pick log's `pick_log.append_failed` (CORE-176), which
+    /// never fails the call and isn't a protocol error code. Nothing once the core is gone.
+    pub(crate) fn report_error(&self, code: &str, tool: &str, message: &str) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.sink_error(code, tool, message);
+        }
     }
 
     /// The tool `name` as `caller` may see it (`job.estimate` checks a call of it): `None`

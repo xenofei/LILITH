@@ -223,23 +223,24 @@ pub fn remove_suite_cache_file(env: &lil_platform::Env, path: &Path) -> std::io:
 }
 
 /// The folders below a workspace's local data folder that [`write_workspace_local_file`]
-/// writes in: the thumbnail cache and the pick log's thumbnails (APP-038, CORE-176).
-const LOCAL_WRITE_DIRS: [&[&str]; 2] = [&["thumbs"], &["picks", "thumbs"]];
+/// writes in: the thumbnail cache, and the pick log's thumbnails and recipes (APP-038,
+/// CORE-176).
+const LOCAL_WRITE_DIRS: [&[&str]; 3] = [&["thumbs"], &["picks", "thumbs"], &["picks", "recipes"]];
 /// The one folder [`remove_workspace_local_file`] removes from: the thumbnail cache (P4b-R36).
 const LOCAL_REMOVE_DIRS: [&[&str]; 1] = [&["thumbs"]];
 
 /// Writes `bytes` as the file `path` of a workspace's local data folder `local_dir`
-/// (ARCH-097): only below `<local dir>\thumbs\` or `<local dir>\picks\thumbs\` (APP-038,
-/// CORE-176). The folders are made; the data goes to a new temp file beside the target
-/// (flushed to disk) and is moved to the target's name without replacing anything. The cache
-/// is keyed by content, so a plain file already there holds the same bytes and is kept: the
-/// temp file is removed and the write succeeds. Anything else at that name (a link, a folder)
-/// is refused, never written through. Temp files of this function older than a day are
-/// removed from the folder first.
+/// (ARCH-097): only below `<local dir>\thumbs\`, `<local dir>\picks\thumbs\` or
+/// `<local dir>\picks\recipes\` (APP-038, CORE-176). The folders are made; the data goes
+/// to a new temp file beside the target (flushed to disk) and is moved to the target's name
+/// without replacing anything. The cache is keyed by content, so a plain file already there
+/// holds the same bytes and is kept: the temp file is removed and the write succeeds. Anything
+/// else at that name (a link, a folder) is refused, never written through. Temp files of this
+/// function older than a day are removed from the folder first.
 ///
 /// # Errors
 /// `PermissionDenied` before anything is written or made: a relative path, a path with a `.`
-/// or `..` part, a path not below one of the two folders (names compared without regard to
+/// or `..` part, a path not below one of the three folders (names compared without regard to
 /// case), a folder on the way that is a link or not a folder, or a file name Windows would
 /// read as something else (as [`write_suite_cache_file`]); then the write's errors.
 pub fn write_workspace_local_file(
@@ -940,6 +941,72 @@ pub fn append_locked(
     Ok(Some(line))
 }
 
+/// Appends `line` (one whole line, ending in `\n`) to the log `path` (created if missing)
+/// under the append lock of [`append_locked`], for a log whose lines need nothing from the
+/// text before them (the pick log, CORE-176). Only the file's last byte is read: when it isn't
+/// `\n` (a torn last line), a `\n` goes before the line. The line goes out in one `write_all`.
+/// `false` at once when another holder has the lock: the caller polls under its retry budget.
+/// Only a plain file with one name is written, as [`touch_workspace_local_file`] touches: a
+/// link or a second name planted at `path` could reach a file elsewhere. A missing file is
+/// made.
+///
+/// # Errors
+/// `PermissionDenied`, before anything is written, for anything at `path` but a plain file
+/// (a link, a folder) or a file with more than one name (a hard link); then the open's, the
+/// read's or the write's error.
+#[allow(clippy::disallowed_methods)]
+pub fn append_line_locked(path: &Path, line: &str) -> std::io::Result<bool> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`: a link is opened itself, never followed.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
+    const REPARSE_POINT: u32 = 0x0400;
+    let refused = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} {why}", path.display()),
+        )
+    };
+    match std::fs::symlink_metadata(long_path(path)) {
+        Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+            return Err(refused("is not a plain file"));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(long_path(path))?;
+    // Again on the open file: a link or a name may have been planted since the check.
+    let meta = file.metadata()?;
+    if meta.file_attributes() & REPARSE_POINT != 0 {
+        return Err(refused("is not a plain file"));
+    }
+    if lil_platform::fs::link_count(&file)? > 1 {
+        return Err(refused("has more than one name (a hard link)"));
+    }
+    let Some(lock) = lil_platform::fs::try_lock_append(&file)? else {
+        return Ok(false);
+    };
+    let len = file.metadata()?.len();
+    let mut out = Vec::with_capacity(line.len() + 1);
+    if len > 0 {
+        let mut last = [0_u8; 1];
+        (&file).seek(SeekFrom::Start(len - 1))?;
+        (&file).read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            out.push(b'\n');
+        }
+    }
+    out.extend_from_slice(line.as_bytes());
+    (&file).write_all(&out)?;
+    drop(lock);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,5 +1207,48 @@ mod tests {
             std::fs::read_to_string(&log).unwrap(),
             "{\"a\":1}\n{\"b\"\n{\"c\":3}\n"
         );
+    }
+
+    /// The pick log's append keeps the earlier content byte for byte, even when it isn't valid
+    /// UTF-8, closes a torn last line, and leaves a whole one as it is. (The one-byte read
+    /// itself is checked by review, not by this test.)
+    #[test] // spec: ARCH-081, CORE-176
+    fn append_line_locked_closes_a_torn_line_reading_only_the_last_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("picks.jsonl");
+        let fp = FailPoints::none();
+        let mut before = vec![0xff_u8, 0xfe, 0x80, b'\n'];
+        before.extend(std::iter::repeat_n(0xc3_u8, 1 << 20));
+        before.extend_from_slice(b"{\"torn\"");
+        write_temp(dir.path(), "picks.jsonl", &before, &fp).unwrap();
+        assert!(append_line_locked(&log, "{\"a\":1}\n").unwrap());
+        assert!(append_line_locked(&log, "{\"b\":2}\n").unwrap());
+        let mut want = before.clone();
+        want.extend_from_slice(b"\n{\"a\":1}\n{\"b\":2}\n");
+        assert_eq!(std::fs::read(&log).unwrap(), want);
+        // A missing log is made.
+        let fresh = dir.path().join("new.jsonl");
+        assert!(append_line_locked(&fresh, "{\"c\":3}\n").unwrap());
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"{\"c\":3}\n");
+    }
+
+    /// A hard link planted at the log's name is refused: the file its other name holds keeps
+    /// its bytes. A folder there is refused too.
+    #[test] // spec: CORE-176
+    #[allow(clippy::disallowed_methods)] // plants the link and the folder
+    fn append_line_locked_refuses_a_hard_link_or_a_folder_at_the_log_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = FailPoints::none();
+        write_temp(dir.path(), "candidate.txt", b"a candidate", &fp).unwrap();
+        let other = dir.path().join("candidate.txt");
+        let log = dir.path().join("picks.jsonl");
+        std::fs::hard_link(&other, &log).unwrap();
+        let err = append_line_locked(&log, "{\"a\":1}\n").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(std::fs::read(&other).unwrap(), b"a candidate");
+        let folder = dir.path().join("folder.jsonl");
+        std::fs::create_dir(&folder).unwrap();
+        let err = append_line_locked(&folder, "{\"a\":1}\n").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     }
 }

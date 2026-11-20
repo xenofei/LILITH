@@ -40,7 +40,7 @@ pub mod write;
 pub use failpoints::{ENV_FAILPOINTS, FailAction, FailPoints, armed};
 pub use fsops::ensure_dir;
 pub use git_gate::{GIT_WAIT, GitGate};
-pub use logs::{LogKind, append_loose_usage};
+pub use logs::{LogKind, append_local_line, append_loose_usage};
 pub use order::asset_manifests;
 pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};
 pub use paths::{WsPath, path_key, writable};
