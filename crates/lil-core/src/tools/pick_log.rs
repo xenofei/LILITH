@@ -30,8 +30,8 @@
 //! - **The append** goes through `store::append_local_line` (`fsops::append_line_locked`: one
 //!   whole line under the append lock, reading only the file's last byte, into a plain file
 //!   with one name, never through a link), polled under the store's backoff (10 ms doubling)
-//!   while another writer holds the lock or a sharing violation stops it, [`APPEND_BUDGET`]
-//!   (1 s) in all. It happens after the decision's Record step (the mark's manifest edit, the
+//!   while another writer holds the lock or a sharing violation stops it: [`APPEND_BUDGET`]
+//!   (1 s) in all for a mark, [`SIGNOFF_APPEND_BUDGET`] (10 s) for a sign-off. It happens after the decision's Record step (the mark's manifest edit, the
 //!   sign-off's Record stage) and never undoes it: a failed append is logged, and reported to
 //!   the tools error sink as `pick_log.append_failed` (the Diagnostics' recent errors; not a
 //!   protocol error code), and the call's result is unchanged.
@@ -40,7 +40,8 @@
 //!   order the manifest took them. Under contention a mark waits at most about 1 s
 //!   ([`APPEND_BUDGET`]) for the log, then records `pick_log.append_failed`, and the decision
 //!   stands. A sign-off's lines are appended in their own task once its Record stage succeeded
-//!   (its run is closed by then).
+//!   (its run is closed by then). Nothing waits for that task, so it keeps the store's usual
+//!   10 s ([`SIGNOFF_APPEND_BUDGET`]).
 //! - **The thumbnail copy**: the 96 px tier at scale 1 of a file whose kind has a renderer
 //!   (`lil_schema::renderable`), through `Thumbnails::ensure`, is copied to
 //!   `<local dir>\picks\thumbs\<sha256>.png` (`fsops::write_workspace_local_file`, which keeps a
@@ -75,9 +76,12 @@ pub const APPEND_FAILED: &str = "pick_log.append_failed";
 pub const PICK_THUMB_PX: u32 = 96;
 /// How long the copy waits for its thumbnail.
 const COPY_WAIT: Duration = Duration::from_secs(60);
-/// How long an append polls for the log's append lock before it counts as failed: a mark waits
-/// for its line (module docs "When a line is written"). The store's other logs keep 10 s.
+/// How long a mark's append polls for the log's append lock before it counts as failed: the
+/// mark waits for its line (module docs "When a line is written").
 pub const APPEND_BUDGET: Duration = Duration::from_secs(1);
+/// The same for a sign-off's lines, appended in a task nothing waits for: the store's usual
+/// 10 s.
+pub const SIGNOFF_APPEND_BUDGET: Duration = Duration::from_secs(10);
 
 /// A logged decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -286,13 +290,15 @@ pub(crate) fn signoff_lines(
 /// Appends `line` to the pick log of `ctx`'s workspace, and keeps `line`'s recipe and copies
 /// the 96 px thumbnail of the file at `thumb` (its workspace path and SHA-256) through `thumbs`
 /// in tasks of their own, never waited for (module docs). Only the append is awaited, for at
-/// most [`APPEND_BUDGET`]. Only for a `ui:*` caller; never returns an error: a failed append is
+/// most `budget` ([`APPEND_BUDGET`] for a mark, [`SIGNOFF_APPEND_BUDGET`] for a sign-off). Only
+/// for a `ui:*` caller; never returns an error: a failed append is
 /// reported to the tools error sink as `pick_log.append_failed`.
 pub async fn log_pick(
     ctx: &CallCtx,
     thumbs: Option<Arc<dyn Thumbnails>>,
     line: PickLine,
     thumb: Option<(&WsPath, &str)>,
+    budget: Duration,
 ) {
     if !logs_caller(ctx) {
         return;
@@ -318,7 +324,7 @@ pub async fn log_pick(
         }
     };
     text.push('\n');
-    if let Err(e) = append_local_line(local.join(PICKS_FILE), text, APPEND_BUDGET).await {
+    if let Err(e) = append_local_line(local.join(PICKS_FILE), text, budget).await {
         report(
             ctx,
             &format!("A Review decision couldn't be added to {PICKS_FILE}: {e}"),

@@ -1424,7 +1424,14 @@ async fn signoff(
             for (line, thumb) in lines {
                 let sha = line.sha256.clone();
                 let at = thumb.as_ref().zip(sha.as_deref());
-                pick_log::log_pick(&later, thumbs.clone(), line, at).await;
+                pick_log::log_pick(
+                    &later,
+                    thumbs.clone(),
+                    line,
+                    at,
+                    pick_log::SIGNOFF_APPEND_BUDGET,
+                )
+                .await;
             }
         }));
     }
@@ -1999,7 +2006,14 @@ async fn mark(
             let thumb = a.dir.join(&line.file).ok();
             let sha = line.sha256.clone();
             let at = thumb.as_ref().zip(sha.as_deref());
-            pick_log::log_pick(ctx, services.thumbs.get().cloned(), line, at).await;
+            pick_log::log_pick(
+                ctx,
+                services.thumbs.get().cloned(),
+                line,
+                at,
+                pick_log::APPEND_BUDGET,
+            )
+            .await;
         }
     }
     drop(guard);
