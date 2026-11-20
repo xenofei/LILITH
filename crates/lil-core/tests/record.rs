@@ -2027,3 +2027,30 @@ async fn trust_is_cleared_only_from_a_verified_app() {
     assert_eq!(fx.manifest(KITE), after);
     fx.shutdown().await;
 }
+
+#[tokio::test] // spec: ARCH-060, APP-039
+async fn trust_finds_a_path_given_in_another_case() {
+    let fx = Fx::plain();
+    let run = fx.import_run(KITE, "kite.png", b"kite").await;
+    let candidate = format!("candidates/{run}/kite.png");
+    // The path in capitals names the same file: its record is the one marked, and the result
+    // names it by its key.
+    let r = fx
+        .dispatcher
+        .asset_trust(
+            &fx.session(ui()),
+            lil_protocol::app::AssetTrustParams {
+                project: Some("sketchbook".to_string()),
+                asset_id: KITE.to_string(),
+                paths: Some(vec![candidate.to_uppercase()]),
+            },
+            "t_trust",
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.trusted, std::slice::from_ref(&candidate));
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"][&candidate]["state"], "trusted", "{m}");
+    assert_eq!(m["trust"].as_object().unwrap().len(), 1, "{m}");
+    fx.shutdown().await;
+}

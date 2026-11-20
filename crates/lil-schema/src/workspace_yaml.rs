@@ -49,7 +49,7 @@ pub struct ProjectYaml {
     /// `style_bible`: the style bible's path, when it is a non-empty string.
     pub style_bible: Option<String>,
     /// `style_version` as written (I4), read through [`ProjectYaml::style_version`].
-    pub style_version: Option<Value>,
+    style_version_raw: Option<Value>,
 }
 
 impl ProjectYaml {
@@ -64,7 +64,7 @@ impl ProjectYaml {
         if self.style_bible.is_none() {
             return Ok(None);
         }
-        match &self.style_version {
+        match &self.style_version_raw {
             None | Some(Value::Null) => Ok(Some(1)),
             Some(v) => v
                 .as_u64()
@@ -145,7 +145,7 @@ pub fn read_project_yaml(text: &str) -> Result<ProjectYaml, String> {
         },
         overrides: cascade_layer(&root),
         style_bible: s("style_bible").filter(|b| !b.trim().is_empty()),
-        style_version: root.get("style_version").cloned(),
+        style_version_raw: root.get("style_version").cloned(),
     })
 }
 
@@ -426,58 +426,20 @@ hardware: {gpu: none}
     #[test] // spec: CORE-025
     fn style_version_needs_a_style_bible() {
         let read = |text: &str| read_project_yaml(text).unwrap().style_version();
+        assert_eq!(read("name: a\n"), Ok(None));
+        assert_eq!(read("style_version: 3\n"), Ok(None), "no bible, no input");
+        assert_eq!(read("style_bible: ''\nstyle_version: 3\n"), Ok(None));
+        assert_eq!(read("style_bible: style/bible.md\n"), Ok(Some(1)));
         assert_eq!(
-            read(
-                "name: a
-"
-            ),
-            Ok(None)
-        );
-        assert_eq!(
-            read(
-                "style_version: 3
-"
-            ),
-            Ok(None),
-            "no bible, no input"
-        );
-        assert_eq!(
-            read(
-                "style_bible: ''
-style_version: 3
-"
-            ),
-            Ok(None)
-        );
-        assert_eq!(
-            read(
-                "style_bible: style/bible.md
-"
-            ),
-            Ok(Some(1))
-        );
-        assert_eq!(
-            read(
-                "style_bible: style/bible.md
-style_version: 2
-"
-            ),
+            read("style_bible: style/bible.md\nstyle_version: 2\n"),
             Ok(Some(2))
         );
         assert_eq!(
-            read(
-                "style_bible: style/bible.md
-style_version: 0
-"
-            ),
+            read("style_bible: style/bible.md\nstyle_version: 0\n"),
             Ok(Some(0))
         );
         for bad in ["two", "-1", "1.5", "[2]"] {
-            let text = format!(
-                "style_bible: style/bible.md
-style_version: {bad}
-"
-            );
+            let text = format!("style_bible: style/bible.md\nstyle_version: {bad}\n");
             assert!(read(&text).is_err(), "{bad}");
         }
     }

@@ -548,7 +548,8 @@ fn duplicates() -> String {
 /// (`asset.import`'s same-bytes warning, CORE-168).
 pub(crate) fn same_bytes(conn: &Connection, sha256: &str) -> rusqlite::Result<Option<String>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT f.path FROM files f WHERE f.sha256 = ?1 AND {}          ORDER BY f.kind <> 'sealed', f.path LIMIT 1",
+        "SELECT f.path FROM files f WHERE f.sha256 = ?1 AND {} \
+         ORDER BY f.kind <> 'sealed', f.path LIMIT 1",
         deliverable("f")
     ))?;
     let mut rows = stmt.query([sha256])?;

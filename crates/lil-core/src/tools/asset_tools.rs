@@ -178,6 +178,7 @@ use super::registry::{
 use super::services::{AssetServices, InUse};
 use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
+use crate::pipeline::record::trust_key;
 use crate::pipeline::{
     Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, actor_of, asset_topic,
     chosen_files, plan_signoff, signed_off_by, start_candidate_run, status_by,
@@ -930,16 +931,17 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
 
 /// CORE-168's warning (Appendix H "Duplicates") for each of `hashes` (bare hex, in file order)
 /// that a sealed or candidate file in the workspace already has: "same bytes as <ref>", the
-/// first such file's ref, a sealed one first (`Index::same_bytes`). It never blocks: an index
-/// that can't answer is one warning saying the check wasn't made.
+/// first such file's ref, a sealed one first (`Index::same_bytes`), once the index's first run
+/// has finished. It never blocks the import: an index that can't answer is one warning saying
+/// the check wasn't made (after the warnings already found, when it fails part-way).
 async fn same_bytes_warnings(a: &Asset, hashes: &[String]) -> Vec<String> {
     let index = &a.open.index;
-    let unchecked = |e: &crate::index::IndexError| {
-        tracing::warn!(error = %e, "the index can't say whether imported bytes are new");
-        format!("whether the workspace already has these files' bytes wasn't checked: {e}")
+    let unchecked = |why: String| {
+        tracing::warn!(why, "the index can't say whether imported bytes are new");
+        format!("whether the workspace already has these files' bytes wasn't checked: {why}")
     };
     if let Err(e) = index.ready_result().await {
-        return vec![unchecked(&e)];
+        return vec![unchecked(e.to_string())];
     }
     let mut warnings = Vec::new();
     for sha256 in hashes {
@@ -950,7 +952,10 @@ async fn same_bytes_warnings(a: &Asset, hashes: &[String]) -> Vec<String> {
                 }
             }
             Ok(None) => {}
-            Err(e) => return vec![unchecked(&e)],
+            Err(e) => {
+                warnings.push(unchecked(e.to_string()));
+                break;
+            }
         }
     }
     warnings
@@ -2630,19 +2635,8 @@ pub(crate) async fn ai_edit(
     p: &lil_protocol::app::AiEditParams,
     trace_id: &str,
 ) -> Result<lil_protocol::app::AiEditResult, ErrorBody> {
-    let invalid = |why: String| ErrorBody::new(&PARAMS_INVALID, why, trace_id);
-    if !is_slug(project) {
-        return Err(invalid(format!("{project:?} is not a project slug")));
-    }
-    if !is_asset_id(&p.asset_id) {
-        return Err(invalid(format!("{:?} is not an asset id", p.asset_id)));
-    }
+    let manifest = app_manifest_path(open, project, &p.asset_id, trace_id).await?;
     let error = |e: StoreError| e.to_error(trace_id);
-    if read_project(&open.store, project).await.map_err(error)? == ProjectFile::Missing {
-        let mut e = unknown_project(project);
-        e.trace_id = trace_id.to_string();
-        return Err(e);
-    }
     let unknown = |what: &str| {
         ErrorBody::new(
             &ASSET_UNKNOWN,
@@ -2653,11 +2647,6 @@ pub(crate) async fn ai_edit(
             trace_id,
         )
     };
-    let manifest = WsPath::parse(&format!(
-        "projects/{project}/assets/{0}/{0}.manifest.json",
-        p.asset_id
-    ))
-    .map_err(error)?;
     if read_manifest(&open.store, &manifest)
         .await
         .map_err(error)?
@@ -2709,8 +2698,8 @@ pub(crate) async fn ai_edit(
     })
 }
 
-/// The manifest path of `project`/`asset_id` for `app/asset.trust`, once the names are checked
-/// and the project is there (the same checks as [`ai_edit`]'s, which is left as Task 15 wrote it).
+/// The manifest path of `project`/`asset_id` for an `app/asset.*` method ([`ai_edit`],
+/// [`trust`]), once the names are checked and the project is there.
 ///
 /// # Errors
 /// `params.invalid` for a name that isn't a project slug or an asset id; `project.unknown`;
@@ -2811,8 +2800,10 @@ pub(crate) async fn trust(
 }
 
 /// Marks the untrusted records of `paths` (every record when `None`) of `m` as trusted at
-/// `utc` ([`trust`]); the paths it changed, each once. `Err(path)` for the first path that is
-/// neither in the `trust` map nor a file the manifest names, and then `m` is unchanged.
+/// `utc` ([`trust`]); the record keys it changed, each once. A path finds its record without
+/// regard to case (`record::trust_key`, as the seal matches names). `Err(path)` for the first
+/// path that is neither in the `trust` map nor a file the manifest names, and then `m` is
+/// unchanged.
 fn mark_trusted(
     m: &mut Manifest,
     paths: Option<&[String]>,
@@ -2820,13 +2811,16 @@ fn mark_trusted(
 ) -> Result<Vec<String>, String> {
     let wanted: Vec<String> = match paths {
         Some(paths) => {
-            if let Some(path) = paths
-                .iter()
-                .find(|p| m.trust(p).is_none() && !names_file(m, p))
-            {
-                return Err(path.clone());
+            let mut keys = Vec::new();
+            for path in paths {
+                match trust_key(m, path) {
+                    Some(key) => keys.push(key),
+                    // A file the suite made: trusted already.
+                    None if names_file(m, path) => {}
+                    None => return Err(path.clone()),
+                }
             }
-            paths.to_vec()
+            keys
         }
         None => match m.get("trust") {
             Some(Value::Object(records)) => records.keys().cloned().collect(),
@@ -2850,10 +2844,11 @@ fn mark_trusted(
 }
 
 /// Whether `m` names the asset-relative `path` as one of its files: a run file, a sealed file
-/// (a `hashes` key) or a `human_edits[]` entry (without regard to case).
+/// (a `hashes` key) or a `human_edits[]` entry (without regard to case, as [`path_key`] folds).
 fn names_file(m: &Manifest, path: &str) -> bool {
     let view = m.view();
-    let same = |p: &str| p.eq_ignore_ascii_case(path);
+    let key = path_key(path);
+    let same = |p: &str| path_key(p) == key;
     view.candidate_runs
         .iter()
         .flat_map(|r| &r.files)

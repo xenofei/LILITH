@@ -327,6 +327,48 @@ impl Dispatcher {
         Some(self.inner.project_of(session, &open, None).await)
     }
 
+    /// The checks of an `app/asset.*` method before its edit (APP-039): the session is a
+    /// verified app's (`ui:*`) that shares `assets.v1` (else `caller.not_allowed` with
+    /// `not_allowed`), it has a workspace (else `workspace.required` with `no_workspace`), which
+    /// is writable; then the session's workspace and the project `project` resolves to, as a
+    /// tool call's.
+    ///
+    /// # Errors
+    /// Those above; the session's workspace errors; `workspace.read_only`.
+    async fn app_asset_gate(
+        &self,
+        session: &Session,
+        project: Option<&str>,
+        not_allowed: &str,
+        no_workspace: &str,
+        trace_id: &str,
+    ) -> Result<(Arc<OpenWorkspace>, String), ErrorBody> {
+        let app = matches!(session.caller, CallerKind::Ui(_))
+            && session
+                .capabilities
+                .iter()
+                .any(|c| c == lil_protocol::app::ASSETS_CAPABILITY);
+        if !app {
+            return Err(ErrorBody::new(
+                &codes::CALLER_NOT_ALLOWED,
+                not_allowed,
+                trace_id,
+            ));
+        }
+        let Some(open) = self.inner.open_workspace(session, trace_id).await? else {
+            return Err(ErrorBody::new(
+                &codes::WORKSPACE_REQUIRED,
+                no_workspace,
+                trace_id,
+            ));
+        };
+        if open.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly.to_error(trace_id));
+        }
+        let project = self.inner.project_of(session, &open, project).await;
+        Ok((open, project))
+    }
+
     /// `app/asset.ai_edit {project?, asset_id, path, sha256}` (P4b-R17, LT-01; Appendix H
     /// "Attribution"): your relabel of one `human_edits[]` entry as an AI edit, in the
     /// session's workspace, its project resolved as a tool call's. The edit is
@@ -343,33 +385,16 @@ impl Dispatcher {
         p: lil_protocol::app::AiEditParams,
         trace_id: &str,
     ) -> Result<lil_protocol::app::AiEditResult, ErrorBody> {
-        let app = matches!(session.caller, CallerKind::Ui(_))
-            && session
-                .capabilities
-                .iter()
-                .any(|c| c == lil_protocol::app::ASSETS_CAPABILITY);
-        if !app {
-            return Err(ErrorBody::new(
-                &codes::CALLER_NOT_ALLOWED,
+        let (open, project) = self
+            .app_asset_gate(
+                session,
+                p.project.as_deref(),
                 "app/asset.ai_edit is for LILITH apps only (with the assets.v1 capability).",
-                trace_id,
-            ));
-        }
-        let Some(open) = self.inner.open_workspace(session, trace_id).await? else {
-            return Err(ErrorBody::new(
-                &codes::WORKSPACE_REQUIRED,
                 "An edit is relabelled within a workspace, and this session has none. Connect \
                  with a workspace first.",
                 trace_id,
-            ));
-        };
-        if open.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly.to_error(trace_id));
-        }
-        let project = self
-            .inner
-            .project_of(session, &open, p.project.as_deref())
-            .await;
+            )
+            .await?;
         let relabelled = super::asset_tools::ai_edit(&open, &project, &p, trace_id).await?;
         // The asset's views re-read it, as after any other manifest edit.
         self.events().publish(
@@ -395,34 +420,17 @@ impl Dispatcher {
         p: lil_protocol::app::AssetTrustParams,
         trace_id: &str,
     ) -> Result<lil_protocol::app::AssetTrustResult, ErrorBody> {
-        let app = matches!(session.caller, CallerKind::Ui(_))
-            && session
-                .capabilities
-                .iter()
-                .any(|c| c == lil_protocol::app::ASSETS_CAPABILITY);
-        if !app {
-            return Err(ErrorBody::new(
-                &codes::CALLER_NOT_ALLOWED,
+        let (open, project) = self
+            .app_asset_gate(
+                session,
+                p.project.as_deref(),
                 "app/asset.trust is for LILITH apps only (with the assets.v1 capability): only \
                  your own Mark as trusted clears a trust record.",
-                trace_id,
-            ));
-        }
-        let Some(open) = self.inner.open_workspace(session, trace_id).await? else {
-            return Err(ErrorBody::new(
-                &codes::WORKSPACE_REQUIRED,
                 "A file is marked as trusted within a workspace, and this session has none. \
                  Connect with a workspace first.",
                 trace_id,
-            ));
-        };
-        if open.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly.to_error(trace_id));
-        }
-        let project = self
-            .inner
-            .project_of(session, &open, p.project.as_deref())
-            .await;
+            )
+            .await?;
         let marked = super::asset_tools::trust(&open, &project, &p, trace_id).await?;
         if !marked.trusted.is_empty() {
             self.events().publish(

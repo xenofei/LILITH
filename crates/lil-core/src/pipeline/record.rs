@@ -33,10 +33,11 @@
 //! **Recording a candidate run** (CORE-025, ARCH-060; Appendix H "Style input" and "Trust"),
 //! whatever made it (an import, a collect, a generation's Record step): before the commit,
 //! step 1 reads the project's `project.yaml`, and the plan's manifest edit is followed by
-//! [`finish_run`] on the run: the style input when the project has a `style_bible`, and each
-//! derived file's trust record. A `project.yaml` that can't be read, or whose `style_version`
-//! isn't a whole number, leaves the run without a style input and is a warning; it never
-//! fails the call.
+//! [`finish_run`] on the run: the style input when the project has a `style_bible`, and the
+//! trust record of each file made from another (role `derived` or `repair`,
+//! [`inherit_from`]). A `project.yaml` that can't be read, or whose `style_version` isn't a
+//! whole number, leaves the run without a style input and is a warning; it never fails the
+//! call.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -44,8 +45,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lil_schema::{
-    Actor, Bump, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy, StatusEvent,
-    Version, change_status, derived_trust,
+    Actor, Bump, CandidateFile, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy,
+    StatusEvent, Version, change_status, derived_trust,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -57,7 +58,7 @@ use crate::index::Index;
 use crate::projects::{
     ProjectFile, Resolver, add_done_entry, dependents_of, read_project, stale_ref,
 };
-use crate::store::{CommitOp, StagingHandle, Store, StoreError, WsPath};
+use crate::store::{CommitOp, StagingHandle, Store, StoreError, WsPath, path_key};
 
 /// Which Record branch a plan takes (CORE-020).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,18 +311,17 @@ async fn style_of(store: &Store, project: &str, warnings: &mut Vec<String>) -> O
 ///   `{ref: "style@<style>", role: "style"}` appended to the run's `inputs` (made when
 ///   missing), unless one of them already names a `style@` ref (a brief's, kept even when it is
 ///   older); `inputs` that isn't a list is left as it is;
-/// - each of its `derived` files without a trust record takes its `from` file's record
-///   ([`derived_trust`], the file found by [`from_path`]); files derived from derived files of
-///   the run follow, in any order.
+/// - each of its files made from another (role `derived` or `repair`) without a trust record
+///   takes its `from` file's record ([`inherit_from`]); files made from such files of the run
+///   follow, in any order.
 ///
 /// Recording the same run again changes nothing.
-pub fn finish_run(m: &mut Manifest, run_id: &str, style: Option<u32>) {
+pub(crate) fn finish_run(m: &mut Manifest, run_id: &str, style: Option<u32>) {
     let same = |r: &Map<String, Value>| {
         r.get("run_id")
             .and_then(Value::as_str)
             .is_some_and(|id| id.eq_ignore_ascii_case(run_id))
     };
-    let mut derived: Vec<(String, String)> = Vec::new();
     for run in m.runs_mut().into_iter().filter(|r| same(r)) {
         if let Some(n) = style {
             let inputs = run
@@ -341,31 +341,65 @@ pub fn finish_run(m: &mut Manifest, run_id: &str, style: Option<u32>) {
                 }
             }
         }
-        let files = run.get("files").and_then(Value::as_array);
-        for file in files.into_iter().flatten() {
-            let field = |k: &str| file.get(k).and_then(Value::as_str);
-            if let (Some("derived"), Some(path), Some(from)) =
-                (field("role"), field("path"), field("from"))
-            {
-                derived.push((path.to_string(), from_path(path, from)));
-            }
-        }
     }
-    // Until nothing changes: a file derived from a derived file follows its `from`.
+    let files: Vec<CandidateFile> = m
+        .view()
+        .candidate_runs
+        .into_iter()
+        .filter(|r| r.run_id.eq_ignore_ascii_case(run_id))
+        .flat_map(|r| r.files)
+        .collect();
+    // Until nothing changes: a file made from such a file follows its `from`.
     loop {
         let mut changed = false;
-        for (path, from) in &derived {
-            if m.trust(path).is_none()
-                && let Some(record) = derived_trust(m, from)
-            {
-                m.set_trust(path, Some(&record));
-                changed = true;
-            }
+        for file in &files {
+            changed |= inherit_from(m, file);
         }
         if !changed {
             break;
         }
     }
+}
+
+/// The key of the asset-relative `path`'s record in `m`'s `trust` map, matched as the seal
+/// matches file names ([`path_key`], without regard to case): `path` itself when it is a key,
+/// else the first key that names the same file. `None` when the file has no record.
+pub(crate) fn trust_key(m: &Manifest, path: &str) -> Option<String> {
+    let Some(Value::Object(trust)) = m.get("trust") else {
+        return None;
+    };
+    if trust.get(path).is_some_and(|v| !v.is_null()) {
+        return Some(path.to_string());
+    }
+    let key = path_key(path);
+    trust
+        .iter()
+        .find(|(k, v)| !v.is_null() && path_key(k) == key)
+        .map(|(k, _)| k.clone())
+}
+
+/// Gives the run file `file`, when it is made from another (role `derived` or `repair`, with a
+/// `from`) and has no record, its `from` file's record ([`derived_trust`], the `from` found by
+/// [`from_path`] and [`trust_key`]): a repaired or derived copy of an outside file is outside
+/// content too (ARCH-060, P4b-R28). Whether it gave one. The Record step ([`finish_run`]) and
+/// the seal (`pipeline::signoff`) both use it.
+pub(crate) fn inherit_from(m: &mut Manifest, file: &CandidateFile) -> bool {
+    if !matches!(file.role.as_str(), "derived" | "repair") {
+        return false;
+    }
+    let Some(from) = &file.from else {
+        return false;
+    };
+    if trust_key(m, &file.path).is_some() {
+        return false;
+    }
+    let Some(record) =
+        trust_key(m, &from_path(&file.path, from)).and_then(|key| derived_trust(m, &key))
+    else {
+        return false;
+    };
+    m.set_trust(&file.path, Some(&record));
+    true
 }
 
 /// The asset-relative path of the file a run file at `path` names in `from`: a `from` without

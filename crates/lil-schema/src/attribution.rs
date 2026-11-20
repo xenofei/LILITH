@@ -267,15 +267,18 @@ pub(crate) fn trust_ptr(path: &str) -> String {
 }
 
 /// Carries the trust record of the asset-relative `from_path` to `to_path` (P4b-R28, P4b-R41):
-/// `to_path` gets a copy of `from_path`'s record, or loses its own when `from_path` has none
-/// (the suite made that file, so its copy counts as trusted too). `from_path`'s record stays:
-/// sign-off, restore and copy all leave the run file records that name it.
+/// `to_path` gets a copy of `from_path`'s record. When `from_path` has none (the suite made
+/// that file), nothing changes: `to_path` keeps any record it has, since only your own Mark as
+/// trusted clears one. `from_path`'s record stays: sign-off, restore and copy all leave the
+/// run file records that name it. Both are keys of the `trust` map as spelled there; a caller
+/// that matches file names without regard to case finds the keys first.
 pub fn carry_trust(m: &mut Manifest, from_path: &str, to_path: &str) {
     if from_path == to_path {
         return;
     }
-    let rec = m.trust(from_path);
-    m.set_trust(to_path, rec.as_ref());
+    if let Some(rec) = m.trust(from_path) {
+        m.set_trust(to_path, Some(&rec));
+    }
 }
 
 /// The record of a file derived from the asset-relative `from` (P4b-R28, P4b-R41): `from`'s
@@ -483,7 +486,7 @@ mod tests {
     }
 
     #[test] // spec: ARCH-060
-    fn carry_trust_copies_the_record_and_a_missing_one_clears_the_target() {
+    fn carry_trust_copies_the_record() {
         let mut m = Manifest::new("sketchbook", "img_dock", "image", "u");
         let rec = untrusted(TrustSourceKind::Import, "a.png");
         m.set_trust("candidates/r_1/a.png", Some(&rec));
@@ -498,10 +501,6 @@ mod tests {
         m.set_trust("candidates/r_1/b.png", Some(&marked));
         carry_trust(&mut m, "candidates/r_1/b.png", "v1.0.0/b.png");
         assert_eq!(m.trust("v1.0.0/b.png"), Some(marked));
-        // A file the suite made has no record to carry, and the target's goes.
-        m.set_trust("v1.0.0/c.png", Some(&rec));
-        carry_trust(&mut m, "candidates/r_1/c.png", "v1.0.0/c.png");
-        assert_eq!(m.trust("v1.0.0/c.png"), None);
         // Onto itself: nothing changes.
         let before = m.clone();
         carry_trust(&mut m, "v1.0.0/a.png", "v1.0.0/a.png");
@@ -510,6 +509,19 @@ mod tests {
         let mut empty = Manifest::new("sketchbook", "img_dock", "image", "u");
         carry_trust(&mut empty, "candidates/r_1/a.png", "v1.0.0/a.png");
         assert_eq!(empty.get("trust"), None);
+    }
+
+    #[test] // spec: ARCH-060
+    fn carry_trust_without_a_source_record_leaves_the_target() {
+        // Only your own Mark as trusted clears a record: a source the suite made (no record)
+        // carries nothing, and the target's record stays as it is.
+        let mut m = Manifest::new("sketchbook", "img_dock", "image", "u");
+        let rec = untrusted(TrustSourceKind::Import, "c.png");
+        m.set_trust("v1.0.0/c.png", Some(&rec));
+        let before = m.clone();
+        carry_trust(&mut m, "candidates/r_1/c.png", "v1.0.0/c.png");
+        assert_eq!(m, before);
+        assert_eq!(m.trust("v1.0.0/c.png"), Some(rec));
     }
 
     #[test] // spec: ARCH-060

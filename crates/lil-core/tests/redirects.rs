@@ -678,11 +678,26 @@ async fn creating_onto_a_redirect_from_warns() {
     };
     let warning = "Old refs to sketchbook/prop_kite will now reach this asset \
                    (registry/redirects.yaml).";
+    // The redirect warnings: importing the same bytes again adds CORE-168's own (Task 16),
+    // which this test leaves aside.
+    let takeover = |r: &Value| -> Vec<String> {
+        r["warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no warnings list: {r}"))
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|w| {
+                !w.starts_with("same bytes as ")
+                    && !w.starts_with("whether the workspace already has these files' bytes")
+            })
+            .map(str::to_string)
+            .collect()
+    };
     let r = fx.ok("asset.import", import("prop_kite", "copy")).await;
-    assert_eq!(r["warnings"], json!([warning]), "{r}");
+    assert_eq!(takeover(&r), [warning], "{r}");
     // Only the first import creates the asset.
     let r = fx.ok("asset.import", import("prop_kite", "copy")).await;
-    assert_eq!(r["warnings"], json!([]), "{r}");
+    assert_eq!(takeover(&r), Vec::<String>::new(), "{r}");
     // Link-external creates it too; another name gets no warning.
     let fx2 = Fx::with(|ws| write_redirects(ws, &[("prop_kite", CRANE, T1)]));
     let src2 = fx2.env.root().join("src").join("kite.png");
@@ -694,9 +709,9 @@ async fn creating_onto_a_redirect_from_warns() {
                    "files": [src2.to_string_lossy()], "mode": "link_external"}),
         )
         .await;
-    assert_eq!(r["warnings"], json!([warning]), "{r}");
+    assert_eq!(takeover(&r), [warning], "{r}");
     let r = fx.ok("asset.import", import("prop_other", "copy")).await;
-    assert_eq!(r["warnings"], json!([]), "{r}");
+    assert_eq!(takeover(&r), Vec::<String>::new(), "{r}");
     // Now the old name reaches the new asset, silently for a ref without a hash.
     let resolved = fx
         .resolve(&format!(
