@@ -1701,6 +1701,129 @@ async fn read_tools_wait_for_the_first_reconcile() {
     hub.close_all().await;
 }
 
+/// The same-bytes check's bound on its wait for the first reconcile (`asset_tools`'
+/// `SAME_BYTES_WAIT`).
+const SAME_BYTES_WAIT: Duration = Duration::from_secs(5);
+
+// Tokio's clock is paused, and the test moves it: no real 5 s pass.
+#[tokio::test(start_paused = true)] // spec: CORE-168, ARCH-089
+async fn import_waits_for_the_first_reconcile_only_so_long() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.copy_fixture_workspace("gate"));
+    let probe = FakeProbe::gated();
+    let hub = hub(&env, probe.clone());
+    let open = hub.open(&ws).await.unwrap();
+    let gate = probe.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || gate.wait_until_gated())
+            .await
+            .unwrap(),
+        "the first reconcile never started"
+    );
+
+    // The import is made while the first reconcile is held: once the bound has passed,
+    // whether its bytes are new isn't checked, and it says so.
+    let source = env.root().join("import-src").join("kite.png");
+    write_file(&source, b"kite one");
+    let mut reg = Registry::new();
+    lil_core::tools::register_asset_tools(&mut reg, &lil_core::tools::AssetServices::unwired());
+    let call_ctx = ctx(&open, &hub);
+    let args = json!({"project": "sketchbook", "asset_id": "prop_kite", "type": "image",
+                      "files": [source.to_string_lossy()], "mode": "copy"});
+    let started = tokio::time::Instant::now();
+    let running = tokio::spawn(async move {
+        let import = reg.get("asset.import").expect("asset.import is registered");
+        import.run(&call_ctx, args).await
+    });
+    // The held reconcile is a blocking task, so the paused clock never moves on its own: the
+    // test moves it 100 ms at a time, giving the import's own file work, on blocking threads, a
+    // real millisecond between steps. The loop ends on a real-time deadline, not a step count,
+    // so a loaded machine can't run out of steps before the import reaches its bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !running.is_finished() && std::time::Instant::now() < deadline {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        running.is_finished(),
+        "the import was still waiting for the first reconcile after 30 s of real time"
+    );
+    let out = running.await.unwrap().unwrap();
+    assert!(started.elapsed() >= SAME_BYTES_WAIT, "it waited first");
+    let warnings = &out.structured["warnings"];
+    assert_eq!(
+        warnings,
+        &json!([
+            "whether the workspace already has these files' bytes wasn't checked: the \
+             workspace is still being indexed"
+        ]),
+        "{warnings}"
+    );
+
+    probe.release();
+    drop(open);
+    hub.close_all().await;
+}
+
+// Tokio's clock is paused, and the test moves it, as above.
+#[tokio::test(start_paused = true)] // spec: CORE-168, ARCH-089
+async fn the_wait_for_the_first_reconcile_leaves_the_version_lock_free() {
+    let env = TestEnv::new();
+    let ws = workspace_ref(&env.copy_fixture_workspace("gate"));
+    let probe = FakeProbe::gated();
+    let hub = hub(&env, probe.clone());
+    let open = hub.open(&ws).await.unwrap();
+    let gate = probe.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || gate.wait_until_gated())
+            .await
+            .unwrap(),
+        "the first reconcile never started"
+    );
+
+    let source = env.root().join("import-src").join("kite.png");
+    write_file(&source, b"kite one");
+    let mut reg = Registry::new();
+    lil_core::tools::register_asset_tools(&mut reg, &lil_core::tools::AssetServices::unwired());
+    let call_ctx = ctx(&open, &hub);
+    let args = json!({"project": "sketchbook", "asset_id": "prop_kite", "type": "image",
+                      "files": [source.to_string_lossy()], "mode": "copy"});
+    let started = tokio::time::Instant::now();
+    let running = tokio::spawn(async move {
+        let import = reg.get("asset.import").expect("asset.import is registered");
+        import.run(&call_ctx, args).await
+    });
+    // While the import waits for the first reconcile, a sign-off, a trash or another import
+    // of the asset can take its version lock.
+    let lock = open.store.version_lock("sketchbook", "prop_kite");
+    let mut checked = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !running.is_finished() && std::time::Instant::now() < deadline {
+        if started.elapsed() < SAME_BYTES_WAIT - Duration::from_millis(200) {
+            assert!(
+                lock.try_lock().is_ok(),
+                "the version lock is held {:?} into the wait",
+                started.elapsed()
+            );
+            checked += 1;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    assert!(checked > 0, "the lock was never checked");
+    assert!(
+        running.is_finished(),
+        "the import was still waiting for the first reconcile after 30 s of real time"
+    );
+    running.await.unwrap().unwrap();
+
+    probe.release();
+    drop(open);
+    hub.close_all().await;
+}
+
 #[tokio::test] // spec: CORE-041
 async fn cold_rebuild_trusts_manifest_hashes_then_verifies() {
     let fx = fx();

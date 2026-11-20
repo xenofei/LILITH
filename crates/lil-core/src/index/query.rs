@@ -543,6 +543,19 @@ fn duplicates() -> String {
     )
 }
 
+/// The path of the first deliverable file ([`deliverable`]) whose SHA-256 is `sha256` (bare
+/// hex), through `files_sha`: a `sealed` file before a `candidate` one, then by path
+/// (`asset.import`'s same-bytes warning, CORE-168).
+pub(crate) fn same_bytes(conn: &Connection, sha256: &str) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT f.path FROM files f WHERE f.sha256 = ?1 AND {} \
+         ORDER BY f.kind <> 'sealed', f.path LIMIT 1",
+        deliverable("f")
+    ))?;
+    let mut rows = stmt.query([sha256])?;
+    rows.next()?.map(|r| r.get::<_, String>(0)).transpose()
+}
+
 /// The conditions of `q`'s filters (not its keyset).
 fn conditions(q: &AssetQuery) -> Vec<Cond> {
     let mut c: Vec<Cond> = Vec::new();

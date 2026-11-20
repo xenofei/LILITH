@@ -26,6 +26,15 @@
 //!   The asset's version lock is held from the run id to the end of the Record stage, so two
 //!   imports of one asset in the same minute get different run ids.
 //!   `ref` is the first file's candidate ref, `handoff.refs` every file's.
+//! - **Trust records** (ARCH-060; Appendix H "Trust"; P4b-R28): `copy` and `asset.collect`
+//!   give each run file an `untrusted` record in the same manifest edit, its source
+//!   `{kind: "import" | "collect", ref: <the path it came from>}`. Only `app/asset.trust`
+//!   ([`trust`], from a verified app) clears one; sign-off carries them (`pipeline::signoff`).
+//! - **Same bytes** (CORE-168; Appendix H "Duplicates"): `asset.import`, in either mode, adds
+//!   "same bytes as <ref> (file <n>)" to `warnings` for each file whose SHA-256 a sealed or
+//!   candidate file in the workspace already has (the index's first such file, a sealed one
+//!   first; `n` the file's 1-based position in `files`, never its name: ARCH-060); it never
+//!   blocks the import.
 //! - **Creating onto a redirect** (ARCH-125; Appendix H): the import that creates an asset
 //!   (there is no manifest yet), in either mode, whose `<project>/<asset_id>` is some entry's
 //!   `from` in `registry/redirects.yaml`, adds the warning "Old refs to <name> will now reach
@@ -145,6 +154,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use lil_protocol::app::{ConfirmFacts, TouchAccess};
 use lil_protocol::codes::{
@@ -155,8 +165,9 @@ use lil_protocol::codes::{
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
     AssetRef, Bump, CandidateRun, Flag, Label, LinkRef, Manifest, SCHEME, Status, StatusEvent,
-    Take, YamlEdit, bare_sha256, change_status, file_takes, fold_tag, hash_value, is_asset_id,
-    is_slug, normalise_tags, takes_of,
+    Take, TrustRecord, TrustSource, TrustSourceKind, TrustState, YamlEdit, bare_sha256,
+    change_status, file_takes, fold_tag, hash_value, is_asset_id, is_slug, normalise_tags,
+    takes_of,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -169,6 +180,7 @@ use super::registry::{
 use super::services::{AssetServices, InUse};
 use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
+use crate::pipeline::record::trust_key;
 use crate::pipeline::{
     Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, actor_of, asset_topic,
     chosen_files, plan_signoff, signed_off_by, start_candidate_run, status_by,
@@ -684,9 +696,19 @@ fn untrusted(names: &[String]) -> Vec<NamedFile> {
         .collect()
 }
 
+/// What [`stage_candidate_run`] staged: the run id, and per file its candidate ref, its name
+/// and its SHA-256.
+struct StagedRun {
+    run_id: String,
+    refs: Vec<String>,
+    names: Vec<String>,
+    hashes: Vec<String>,
+}
+
 /// Copies `files` into a staging handle and leaves a candidate-run plan for the Record stage.
-/// `extra` runs on the manifest after the run has started (`asset.collect` removes `external`).
-/// Returns the run id, the files' candidate refs and their names.
+/// With `remove_external` (`asset.collect`) the manifest edit also removes `external`. Each
+/// file gets an `untrusted` trust record (ARCH-060), its source `import` or, with
+/// `remove_external`, `collect`, and `ref` the path it came from.
 async fn stage_candidate_run(
     ctx: &CallCtx,
     a: &Asset,
@@ -694,7 +716,7 @@ async fn stage_candidate_run(
     files: &[(PathBuf, String)],
     expected: Option<&HashMap<String, String>>,
     remove_external: bool,
-) -> Result<(String, Vec<String>, Vec<String>), ErrorBody> {
+) -> Result<StagedRun, ErrorBody> {
     let store = a.store().clone();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
     // The asset's version lock from the run id to the end of the Record stage: two runs of
@@ -704,6 +726,9 @@ async fn stage_candidate_run(
         .lock_owned()
         .await;
     let current = read_manifest(&store, &a.manifest).await.map_err(error)?;
+    if current.as_ref().is_some_and(damaged) {
+        return Err(error(StoreError::NeedsRepair(a.manifest.clone())));
+    }
     let now = store.now_utc();
     let run_id = store
         .next_run_id(&a.dir, current.as_ref(), now)
@@ -715,6 +740,13 @@ async fn stage_candidate_run(
     let mut records = Vec::with_capacity(files.len());
     let mut refs = Vec::with_capacity(files.len());
     let mut names = Vec::with_capacity(files.len());
+    let mut hashes = Vec::with_capacity(files.len());
+    let mut trust = Vec::with_capacity(files.len());
+    let kind = if remove_external {
+        TrustSourceKind::Collect
+    } else {
+        TrustSourceKind::Import
+    };
     for (source, name) in files {
         let staged = store.stage_copy(&handle, source, name).await;
         let (staged, sha256) = match staged {
@@ -748,6 +780,18 @@ async fn stage_candidate_run(
             "role": "candidate",
             "sha256": sha256,
         }));
+        hashes.push(sha256);
+        trust.push((
+            format!("candidates/{run_id}/{name}"),
+            TrustRecord {
+                state: TrustState::Untrusted,
+                sources: vec![TrustSource {
+                    kind,
+                    r#ref: source.display().to_string(),
+                }],
+                marked_trusted: None,
+            },
+        ));
         refs.push(
             AssetRef::Candidate {
                 ws: a.open.ws.id.clone(),
@@ -778,7 +822,11 @@ async fn stage_candidate_run(
     );
     let by = status_by(&ctx.session.caller);
     let actor = actor_of(&ctx.session.caller);
+    let rel = a.manifest.clone();
     let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
+        if damaged(m) {
+            return Err(StoreError::NeedsRepair(rel.clone()));
+        }
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&project, &asset_id, &asset_type, &uuid);
         }
@@ -786,6 +834,9 @@ async fn stage_candidate_run(
             unreachable!("the run is an object");
         };
         start_candidate_run(m, run, &by, &actor, now)?;
+        for (path, record) in &trust {
+            m.set_trust(path, Some(record));
+        }
         if remove_external {
             m.remove("external");
         }
@@ -822,7 +873,12 @@ async fn stage_candidate_run(
         refs: refs.clone(),
         version_guard: Some(guard),
     });
-    Ok((run_id, refs, names))
+    Ok(StagedRun {
+        run_id,
+        refs,
+        names,
+        hashes,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -836,11 +892,19 @@ async fn import(ctx: &CallCtx, args: ImportArgs) -> Result<(ImportResult, String
         return Err(invalid(ctx, "type is one non-empty line".to_string()));
     }
     let files = sources(ctx, &args.files)?;
-    let warnings = creation_warnings(ctx, &a).await?;
+    let mut warnings = creation_warnings(ctx, &a).await?;
     match args.mode {
         ImportMode::Copy => {
-            let (run_id, refs, names) =
-                stage_candidate_run(ctx, &a, asset_type, &files, None, false).await?;
+            // Before `stage_candidate_run` takes the asset's version lock, so the wait never
+            // holds it.
+            let ready = index_ready(&a).await;
+            let StagedRun {
+                run_id,
+                refs,
+                names,
+                hashes,
+            } = stage_candidate_run(ctx, &a, asset_type, &files, None, false).await?;
+            warnings.extend(same_bytes_warnings(&a, ready, &hashes).await);
             let summary = format!(
                 "importing {} file(s) into {} as candidate run {run_id}",
                 files.len(),
@@ -864,6 +928,15 @@ async fn import(ctx: &CallCtx, args: ImportArgs) -> Result<(ImportResult, String
     }
 }
 
+/// Whether `m`, a manifest an import or a link would write, is damaged: it has keys but no
+/// `asset_id` (a hand edit, a bad merge or a partial write dropped it). Writing a new manifest
+/// over it would lose everything it holds, its trust records included, so the import is
+/// refused with `manifest.needs_repair` instead. A missing file or an empty map is a new
+/// asset's.
+fn damaged(m: &Manifest) -> bool {
+    m.get("asset_id").is_none() && !m.as_map().is_empty()
+}
+
 /// The warning of an import that creates an asset onto a redirect's `from` (module docs).
 async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, ErrorBody> {
     if a.store()
@@ -875,6 +948,87 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
         return Ok(Vec::new());
     }
     Ok(takeover_warnings(a).await)
+}
+
+/// How long `asset.import`'s same-bytes check (CORE-168) waits for the index's first run of
+/// the workspace (`Index::ready_result`) before it gives up and says the check wasn't made:
+/// long enough for a small workspace just opened, short enough that an import made while a
+/// big one is still being indexed isn't held up for it.
+const SAME_BYTES_WAIT: Duration = Duration::from_secs(5);
+
+/// Waits, at most [`SAME_BYTES_WAIT`], for the index's first run of the workspace, for the
+/// same-bytes check. `Err` says why the check can't be made: the run isn't done in time, or the
+/// index failed. A copy import waits before it takes the asset's version lock.
+async fn index_ready(a: &Asset) -> Result<(), String> {
+    match tokio::time::timeout(SAME_BYTES_WAIT, a.open.index.ready_result()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the workspace is still being indexed".to_string()),
+    }
+}
+
+/// CORE-168's warning (Appendix H "Duplicates") for each of `hashes` (bare hex, in file order)
+/// that a sealed or candidate file in the workspace already has: "same bytes as <ref> (file
+/// <n>)", the first such file's ref, a sealed one first (`Index::same_bytes`), and `n` the
+/// imported file's 1-based position (its name is untrusted text), when the index was `ready`
+/// ([`index_ready`]); this never waits. It never blocks the import: an index that wasn't ready,
+/// or that can't answer, is one warning saying the check wasn't made (after the warnings
+/// already found, when it fails part-way).
+async fn same_bytes_warnings(
+    a: &Asset,
+    ready: Result<(), String>,
+    hashes: &[String],
+) -> Vec<String> {
+    let index = &a.open.index;
+    let unchecked = |why: String| {
+        tracing::warn!(why, "the index can't say whether imported bytes are new");
+        format!("whether the workspace already has these files' bytes wasn't checked: {why}")
+    };
+    if let Err(why) = ready {
+        return vec![unchecked(why)];
+    }
+    let mut warnings = Vec::new();
+    for (i, sha256) in hashes.iter().enumerate() {
+        match index.same_bytes(sha256).await {
+            Ok(Some(path)) => {
+                if let Some(r) = file_ref(&a.open.ws.id, &path) {
+                    warnings.push(format!("same bytes as {r} (file {})", i + 1));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warnings.push(unchecked(e.to_string()));
+                break;
+            }
+        }
+    }
+    warnings
+}
+
+/// The ref of a sealed or candidate file at the workspace path `path`
+/// (`lil://<ws>/<project>/<asset>@<version>`, or `…@candidate/<run>/<file>`); `None` for any
+/// other path.
+fn file_ref(ws_id: &str, path: &WsPath) -> Option<String> {
+    let parts: Vec<&str> = path.as_str().split('/').collect();
+    let (project, asset) = (parts.get(1)?.to_string(), parts.get(3)?.to_string());
+    let r = match crate::index::kind_of(path) {
+        crate::index::FileKind::Sealed => AssetRef::Sealed {
+            ws: ws_id.to_string(),
+            project,
+            asset,
+            version: parts[4].get(1..)?.parse().ok()?,
+            sha256: None,
+        },
+        crate::index::FileKind::Candidate => AssetRef::Candidate {
+            ws: ws_id.to_string(),
+            project,
+            asset,
+            run: parts[5].to_string(),
+            file: parts[6..].join("/"),
+        },
+        _ => return None,
+    };
+    Some(r.to_string())
 }
 
 /// ARCH-125's warning when the asset's name is some redirect's `from` (old refs to it will
@@ -914,7 +1068,7 @@ async fn link_external(
     a: &Asset,
     asset_type: &str,
     files: &[(PathBuf, String)],
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> Result<(ImportResult, String), ErrorBody> {
     let store = a.store();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
@@ -923,6 +1077,9 @@ async fn link_external(
         let sha256 = store.hash_outside(source).await.map_err(error)?;
         linked.push((source.display().to_string(), sha256));
     }
+    let hashes: Vec<String> = linked.iter().map(|(_, h)| h.clone()).collect();
+    let ready = index_ready(a).await;
+    warnings.extend(same_bytes_warnings(a, ready, &hashes).await);
     let uuid = store.ids().uuid();
     let (project, asset_id, asset_type) = (
         a.project.clone(),
@@ -931,7 +1088,11 @@ async fn link_external(
     );
     let by = status_by(&ctx.session.caller);
     let utc = lil_schema::time::rfc3339(store.now_utc());
+    let rel = a.manifest.clone();
     let edit = move |m: &mut Manifest| {
+        if damaged(m) {
+            return Err(StoreError::NeedsRepair(rel.clone()));
+        }
         if m.get("asset_id").is_none() {
             *m = Manifest::new(&project, &asset_id, &asset_type, &uuid);
         }
@@ -1020,8 +1181,12 @@ async fn collect(ctx: &CallCtx, args: AssetArgs) -> Result<(CollectResult, Strin
         expected.insert(name.clone(), found);
     }
     let asset_type = view.asset_type.unwrap_or_else(|| "file".to_string());
-    let (run_id, refs, names) =
-        stage_candidate_run(ctx, &a, &asset_type, &files, Some(&expected), true).await?;
+    let StagedRun {
+        run_id,
+        refs,
+        names,
+        ..
+    } = stage_candidate_run(ctx, &a, &asset_type, &files, Some(&expected), true).await?;
     let summary = format!(
         "collecting {} file(s) into {} as candidate run {run_id}",
         files.len(),
@@ -2519,19 +2684,8 @@ pub(crate) async fn ai_edit(
     p: &lil_protocol::app::AiEditParams,
     trace_id: &str,
 ) -> Result<lil_protocol::app::AiEditResult, ErrorBody> {
-    let invalid = |why: String| ErrorBody::new(&PARAMS_INVALID, why, trace_id);
-    if !is_slug(project) {
-        return Err(invalid(format!("{project:?} is not a project slug")));
-    }
-    if !is_asset_id(&p.asset_id) {
-        return Err(invalid(format!("{:?} is not an asset id", p.asset_id)));
-    }
+    let manifest = app_manifest_path(open, project, &p.asset_id, trace_id).await?;
     let error = |e: StoreError| e.to_error(trace_id);
-    if read_project(&open.store, project).await.map_err(error)? == ProjectFile::Missing {
-        let mut e = unknown_project(project);
-        e.trace_id = trace_id.to_string();
-        return Err(e);
-    }
     let unknown = |what: &str| {
         ErrorBody::new(
             &ASSET_UNKNOWN,
@@ -2542,11 +2696,6 @@ pub(crate) async fn ai_edit(
             trace_id,
         )
     };
-    let manifest = WsPath::parse(&format!(
-        "projects/{project}/assets/{0}/{0}.manifest.json",
-        p.asset_id
-    ))
-    .map_err(error)?;
     if read_manifest(&open.store, &manifest)
         .await
         .map_err(error)?
@@ -2596,6 +2745,165 @@ pub(crate) async fn ai_edit(
     Ok(lil_protocol::app::AiEditResult {
         human_edit: entry.clone(),
     })
+}
+
+/// The manifest path of `project`/`asset_id` for an `app/asset.*` method ([`ai_edit`],
+/// [`trust`]), once the names are checked and the project is there.
+///
+/// # Errors
+/// `params.invalid` for a name that isn't a project slug or an asset id; `project.unknown`;
+/// the store's read error.
+async fn app_manifest_path(
+    open: &OpenWorkspace,
+    project: &str,
+    asset_id: &str,
+    trace_id: &str,
+) -> Result<WsPath, ErrorBody> {
+    let invalid = |why: String| ErrorBody::new(&PARAMS_INVALID, why, trace_id);
+    if !is_slug(project) {
+        return Err(invalid(format!("{project:?} is not a project slug")));
+    }
+    if !is_asset_id(asset_id) {
+        return Err(invalid(format!("{asset_id:?} is not an asset id")));
+    }
+    let error = |e: StoreError| e.to_error(trace_id);
+    if read_project(&open.store, project).await.map_err(error)? == ProjectFile::Missing {
+        let mut e = unknown_project(project);
+        e.trace_id = trace_id.to_string();
+        return Err(e);
+    }
+    WsPath::parse(&format!(
+        "projects/{project}/assets/{asset_id}/{asset_id}.manifest.json"
+    ))
+    .map_err(error)
+}
+
+/// `app/asset.trust {project?, asset_id, paths?}` (ARCH-060; Appendix H "Trust"; P4b-R28),
+/// the one call that clears a trust record: in `open`'s `project` (resolved by the caller), each
+/// untrusted record of `paths` (every untrusted record of the asset when `paths` is left out)
+/// becomes `trusted` with `marked_trusted: {utc}`, its sources kept, through one hash-checked
+/// manifest edit. The result lists the paths it changed, in the order asked (`trust` map order
+/// without `paths`); a path that is trusted already (marked earlier, or a file the suite made,
+/// which has no record) is left out without an error. Nothing else is touched.
+///
+/// # Errors
+/// `params.invalid` for a name that isn't a project slug or an asset id; `project.unknown`;
+/// `asset.unknown` when the asset has no manifest, or a path is neither in its `trust` map
+/// nor a file its manifest names (a run file, a sealed file in `hashes`, a `human_edits[]`
+/// entry), and then nothing is written; the store's errors (`manifest.needs_repair`, …).
+pub(crate) async fn trust(
+    open: &OpenWorkspace,
+    project: &str,
+    p: &lil_protocol::app::AssetTrustParams,
+    trace_id: &str,
+) -> Result<lil_protocol::app::AssetTrustResult, ErrorBody> {
+    let manifest = app_manifest_path(open, project, &p.asset_id, trace_id).await?;
+    let error = |e: StoreError| e.to_error(trace_id);
+    let unknown = |what: &str| {
+        ErrorBody::new(
+            &ASSET_UNKNOWN,
+            format!(
+                "{project}/{} has {what}; asset.get lists its trust records.",
+                p.asset_id
+            ),
+            trace_id,
+        )
+    };
+    let utc = lil_schema::time::rfc3339(open.store.now_utc());
+    // What the edit found: the paths it marked, or the reason it wrote nothing.
+    let found: std::sync::Mutex<Result<Vec<String>, String>> =
+        std::sync::Mutex::new(Ok(Vec::new()));
+    let edit = |m: &mut Manifest| -> Result<(), StoreError> {
+        let marked = if m.get("asset_id").is_none() {
+            Err("no manifest".to_string())
+        } else {
+            mark_trusted(m, p.paths.as_deref(), &utc)
+                .map_err(|path| format!("no file {path} in its manifest"))
+        };
+        let refused = marked.is_err();
+        *found
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = marked;
+        if refused {
+            // Nothing is written; the caller answers `asset.unknown`.
+            return Err(StoreError::Invalid("unknown path".to_string()));
+        }
+        Ok(())
+    };
+    if read_manifest(&open.store, &manifest)
+        .await
+        .map_err(error)?
+        .is_none()
+    {
+        return Err(unknown("no manifest"));
+    }
+    let edited = open.store.edit_manifest(&manifest, &edit).await;
+    let found = found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match (edited, found) {
+        (_, Err(what)) => Err(unknown(&what)),
+        (Err(e), Ok(_)) => Err(error(e)),
+        (Ok(_), Ok(trusted)) => Ok(lil_protocol::app::AssetTrustResult { trusted }),
+    }
+}
+
+/// Marks the untrusted records of `paths` (every record when `None`) of `m` as trusted at
+/// `utc` ([`trust`]); the record keys it changed, each once. A path finds its record without
+/// regard to case (`record::trust_key`, as the seal matches names). `Err(path)` for the first
+/// path that is neither in the `trust` map nor a file the manifest names, and then `m` is
+/// unchanged.
+fn mark_trusted(
+    m: &mut Manifest,
+    paths: Option<&[String]>,
+    utc: &str,
+) -> Result<Vec<String>, String> {
+    let wanted: Vec<String> = match paths {
+        Some(paths) => {
+            let mut keys = Vec::new();
+            for path in paths {
+                match trust_key(m, path) {
+                    Some(key) => keys.push(key),
+                    // A file the suite made: trusted already.
+                    None if names_file(m, path) => {}
+                    None => return Err(path.clone()),
+                }
+            }
+            keys
+        }
+        None => match m.get("trust") {
+            Some(Value::Object(records)) => records.keys().cloned().collect(),
+            _ => Vec::new(),
+        },
+    };
+    let mut changed: Vec<String> = Vec::new();
+    for path in wanted {
+        let Some(mut record) = m.trust(&path) else {
+            continue;
+        };
+        if record.state == TrustState::Trusted || changed.contains(&path) {
+            continue;
+        }
+        record.state = TrustState::Trusted;
+        record.marked_trusted = Some(utc.to_string());
+        m.set_trust(&path, Some(&record));
+        changed.push(path);
+    }
+    Ok(changed)
+}
+
+/// Whether `m` names the asset-relative `path` as one of its files: a run file, a sealed file
+/// (a `hashes` key) or a `human_edits[]` entry (without regard to case, as [`path_key`] folds).
+fn names_file(m: &Manifest, path: &str) -> bool {
+    let view = m.view();
+    let key = path_key(path);
+    let same = |p: &str| path_key(p) == key;
+    view.candidate_runs
+        .iter()
+        .flat_map(|r| &r.files)
+        .any(|f| same(&f.path))
+        || view.human_edits.iter().any(|e| same(&e.path))
+        || matches!(m.get("hashes"), Some(Value::Object(h)) if h.keys().any(|k| same(k)))
 }
 
 /// Registers `asset.import`, `asset.collect`, `asset.signoff`, `asset.request_signoff`,

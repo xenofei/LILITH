@@ -26,7 +26,18 @@
 //! - the other open runs for that version (targeting it or an older one, or nothing) become
 //!   `rejected`, with `rejected_at_version`, so their 90 days start at this sign-off; those in
 //!   `keep_runs` stay open with `pinned: true` instead (CORE-032);
-//! - `hashes["v<version>/<file>"] = "sha256:<hex>"` for each chosen file.
+//! - `hashes["v<version>/<file>"] = "sha256:<hex>"` for each chosen file;
+//! - trust records go with the files to the version (ARCH-060; P4b-R28): each file the seal
+//!   takes (the chosen ones and, through `from`, the run's `derived` files made from them, as
+//!   the store's seal picks them) gets its run file's record at `v<version>/<name>`
+//!   (`lil_schema::carry_trust`); a file made from another (`derived`, `repair` or `preview`)
+//!   without a record takes its `from` file's first (`record::inherit_from`, which finds the
+//!   `from` file as the seal does: by bare name among the run's files). Records are found as
+//!   the seal finds names, without regard to case (`record::trust_key`). Each record under the
+//!   run's `candidates/<run>/source/` goes to the same place under `v<version>/source/`, where
+//!   the seal moves that folder. The run file's record stays (the run still names that path),
+//!   so `app/asset.trust` without `paths` can list a candidate path whose file the seal moved.
+//!   No sign-off, by anyone, clears a record.
 
 use std::collections::BTreeMap;
 
@@ -35,12 +46,14 @@ use lil_protocol::codes::{
 };
 use lil_protocol::{CallerKind, CodeSpec, ErrorBody};
 use lil_schema::{
-    Bump, CandidateFile, CandidateRun, Manifest, StatusBy, StatusEvent, Version, Via,
+    Bump, CandidateFile, CandidateRun, Manifest, StatusBy, StatusEvent, Version, Via, carry_trust,
     change_status, hash_value, takes_of,
 };
 use serde_json::{Map, Value, json};
 
+use super::record::{inherit_from, trust_key};
 use super::status::status_by;
+use crate::store::{name_key, path_key};
 
 /// What a sign-off chooses: the run's files by name (`files`), or takes by number (`takes`;
 /// Appendix H "Takes").
@@ -297,6 +310,8 @@ pub fn plan_signoff(
     out.set("hashes", Value::Object(hashes));
     out.set("version", Value::from(version.to_string()));
     out.set("approved_version", Value::from(version.to_string()));
+    let sealed: Vec<&CandidateFile> = chosen.iter().map(|(_, record)| *record).collect();
+    carry_to_version(&mut out, &run.run_id, &run.files, sealed, version);
 
     let names: Vec<Value> = chosen.iter().map(|(n, _)| Value::from(*n)).collect();
     let date = lil_schema::time::date(now_utc);
@@ -341,6 +356,54 @@ pub fn plan_signoff(
         }
     }
     Ok((out, version))
+}
+
+/// Trust records at the seal (module docs): `sealed` (the chosen records of run `run_id`,
+/// whose records are `files`) and, transitively, the `derived` records made from them, matched
+/// by name as the store's seal matches them ([`name_key`]); then the run's `source/` records.
+fn carry_to_version<'a>(
+    m: &mut Manifest,
+    run_id: &str,
+    files: &'a [CandidateFile],
+    mut sealed: Vec<&'a CandidateFile>,
+    version: Version,
+) {
+    let has = |list: &[&CandidateFile], name: &str| {
+        let key = name_key(name);
+        list.iter().any(|f| name_key(&f.path) == key)
+    };
+    loop {
+        let more: Vec<&CandidateFile> = files
+            .iter()
+            .filter(|f| f.role == "derived" && !has(&sealed, &f.path))
+            .filter(|f| f.from.as_deref().is_some_and(|from| has(&sealed, from)))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        sealed.extend(more);
+    }
+    for file in sealed {
+        inherit_from(m, files, file);
+        if let Some(key) = trust_key(m, &file.path) {
+            carry_trust(m, &key, &format!("v{version}/{}", bare_name(&file.path)));
+        }
+    }
+    // The seal moves the run's `source/` folder to `v<version>/source/`.
+    let source = path_key(&format!("candidates/{run_id}/source/"));
+    let keys: Vec<String> = match m.get("trust") {
+        Some(Value::Object(trust)) => trust
+            .keys()
+            .filter(|k| path_key(k).starts_with(&source))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    let skip = source.chars().count();
+    for key in keys {
+        let rest: String = key.chars().skip(skip).collect();
+        carry_trust(m, &key, &format!("v{version}/source/{rest}"));
+    }
 }
 
 /// CORE-052's automatic pick among `files` (a run's records): of those that pass every

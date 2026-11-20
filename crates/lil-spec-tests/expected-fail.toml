@@ -11,13 +11,6 @@ tests = [
     { name = "lil-spec-tests::versions_4b::restore_version_seals_a_copy_as_the_next_version", rule = "CORE-177", file = "tests/versions_4b.rs" },
     # CORE-177, APP-141
     { name = "lil-spec-tests::versions_4b::get_version_reads_the_snapshot", rule = "CORE-177", file = "tests/versions_4b.rs" },
-    # Task 16
-    # CORE-168
-    { name = "lil-spec-tests::marks_4b::duplicates_finds_assets_sharing_bytes", rule = "CORE-168", file = "tests/marks_4b.rs" },
-    # ARCH-060
-    { name = "lil-spec-tests::workspace_4b::import_marks_files_untrusted_and_only_the_app_clears_it", rule = "ARCH-060", file = "tests/workspace_4b.rs" },
-    # CORE-025
-    { name = "lil-spec-tests::workspace_4b::style_input_is_added_to_every_run", rule = "CORE-025", file = "tests/workspace_4b.rs" },
     # Task 17
     # CORE-040
     { name = "lil-spec-tests::workspace_4b::agents_cannot_write_instruction_files", rule = "CORE-040", file = "tests/workspace_4b.rs" },

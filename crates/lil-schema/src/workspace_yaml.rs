@@ -46,6 +46,38 @@ pub struct ProjectYaml {
     /// The project's cascade layer, from its top-level keys (and `pipeline.skip_stages`,
     /// `pipeline.auto_approve`).
     pub overrides: Map<String, Value>,
+    /// `style_bible`: the style bible's path, when it is a non-empty string.
+    pub style_bible: Option<String>,
+    /// `style_bible` as written, for [`ProjectYaml::style_version`]'s check.
+    style_bible_raw: Option<Value>,
+    /// `style_version` as written (I4), read through [`ProjectYaml::style_version`].
+    style_version_raw: Option<Value>,
+}
+
+impl ProjectYaml {
+    /// The style version every run of the project records as its `style@<n>` input (CORE-025):
+    /// `None` without a `style_bible`; with one, `style_version` (a whole number), or 1 when
+    /// it has none.
+    ///
+    /// # Errors
+    /// A `style_bible` that isn't a string (nor `null`), or, with a `style_bible`, a
+    /// `style_version` that isn't a whole number from 0 to 2^32 - 1: the reason.
+    pub fn style_version(&self) -> Result<Option<u32>, String> {
+        if self.style_bible.is_none() {
+            return match &self.style_bible_raw {
+                None | Some(Value::Null | Value::String(_)) => Ok(None),
+                Some(v) => Err(format!("project.yaml's style_bible {v} is not a path")),
+            };
+        }
+        match &self.style_version_raw {
+            None | Some(Value::Null) => Ok(Some(1)),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| format!("project.yaml's style_version {v} is not a whole number")),
+        }
+    }
 }
 
 /// The `progress.md` of a new project; `<name>` is replaced by the project's name.
@@ -117,6 +149,9 @@ pub fn read_project_yaml(text: &str) -> Result<ProjectYaml, String> {
             _ => Map::new(),
         },
         overrides: cascade_layer(&root),
+        style_bible: s("style_bible").filter(|b| !b.trim().is_empty()),
+        style_bible_raw: root.get("style_bible").cloned(),
+        style_version_raw: root.get("style_version").cloned(),
     })
 }
 
@@ -392,5 +427,33 @@ hardware: {gpu: none}
         let odd = read_hardware("hardware: {gpu: [a], vram_gb: lots, ram_gb: -1}\n").unwrap();
         assert_eq!(odd, HardwareYaml::default());
         assert!(read_hardware("- a\n").is_err());
+    }
+
+    #[test] // spec: CORE-025
+    fn style_version_needs_a_style_bible() {
+        let read = |text: &str| read_project_yaml(text).unwrap().style_version();
+        assert_eq!(read("name: a\n"), Ok(None));
+        assert_eq!(read("style_version: 3\n"), Ok(None), "no bible, no input");
+        assert_eq!(read("style_bible: ''\nstyle_version: 3\n"), Ok(None));
+        assert_eq!(read("style_bible: style/bible.md\n"), Ok(Some(1)));
+        assert_eq!(
+            read("style_bible: style/bible.md\nstyle_version: 2\n"),
+            Ok(Some(2))
+        );
+        assert_eq!(
+            read("style_bible: style/bible.md\nstyle_version: 0\n"),
+            Ok(Some(0))
+        );
+        for bad in ["two", "-1", "1.5", "[2]"] {
+            let text = format!("style_bible: style/bible.md\nstyle_version: {bad}\n");
+            assert!(read(&text).is_err(), "{bad}");
+        }
+        // A `style_bible` that isn't a path is an error too, not a project without one.
+        assert_eq!(read("style_bible:\nstyle_version: 3\n"), Ok(None));
+        assert_eq!(
+            read("style_bible: [a]\nstyle_version: 3\n"),
+            Err(r#"project.yaml's style_bible ["a"] is not a path"#.to_string())
+        );
+        assert!(read("style_bible: 7\n").is_err());
     }
 }

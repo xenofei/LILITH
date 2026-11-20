@@ -29,6 +29,15 @@
 //! events and the dependents) is best-effort (ruling Q31): a failure is logged and returned in
 //! [`RecordOutcome::warnings`], which the Record stage puts in the result as `warnings`, and steps 2
 //! and 3 always run.
+//!
+//! **Recording a candidate run** (CORE-025, ARCH-060; Appendix H "Style input" and "Trust"),
+//! whatever made it (an import, a collect, a generation's Record step): before the commit,
+//! step 1 reads the project's `project.yaml`, and the plan's manifest edit is followed by
+//! [`finish_run`] on the run: the style input when the project has a `style_bible`, and the
+//! trust record of each file made from another (role `derived`, `repair` or `preview`,
+//! [`inherit_from`]). A `project.yaml` that can't be read, whose `style_bible` isn't a path or
+//! whose `style_version` isn't a whole number leaves the run without a style input and is a
+//! warning; it never fails the call.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -36,8 +45,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lil_schema::{
-    Actor, Bump, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy, StatusEvent,
-    Version, change_status,
+    Actor, Bump, CandidateFile, LinkRef, Manifest, ManifestView, Reason, SCHEME, Status, StatusBy,
+    StatusEvent, Version, carry_derived_trust, change_status,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -46,8 +55,10 @@ use serde_json::{Map, Value, json};
 use crate::events::EventBus;
 use crate::graph::is_stale;
 use crate::index::Index;
-use crate::projects::{Resolver, add_done_entry, dependents_of, stale_ref};
-use crate::store::{CommitOp, StagingHandle, Store, StoreError, WsPath};
+use crate::projects::{
+    ProjectFile, Resolver, add_done_entry, dependents_of, read_project, stale_ref,
+};
+use crate::store::{CommitOp, StagingHandle, Store, StoreError, WsPath, from_file, path_key};
 
 /// Which Record branch a plan takes (CORE-020).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +216,19 @@ pub async fn apply_record(
         .iter()
         .filter_map(|o| o.from.parent().map(PathBuf::from))
         .collect();
+    // A candidate run: its style input and derived files' records, in the same manifest edit.
+    let mut early = Vec::new();
+    if let RecordBranch::CandidateRun { run_id } = &branch
+        && let Some((_, edit)) = commit.manifest.as_mut()
+    {
+        let style = style_of(store, &project, &mut early).await;
+        let (inner, run_id) = (edit.clone(), run_id.clone());
+        *edit = Arc::new(move |m: &mut Manifest| {
+            inner(m)?;
+            finish_run(m, &run_id, style);
+            Ok(())
+        });
+    }
     let committed = match WsPath::parse(&format!("projects/{project}/progress.md")) {
         Ok(progress) => {
             let (date, entry, shown) = (
@@ -233,7 +257,8 @@ pub async fn apply_record(
         refs,
         ..HandOff::default()
     };
-    let mut warnings = report.warnings;
+    let mut warnings = early;
+    warnings.extend(report.warnings);
     let topic = asset_topic(ws_id, &project, &asset_id);
     match &branch {
         RecordBranch::CandidateRun { run_id } => {
@@ -259,6 +284,144 @@ pub async fn apply_record(
     }
     events.publish(&format!("project:{project}"), json!({"kind": "progress"}));
     Ok(RecordOutcome { handoff, warnings })
+}
+
+/// The style version a run of `project` records as its input (CORE-025): `None` without a
+/// `style_bible` (or a `project.yaml`). A `project.yaml` that can't be read or parsed, a
+/// `style_bible` that isn't a path or a `style_version` that isn't a whole number is `None`
+/// too, logged and added to `warnings`.
+async fn style_of(store: &Store, project: &str, warnings: &mut Vec<String>) -> Option<u32> {
+    let why = match read_project(store, project).await {
+        Ok(ProjectFile::Parsed(p)) => match p.style_version() {
+            Ok(style) => return style,
+            Err(why) => why,
+        },
+        Ok(ProjectFile::Missing) => return None,
+        Ok(ProjectFile::Unreadable(why)) => why,
+        Err(e) => e.to_string(),
+    };
+    tracing::warn!(project, why, "the run gets no style input");
+    warnings.push(format!(
+        "the run has no style input: the style version of {project} can't be read ({why})"
+    ));
+    None
+}
+
+/// What recording run `run_id` adds to it in `m` (CORE-025, ARCH-060; module docs):
+/// - with `style` (the project's style version, when it has a `style_bible`), the input
+///   `{ref: "style@<style>", role: "style"}` appended to the run's `inputs` (made when
+///   missing), unless one of them is already a style ref (`style@<n>`, [`LinkRef::Style`]: a
+///   brief's, kept even when it is older); `inputs` that isn't a list is left as it is;
+/// - each of its files made from another (role `derived`, `repair` or `preview`) without a
+///   trust record takes its `from` file's record ([`inherit_from`]); files made from such
+///   files of the run follow, in any order.
+///
+/// Recording the same run again changes nothing.
+pub(crate) fn finish_run(m: &mut Manifest, run_id: &str, style: Option<u32>) {
+    let same = |r: &Map<String, Value>| {
+        r.get("run_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.eq_ignore_ascii_case(run_id))
+    };
+    for run in m.runs_mut().into_iter().filter(|r| same(r)) {
+        if let Some(n) = style {
+            let inputs = run
+                .entry("inputs")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if inputs.is_null() {
+                *inputs = Value::Array(Vec::new());
+            }
+            if let Value::Array(list) = inputs {
+                let has_style = list.iter().any(|i| {
+                    i.get("ref")
+                        .and_then(Value::as_str)
+                        .and_then(|r| r.parse::<LinkRef>().ok())
+                        .is_some_and(|r| matches!(r, LinkRef::Style(_)))
+                });
+                if !has_style {
+                    list.push(json!({"ref": format!("style@{n}"), "role": "style"}));
+                }
+            }
+        }
+    }
+    let files: Vec<CandidateFile> = m
+        .view()
+        .candidate_runs
+        .into_iter()
+        .filter(|r| r.run_id.eq_ignore_ascii_case(run_id))
+        .flat_map(|r| r.files)
+        .collect();
+    // Until nothing changes: a file made from such a file follows its `from`.
+    loop {
+        let mut changed = false;
+        for file in &files {
+            changed |= inherit_from(m, &files, file);
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// The key of the asset-relative `path`'s record in `m`'s `trust` map, matched as the seal
+/// matches file names ([`path_key`], without regard to case): `path` itself when it is a key,
+/// else the first key that names the same file. `None` when the file has no record.
+pub(crate) fn trust_key(m: &Manifest, path: &str) -> Option<String> {
+    let Some(Value::Object(trust)) = m.get("trust") else {
+        return None;
+    };
+    if trust.get(path).is_some_and(|v| !v.is_null()) {
+        return Some(path.to_string());
+    }
+    let key = path_key(path);
+    trust
+        .iter()
+        .find(|(k, v)| !v.is_null() && path_key(k) == key)
+        .map(|(k, _)| k.clone())
+}
+
+/// Gives the run file `file` (one of its run's `files`), when it is made from another (role
+/// `derived`, `repair` or `preview`, with a `from`) and has no record, its `from` file's record
+/// ([`carry_derived_trust`]): a repaired or derived copy of an outside file, or a preview that
+/// renders one, is outside content too (ARCH-060, P4b-R28). Whether it gave one. The Record
+/// step ([`finish_run`]) and the seal (`pipeline::signoff`) both use it.
+///
+/// The `from` file is found as the store's seal finds it: the run file with the same bare name
+/// ([`from_file`], without regard to case). When that file has no record, or the run has no
+/// such file, the `from` read as a path ([`from_path`]: another run's file) is tried too, so
+/// a record is never missed. Records are found by [`trust_key`].
+pub(crate) fn inherit_from(
+    m: &mut Manifest,
+    files: &[CandidateFile],
+    file: &CandidateFile,
+) -> bool {
+    if !matches!(file.role.as_str(), "derived" | "repair" | "preview") {
+        return false;
+    }
+    let Some(from) = &file.from else {
+        return false;
+    };
+    if trust_key(m, &file.path).is_some() {
+        return false;
+    }
+    let Some(key) = from_file(files, from)
+        .map(|source| source.path.clone())
+        .into_iter()
+        .chain([from_path(&file.path, from)])
+        .find_map(|path| trust_key(m, &path))
+    else {
+        return false;
+    };
+    carry_derived_trust(m, &key, &file.path)
+}
+
+/// The asset-relative path of the file a run file at `path` names in `from`: a `from` without
+/// a `/` is a file of the same run folder, one with a `/` is asset-relative already.
+pub(crate) fn from_path(path: &str, from: &str) -> String {
+    match (from.contains('/'), path.rsplit_once('/')) {
+        (false, Some((dir, _))) => format!("{dir}/{from}"),
+        _ => from.to_string(),
+    }
 }
 
 /// Gives back the staging handles in `dirs` (the folders the outputs came from); a handle that

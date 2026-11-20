@@ -43,7 +43,7 @@ pub use git_gate::{GIT_WAIT, GitGate};
 pub use logs::{LogKind, append_local_line, append_loose_usage};
 pub use order::asset_manifests;
 pub use order::{CommitOp, CommitReport, ManifestEdit, OutputMove, TextEdit};
-pub use paths::{WsPath, path_key, writable};
+pub use paths::{WsPath, from_file, name_key, path_key, writable};
 pub use personal::{Personal, list_files};
 pub use staging::{STAGING_DIR, StagingHandle};
 pub use suite_toml::{register_workspace, set_caps, set_desktop};

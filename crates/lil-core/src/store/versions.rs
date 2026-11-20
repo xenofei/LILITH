@@ -83,7 +83,7 @@ use lil_schema::{
 use super::fsops;
 use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
-use super::paths::{WsPath, path_key};
+use super::paths::{WsPath, name_key, path_key};
 use super::staging::SEAL_PREFIX;
 use super::write::{
     PathLock, Seen, Store, StoreError, blocking, exists, link_refused, lock, remove_if_hash, see,
@@ -245,9 +245,10 @@ fn bare_name(path: &str) -> &str {
 }
 
 /// The files of a sealed run: the chosen ones, then (transitively) every `derived` file made
-/// from one of them. Each is copied when any run file names it in `from`.
+/// from one of them. Each is copied when any run file names it in `from`. A `from` names the
+/// run file with its [`name_key`], the one rule every reader of `from` uses.
 fn plan_names(chosen: &[String], records: &[CandidateFile]) -> Vec<(String, bool)> {
-    let key = |name: &str| path_key(name);
+    let key = name_key;
     let mut included: BTreeMap<String, String> =
         chosen.iter().map(|n| (key(n), n.clone())).collect();
     loop {
@@ -257,7 +258,7 @@ fn plan_names(chosen: &[String], records: &[CandidateFile]) -> Vec<(String, bool
             .filter(|r| {
                 r.from
                     .as_deref()
-                    .is_some_and(|from| included.contains_key(&key(bare_name(from))))
+                    .is_some_and(|from| included.contains_key(&key(from)))
             })
             .map(|r| bare_name(&r.path).to_string())
             .filter(|name| !included.contains_key(&key(name)))
@@ -272,7 +273,7 @@ fn plan_names(chosen: &[String], records: &[CandidateFile]) -> Vec<(String, bool
     let sources: BTreeSet<String> = records
         .iter()
         .filter_map(|r| r.from.as_deref())
-        .map(|from| key(bare_name(from)))
+        .map(key)
         .collect();
     let mut names: Vec<(String, bool)> = included
         .into_iter()

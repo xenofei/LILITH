@@ -7,7 +7,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::manifest::{Obj, Reader, esc, set_opt, set_utc_object};
+use crate::manifest::{Manifest, Obj, Reader, esc, set_opt, set_utc_object};
 
 /// `actor.kind`. The set is open on read: a kind this suite doesn't know is kept, unchanged,
 /// as [`ActorKind::Other`] and written back as it was.
@@ -266,6 +266,62 @@ pub(crate) fn trust_ptr(path: &str) -> String {
     format!("/trust/{}", esc(path))
 }
 
+/// Carries the trust record of the asset-relative `from_path` to `to_path` (P4b-R28, P4b-R41):
+/// `to_path` gets a copy of `from_path`'s record. When `from_path` has none (the suite made
+/// that file), nothing changes: `to_path` keeps any record it has, since only your own Mark as
+/// trusted clears one. `from_path`'s record stays: sign-off, restore and copy all leave the
+/// run file records that name it. Both are keys of the `trust` map as spelled there; a caller
+/// that matches file names without regard to case finds the keys first.
+///
+/// The copy is the record as written, its unknown keys and sources of unknown kinds included;
+/// a record that isn't an object is copied as it reads (untrusted).
+pub fn carry_trust(m: &mut Manifest, from_path: &str, to_path: &str) {
+    if from_path == to_path {
+        return;
+    }
+    let copy = match m.trust_raw(from_path) {
+        Some(raw) => raw.clone(),
+        None => match m.trust(from_path) {
+            Some(rec) => {
+                let mut map = Map::new();
+                rec.write_into(&mut map);
+                map
+            }
+            None => return,
+        },
+    };
+    m.set_trust_raw(to_path, copy);
+}
+
+/// Gives `to_path` the record of a file derived from `from` ([`derived_trust`]), built on
+/// `from`'s record as written: its unknown keys and sources of unknown kinds stay, and the
+/// `derived` source is appended. Whether `from` had a record to give; when it had none,
+/// nothing changes.
+pub fn carry_derived_trust(m: &mut Manifest, from: &str, to_path: &str) -> bool {
+    let Some(rec) = derived_trust(m, from) else {
+        return false;
+    };
+    let mut map = m.trust_raw(from).cloned().unwrap_or_default();
+    rec.write_into(&mut map);
+    m.set_trust_raw(to_path, map);
+    true
+}
+
+/// The record of a file derived from the asset-relative `from` (P4b-R28, P4b-R41): `from`'s
+/// record, with the source `{kind: "derived", ref: from}` appended (once). `None` when `from`
+/// has no record: a file the suite derives from a suite-made file is the suite's too.
+pub fn derived_trust(m: &Manifest, from: &str) -> Option<TrustRecord> {
+    let mut rec = m.trust(from)?;
+    let source = TrustSource {
+        kind: TrustSourceKind::Derived,
+        r#ref: from.to_string(),
+    };
+    if !rec.sources.contains(&source) {
+        rec.sources.push(source);
+    }
+    Some(rec)
+}
+
 /// Reads every record of the manifest's `trust` map, for their warnings.
 pub(crate) fn read_trust(r: &mut Reader, root: Obj<'_>) {
     match Reader::field(root, "trust") {
@@ -282,7 +338,6 @@ pub(crate) fn read_trust(r: &mut Reader, root: Obj<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::Manifest;
     use serde_json::json;
 
     const HEX: &str = "aaae4dbdb0e697350dac691b26928d34a69061cf320b175c257c103fcaa32766";
@@ -443,5 +498,126 @@ mod tests {
         ] {
             assert!(pointers.contains(&p), "{p} missing from {pointers:?}");
         }
+    }
+
+    fn untrusted(kind: TrustSourceKind, r: &str) -> TrustRecord {
+        TrustRecord {
+            state: TrustState::Untrusted,
+            sources: vec![TrustSource {
+                kind,
+                r#ref: r.into(),
+            }],
+            marked_trusted: None,
+        }
+    }
+
+    #[test] // spec: ARCH-060
+    fn carry_trust_copies_the_record() {
+        let mut m = Manifest::new("sketchbook", "img_dock", "image", "u");
+        let rec = untrusted(TrustSourceKind::Import, "a.png");
+        m.set_trust("candidates/r_1/a.png", Some(&rec));
+        carry_trust(&mut m, "candidates/r_1/a.png", "v1.0.0/a.png");
+        assert_eq!(m.trust("v1.0.0/a.png"), Some(rec.clone()));
+        // The source keeps its record: the run's file record still names it.
+        assert_eq!(m.trust("candidates/r_1/a.png"), Some(rec.clone()));
+        // A record you marked as trusted is carried as it is.
+        let mut marked = rec.clone();
+        marked.state = TrustState::Trusted;
+        marked.marked_trusted = Some("2026-11-02T00:00:00Z".into());
+        m.set_trust("candidates/r_1/b.png", Some(&marked));
+        carry_trust(&mut m, "candidates/r_1/b.png", "v1.0.0/b.png");
+        assert_eq!(m.trust("v1.0.0/b.png"), Some(marked));
+        // Onto itself: nothing changes.
+        let before = m.clone();
+        carry_trust(&mut m, "v1.0.0/a.png", "v1.0.0/a.png");
+        assert_eq!(m, before);
+        // Nothing to carry and nothing at the target: no `trust` map appears.
+        let mut empty = Manifest::new("sketchbook", "img_dock", "image", "u");
+        carry_trust(&mut empty, "candidates/r_1/a.png", "v1.0.0/a.png");
+        assert_eq!(empty.get("trust"), None);
+    }
+
+    #[test] // spec: ARCH-060
+    fn carry_trust_without_a_source_record_leaves_the_target() {
+        // Only your own Mark as trusted clears a record: a source the suite made (no record)
+        // carries nothing, and the target's record stays as it is.
+        let mut m = Manifest::new("sketchbook", "img_dock", "image", "u");
+        let rec = untrusted(TrustSourceKind::Import, "c.png");
+        m.set_trust("v1.0.0/c.png", Some(&rec));
+        let before = m.clone();
+        carry_trust(&mut m, "candidates/r_1/c.png", "v1.0.0/c.png");
+        assert_eq!(m, before);
+        assert_eq!(m.trust("v1.0.0/c.png"), Some(rec));
+    }
+
+    #[test] // spec: ARCH-060
+    fn derived_trust_takes_the_from_record_and_names_it() {
+        let mut m = Manifest::new("sketchbook", "img_dock", "image", "u");
+        assert_eq!(derived_trust(&m, "candidates/r_1/a.png"), None);
+        let rec = untrusted(TrustSourceKind::Collect, "a.png");
+        m.set_trust("candidates/r_1/a.png", Some(&rec));
+        let derived = derived_trust(&m, "candidates/r_1/a.png").unwrap();
+        assert_eq!(derived.state, TrustState::Untrusted);
+        assert_eq!(
+            derived.sources,
+            [
+                rec.sources[0].clone(),
+                TrustSource {
+                    kind: TrustSourceKind::Derived,
+                    r#ref: "candidates/r_1/a.png".into(),
+                }
+            ]
+        );
+        // Derived from the derived file: each `from` is named once.
+        m.set_trust("candidates/r_1/a_cut.png", Some(&derived));
+        let again = derived_trust(&m, "candidates/r_1/a_cut.png").unwrap();
+        assert_eq!(again.sources.len(), 3, "{again:?}");
+        m.set_trust("candidates/r_1/a.png", Some(&derived));
+        let same = derived_trust(&m, "candidates/r_1/a.png").unwrap();
+        assert_eq!(same.sources, derived.sources);
+        // A file you marked as trusted passes that on.
+        let mut marked = rec;
+        marked.state = TrustState::Trusted;
+        marked.marked_trusted = Some("2026-11-02T00:00:00Z".into());
+        m.set_trust("candidates/r_1/b.png", Some(&marked));
+        let from_marked = derived_trust(&m, "candidates/r_1/b.png").unwrap();
+        assert_eq!(from_marked.state, TrustState::Trusted);
+        assert_eq!(
+            from_marked.marked_trusted.as_deref(),
+            Some("2026-11-02T00:00:00Z")
+        );
+    }
+
+    #[test] // spec: ARCH-060
+    fn carried_and_derived_records_keep_unknown_keys_and_sources() {
+        let mut m = Manifest::new("sketchbook", "img_dock", "image", "u");
+        let raw = json!({"state": "untrusted",
+                         "sources": [{"kind": "import", "ref": "x"}, {"kind": "web"}],
+                         "origin": {"caller_kind": "mcp", "model": "m"}});
+        let mut trust = Map::new();
+        trust.insert("candidates/r_1/a.png".into(), raw.clone());
+        m.set("trust", Value::Object(trust));
+        carry_trust(&mut m, "candidates/r_1/a.png", "v1.0.0/a.png");
+        assert_eq!(m.get("trust").unwrap()["v1.0.0/a.png"], raw);
+        assert!(carry_derived_trust(
+            &mut m,
+            "candidates/r_1/a.png",
+            "candidates/r_1/a_cut.png"
+        ));
+        assert_eq!(
+            m.get("trust").unwrap()["candidates/r_1/a_cut.png"],
+            json!({"state": "untrusted",
+                   "sources": [{"kind": "import", "ref": "x"}, {"kind": "web"},
+                               {"kind": "derived", "ref": "candidates/r_1/a.png"}],
+                   "origin": {"caller_kind": "mcp", "model": "m"}})
+        );
+        // Nothing to derive from: nothing changes.
+        let before = m.clone();
+        assert!(!carry_derived_trust(
+            &mut m,
+            "candidates/r_1/b.png",
+            "v1.0.0/b.png"
+        ));
+        assert_eq!(m, before);
     }
 }

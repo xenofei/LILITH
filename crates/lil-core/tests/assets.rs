@@ -12,17 +12,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lil_core::events::EventBus;
-use lil_core::pipeline::{RecordBranch, RecordPlan, apply_record, auto_pick, signed_off_by};
+use lil_core::pipeline::{
+    RecordBranch, RecordPlan, apply_record, auto_pick, signed_off_by, start_candidate_run,
+};
 use lil_core::session::Session;
 use lil_core::state::StateRegistry;
-use lil_core::store::{ChangeSink, CommitOp, StoreError, StoreEvent, WsPath};
+use lil_core::store::{ChangeSink, CommitOp, ManifestEdit, StoreError, StoreEvent, WsPath};
 use lil_core::tools::{Dispatcher, PipelineHooks, TestGates, core_registry};
 use lil_core::workspace::{OpenWorkspace, WorkspaceHub, WorkspaceRef};
 use lil_platform::fs::{Probe, SystemProbe};
 use lil_platform::paths::folder_key;
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{CallerKind, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolOutput};
-use lil_schema::CandidateFile;
+use lil_schema::{CandidateFile, Manifest, StatusBy};
 use lil_testkit::files::write_file;
 use lil_testkit::{FakeClock, SeqIds, TestEnv, sha256_bytes, version_content_hash_of};
 use serde_json::{Value, json};
@@ -949,11 +951,12 @@ async fn collect_removes_external_without_reordering_keys() {
         .await;
     assert_handoff(&r);
     let after = fx.manifest("prop_ext");
-    // The status change appends its status log, a new key, at the end (CORE-156).
+    // The status change appends its status log, a new key, at the end (CORE-156), and the
+    // collected file's trust record follows (ARCH-060).
     let expected: Vec<String> = before
         .into_iter()
         .filter(|k| k != "external")
-        .chain(["status_log".to_string()])
+        .chain(["status_log".to_string(), "trust".to_string()])
         .collect();
     assert_eq!(keys(&after), expected, "{after}");
     assert_eq!(after["status"], "candidate");
@@ -3032,5 +3035,709 @@ async fn signoff_by_takes_hashes_a_pre_2b_run() {
         let sealed = fx.path(&format!("{dir}/v{version}/{n}"));
         assert_eq!(sha256_bytes(&std::fs::read(&sealed).unwrap()), *sha, "{n}");
     }
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Trust records, the style input and the same-bytes warning (ARCH-060, CORE-025, CORE-168;
+// Appendix H "Trust", "Style input" and "Duplicates"; P4b-R28).
+// ---------------------------------------------------------------------------------------------
+
+/// Records the run `run` of `asset` as a generation's Record step does: a job's `RecordPlan`
+/// through `apply_record`, no tool call, the run started by `start_candidate_run`.
+async fn record_generation(fx: &Fx, asset: &str, run: Value) {
+    let open = fx.open().await;
+    let run_id = run["run_id"].as_str().expect("a run id").to_string();
+    let rel = WsPath::parse(&format!(
+        "projects/sketchbook/assets/{asset}/{asset}.manifest.json"
+    ))
+    .unwrap();
+    let Value::Object(run) = run else {
+        panic!("a run is an object");
+    };
+    let actor = lil_schema::Actor {
+        kind: lil_schema::ActorKind::Cli,
+        task_id: None,
+        conversation_id: None,
+        session_id: None,
+    };
+    let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
+        start_candidate_run(m, run.clone(), &StatusBy::Cli, &actor, 0)
+    });
+    let plan = RecordPlan {
+        branch: RecordBranch::CandidateRun {
+            run_id: run_id.clone(),
+        },
+        project: "sketchbook".into(),
+        asset_id: asset.into(),
+        commit: CommitOp {
+            manifest: Some((rel, edit)),
+            ..CommitOp::default()
+        },
+        progress_entry: format!("generated candidate run {run_id}"),
+        refs: Vec::new(),
+        version_guard: None,
+    };
+    let outcome = apply_record(
+        &open.store,
+        &open.index,
+        &fx.events,
+        &open.ws.id,
+        "2026-10-16",
+        plan,
+    )
+    .await
+    .expect("the run is recorded");
+    assert_eq!(outcome.warnings, Vec::<String>::new());
+}
+
+/// An untrusted record from `kind` with the source `r`.
+fn untrusted_record(kind: &str, r: &str) -> Value {
+    json!({"state": "untrusted", "sources": [{"kind": kind, "ref": r}]})
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn import_and_collect_write_untrusted_records() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let source = fx.env.root().join("import-src").join("kite.png");
+    let imported = format!("candidates/{run}/kite.png");
+    let m = fx.manifest(KITE);
+    assert_eq!(
+        m["trust"],
+        json!({ imported.clone(): untrusted_record("import", &source.to_string_lossy()) }),
+        "{m}"
+    );
+
+    // Linking writes no record (nothing is in the workspace); collecting does.
+    let ext = fx.outside("kite_ext.png", b"external kite");
+    fx.ok(
+        "asset.import",
+        json!({"project": "sketchbook", "asset_id": KITE, "type": "image",
+               "files": [ext.to_string_lossy()], "mode": "link_external"}),
+    )
+    .await;
+    assert_eq!(fx.manifest(KITE)["trust"], m["trust"]);
+    let collected = fx
+        .ok(
+            "asset.collect",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    let collected_run = collected["run_id"].as_str().unwrap();
+    let m = fx.manifest(KITE);
+    assert_eq!(
+        m["trust"],
+        json!({
+            imported: untrusted_record("import", &source.to_string_lossy()),
+            format!("candidates/{collected_run}/kite_ext.png"):
+                untrusted_record("collect", &ext.to_string_lossy()),
+        }),
+        "{m}"
+    );
+    let got = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    assert_eq!(got["trust"], m["trust"]);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn signoff_carries_records_to_the_sealed_paths() {
+    // The crane's open run: `crane_c.png` came from outside; its derived cut-out has no record
+    // of its own yet.
+    let crane_c = format!("candidates/{CRANE_OPEN_RUN}/crane_c.png");
+    let outside = untrusted_record("import", "crane_c.png");
+    let fx = Fx::with(|ws| {
+        edit_manifest(ws, CRANE, |m| {
+            m["trust"] = json!({ crane_c.clone(): outside.clone() });
+        });
+    });
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let candidate = format!("candidates/{run}/kite.png");
+    let record = fx.manifest(KITE)["trust"][&candidate].clone();
+    fx.signoff(KITE, &run, &["kite.png"], json!({})).await;
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"]["v1.0.0/kite.png"], record, "{m}");
+    // The run's file record still names the candidate path, and so does its record.
+    assert_eq!(m["trust"][&candidate], record, "{m}");
+    let snapshot = read_json(&fx.path(&format!("{KITE_DIR}/v1.0.0/manifest.snapshot.json")));
+    assert_eq!(snapshot["trust"], m["trust"], "{snapshot}");
+
+    // By takes: the primary's record, and the derived companion takes it with its source.
+    let r = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": CRANE, "run_id": CRANE_OPEN_RUN,
+                   "takes": [1]}),
+        )
+        .await;
+    assert_eq!(r["version"], "1.1.0", "{r}");
+    let m = fx.manifest(CRANE);
+    let mut derived = outside.clone();
+    derived["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "derived", "ref": crane_c}));
+    assert_eq!(m["trust"]["v1.1.0/crane_c.png"], outside, "{m}");
+    assert_eq!(m["trust"]["v1.1.0/crane_c_cutout.png"], derived, "{m}");
+    // A file the suite made has no record, sealed or not.
+    assert!(m["trust"].get("v1.0.0/crane_b.png").is_none(), "{m}");
+    let snapshot = read_json(&fx.path(&format!(
+        "projects/sketchbook/assets/{CRANE}/v1.1.0/manifest.snapshot.json"
+    )));
+    assert_eq!(snapshot["trust"]["v1.1.0/crane_c_cutout.png"], derived);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn a_derived_file_inherits_its_sources_record() {
+    let fx = Fx::new();
+    let imported = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let from = format!("candidates/{imported}/kite.png");
+    let record = fx.manifest(KITE)["trust"][&from].clone();
+    // A generation's run: a cut-out of the imported file and a larger copy of that cut-out
+    // (listed first, so its `from` comes later in the run), and a file the run made itself,
+    // with its own cut-out.
+    let run = "r_20261020_0800";
+    let path = |name: &str| format!("candidates/{run}/{name}");
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": run, "path": format!("candidates/{run}/"), "status": "open",
+        "files": [
+            {"path": path("kite_cut_big.png"), "role": "derived", "from": "kite_cut.png"},
+            {"path": path("kite_cut.png"), "role": "derived", "from": from},
+            {"path": path("fresh.png"), "role": "candidate"},
+            {"path": path("fresh_cut.png"), "role": "derived", "from": "fresh.png"},
+        ]}),
+    )
+    .await;
+    let m = fx.manifest(KITE);
+    let mut cut = record.clone();
+    cut["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "derived", "ref": from}));
+    assert_eq!(m["trust"][path("kite_cut.png")], cut, "{m}");
+    let mut big = cut.clone();
+    big["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "derived", "ref": path("kite_cut.png")}));
+    assert_eq!(m["trust"][path("kite_cut_big.png")], big, "{m}");
+    for name in ["fresh.png", "fresh_cut.png"] {
+        assert!(m["trust"].get(path(name)).is_none(), "{name}: {m}");
+    }
+    assert_eq!(
+        m["trust"][&from], record,
+        "the source's record is unchanged"
+    );
+    assert_eq!(m["trust"].as_object().unwrap().len(), 3, "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-025
+async fn style_input_is_added_to_every_run() {
+    let fx = Fx::with(|ws| {
+        let project = file(ws, "projects/sketchbook/project.yaml");
+        let mut text = read_text(&project);
+        text.push_str("style_bible: style/bible.md\nstyle_version: 3\n");
+        write_file(&project, text.as_bytes());
+    });
+    let style = json!({"ref": "style@3", "role": "style"});
+    // An import, then a collect.
+    let run = fx.import_run(KITE, "kite.png", b"kite").await;
+    assert_eq!(
+        run_of(&fx.manifest(KITE), &run)["inputs"],
+        json!([style.clone()])
+    );
+    let ext = fx.outside("kite_ext.png", b"external kite");
+    fx.ok(
+        "asset.import",
+        json!({"project": "sketchbook", "asset_id": "prop_crate", "type": "image",
+               "files": [ext.to_string_lossy()], "mode": "link_external"}),
+    )
+    .await;
+    let collected = fx
+        .ok(
+            "asset.collect",
+            json!({"project": "sketchbook", "asset_id": "prop_crate"}),
+        )
+        .await;
+    let m = fx.manifest("prop_crate");
+    assert_eq!(
+        run_of(&m, collected["run_id"].as_str().unwrap())["inputs"],
+        json!([style.clone()])
+    );
+
+    // A generation, with another input: the style input comes after it.
+    let lamp = json!({"ref": "prop_signal_lamp@1.0.0", "role": "reference"});
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": "r_20261020_0800", "status": "open", "files": [],
+               "inputs": [lamp.clone()]}),
+    )
+    .await;
+    assert_eq!(
+        run_of(&fx.manifest(KITE), "r_20261020_0800")["inputs"],
+        json!([lamp.clone(), style.clone()])
+    );
+    // A run made from a brief keeps the brief's own, older style version, and gets no second.
+    let brief = json!([
+        {"ref": "style@1", "role": "style", "sections": ["palette"]},
+        lamp.clone(),
+    ]);
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": "r_20261020_0900", "status": "open", "files": [],
+               "inputs": brief.clone()}),
+    )
+    .await;
+    assert_eq!(
+        run_of(&fx.manifest(KITE), "r_20261020_0900")["inputs"],
+        brief
+    );
+    fx.shutdown().await;
+
+    // Without a style bible: no input.
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "kite.png", b"kite").await;
+    let m = fx.manifest(KITE);
+    assert!(run_of(&m, &run).get("inputs").is_none(), "{m}");
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": "r_20261020_0800", "status": "open", "files": []}),
+    )
+    .await;
+    let m = fx.manifest(KITE);
+    assert!(run_of(&m, "r_20261020_0800").get("inputs").is_none(), "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-168
+async fn import_warns_about_same_bytes_and_never_blocks() {
+    let fx = Fx::with(|ws| {
+        // A working document's bytes don't count.
+        write_file(
+            &file(
+                ws,
+                &format!("projects/sketchbook/assets/{CRANE}/work/sketch.psd"),
+            ),
+            b"a working document",
+        );
+    });
+    let crane_dir = format!("projects/sketchbook/assets/{CRANE}");
+    let sealed = std::fs::read(fx.path(&format!("{crane_dir}/v1.0.0/crane_b.png"))).unwrap();
+    let candidate = std::fs::read(fx.path(&format!(
+        "{crane_dir}/candidates/{CRANE_OPEN_RUN}/crane_c.png"
+    )))
+    .unwrap();
+    let ws = fx.ws_id();
+    let sealed_ref = format!("lil://{ws}/sketchbook/{CRANE}@1.0.0");
+    let candidate_ref =
+        format!("lil://{ws}/sketchbook/{CRANE}@candidate/{CRANE_OPEN_RUN}/crane_c.png");
+    let same = |r: &Value| -> Vec<String> {
+        r["warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no warnings list: {r}"))
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|w| w.starts_with("same bytes as "))
+            .map(str::to_string)
+            .collect()
+    };
+
+    // New bytes, and a working document's: no warning.
+    let r = fx.import(KITE, &[("kite.png", b"kite one")]).await;
+    assert_eq!(same(&r), Vec::<String>::new(), "{r}");
+    let r = fx
+        .import(KITE, &[("sketch_copy.psd", b"a working document")])
+        .await;
+    assert_eq!(same(&r), Vec::<String>::new(), "{r}");
+
+    // The bytes of the crane's sealed file: named by its sealed ref, and imported all the same.
+    let r = fx.import(KITE, &[("kite_b.png", &sealed)]).await;
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {sealed_ref} (file 1)")],
+        "{r}"
+    );
+    let run = r["run_id"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read(fx.path(&format!("{KITE_DIR}/candidates/{run}/kite_b.png"))).unwrap(),
+        sealed
+    );
+    assert_eq!(
+        run_of(&fx.manifest(KITE), run)["files"][0]["path"],
+        format!("candidates/{run}/kite_b.png")
+    );
+    // A candidate of the crane itself has them too, and its path sorts before the sealed
+    // file's (`chr_paper_crane/candidates/…` < `chr_paper_crane/v1.0.0/…`).
+    let r = fx.import(CRANE, &[("crane_b_copy.png", &sealed)]).await;
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {sealed_ref} (file 1)")],
+        "{r}"
+    );
+    // So do candidates of the kite and the crane now: the sealed ref still comes first, not
+    // the first path.
+    let r = fx.import("prop_crate", &[("crate_b.png", &sealed)]).await;
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {sealed_ref} (file 1)")],
+        "{r}"
+    );
+    // A candidate's bytes: its candidate ref. One warning per file, in file order, each
+    // naming the file by its position in `files`.
+    let r = fx
+        .import(
+            "prop_crate",
+            &[("crate_c.png", &candidate), ("crate_new.png", b"crate new")],
+        )
+        .await;
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {candidate_ref} (file 1)")],
+        "{r}"
+    );
+    // A mixed import whose second file is the duplicate.
+    let r = fx
+        .import(
+            "prop_crate",
+            &[
+                ("crate_newer.png", b"crate newer"),
+                ("crate_c2.png", &candidate),
+            ],
+        )
+        .await;
+    assert_eq!(
+        same(&r),
+        [format!("same bytes as {candidate_ref} (file 2)")],
+        "{r}"
+    );
+    let r = fx
+        .import(
+            "prop_box",
+            &[("box_c.png", &candidate), ("box_b.png", &sealed)],
+        )
+        .await;
+    assert_eq!(
+        same(&r),
+        [
+            format!("same bytes as {candidate_ref} (file 1)"),
+            format!("same bytes as {sealed_ref} (file 2)")
+        ],
+        "{r}"
+    );
+    fx.shutdown().await;
+}
+
+/// The crane fixture's open run: `edit` changes its file records (`crane_c.png`, then its
+/// derived `crane_c_cutout.png`), and its outside file gets the record `record` under `key`.
+fn crane_run_with(ws: &Path, key: &str, record: &Value, edit: impl FnOnce(&mut Vec<Value>)) {
+    edit_manifest(ws, CRANE, |m| {
+        m["trust"] = json!({ key: record });
+        let runs = m["candidate_runs"].as_array_mut().unwrap();
+        let run = runs
+            .iter_mut()
+            .find(|r| r["run_id"] == CRANE_OPEN_RUN)
+            .unwrap();
+        edit(run["files"].as_array_mut().unwrap());
+    });
+}
+
+/// `record` with the source `{derived, ref: from}` appended.
+fn derived_from(record: &Value, from: &str) -> Value {
+    let mut derived = record.clone();
+    derived["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "derived", "ref": from}));
+    derived
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn a_from_in_another_case_finds_its_record() {
+    // The seal: the crane's outside file has its record under another spelling, and its
+    // cut-out names it in a third. Both sealed files are untrusted.
+    let key = format!("candidates/{CRANE_OPEN_RUN}/Crane_C.png");
+    let outside = untrusted_record("import", "crane_c.png");
+    let fx = Fx::with(|ws| {
+        crane_run_with(ws, &key, &outside, |files| {
+            files[1]["from"] = json!("CRANE_C.png");
+        });
+    });
+    fx.signoff(CRANE, CRANE_OPEN_RUN, &["crane_c.png"], json!({}))
+        .await;
+    let m = fx.manifest(CRANE);
+    assert_eq!(m["trust"]["v1.1.0/crane_c.png"], outside, "{m}");
+    assert_eq!(
+        m["trust"]["v1.1.0/crane_c_cutout.png"],
+        derived_from(&outside, &key),
+        "{m}"
+    );
+
+    // The Record step: a cut-out whose `from` spells the imported file in capitals.
+    let imported = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let from = format!("candidates/{imported}/kite.png");
+    let record = fx.manifest(KITE)["trust"][&from].clone();
+    let run = "r_20261020_0800";
+    let cut = format!("candidates/{run}/kite_cut.png");
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": run, "status": "open", "files": [
+            {"path": cut, "role": "derived", "from": format!("candidates/{imported}/KITE.png")},
+        ]}),
+    )
+    .await;
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"][&cut], derived_from(&record, &from), "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn a_repair_file_inherits_its_sources_record() {
+    // The seal: the crane's cut-out is a repair of its outside file, a companion of take 1.
+    let crane_c = format!("candidates/{CRANE_OPEN_RUN}/crane_c.png");
+    let outside = untrusted_record("import", "crane_c.png");
+    let fx = Fx::with(|ws| {
+        crane_run_with(ws, &crane_c, &outside, |files| {
+            files[1]["role"] = json!("repair");
+        });
+    });
+    let r = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": CRANE, "run_id": CRANE_OPEN_RUN,
+                   "takes": [1]}),
+        )
+        .await;
+    assert_eq!(r["version"], "1.1.0", "{r}");
+    let m = fx.manifest(CRANE);
+    assert_eq!(
+        m["trust"]["v1.1.0/crane_c_cutout.png"],
+        derived_from(&outside, &crane_c),
+        "{m}"
+    );
+
+    // The Record step: a repair of an imported file, and a cut-out of that repair.
+    let imported = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let from = format!("candidates/{imported}/kite.png");
+    let record = fx.manifest(KITE)["trust"][&from].clone();
+    let run = "r_20261020_0800";
+    let path = |name: &str| format!("candidates/{run}/{name}");
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": run, "status": "open", "files": [
+            {"path": path("kite_fixed_cut.png"), "role": "derived", "from": "kite_fixed.png"},
+            {"path": path("kite_fixed.png"), "role": "repair", "from": from},
+        ]}),
+    )
+    .await;
+    let m = fx.manifest(KITE);
+    let fixed = derived_from(&record, &from);
+    assert_eq!(m["trust"][path("kite_fixed.png")], fixed, "{m}");
+    assert_eq!(
+        m["trust"][path("kite_fixed_cut.png")],
+        derived_from(&fixed, &path("kite_fixed.png")),
+        "{m}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn signoff_carries_source_records() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    // The run's `source/` folder holds an outside file, with its record.
+    write_file(
+        &fx.path(&format!(
+            "{KITE_DIR}/candidates/{run}/source/layers/ref.png"
+        )),
+        b"a reference",
+    );
+    let key = format!("candidates/{run}/source/layers/ref.png");
+    let outside = untrusted_record("import", "ref.png");
+    edit_manifest(&fx.ws, KITE, |m| {
+        m["trust"][&key] = outside.clone();
+    });
+    fx.signoff(KITE, &run, &["kite.png"], json!({})).await;
+    assert!(
+        fx.path(&format!("{KITE_DIR}/v1.0.0/source/layers/ref.png"))
+            .exists(),
+        "the seal moved the source folder"
+    );
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"]["v1.0.0/source/layers/ref.png"], outside, "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn every_from_the_seal_accepts_finds_its_record() {
+    // The store's seal finds a derived file's `from` by its bare name among the run's files,
+    // so each of these names the outside `crane_c.png`: the sealed cut-out takes its record.
+    let crane_c = format!("candidates/{CRANE_OPEN_RUN}/crane_c.png");
+    let outside = untrusted_record("import", "crane_c.png");
+    for from in [
+        "./crane_c.png".to_string(),
+        "sub/crane_c.png".to_string(),
+        format!("lil://w/sketchbook/{CRANE}@candidate/{CRANE_OPEN_RUN}/crane_c.png"),
+    ] {
+        let fx = Fx::with(|ws| {
+            crane_run_with(ws, &crane_c, &outside, |files| {
+                files[1]["from"] = json!(from);
+            });
+        });
+        fx.signoff(CRANE, CRANE_OPEN_RUN, &["crane_c.png"], json!({}))
+            .await;
+        assert!(
+            fx.path(&format!(
+                "projects/sketchbook/assets/{CRANE}/v1.1.0/crane_c_cutout.png"
+            ))
+            .exists(),
+            "{from}: the seal copied the cut-out"
+        );
+        let m = fx.manifest(CRANE);
+        assert_eq!(
+            m["trust"]["v1.1.0/crane_c_cutout.png"],
+            derived_from(&outside, &crane_c),
+            "{from}: {m}"
+        );
+        fx.shutdown().await;
+    }
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn a_preview_file_inherits_its_sources_record() {
+    // The seal: the crane's cut-out is a preview of its outside file, a companion of take 1.
+    let crane_c = format!("candidates/{CRANE_OPEN_RUN}/crane_c.png");
+    let outside = untrusted_record("import", "crane_c.png");
+    let fx = Fx::with(|ws| {
+        crane_run_with(ws, &crane_c, &outside, |files| {
+            files[1]["role"] = json!("preview");
+        });
+    });
+    let r = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": CRANE, "run_id": CRANE_OPEN_RUN,
+                   "takes": [1]}),
+        )
+        .await;
+    assert_eq!(r["version"], "1.1.0", "{r}");
+    let m = fx.manifest(CRANE);
+    assert_eq!(
+        m["trust"]["v1.1.0/crane_c_cutout.png"],
+        derived_from(&outside, &crane_c),
+        "{m}"
+    );
+
+    // The Record step: a preview of an imported file.
+    let imported = fx.import_run(KITE, "kite.png", b"kite one").await;
+    let from = format!("candidates/{imported}/kite.png");
+    let record = fx.manifest(KITE)["trust"][&from].clone();
+    let preview = "candidates/r_20261020_0800/kite_preview.png";
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": "r_20261020_0800", "status": "open", "files": [
+            {"path": preview, "role": "preview", "from": from},
+        ]}),
+    )
+    .await;
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"][preview], derived_from(&record, &from), "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060
+async fn import_refuses_a_manifest_without_asset_id() {
+    let fx = Fx::new();
+    fx.import_run(KITE, "kite.png", b"kite one").await;
+    // A damaged manifest: a hand edit dropped `asset_id`.
+    edit_manifest(&fx.ws, KITE, |m| {
+        m.as_object_mut().unwrap().shift_remove("asset_id");
+    });
+    let manifest = fx.path(&format!("{KITE_DIR}/{KITE}.manifest.json"));
+    let before = std::fs::read(&manifest).unwrap();
+    let runs = || {
+        std::fs::read_dir(fx.path(&format!("{KITE_DIR}/candidates")))
+            .unwrap()
+            .count()
+    };
+    let runs_before = runs();
+    let kite2 = fx.outside("kite2.png", b"kite two");
+    for mode in ["copy", "link_external"] {
+        let e = fx
+            .err(
+                "asset.import",
+                json!({"project": "sketchbook", "asset_id": KITE, "type": "image",
+                       "files": [kite2.to_string_lossy()], "mode": mode}),
+            )
+            .await;
+        assert_eq!(e.code, "manifest.needs_repair", "{mode}: {e:?}");
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            before,
+            "{mode}: nothing written"
+        );
+        assert_eq!(runs(), runs_before, "{mode}: no new run");
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-025
+async fn only_a_style_ref_counts_as_the_style_input() {
+    let fx = Fx::with(|ws| {
+        let project = file(ws, "projects/sketchbook/project.yaml");
+        let mut text = read_text(&project);
+        text.push_str("style_bible: style/bible.md\nstyle_version: 3\n");
+        write_file(&project, text.as_bytes());
+    });
+    // `style@1.0.0` is a ref to an asset called `style`, not to the style bible.
+    let asset = json!({"ref": "style@1.0.0", "role": "reference"});
+    record_generation(
+        &fx,
+        KITE,
+        json!({"run_id": "r_20261020_0800", "status": "open", "files": [],
+               "inputs": [asset.clone()]}),
+    )
+    .await;
+    assert_eq!(
+        run_of(&fx.manifest(KITE), "r_20261020_0800")["inputs"],
+        json!([asset, {"ref": "style@3", "role": "style"}])
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-025
+async fn a_style_bible_that_is_not_a_path_warns() {
+    let fx = Fx::with(|ws| {
+        let project = file(ws, "projects/sketchbook/project.yaml");
+        let mut text = read_text(&project);
+        text.push_str("style_bible: [a]\nstyle_version: 3\n");
+        write_file(&project, text.as_bytes());
+    });
+    let r = fx.import(KITE, &[("kite.png", b"kite")]).await;
+    assert_eq!(
+        r["warnings"],
+        json!([
+            "the run has no style input: the style version of sketchbook can't be read \
+             (project.yaml's style_bible [\"a\"] is not a path)"
+        ]),
+        "{r}"
+    );
+    let m = fx.manifest(KITE);
+    let run = r["run_id"].as_str().unwrap();
+    assert!(run_of(&m, run).get("inputs").is_none(), "{m}");
     fx.shutdown().await;
 }

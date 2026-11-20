@@ -524,8 +524,8 @@ fn queue_methods_need_a_verified_app_and_the_capability() {
 
 /// Protocol 1.4's three `app/*` methods (APP-039; Appendix D): only for a verified app whose
 /// session shares `assets.v1` (else `caller.not_allowed`, the shape of the earlier capability
-/// refusals); with it, `app/thumbs.request` is answered (Task 12), `app/asset.ai_edit` is routed
-/// (Task 15; this app has no workspace), and `app/asset.trust` is -32601 until its task routes it.
+/// refusals); with it, `app/thumbs.request` is answered (Task 12), and `app/asset.ai_edit`
+/// (Task 15) and `app/asset.trust` (Task 16) are routed (this app has no workspace).
 #[test] // spec: APP-039, APP-040, APP-043
 fn app_assets_methods_need_the_capability() {
     let env = TestEnv::new();
@@ -562,7 +562,7 @@ fn app_assets_methods_need_the_capability() {
         refused(&older.call(m, params.clone()));
     }
     // An app that shares it: `app/thumbs.request` is answered (no default workspace here, so
-    // the item is the icon), `app/asset.ai_edit` is routed, and the third is not routed yet.
+    // the item is the icon), and the other two are routed.
     let mut app =
         lil_testkit::TestApp::start_with_capabilities(&env, None, &[], lil_protocol::CAPABILITIES);
     let shared = app.hello()["capabilities"].clone();
@@ -576,13 +576,11 @@ fn app_assets_methods_need_the_capability() {
             assert_eq!(response["result"]["status"], "ok", "{m}: {response}");
             let thumb = &response["result"]["thumbs"][0];
             assert_eq!(thumb["state"], "icon", "{response}");
-        } else if *m == "app/asset.ai_edit" {
+        } else {
             assert_eq!(
                 response["result"]["error"]["code"], "workspace.required",
                 "{m}: {response}"
             );
-        } else {
-            assert_eq!(response["error"]["code"], -32601, "{m}: {response}");
         }
     }
 }

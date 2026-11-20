@@ -1137,6 +1137,24 @@ impl Index {
             .await
     }
 
+    /// The first sealed or candidate file with the SHA-256 `sha256` (bare hex), a sealed one
+    /// first, then by path; not one that is missing, empty, a working document or under a
+    /// `source/` folder (CORE-168; Appendix H "Duplicates"): what `asset.import`'s same-bytes
+    /// warning names.
+    ///
+    /// # Errors
+    /// [`IndexError::Sql`] when the database fails.
+    pub async fn same_bytes(&self, sha256: &str) -> Result<Option<WsPath>, IndexError> {
+        let sha256 = sha256.to_ascii_lowercase();
+        self.db
+            .call(move |conn| {
+                query::same_bytes(conn, &sha256)
+                    .map(|path| path.map(WsPath::from_disk))
+                    .map_err(|e| sql(&e))
+            })
+            .await
+    }
+
     /// The SHA-256 the asset's manifest records for `path` (`hashes`, or a run's
     /// `files[].sha256`), bare hex.
     ///

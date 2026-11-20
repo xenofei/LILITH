@@ -1909,3 +1909,148 @@ async fn by_core_is_refused_and_by_ids_are_capped() {
     assert_eq!(fx.edit_with(KITE, &sha).unwrap()["actor"], by);
     fx.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 16: your own Mark as trusted (ARCH-060, APP-039; Appendix H "Trust"; P4b-R28).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test] // spec: ARCH-060, APP-039
+async fn trust_is_cleared_only_from_a_verified_app() {
+    let fx = Fx::plain();
+    let run = fx.import_run(KITE, "kite.png", b"kite").await;
+    let candidate = format!("candidates/{run}/kite.png");
+    let sealed = "v1.0.0/kite.png";
+    let params = |asset: &str, paths: Option<&[&str]>| lil_protocol::app::AssetTrustParams {
+        project: Some("sketchbook".to_string()),
+        asset_id: asset.to_string(),
+        paths: paths.map(|p| p.iter().map(|s| s.to_string()).collect()),
+    };
+
+    // An agent's sign-off leaves the record: the sealed file is untrusted too.
+    fx.ok_by(
+        CallerKind::Mcp,
+        "asset.signoff",
+        Fx::signoff_args(KITE, &run, "kite.png", json!({})),
+    )
+    .await;
+    let before = fx.manifest(KITE);
+    for path in [candidate.as_str(), sealed] {
+        assert_eq!(before["trust"][path]["state"], "untrusted", "{before}");
+    }
+
+    // Only a verified app sharing assets.v1 clears it: the method's own check, besides the
+    // router's.
+    let mut without_assets = (*fx.session(ui())).clone();
+    without_assets
+        .capabilities
+        .retain(|c| c != lil_protocol::app::ASSETS_CAPABILITY);
+    let refused = [
+        fx.session(CallerKind::Mcp),
+        fx.session(CallerKind::Cli),
+        fx.session(CallerKind::Assistant),
+        Arc::new(without_assets),
+    ];
+    for session in &refused {
+        let e = fx
+            .dispatcher
+            .asset_trust(session, params(KITE, None), "t_trust")
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "caller.not_allowed", "{}: {e:?}", session.caller);
+        assert_eq!(e.trace_id, "t_trust");
+    }
+    assert_eq!(fx.manifest(KITE), before, "nothing changed");
+
+    // Your app: one path. The record keeps its sources and gains `marked_trusted`.
+    let app = fx.session(ui());
+    let r = fx
+        .dispatcher
+        .asset_trust(&app, params(KITE, Some(&[sealed])), "t_trust")
+        .await
+        .unwrap();
+    assert_eq!(r.trusted, [sealed]);
+    let m = fx.manifest(KITE);
+    let record = &m["trust"][sealed];
+    assert_eq!(record["state"], "trusted", "{record}");
+    assert!(record["marked_trusted"]["utc"].is_string(), "{record}");
+    assert_eq!(record["sources"], before["trust"][sealed]["sources"]);
+    assert_eq!(m["trust"][&candidate], before["trust"][&candidate]);
+
+    // A path the manifest doesn't have, or an asset that doesn't exist: asset.unknown, and
+    // nothing is written.
+    for p in [
+        params(KITE, Some(&["candidates/r_20261016_1300/none.png"])),
+        params(KITE, Some(&[candidate.as_str(), "v9.0.0/kite.png"])),
+        params("prop_never", None),
+    ] {
+        let e = fx
+            .dispatcher
+            .asset_trust(&app, p, "t_trust")
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "asset.unknown", "{e:?}");
+        assert_eq!(e.trace_id, "t_trust");
+    }
+    assert_eq!(fx.manifest(KITE), m);
+
+    // Without paths: every untrusted record, and the result lists only those it changed.
+    let r = fx
+        .dispatcher
+        .asset_trust(&app, params(KITE, None), "t_trust")
+        .await
+        .unwrap();
+    assert_eq!(r.trusted, std::slice::from_ref(&candidate));
+    let after = fx.manifest(KITE);
+    assert_eq!(after["trust"][&candidate]["state"], "trusted");
+    assert_eq!(
+        after["trust"][sealed], m["trust"][sealed],
+        "an earlier mark stays as it was"
+    );
+    // Nothing left to clear: no error, an empty list. A file the suite made (no record) counts
+    // as trusted already.
+    let r = fx
+        .dispatcher
+        .asset_trust(&app, params(KITE, Some(&[sealed, &candidate])), "t_trust")
+        .await
+        .unwrap();
+    assert!(r.trusted.is_empty(), "{r:?}");
+    let r = fx
+        .dispatcher
+        .asset_trust(
+            &app,
+            params("chr_paper_crane", Some(&["v1.0.0/crane_b.png"])),
+            "t_trust",
+        )
+        .await
+        .unwrap();
+    assert!(r.trusted.is_empty(), "{r:?}");
+    assert_eq!(fx.manifest(KITE), after);
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: ARCH-060, APP-039
+async fn trust_finds_a_path_given_in_another_case() {
+    let fx = Fx::plain();
+    let run = fx.import_run(KITE, "kite.png", b"kite").await;
+    let candidate = format!("candidates/{run}/kite.png");
+    // The path in capitals names the same file: its record is the one marked, and the result
+    // names it by its key.
+    let r = fx
+        .dispatcher
+        .asset_trust(
+            &fx.session(ui()),
+            lil_protocol::app::AssetTrustParams {
+                project: Some("sketchbook".to_string()),
+                asset_id: KITE.to_string(),
+                paths: Some(vec![candidate.to_uppercase()]),
+            },
+            "t_trust",
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.trusted, std::slice::from_ref(&candidate));
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"][&candidate]["state"], "trusted", "{m}");
+    assert_eq!(m["trust"].as_object().unwrap().len(), 1, "{m}");
+    fx.shutdown().await;
+}
