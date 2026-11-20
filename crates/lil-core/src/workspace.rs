@@ -187,6 +187,10 @@ pub struct OpenWorkspace {
     /// The workspace's index and the store's change sink: `index.db` in the workspace's local
     /// folder when read-write, SQLite `:memory:` when read-only (ARCH-028, ARCH-097, CORE-005).
     pub index: Arc<Index>,
+    /// The workspace's local data folder (ARCH-097), as the thumbnail cache finds it:
+    /// `Env::workspace_local_dir_for_canonical` of `ws.path`; `None` when it can't be told. It
+    /// holds the pick log (CORE-176).
+    pub local_dir: Option<PathBuf>,
     /// The watcher (read-write only; ARCH-079, ARCH-083): fed by `ReadDirectoryChangesW`, or
     /// without a folder watch where watching is unsupported (`lil notify` and the git pause
     /// still work then).
@@ -640,6 +644,7 @@ impl WorkspaceHub {
             state,
             store,
             index,
+            local_dir: self.env.workspace_local_dir_for_canonical(&ws.path).ok(),
             watch,
             orphans,
             lock: Mutex::new(taken),

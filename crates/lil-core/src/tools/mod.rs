@@ -10,6 +10,7 @@ pub mod desktop_tools;
 pub mod dispatcher;
 pub mod doctor_tools;
 pub mod job_tools;
+pub mod pick_log;
 pub mod project_tools;
 pub mod record_stage;
 pub mod ref_tools;

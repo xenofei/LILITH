@@ -10,7 +10,9 @@
 //! ARCH-125). A commit error
 //! before the manifest edit replaces the outcome with the store error (outputs already moved
 //! stay as listed orphans, ARCH-075); nothing after the manifest edit does. A plan left by a
-//! call that didn't end `ok` is dropped unwritten, and with it any version-lock guard.
+//! call that didn't end `ok` is dropped unwritten, and with it any version-lock guard. Once
+//! [`apply_record`] returns `Ok`, the work the tool left with `RecordSlot::after` starts in its
+//! own task; otherwise it is dropped.
 //! Repairs and QA (CORE-025's middle steps) are the empty stages between ingest (Execute) and
 //! this one.
 
@@ -70,6 +72,11 @@ impl RecordStage for WorkspaceRecord {
             .await
             {
                 Ok(recorded) => {
+                    // The tool's work for after its Record step, in its own task: it never
+                    // delays the result (the pick log's sign-off lines, CORE-176).
+                    if let Some(after) = ctx.record.take_after() {
+                        tokio::spawn(after);
+                    }
                     let handoff = serde_json::to_value(&recorded.handoff)
                         .expect("a hand-off block serialises");
                     if !recorded.warnings.is_empty() {
