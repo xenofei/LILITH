@@ -46,6 +46,33 @@ pub struct ProjectYaml {
     /// The project's cascade layer, from its top-level keys (and `pipeline.skip_stages`,
     /// `pipeline.auto_approve`).
     pub overrides: Map<String, Value>,
+    /// `style_bible`: the style bible's path, when it is a non-empty string.
+    pub style_bible: Option<String>,
+    /// `style_version` as written (I4), read through [`ProjectYaml::style_version`].
+    pub style_version: Option<Value>,
+}
+
+impl ProjectYaml {
+    /// The style version every run of the project records as its `style@<n>` input (CORE-025):
+    /// `None` without a `style_bible`; with one, `style_version` (a whole number), or 1 when
+    /// it has none.
+    ///
+    /// # Errors
+    /// With a `style_bible`, a `style_version` that isn't a whole number from 0 to 2^32 - 1:
+    /// the reason.
+    pub fn style_version(&self) -> Result<Option<u32>, String> {
+        if self.style_bible.is_none() {
+            return Ok(None);
+        }
+        match &self.style_version {
+            None | Some(Value::Null) => Ok(Some(1)),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| format!("project.yaml's style_version {v} is not a whole number")),
+        }
+    }
 }
 
 /// The `progress.md` of a new project; `<name>` is replaced by the project's name.
@@ -117,6 +144,8 @@ pub fn read_project_yaml(text: &str) -> Result<ProjectYaml, String> {
             _ => Map::new(),
         },
         overrides: cascade_layer(&root),
+        style_bible: s("style_bible").filter(|b| !b.trim().is_empty()),
+        style_version: root.get("style_version").cloned(),
     })
 }
 
@@ -392,5 +421,64 @@ hardware: {gpu: none}
         let odd = read_hardware("hardware: {gpu: [a], vram_gb: lots, ram_gb: -1}\n").unwrap();
         assert_eq!(odd, HardwareYaml::default());
         assert!(read_hardware("- a\n").is_err());
+    }
+
+    #[test] // spec: CORE-025
+    fn style_version_needs_a_style_bible() {
+        let read = |text: &str| read_project_yaml(text).unwrap().style_version();
+        assert_eq!(
+            read(
+                "name: a
+"
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            read(
+                "style_version: 3
+"
+            ),
+            Ok(None),
+            "no bible, no input"
+        );
+        assert_eq!(
+            read(
+                "style_bible: ''
+style_version: 3
+"
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            read(
+                "style_bible: style/bible.md
+"
+            ),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            read(
+                "style_bible: style/bible.md
+style_version: 2
+"
+            ),
+            Ok(Some(2))
+        );
+        assert_eq!(
+            read(
+                "style_bible: style/bible.md
+style_version: 0
+"
+            ),
+            Ok(Some(0))
+        );
+        for bad in ["two", "-1", "1.5", "[2]"] {
+            let text = format!(
+                "style_bible: style/bible.md
+style_version: {bad}
+"
+            );
+            assert!(read(&text).is_err(), "{bad}");
+        }
     }
 }

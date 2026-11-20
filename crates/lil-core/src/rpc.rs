@@ -35,9 +35,9 @@
 //!   `context.v1`, else `caller.not_allowed`; ARCH-088), protocol 1.4's `app/thumbs.request`,
 //!   `app/asset.trust` and `app/asset.ai_edit` need `assets.v1` (else `caller.not_allowed`);
 //!   `app/thumbs.request` goes to the [`Thumbnails`] (a request that isn't one, or a path that
-//!   isn't workspace-relative, is `params.invalid`; APP-038), `app/asset.ai_edit` goes to the
-//!   dispatcher (P4b-R17), `app/asset.trust` is -32601 until its task routes it, and any
-//!   other `app/*` method is -32601 for an app. `tools/list`
+//!   isn't workspace-relative, is `params.invalid`; APP-038), `app/asset.ai_edit` (P4b-R17)
+//!   and `app/asset.trust` (ARCH-060, P4b-R28) go to the dispatcher, and any other `app/*`
+//!   method is -32601 for an app. `tools/list`
 //!   carries the per-connection `requiresUserInteraction` marker ([`Confirm::annotate`]).
 //!   `app/*` methods are admitted as `tools/call` is (APP-041): a draining core answers them
 //!   `core.draining`, each counts as a call in flight until it is answered, and each error
@@ -664,8 +664,7 @@ impl RpcRouter {
             return outcome(id, into_outcome(store.set(p).await));
         }
         // Protocol 1.4's three (APP-039; Appendix D): each needs `assets.v1`;
-        // `app/thumbs.request` goes to the thumbnail cache, and the other two are -32601 until
-        // their own tasks route them (Tasks 15 and 16).
+        // `app/thumbs.request` goes to the thumbnail cache, the other two to the dispatcher.
         if matches!(
             m,
             app::THUMBS_REQUEST | app::ASSET_TRUST | app::ASSET_AI_EDIT
@@ -710,6 +709,22 @@ impl RpcRouter {
                 let trace_id = self.ids.id("t");
                 let relabelled = self.dispatcher.ai_edit(session, p, &trace_id).await;
                 return outcome(id, into_outcome(relabelled));
+            }
+            if m == app::ASSET_TRUST {
+                // Task 16 (ARCH-060, P4b-R28): your own Mark as trusted, in the session's
+                // workspace.
+                let p: app::AssetTrustParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        return Response::Error {
+                            id: Some(id),
+                            error,
+                        };
+                    }
+                };
+                let trace_id = self.ids.id("t");
+                let marked = self.dispatcher.asset_trust(session, p, &trace_id).await;
+                return outcome(id, into_outcome(marked));
             }
             return not_found(id);
         }

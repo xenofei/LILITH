@@ -379,6 +379,60 @@ impl Dispatcher {
         Ok(relabelled)
     }
 
+    /// `app/asset.trust {project?, asset_id, paths?}` (ARCH-060; Appendix H "Trust";
+    /// P4b-R28): your own Mark as trusted, in the session's workspace, its project resolved as
+    /// a tool call's. The edit is `asset_tools::trust`'s; then, when it changed a record,
+    /// `{kind: "manifest"}` on the asset's topic.
+    ///
+    /// # Errors
+    /// `caller.not_allowed` unless the session is a verified app's (`ui:*`) that shares
+    /// `assets.v1` (the router refuses anyone else first; APP-039): an agent, a script or a
+    /// vote never clears a record; `workspace.required` without a workspace, and the
+    /// session's workspace errors; `workspace.read_only`; `asset_tools::trust`'s.
+    pub async fn asset_trust(
+        &self,
+        session: &Session,
+        p: lil_protocol::app::AssetTrustParams,
+        trace_id: &str,
+    ) -> Result<lil_protocol::app::AssetTrustResult, ErrorBody> {
+        let app = matches!(session.caller, CallerKind::Ui(_))
+            && session
+                .capabilities
+                .iter()
+                .any(|c| c == lil_protocol::app::ASSETS_CAPABILITY);
+        if !app {
+            return Err(ErrorBody::new(
+                &codes::CALLER_NOT_ALLOWED,
+                "app/asset.trust is for LILITH apps only (with the assets.v1 capability): only \
+                 your own Mark as trusted clears a trust record.",
+                trace_id,
+            ));
+        }
+        let Some(open) = self.inner.open_workspace(session, trace_id).await? else {
+            return Err(ErrorBody::new(
+                &codes::WORKSPACE_REQUIRED,
+                "A file is marked as trusted within a workspace, and this session has none. \
+                 Connect with a workspace first.",
+                trace_id,
+            ));
+        };
+        if open.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly.to_error(trace_id));
+        }
+        let project = self
+            .inner
+            .project_of(session, &open, p.project.as_deref())
+            .await;
+        let marked = super::asset_tools::trust(&open, &project, &p, trace_id).await?;
+        if !marked.trusted.is_empty() {
+            self.events().publish(
+                &crate::pipeline::asset_topic(&open.ws.id, &project, &p.asset_id),
+                json!({"kind": "manifest"}),
+            );
+        }
+        Ok(marked)
+    }
+
     /// Runs one `tools/call` through every stage (module docs). Never fails: every failure is
     /// an `Outcome::Error`, and each goes to the error sink, also when the caller has gone.
     pub async fn call(&self, session: Arc<Session>, p: ToolCallParams) -> Outcome<ToolOutput> {

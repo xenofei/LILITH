@@ -39,7 +39,10 @@ pub mod version;
 pub mod workspace_yaml;
 pub mod yaml_edit;
 
-pub use attribution::{Actor, ActorKind, TrustRecord, TrustSource, TrustSourceKind, TrustState};
+pub use attribution::{
+    Actor, ActorKind, TrustRecord, TrustSource, TrustSourceKind, TrustState, carry_trust,
+    derived_trust,
+};
 pub use content_hash::{is_os_metadata, sha256_hex, version_content_hash};
 pub use display::{DisplayFile, MediaKind, display_file, media_kind_of, renderable};
 pub use lilref::{LilRef, parse_lilref, write_lilref};
