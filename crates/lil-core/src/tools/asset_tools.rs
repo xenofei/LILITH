@@ -153,6 +153,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use lil_protocol::app::{ConfirmFacts, TouchAccess};
 use lil_protocol::codes::{
@@ -929,19 +930,32 @@ async fn creation_warnings(ctx: &CallCtx, a: &Asset) -> Result<Vec<String>, Erro
     Ok(takeover_warnings(a).await)
 }
 
+/// How long `asset.import`'s same-bytes check (CORE-168) waits for the index's first run of
+/// the workspace (`Index::ready_result`) before it gives up and says the check wasn't made:
+/// long enough for a small workspace just opened, short enough that an import made while a
+/// big one is still being indexed isn't held up for it.
+const SAME_BYTES_WAIT: Duration = Duration::from_secs(5);
+
 /// CORE-168's warning (Appendix H "Duplicates") for each of `hashes` (bare hex, in file order)
 /// that a sealed or candidate file in the workspace already has: "same bytes as <ref>", the
 /// first such file's ref, a sealed one first (`Index::same_bytes`), once the index's first run
-/// has finished. It never blocks the import: an index that can't answer is one warning saying
-/// the check wasn't made (after the warnings already found, when it fails part-way).
+/// has finished. It never blocks the import: an index whose first run isn't done within
+/// [`SAME_BYTES_WAIT`], or that can't answer, is one warning saying the check wasn't made
+/// (after the warnings already found, when it fails part-way).
 async fn same_bytes_warnings(a: &Asset, hashes: &[String]) -> Vec<String> {
     let index = &a.open.index;
     let unchecked = |why: String| {
         tracing::warn!(why, "the index can't say whether imported bytes are new");
         format!("whether the workspace already has these files' bytes wasn't checked: {why}")
     };
-    if let Err(e) = index.ready_result().await {
-        return vec![unchecked(e.to_string())];
+    match tokio::time::timeout(SAME_BYTES_WAIT, index.ready_result()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return vec![unchecked(e.to_string())],
+        Err(_) => {
+            return vec![unchecked(
+                "the workspace is still being indexed".to_string(),
+            )];
+        }
     }
     let mut warnings = Vec::new();
     for sha256 in hashes {
