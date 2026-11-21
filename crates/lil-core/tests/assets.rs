@@ -4857,3 +4857,92 @@ async fn only_files_at_the_top_of_the_run_folder_are_signed_off() {
     );
     fx.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Restore and sign-off failure paths (Task 14 audit, PR #113).
+// ---------------------------------------------------------------------------------------------
+
+/// A record that isn't at the top of its run folder is refused before anything moves, even
+/// when it lies outside the run folder (Task 14 audit M-4).
+#[tokio::test] // spec: CORE-026, CORE-024
+async fn a_record_outside_the_run_folder_is_refused_before_the_seal() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "a.png", b"top a").await;
+    edit_manifest(&fx.ws, KITE, |m| {
+        run_mut(m, &run)["files"][0]["path"] = json!("candidates/r_elsewhere/a.png");
+    });
+    let file = fx.path(&format!("{KITE_DIR}/candidates/{run}/a.png"));
+    write_file(&file, b"edited outside");
+    let e = fx
+        .err(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": KITE, "run_id": run,
+                   "files": ["a.png"]}),
+        )
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(e.message.contains("top of the run folder"), "{e:?}");
+    assert!(!fx.path(&format!("{KITE_DIR}/v1.0.0")).exists());
+    assert_eq!(std::fs::read(&file).unwrap(), b"edited outside");
+    let orphans = fx.open().await.store.orphans().await.unwrap();
+    assert_eq!(orphans, Vec::<WsPath>::new());
+    fx.shutdown().await;
+}
+
+/// `asset.get_version` checks its ids as the other asset tools do (Task 14 audit L-3).
+#[tokio::test] // spec: APP-141
+async fn get_version_validates_its_ids() {
+    let fx = Fx::new();
+    kite_versions(&fx).await;
+    for (project, asset) in [
+        ("sketchbook", "PROP_KITE"),
+        ("sketchbook/assets/prop_kite/v1.0.0", KITE),
+    ] {
+        let e = fx
+            .err(
+                "asset.get_version",
+                json!({"project": project, "asset_id": asset, "version": "1.0.0"}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{project} {asset}: {e:?}");
+    }
+    fx.shutdown().await;
+}
+
+/// An override refuses a file its automatic version holds already, such as a derived file the
+/// automatic seal copied (Task 14 audit L-4).
+#[tokio::test] // spec: CORE-052
+async fn an_override_refuses_a_file_already_in_the_overridden_version() {
+    let fx = Fx::new();
+    let r = fx
+        .import(
+            KITE,
+            &[
+                ("a.png", b"kite a"),
+                ("b.png", b"kite b"),
+                ("d.png", b"derived a"),
+            ],
+        )
+        .await;
+    let run = r["run_id"].as_str().unwrap().to_string();
+    edit_manifest(&fx.ws, KITE, |m| {
+        let d = &mut run_mut(m, &run)["files"][2];
+        d["role"] = json!("derived");
+        d["from"] = json!("a.png");
+    });
+    fx.signoff(KITE, &run, &["a.png"], json!({})).await;
+    edit_manifest(&fx.ws, KITE, |m| {
+        run_mut(m, &run)["signed_off"]["by"] = json!("auto");
+    });
+    let m = fx.manifest(KITE);
+    assert!(m["hashes"].get("v1.0.0/d.png").is_some(), "{m}");
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    let e = fx
+        .err("asset.signoff", override_args(&run, &["d.png"], "1.0.0"))
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(e.message.contains("chose already"), "{e:?}");
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
+    fx.shutdown().await;
+}

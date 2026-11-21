@@ -30,7 +30,8 @@
 //! snapshot's top-level `inputs` and then its run's `inputs`, once per `ref`, `signed_off`
 //! the snapshot's run's `signed_off` as written, `restored_from` that run's, and
 //! `trust` the manifest's records under `v<version>/`. A legacy version (no snapshot) gives
-//! its files and hashes only. An unknown asset or version is `asset.unknown`.
+//! its files and hashes only. A project that isn't a slug or an asset id that isn't one is
+//! `params.invalid`, as for every asset tool; an unknown asset or version is `asset.unknown`.
 
 use lil_protocol::codes::{ASSET_UNKNOWN, PARAMS_INVALID};
 use lil_protocol::{EffectClass, ErrorBody};
@@ -492,6 +493,7 @@ async fn get_version(
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
     let project = args.project.unwrap_or_else(|| ctx.project_or_default());
     let asset_id = args.asset_id;
+    super::asset_tools::validate_ids(ctx, &project, &asset_id)?;
     let unknown = |what: String| ErrorBody::new(&ASSET_UNKNOWN, what, ctx.trace_id.clone());
     let Ok(version) = args.version.parse::<Version>() else {
         return Err(invalid(

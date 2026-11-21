@@ -283,7 +283,8 @@ pub(crate) fn top_level_file<'r>(run: &'r CandidateRun, name: &str) -> Option<&'
 ///
 /// # Errors
 /// `asset.unknown` when no file matches; `params.invalid` for a bare name more than one file
-/// has, or a file in a folder inside the run folder.
+/// has, or a record whose path isn't the run folder and one name (a file in a folder inside
+/// it, or a record outside it).
 fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile, ErrorBody> {
     let hits: Vec<&CandidateFile> = run
         .files
@@ -294,13 +295,13 @@ fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile
         [one]
             if path_key(&one.path)
                 .strip_prefix(&run_dir_of(run))
-                .is_some_and(|inside| inside.contains('/')) =>
+                .is_none_or(|inside| inside.is_empty() || inside.contains('/')) =>
         {
             Err(fail(
                 &PARAMS_INVALID,
                 format!(
-                    "`{name}` is in a folder inside the run `{}`: only files at the top of the \
-                     run folder can be signed off.",
+                    "`{name}` is not a file at the top of the run `{}`'s folder: only files at \
+                     the top of the run folder can be signed off.",
                     run.run_id
                 ),
             ))
@@ -439,13 +440,22 @@ pub fn plan_signoff_with(
     }
     let picked = chosen_files(run, chosen)?;
     let mut chosen: Vec<(&str, &CandidateFile)> = Vec::new();
+    // A file the overridden version holds already (its `hashes` key), such as a derived file
+    // its seal took along.
+    let in_overridden = |name: &str| {
+        overrides.as_ref().is_some_and(|(v, _, _)| {
+            let key = path_key(&format!("v{v}/{name}"));
+            view.hashes.keys().any(|k| path_key(k) == key)
+        })
+    };
     for name in &picked.names {
         let record = named_file(run, name)?;
         if admitted
-            && run
+            && (run
                 .selected
                 .iter()
                 .any(|s| same(s, bare_name(&record.path)))
+                || in_overridden(bare_name(&record.path)))
         {
             return Err(fail(
                 &PARAMS_INVALID,

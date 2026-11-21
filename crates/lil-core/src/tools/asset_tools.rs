@@ -661,14 +661,9 @@ fn unknown_asset(ctx: &CallCtx, a: &Asset) -> ErrorBody {
 
 /// The call's asset: names checked, the project must exist, and no folder on the way to the
 /// asset may be a link.
-async fn asset_of(
-    ctx: &CallCtx,
-    project: Option<String>,
-    asset_id: &str,
-) -> Result<Asset, ErrorBody> {
-    let open = ctx.workspace()?.clone();
-    let project = project.unwrap_or_else(|| ctx.project_or_default());
-    if !is_slug(&project) {
+/// `params.invalid` unless `project` is a project slug and `asset_id` an asset id.
+pub(crate) fn validate_ids(ctx: &CallCtx, project: &str, asset_id: &str) -> Result<(), ErrorBody> {
+    if !is_slug(project) {
         return Err(invalid(ctx, format!("{project:?} is not a project slug")));
     }
     if !is_asset_id(asset_id) {
@@ -680,6 +675,17 @@ async fn asset_of(
             ),
         ));
     }
+    Ok(())
+}
+
+async fn asset_of(
+    ctx: &CallCtx,
+    project: Option<String>,
+    asset_id: &str,
+) -> Result<Asset, ErrorBody> {
+    let open = ctx.workspace()?.clone();
+    let project = project.unwrap_or_else(|| ctx.project_or_default());
+    validate_ids(ctx, &project, asset_id)?;
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
     if read_project(&open.store, &project).await.map_err(error)? == ProjectFile::Missing {
         return Err(traced(ctx, unknown_project(&project)));
@@ -1526,7 +1532,19 @@ async fn signoff_locked(
     // its sealing folder, so a save that lands in between is never sealed either.
     let mut expected = BTreeMap::new();
     for name in &run.selected {
-        let Some(hex) = top_level_file(&run, name).and_then(|f| f.sha256.clone()) else {
+        // `plan_signoff` checked each name; a name without a record at the top of the run
+        // folder is refused before anything moves, never skipped.
+        let Some(file) = top_level_file(&run, name) else {
+            return Err(invalid(
+                ctx,
+                format!(
+                    "`{name}` is not a file at the top of the run `{}`'s folder: only files at \
+                     the top of the run folder can be signed off.",
+                    run.run_id
+                ),
+            ));
+        };
+        let Some(hex) = file.sha256.clone() else {
             continue;
         };
         let rel = a
