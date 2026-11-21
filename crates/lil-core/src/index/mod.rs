@@ -883,8 +883,9 @@ impl Index {
     /// `manifest.snapshot.json` whose version is neither the manifest's `approved_version` nor a
     /// run's `signed_off.version` or an override's `overrides_auto_pick.version`; and the
     /// conflict copies (`*.lil-conflict-*`) anywhere under `projects/<project>/`. An asset
-    /// folder without a manifest records none; one whose manifest doesn't parse is skipped. Run ids, version folders and the project compare
-    /// without regard to case, so a project folder renamed only in case has the same orphans.
+    /// folder without a manifest records none; one whose manifest doesn't parse is skipped.
+    /// Run ids, version folders and the project compare without regard to case, so a project
+    /// folder renamed only in case has the same orphans.
     /// Sorted, one path per folder or copy, spelled as indexed.
     ///
     /// # Errors
