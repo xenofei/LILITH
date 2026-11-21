@@ -6,8 +6,9 @@
 //! - [`detail`]: `asset.get`'s [`AssetDetail`] and `assets.query`'s [`AssetSummary`];
 //! - [`record`]: the Record stage's [`RecordPlan`] and [`apply_record`], and
 //!   [`start_candidate_run`];
-//! - [`signoff`]: [`plan_signoff`] (with [`Chosen`] and [`chosen_files`]), [`signed_off_by`]
-//!   and [`auto_pick`];
+//! - [`signoff`]: [`plan_signoff`] and [`plan_signoff_with`] (with [`Chosen`],
+//!   [`chosen_files`] and [`SignoffRecord`]), [`signed_off_by`], [`auto_pick`], and a restore's
+//!   run ([`restored_run`], [`add_restored_run`]);
 //! - [`status`]: [`status_by`], the status log's `by` for a caller, and [`actor_of`], the
 //!   `actor` of a caller's work;
 //! - [`collections`]: `registry/collections.yaml`'s saved searches and collections (CORE-155).
@@ -28,6 +29,7 @@ pub use record::{
     merge_warnings, start_candidate_run,
 };
 pub use signoff::{
-    Chosen, ChosenFiles, SignedOffBy, auto_pick, chosen_files, plan_signoff, signed_off_by,
+    Chosen, ChosenFiles, RestoredRun, SignedOffBy, SignoffRecord, add_restored_run, auto_pick,
+    chosen_files, plan_signoff, plan_signoff_with, restored_run, signed_off_by,
 };
 pub use status::{actor_of, status_by};

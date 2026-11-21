@@ -140,6 +140,22 @@ impl Store {
         })
     }
 
+    /// Removes copies the caller staged in the handle `h` for an operation it refused: each
+    /// `(path, sha256)` in the handle's folder that still has that hash (a file changed since
+    /// is left). A copy that can't be removed is logged and left, so releasing the handle then
+    /// makes it an orphan.
+    pub async fn discard_staged(&self, h: &StagingHandle, staged: &[(PathBuf, String)]) {
+        for (path, sha256) in staged {
+            if !path.starts_with(&h.dir) {
+                continue;
+            }
+            let (p, s) = (path.clone(), sha256.clone());
+            if let Err(e) = blocking(move || super::write::remove_if_hash(&p, &s)).await {
+                tracing::warn!(path = %path.display(), error = %e, "a staged copy can't be removed");
+            }
+        }
+    }
+
     /// Gives the handle back and removes its folder, which must be empty (its files were
     /// ingested). A handle that still holds files is kept on disk, is no longer live, and so
     /// becomes an orphan; the call is then `store.io`. A folder that is already gone is fine.
@@ -236,6 +252,28 @@ impl Store {
                 why: "the staged copy can't be read back".to_string(),
             }),
         }
+    }
+
+    /// As [`Store::stage_copy`], with the staged copy's read-only attribute cleared: a copy of
+    /// a sealed (read-only) file that becomes a run file (CORE-177's restore).
+    ///
+    /// # Errors
+    /// As [`Store::stage_copy`]; `store.io` when the attribute can't be cleared.
+    pub async fn stage_copy_writable(
+        &self,
+        h: &StagingHandle,
+        from: &Path,
+        name: &str,
+    ) -> Result<(PathBuf, String), StoreError> {
+        let (to, sha256) = self.stage_copy(h, from, name).await?;
+        let path = to.clone();
+        blocking(move || fsops::set_readonly(&path, false))
+            .await
+            .map_err(|e| StoreError::Io {
+                path: format!("{STAGING_DIR}/{}/{name}", h.id),
+                why: e.to_string(),
+            })?;
+        Ok((to, sha256))
     }
 
     /// The SHA-256 of a file named by an absolute path that may be outside the workspace (a

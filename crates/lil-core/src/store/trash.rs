@@ -46,17 +46,19 @@
 //!   date, unless `pinned` (CORE-032), and records `trashed_utc` on the run with
 //!   `edit_manifest` (the one change I5 allows on a signed-off run). A run's sign-off date is
 //!   the `signed_off.date` of the run signed off as its `rejected_at_version` (the version
-//!   whose sign-off rejected it), else as its `target_version`, or else of the
-//!   first sign-off on or after the day the run was created (a sign-off with a confirmed bump
-//!   seals another version than the run's target); a run with neither is kept. A due run
-//!   whose folder is already in the trash without `trashed_utc` (the manifest edit failed, or
-//!   the core stopped, after the move) gets the entry's `moved_utc` as its `trashed_utc`.
+//!   whose sign-off rejected it; for an automatic version an override replaced in its run's
+//!   record, P4b-R38, the date in that version's snapshot), else as its `target_version`, or
+//!   else of the first sign-off on or after the day the run was created (a sign-off with a
+//!   confirmed bump seals another version than the run's target); a run with neither is
+//!   kept. A due run whose folder is already in the trash without `trashed_utc` (the manifest
+//!   edit failed, or the core stopped, after the move) gets the entry's `moved_utc` as its
+//!   `trashed_utc`.
 //!   Assets without a `candidates/` folder are skipped before their manifest is read.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use lil_schema::{CandidateRun, Manifest, ManifestView};
+use lil_schema::{CandidateRun, Manifest, ManifestView, Version};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,7 +67,7 @@ use super::fsops;
 use super::git_gate::GIT_WAIT;
 use super::order::{list, version_folder};
 use super::paths::{WsPath, path_key, writable};
-use super::versions::{files_under, set_readonly_all};
+use super::versions::{SNAPSHOT, files_under, set_readonly_all};
 use super::write::{
     ChangeKind, Seen, Store, StoreError, StoreEvent, blocking, hash_file, link_refused, read_all,
     see,
@@ -343,27 +345,31 @@ fn reseal_asset_folder(
 }
 
 /// The sign-off date (Unix seconds) that starts a rejected run's 90 days (module docs).
-fn signoff_date(view: &ManifestView, run: &CandidateRun) -> Option<i64> {
+/// `overridden` adds the sign-offs whose runs' records an override replaced, as (version,
+/// date) read from their snapshots.
+fn signoff_date(
+    view: &ManifestView,
+    run: &CandidateRun,
+    overridden: &[(Version, i64)],
+) -> Option<i64> {
     let signed = || {
         view.candidate_runs
             .iter()
             .filter_map(|r| r.signed_off.as_ref())
-            .filter_map(|s| parse_date(&s.date).map(|d| (s, d)))
+            .filter_map(|s| parse_date(&s.date).map(|d| (s.version, d)))
+            .chain(overridden.iter().copied())
     };
     // The sign-off that rejected it, which records its version on the run (Task 13).
     if let Some(rejecting) = run.rejected_at_version
         && let Some(d) = signed()
-            .filter(|(s, _)| s.version == rejecting)
+            .filter(|(v, _)| *v == rejecting)
             .map(|(_, d)| d)
             .min()
     {
         return Some(d);
     }
     if let Some(target) = run.target_version
-        && let Some(d) = signed()
-            .filter(|(s, _)| s.version == target)
-            .map(|(_, d)| d)
-            .min()
+        && let Some(d) = signed().filter(|(v, _)| *v == target).map(|(_, d)| d).min()
     {
         return Some(d);
     }
@@ -1281,6 +1287,41 @@ impl Store {
         Ok(report)
     }
 
+    /// The sign-off dates of the automatic versions whose runs' records an override replaced
+    /// (`signed_off.overrides_auto_pick`, P4b-R38), read from each version's snapshot in the
+    /// asset folder `asset`: (version, date). A version whose snapshot can't be read has none.
+    async fn overridden_dates(&self, asset: &WsPath, view: &ManifestView) -> Vec<(Version, i64)> {
+        let mut dates = Vec::new();
+        let overridden = view
+            .candidate_runs
+            .iter()
+            .filter_map(|r| r.signed_off.as_ref()?.overrides_auto_pick.as_ref())
+            .map(|o| o.version);
+        for version in overridden {
+            let Ok(rel) = asset.join(&format!("v{version}/{SNAPSHOT}")) else {
+                continue;
+            };
+            let Ok(Some(bytes)) = self.read(&rel).await else {
+                continue;
+            };
+            let date = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|t| Manifest::parse(t).ok())
+                .and_then(|(m, _)| {
+                    m.view()
+                        .candidate_runs
+                        .into_iter()
+                        .filter_map(|r| r.signed_off)
+                        .find(|s| s.version == version)
+                })
+                .and_then(|s| parse_date(&s.date));
+            if let Some(date) = date {
+                dates.push((version, date));
+            }
+        }
+        dates
+    }
+
     /// Moves the due rejected runs of one asset to the trash and records their `trashed_utc`,
     /// under the asset's version lock, taken only when a run is due (a first read without it
     /// decides). A due run whose folder is already in the trash
@@ -1304,8 +1345,8 @@ impl Store {
                 .and_then(|t| Manifest::parse(t).ok())
                 .map(|(m, _)| m.view()))
         };
-        let wanted = |view: &ManifestView, run: &CandidateRun| {
-            let due = signoff_date(view, run).map(|d| d + REJECTED_KEEP_DAYS * DAY);
+        let wanted = |view: &ManifestView, overridden: &[(Version, i64)], run: &CandidateRun| {
+            let due = signoff_date(view, run, overridden).map(|d| d + REJECTED_KEEP_DAYS * DAY);
             run.status.as_deref() == Some("rejected")
                 && !run.pinned
                 && run.trashed_utc.is_none()
@@ -1314,19 +1355,25 @@ impl Store {
         // The version lock only when a run is due: a pass over an asset with nothing to move
         // never holds it, so it never looks like a sign-off to `asset.trash`'s in-use check
         // (CORE-157). The manifest is read again under the lock.
-        let due_now = read_view()
-            .await?
-            .is_some_and(|view| view.candidate_runs.iter().any(|r| wanted(&view, r)));
-        if !due_now {
+        let Some(first) = read_view().await? else {
+            return Ok(Vec::new());
+        };
+        let overridden = self.overridden_dates(&asset, &first).await;
+        if !first
+            .candidate_runs
+            .iter()
+            .any(|r| wanted(&first, &overridden, r))
+        {
             return Ok(Vec::new());
         }
         let _guard = self.version_lock(project, asset_id).lock_owned().await;
         let Some(view) = read_view().await? else {
             return Ok(Vec::new());
         };
+        let overridden = self.overridden_dates(&asset, &view).await;
         let mut trashed = Vec::new();
         for run in &view.candidate_runs {
-            if !wanted(&view, run) {
+            if !wanted(&view, &overridden, run) {
                 continue;
             }
             let folder = asset.join(&format!("candidates/{}", run.run_id))?;
@@ -1439,12 +1486,12 @@ mod tests {
         let view = Manifest::parse(&text).unwrap().0.view();
         // Recorded: the sign-off of 2.0.0 rejected it, though it targeted 1.0.0.
         assert_eq!(
-            signoff_date(&view, &view.candidate_runs[2]),
+            signoff_date(&view, &view.candidate_runs[2], &[]),
             parse_date("2026-11-20")
         );
         // Not recorded (older manifests): the sign-off of its target version.
         assert_eq!(
-            signoff_date(&view, &view.candidate_runs[3]),
+            signoff_date(&view, &view.candidate_runs[3], &[]),
             parse_date("2026-10-02")
         );
     }

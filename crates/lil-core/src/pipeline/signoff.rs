@@ -38,6 +38,14 @@
 //!   the seal moves that folder. The run file's record stays (the run still names that path),
 //!   so `app/asset.trust` without `paths` can list a candidate path whose file the seal moved.
 //!   No sign-off, by anyone, clears a record.
+//!
+//! A chosen name with a `/` is the file's path in the asset or run folder; a bare name must
+//! name exactly one file of the run (`params.invalid` otherwise), as `asset.mark` resolves a
+//! file (`file_named`), and that file must be at the top of the run folder. An automatic
+//! sign-off records its pick ([`auto_pick`]) as `signed_off.auto_pick` (CORE-052).
+//! [`plan_signoff_with`] adds the override of an automatic pick (P4b-R38) and a
+//! restore's reason and trust records (CORE-177); [`restored_run`] and [`add_restored_run`]
+//! make a restore's run.
 
 use std::collections::BTreeMap;
 
@@ -46,8 +54,9 @@ use lil_protocol::codes::{
 };
 use lil_protocol::{CallerKind, CodeSpec, ErrorBody};
 use lil_schema::{
-    Bump, CandidateFile, CandidateRun, Manifest, StatusBy, StatusEvent, Version, Via, carry_trust,
-    change_status, hash_value, takes_of,
+    Actor, AutoPick, AutoPickCandidate, AutoPickReason, Bump, CandidateFile, CandidateRun, Gate,
+    Manifest, Reason, StatusBy, StatusEvent, Version, Via, carry_trust, change_status, file_takes,
+    hash_value, takes_of,
 };
 use serde_json::{Map, Value, json};
 
@@ -138,11 +147,14 @@ pub fn signed_off_by(caller: &CallerKind) -> String {
 /// Who a sign-off is by (CORE-051; Appendix H "Manifest fields"): `signed_off.by` and its
 /// optional `via`, which its status-log entry carries too. Only its constructors make one, so
 /// no caller can name `auto` itself (ruling 4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SignedOffBy {
     /// `user`, `assistant`, `claude-code`, `cli` or `auto`.
     by: String,
     via: Option<Via>,
+    /// An automatic sign-off's pick and why ([`auto_pick`]), recorded as
+    /// `signed_off.auto_pick` (CORE-052).
+    auto_pick: Option<AutoPick>,
 }
 
 impl SignedOffBy {
@@ -151,7 +163,15 @@ impl SignedOffBy {
         SignedOffBy {
             by: signed_off_by(caller),
             via: None,
+            auto_pick: None,
         }
+    }
+
+    /// The same sign-off, recording the automatic pick that chose its file (CORE-052).
+    #[cfg(test)]
+    pub(crate) fn with_auto_pick(mut self, pick: AutoPick) -> SignedOffBy {
+        self.auto_pick = Some(pick);
+        self
     }
 
     /// A sign-off `auto_approve` makes under `rule`: `by: auto`, `via: {rule}`. No tool argument
@@ -166,8 +186,23 @@ impl SignedOffBy {
                 conversation_id: None,
                 rule: Some(rule.to_string()),
             }),
+            auto_pick: None,
         }
     }
+}
+
+/// What a sign-off records beyond its files (Appendix H): the automatic pick it overrides
+/// (`asset.signoff {overrides}`, P4b-R38) or the version a restore copied (CORE-177).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignoffRecord {
+    /// The version an automatic sign-off made, whose pick this sign-off overrides.
+    pub overrides: Option<Version>,
+    /// The version a restore as new version copied into the run.
+    pub restored_from: Option<Version>,
+    /// The version a restore signs off as, which it planned itself (CORE-177): its bump on
+    /// the approved version, or on the highest version folder when none is approved; or the
+    /// target of the run a failed restore left. Any bump is then ignored.
+    pub at: Option<Version>,
 }
 
 fn fail(spec: &CodeSpec, message: String) -> ErrorBody {
@@ -200,8 +235,172 @@ pub fn plan_signoff(
     by: &SignedOffBy,
     now_utc: i64,
 ) -> Result<(Manifest, Version), ErrorBody> {
+    plan_signoff_with(
+        m,
+        run_id,
+        chosen,
+        bump,
+        keep_runs,
+        by,
+        &SignoffRecord::default(),
+        now_utc,
+    )
+}
+
+/// The run folder of `run` under [`path_key`], ending in `/`.
+fn run_dir_of(run: &CandidateRun) -> String {
+    let mut run_dir = path_key(
+        &run.path
+            .clone()
+            .unwrap_or_else(|| format!("candidates/{}/", run.run_id)),
+    );
+    if !run_dir.ends_with('/') {
+        run_dir.push('/');
+    }
+    run_dir
+}
+
+/// Whether the record `f` of run `run` is the file `given` names (ruling 4; `asset.mark` and
+/// sign-off resolve a file this way), compared as the seal compares names ([`path_key`]): a
+/// name with a `/` (or `\`) is the file's path in the asset folder or in the run folder; a bare
+/// name is the file's bare name (which more than one file may have).
+pub(crate) fn file_named(run: &CandidateRun, f: &CandidateFile, given: &str) -> bool {
+    let given = path_key(&given.replace('\\', "/"));
+    if given.contains('/') {
+        let path = path_key(&f.path);
+        path == given || path.strip_prefix(&run_dir_of(run)) == Some(given.as_str())
+    } else {
+        name_key(&f.path) == given
+    }
+}
+
+/// The record of run `run` for `name`, a file at the top of its run folder, found by its full
+/// path as the seal finds it ([`path_key`]), so that a file of the same bare name in a folder
+/// inside the run folder never stands in for it.
+pub(crate) fn top_level_file<'r>(run: &'r CandidateRun, name: &str) -> Option<&'r CandidateFile> {
+    let key = format!("{}{}", run_dir_of(run), path_key(name));
+    run.files.iter().find(|f| path_key(&f.path) == key)
+}
+
+/// The record of run `run` that `name` names to sign off ([`file_named`]): a bare name must be
+/// one file's, and the file must be at the top of the run folder, where a seal takes it.
+///
+/// # Errors
+/// `asset.unknown` when no file matches; `params.invalid` for a bare name more than one file
+/// has, or a record whose path isn't the run folder and one name (a file in a folder inside
+/// it, or a record outside it).
+fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile, ErrorBody> {
+    let hits: Vec<&CandidateFile> = run
+        .files
+        .iter()
+        .filter(|f| file_named(run, f, name))
+        .collect();
+    match hits.as_slice() {
+        [one]
+            if path_key(&one.path)
+                .strip_prefix(&run_dir_of(run))
+                .is_none_or(|inside| inside.is_empty() || inside.contains('/')) =>
+        {
+            Err(fail(
+                &PARAMS_INVALID,
+                format!(
+                    "`{name}` is not a file at the top of the run `{}`'s folder: only files at \
+                     the top of the run folder can be signed off.",
+                    run.run_id
+                ),
+            ))
+        }
+        [one] => Ok(one),
+        [] => Err(fail(
+            &ASSET_UNKNOWN,
+            format!("The run `{}` has no file `{name}`.", run.run_id),
+        )),
+        _ => Err(fail(
+            &PARAMS_INVALID,
+            format!(
+                "`{name}` names more than one file of the run `{}`: name the file's path in the \
+                 run folder.",
+                run.run_id
+            ),
+        )),
+    }
+}
+
+/// The automatic sign-off an `overrides` names (P4b-R38): its run and what it picked.
+///
+/// # Errors
+/// `params.invalid` when no run's sign-off made `version` or that sign-off's `by` isn't
+/// `auto`, and when that automatic pick was overridden already (one override per automatic
+/// version: the overriding sign-off replaced the run's record, so its run is no longer the
+/// automatic one).
+fn overridden(
+    runs: &[CandidateRun],
+    version: Version,
+) -> Result<(&CandidateRun, String), ErrorBody> {
+    let auto = runs.iter().find_map(|r| {
+        let s = r.signed_off.as_ref()?;
+        (s.version == version && s.by == StatusBy::Auto.as_str()).then_some((r, s))
+    });
+    let by_override = runs.iter().find_map(|r| {
+        let s = r.signed_off.as_ref()?;
+        let o = s.overrides_auto_pick.as_ref()?;
+        (o.version == version).then_some(s.version)
+    });
+    if let (None, Some(by)) = (auto, by_override) {
+        return Err(fail(
+            &PARAMS_INVALID,
+            format!(
+                "The automatic pick of {version} was overridden already, by version {by}: an \
+                 automatic version is overridden once."
+            ),
+        ));
+    }
+    let Some((run, signed)) = auto else {
+        return Err(fail(
+            &PARAMS_INVALID,
+            format!(
+                "overrides names {version}, which is not a version an automatic sign-off made."
+            ),
+        ));
+    };
+    let picked = signed
+        .auto_pick
+        .as_ref()
+        .map(|p| p.picked.clone())
+        .or_else(|| run.selected.first().cloned())
+        .unwrap_or_default();
+    Ok((run, picked))
+}
+
+/// [`plan_signoff`] with what the sign-off records beyond its files (module docs):
+/// - `record.overrides` (P4b-R38): the version's sign-off must be by `auto`, and the run must
+///   be the one that made it, which is admitted though closed, for files it hasn't selected;
+///   `signed_off.overrides_auto_pick` gets `{version, picked}`;
+/// - `record.restored_from` (CORE-177): the status-log entry gets the reason
+///   `{code: "restored", ref: "<asset_id>@<version>"}`. The trust records of the run's files
+///   go to the new version's paths as every sign-off carries them (module docs).
+///
+/// # Errors
+/// As [`plan_signoff`]; `params.invalid` for an `overrides` that names no automatic sign-off,
+/// one whose run isn't `run_id` while `run_id` is open, or a chosen file the overridden run
+/// selected already. A closed run that isn't the overridden one is `asset.unknown`, as today.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_signoff_with(
+    m: &Manifest,
+    run_id: &str,
+    chosen: &Chosen,
+    bump: Option<Bump>,
+    keep_runs: &[String],
+    by: &SignedOffBy,
+    record: &SignoffRecord,
+    now_utc: i64,
+) -> Result<(Manifest, Version), ErrorBody> {
     let view = m.view();
     let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let overrides = record
+        .overrides
+        .map(|v| overridden(&view.candidate_runs, v).map(|(r, picked)| (v, r, picked)))
+        .transpose()?;
     let Some(run) = view.candidate_runs.iter().find(|r| same(&r.run_id, run_id)) else {
         return Err(fail(
             &ASSET_UNKNOWN,
@@ -212,12 +411,26 @@ pub fn plan_signoff(
         ));
     };
     let run_id = run.run_id.clone();
-    if !matches!(run.status.as_deref(), None | Some("open")) || run.trashed_utc.is_some() {
+    let open = matches!(run.status.as_deref(), None | Some("open")) && run.trashed_utc.is_none();
+    // P4b-R38: the run of the overridden automatic sign-off is admitted though closed.
+    let admitted = overrides
+        .as_ref()
+        .is_some_and(|(_, r, _)| same(&r.run_id, &run_id) && r.trashed_utc.is_none());
+    if !open && !admitted {
         return Err(fail(
             &ASSET_UNKNOWN,
             format!(
                 "The run `{run_id}` is {}, not open: only an open run can be signed off.",
                 run.status.as_deref().unwrap_or("trashed")
+            ),
+        ));
+    }
+    if let (Some((v, r, _)), false) = (&overrides, admitted) {
+        return Err(fail(
+            &PARAMS_INVALID,
+            format!(
+                "overrides {v} signs off a file of the run that made it (`{}`), not of `{run_id}`.",
+                r.run_id
             ),
         ));
     }
@@ -231,13 +444,31 @@ pub fn plan_signoff(
     }
     let picked = chosen_files(run, chosen)?;
     let mut chosen: Vec<(&str, &CandidateFile)> = Vec::new();
+    // A file the overridden version holds already (its `hashes` key), such as a derived file
+    // its seal took along.
+    let in_overridden = |name: &str| {
+        overrides.as_ref().is_some_and(|(v, _, _)| {
+            let key = path_key(&format!("v{v}/{name}"));
+            view.hashes.keys().any(|k| path_key(k) == key)
+        })
+    };
     for name in &picked.names {
-        let Some(record) = run.files.iter().find(|f| same(bare_name(&f.path), name)) else {
+        let record = named_file(run, name)?;
+        if admitted
+            && (run
+                .selected
+                .iter()
+                .any(|s| same(s, bare_name(&record.path)))
+                || in_overridden(bare_name(&record.path)))
+        {
             return Err(fail(
-                &ASSET_UNKNOWN,
-                format!("The run `{run_id}` has no file `{name}`."),
+                &PARAMS_INVALID,
+                format!(
+                    "`{name}` is what the automatic sign-off chose already: an override signs \
+                     off another take of its run."
+                ),
             ));
-        };
+        }
         if !chosen.iter().any(|(n, _)| same(n, bare_name(&record.path))) {
             chosen.push((bare_name(&record.path), record));
         }
@@ -251,10 +482,11 @@ pub fn plan_signoff(
 
     // Ruling Q22: omitting `bump` accepts the proposal (CORE-027's proposed-then-confirmed);
     // `version.exists` is only for a real collision.
-    let version = match (view.approved_version, bump) {
-        (None, _) => view.version.unwrap_or(Version::new(1, 0, 0)),
-        (Some(approved), Some(b)) => approved.bump(b),
-        (Some(approved), None) => match (view.version, run.target_version) {
+    let version = match (record.at, view.approved_version, bump) {
+        (Some(at), _, _) => at,
+        (None, None, _) => view.version.unwrap_or(Version::new(1, 0, 0)),
+        (None, Some(approved), Some(b)) => approved.bump(b),
+        (None, Some(approved), None) => match (view.version, run.target_version) {
             (Some(v), _) if v > approved => v,
             (_, Some(t)) if t > approved => t,
             _ => approved.bump(Bump::Minor),
@@ -277,12 +509,29 @@ pub fn plan_signoff(
     // Ruling Q23: an open run on an approved asset is new work, so it can be signed off; the
     // status log gets one entry for the sign-off (ruling PF-5).
     let mut out = m.clone();
+    if admitted {
+        // The overridden run counts as open for the sign-off: the status machine takes it as
+        // new work on the approved asset (ruling Q23), and it is `selected` again below.
+        for r in out.runs_mut() {
+            if r.get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| same(id, &run_id))
+            {
+                r.insert("status".into(), Value::from("open"));
+            }
+        }
+    }
+    let reason = record.restored_from.map(|from| Reason {
+        code: "restored".to_string(),
+        r#ref: Some(format!("{}@{from}", view.asset_id)),
+        note: None,
+    });
     change_status(
         &mut out,
         &StatusEvent::Signoff,
         StatusBy::from_wire(&by.by),
         by.via.clone(),
-        None,
+        reason,
         &lil_schema::time::rfc3339(now_utc),
     )
     .map_err(|why| fail(&STATUS_INVALID_TRANSITION, why))?;
@@ -322,6 +571,13 @@ pub fn plan_signoff(
     if let Some(takes) = &picked.takes {
         signed_off["takes"] = json!(takes);
         signed_off["companions"] = json!(picked.companions);
+    }
+    if let Some(pick) = &by.auto_pick {
+        signed_off["auto_pick"] = auto_pick_value(pick);
+    }
+    if let Some((version, _, picked)) = &overrides {
+        signed_off["overrides_auto_pick"] =
+            json!({"version": version.to_string(), "picked": picked});
     }
     let keep = |id: &str| keep_runs.iter().any(|k| same(k, id));
     for r in out.runs_mut() {
@@ -406,18 +662,34 @@ fn carry_to_version<'a>(
     }
 }
 
-/// CORE-052's automatic pick among `files` (a run's records): of those that pass every
-/// technical gate (`passes`, by bare name), the best vision-review score when a vision review
-/// scored any of them (ties: the lower seed, then the name); otherwise the lowest seed (files
-/// without a seed last, ties by name). `None` when no file passes.
+/// CORE-052's automatic pick among `files` (a run's records), and why. `gates` gives each
+/// file's technical gate results (by bare name); a file passes when every one is `pass`. Of
+/// the passing files: the best vision-review score when a vision review (`vision`: by bare
+/// name, the score and the review's reason) scored any of them (ties: the lower seed, then the
+/// name), with reason `vision_score`; otherwise the lowest seed (files without a seed last,
+/// ties by name), with reason `lowest_seed`. Every file is a candidate in the record, in file
+/// order, with its gates and, when the review scored it, its score and reason. `None` when no
+/// file passes.
 pub fn auto_pick(
     files: &[CandidateFile],
-    vision: Option<&BTreeMap<String, f64>>,
-    passes: &dyn Fn(&str) -> bool,
-) -> Option<String> {
+    vision: Option<&BTreeMap<String, (f64, String)>>,
+    gates: &dyn Fn(&str) -> Vec<(String, Gate)>,
+) -> Option<AutoPick> {
+    let review = |f: &CandidateFile| vision.and_then(|v| v.get(bare_name(&f.path)));
+    let candidates: Vec<AutoPickCandidate> = files
+        .iter()
+        .map(|f| AutoPickCandidate {
+            file: bare_name(&f.path).to_string(),
+            gates: gates(bare_name(&f.path)),
+            vision_score: review(f).map(|(s, _)| *s),
+            vision_reason: review(f).map(|(_, r)| r.clone()),
+        })
+        .collect();
     let passing: Vec<&CandidateFile> = files
         .iter()
-        .filter(|f| passes(bare_name(&f.path)))
+        .zip(&candidates)
+        .filter(|(_, c)| c.gates.iter().all(|(_, g)| *g == Gate::Pass))
+        .map(|(f, _)| f)
         .collect();
     let seed_then_name = |a: &&CandidateFile, b: &&CandidateFile| {
         let seed = |f: &CandidateFile| f.seed.unwrap_or(i64::MAX);
@@ -425,21 +697,249 @@ pub fn auto_pick(
             .cmp(&seed(b))
             .then_with(|| bare_name(&a.path).cmp(bare_name(&b.path)))
     };
-    let score = |f: &CandidateFile| vision.and_then(|v| v.get(bare_name(&f.path)).copied());
     let scored: Vec<(&CandidateFile, f64)> = passing
         .iter()
-        .filter_map(|f| score(f).map(|s| (*f, s)))
+        .filter_map(|f| review(f).map(|(s, _)| (*f, *s)))
         .filter(|(_, s)| s.is_finite())
         .collect();
-    let best = if scored.is_empty() {
-        passing.into_iter().min_by(seed_then_name)
+    let (best, reason) = if scored.is_empty() {
+        (
+            passing.into_iter().min_by(seed_then_name),
+            AutoPickReason::LowestSeed,
+        )
     } else {
-        scored
+        let best = scored
             .into_iter()
             .min_by(|(a, sa), (b, sb)| sb.total_cmp(sa).then_with(|| seed_then_name(a, b)))
-            .map(|(f, _)| f)
+            .map(|(f, _)| f);
+        (best, AutoPickReason::VisionScore)
     };
-    best.map(|f| bare_name(&f.path).to_string())
+    best.map(|f| AutoPick {
+        picked: bare_name(&f.path).to_string(),
+        reason,
+        candidates,
+    })
+}
+
+/// `signed_off.auto_pick` as Appendix H writes it: `{picked, reason, candidates: [{file,
+/// gates: {<name>: "pass" | "fail"}, vision_score?, vision_reason?}]}`.
+fn auto_pick_value(pick: &AutoPick) -> Value {
+    let candidates: Vec<Value> = pick
+        .candidates
+        .iter()
+        .map(|c| {
+            let gates: Map<String, Value> = c
+                .gates
+                .iter()
+                .map(|(name, gate)| {
+                    let result = match gate {
+                        Gate::Pass => "pass",
+                        Gate::Fail => "fail",
+                    };
+                    (name.clone(), Value::from(result))
+                })
+                .collect();
+            let mut v = json!({"file": c.file, "gates": gates});
+            if let Some(score) = c.vision_score {
+                v["vision_score"] = json!(score);
+            }
+            if let Some(reason) = &c.vision_reason {
+                v["vision_reason"] = json!(reason);
+            }
+            v
+        })
+        .collect();
+    json!({"picked": pick.picked, "reason": pick.reason.as_str(), "candidates": candidates})
+}
+
+/// The paths in the manifest's `trust` map under the folder `prefix` (ending in `/`), found
+/// as the seal finds names ([`path_key`]), in map order, each with the rest of its path.
+fn trust_paths(m: &Manifest, prefix: &str) -> Vec<(String, String)> {
+    let prefix = path_key(prefix);
+    let skip = prefix.chars().count();
+    match m.get("trust") {
+        Some(Value::Object(trust)) => trust
+            .keys()
+            .filter(|k| path_key(k).starts_with(&prefix))
+            .map(|k| (k.clone(), k.chars().skip(skip).collect()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A restore's new run (CORE-177) and what its sign-off chooses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredRun {
+    /// The `candidate_runs` entry: `open`, with `restored_from`, the caller's `actor`, and a
+    /// record for each top-level file of the version (`source/**` files have none, as in any
+    /// run).
+    pub run: Map<String, Value>,
+    /// The old sign-off's takes when it named takes, else the files it selected; for a version
+    /// without that sign-off (a legacy version), every file.
+    pub chosen: Chosen,
+}
+
+/// The run a restore of `restored_from` stages its copies into (CORE-177): `files` are the
+/// version's files as (path inside the version folder, bare SHA-256), the snapshot left out;
+/// `snapshot` is the version's `manifest.snapshot.json` (`None` for a legacy version). Each
+/// top-level file's record is `candidates/<run_id>/<name>` with the old run's `role`, `seed`
+/// and `from` for that name (`candidate` without one), its take number and primary as the old
+/// run numbered its takes (`take` and `primary` written explicitly, so the old sign-off's take
+/// numbers name the same takes), and the copy's `sha256`. `target_version` is left `null` for
+/// the caller to set.
+pub fn restored_run(
+    snapshot: Option<&Manifest>,
+    restored_from: Version,
+    run_id: &str,
+    files: &[(String, String)],
+    actor: &Actor,
+    now_utc: i64,
+) -> RestoredRun {
+    let old = snapshot.and_then(|s| {
+        s.view().candidate_runs.into_iter().find(|r| {
+            r.signed_off
+                .as_ref()
+                .is_some_and(|o| o.version == restored_from)
+        })
+    });
+    // Each old record with its take as the old run numbered it (P4b-R3: a run without `take`
+    // fields numbers its takes by file order) and whether it is that take's primary. The
+    // restored run holds only the version's files, so it gets these explicitly: numbered
+    // afresh, the old sign-off's take numbers would name other takes or none.
+    let numbered: Vec<(&CandidateFile, Option<u32>, bool)> = old
+        .as_ref()
+        .map(|r| {
+            let takes = takes_of(r);
+            r.files
+                .iter()
+                .zip(file_takes(r))
+                .map(|(f, n)| {
+                    let primary = n.is_some_and(|n| {
+                        takes
+                            .iter()
+                            .any(|t| t.n == n && same_name(&f.path, &t.primary))
+                    });
+                    (f, n, primary)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let was = |name: &str| {
+        numbered
+            .iter()
+            .find(|(f, _, _)| same_name(&f.path, name))
+            .copied()
+    };
+    let names: Vec<&str> = files
+        .iter()
+        .map(|(inside, _)| inside.as_str())
+        .filter(|inside| !inside.contains('/'))
+        .collect();
+    let mut records = Vec::with_capacity(names.len());
+    for (name, sha256) in files.iter().filter(|(inside, _)| !inside.contains('/')) {
+        let mut rec = Map::new();
+        rec.insert("path".into(), json!(format!("candidates/{run_id}/{name}")));
+        let old_record = was(name);
+        rec.insert(
+            "role".into(),
+            json!(old_record.map_or("candidate", |(f, _, _)| f.role.as_str())),
+        );
+        rec.insert("sha256".into(), json!(sha256));
+        if let Some((f, take, primary)) = old_record {
+            if let Some(seed) = f.seed {
+                rec.insert("seed".into(), json!(seed));
+            }
+            if let Some(from) = &f.from {
+                rec.insert("from".into(), json!(bare_name(from)));
+            }
+            if let Some(take) = take {
+                rec.insert("take".into(), json!(take));
+            }
+            if primary {
+                rec.insert("primary".into(), Value::Bool(true));
+            }
+        }
+        rec.insert("actor".into(), actor.to_value());
+        records.push(Value::Object(rec));
+    }
+    // Takes only when every file keeps a take: a file in none would stay behind unsealed.
+    let all_taken = names
+        .iter()
+        .all(|n| was(n).is_some_and(|(_, take, _)| take.is_some()));
+    let signed = old.as_ref().and_then(|r| r.signed_off.as_ref());
+    let every = || Chosen::Files(names.iter().map(|n| n.to_string()).collect());
+    let chosen = match (old.as_ref(), signed) {
+        (Some(_), Some(s)) if !s.takes.is_empty() && all_taken => Chosen::Takes(s.takes.clone()),
+        (Some(r), Some(_)) => {
+            let selected: Vec<String> = r
+                .selected
+                .iter()
+                .filter(|s| names.iter().any(|n| n.eq_ignore_ascii_case(s)))
+                .cloned()
+                .collect();
+            if selected.is_empty() {
+                every()
+            } else {
+                Chosen::Files(selected)
+            }
+        }
+        _ => every(),
+    };
+    let run = json!({
+        "run_id": run_id,
+        "path": format!("candidates/{run_id}/"),
+        "status": "open",
+        "created": lil_schema::time::rfc3339(now_utc),
+        "target_version": null,
+        "files": records,
+        "selected": null,
+        "signed_off": null,
+        "pinned": false,
+        "actor": actor.to_value(),
+        "restored_from": restored_from.to_string(),
+    });
+    let Value::Object(run) = run else {
+        unreachable!("the run is an object");
+    };
+    RestoredRun { run, chosen }
+}
+
+/// Adds a restore's run (from [`restored_run`], `target_version` set) to the manifest, with no
+/// status change (the sign-off that follows makes the one entry), and carries the trust record
+/// of each file of `v<restored_from>/` to the same path in the run folder
+/// (`lil_schema::carry_trust`), where the sign-off finds it and carries it on to the new
+/// version as every sign-off does.
+///
+/// # Errors
+/// A message when the manifest has a run with that id already or `candidate_runs` isn't a list.
+pub fn add_restored_run(
+    m: &mut Manifest,
+    run: &Map<String, Value>,
+    restored_from: Version,
+) -> Result<(), String> {
+    let id = run
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if m.view()
+        .candidate_runs
+        .iter()
+        .any(|r| r.run_id.eq_ignore_ascii_case(id))
+    {
+        return Err(format!("the manifest has a run `{id}` already"));
+    }
+    m.push("candidate_runs", Value::Object(run.clone()))
+        .map_err(|e| format!("{e:?}"))?;
+    for (path, rest) in trust_paths(m, &format!("v{restored_from}/")) {
+        carry_trust(m, &path, &format!("candidates/{id}/{rest}"));
+    }
+    Ok(())
+}
+
+/// Whether a run file record's `path` has the bare name `name` (compared without regard to
+/// case).
+fn same_name(path: &str, name: &str) -> bool {
+    bare_name(path).eq_ignore_ascii_case(name)
 }
 
 #[cfg(test)]
@@ -720,5 +1220,247 @@ mod tests {
             )),
             "status.invalid_transition"
         );
+    }
+
+    /// `r_1` with `a.png` at the top of its folder and in `sub/`.
+    fn two_named_a() -> Manifest {
+        let mut m = manifest();
+        m.runs_mut()[0].insert(
+            "files".into(),
+            json!([
+                {"path": "candidates/r_1/a.png", "role": "candidate", "sha256": "a".repeat(64)},
+                {"path": "candidates/r_1/sub/a.png", "role": "candidate", "sha256": "c".repeat(64)},
+            ]),
+        );
+        m
+    }
+
+    #[test] // spec: CORE-026 (controller ruling 4)
+    fn an_ambiguous_bare_name_is_params_invalid_and_a_path_chooses() {
+        let m = two_named_a();
+        let cli = SignedOffBy::caller(&CallerKind::Cli);
+        let e = plan_signoff(&m, "r_1", &files(&["a.png"]), None, &[], &cli, 0).unwrap_err();
+        assert_eq!(e.code, "params.invalid", "{e:?}");
+        // A path names one file, but a file in a folder inside the run folder is never sealed.
+        for name in ["sub/a.png", r"sub\a.png", "candidates/r_1/sub/a.png"] {
+            let e = plan_signoff(&m, "r_1", &files(&[name]), None, &[], &cli, 0).unwrap_err();
+            assert_eq!(e.code, "params.invalid", "{name}: {e:?}");
+            assert!(e.message.contains("top of the run folder"), "{name}: {e:?}");
+        }
+        // The top-level file's path in the asset folder chooses it.
+        let (signed, _) = plan_signoff(
+            &m,
+            "r_1",
+            &files(&["candidates/r_1/a.png"]),
+            None,
+            &[],
+            &cli,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            signed.view().hashes.get("v1.0.0/a.png").map(String::as_str),
+            Some("a".repeat(64).as_str())
+        );
+        let e = plan_signoff(&m, "r_1", &files(&["other/a.png"]), None, &[], &cli, 0).unwrap_err();
+        assert_eq!(e.code, "asset.unknown", "{e:?}");
+    }
+
+    fn pick() -> AutoPick {
+        AutoPick {
+            picked: "a.png".to_string(),
+            reason: AutoPickReason::VisionScore,
+            candidates: vec![AutoPickCandidate {
+                file: "a.png".to_string(),
+                gates: vec![("size".to_string(), Gate::Pass)],
+                vision_score: Some(0.5),
+                vision_reason: Some("clean".to_string()),
+            }],
+        }
+    }
+
+    #[test] // spec: CORE-052
+    fn an_automatic_signoff_records_its_pick() {
+        let by = SignedOffBy::auto("auto_approve:image").with_auto_pick(pick());
+        let (signed, _) =
+            plan_signoff(&manifest(), "r_1", &files(&["a.png"]), None, &[], &by, 0).unwrap();
+        let run = &signed.as_map()["candidate_runs"][0];
+        assert_eq!(
+            run["signed_off"]["auto_pick"],
+            json!({"picked": "a.png", "reason": "vision_score", "candidates": [
+                {"file": "a.png", "gates": {"size": "pass"}, "vision_score": 0.5,
+                 "vision_reason": "clean"}]}),
+            "{run}"
+        );
+        // It reads back as the same pick.
+        let view = signed.view();
+        assert_eq!(
+            view.candidate_runs[0]
+                .signed_off
+                .as_ref()
+                .and_then(|s| s.auto_pick.clone()),
+            Some(pick())
+        );
+        // A caller's sign-off records none.
+        let (signed, _) = plan_signoff(
+            &manifest(),
+            "r_1",
+            &files(&["a.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Cli),
+            0,
+        )
+        .unwrap();
+        let signed_off = &signed.as_map()["candidate_runs"][0]["signed_off"];
+        assert!(signed_off.get("auto_pick").is_none(), "{signed_off}");
+    }
+
+    #[test] // spec: CORE-052 (P4b-R38)
+    fn an_override_reopens_only_the_automatic_run() {
+        // `r_1` holds a.png and b.png; the automatic sign-off chose a.png as 1.0.0.
+        let mut m = manifest();
+        m.runs_mut()[0].insert(
+            "files".into(),
+            json!([
+                {"path": "candidates/r_1/a.png", "role": "candidate", "sha256": "a".repeat(64)},
+                {"path": "candidates/r_1/b.png", "role": "candidate", "sha256": "b".repeat(64)},
+            ]),
+        );
+        let by = SignedOffBy::auto("auto_approve:image").with_auto_pick(pick());
+        let (auto, _) = plan_signoff(&m, "r_1", &files(&["a.png"]), None, &[], &by, 0).unwrap();
+        let cli = SignedOffBy::caller(&CallerKind::Cli);
+        let record = SignoffRecord {
+            overrides: Some(Version::new(1, 0, 0)),
+            restored_from: None,
+            at: None,
+        };
+        let plan = |chosen: &[&str], run: &str, record: &SignoffRecord| {
+            plan_signoff_with(&auto, run, &files(chosen), None, &[], &cli, record, 0)
+        };
+        let (signed, v) = plan(&["b.png"], "r_1", &record).unwrap();
+        assert_eq!(v, Version::new(1, 1, 0));
+        let run = &signed.view().candidate_runs[0];
+        assert_eq!(run.status.as_deref(), Some("selected"));
+        assert_eq!(run.selected, ["b.png"]);
+        let s = run.signed_off.as_ref().unwrap();
+        assert_eq!((s.by.as_str(), s.version), ("cli", v));
+        assert_eq!(
+            s.overrides_auto_pick,
+            Some(lil_schema::OverridesAutoPick {
+                version: Version::new(1, 0, 0),
+                picked: "a.png".to_string()
+            })
+        );
+        let log = signed.status_log();
+        let newest = log.last().unwrap();
+        assert_eq!(
+            (newest.from, newest.to),
+            (
+                Some(lil_schema::Status::Approved),
+                lil_schema::Status::Approved
+            )
+        );
+        // The file it chose already; the closed run without `overrides`; another run with it.
+        assert_eq!(
+            plan(&["a.png"], "r_1", &record).unwrap_err().code,
+            "params.invalid"
+        );
+        assert_eq!(
+            plan(&["b.png"], "r_1", &SignoffRecord::default())
+                .unwrap_err()
+                .code,
+            "asset.unknown"
+        );
+        // r_2 was rejected by the automatic sign-off: still refused as today.
+        assert_eq!(
+            plan(&["b.png"], "r_2", &record).unwrap_err().code,
+            "asset.unknown"
+        );
+        // A version no automatic sign-off made.
+        let not_auto = SignoffRecord {
+            overrides: Some(Version::new(2, 0, 0)),
+            restored_from: None,
+            at: None,
+        };
+        assert_eq!(
+            plan(&["b.png"], "r_1", &not_auto).unwrap_err().code,
+            "params.invalid"
+        );
+    }
+
+    #[test] // spec: CORE-177
+    fn a_restore_logs_restored_and_carries_its_trust_records() {
+        // The restore's open run `r_9`, holding a copy of 1.0.0's a.png with its trust record.
+        let (mut m, _) = plan_signoff(
+            &manifest(),
+            "r_1",
+            &files(&["a.png"]),
+            None,
+            &[],
+            &SignedOffBy::caller(&CallerKind::Cli),
+            0,
+        )
+        .unwrap();
+        let untrusted = lil_schema::TrustRecord {
+            state: lil_schema::TrustState::Untrusted,
+            sources: Vec::new(),
+            marked_trusted: None,
+        };
+        m.set_trust("v1.0.0/a.png", Some(&untrusted));
+        let files_of = [("a.png".to_string(), "a".repeat(64))];
+        let actor = lil_schema::Actor {
+            kind: lil_schema::ActorKind::Cli,
+            task_id: None,
+            conversation_id: None,
+            session_id: None,
+        };
+        let snapshot = m.clone();
+        let restored = restored_run(
+            Some(&snapshot),
+            Version::new(1, 0, 0),
+            "r_9",
+            &files_of,
+            &actor,
+            0,
+        );
+        assert_eq!(restored.chosen, files(&["a.png"]));
+        add_restored_run(&mut m, &restored.run, Version::new(1, 0, 0)).unwrap();
+        assert_eq!(m.trust("candidates/r_9/a.png"), Some(untrusted.clone()));
+        let entries = m.status_log().len();
+        let record = SignoffRecord {
+            overrides: None,
+            restored_from: Some(Version::new(1, 0, 0)),
+            at: None,
+        };
+        let (signed, v) = plan_signoff_with(
+            &m,
+            "r_9",
+            &restored.chosen,
+            Some(Bump::Minor),
+            &[],
+            &SignedOffBy::caller(&CallerKind::Cli),
+            &record,
+            0,
+        )
+        .unwrap();
+        assert_eq!(v, Version::new(1, 1, 0));
+        let log = signed.status_log();
+        assert_eq!(log.len(), entries + 1);
+        let reason = log.last().unwrap().reason.clone().unwrap();
+        assert_eq!(
+            (reason.code.as_str(), reason.r#ref.as_deref()),
+            ("restored", Some("prop_kite@1.0.0"))
+        );
+        assert_eq!(signed.trust("v1.1.0/a.png"), Some(untrusted.clone()));
+        assert_eq!(signed.trust("v1.0.0/a.png"), Some(untrusted.clone()));
+        // The run's record stays, as with every sign-off.
+        assert_eq!(signed.trust("candidates/r_9/a.png"), Some(untrusted));
+        assert_eq!(
+            signed.view().candidate_runs[3].restored_from,
+            Some(Version::new(1, 0, 0))
+        );
+        // A second run of the same id is refused.
+        assert!(add_restored_run(&mut m, &restored.run, Version::new(1, 0, 0)).is_err());
     }
 }

@@ -1163,6 +1163,55 @@ fn the_ref_tools_are_pinned() {
     assert_eq!(resolve.input_schema["additionalProperties"], false);
 }
 
+/// The plan-4b version rows (CORE-177, CORE-052; Appendix H "Restore as new version and
+/// version detail"): `asset.restore_version` writes and `asset.get_version` reads, in
+/// `workspace`, with exactly their arguments; `asset.signoff` takes `overrides`.
+#[test] // spec: CORE-177, CORE-052, CORE-146, CORE-058
+fn the_version_tools_are_pinned() {
+    let env = TestEnv::new();
+    let states = Arc::new(StateRegistry::open(&env.env, no_fatal()).unwrap());
+    let reg = registry_for(&env, false, &Arc::new(TestGates::new()), &states);
+    let find = |name: &str| {
+        reg.descriptors()
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} is registered"))
+    };
+    let props = |d: &ToolDescriptor| -> Vec<String> {
+        d.input_schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    for (name, effect, args) in [
+        (
+            "asset.restore_version",
+            EffectClass::Write,
+            &["project", "asset_id", "version", "bump"][..],
+        ),
+        (
+            "asset.get_version",
+            EffectClass::Read,
+            &["project", "asset_id", "version"][..],
+        ),
+    ] {
+        let d = find(name);
+        assert_eq!(
+            (d.effect, d.module.as_str()),
+            (effect, WORKSPACE_MODULE),
+            "{name}"
+        );
+        assert_eq!(props(&d), args, "{name}");
+        assert_eq!(d.input_schema["additionalProperties"], false, "{name}");
+    }
+    assert!(
+        props(&find("asset.signoff")).contains(&"overrides".to_string()),
+        "asset.signoff takes overrides"
+    );
+}
+
 /// `fill_touches` (P4b-R33; Appendix H "Confirmations"): `{project}` from the arguments, else
 /// the call's project; `{asset_id}`; `{files[]}` one touch per string; and a declaration whose
 /// argument is missing is skipped while the others are still listed (ruling 2's choice: the
