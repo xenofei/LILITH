@@ -243,13 +243,13 @@ pub fn plan_signoff(
     )
 }
 
-/// The run folder of `run`, lower-cased, ending in `/`.
+/// The run folder of `run` under [`path_key`], ending in `/`.
 fn run_dir_of(run: &CandidateRun) -> String {
-    let mut run_dir = run
-        .path
-        .clone()
-        .unwrap_or_else(|| format!("candidates/{}/", run.run_id))
-        .to_lowercase();
+    let mut run_dir = path_key(
+        &run.path
+            .clone()
+            .unwrap_or_else(|| format!("candidates/{}/", run.run_id)),
+    );
     if !run_dir.ends_with('/') {
         run_dir.push('/');
     }
@@ -257,17 +257,25 @@ fn run_dir_of(run: &CandidateRun) -> String {
 }
 
 /// Whether the record `f` of run `run` is the file `given` names (ruling 4; `asset.mark` and
-/// sign-off resolve a file this way), compared without regard to case: a name with a `/` (or
-/// `\`) is the file's path in the asset folder or in the run folder; a bare name is the file's
-/// bare name (which more than one file may have).
+/// sign-off resolve a file this way), compared as the seal compares names ([`path_key`]): a
+/// name with a `/` (or `\`) is the file's path in the asset folder or in the run folder; a bare
+/// name is the file's bare name (which more than one file may have).
 pub(crate) fn file_named(run: &CandidateRun, f: &CandidateFile, given: &str) -> bool {
-    let given = given.replace('\\', "/").to_lowercase();
-    let path = f.path.to_lowercase();
+    let given = path_key(&given.replace('\\', "/"));
     if given.contains('/') {
+        let path = path_key(&f.path);
         path == given || path.strip_prefix(&run_dir_of(run)) == Some(given.as_str())
     } else {
-        bare_name(&path) == given
+        name_key(&f.path) == given
     }
+}
+
+/// The record of run `run` for `name`, a file at the top of its run folder, found by its full
+/// path as the seal finds it ([`path_key`]), so that a file of the same bare name in a folder
+/// inside the run folder never stands in for it.
+pub(crate) fn top_level_file<'r>(run: &'r CandidateRun, name: &str) -> Option<&'r CandidateFile> {
+    let key = format!("{}{}", run_dir_of(run), path_key(name));
+    run.files.iter().find(|f| path_key(&f.path) == key)
 }
 
 /// The record of run `run` that `name` names to sign off ([`file_named`]): a bare name must be
@@ -284,9 +292,7 @@ fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile
         .collect();
     match hits.as_slice() {
         [one]
-            if one
-                .path
-                .to_lowercase()
+            if path_key(&one.path)
                 .strip_prefix(&run_dir_of(run))
                 .is_some_and(|inside| inside.contains('/')) =>
         {

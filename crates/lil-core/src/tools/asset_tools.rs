@@ -209,7 +209,7 @@ use super::services::{AssetServices, InUse};
 use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::record::trust_key;
-use crate::pipeline::signoff::file_named;
+use crate::pipeline::signoff::{file_named, top_level_file};
 use crate::pipeline::{
     Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, SignoffRecord, actor_of,
     add_restored_run, asset_topic, chosen_files, plan_signoff_with, restored_run, signed_off_by,
@@ -1526,12 +1526,7 @@ async fn signoff_locked(
     // its sealing folder, so a save that lands in between is never sealed either.
     let mut expected = BTreeMap::new();
     for name in &run.selected {
-        let Some(hex) = run
-            .files
-            .iter()
-            .find(|f| f.path.rsplit('/').next() == Some(name.as_str()))
-            .and_then(|f| f.sha256.clone())
-        else {
+        let Some(hex) = top_level_file(&run, name).and_then(|f| f.sha256.clone()) else {
             continue;
         };
         let rel = a

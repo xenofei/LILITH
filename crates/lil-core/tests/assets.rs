@@ -4740,6 +4740,34 @@ async fn a_run_rejected_by_an_overridden_signoff_keeps_its_date() {
     fx.shutdown().await;
 }
 
+/// The check before the seal finds the chosen file's record by its full path: a nested file
+/// of the same bare name listed first doesn't stand in for it.
+#[tokio::test] // spec: CORE-026
+async fn a_nested_namesake_listed_first_does_not_block_the_seal() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "a.png", b"top a").await;
+    let run_dir = fx.path(&format!("{KITE_DIR}/candidates/{run}"));
+    write_file(&run_dir.join("sub").join("a.png"), b"nested a");
+    edit_manifest(&fx.ws, KITE, |m| {
+        let files = run_mut(m, &run)["files"].as_array_mut().unwrap();
+        files.insert(
+            0,
+            json!({"path": format!("candidates/{run}/sub/a.png"), "role": "candidate",
+                   "sha256": sha256_bytes(b"nested a")}),
+        );
+    });
+    // A bare `a.png` is ambiguous here (ruling 4): the top-level file is named by its path.
+    let signed = fx
+        .signoff(KITE, &run, &[&format!("candidates/{run}/a.png")], json!({}))
+        .await;
+    assert_eq!(signed["version"], "1.0.0", "{signed}");
+    assert_eq!(
+        version_tree(&fx.path(&format!("{KITE_DIR}/v1.0.0"))),
+        BTreeMap::from([(PathBuf::from("a.png"), b"top a".to_vec())])
+    );
+    fx.shutdown().await;
+}
+
 /// A seal takes only files at the top of the run folder (ruling 4): a nested file is refused
 /// before anything moves, a bare name two files share is ambiguous, and the top-level file's
 /// path seals it.
