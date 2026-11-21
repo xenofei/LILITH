@@ -786,7 +786,7 @@ struct Fields {
     /// `project.status`'s orphan runs are the run folders none of them names.
     run_keys: String,
     /// The keys of the versions recorded, joined by `,`: `approved_version` and each run's
-    /// `signed_off.version`.
+    /// `signed_off.version` or an override's `overrides_auto_pick.version`.
     versions: String,
 }
 

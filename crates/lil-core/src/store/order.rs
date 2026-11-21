@@ -441,7 +441,8 @@ impl Store {
     /// - `candidates/<run>/` folders that their asset's manifest has no run for (an asset with
     ///   no manifest records none; one whose manifest doesn't parse is skipped);
     /// - `v<semver>/` folders that hold a `manifest.snapshot.json` but whose version is
-    ///   neither the manifest's `approved_version` nor a run's `signed_off.version`;
+    ///   neither the manifest's `approved_version` nor a run's `signed_off.version` or an
+    ///   override's `overrides_auto_pick.version`;
     /// - non-empty staging handles and `seal-*` folders that aren't this store's own (a dead
     ///   core's, at a read-write open);
     /// - conflict copies, `*.lil-conflict-*` and legacy ones.
