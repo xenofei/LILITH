@@ -26,8 +26,9 @@
 //! folder and its `manifest.snapshot.json`, through the store (no index wait, no lock): every
 //! file in the folder but the snapshot, as `v<version>/<path>`, with the manifest's recorded
 //! SHA-256 (else the file's, `null` when it can't be read) and its media kind; `primary` for a
-//! file the sign-off chose that isn't a companion. `recipe` and `inputs` are the snapshot's,
-//! `signed_off` the snapshot's run's `signed_off` as written, `restored_from` that run's, and
+//! file the sign-off chose that isn't a companion. `recipe` is the snapshot's, `inputs` the
+//! snapshot's top-level `inputs` and then its run's `inputs`, once per `ref`, `signed_off`
+//! the snapshot's run's `signed_off` as written, `restored_from` that run's, and
 //! `trust` the manifest's records under `v<version>/`. A legacy version (no snapshot) gives
 //! its files and hashes only. An unknown asset or version is `asset.unknown`.
 
@@ -36,7 +37,7 @@ use lil_protocol::{EffectClass, ErrorBody};
 use lil_schema::{AssetRef, Flag, Label, Manifest, Version, media_kind_of};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use super::collection_tools::collection_filter;
 use super::registry::{CallCtx, Registry, typed_tool};
@@ -543,17 +544,28 @@ async fn get_version(
             .find(|r| r.signed_off.as_ref().is_some_and(|o| o.version == version))
     });
     let wire = version.to_string();
-    let signed_off = snapshot
+    let raw_run = snapshot
         .as_ref()
         .and_then(|s| s.get("candidate_runs"))
         .and_then(Value::as_array)
         .and_then(|runs| {
             runs.iter()
-                .map(|r| &r["signed_off"])
-                .find(|o| o["version"].as_str() == Some(wire.as_str()))
+                .find(|r| r["signed_off"]["version"].as_str() == Some(wire.as_str()))
+        });
+    let signed_off = raw_run.map_or(Value::Null, |r| r["signed_off"].clone());
+    // The snapshot's inputs, then its run's, once per `ref` (the first entry kept).
+    fn listed(v: Option<&Value>) -> impl Iterator<Item = &Value> {
+        v.and_then(Value::as_array).into_iter().flatten()
+    }
+    let mut refs = std::collections::BTreeSet::new();
+    let inputs: Vec<Value> = listed(snapshot.as_ref().and_then(|s| s.get("inputs")))
+        .chain(listed(raw_run.and_then(|r| r.get("inputs"))))
+        .filter(|i| match i["ref"].as_str() {
+            Some(r) => refs.insert(r.to_string()),
+            None => true,
         })
         .cloned()
-        .unwrap_or(Value::Null);
+        .collect();
     let companions = run
         .as_ref()
         .and_then(|r| r.signed_off.as_ref())
@@ -619,7 +631,7 @@ async fn get_version(
             files,
             companions,
             recipe: from_snapshot("recipe", Value::Null),
-            inputs: from_snapshot("inputs", json!([])),
+            inputs: Value::Array(inputs),
             signed_off,
             restored_from: run
                 .as_ref()

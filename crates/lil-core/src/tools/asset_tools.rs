@@ -68,11 +68,15 @@
 //!   `ui:*` caller, the call leaves the pick log's lines (one per signed take,
 //!   `tools::pick_log`) for after its Record stage, which starts them only once the sign-off is
 //!   recorded. A name in `files` with a `/` is the file's path in the asset or run folder; a
-//!   bare name must name exactly one file (`params.invalid` otherwise). With
-//!   `overrides: "<version>"` (CORE-052; P4b-R38) the sign-off overrides that automatic
+//!   bare name must name exactly one file (`params.invalid` otherwise). Only files at the top
+//!   of the run folder can be signed off: a file in a folder inside it is `params.invalid`.
+//!   With `overrides: "<version>"` (CORE-052; P4b-R38) the sign-off overrides that automatic
 //!   sign-off (`pipeline::plan_signoff_with`): the version's `signed_off.by` must be `auto`
-//!   (`params.invalid` otherwise), and its run is admitted though closed, for files it didn't
-//!   select; the next version records `signed_off.overrides_auto_pick`.
+//!   (`params.invalid` otherwise, also for a version overridden already), and its run is
+//!   admitted though closed, for files it didn't select; the next version records
+//!   `signed_off.overrides_auto_pick`, which replaces the run's record of the automatic
+//!   sign-off. After an override the automatic record lives in that version's snapshot
+//!   (`asset.get_version`).
 //! - **`asset.restore_version`** (CORE-177; Appendix H): under one hold of the asset's version
 //!   lock, every file of `v<version>/` (the snapshot left out; top-level files and `source/**`)
 //!   is copied with `Store::stage_copy_writable` (never moved out of the sealed folder; each
@@ -83,8 +87,10 @@
 //!   sign-off chose (its takes, else its files; every file for a legacy version). The
 //!   status-log entry carries `{code: "restored", ref: "<asset_id>@<version>"}`, the trust
 //!   records move to the new version's paths, and `{kind: "restored", version, restored_from}`
-//!   goes out on the asset's topic. An unknown version is `asset.unknown`. A restore writes no
-//!   pick-log line.
+//!   goes out on the asset's topic. As with any sign-off without `keep_runs`, the other open
+//!   runs for the new version are rejected. An unknown version is `asset.unknown`. A restore
+//!   writes no pick-log line. A failure after the restored run is committed leaves it open:
+//!   finish it with `asset.signoff`, or let a retry reject it.
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
 //!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
@@ -178,9 +184,9 @@ use std::time::Duration;
 
 use lil_protocol::app::{ConfirmFacts, TouchAccess};
 use lil_protocol::codes::{
-    ASSET_IN_USE, ASSET_IN_USE_MESSAGE, ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, MANIFEST_NEEDS_REPAIR,
-    PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID, STATE_UNAVAILABLE, STATUS_INVALID_TRANSITION,
-    WORKSPACE_REQUIRED,
+    ASSET_IN_USE, ASSET_IN_USE_MESSAGE, ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, CORE_BUG,
+    MANIFEST_NEEDS_REPAIR, PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID, STATE_UNAVAILABLE,
+    STATUS_INVALID_TRANSITION, WORKSPACE_REQUIRED,
 };
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
@@ -201,6 +207,7 @@ use super::services::{AssetServices, InUse};
 use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::record::trust_key;
+use crate::pipeline::signoff::file_named;
 use crate::pipeline::{
     Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, SignoffRecord, actor_of,
     add_restored_run, asset_topic, chosen_files, plan_signoff_with, restored_run, signed_off_by,
@@ -1857,7 +1864,7 @@ async fn restore_version(
     };
     let mut planned = m.clone();
     let version = add_restored_run(&mut planned, &restored.run, from)
-        .map_err(|why| invalid(ctx, why))
+        .map_err(|why| ErrorBody::new(&CORE_BUG, why, ctx.trace_id.clone()))
         .and_then(|()| {
             plan_signoff_with(
                 &planned,
@@ -1911,6 +1918,7 @@ async fn restore_version(
     let (topic, asset_id) = (a.topic(), a.asset_id.clone());
     let (signed, _) =
         signoff_locked(ctx, services, a, guard, restored.chosen, call, record).await?;
+    // TODO(Task 14 rebase): publish via RecordSlot::after
     ctx.events.publish(
         &topic,
         json!({"kind": "restored", "version": signed.version, "restored_from": from.to_string()}),
@@ -2200,24 +2208,9 @@ pub(crate) fn resolve_take(
             .find(|t| t.n == n)
             .ok_or_else(|| unknown(format!("take {n}"))),
         (None, Some(file)) => {
-            let given = file.replace('\\', "/").to_lowercase();
-            let mut run_dir = run
-                .path
-                .clone()
-                .unwrap_or_else(|| format!("candidates/{}/", run.run_id))
-                .to_lowercase();
-            if !run_dir.ends_with('/') {
-                run_dir.push('/');
-            }
-            let bare = !given.contains('/');
             let mut found = BTreeSet::new();
             for (f, n) in run.files.iter().zip(file_takes(run)) {
-                let path = f.path.to_lowercase();
-                let hit = if bare {
-                    path.rsplit('/').next() == Some(given.as_str())
-                } else {
-                    path == given || path.strip_prefix(&run_dir) == Some(given.as_str())
-                };
+                let hit = file_named(run, f, file);
                 if let (true, Some(n)) = (hit, n) {
                     found.insert(n);
                 }

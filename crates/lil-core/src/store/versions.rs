@@ -1076,10 +1076,15 @@ impl Store {
                     .unwrap_or(false);
                 (has_snapshot, Some(version_content_hash(&recorded)), false)
             };
-            let signed = view
-                .candidate_runs
-                .iter()
-                .any(|r| r.signed_off.as_ref().is_some_and(|s| s.version == version));
+            // An overridden automatic version stays recorded (P4b-R38).
+            let signed = view.candidate_runs.iter().any(|r| {
+                r.signed_off.as_ref().is_some_and(|s| {
+                    s.version == version
+                        || s.overrides_auto_pick
+                            .as_ref()
+                            .is_some_and(|o| o.version == version)
+                })
+            });
             found.push(VersionDir {
                 version,
                 dir: rel,

@@ -3984,9 +3984,21 @@ async fn restore_holds_the_version_lock() {
         let fx = fx.clone();
         tokio::spawn(async move { fx.ok("asset.restore_version", restore_args("1.0.0")).await })
     };
-    let held = tokio::task::spawn_blocking(move || at_rx.recv().unwrap())
-        .await
-        .unwrap();
+    let held =
+        tokio::task::spawn_blocking(move || at_rx.recv_timeout(std::time::Duration::from_secs(30)))
+            .await
+            .unwrap();
+    let held = match held {
+        Ok(held) => held,
+        Err(e) => {
+            let result = if restore.is_finished() {
+                format!("{:?}", restore.await)
+            } else {
+                "still running".to_string()
+            };
+            panic!("the restore never reached its commit ({e}): {result}");
+        }
+    };
     assert!(held, "the restore commits its run under the version lock");
     let signoff = {
         let fx = fx.clone();
@@ -4148,6 +4160,36 @@ async fn get_version_reads_the_snapshot_and_a_legacy_version() {
     fx.shutdown().await;
 }
 
+/// `asset.get_version`'s `inputs` are the snapshot's own and then its run's, once per ref.
+#[tokio::test] // spec: CORE-177, APP-141
+async fn get_version_lists_the_snapshot_and_run_inputs_once() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "kite.png", b"kite one").await;
+    edit_manifest(&fx.ws, KITE, |m| {
+        m["inputs"] = json!([{"ref": "chr_paper_crane@1.0.0", "role": "reference"}]);
+        run_mut(m, &run)["inputs"] = json!([
+            {"ref": "chr_paper_crane@1.0.0", "role": "style"},
+            {"ref": "prop_signal_lamp@1.0.0", "role": "reference"},
+        ]);
+    });
+    fx.signoff(KITE, &run, &["kite.png"], json!({})).await;
+    let v = fx
+        .ok(
+            "asset.get_version",
+            json!({"project": "sketchbook", "asset_id": KITE, "version": "1.0.0"}),
+        )
+        .await;
+    assert_eq!(
+        v["inputs"],
+        json!([
+            {"ref": "chr_paper_crane@1.0.0", "role": "reference"},
+            {"ref": "prop_signal_lamp@1.0.0", "role": "reference"},
+        ]),
+        "{v}"
+    );
+    fx.shutdown().await;
+}
+
 #[test] // spec: CORE-052
 fn auto_pick_records_why() {
     let f = |name: &str, seed: Option<i64>| CandidateFile {
@@ -4232,7 +4274,7 @@ async fn auto_signed_kite(fx: &Fx) -> String {
         .await;
     let run = r["run_id"].as_str().unwrap().to_string();
     fx.signoff(KITE, &run, &["a.png"], json!({})).await;
-    edit_manifest(&fx.ws, KITE, |m| {
+    let auto = |m: &mut Value| {
         let signed = &mut run_mut(m, &run)["signed_off"];
         signed["by"] = json!("auto");
         signed["via"] = json!({"rule": "auto_approve:image"});
@@ -4241,8 +4283,29 @@ async fn auto_signed_kite(fx: &Fx) -> String {
             "candidates": [{"file": "a.png", "gates": {"size": "pass"}},
                            {"file": "b.png", "gates": {"size": "pass"}}],
         });
-    });
+    };
+    edit_manifest(&fx.ws, KITE, auto);
+    // An automatic sign-off writes the same record into its version's snapshot.
+    edit_snapshot(fx, "1.0.0", auto);
     run
+}
+
+/// Edits the snapshot sealed as `version` of the kite, read-only again after (the fixture
+/// stands in for a sign-off the tools can't make, so it writes past the store).
+#[allow(clippy::disallowed_methods, clippy::permissions_set_readonly_false)]
+fn edit_snapshot(fx: &Fx, version: &str, edit: impl FnOnce(&mut Value)) {
+    let path = fx.path(&format!("{KITE_DIR}/v{version}/manifest.snapshot.json"));
+    let mut snapshot = read_json(&path);
+    edit(&mut snapshot);
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+    write_file(
+        &path,
+        serde_json::to_string_pretty(&snapshot).unwrap().as_bytes(),
+    );
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).unwrap();
 }
 
 fn override_args(run: &str, files: &[&str], overrides: &str) -> Value {
@@ -4297,6 +4360,8 @@ async fn override_signs_off_a_file_of_the_closed_auto_run() {
         )
         .await;
     assert_eq!(v["signed_off"]["version"], "1.0.0", "{v}");
+    assert_eq!(v["signed_off"]["by"], "auto", "{v}");
+    assert_eq!(v["signed_off"]["auto_pick"]["picked"], "a.png", "{v}");
     fx.shutdown().await;
 }
 
@@ -4368,5 +4433,206 @@ async fn other_closed_runs_stay_refused() {
         assert_eq!(e.code, "asset.unknown", "{args}: {e:?}");
     }
     assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
+    fx.shutdown().await;
+}
+
+/// A version signed off by takes of a run whose files have no `take` (an import, numbered by
+/// P4b-R3's rule) restores with the same take numbers: the second of two, and the second and
+/// third of three, whose numbers would otherwise shift in a run holding only those files.
+#[tokio::test] // spec: CORE-177
+async fn restore_of_a_version_signed_off_by_later_takes() {
+    let fx = Fx::new();
+    let by_takes = |run: &str, takes: Value| json!({"project": "sketchbook", "asset_id": KITE, "run_id": run, "takes": takes});
+    let r = fx
+        .import(KITE, &[("a.png", b"kite a"), ("b.png", b"kite b")])
+        .await;
+    let run = r["run_id"].as_str().unwrap().to_string();
+    let signed = fx.ok("asset.signoff", by_takes(&run, json!([2]))).await;
+    assert_eq!(signed["version"], "1.0.0", "{signed}");
+
+    let r = fx.ok("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(r["version"], "1.1.0", "{r}");
+    let restored = version_tree(&fx.path(&format!("{KITE_DIR}/v1.1.0")));
+    assert_eq!(
+        restored,
+        BTreeMap::from([(PathBuf::from("b.png"), b"kite b".to_vec())])
+    );
+    let m = fx.manifest(KITE);
+    let signed = &signed_run(&m, "1.1.0")["signed_off"];
+    assert_eq!(signed["takes"], json!([2]), "{m}");
+
+    // Three takes, the second and third chosen.
+    let r = fx
+        .import(
+            KITE,
+            &[
+                ("c.png", b"kite c"),
+                ("d.png", b"kite d"),
+                ("e.png", b"kite e"),
+            ],
+        )
+        .await;
+    let run = r["run_id"].as_str().unwrap().to_string();
+    let signed = fx.ok("asset.signoff", by_takes(&run, json!([2, 3]))).await;
+    assert_eq!(signed["version"], "1.2.0", "{signed}");
+    let r = fx.ok("asset.restore_version", restore_args("1.2.0")).await;
+    assert_eq!(r["version"], "1.3.0", "{r}");
+    let restored = version_tree(&fx.path(&format!("{KITE_DIR}/v1.3.0")));
+    assert_eq!(
+        restored,
+        BTreeMap::from([
+            (PathBuf::from("d.png"), b"kite d".to_vec()),
+            (PathBuf::from("e.png"), b"kite e".to_vec()),
+        ])
+    );
+    let m = fx.manifest(KITE);
+    let run = signed_run(&m, "1.3.0");
+    assert_eq!(run["signed_off"]["takes"], json!([2, 3]), "{run}");
+    assert_eq!(run["selected"], json!(["d.png", "e.png"]), "{run}");
+    fx.shutdown().await;
+}
+
+/// After an override the automatic version is still a recorded version: no orphan in
+/// `Store::orphans` or `project.status`, not legacy in `asset.get`, and a second override of it
+/// is refused for what it is.
+#[tokio::test] // spec: CORE-052, CORE-038
+async fn an_override_keeps_the_automatic_version_recorded() {
+    let fx = Fx::new();
+    let run = auto_signed_kite(&fx).await;
+    fx.ok("asset.signoff", override_args(&run, &["b.png"], "1.0.0"))
+        .await;
+
+    let orphans = fx.open().await.store.orphans().await.unwrap();
+    assert_eq!(orphans, Vec::<WsPath>::new());
+    let status = fx
+        .ok("project.status", json!({"project": "sketchbook"}))
+        .await;
+    assert_eq!(status["orphans"], json!([]), "{status}");
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    let v1 = detail["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["version"] == "1.0.0")
+        .unwrap_or_else(|| panic!("{detail}"));
+    assert_eq!(v1["legacy"], false, "{detail}");
+
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    let e = fx
+        .err("asset.signoff", override_args(&run, &["a.png"], "1.0.0"))
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert!(
+        e.message.contains("overridden already") && e.message.contains("1.1.0"),
+        "{e:?}"
+    );
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
+    fx.shutdown().await;
+}
+
+/// A run the automatic sign-off rejected keeps that sign-off's date for its 90 days, though
+/// the override replaced the run's record of it (the date is read from the version's
+/// snapshot).
+#[tokio::test] // spec: CORE-032, CORE-052
+async fn a_run_rejected_by_an_overridden_signoff_keeps_its_date() {
+    let fx = Fx::new();
+    let r = fx
+        .import(KITE, &[("a.png", b"kite a"), ("b.png", b"kite b")])
+        .await;
+    let first = r["run_id"].as_str().unwrap().to_string();
+    let second = fx.import_run(KITE, "c.png", b"kite c").await;
+    fx.signoff(KITE, &first, &["a.png"], json!({})).await;
+    edit_manifest(&fx.ws, KITE, |m| {
+        run_mut(m, &first)["signed_off"]["by"] = json!("auto");
+    });
+    assert_eq!(
+        run_of(&fx.manifest(KITE), &second)["rejected_at_version"],
+        "1.0.0"
+    );
+    fx.ok("asset.signoff", override_args(&first, &["b.png"], "1.0.0"))
+        .await;
+    // The override was signed off long after the automatic sign-off.
+    edit_manifest(&fx.ws, KITE, |m| {
+        run_mut(m, &first)["signed_off"]["date"] = json!("2099-01-01");
+    });
+
+    let store = fx.open().await.store.clone();
+    // The fixture's clock doesn't move: every sign-off here is on its first day.
+    let start = FakeClock::new()
+        .utc_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let due = i64::try_from(start).unwrap() + (lil_core::store::REJECTED_KEEP_DAYS + 1) * 86_400;
+    let report = store.maintenance(due).await.unwrap();
+    let rejected = format!("{KITE_DIR}/candidates/{second}");
+    assert_eq!(
+        report
+            .runs_trashed
+            .iter()
+            .map(WsPath::as_str)
+            .collect::<Vec<_>>(),
+        [rejected.as_str()],
+        "{report:?}"
+    );
+    fx.shutdown().await;
+}
+
+/// A seal takes only files at the top of the run folder (ruling 4): a nested file is refused
+/// before anything moves, a bare name two files share is ambiguous, and the top-level file's
+/// path seals it.
+#[tokio::test] // spec: CORE-026
+async fn only_files_at_the_top_of_the_run_folder_are_signed_off() {
+    let fx = Fx::new();
+    let run = fx.import_run(KITE, "a.png", b"top a").await;
+    let run_dir = fx.path(&format!("{KITE_DIR}/candidates/{run}"));
+    write_file(&run_dir.join("sub").join("a.png"), b"nested a");
+    edit_manifest(&fx.ws, KITE, |m| {
+        let files = run_mut(m, &run)["files"].as_array_mut().unwrap();
+        files.push(
+            json!({"path": format!("candidates/{run}/sub/a.png"), "role": "candidate",
+                          "sha256": lil_schema::sha256_hex(b"nested a")}),
+        );
+    });
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    let files = tree(&run_dir);
+
+    for name in ["sub/a.png", "a.png"] {
+        let e = fx
+            .err(
+                "asset.signoff",
+                json!({"project": "sketchbook", "asset_id": KITE, "run_id": run,
+                       "files": [name]}),
+            )
+            .await;
+        assert_eq!(e.code, "params.invalid", "{name}: {e:?}");
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            bytes,
+            "{name}: nothing written"
+        );
+        assert_eq!(tree(&run_dir), files, "{name}: nothing moved");
+        assert!(!fx.path(&format!("{KITE_DIR}/v1.0.0")).exists(), "{name}");
+    }
+
+    let signed = fx
+        .signoff(KITE, &run, &[&format!("candidates/{run}/a.png")], json!({}))
+        .await;
+    assert_eq!(signed["version"], "1.0.0", "{signed}");
+    assert_eq!(
+        version_tree(&fx.path(&format!("{KITE_DIR}/v1.0.0"))),
+        BTreeMap::from([(PathBuf::from("a.png"), b"top a".to_vec())])
+    );
+    assert_eq!(
+        std::fs::read(run_dir.join("sub").join("a.png")).unwrap(),
+        b"nested a"
+    );
     fx.shutdown().await;
 }

@@ -41,8 +41,9 @@
 //!
 //! A chosen name with a `/` is the file's path in the asset or run folder; a bare name must
 //! name exactly one file of the run (`params.invalid` otherwise), as `asset.mark` resolves a
-//! file. An automatic sign-off records its pick ([`auto_pick`]) as `signed_off.auto_pick`
-//! (CORE-052). [`plan_signoff_with`] adds the override of an automatic pick (P4b-R38) and a
+//! file (`file_named`), and that file must be at the top of the run folder. An automatic
+//! sign-off records its pick ([`auto_pick`]) as `signed_off.auto_pick` (CORE-052).
+//! [`plan_signoff_with`] adds the override of an automatic pick (P4b-R38) and a
 //! restore's reason and trust records (CORE-177); [`restored_run`] and [`add_restored_run`]
 //! make a restore's run.
 
@@ -54,8 +55,8 @@ use lil_protocol::codes::{
 use lil_protocol::{CallerKind, CodeSpec, ErrorBody};
 use lil_schema::{
     Actor, AutoPick, AutoPickCandidate, AutoPickReason, Bump, CandidateFile, CandidateRun, Gate,
-    Manifest, Reason, StatusBy, StatusEvent, Version, Via, carry_trust, change_status, hash_value,
-    takes_of,
+    Manifest, Reason, StatusBy, StatusEvent, Version, Via, carry_trust, change_status, file_takes,
+    hash_value, takes_of,
 };
 use serde_json::{Map, Value, json};
 
@@ -242,15 +243,8 @@ pub fn plan_signoff(
     )
 }
 
-/// The record of run `run` that `name` names (as `asset.mark` resolves a file): a name with a
-/// `/` (or `\`) is the file's path in the asset folder or in the run folder; a bare name names
-/// the one file that has it.
-///
-/// # Errors
-/// `asset.unknown` when no file matches; `params.invalid` for a bare name more than one file
-/// has.
-fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile, ErrorBody> {
-    let given = name.replace('\\', "/").to_lowercase();
+/// The run folder of `run`, lower-cased, ending in `/`.
+fn run_dir_of(run: &CandidateRun) -> String {
     let mut run_dir = run
         .path
         .clone()
@@ -259,20 +253,52 @@ fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile
     if !run_dir.ends_with('/') {
         run_dir.push('/');
     }
-    let bare = !given.contains('/');
+    run_dir
+}
+
+/// Whether the record `f` of run `run` is the file `given` names (ruling 4; `asset.mark` and
+/// sign-off resolve a file this way), compared without regard to case: a name with a `/` (or
+/// `\`) is the file's path in the asset folder or in the run folder; a bare name is the file's
+/// bare name (which more than one file may have).
+pub(crate) fn file_named(run: &CandidateRun, f: &CandidateFile, given: &str) -> bool {
+    let given = given.replace('\\', "/").to_lowercase();
+    let path = f.path.to_lowercase();
+    if given.contains('/') {
+        path == given || path.strip_prefix(&run_dir_of(run)) == Some(given.as_str())
+    } else {
+        bare_name(&path) == given
+    }
+}
+
+/// The record of run `run` that `name` names to sign off ([`file_named`]): a bare name must be
+/// one file's, and the file must be at the top of the run folder, where a seal takes it.
+///
+/// # Errors
+/// `asset.unknown` when no file matches; `params.invalid` for a bare name more than one file
+/// has, or a file in a folder inside the run folder.
+fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile, ErrorBody> {
     let hits: Vec<&CandidateFile> = run
         .files
         .iter()
-        .filter(|f| {
-            let path = f.path.to_lowercase();
-            if bare {
-                bare_name(&path) == given
-            } else {
-                path == given || path.strip_prefix(&run_dir) == Some(given.as_str())
-            }
-        })
+        .filter(|f| file_named(run, f, name))
         .collect();
     match hits.as_slice() {
+        [one]
+            if one
+                .path
+                .to_lowercase()
+                .strip_prefix(&run_dir_of(run))
+                .is_some_and(|inside| inside.contains('/')) =>
+        {
+            Err(fail(
+                &PARAMS_INVALID,
+                format!(
+                    "`{name}` is in a folder inside the run `{}`: only files at the top of the \
+                     run folder can be signed off.",
+                    run.run_id
+                ),
+            ))
+        }
         [one] => Ok(one),
         [] => Err(fail(
             &ASSET_UNKNOWN,
@@ -293,7 +319,9 @@ fn named_file<'r>(run: &'r CandidateRun, name: &str) -> Result<&'r CandidateFile
 ///
 /// # Errors
 /// `params.invalid` when no run's sign-off made `version` or that sign-off's `by` isn't
-/// `auto`.
+/// `auto`, and when that automatic pick was overridden already (one override per automatic
+/// version: the overriding sign-off replaced the run's record, so its run is no longer the
+/// automatic one).
 fn overridden(
     runs: &[CandidateRun],
     version: Version,
@@ -302,6 +330,20 @@ fn overridden(
         let s = r.signed_off.as_ref()?;
         (s.version == version && s.by == StatusBy::Auto.as_str()).then_some((r, s))
     });
+    let by_override = runs.iter().find_map(|r| {
+        let s = r.signed_off.as_ref()?;
+        let o = s.overrides_auto_pick.as_ref()?;
+        (o.version == version).then_some(s.version)
+    });
+    if let (None, Some(by)) = (auto, by_override) {
+        return Err(fail(
+            &PARAMS_INVALID,
+            format!(
+                "The automatic pick of {version} was overridden already, by version {by}: an \
+                 automatic version is overridden once."
+            ),
+        ));
+    }
     let Some((run, signed)) = auto else {
         return Err(fail(
             &PARAMS_INVALID,
@@ -734,9 +776,11 @@ pub struct RestoredRun {
 /// The run a restore of `restored_from` stages its copies into (CORE-177): `files` are the
 /// version's files as (path inside the version folder, bare SHA-256), the snapshot left out;
 /// `snapshot` is the version's `manifest.snapshot.json` (`None` for a legacy version). Each
-/// top-level file's record is `candidates/<run_id>/<name>` with the old run's `role`, `seed`,
-/// `from`, `take` and `primary` for that name (`candidate` without one) and the copy's
-/// `sha256`. `target_version` is left `null` for the caller to set.
+/// top-level file's record is `candidates/<run_id>/<name>` with the old run's `role`, `seed`
+/// and `from` for that name (`candidate` without one), its take number and primary as the old
+/// run numbered its takes (`take` and `primary` written explicitly, so the old sign-off's take
+/// numbers name the same takes), and the copy's `sha256`. `target_version` is left `null` for
+/// the caller to set.
 pub fn restored_run(
     snapshot: Option<&Manifest>,
     restored_from: Version,
@@ -752,9 +796,33 @@ pub fn restored_run(
                 .is_some_and(|o| o.version == restored_from)
         })
     });
+    // Each old record with its take as the old run numbered it (P4b-R3: a run without `take`
+    // fields numbers its takes by file order) and whether it is that take's primary. The
+    // restored run holds only the version's files, so it gets these explicitly: numbered
+    // afresh, the old sign-off's take numbers would name other takes or none.
+    let numbered: Vec<(&CandidateFile, Option<u32>, bool)> = old
+        .as_ref()
+        .map(|r| {
+            let takes = takes_of(r);
+            r.files
+                .iter()
+                .zip(file_takes(r))
+                .map(|(f, n)| {
+                    let primary = n.is_some_and(|n| {
+                        takes
+                            .iter()
+                            .any(|t| t.n == n && same_name(&f.path, &t.primary))
+                    });
+                    (f, n, primary)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let was = |name: &str| {
-        old.as_ref()
-            .and_then(|r| r.files.iter().find(|f| same_name(&f.path, name)))
+        numbered
+            .iter()
+            .find(|(f, _, _)| same_name(&f.path, name))
+            .copied()
     };
     let names: Vec<&str> = files
         .iter()
@@ -765,34 +833,37 @@ pub fn restored_run(
     for (name, sha256) in files.iter().filter(|(inside, _)| !inside.contains('/')) {
         let mut rec = Map::new();
         rec.insert("path".into(), json!(format!("candidates/{run_id}/{name}")));
-        let f = was(name);
+        let old_record = was(name);
         rec.insert(
             "role".into(),
-            json!(f.map_or("candidate", |f| f.role.as_str())),
+            json!(old_record.map_or("candidate", |(f, _, _)| f.role.as_str())),
         );
         rec.insert("sha256".into(), json!(sha256));
-        if let Some(f) = f {
+        if let Some((f, take, primary)) = old_record {
             if let Some(seed) = f.seed {
                 rec.insert("seed".into(), json!(seed));
             }
             if let Some(from) = &f.from {
                 rec.insert("from".into(), json!(bare_name(from)));
             }
-            if let Some(take) = f.take {
+            if let Some(take) = take {
                 rec.insert("take".into(), json!(take));
             }
-            if f.primary {
+            if primary {
                 rec.insert("primary".into(), Value::Bool(true));
             }
         }
         rec.insert("actor".into(), actor.to_value());
         records.push(Value::Object(rec));
     }
-    let all_recorded = names.iter().all(|n| was(n).is_some());
+    // Takes only when every file keeps a take: a file in none would stay behind unsealed.
+    let all_taken = names
+        .iter()
+        .all(|n| was(n).is_some_and(|(_, take, _)| take.is_some()));
     let signed = old.as_ref().and_then(|r| r.signed_off.as_ref());
     let every = || Chosen::Files(names.iter().map(|n| n.to_string()).collect());
     let chosen = match (old.as_ref(), signed) {
-        (Some(_), Some(s)) if !s.takes.is_empty() && all_recorded => Chosen::Takes(s.takes.clone()),
+        (Some(_), Some(s)) if !s.takes.is_empty() && all_taken => Chosen::Takes(s.takes.clone()),
         (Some(r), Some(_)) => {
             let selected: Vec<String> = r
                 .selected
@@ -1164,16 +1235,27 @@ mod tests {
         let cli = SignedOffBy::caller(&CallerKind::Cli);
         let e = plan_signoff(&m, "r_1", &files(&["a.png"]), None, &[], &cli, 0).unwrap_err();
         assert_eq!(e.code, "params.invalid", "{e:?}");
-        // The path in the run folder, or in the asset folder, names one file.
+        // A path names one file, but a file in a folder inside the run folder is never sealed.
         for name in ["sub/a.png", r"sub\a.png", "candidates/r_1/sub/a.png"] {
-            let (signed, _) = plan_signoff(&m, "r_1", &files(&[name]), None, &[], &cli, 0)
-                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            assert_eq!(
-                signed.view().hashes.get("v1.0.0/a.png").map(String::as_str),
-                Some("c".repeat(64).as_str()),
-                "{name}"
-            );
+            let e = plan_signoff(&m, "r_1", &files(&[name]), None, &[], &cli, 0).unwrap_err();
+            assert_eq!(e.code, "params.invalid", "{name}: {e:?}");
+            assert!(e.message.contains("top of the run folder"), "{name}: {e:?}");
         }
+        // The top-level file's path in the asset folder chooses it.
+        let (signed, _) = plan_signoff(
+            &m,
+            "r_1",
+            &files(&["candidates/r_1/a.png"]),
+            None,
+            &[],
+            &cli,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            signed.view().hashes.get("v1.0.0/a.png").map(String::as_str),
+            Some("a".repeat(64).as_str())
+        );
         let e = plan_signoff(&m, "r_1", &files(&["other/a.png"]), None, &[], &cli, 0).unwrap_err();
         assert_eq!(e.code, "asset.unknown", "{e:?}");
     }

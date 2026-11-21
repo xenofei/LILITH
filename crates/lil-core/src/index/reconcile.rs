@@ -994,11 +994,13 @@ fn parse_manifest(rel: &WsPath, bytes: &[u8], last_write: i64) -> Option<Parsed>
             versions: view
                 .approved_version
                 .into_iter()
-                .chain(
-                    view.candidate_runs
-                        .iter()
-                        .filter_map(|run| run.signed_off.as_ref().map(|s| s.version)),
-                )
+                .chain(view.candidate_runs.iter().flat_map(|run| {
+                    // An overridden automatic version stays recorded (P4b-R38).
+                    run.signed_off.as_ref().into_iter().flat_map(|s| {
+                        std::iter::once(s.version)
+                            .chain(s.overrides_auto_pick.as_ref().map(|o| o.version))
+                    })
+                }))
                 .map(|v| path_key(&v.to_string()))
                 .collect::<Vec<_>>()
                 .join(","),
