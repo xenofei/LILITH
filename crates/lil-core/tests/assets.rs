@@ -4054,9 +4054,19 @@ async fn restore_copies_trust_records() {
     let m = fx.manifest(KITE);
     assert_eq!(m["trust"]["v1.2.0/kite.png"], record, "{m}");
     assert_eq!(m["trust"]["v1.0.0/kite.png"], record, "{m}");
-    // No record is left on the run's paths, which the seal emptied.
+    // No record is left on the restored run's paths, which the seal emptied; the second
+    // import's record stays on its run's path and went to v1.1.0, as every sign-off carries it.
     let keys: Vec<&String> = m["trust"].as_object().unwrap().keys().collect();
-    assert_eq!(keys, ["v1.0.0/kite.png", "v1.2.0/kite.png"], "{m}");
+    assert_eq!(
+        keys,
+        [
+            "v1.0.0/kite.png",
+            &format!("candidates/{second}/kite.png"),
+            "v1.1.0/kite.png",
+            "v1.2.0/kite.png"
+        ],
+        "{m}"
+    );
     fx.shutdown().await;
 }
 
@@ -4121,7 +4131,14 @@ async fn get_version_reads_the_snapshot_and_a_legacy_version() {
     assert!(v.get("restored_from").is_none(), "{v}");
     assert!(v["inputs"].is_array(), "{v}");
     assert!(v.get("recipe").is_some(), "{v}");
-    assert_eq!(v["trust"], json!({}), "{v}");
+    // The import's `untrusted` records, carried to the version by its sign-off (ARCH-060).
+    let trust = v["trust"].as_object().unwrap();
+    assert_eq!(
+        trust.keys().collect::<Vec<_>>(),
+        ["v1.0.0/kite.png", "v1.0.0/kite_mask.png"],
+        "{v}"
+    );
+    assert!(trust.values().all(|r| r["state"] == "untrusted"), "{v}");
 
     // A restored version names what it was restored from.
     fx.ok("asset.restore_version", restore_args("1.0.0")).await;
