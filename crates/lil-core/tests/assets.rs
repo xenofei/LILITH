@@ -4676,6 +4676,8 @@ async fn an_override_keeps_the_automatic_version_recorded() {
         .iter()
         .find(|v| v["version"] == "1.0.0")
         .unwrap_or_else(|| panic!("{detail}"));
+    // This holds through the snapshot; `an_overridden_version_without_its_snapshot_is_not_legacy`
+    // pins the override's own record.
     assert_eq!(v1["legacy"], false, "{detail}");
 
     let manifest = manifest_file(&fx.ws, KITE);
@@ -4690,6 +4692,41 @@ async fn an_override_keeps_the_automatic_version_recorded() {
     );
     assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
     fx.shutdown().await;
+}
+
+/// A version an override names (`signed_off.overrides_auto_pick.version`) is recorded, so it
+/// isn't legacy even without its `manifest.snapshot.json`.
+#[tokio::test] // spec: CORE-052, CORE-033
+async fn an_overridden_version_without_its_snapshot_is_not_legacy() {
+    let fx = Fx::new();
+    let run = auto_signed_kite(&fx).await;
+    fx.ok("asset.signoff", override_args(&run, &["b.png"], "1.0.0"))
+        .await;
+    remove_snapshot(&fx, "1.0.0");
+    let detail = fx
+        .ok(
+            "asset.get",
+            json!({"project": "sketchbook", "asset_id": KITE}),
+        )
+        .await;
+    let v1 = detail["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["version"] == "1.0.0")
+        .unwrap_or_else(|| panic!("{detail}"));
+    assert_eq!(v1["legacy"], false, "{detail}");
+    fx.shutdown().await;
+}
+
+/// Removes the snapshot sealed as `version` of the kite (the fixture writes past the store).
+#[allow(clippy::disallowed_methods, clippy::permissions_set_readonly_false)]
+fn remove_snapshot(fx: &Fx, version: &str) {
+    let path = fx.path(&format!("{KITE_DIR}/v{version}/manifest.snapshot.json"));
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    std::fs::remove_file(&path).unwrap();
 }
 
 /// A run the automatic sign-off rejected keeps that sign-off's date for its 90 days, though
