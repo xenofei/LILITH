@@ -102,7 +102,9 @@
 //!   `asset.unknown`. A restore writes no pick-log line. A restore whose Record stage failed
 //!   leaves its run open with a sealed, unrecorded `v<target>/`: a retry of the same restore
 //!   adopts that run and signs it off as its target (the seal adopts the folder, ruling Q31)
-//!   instead of making a new run; the run can also be finished with `asset.signoff`.
+//!   instead of making a new run, keeping the `restored` reason and event. The run can also
+//!   be finished with `asset.signoff`, but that sign-off is a plain one: no `restored` reason
+//!   in the status log and no `restored` event.
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
 //!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
