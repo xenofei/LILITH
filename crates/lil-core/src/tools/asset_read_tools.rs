@@ -7,6 +7,7 @@
 //! |---|---|---|---|
 //! | `assets.query` | read | `{project?, status?, type?, text?, tags?, rating_min?, label?, flag?, collection?, duplicates?, deprecated?, facets?, sort?, limit?, cursor?}` | `{assets: [AssetSummary], next_cursor: string\|null, total, facets?, tags_more?}` |
 //! | `asset.get` | read | `{project?, asset_id}` | `AssetDetail` |
+//! | `asset.get_version` | read | `{project?, asset_id, version}` | `{version, ref, files: [{path, sha256, media_kind, primary}], companions, recipe, inputs, signed_off, restored_from?, trust}` |
 //!
 //! `assets.query`'s `project` is a filter: omitted, it means every project (the session's
 //! active project never narrows it). `status` and `type` take a string or a list (any of);
@@ -20,13 +21,22 @@
 //! (PR #89 audit, L3). `asset.get`'s omitted `project` is the call's resolved project
 //! (`CallCtx::project`: the session's active project, else the workspace's hint, else
 //! `sketchbook`).
+//!
+//! `asset.get_version` (CORE-177, APP-141; Appendix H) reads one sealed version from its
+//! folder and its `manifest.snapshot.json`, through the store (no index wait, no lock): every
+//! file in the folder but the snapshot, as `v<version>/<path>`, with the manifest's recorded
+//! SHA-256 (else the file's, `null` when it can't be read) and its media kind; `primary` for a
+//! file the sign-off chose that isn't a companion. `recipe` and `inputs` are the snapshot's,
+//! `signed_off` the snapshot's run's `signed_off` as written, `restored_from` that run's, and
+//! `trust` the manifest's records under `v<version>/`. A legacy version (no snapshot) gives
+//! its files and hashes only. An unknown asset or version is `asset.unknown`.
 
-use lil_protocol::codes::PARAMS_INVALID;
+use lil_protocol::codes::{ASSET_UNKNOWN, PARAMS_INVALID};
 use lil_protocol::{EffectClass, ErrorBody};
-use lil_schema::{Flag, Label};
+use lil_schema::{AssetRef, Flag, Label, Manifest, Version, media_kind_of};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use super::collection_tools::collection_filter;
 use super::registry::{CallCtx, Registry, typed_tool};
@@ -36,6 +46,7 @@ use crate::index::{
     encode_cursor,
 };
 use crate::pipeline::{AssetDetail, AssetSummary, asset_detail, asset_summary};
+use crate::store::{SNAPSHOT, StoreError, WsPath};
 
 /// The page size when `limit` is omitted.
 pub const DEFAULT_LIMIT: usize = 200;
@@ -63,6 +74,12 @@ const GET_DESCRIPTION: &str = "Get one asset by project and asset_id: its summar
     proposed bump, the manifest's candidate runs, human edits, external files, status log and \
     trust records, the state of each file (ok, not_fetched, cloud_only, human_edit, \
     needs_repair, missing), the inputs it uses and the assets that use it.";
+
+const GET_VERSION_DESCRIPTION: &str = "Get one sealed version of an asset: its files (path, \
+    SHA-256, media kind, and whether the sign-off chose it as a take's primary), the chosen \
+    takes' companions, the recipe and inputs, the sign-off record, restored_from when it was \
+    restored from an older version, and the trust records of its files. A legacy version (no \
+    snapshot) gives its files and hashes only.";
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -254,6 +271,44 @@ struct GetArgs {
     asset_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetVersionArgs {
+    /// A project slug; omitted: the session's active project.
+    project: Option<String>,
+    asset_id: String,
+    /// The sealed version.
+    version: String,
+}
+
+/// A file of a sealed version.
+#[derive(Debug, Serialize, JsonSchema)]
+struct VersionFile {
+    /// Asset-relative: `v<version>/<path in the version>`.
+    path: String,
+    /// Bare hex; `null` when it isn't recorded and the file can't be read.
+    sha256: Option<String>,
+    media_kind: String,
+    /// The sign-off chose the file, and not as a companion.
+    primary: bool,
+}
+
+/// `asset.get_version`'s result (Appendix H).
+#[derive(Debug, Serialize, JsonSchema)]
+struct VersionDetail {
+    version: String,
+    #[serde(rename = "ref")]
+    r#ref: String,
+    files: Vec<VersionFile>,
+    companions: Vec<String>,
+    recipe: Value,
+    inputs: Value,
+    signed_off: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restored_from: Option<String>,
+    trust: Value,
+}
+
 fn invalid(ctx: &CallCtx, why: String) -> ErrorBody {
     ErrorBody::new(&PARAMS_INVALID, why, ctx.trace_id.clone())
 }
@@ -427,7 +482,156 @@ async fn get(ctx: &CallCtx, args: GetArgs) -> Result<(AssetDetail, String), Erro
     Ok((detail, summary))
 }
 
-/// Registers `assets.query` and `asset.get` (module `workspace`).
+async fn get_version(
+    ctx: &CallCtx,
+    args: GetVersionArgs,
+) -> Result<(VersionDetail, String), ErrorBody> {
+    let open = ctx.workspace()?;
+    let store = &open.store;
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let project = args.project.unwrap_or_else(|| ctx.project_or_default());
+    let asset_id = args.asset_id;
+    let unknown = |what: String| ErrorBody::new(&ASSET_UNKNOWN, what, ctx.trace_id.clone());
+    let Ok(version) = args.version.parse::<Version>() else {
+        return Err(invalid(
+            ctx,
+            "version names a sealed version, as major.minor.patch".to_string(),
+        ));
+    };
+    let asset = WsPath::parse(&format!("projects/{project}/assets/{asset_id}")).map_err(error)?;
+    let manifest = asset
+        .join(&format!("{asset_id}.manifest.json"))
+        .map_err(error)?;
+    let Some(bytes) = store.read(&manifest).await.map_err(error)? else {
+        return Err(unknown(format!(
+            "There is no asset `{asset_id}` in the project `{project}`; assets.query lists the \
+             assets there are."
+        )));
+    };
+    let live = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|t| Manifest::parse(t).ok())
+        .map(|(m, _)| m);
+    let Some(found) = store
+        .versions(&project, &asset_id)
+        .await
+        .map_err(error)?
+        .into_iter()
+        .find(|v| v.version == version)
+    else {
+        return Err(unknown(format!(
+            "`{asset_id}` has no version {version}; asset.get lists its versions."
+        )));
+    };
+    let snapshot = if found.legacy {
+        None
+    } else {
+        let rel = found.dir.join(SNAPSHOT).map_err(error)?;
+        store
+            .read(&rel)
+            .await
+            .map_err(error)?
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|t| Manifest::parse(&t).ok())
+            .map(|(m, _)| m)
+    };
+    // The snapshot's run signed off as this version: its view, and its `signed_off` as written.
+    let run = snapshot.as_ref().and_then(|s| {
+        s.view()
+            .candidate_runs
+            .into_iter()
+            .find(|r| r.signed_off.as_ref().is_some_and(|o| o.version == version))
+    });
+    let wire = version.to_string();
+    let signed_off = snapshot
+        .as_ref()
+        .and_then(|s| s.get("candidate_runs"))
+        .and_then(Value::as_array)
+        .and_then(|runs| {
+            runs.iter()
+                .map(|r| &r["signed_off"])
+                .find(|o| o["version"].as_str() == Some(wire.as_str()))
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    let companions = run
+        .as_ref()
+        .and_then(|r| r.signed_off.as_ref())
+        .map(|o| o.companions.clone())
+        .unwrap_or_default();
+    let primary = |inside: &str| {
+        run.as_ref().is_some_and(|r| {
+            r.selected.iter().any(|s| s.eq_ignore_ascii_case(inside))
+                && !companions.iter().any(|c| c.eq_ignore_ascii_case(inside))
+        })
+    };
+    let hashes = live.as_ref().map(|m| m.view().hashes).unwrap_or_default();
+    let prefix = format!("v{version}/");
+    let mut files = Vec::new();
+    for (inside, _) in store.version_files(&found.dir).await.map_err(error)? {
+        if inside == SNAPSHOT {
+            continue;
+        }
+        let path = format!("{prefix}{inside}");
+        let sha256 = match hashes.get(&path) {
+            Some(hex) => Some(hex.clone()),
+            None => match found.dir.join(&inside) {
+                Ok(rel) => store.hash(&rel).await.ok().flatten(),
+                Err(_) => None,
+            },
+        };
+        files.push(VersionFile {
+            media_kind: media_kind_of(&inside).as_str().to_string(),
+            primary: primary(&inside),
+            path,
+            sha256,
+        });
+    }
+    let trust: Map<String, Value> = match live.as_ref().and_then(|m| m.get("trust")) {
+        Some(Value::Object(t)) => t
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        _ => Map::new(),
+    };
+    let from_snapshot = |key: &str, empty: Value| {
+        snapshot
+            .as_ref()
+            .and_then(|s| s.get(key))
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(empty)
+    };
+    let r#ref = AssetRef::Sealed {
+        ws: open.ws.id.clone(),
+        project: project.clone(),
+        asset: asset_id.clone(),
+        version,
+        sha256: found.content_hash.clone(),
+    }
+    .to_string();
+    let summary = format!("{project}/{asset_id}@{version}");
+    Ok((
+        VersionDetail {
+            version: wire,
+            r#ref,
+            files,
+            companions,
+            recipe: from_snapshot("recipe", Value::Null),
+            inputs: from_snapshot("inputs", json!([])),
+            signed_off,
+            restored_from: run
+                .as_ref()
+                .and_then(|r| r.restored_from)
+                .map(|v| v.to_string()),
+            trust: Value::Object(trust),
+        },
+        summary,
+    ))
+}
+
+/// Registers `assets.query`, `asset.get` and `asset.get_version` (module `workspace`).
 pub fn register_asset_read_tools(reg: &mut Registry) {
     reg.register(typed_tool(
         "assets.query",
@@ -442,5 +646,12 @@ pub fn register_asset_read_tools(reg: &mut Registry) {
         EffectClass::Read,
         WORKSPACE_MODULE,
         |ctx, args: GetArgs| Box::pin(get(ctx, args)),
+    ));
+    reg.register(typed_tool(
+        "asset.get_version",
+        GET_VERSION_DESCRIPTION,
+        EffectClass::Read,
+        WORKSPACE_MODULE,
+        |ctx, args: GetVersionArgs| Box::pin(get_version(ctx, args)),
     ));
 }

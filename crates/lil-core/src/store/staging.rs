@@ -238,6 +238,28 @@ impl Store {
         }
     }
 
+    /// As [`Store::stage_copy`], with the staged copy's read-only attribute cleared: a copy of
+    /// a sealed (read-only) file that becomes a run file (CORE-177's restore).
+    ///
+    /// # Errors
+    /// As [`Store::stage_copy`]; `store.io` when the attribute can't be cleared.
+    pub async fn stage_copy_writable(
+        &self,
+        h: &StagingHandle,
+        from: &Path,
+        name: &str,
+    ) -> Result<(PathBuf, String), StoreError> {
+        let (to, sha256) = self.stage_copy(h, from, name).await?;
+        let path = to.clone();
+        blocking(move || fsops::set_readonly(&path, false))
+            .await
+            .map_err(|e| StoreError::Io {
+                path: format!("{STAGING_DIR}/{}/{name}", h.id),
+                why: e.to_string(),
+            })?;
+        Ok((to, sha256))
+    }
+
     /// The SHA-256 of a file named by an absolute path that may be outside the workspace (a
     /// link-external file, a file to import), read through the probe: the attributes first,
     /// so a link is never followed and a cloud-only placeholder never downloaded.

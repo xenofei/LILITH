@@ -24,7 +24,9 @@ use lil_platform::fs::{Probe, SystemProbe};
 use lil_platform::paths::folder_key;
 use lil_platform::{Clock, IdSource};
 use lil_protocol::{CallerKind, EffectClass, ErrorBody, Outcome, ToolCallParams, ToolOutput};
-use lil_schema::{CandidateFile, Manifest, StatusBy};
+use lil_schema::{
+    AutoPick, AutoPickCandidate, AutoPickReason, CandidateFile, Gate, Manifest, StatusBy,
+};
 use lil_testkit::files::write_file;
 use lil_testkit::{FakeClock, SeqIds, TestEnv, sha256_bytes, version_content_hash_of};
 use serde_json::{Value, json};
@@ -543,35 +545,46 @@ fn auto_pick_prefers_vision_score_then_lowest_passing_seed() {
         f("c.png", Some(20)),
         f("d.png", None),
     ];
-    let all = |_: &str| true;
-    let not_b = |n: &str| n != "b.png";
+    let all = |_: &str| Vec::new();
+    let not_b = |n: &str| {
+        let gate = if n == "b.png" { Gate::Fail } else { Gate::Pass };
+        vec![("size".to_string(), gate)]
+    };
+    let picked = |pick: Option<AutoPick>| pick.map(|p| p.picked);
     // No vision review: the lowest seed among the passing files.
-    assert_eq!(auto_pick(&files, None, &all).as_deref(), Some("b.png"));
-    assert_eq!(auto_pick(&files, None, &not_b).as_deref(), Some("c.png"));
-    // A vision review: the best score among the passing files, whatever the seed.
-    let scores: BTreeMap<String, f64> = [("a.png", 0.9), ("b.png", 0.95), ("c.png", 0.4)]
-        .into_iter()
-        .map(|(n, s)| (n.to_string(), s))
-        .collect();
     assert_eq!(
-        auto_pick(&files, Some(&scores), &all).as_deref(),
+        picked(auto_pick(&files, None, &all)).as_deref(),
         Some("b.png")
     );
     assert_eq!(
-        auto_pick(&files, Some(&scores), &not_b).as_deref(),
+        picked(auto_pick(&files, None, &not_b)).as_deref(),
+        Some("c.png")
+    );
+    // A vision review: the best score among the passing files, whatever the seed.
+    let scores: BTreeMap<String, (f64, String)> = [("a.png", 0.9), ("b.png", 0.95), ("c.png", 0.4)]
+        .into_iter()
+        .map(|(n, s)| (n.to_string(), (s, String::new())))
+        .collect();
+    assert_eq!(
+        picked(auto_pick(&files, Some(&scores), &all)).as_deref(),
+        Some("b.png")
+    );
+    assert_eq!(
+        picked(auto_pick(&files, Some(&scores), &not_b)).as_deref(),
         Some("a.png")
     );
     // Equal scores: the lower seed.
-    let tied: BTreeMap<String, f64> = [("a.png", 0.5), ("c.png", 0.5)]
+    let tied: BTreeMap<String, (f64, String)> = [("a.png", 0.5), ("c.png", 0.5)]
         .into_iter()
-        .map(|(n, s)| (n.to_string(), s))
+        .map(|(n, s)| (n.to_string(), (s, String::new())))
         .collect();
     assert_eq!(
-        auto_pick(&files, Some(&tied), &all).as_deref(),
+        picked(auto_pick(&files, Some(&tied), &all)).as_deref(),
         Some("c.png")
     );
     // Nothing passes: no pick.
-    assert_eq!(auto_pick(&files, None, &|_| false), None);
+    let none = |_: &str| vec![("size".to_string(), Gate::Fail)];
+    assert_eq!(auto_pick(&files, None, &none), None);
 }
 
 #[tokio::test] // spec: CORE-027
@@ -3739,5 +3752,621 @@ async fn a_style_bible_that_is_not_a_path_warns() {
     let m = fx.manifest(KITE);
     let run = r["run_id"].as_str().unwrap();
     assert!(run_of(&m, run).get("inputs").is_none(), "{m}");
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Restore as new version, version detail, and the automatic pick's record and its override
+// (plan 4b; CORE-052, CORE-177, APP-141; P4b-R18, P4b-R38).
+// ---------------------------------------------------------------------------------------------
+
+/// The run `run` of the manifest `m`, to edit.
+fn run_mut<'a>(m: &'a mut Value, run: &str) -> &'a mut Value {
+    m["candidate_runs"]
+        .as_array_mut()
+        .and_then(|runs| runs.iter_mut().find(|r| r["run_id"] == run))
+        .unwrap_or_else(|| panic!("no run {run}"))
+}
+
+/// The run of `m` signed off as `version`.
+fn signed_run<'a>(m: &'a Value, version: &str) -> &'a Value {
+    m["candidate_runs"]
+        .as_array()
+        .and_then(|runs| runs.iter().find(|r| r["signed_off"]["version"] == version))
+        .unwrap_or_else(|| panic!("no run signed off as {version}: {m}"))
+}
+
+/// The kite signed off twice. `v1.0.0` by take: take 1 is `kite.png` (primary) with its
+/// companion `kite_mask.png`, and the run has `source/kite.kra`; `v1.1.0` from a second run's
+/// `kite.png`, with other bytes. Returns the first run's id.
+async fn kite_versions(fx: &Fx) -> String {
+    let first = fx
+        .import(
+            KITE,
+            &[("kite.png", b"kite one"), ("kite_mask.png", b"mask one")],
+        )
+        .await;
+    let run = first["run_id"].as_str().unwrap().to_string();
+    edit_manifest(&fx.ws, KITE, |m| {
+        let files = &mut run_mut(m, &run)["files"];
+        files[0]["take"] = json!(1);
+        files[0]["primary"] = json!(true);
+        files[1]["take"] = json!(1);
+    });
+    write_file(
+        &fx.path(&format!("{KITE_DIR}/candidates/{run}/source/kite.kra")),
+        b"layered source",
+    );
+    let signed = fx
+        .ok(
+            "asset.signoff",
+            json!({"project": "sketchbook", "asset_id": KITE, "run_id": run, "takes": [1]}),
+        )
+        .await;
+    assert_eq!(signed["version"], "1.0.0", "{signed}");
+    let second = fx.import_run(KITE, "kite.png", b"kite two").await;
+    let signed = fx.signoff(KITE, &second, &["kite.png"], json!({})).await;
+    assert_eq!(signed["version"], "1.1.0", "{signed}");
+    run
+}
+
+fn restore_args(version: &str) -> Value {
+    json!({"project": "sketchbook", "asset_id": KITE, "version": version})
+}
+
+/// The files under `dir` by their path inside it, `manifest.snapshot.json` left out.
+fn version_tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    tree(dir)
+        .into_iter()
+        .map(|(p, b)| (p.strip_prefix(dir).unwrap().to_path_buf(), b))
+        .filter(|(p, _)| p != Path::new("manifest.snapshot.json"))
+        .collect()
+}
+
+#[tokio::test] // spec: CORE-177, CORE-156
+async fn restore_version_seals_a_copy_as_the_next_version() {
+    let fx = Fx::new();
+    kite_versions(&fx).await;
+    let old = fx.path(&format!("{KITE_DIR}/v1.0.0"));
+    let before = tree(&old);
+    let entries = status_log(&fx.manifest(KITE)).len();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(9, tx);
+    let topic = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_id());
+    fx.events
+        .subscribe(9, std::slice::from_ref(&topic), &Default::default())
+        .await;
+
+    let r = fx.ok("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(r["version"], "1.2.0", "a minor bump by default: {r}");
+    assert_eq!(r["restored_from"], "1.0.0", "{r}");
+    assert!(
+        r["ref"]
+            .as_str()
+            .is_some_and(|s| s.contains(&format!("/sketchbook/{KITE}@1.2.0#sha256="))),
+        "{r}"
+    );
+    assert_handoff(&r);
+
+    // The files, the companion and `source/`, byte-equal and read-only; the old version as
+    // it was.
+    let new = fx.path(&format!("{KITE_DIR}/v1.2.0"));
+    let copied = version_tree(&new);
+    assert_eq!(
+        copied.keys().cloned().collect::<Vec<_>>(),
+        [
+            PathBuf::from("kite.png"),
+            PathBuf::from("kite_mask.png"),
+            Path::new("source").join("kite.kra"),
+        ]
+    );
+    assert_eq!(copied, version_tree(&old));
+    for path in tree(&new).keys() {
+        assert!(
+            std::fs::metadata(path).unwrap().permissions().readonly(),
+            "{}",
+            path.display()
+        );
+    }
+    assert_eq!(tree(&old), before, "the old version is unchanged");
+
+    // A new run, signed off through the normal path with the old version's takes.
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], "1.2.0", "{m}");
+    let run = signed_run(&m, "1.2.0");
+    assert_eq!(run["restored_from"], "1.0.0", "{run}");
+    assert_eq!(run["status"], "selected", "{run}");
+    assert_eq!(
+        run["selected"],
+        json!(["kite.png", "kite_mask.png"]),
+        "{run}"
+    );
+    assert_eq!(run["signed_off"]["takes"], json!([1]), "{run}");
+    assert_eq!(
+        run["signed_off"]["companions"],
+        json!(["kite_mask.png"]),
+        "{run}"
+    );
+    assert_eq!(run["signed_off"]["by"], "cli", "{run}");
+    assert_eq!(run["actor"]["kind"], "cli", "{run}");
+    assert_eq!(
+        m["hashes"]["v1.2.0/source/kite.kra"],
+        format!("sha256:{}", sha256_bytes(b"layered source")),
+        "{m}"
+    );
+
+    // One status-log entry, `restored`.
+    let log = status_log(&m);
+    assert_eq!(log.len(), entries + 1, "{m}");
+    let newest = log.last().unwrap();
+    assert_eq!(
+        (&newest["from"], &newest["to"], &newest["by"]),
+        (&json!("approved"), &json!("approved"), &json!("cli")),
+        "{newest}"
+    );
+    assert_eq!(
+        newest["reason"],
+        json!({"code": "restored", "ref": format!("{KITE}@1.0.0")}),
+        "{newest}"
+    );
+
+    // The staging handles were given back.
+    let left: Vec<_> = std::fs::read_dir(fx.path(".lilith/staging"))
+        .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "staging still holds {left:?}");
+
+    // The event.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut restored = None;
+    while restored.is_none() && tokio::time::Instant::now() < deadline {
+        while let Ok(line) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["params"]["data"]["kind"] == "restored" {
+                restored = Some(v["params"].clone());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let restored = restored.expect("a restored event");
+    assert_eq!(restored["topic"], topic, "{restored}");
+    assert_eq!(
+        restored["data"],
+        json!({"kind": "restored", "version": "1.2.0", "restored_from": "1.0.0"}),
+        "{restored}"
+    );
+    fx.shutdown().await;
+}
+
+/// The restore holds the asset's version lock from its staging to its seal: paused while it
+/// commits its run, a sign-off of the same asset waits, and runs once the restore is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: CORE-177, CORE-026
+async fn restore_holds_the_version_lock() {
+    let fp = lil_core::store::FailPoints::none();
+    let fx = Arc::new(Fx::build_with(
+        |_| {},
+        |_| Arc::new(SystemProbe),
+        fp.clone(),
+    ));
+    kite_versions(&fx).await;
+    let waiting = fx.import_run(KITE, "kite.png", b"kite three").await;
+    let lock = fx.open().await.store.version_lock("sketchbook", KITE);
+
+    // From here, the first commit (the restore's run) reports whether the lock is held and
+    // waits for `go`; every seal reports too.
+    let (at_tx, at_rx) = std::sync::mpsc::channel::<bool>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (at_tx, go_rx) = (Mutex::new(at_tx), Mutex::new(go_rx));
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    let at_commit = lock.clone();
+    fp.on(
+        "store.after_output",
+        Box::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                let held = at_commit.try_lock().is_err();
+                at_tx.lock().unwrap().send(held).unwrap();
+                go_rx.lock().unwrap().recv().unwrap();
+            }
+            Ok(())
+        }),
+    );
+    let at_seal = Arc::new(Mutex::new(Vec::new()));
+    let (seen, at_seal_lock) = (at_seal.clone(), lock.clone());
+    fp.on(
+        "store.after_seal",
+        Box::new(move || {
+            seen.lock().unwrap().push(at_seal_lock.try_lock().is_err());
+            Ok(())
+        }),
+    );
+
+    let restore = {
+        let fx = fx.clone();
+        tokio::spawn(async move { fx.ok("asset.restore_version", restore_args("1.0.0")).await })
+    };
+    let held = tokio::task::spawn_blocking(move || at_rx.recv().unwrap())
+        .await
+        .unwrap();
+    assert!(held, "the restore commits its run under the version lock");
+    let signoff = {
+        let fx = fx.clone();
+        let run = waiting.clone();
+        tokio::spawn(async move {
+            fx.call_as(
+                CallerKind::Cli,
+                true,
+                "asset.signoff",
+                json!({"project": "sketchbook", "asset_id": KITE, "run_id": run,
+                       "files": ["kite.png"]}),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!signoff.is_finished(), "the sign-off waits for the restore");
+    go_tx.send(()).unwrap();
+    let restored = restore.await.unwrap();
+    assert_eq!(restored["version"], "1.2.0", "{restored}");
+    // The sign-off ran after the restore was recorded: the restore's sign-off rejected the
+    // open run, as every sign-off rejects the other open runs for its version.
+    match signoff.await.unwrap() {
+        Outcome::Error { error } => assert_eq!(error.code, "asset.unknown", "{error:?}"),
+        other => panic!("the sign-off should find its run rejected: {other:?}"),
+    }
+    let m = fx.manifest(KITE);
+    assert_eq!(run_of(&m, &waiting)["rejected_at_version"], "1.2.0", "{m}");
+    assert_eq!(m["approved_version"], "1.2.0", "{m}");
+    let at_seal = at_seal.lock().unwrap().clone();
+    assert_eq!(at_seal, [true], "the restore seals under the lock");
+    drop(lock);
+    let Ok(fx) = Arc::try_unwrap(fx) else {
+        panic!("the fixture is still shared");
+    };
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-177, ARCH-060
+async fn restore_copies_trust_records() {
+    let fx = Fx::new();
+    let first = fx.import_run(KITE, "kite.png", b"kite one").await;
+    fx.signoff(KITE, &first, &["kite.png"], json!({})).await;
+    let record = json!({"state": "untrusted", "sources": [{"kind": "import", "ref": "kite.png"}]});
+    edit_manifest(&fx.ws, KITE, |m| {
+        m["trust"] = json!({"v1.0.0/kite.png": record});
+    });
+    let second = fx.import_run(KITE, "kite.png", b"kite two").await;
+    fx.signoff(KITE, &second, &["kite.png"], json!({})).await;
+
+    let r = fx.ok("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(r["version"], "1.2.0", "{r}");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"]["v1.2.0/kite.png"], record, "{m}");
+    assert_eq!(m["trust"]["v1.0.0/kite.png"], record, "{m}");
+    // No record is left on the run's paths, which the seal emptied.
+    let keys: Vec<&String> = m["trust"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["v1.0.0/kite.png", "v1.2.0/kite.png"], "{m}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-177
+async fn restore_of_an_unknown_version_is_asset_unknown() {
+    let fx = Fx::new();
+    let first = fx.import_run(KITE, "kite.png", b"kite one").await;
+    fx.signoff(KITE, &first, &["kite.png"], json!({})).await;
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    let candidates = tree(&fx.path(&format!("{KITE_DIR}/candidates")));
+
+    let e = fx.err("asset.restore_version", restore_args("1.1.0")).await;
+    assert_eq!(e.code, "asset.unknown", "{e:?}");
+    let e = fx
+        .err(
+            "asset.restore_version",
+            json!({"project": "sketchbook", "asset_id": "prop_nothing", "version": "1.0.0"}),
+        )
+        .await;
+    assert_eq!(e.code, "asset.unknown", "{e:?}");
+    let e = fx.err("asset.restore_version", restore_args("one")).await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
+    assert_eq!(
+        tree(&fx.path(&format!("{KITE_DIR}/candidates"))),
+        candidates
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-177, APP-141, APP-113
+async fn get_version_reads_the_snapshot_and_a_legacy_version() {
+    let fx = Fx::new();
+    kite_versions(&fx).await;
+    let get = |asset: &str, version: &str| json!({"project": "sketchbook", "asset_id": asset, "version": version});
+
+    let v = fx.ok("asset.get_version", get(KITE, "1.0.0")).await;
+    assert_eq!(v["version"], "1.0.0", "{v}");
+    assert!(
+        v["ref"]
+            .as_str()
+            .is_some_and(|s| s.contains(&format!("/sketchbook/{KITE}@1.0.0#sha256="))),
+        "{v}"
+    );
+    assert_eq!(
+        v["files"],
+        json!([
+            {"path": "v1.0.0/kite.png", "sha256": sha256_bytes(b"kite one"),
+             "media_kind": "image", "primary": true},
+            {"path": "v1.0.0/kite_mask.png", "sha256": sha256_bytes(b"mask one"),
+             "media_kind": "image", "primary": false},
+            {"path": "v1.0.0/source/kite.kra", "sha256": sha256_bytes(b"layered source"),
+             "media_kind": "other", "primary": false},
+        ]),
+        "{v}"
+    );
+    assert_eq!(v["companions"], json!(["kite_mask.png"]), "{v}");
+    assert_eq!(v["signed_off"]["version"], "1.0.0", "{v}");
+    assert_eq!(v["signed_off"]["by"], "cli", "{v}");
+    assert_eq!(v["signed_off"]["takes"], json!([1]), "{v}");
+    assert!(v.get("restored_from").is_none(), "{v}");
+    assert!(v["inputs"].is_array(), "{v}");
+    assert!(v.get("recipe").is_some(), "{v}");
+    assert_eq!(v["trust"], json!({}), "{v}");
+
+    // A restored version names what it was restored from.
+    fx.ok("asset.restore_version", restore_args("1.0.0")).await;
+    let v = fx.ok("asset.get_version", get(KITE, "1.2.0")).await;
+    assert_eq!(v["restored_from"], "1.0.0", "{v}");
+    assert_eq!(v["files"][0]["path"], "v1.2.0/kite.png", "{v}");
+    assert_eq!(v["files"][0]["primary"], true, "{v}");
+
+    // A legacy version: its files and hashes only.
+    let v = fx
+        .ok("asset.get_version", get("prop_signal_lamp", "1.0.0"))
+        .await;
+    let lamp = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "v1.0.0/prop_signal_lamp.png")
+        .unwrap_or_else(|| panic!("no prop_signal_lamp.png: {v}"))
+        .clone();
+    assert_eq!(
+        lamp["sha256"], "4564ff7231849624a5b632fff8c1e3e0219d4fb8612ef1bb83263001079c2772",
+        "{v}"
+    );
+    assert_eq!(lamp["primary"], false, "{v}");
+    assert_eq!(v["files"].as_array().unwrap().len(), 5, "{v}");
+    assert!(v["signed_off"].is_null(), "{v}");
+    assert_eq!(v["companions"], json!([]), "{v}");
+
+    // An unknown version, or asset.
+    let e = fx.err("asset.get_version", get(KITE, "9.0.0")).await;
+    assert_eq!(e.code, "asset.unknown", "{e:?}");
+    let e = fx
+        .err("asset.get_version", get("prop_nothing", "1.0.0"))
+        .await;
+    assert_eq!(e.code, "asset.unknown", "{e:?}");
+    fx.shutdown().await;
+}
+
+#[test] // spec: CORE-052
+fn auto_pick_records_why() {
+    let f = |name: &str, seed: Option<i64>| CandidateFile {
+        path: format!("candidates/r_1/{name}"),
+        seed,
+        role: "candidate".into(),
+        ..Default::default()
+    };
+    let files = [
+        f("a.png", Some(30)),
+        f("b.png", Some(10)),
+        f("c.png", Some(20)),
+    ];
+    // Two gates; `b.png` fails `alpha`.
+    let gates = |n: &str| {
+        let alpha = if n == "b.png" { Gate::Fail } else { Gate::Pass };
+        vec![
+            ("size".to_string(), Gate::Pass),
+            ("alpha".to_string(), alpha),
+        ]
+    };
+    let candidate = |file: &str, alpha: Gate, vision: Option<(f64, &str)>| AutoPickCandidate {
+        file: file.to_string(),
+        gates: vec![
+            ("size".to_string(), Gate::Pass),
+            ("alpha".to_string(), alpha),
+        ],
+        vision_score: vision.map(|(s, _)| s),
+        vision_reason: vision.map(|(_, r)| r.to_string()),
+    };
+
+    // No vision review: the lowest seed among the files passing every gate.
+    let pick = auto_pick(&files, None, &gates).expect("a pick");
+    assert_eq!(
+        pick,
+        AutoPick {
+            picked: "c.png".to_string(),
+            reason: AutoPickReason::LowestSeed,
+            candidates: vec![
+                candidate("a.png", Gate::Pass, None),
+                candidate("b.png", Gate::Fail, None),
+                candidate("c.png", Gate::Pass, None),
+            ],
+        }
+    );
+
+    // A vision review: the best score among the passing files, each candidate with its score
+    // and the review's reason.
+    let vision: BTreeMap<String, (f64, String)> = [
+        ("a.png", 0.9, "clean edges"),
+        ("b.png", 0.95, "best colour"),
+        ("c.png", 0.4, "blurred"),
+    ]
+    .into_iter()
+    .map(|(n, s, r)| (n.to_string(), (s, r.to_string())))
+    .collect();
+    let pick = auto_pick(&files, Some(&vision), &gates).expect("a pick");
+    assert_eq!(
+        pick,
+        AutoPick {
+            picked: "a.png".to_string(),
+            reason: AutoPickReason::VisionScore,
+            candidates: vec![
+                candidate("a.png", Gate::Pass, Some((0.9, "clean edges"))),
+                candidate("b.png", Gate::Fail, Some((0.95, "best colour"))),
+                candidate("c.png", Gate::Pass, Some((0.4, "blurred"))),
+            ],
+        }
+    );
+    // Nothing passes: no pick.
+    let all_fail = |_: &str| vec![("size".to_string(), Gate::Fail)];
+    assert_eq!(auto_pick(&files, Some(&vision), &all_fail), None);
+}
+
+/// The kite's run with `a.png` and `b.png`, `a.png` signed off as `v1.0.0` and that sign-off
+/// made automatic as `auto_approve` will record it (no tool signs off as `auto`, ruling 4; the
+/// sign-off path with `auto` is `pipeline::signoff`'s unit tests): `by: auto`, `via` and its
+/// pick. Returns the run id.
+async fn auto_signed_kite(fx: &Fx) -> String {
+    let r = fx
+        .import(KITE, &[("a.png", b"kite a"), ("b.png", b"kite b")])
+        .await;
+    let run = r["run_id"].as_str().unwrap().to_string();
+    fx.signoff(KITE, &run, &["a.png"], json!({})).await;
+    edit_manifest(&fx.ws, KITE, |m| {
+        let signed = &mut run_mut(m, &run)["signed_off"];
+        signed["by"] = json!("auto");
+        signed["via"] = json!({"rule": "auto_approve:image"});
+        signed["auto_pick"] = json!({
+            "picked": "a.png", "reason": "lowest_seed",
+            "candidates": [{"file": "a.png", "gates": {"size": "pass"}},
+                           {"file": "b.png", "gates": {"size": "pass"}}],
+        });
+    });
+    run
+}
+
+fn override_args(run: &str, files: &[&str], overrides: &str) -> Value {
+    json!({"project": "sketchbook", "asset_id": KITE, "run_id": run, "files": files,
+           "overrides": overrides})
+}
+
+#[tokio::test] // spec: CORE-052
+async fn override_signs_off_a_file_of_the_closed_auto_run() {
+    let fx = Fx::new();
+    let run = auto_signed_kite(&fx).await;
+    let v1 = tree(&fx.path(&format!("{KITE_DIR}/v1.0.0")));
+    let entries = status_log(&fx.manifest(KITE)).len();
+
+    let r = fx
+        .ok("asset.signoff", override_args(&run, &["b.png"], "1.0.0"))
+        .await;
+    assert_eq!(r["version"], "1.1.0", "the next version: {r}");
+    assert_eq!(
+        std::fs::read(fx.path(&format!("{KITE_DIR}/v1.1.0/b.png"))).unwrap(),
+        b"kite b"
+    );
+    assert_eq!(
+        tree(&fx.path(&format!("{KITE_DIR}/v1.0.0"))),
+        v1,
+        "the automatic version is unchanged"
+    );
+    let m = fx.manifest(KITE);
+    assert_eq!(m["approved_version"], "1.1.0", "{m}");
+    let signed = &run_of(&m, &run)["signed_off"];
+    assert_eq!(signed["version"], "1.1.0", "{signed}");
+    assert_eq!(signed["by"], "cli", "{signed}");
+    assert_eq!(
+        signed["overrides_auto_pick"],
+        json!({"version": "1.0.0", "picked": "a.png"}),
+        "{signed}"
+    );
+    assert_eq!(run_of(&m, &run)["selected"], json!(["b.png"]), "{m}");
+    let log = status_log(&m);
+    assert_eq!(log.len(), entries + 1, "{m}");
+    let newest = log.last().unwrap();
+    assert_eq!(
+        (&newest["from"], &newest["to"], &newest["by"]),
+        (&json!("approved"), &json!("approved"), &json!("cli")),
+        "{newest}"
+    );
+    // The automatic sign-off's record stays in its version's snapshot.
+    let v = fx
+        .ok(
+            "asset.get_version",
+            json!({"project": "sketchbook", "asset_id": KITE, "version": "1.0.0"}),
+        )
+        .await;
+    assert_eq!(v["signed_off"]["version"], "1.0.0", "{v}");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-052
+async fn an_override_of_an_already_selected_file_is_refused() {
+    let fx = Fx::new();
+    let run = auto_signed_kite(&fx).await;
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    let e = fx
+        .err("asset.signoff", override_args(&run, &["a.png"], "1.0.0"))
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
+    assert!(!fx.path(&format!("{KITE_DIR}/v1.1.0")).exists());
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-052
+async fn overrides_of_a_non_auto_version_is_params_invalid() {
+    let fx = Fx::new();
+    let r = fx
+        .import(KITE, &[("a.png", b"kite a"), ("b.png", b"kite b")])
+        .await;
+    let run = r["run_id"].as_str().unwrap().to_string();
+    fx.signoff(KITE, &run, &["a.png"], json!({})).await;
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    // A sign-off by `cli`, and a version nothing signed off.
+    for version in ["1.0.0", "2.0.0"] {
+        let e = fx
+            .err("asset.signoff", override_args(&run, &["b.png"], version))
+            .await;
+        assert_eq!(e.code, "params.invalid", "{version}: {e:?}");
+    }
+    let e = fx
+        .err("asset.signoff", override_args(&run, &["b.png"], "one"))
+        .await;
+    assert_eq!(e.code, "params.invalid", "{e:?}");
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
+    fx.shutdown().await;
+}
+
+#[tokio::test] // spec: CORE-052, CORE-026
+async fn other_closed_runs_stay_refused() {
+    let fx = Fx::new();
+    // Two runs: the first's `a.png` is signed off automatically, which rejects the second.
+    let r = fx
+        .import(KITE, &[("a.png", b"kite a"), ("b.png", b"kite b")])
+        .await;
+    let first = r["run_id"].as_str().unwrap().to_string();
+    let second = fx.import_run(KITE, "c.png", b"kite c").await;
+    fx.signoff(KITE, &first, &["a.png"], json!({})).await;
+    edit_manifest(&fx.ws, KITE, |m| {
+        run_mut(m, &first)["signed_off"]["by"] = json!("auto");
+    });
+    assert_eq!(run_of(&fx.manifest(KITE), &second)["status"], "rejected");
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+
+    // The rejected run, with or without `overrides`, and the automatic run without it: today's
+    // refusal.
+    for args in [
+        override_args(&second, &["c.png"], "1.0.0"),
+        json!({"project": "sketchbook", "asset_id": KITE, "run_id": second, "files": ["c.png"]}),
+        json!({"project": "sketchbook", "asset_id": KITE, "run_id": first, "files": ["b.png"]}),
+    ] {
+        let e = fx.err("asset.signoff", args.clone()).await;
+        assert_eq!(e.code, "asset.unknown", "{args}: {e:?}");
+    }
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
     fx.shutdown().await;
 }

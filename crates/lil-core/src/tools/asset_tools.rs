@@ -8,7 +8,8 @@
 //! |---|---|---|---|
 //! | `asset.import` | write | `{project?, asset_id, type, files: [path], mode: "copy"\|"link_external"}` | `{ref, run_id?, handoff, files}` |
 //! | `asset.collect` | write | `{project?, asset_id}` | `{run_id, handoff, files}` |
-//! | `asset.signoff` | write | `{project?, asset_id, run_id, files?: [name], takes?: [n], bump?, keep_runs?, review_view?}` | `{ref, version, handoff}` |
+//! | `asset.signoff` | write | `{project?, asset_id, run_id, files?: [name], takes?: [n], bump?, keep_runs?, review_view?, overrides?}` | `{ref, version, handoff}` |
+//! | `asset.restore_version` | write | `{project?, asset_id, version, bump?}` | `{ref, version, restored_from, handoff}` |
 //! | `asset.request_signoff` | write | `{project?, asset_id}` | `{status}` |
 //! | `asset.pin_input` | write | `{project?, asset_id, ref, reason}` | `{pinned_inputs}` |
 //! | `asset.deprecate` | write | `{project?, asset_id, deprecated}` | `{status}` |
@@ -66,7 +67,24 @@
 //!   companions, and `signed_off` records `takes` and `companions`. With `review_view`, from a
 //!   `ui:*` caller, the call leaves the pick log's lines (one per signed take,
 //!   `tools::pick_log`) for after its Record stage, which starts them only once the sign-off is
-//!   recorded.
+//!   recorded. A name in `files` with a `/` is the file's path in the asset or run folder; a
+//!   bare name must name exactly one file (`params.invalid` otherwise). With
+//!   `overrides: "<version>"` (CORE-052; P4b-R38) the sign-off overrides that automatic
+//!   sign-off (`pipeline::plan_signoff_with`): the version's `signed_off.by` must be `auto`
+//!   (`params.invalid` otherwise), and its run is admitted though closed, for files it didn't
+//!   select; the next version records `signed_off.overrides_auto_pick`.
+//! - **`asset.restore_version`** (CORE-177; Appendix H): under one hold of the asset's version
+//!   lock, every file of `v<version>/` (the snapshot left out; top-level files and `source/**`)
+//!   is copied with `Store::stage_copy_writable` (never moved out of the sealed folder; each
+//!   copy must match its `hashes` entry) and committed as a new open run with `restored_from`
+//!   and the caller's `actor` (`pipeline::restored_run`, `pipeline::add_restored_run`, which
+//!   copies the version's trust records to the run's paths), with no status change; then the
+//!   run is signed off as `asset.signoff` does (bump default `minor`), choosing what the old
+//!   sign-off chose (its takes, else its files; every file for a legacy version). The
+//!   status-log entry carries `{code: "restored", ref: "<asset_id>@<version>"}`, the trust
+//!   records move to the new version's paths, and `{kind: "restored", version, restored_from}`
+//!   goes out on the asset's topic. An unknown version is `asset.unknown`. A restore writes no
+//!   pick-log line.
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
 //!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
@@ -150,6 +168,8 @@
 //! component the workspace accepts, without `#` (ruling Q8). Changes are published on the
 //! asset's topic: `{kind: "manifest"}` and `{kind: "status", status}`; the Record stage
 //! publishes the candidate runs and sealed versions.
+//!
+//! [`plan_signoff`]: crate::pipeline::plan_signoff
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -165,7 +185,7 @@ use lil_protocol::codes::{
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
     AssetRef, Bump, CandidateRun, Flag, Label, LinkRef, Manifest, SCHEME, Status, StatusEvent,
-    Take, TrustRecord, TrustSource, TrustSourceKind, TrustState, YamlEdit, bare_sha256,
+    Take, TrustRecord, TrustSource, TrustSourceKind, TrustState, Version, YamlEdit, bare_sha256,
     change_status, file_takes, fold_tag, hash_value, is_asset_id, is_slug, normalise_tags,
     takes_of,
 };
@@ -182,8 +202,9 @@ use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::record::trust_key;
 use crate::pipeline::{
-    Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, actor_of, asset_topic,
-    chosen_files, plan_signoff, signed_off_by, start_candidate_run, status_by,
+    Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, SignoffRecord, actor_of,
+    add_restored_run, asset_topic, chosen_files, plan_signoff_with, restored_run, signed_off_by,
+    start_candidate_run, status_by,
 };
 use crate::projects::redirects::{name_of, read_redirects};
 use crate::projects::repair as folder_repair;
@@ -191,8 +212,8 @@ use crate::projects::{
     ProjectFile, REDIRECTS_YAML, Resolver, project_yaml_path, read_project, unknown_project,
 };
 use crate::store::{
-    ASSET_TRASH_REASON, CommitOp, ManifestEdit, OutputMove, SNAPSHOT, SealRequest, Store,
-    StoreError, Written, WsPath, path_key,
+    ASSET_TRASH_REASON, CommitOp, ManifestEdit, OutputMove, SNAPSHOT, SealRequest, StagingHandle,
+    Store, StoreError, VersionDir, Written, WsPath, path_key,
 };
 use crate::workspace::OpenWorkspace;
 
@@ -215,7 +236,15 @@ const SIGNOFF_DESCRIPTION: &str = "Sign off files of an open candidate run, name
     for that version are rejected unless listed in keep_runs (kept open and pinned). bump \
     (major, minor, patch) confirms the version bump; without it the version proposed when the \
     work started is used. The result's ref carries the version's content hash; handoff lists \
-    what this unlocks and what it made stale.";
+    what this unlocks and what it made stale. A file name with a / is its path in the run \
+    folder. overrides (a version an automatic sign-off made) signs off another take of that \
+    closed run as the next version, recorded as an override of the automatic pick.";
+
+const RESTORE_DESCRIPTION: &str = "Restore an older sealed version as the asset's next \
+    version: its files, companions and source/ are copied (the old version is not changed) \
+    into a new candidate run and signed off through the normal sign-off, as a new version that \
+    records restored_from. bump (major, minor, patch) defaults to minor. The result's ref \
+    carries the new version's content hash.";
 
 const MARK_DESCRIPTION: &str = "Set an asset's marks: tags (replaces them) or add_tags and \
     remove_tags (compared without regard to case), rating (0-5, 0 unrated) and label (red, \
@@ -349,6 +378,29 @@ struct SignoffArgs {
     keep_runs: Vec<String>,
     /// The Review view the sign-off came from.
     review_view: Option<ReviewView>,
+    /// A version an automatic sign-off made: this sign-off overrides its pick, with another
+    /// take of that run.
+    overrides: Option<String>,
+}
+
+/// What [`signoff_locked`] takes of a sign-off's arguments.
+struct SignoffCall {
+    run_id: String,
+    bump: Option<BumpArg>,
+    keep_runs: Vec<String>,
+    review_view: Option<ReviewView>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RestoreArgs {
+    /// A project slug; omitted: the call's project.
+    project: Option<String>,
+    asset_id: String,
+    /// The sealed version to restore.
+    version: String,
+    /// The new version's bump; omitted: minor.
+    bump: Option<BumpArg>,
 }
 
 /// A Review view (Appendix H "Pick log"): validated on `asset.mark` and `asset.signoff`, stored
@@ -483,6 +535,17 @@ struct SignoffResult {
     #[serde(rename = "ref")]
     r#ref: String,
     version: String,
+    handoff: HandOff,
+    /// What failed after the manifest recorded the operation (ruling Q31).
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RestoreResult {
+    #[serde(rename = "ref")]
+    r#ref: String,
+    version: String,
+    restored_from: String,
     handoff: HandOff,
     /// What failed after the manifest recorded the operation (ruling Q31).
     warnings: Vec<String>,
@@ -1340,6 +1403,16 @@ async fn signoff(
             ));
         }
     };
+    let overrides = match args.overrides.as_deref().map(str::parse::<Version>) {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(_)) => {
+            return Err(invalid(
+                ctx,
+                "overrides names a version, as major.minor.patch".to_string(),
+            ));
+        }
+    };
     let a = asset_of(ctx, args.project, &args.asset_id).await?;
     let store = a.store().clone();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
@@ -1354,6 +1427,32 @@ async fn signoff(
         .version_lock(&a.project, &a.asset_id)
         .lock_owned()
         .await;
+    let call = SignoffCall {
+        run_id: args.run_id,
+        bump: args.bump,
+        keep_runs: args.keep_runs,
+        review_view: args.review_view,
+    };
+    let record = SignoffRecord {
+        overrides,
+        restored_from: None,
+    };
+    signoff_locked(ctx, services, a, guard, chosen, call, record).await
+}
+
+/// `asset.signoff` from the version lock on (module docs), `guard` holding it: the Record
+/// stage drops it.
+async fn signoff_locked(
+    ctx: &CallCtx,
+    services: &AssetServices,
+    a: Asset,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    chosen: Chosen,
+    args: SignoffCall,
+    record: SignoffRecord,
+) -> Result<(SignoffResult, String), ErrorBody> {
+    let store = a.store().clone();
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
     // Read again under the lock: a sign-off that held it before has recorded its version.
     let Some(m) = read_manifest(&store, &a.manifest).await.map_err(error)? else {
         return Err(unknown_asset(ctx, &a));
@@ -1381,13 +1480,14 @@ async fn signoff(
     let by = SignedOffBy::caller(&ctx.session.caller);
     let now = store.now_utc();
     let bump = args.bump.map(Bump::from);
-    let (planned, version) = plan_signoff(
+    let (planned, version) = plan_signoff_with(
         &with_hashes(&m, &args.run_id, &filled),
         &args.run_id,
         &chosen,
         bump,
         &args.keep_runs,
         &by,
+        &record,
         now,
     )
     .map_err(|e| traced(ctx, e))?;
@@ -1494,13 +1594,14 @@ async fn signoff(
         args.keep_runs.clone(),
     );
     let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
-        let (mut out, again) = plan_signoff(
+        let (mut out, again) = plan_signoff_with(
             &with_hashes(m, &run_id, &filled),
             &run_id,
             &chosen,
             bump,
             &keep,
             &by,
+            &record,
             now,
         )
         .map_err(|e| replanned_error(&rel, &e))?;
@@ -1626,6 +1727,202 @@ async fn signoff(
             r#ref,
             version: version.to_string(),
             warnings: Vec::new(),
+        },
+        summary,
+    ))
+}
+
+/// The files of version `old` copied into the handle `h` for the run `run_id` (CORE-177):
+/// each top-level file and each `source/**` file (the snapshot left out), writable, and
+/// checked against its `hashes` entry when it has one. Returns the moves into
+/// `candidates/<run_id>/` and each file's (path inside the version, SHA-256).
+async fn stage_restore(
+    a: &Asset,
+    h: &StagingHandle,
+    old: &VersionDir,
+    recorded: &BTreeMap<String, String>,
+    run_id: &str,
+) -> Result<(Vec<OutputMove>, Vec<(String, String)>), StoreError> {
+    let store = a.store();
+    let listed = store.version_files(&old.dir).await?;
+    let mut outputs = Vec::with_capacity(listed.len());
+    let mut files = Vec::with_capacity(listed.len());
+    let wanted = listed
+        .iter()
+        .filter(|(inside, _)| inside != SNAPSHOT)
+        .filter(|(inside, _)| !inside.contains('/') || inside.starts_with("source/"));
+    for (i, (inside, path)) in wanted.enumerate() {
+        let (staged, sha256) = store.stage_copy_writable(h, path, &format!("f{i}")).await?;
+        if let Some(expected) = recorded.get(&format!("v{}/{inside}", old.version))
+            && *expected != sha256
+        {
+            return Err(StoreError::Changed {
+                path: old.dir.join(inside)?,
+                expected: expected.clone(),
+                found: sha256,
+            });
+        }
+        let to = a.dir.join(&format!("candidates/{run_id}/{inside}"))?;
+        outputs.push(OutputMove { from: staged, to });
+        files.push((inside.clone(), sha256));
+    }
+    Ok((outputs, files))
+}
+
+async fn restore_version(
+    ctx: &CallCtx,
+    services: &AssetServices,
+    args: RestoreArgs,
+) -> Result<(RestoreResult, String), ErrorBody> {
+    let Ok(from) = args.version.parse::<Version>() else {
+        return Err(invalid(
+            ctx,
+            "version names a sealed version, as major.minor.patch".to_string(),
+        ));
+    };
+    let a = asset_of(ctx, args.project, &args.asset_id).await?;
+    let store = a.store().clone();
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let Some(m) = read_manifest(&store, &a.manifest).await.map_err(error)? else {
+        return Err(unknown_asset(ctx, &a));
+    };
+    if !m.view().external.is_empty() {
+        return Err(link_external_refusal(ctx, &a));
+    }
+    // CORE-177: the copies, the run and the seal under one hold of the version lock, to the
+    // end of the Record stage.
+    let guard = store
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
+    let Some(m) = read_manifest(&store, &a.manifest).await.map_err(error)? else {
+        return Err(unknown_asset(ctx, &a));
+    };
+    if !m.view().external.is_empty() {
+        return Err(link_external_refusal(ctx, &a));
+    }
+    let versions = store
+        .versions(&a.project, &a.asset_id)
+        .await
+        .map_err(error)?;
+    let Some(old) = versions.into_iter().find(|v| v.version == from) else {
+        return Err(ErrorBody::new(
+            &ASSET_UNKNOWN,
+            format!(
+                "`{}` has no version {from}; asset.get lists its versions.",
+                a.asset_id
+            ),
+            ctx.trace_id.clone(),
+        ));
+    };
+    // The old sign-off, from the version's snapshot: a legacy version has none.
+    let snapshot = match old.dir.join(SNAPSHOT) {
+        Ok(rel) if !old.legacy => store
+            .read(&rel)
+            .await
+            .map_err(error)?
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| Manifest::parse(&text).ok())
+            .map(|(s, _)| s),
+        _ => None,
+    };
+    let now = store.now_utc();
+    let run_id = store
+        .next_run_id(&a.dir, Some(&m), now)
+        .await
+        .map_err(error)?;
+    let recorded = m.view().hashes;
+    let handle = store.staging_handle().await.map_err(error)?;
+    let (outputs, files) = match stage_restore(&a, &handle, &old, &recorded, &run_id).await {
+        Ok(staged) => staged,
+        Err(e) => {
+            // What was staged stays in the handle as an orphan; nothing is deleted.
+            let _ = store.release_handle(handle).await;
+            return Err(error(e));
+        }
+    };
+    let restored = restored_run(
+        snapshot.as_ref(),
+        from,
+        &run_id,
+        &files,
+        &actor_of(&ctx.session.caller),
+        now,
+    );
+    // The sign-off is planned before anything is written: its version is the run's target.
+    let bump = args.bump.unwrap_or(BumpArg::Minor);
+    let record = SignoffRecord {
+        overrides: None,
+        restored_from: Some(from),
+    };
+    let mut planned = m.clone();
+    let version = add_restored_run(&mut planned, &restored.run, from)
+        .map_err(|why| invalid(ctx, why))
+        .and_then(|()| {
+            plan_signoff_with(
+                &planned,
+                &run_id,
+                &restored.chosen,
+                Some(bump.into()),
+                &[],
+                &SignedOffBy::caller(&ctx.session.caller),
+                &record,
+                now,
+            )
+            .map(|(_, v)| v)
+            .map_err(|e| traced(ctx, e))
+        });
+    let version = match version {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = store.release_handle(handle).await;
+            return Err(e);
+        }
+    };
+    let mut run = restored.run.clone();
+    run.insert("target_version".into(), Value::from(version.to_string()));
+    let rel = a.manifest.clone();
+    let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
+        add_restored_run(m, &run, from).map_err(|why| {
+            tracing::warn!(path = %rel, why = %why, "the manifest changed during a restore");
+            conflict(&rel)
+        })
+    });
+    let committed = store
+        .commit(CommitOp {
+            outputs,
+            moved: Vec::new(),
+            removed: Vec::new(),
+            manifest: Some((a.manifest.clone(), edit)),
+            job_line: None,
+            progress: None,
+        })
+        .await;
+    let _ = store.release_handle(handle).await;
+    committed.map_err(error)?;
+
+    let call = SignoffCall {
+        run_id,
+        bump: Some(bump),
+        keep_runs: Vec::new(),
+        // A restore writes no pick-log line.
+        review_view: None,
+    };
+    let (topic, asset_id) = (a.topic(), a.asset_id.clone());
+    let (signed, _) =
+        signoff_locked(ctx, services, a, guard, restored.chosen, call, record).await?;
+    ctx.events.publish(
+        &topic,
+        json!({"kind": "restored", "version": signed.version, "restored_from": from.to_string()}),
+    );
+    let summary = format!("restored {asset_id} {from} as {}", signed.version);
+    Ok((
+        RestoreResult {
+            r#ref: signed.r#ref,
+            version: signed.version,
+            restored_from: from.to_string(),
+            handoff: signed.handoff,
+            warnings: signed.warnings,
         },
         summary,
     ))
@@ -2935,6 +3232,17 @@ pub fn register_asset_tools(reg: &mut Registry, services: &AssetServices) {
         move |ctx, args: SignoffArgs| {
             let services = signing.clone();
             Box::pin(async move { signoff(ctx, &services, args).await })
+        },
+    ));
+    let restoring = services.clone();
+    reg.register(typed_tool(
+        "asset.restore_version",
+        RESTORE_DESCRIPTION,
+        EffectClass::Write,
+        WORKSPACE_MODULE,
+        move |ctx, args: RestoreArgs| {
+            let services = restoring.clone();
+            Box::pin(async move { restore_version(ctx, &services, args).await })
         },
     ));
     reg.register(typed_tool(

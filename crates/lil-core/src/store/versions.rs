@@ -1092,6 +1092,19 @@ impl Store {
         Ok(found)
     }
 
+    /// Every file in the version folder `dir` (a [`VersionDir::dir`]) as [`files_under`] lists
+    /// them: (`/`-separated path inside the folder, absolute path), sorted, links and OS
+    /// metadata files skipped, the snapshot included.
+    ///
+    /// # Errors
+    /// `store.io` when the folder can't be listed.
+    pub async fn version_files(&self, dir: &WsPath) -> Result<Vec<(String, PathBuf)>, StoreError> {
+        let abs = dir.abs(self.root());
+        blocking(move || files_under(&abs))
+            .await
+            .map_err(|e| StoreError::io(dir, &e))
+    }
+
     /// A version folder with no `hashes` entries, read from disk: whether it holds a snapshot,
     /// its content hash (`None` when a file in it is cloud-only, never read) and that flag.
     async fn hash_legacy(
