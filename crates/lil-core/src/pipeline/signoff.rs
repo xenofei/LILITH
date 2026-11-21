@@ -199,6 +199,10 @@ pub struct SignoffRecord {
     pub overrides: Option<Version>,
     /// The version a restore as new version copied into the run.
     pub restored_from: Option<Version>,
+    /// The version a restore signs off as, which it planned itself (CORE-177): its bump on
+    /// the approved version, or on the highest version folder when none is approved; or the
+    /// target of the run a failed restore left. Any bump is then ignored.
+    pub at: Option<Version>,
 }
 
 fn fail(spec: &CodeSpec, message: String) -> ErrorBody {
@@ -478,10 +482,11 @@ pub fn plan_signoff_with(
 
     // Ruling Q22: omitting `bump` accepts the proposal (CORE-027's proposed-then-confirmed);
     // `version.exists` is only for a real collision.
-    let version = match (view.approved_version, bump) {
-        (None, _) => view.version.unwrap_or(Version::new(1, 0, 0)),
-        (Some(approved), Some(b)) => approved.bump(b),
-        (Some(approved), None) => match (view.version, run.target_version) {
+    let version = match (record.at, view.approved_version, bump) {
+        (Some(at), _, _) => at,
+        (None, None, _) => view.version.unwrap_or(Version::new(1, 0, 0)),
+        (None, Some(approved), Some(b)) => approved.bump(b),
+        (None, Some(approved), None) => match (view.version, run.target_version) {
             (Some(v), _) if v > approved => v,
             (_, Some(t)) if t > approved => t,
             _ => approved.bump(Bump::Minor),
@@ -1328,6 +1333,7 @@ mod tests {
         let record = SignoffRecord {
             overrides: Some(Version::new(1, 0, 0)),
             restored_from: None,
+            at: None,
         };
         let plan = |chosen: &[&str], run: &str, record: &SignoffRecord| {
             plan_signoff_with(&auto, run, &files(chosen), None, &[], &cli, record, 0)
@@ -1375,6 +1381,7 @@ mod tests {
         let not_auto = SignoffRecord {
             overrides: Some(Version::new(2, 0, 0)),
             restored_from: None,
+            at: None,
         };
         assert_eq!(
             plan(&["b.png"], "r_1", &not_auto).unwrap_err().code,
@@ -1424,6 +1431,7 @@ mod tests {
         let record = SignoffRecord {
             overrides: None,
             restored_from: Some(Version::new(1, 0, 0)),
+            at: None,
         };
         let (signed, v) = plan_signoff_with(
             &m,

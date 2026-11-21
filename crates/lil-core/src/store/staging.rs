@@ -140,6 +140,22 @@ impl Store {
         })
     }
 
+    /// Removes copies the caller staged in the handle `h` for an operation it refused: each
+    /// `(path, sha256)` in the handle's folder that still has that hash (a file changed since
+    /// is left). A copy that can't be removed is logged and left, so releasing the handle then
+    /// makes it an orphan.
+    pub async fn discard_staged(&self, h: &StagingHandle, staged: &[(PathBuf, String)]) {
+        for (path, sha256) in staged {
+            if !path.starts_with(&h.dir) {
+                continue;
+            }
+            let (p, s) = (path.clone(), sha256.clone());
+            if let Err(e) = blocking(move || super::write::remove_if_hash(&p, &s)).await {
+                tracing::warn!(path = %path.display(), error = %e, "a staged copy can't be removed");
+            }
+        }
+    }
+
     /// Gives the handle back and removes its folder, which must be empty (its files were
     /// ingested). A handle that still holds files is kept on disk, is no longer live, and so
     /// becomes an orphan; the call is then `store.io`. A folder that is already gone is fine.

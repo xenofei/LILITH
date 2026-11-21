@@ -4862,6 +4862,174 @@ async fn only_files_at_the_top_of_the_run_folder_are_signed_off() {
 // Restore and sign-off failure paths (Task 14 audit, PR #113).
 // ---------------------------------------------------------------------------------------------
 
+/// Clears the read-only attribute of the sealed file `path` (the fixture writes past the
+/// store, as an edit outside the suite would).
+#[allow(clippy::disallowed_methods, clippy::permissions_set_readonly_false)]
+fn unseal(path: &Path) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+/// Deletes the sealed file `path`, as an edit outside the suite would.
+#[allow(clippy::disallowed_methods)]
+fn delete_sealed(path: &Path) {
+    unseal(path);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// The handles left in the workspace's staging folder.
+fn staging_left(fx: &Fx) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(fx.path(".lilith/staging"))
+        .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default()
+}
+
+/// The open runs of the manifest `m`, by id.
+fn open_runs(m: &Value) -> Vec<String> {
+    m["candidate_runs"]
+        .as_array()
+        .map(|runs| {
+            runs.iter()
+                .filter(|r| r["status"].is_null() || r["status"] == "open")
+                .filter(|r| r["trashed_utc"].is_null())
+                .map(|r| r["run_id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A restore whose Record stage failed is finished by a plain retry: the leftover run is
+/// signed off as the version its seal made, with the `restored` reason and event, and nothing
+/// is left over (Task 14 audit M-1).
+#[tokio::test] // spec: CORE-177, CORE-038
+async fn a_retry_finishes_a_restore_whose_record_failed() {
+    let fp = lil_core::store::FailPoints::none();
+    let fx = Fx::build_with(|_| {}, |_| Arc::new(SystemProbe), fp.clone());
+    kite_versions(&fx).await;
+    let manifest = manifest_file(&fx.ws, KITE);
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    fp.on(
+        "store.after_seal",
+        Box::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                let mut m = read_json(&manifest);
+                m["hashes"]["v1.2.0/stray.png"] = json!(format!("sha256:{}", "0".repeat(64)));
+                write_file(
+                    &manifest,
+                    serde_json::to_string_pretty(&m).unwrap().as_bytes(),
+                );
+            }
+            Ok(())
+        }),
+    );
+    let e = fx.err("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    edit_manifest(&fx.ws, KITE, |m| {
+        m["hashes"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("v1.2.0/stray.png");
+    });
+
+    let mut rx = kite_events(&fx).await;
+    let r = fx.ok("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(r["version"], "1.2.0", "{r}");
+    let m = fx.manifest(KITE);
+    let newest = status_log(&m).last().cloned().unwrap();
+    assert_eq!(
+        newest["reason"],
+        json!({"code": "restored", "ref": format!("{KITE}@1.0.0")}),
+        "{m}"
+    );
+    let restored: Vec<&Value> = m["candidate_runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["restored_from"] == "1.0.0")
+        .collect();
+    assert_eq!(restored.len(), 1, "{m}");
+    assert_eq!(restored[0]["signed_off"]["version"], "1.2.0", "{m}");
+    assert_eq!(open_runs(&m), Vec::<String>::new(), "{m}");
+    let orphans = fx.open().await.store.orphans().await.unwrap();
+    assert_eq!(orphans, Vec::<WsPath>::new());
+    let kinds = kinds_until(&mut rx, "restored", std::time::Duration::from_secs(30)).await;
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("restored"),
+        "{kinds:?}"
+    );
+    fx.shutdown().await;
+}
+
+/// A legacy version of an asset with no `approved_version` restores, bumped from its highest
+/// version folder, and leaves no extra open run (Task 14 audit M-2).
+#[tokio::test] // spec: CORE-177, CORE-033
+async fn a_legacy_version_without_an_approved_version_restores() {
+    let lamp = |bump: Option<&str>| {
+        let mut args =
+            json!({"project": "sketchbook", "asset_id": "prop_signal_lamp", "version": "1.0.0"});
+        if let Some(bump) = bump {
+            args["bump"] = json!(bump);
+        }
+        args
+    };
+    for (bump, want) in [(None, "1.1.0"), (Some("major"), "2.0.0")] {
+        let fx = Fx::new();
+        let before = open_runs(&fx.manifest("prop_signal_lamp"));
+        let r = fx.ok("asset.restore_version", lamp(bump)).await;
+        assert_eq!(r["version"], want, "{bump:?}: {r}");
+        let m = fx.manifest("prop_signal_lamp");
+        assert_eq!(m["approved_version"], want, "{m}");
+        assert_eq!(open_runs(&m), before, "{bump:?}: {m}");
+        fx.shutdown().await;
+    }
+}
+
+/// A version whose folder doesn't hold exactly its recorded files is refused before anything
+/// is staged or written: a deleted companion, an extra top-level file, an extra `source/`
+/// file (Task 14 audit M-3).
+#[tokio::test] // spec: CORE-177, CORE-024
+async fn a_version_folder_that_isnt_its_recorded_files_is_refused() {
+    for case in ["missing", "extra", "extra source"] {
+        let fx = Fx::new();
+        kite_versions(&fx).await;
+        let old = fx.path(&format!("{KITE_DIR}/v1.0.0"));
+        let named = match case {
+            "missing" => {
+                delete_sealed(&old.join("kite_mask.png"));
+                "kite_mask.png"
+            }
+            "extra" => {
+                write_file(&old.join("extra.png"), b"planted");
+                "extra.png"
+            }
+            _ => {
+                write_file(&old.join("source").join("extra.txt"), b"planted");
+                "source/extra.txt"
+            }
+        };
+        let manifest = manifest_file(&fx.ws, KITE);
+        let bytes = std::fs::read(&manifest).unwrap();
+        let candidates = tree(&fx.path(&format!("{KITE_DIR}/candidates")));
+        let e = fx.err("asset.restore_version", restore_args("1.0.0")).await;
+        assert_eq!(e.code, "store.hash_conflict", "{case}: {e:?}");
+        assert!(e.message.contains(named), "{case}: {e:?}");
+        assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "{case}");
+        assert_eq!(
+            tree(&fx.path(&format!("{KITE_DIR}/candidates"))),
+            candidates,
+            "{case}"
+        );
+        assert!(
+            staging_left(&fx).is_empty(),
+            "{case}: {:?}",
+            staging_left(&fx)
+        );
+        fx.shutdown().await;
+    }
+}
+
 /// A record that isn't at the top of its run folder is refused before anything moves, even
 /// when it lies outside the run folder (Task 14 audit M-4).
 #[tokio::test] // spec: CORE-026, CORE-024
@@ -4886,6 +5054,63 @@ async fn a_record_outside_the_run_folder_is_refused_before_the_seal() {
     assert_eq!(std::fs::read(&file).unwrap(), b"edited outside");
     let orphans = fx.open().await.store.orphans().await.unwrap();
     assert_eq!(orphans, Vec::<WsPath>::new());
+    fx.shutdown().await;
+}
+
+/// A refused restore leaves nothing in the staging folder: an edited sealed file (found while
+/// copying) and a deprecated asset (Task 14 audit L-1).
+#[tokio::test] // spec: CORE-177, CORE-038
+async fn a_refused_restore_leaves_no_staged_copies() {
+    for case in ["edited", "deprecated"] {
+        let fx = Fx::new();
+        kite_versions(&fx).await;
+        if case == "edited" {
+            let sealed = fx.path(&format!("{KITE_DIR}/v1.0.0/kite.png"));
+            unseal(&sealed);
+            write_file(&sealed, b"edited outside");
+        } else {
+            fx.ok(
+                "asset.deprecate",
+                json!({"project": "sketchbook", "asset_id": KITE, "deprecated": true}),
+            )
+            .await;
+        }
+        let e = fx.err("asset.restore_version", restore_args("1.0.0")).await;
+        assert_ne!(e.code, "", "{case}");
+        assert!(
+            staging_left(&fx).is_empty(),
+            "{case}: {:?}",
+            staging_left(&fx)
+        );
+        let orphans = fx.open().await.store.orphans().await.unwrap();
+        assert_eq!(orphans, Vec::<WsPath>::new(), "{case}");
+        fx.shutdown().await;
+    }
+}
+
+/// A snapshot that is there but doesn't parse is `manifest.needs_repair` for a restore, and
+/// `asset.get_version` still reads the version's files (Task 14 audit L-2).
+#[tokio::test] // spec: CORE-177, APP-141
+async fn a_restore_of_a_version_whose_snapshot_doesnt_parse_needs_repair() {
+    let fx = Fx::new();
+    kite_versions(&fx).await;
+    let snapshot = fx.path(&format!("{KITE_DIR}/v1.0.0/manifest.snapshot.json"));
+    unseal(&snapshot);
+    write_file(&snapshot, b"{ not json");
+    let manifest = manifest_file(&fx.ws, KITE);
+    let bytes = std::fs::read(&manifest).unwrap();
+    let e = fx.err("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(e.code, "manifest.needs_repair", "{e:?}");
+    assert_eq!(std::fs::read(&manifest).unwrap(), bytes, "nothing written");
+    assert!(staging_left(&fx).is_empty(), "{:?}", staging_left(&fx));
+    let v = fx
+        .ok(
+            "asset.get_version",
+            json!({"project": "sketchbook", "asset_id": KITE, "version": "1.0.0"}),
+        )
+        .await;
+    assert!(v["signed_off"].is_null(), "{v}");
+    assert_eq!(v["files"].as_array().unwrap().len(), 3, "{v}");
     fx.shutdown().await;
 }
 
