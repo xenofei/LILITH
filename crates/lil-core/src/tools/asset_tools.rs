@@ -86,8 +86,9 @@
 //!   run is signed off as `asset.signoff` does (bump default `minor`), choosing what the old
 //!   sign-off chose (its takes, else its files; every file for a legacy version). The
 //!   status-log entry carries `{code: "restored", ref: "<asset_id>@<version>"}`, the trust
-//!   records move to the new version's paths, and `{kind: "restored", version, restored_from}`
-//!   goes out on the asset's topic. As with any sign-off without `keep_runs`, the other open
+//!   records move to the new version's paths, and once the Record stage has recorded the
+//!   sign-off (`RecordSlot::after`; never when it fails) `{kind: "restored", version,
+//!   restored_from}` goes out on the asset's topic. As with any sign-off without `keep_runs`, the other open
 //!   runs for the new version are rejected. An unknown version is `asset.unknown`. A restore
 //!   writes no pick-log line. A failure after the restored run is committed leaves it open:
 //!   finish it with `asset.signoff`, or let a retry reject it.
@@ -1918,11 +1919,20 @@ async fn restore_version(
     let (topic, asset_id) = (a.topic(), a.asset_id.clone());
     let (signed, _) =
         signoff_locked(ctx, services, a, guard, restored.chosen, call, record).await?;
-    // TODO(Task 14 rebase): publish via RecordSlot::after
-    ctx.events.publish(
-        &topic,
+    // `restored` goes out once the Record stage has recorded the sign-off, never when it
+    // fails (`RecordSlot::after`). A restore leaves no other work there (it writes no pick-log
+    // line), but any is kept and runs first.
+    let earlier = ctx.record.take_after();
+    let (events, data) = (
+        ctx.events.clone(),
         json!({"kind": "restored", "version": signed.version, "restored_from": from.to_string()}),
     );
+    ctx.record.after(Box::pin(async move {
+        if let Some(earlier) = earlier {
+            earlier.await;
+        }
+        events.publish(&topic, data);
+    }));
     let summary = format!("restored {asset_id} {from} as {}", signed.version);
     Ok((
         RestoreResult {

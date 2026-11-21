@@ -3938,6 +3938,88 @@ async fn restore_version_seals_a_copy_as_the_next_version() {
     fx.shutdown().await;
 }
 
+/// The kinds of the events that reach `rx` within `wait`, in order, up to the first `stop`
+/// kind.
+async fn kinds_until(
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    stop: &str,
+    wait: std::time::Duration,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut kinds = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(line) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            let kind = v["params"]["data"]["kind"].as_str().unwrap_or_default();
+            kinds.push(kind.to_string());
+            if kind == stop {
+                return kinds;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    kinds
+}
+
+/// A subscriber of the kite's topic, on connection 9.
+async fn kite_events(fx: &Fx) -> tokio::sync::mpsc::Receiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    fx.events.attach(9, tx);
+    let topic = format!("asset:lil://{}/sketchbook/{KITE}", fx.ws_id());
+    fx.events
+        .subscribe(9, std::slice::from_ref(&topic), &Default::default())
+        .await;
+    rx
+}
+
+/// `restored` goes out once the Record stage has recorded the sign-off: after its
+/// `version_sealed`.
+#[tokio::test] // spec: CORE-177
+async fn restored_goes_out_after_the_version_is_recorded() {
+    let fx = Fx::new();
+    kite_versions(&fx).await;
+    let mut rx = kite_events(&fx).await;
+    fx.ok("asset.restore_version", restore_args("1.0.0")).await;
+    let kinds = kinds_until(&mut rx, "restored", std::time::Duration::from_secs(30)).await;
+    let at = |kind: &str| kinds.iter().position(|k| k == kind);
+    assert!(
+        at("version_sealed").is_some() && at("version_sealed") < at("restored"),
+        "{kinds:?}"
+    );
+    fx.shutdown().await;
+}
+
+/// A restore whose Record stage fails publishes no `restored`.
+#[tokio::test] // spec: CORE-177
+async fn a_restore_whose_record_fails_publishes_no_restored() {
+    let fp = lil_core::store::FailPoints::none();
+    let fx = Fx::build_with(|_| {}, |_| Arc::new(SystemProbe), fp.clone());
+    kite_versions(&fx).await;
+    let mut rx = kite_events(&fx).await;
+    // After the seal, a stray `v1.2.0/` key in `hashes`: the Record stage's edit refuses it.
+    let manifest = manifest_file(&fx.ws, KITE);
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    fp.on(
+        "store.after_seal",
+        Box::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                let mut m = read_json(&manifest);
+                m["hashes"]["v1.2.0/stray.png"] = json!(format!("sha256:{}", "0".repeat(64)));
+                write_file(
+                    &manifest,
+                    serde_json::to_string_pretty(&m).unwrap().as_bytes(),
+                );
+            }
+            Ok(())
+        }),
+    );
+    let e = fx.err("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(e.code, "store.hash_conflict", "{e:?}");
+    let kinds = kinds_until(&mut rx, "restored", std::time::Duration::from_secs(2)).await;
+    assert!(!kinds.iter().any(|k| k == "restored"), "{kinds:?}");
+    fx.shutdown().await;
+}
+
 /// The restore holds the asset's version lock from its staging to its seal: paused while it
 /// commits its run, a sign-off of the same asset waits, and runs once the restore is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)] // spec: CORE-177, CORE-026
