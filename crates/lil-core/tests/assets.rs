@@ -4177,7 +4177,7 @@ async fn a_restore_of_a_trusted_or_unflagged_version_flags_nothing() {
 
     // Never flagged: no record at all.
     edit_manifest(&fx.ws, KITE, |m| {
-        m.as_object_mut().unwrap().remove("trust");
+        m.as_object_mut().unwrap().shift_remove("trust");
     });
     let r = fx.ok("asset.restore_version", restore_args("1.0.0")).await;
     assert_eq!(r["version"], "1.2.0", "{r}");
