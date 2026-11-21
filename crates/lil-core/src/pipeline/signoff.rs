@@ -366,8 +366,8 @@ fn overridden(
 ///   be the one that made it, which is admitted though closed, for files it hasn't selected;
 ///   `signed_off.overrides_auto_pick` gets `{version, picked}`;
 /// - `record.restored_from` (CORE-177): the status-log entry gets the reason
-///   `{code: "restored", ref: "<asset_id>@<version>"}`, and the trust records of the run's
-///   files move to the new version's paths.
+///   `{code: "restored", ref: "<asset_id>@<version>"}`. The trust records of the run's files
+///   go to the new version's paths as every sign-off carries them (module docs).
 ///
 /// # Errors
 /// As [`plan_signoff`]; `params.invalid` for an `overrides` that names no automatic sign-off,
@@ -558,15 +558,6 @@ pub fn plan_signoff_with(
         signed_off["overrides_auto_pick"] =
             json!({"version": version.to_string(), "picked": picked});
     }
-    if record.restored_from.is_some() {
-        // The restored files leave the run folder for the version: so do their trust records.
-        let from = format!("candidates/{run_id}/");
-        for path in trust_paths(&out, &from) {
-            let to = format!("v{version}/{}", &path[from.len()..]);
-            copy_trust(&mut out, &path, &to);
-            out.set_trust(&path, None);
-        }
-    }
     let keep = |id: &str| keep_runs.iter().any(|k| same(k, id));
     for r in out.runs_mut() {
         let id = r
@@ -740,24 +731,18 @@ fn auto_pick_value(pick: &AutoPick) -> Value {
     json!({"picked": pick.picked, "reason": pick.reason.as_str(), "candidates": candidates})
 }
 
-/// The paths in the manifest's `trust` map that start with `prefix`, in map order.
-fn trust_paths(m: &Manifest, prefix: &str) -> Vec<String> {
+/// The paths in the manifest's `trust` map under the folder `prefix` (ending in `/`), found
+/// as the seal finds names ([`path_key`]), in map order, each with the rest of its path.
+fn trust_paths(m: &Manifest, prefix: &str) -> Vec<(String, String)> {
+    let prefix = path_key(prefix);
+    let skip = prefix.chars().count();
     match m.get("trust") {
         Some(Value::Object(trust)) => trust
             .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
+            .filter(|k| path_key(k).starts_with(&prefix))
+            .map(|k| (k.clone(), k.chars().skip(skip).collect()))
             .collect(),
         _ => Vec::new(),
-    }
-}
-
-// Replaced by lil_schema::carry_trust (Task 16) on rebase.
-/// Copies the trust record of `from` (if it has one) to `to` (ARCH-060: a copy keeps its
-/// source's trust).
-fn copy_trust(m: &mut Manifest, from: &str, to: &str) {
-    if let Some(rec) = m.trust(from) {
-        m.set_trust(to, Some(&rec));
     }
 }
 
@@ -899,8 +884,10 @@ pub fn restored_run(
 }
 
 /// Adds a restore's run (from [`restored_run`], `target_version` set) to the manifest, with no
-/// status change (the sign-off that follows makes the one entry), and copies the trust record
-/// of each file of `v<restored_from>/` to the same path in the run folder.
+/// status change (the sign-off that follows makes the one entry), and carries the trust record
+/// of each file of `v<restored_from>/` to the same path in the run folder
+/// (`lil_schema::carry_trust`), where the sign-off finds it and carries it on to the new
+/// version as every sign-off does.
 ///
 /// # Errors
 /// A message when the manifest has a run with that id already or `candidate_runs` isn't a list.
@@ -922,10 +909,8 @@ pub fn add_restored_run(
     }
     m.push("candidate_runs", Value::Object(run.clone()))
         .map_err(|e| format!("{e:?}"))?;
-    let from = format!("v{restored_from}/");
-    for path in trust_paths(m, &from) {
-        let to = format!("candidates/{id}/{}", &path[from.len()..]);
-        copy_trust(m, &path, &to);
+    for (path, rest) in trust_paths(m, &format!("v{restored_from}/")) {
+        carry_trust(m, &path, &format!("candidates/{id}/{rest}"));
     }
     Ok(())
 }
@@ -1382,7 +1367,7 @@ mod tests {
     }
 
     #[test] // spec: CORE-177
-    fn a_restore_logs_restored_and_moves_its_trust_records() {
+    fn a_restore_logs_restored_and_carries_its_trust_records() {
         // The restore's open run `r_9`, holding a copy of 1.0.0's a.png with its trust record.
         let (mut m, _) = plan_signoff(
             &manifest(),
@@ -1444,8 +1429,9 @@ mod tests {
             ("restored", Some("prop_kite@1.0.0"))
         );
         assert_eq!(signed.trust("v1.1.0/a.png"), Some(untrusted.clone()));
-        assert_eq!(signed.trust("v1.0.0/a.png"), Some(untrusted));
-        assert_eq!(signed.trust("candidates/r_9/a.png"), None);
+        assert_eq!(signed.trust("v1.0.0/a.png"), Some(untrusted.clone()));
+        // The run's record stays, as with every sign-off.
+        assert_eq!(signed.trust("candidates/r_9/a.png"), Some(untrusted));
         assert_eq!(
             signed.view().candidate_runs[3].restored_from,
             Some(Version::new(1, 0, 0))

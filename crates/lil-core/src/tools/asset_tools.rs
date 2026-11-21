@@ -82,16 +82,17 @@
 //!   is copied with `Store::stage_copy_writable` (never moved out of the sealed folder; each
 //!   copy must match its `hashes` entry) and committed as a new open run with `restored_from`
 //!   and the caller's `actor` (`pipeline::restored_run`, `pipeline::add_restored_run`, which
-//!   copies the version's trust records to the run's paths), with no status change; then the
+//!   carries the version's trust records to the run's paths), with no status change; then the
 //!   run is signed off as `asset.signoff` does (bump default `minor`), choosing what the old
 //!   sign-off chose (its takes, else its files; every file for a legacy version). The
 //!   status-log entry carries `{code: "restored", ref: "<asset_id>@<version>"}`, the trust
-//!   records move to the new version's paths, and once the Record stage has recorded the
-//!   sign-off (`RecordSlot::after`; never when it fails) `{kind: "restored", version,
-//!   restored_from}` goes out on the asset's topic. As with any sign-off without `keep_runs`, the other open
-//!   runs for the new version are rejected. An unknown version is `asset.unknown`. A restore
-//!   writes no pick-log line. A failure after the restored run is committed leaves it open:
-//!   finish it with `asset.signoff`, or let a retry reject it.
+//!   records go on to the new version's paths as every sign-off carries them, and once the
+//!   Record stage has recorded the sign-off (`RecordSlot::after`; never when it fails)
+//!   `{kind: "restored", version, restored_from}` goes out on the asset's topic. As with any
+//!   sign-off without `keep_runs`, the other open runs for the new version are rejected. An
+//!   unknown version is `asset.unknown`. A restore writes no pick-log line. A failure after
+//!   the restored run is committed leaves it open: finish it with `asset.signoff`, or let a
+//!   retry reject it.
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
 //!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it

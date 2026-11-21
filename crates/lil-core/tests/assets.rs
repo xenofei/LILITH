@@ -6,7 +6,7 @@
 //! with the fake clock and ids (QA-031), on a copy of the spec fixture workspace under the
 //! test's `TestEnv` root. Fixture files are written with `lil_testkit::files::write_file`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -4136,19 +4136,76 @@ async fn restore_copies_trust_records() {
     let m = fx.manifest(KITE);
     assert_eq!(m["trust"]["v1.2.0/kite.png"], record, "{m}");
     assert_eq!(m["trust"]["v1.0.0/kite.png"], record, "{m}");
-    // No record is left on the restored run's paths, which the seal emptied; the second
-    // import's record stays on its run's path and went to v1.1.0, as every sign-off carries it.
-    let keys: Vec<&String> = m["trust"].as_object().unwrap().keys().collect();
+    // Every sign-off's carry: the run's record stays on its path, and goes on to the version
+    // (the second import's to v1.1.0, the restored run's to v1.2.0).
+    let restored = signed_run(&m, "1.2.0")["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let keys: BTreeSet<&str> = m["trust"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let second_key = format!("candidates/{second}/kite.png");
+    let restored_key = format!("candidates/{restored}/kite.png");
     assert_eq!(
         keys,
-        [
+        BTreeSet::from([
             "v1.0.0/kite.png",
-            &format!("candidates/{second}/kite.png"),
+            second_key.as_str(),
             "v1.1.0/kite.png",
-            "v1.2.0/kite.png"
-        ],
+            restored_key.as_str(),
+            "v1.2.0/kite.png",
+        ]),
         "{m}"
     );
+    assert_eq!(m["trust"][&restored_key], record, "{m}");
+    fx.shutdown().await;
+}
+
+/// A restore flags nothing itself: a version without records gives a version without them,
+/// and a trusted one stays trusted.
+#[tokio::test] // spec: CORE-177, ARCH-060
+async fn a_restore_of_a_trusted_or_unflagged_version_flags_nothing() {
+    let fx = Fx::new();
+    let first = fx.import_run(KITE, "kite.png", b"kite one").await;
+    fx.signoff(KITE, &first, &["kite.png"], json!({})).await;
+    let second = fx.import_run(KITE, "kite.png", b"kite two").await;
+    fx.signoff(KITE, &second, &["kite.png"], json!({})).await;
+
+    // Never flagged: no record at all.
+    edit_manifest(&fx.ws, KITE, |m| {
+        m.as_object_mut().unwrap().remove("trust");
+    });
+    let r = fx.ok("asset.restore_version", restore_args("1.0.0")).await;
+    assert_eq!(r["version"], "1.2.0", "{r}");
+    let m = fx.manifest(KITE);
+    assert!(
+        m.get("trust")
+            .is_none_or(|t| t.as_object().is_some_and(|t| t.is_empty())),
+        "{m}"
+    );
+
+    // Trusted: the new version's record is the same trusted record.
+    let trusted = json!({"state": "trusted", "sources": [{"kind": "import", "ref": "kite.png"}],
+                         "marked_trusted": "2027-01-15T08:00:00Z"});
+    edit_manifest(&fx.ws, KITE, |m| {
+        m["trust"] = json!({"v1.1.0/kite.png": trusted});
+    });
+    let r = fx.ok("asset.restore_version", restore_args("1.1.0")).await;
+    assert_eq!(r["version"], "1.3.0", "{r}");
+    let m = fx.manifest(KITE);
+    assert_eq!(m["trust"]["v1.3.0/kite.png"], trusted, "{m}");
+    let untrusted: Vec<&String> = m["trust"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, r)| r["state"] == "untrusted")
+        .map(|(k, _)| k)
+        .collect();
+    assert!(untrusted.is_empty(), "{m}");
     fx.shutdown().await;
 }
 
