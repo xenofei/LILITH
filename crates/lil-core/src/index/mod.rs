@@ -227,7 +227,7 @@ const ORPHAN_RUNS: &str = "
 /// [`Index::orphans_of`]'s orphan versions: the keys of the `v<semver>` folders under `?1`..`?2`
 /// (as [`ORPHAN_RUNS`]) holding a `manifest.snapshot.json` row, whose asset folder has no asset
 /// row or one whose manifest parses and records neither that `approved_version` nor a run's
-/// `signed_off.version`.
+/// `signed_off.version` or an override's `overrides_auto_pick.version`.
 const ORPHAN_VERSIONS: &str = "
     SELECT DISTINCT substr(s.key, 1, length(s.key) - 23) FROM (
         SELECT key,
@@ -881,10 +881,11 @@ impl Index {
     /// the disk: the `candidates/<run>` folders holding an indexed file whose asset's manifest
     /// has no run of that id; the `v<semver>` folders holding an indexed
     /// `manifest.snapshot.json` whose version is neither the manifest's `approved_version` nor a
-    /// run's `signed_off.version`; and the conflict copies (`*.lil-conflict-*`) anywhere under
-    /// `projects/<project>/`. An asset folder without a manifest records none; one whose
-    /// manifest doesn't parse is skipped. Run ids, version folders and the project compare
-    /// without regard to case, so a project folder renamed only in case has the same orphans.
+    /// run's `signed_off.version` or an override's `overrides_auto_pick.version`; and the
+    /// conflict copies (`*.lil-conflict-*`) anywhere under `projects/<project>/`. An asset
+    /// folder without a manifest records none; one whose manifest doesn't parse is skipped.
+    /// Run ids, version folders and the project compare without regard to case, so a project
+    /// folder renamed only in case has the same orphans.
     /// Sorted, one path per folder or copy, spelled as indexed.
     ///
     /// # Errors

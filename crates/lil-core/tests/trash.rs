@@ -1158,11 +1158,16 @@ fn hard_deletes_happen_only_in_purge_temp_cleanup_and_index_rebuild() {
         ) || rel.starts_with("index/")
     };
     // Hash-checked deletes of the core's own bytes through one unshared handle: settled
-    // backups (the store's and `suite.toml`'s) and a failed seal's own copies and snapshot.
+    // backups (the store's and `suite.toml`'s), a failed seal's own copies and snapshot, and a
+    // refused restore's own staged copies.
     let checked = |rel: &str| {
         matches!(
             rel,
-            "store/fsops.rs" | "store/write.rs" | "store/suite_toml.rs" | "store/versions.rs"
+            "store/fsops.rs"
+                | "store/write.rs"
+                | "store/suite_toml.rs"
+                | "store/versions.rs"
+                | "store/staging.rs"
         )
     };
     type Allowed<'a> = &'a dyn Fn(&str) -> bool;

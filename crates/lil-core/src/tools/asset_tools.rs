@@ -8,7 +8,8 @@
 //! |---|---|---|---|
 //! | `asset.import` | write | `{project?, asset_id, type, files: [path], mode: "copy"\|"link_external"}` | `{ref, run_id?, handoff, files}` |
 //! | `asset.collect` | write | `{project?, asset_id}` | `{run_id, handoff, files}` |
-//! | `asset.signoff` | write | `{project?, asset_id, run_id, files?: [name], takes?: [n], bump?, keep_runs?, review_view?}` | `{ref, version, handoff}` |
+//! | `asset.signoff` | write | `{project?, asset_id, run_id, files?: [name], takes?: [n], bump?, keep_runs?, review_view?, overrides?}` | `{ref, version, handoff}` |
+//! | `asset.restore_version` | write | `{project?, asset_id, version, bump?}` | `{ref, version, restored_from, handoff}` |
 //! | `asset.request_signoff` | write | `{project?, asset_id}` | `{status}` |
 //! | `asset.pin_input` | write | `{project?, asset_id, ref, reason}` | `{pinned_inputs}` |
 //! | `asset.deprecate` | write | `{project?, asset_id, deprecated}` | `{status}` |
@@ -66,7 +67,44 @@
 //!   companions, and `signed_off` records `takes` and `companions`. With `review_view`, from a
 //!   `ui:*` caller, the call leaves the pick log's lines (one per signed take,
 //!   `tools::pick_log`) for after its Record stage, which starts them only once the sign-off is
-//!   recorded.
+//!   recorded. A name in `files` with a `/` is the file's path in the asset or run folder; a
+//!   bare name must name exactly one file (`params.invalid` otherwise). Only files at the top
+//!   of the run folder can be signed off: a file in a folder inside it is `params.invalid`.
+//!   With `overrides: "<version>"` (CORE-052; P4b-R38) the sign-off overrides that automatic
+//!   sign-off (`pipeline::plan_signoff_with`): the version's `signed_off.by` must be `auto`
+//!   (`params.invalid` otherwise, also for a version overridden already), and its run is
+//!   admitted though closed, for files it didn't select; the next version records
+//!   `signed_off.overrides_auto_pick`, which replaces the run's record of the automatic
+//!   sign-off. After an override the automatic record lives in that version's snapshot
+//!   (`asset.get_version`).
+//! - **`asset.restore_version`** (CORE-177; Appendix H): under one hold of the asset's version
+//!   lock, in four steps. 1. The pre-flight, before anything is staged or written: the
+//!   version's snapshot must parse (`manifest.needs_repair`; none for a legacy version); its
+//!   folder must hold exactly the files its `hashes` entries record (the snapshot left out;
+//!   compared by `path_key`), a missing or unrecorded file being `store.hash_conflict` naming
+//!   it, and a version with no entries giving the files there are; the new version is the
+//!   bump (default `minor`) on the approved version, or on the highest version folder when
+//!   none is approved, and its folder must not exist (`version.exists`); and the sign-off is
+//!   planned as a dry run on the planned run, so its status, version and empty-choice
+//!   refusals come before anything is written. 2. Every top-level and `source/**` file is
+//!   copied with `Store::stage_copy_writable` (never moved out of the sealed folder; each
+//!   copy must match its hash, and a refusal removes the copies made) and committed as a new
+//!   open run with `restored_from`, `target_version` and the caller's `actor`
+//!   (`pipeline::restored_run`, `pipeline::add_restored_run`, which carries the version's
+//!   trust records to the run's paths), with no status change. 3. The run is signed off as
+//!   `asset.signoff` does, as the planned version, choosing what the old sign-off chose (its
+//!   takes, else its files; every file for a legacy version). The status-log entry carries
+//!   `{code: "restored", ref: "<asset_id>@<version>"}`, the trust records go on to the new
+//!   version's paths as every sign-off carries them, and once the Record stage has recorded
+//!   the sign-off (`RecordSlot::after`; never when it fails) `{kind: "restored", version,
+//!   restored_from}` goes out on the asset's topic. As with any sign-off without `keep_runs`,
+//!   the other open runs for the new version are rejected. An unknown version is
+//!   `asset.unknown`. A restore writes no pick-log line. A restore whose Record stage failed
+//!   leaves its run open with a sealed, unrecorded `v<target>/`: a retry of the same restore
+//!   adopts that run and signs it off as its target (the seal adopts the folder, ruling Q31)
+//!   instead of making a new run, keeping the `restored` reason and event. The run can also
+//!   be finished with `asset.signoff`, but that sign-off is a plain one: no `restored` reason
+//!   in the status log and no `restored` event.
 //! - **`asset.request_signoff`** moves the status to `in_review` (CORE-053) with a manifest
 //!   edit; an asset already `in_review` is left as it is, and an `approved`, `exported` or
 //!   `released` asset with an open (kept) run takes `CandidateRun` first (ruling Q23). It is not a Record branch, so it
@@ -150,6 +188,8 @@
 //! component the workspace accepts, without `#` (ruling Q8). Changes are published on the
 //! asset's topic: `{kind: "manifest"}` and `{kind: "status", status}`; the Record stage
 //! publishes the candidate runs and sealed versions.
+//!
+//! [`plan_signoff`]: crate::pipeline::plan_signoff
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -158,14 +198,14 @@ use std::time::Duration;
 
 use lil_protocol::app::{ConfirmFacts, TouchAccess};
 use lil_protocol::codes::{
-    ASSET_IN_USE, ASSET_IN_USE_MESSAGE, ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, MANIFEST_NEEDS_REPAIR,
-    PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID, STATE_UNAVAILABLE, STATUS_INVALID_TRANSITION,
-    WORKSPACE_REQUIRED,
+    ASSET_IN_USE, ASSET_IN_USE_MESSAGE, ASSET_LINK_EXTERNAL, ASSET_UNKNOWN, CORE_BUG,
+    MANIFEST_NEEDS_REPAIR, PARAMS_INVALID, REF_HASH_MISMATCH, REF_INVALID, STATE_UNAVAILABLE,
+    STATUS_INVALID_TRANSITION, STORE_HASH_CONFLICT, VERSION_EXISTS, WORKSPACE_REQUIRED,
 };
 use lil_protocol::{AgentHint, EffectClass, ErrorBody, Fix, UiAction};
 use lil_schema::{
     AssetRef, Bump, CandidateRun, Flag, Label, LinkRef, Manifest, SCHEME, Status, StatusEvent,
-    Take, TrustRecord, TrustSource, TrustSourceKind, TrustState, YamlEdit, bare_sha256,
+    Take, TrustRecord, TrustSource, TrustSourceKind, TrustState, Version, YamlEdit, bare_sha256,
     change_status, file_takes, fold_tag, hash_value, is_asset_id, is_slug, normalise_tags,
     takes_of,
 };
@@ -181,9 +221,11 @@ use super::services::{AssetServices, InUse};
 use super::stages::ConfirmInput;
 use super::workspace_tools::WORKSPACE_MODULE;
 use crate::pipeline::record::trust_key;
+use crate::pipeline::signoff::{file_named, top_level_file};
 use crate::pipeline::{
-    Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, actor_of, asset_topic,
-    chosen_files, plan_signoff, signed_off_by, start_candidate_run, status_by,
+    Chosen, HandOff, RecordBranch, RecordPlan, RecordSlot, SignedOffBy, SignoffRecord, actor_of,
+    add_restored_run, asset_topic, chosen_files, plan_signoff_with, restored_run, signed_off_by,
+    start_candidate_run, status_by,
 };
 use crate::projects::redirects::{name_of, read_redirects};
 use crate::projects::repair as folder_repair;
@@ -191,8 +233,8 @@ use crate::projects::{
     ProjectFile, REDIRECTS_YAML, Resolver, project_yaml_path, read_project, unknown_project,
 };
 use crate::store::{
-    ASSET_TRASH_REASON, CommitOp, ManifestEdit, OutputMove, SNAPSHOT, SealRequest, Store,
-    StoreError, Written, WsPath, path_key,
+    ASSET_TRASH_REASON, CommitOp, ManifestEdit, OutputMove, SNAPSHOT, SealRequest, StagingHandle,
+    Store, StoreError, VersionDir, Written, WsPath, path_key,
 };
 use crate::workspace::OpenWorkspace;
 
@@ -215,7 +257,15 @@ const SIGNOFF_DESCRIPTION: &str = "Sign off files of an open candidate run, name
     for that version are rejected unless listed in keep_runs (kept open and pinned). bump \
     (major, minor, patch) confirms the version bump; without it the version proposed when the \
     work started is used. The result's ref carries the version's content hash; handoff lists \
-    what this unlocks and what it made stale.";
+    what this unlocks and what it made stale. A file name with a / is its path in the run \
+    folder. overrides (a version an automatic sign-off made) signs off another take of that \
+    closed run as the next version, recorded as an override of the automatic pick.";
+
+const RESTORE_DESCRIPTION: &str = "Restore an older sealed version as the asset's next \
+    version: its files, companions and source/ are copied (the old version is not changed) \
+    into a new candidate run and signed off through the normal sign-off, as a new version that \
+    records restored_from. bump (major, minor, patch) defaults to minor. The result's ref \
+    carries the new version's content hash.";
 
 const MARK_DESCRIPTION: &str = "Set an asset's marks: tags (replaces them) or add_tags and \
     remove_tags (compared without regard to case), rating (0-5, 0 unrated) and label (red, \
@@ -349,6 +399,29 @@ struct SignoffArgs {
     keep_runs: Vec<String>,
     /// The Review view the sign-off came from.
     review_view: Option<ReviewView>,
+    /// A version an automatic sign-off made: this sign-off overrides its pick, with another
+    /// take of that run.
+    overrides: Option<String>,
+}
+
+/// What [`signoff_locked`] takes of a sign-off's arguments.
+struct SignoffCall {
+    run_id: String,
+    bump: Option<BumpArg>,
+    keep_runs: Vec<String>,
+    review_view: Option<ReviewView>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RestoreArgs {
+    /// A project slug; omitted: the call's project.
+    project: Option<String>,
+    asset_id: String,
+    /// The sealed version to restore.
+    version: String,
+    /// The new version's bump; omitted: minor.
+    bump: Option<BumpArg>,
 }
 
 /// A Review view (Appendix H "Pick log"): validated on `asset.mark` and `asset.signoff`, stored
@@ -489,6 +562,17 @@ struct SignoffResult {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+struct RestoreResult {
+    #[serde(rename = "ref")]
+    r#ref: String,
+    version: String,
+    restored_from: String,
+    handoff: HandOff,
+    /// What failed after the manifest recorded the operation (ruling Q31).
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 struct StatusResult {
     status: String,
 }
@@ -589,14 +673,9 @@ fn unknown_asset(ctx: &CallCtx, a: &Asset) -> ErrorBody {
 
 /// The call's asset: names checked, the project must exist, and no folder on the way to the
 /// asset may be a link.
-async fn asset_of(
-    ctx: &CallCtx,
-    project: Option<String>,
-    asset_id: &str,
-) -> Result<Asset, ErrorBody> {
-    let open = ctx.workspace()?.clone();
-    let project = project.unwrap_or_else(|| ctx.project_or_default());
-    if !is_slug(&project) {
+/// `params.invalid` unless `project` is a project slug and `asset_id` an asset id.
+pub(crate) fn validate_ids(ctx: &CallCtx, project: &str, asset_id: &str) -> Result<(), ErrorBody> {
+    if !is_slug(project) {
         return Err(invalid(ctx, format!("{project:?} is not a project slug")));
     }
     if !is_asset_id(asset_id) {
@@ -608,6 +687,17 @@ async fn asset_of(
             ),
         ));
     }
+    Ok(())
+}
+
+async fn asset_of(
+    ctx: &CallCtx,
+    project: Option<String>,
+    asset_id: &str,
+) -> Result<Asset, ErrorBody> {
+    let open = ctx.workspace()?.clone();
+    let project = project.unwrap_or_else(|| ctx.project_or_default());
+    validate_ids(ctx, &project, asset_id)?;
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
     if read_project(&open.store, &project).await.map_err(error)? == ProjectFile::Missing {
         return Err(traced(ctx, unknown_project(&project)));
@@ -1340,6 +1430,16 @@ async fn signoff(
             ));
         }
     };
+    let overrides = match args.overrides.as_deref().map(str::parse::<Version>) {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(_)) => {
+            return Err(invalid(
+                ctx,
+                "overrides names a version, as major.minor.patch".to_string(),
+            ));
+        }
+    };
     let a = asset_of(ctx, args.project, &args.asset_id).await?;
     let store = a.store().clone();
     let error = |e: StoreError| e.to_error(&ctx.trace_id);
@@ -1354,6 +1454,33 @@ async fn signoff(
         .version_lock(&a.project, &a.asset_id)
         .lock_owned()
         .await;
+    let call = SignoffCall {
+        run_id: args.run_id,
+        bump: args.bump,
+        keep_runs: args.keep_runs,
+        review_view: args.review_view,
+    };
+    let record = SignoffRecord {
+        overrides,
+        restored_from: None,
+        at: None,
+    };
+    signoff_locked(ctx, services, a, guard, chosen, call, record).await
+}
+
+/// `asset.signoff` from the version lock on (module docs), `guard` holding it: the Record
+/// stage drops it.
+async fn signoff_locked(
+    ctx: &CallCtx,
+    services: &AssetServices,
+    a: Asset,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    chosen: Chosen,
+    args: SignoffCall,
+    record: SignoffRecord,
+) -> Result<(SignoffResult, String), ErrorBody> {
+    let store = a.store().clone();
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
     // Read again under the lock: a sign-off that held it before has recorded its version.
     let Some(m) = read_manifest(&store, &a.manifest).await.map_err(error)? else {
         return Err(unknown_asset(ctx, &a));
@@ -1381,13 +1508,14 @@ async fn signoff(
     let by = SignedOffBy::caller(&ctx.session.caller);
     let now = store.now_utc();
     let bump = args.bump.map(Bump::from);
-    let (planned, version) = plan_signoff(
+    let (planned, version) = plan_signoff_with(
         &with_hashes(&m, &args.run_id, &filled),
         &args.run_id,
         &chosen,
         bump,
         &args.keep_runs,
         &by,
+        &record,
         now,
     )
     .map_err(|e| traced(ctx, e))?;
@@ -1417,12 +1545,19 @@ async fn signoff(
     // its sealing folder, so a save that lands in between is never sealed either.
     let mut expected = BTreeMap::new();
     for name in &run.selected {
-        let Some(hex) = run
-            .files
-            .iter()
-            .find(|f| f.path.rsplit('/').next() == Some(name.as_str()))
-            .and_then(|f| f.sha256.clone())
-        else {
+        // `plan_signoff` checked each name; a name without a record at the top of the run
+        // folder is refused before anything moves, never skipped.
+        let Some(file) = top_level_file(&run, name) else {
+            return Err(invalid(
+                ctx,
+                format!(
+                    "`{name}` is not a file at the top of the run `{}`'s folder: only files at \
+                     the top of the run folder can be signed off.",
+                    run.run_id
+                ),
+            ));
+        };
+        let Some(hex) = file.sha256.clone() else {
             continue;
         };
         let rel = a
@@ -1494,13 +1629,14 @@ async fn signoff(
         args.keep_runs.clone(),
     );
     let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
-        let (mut out, again) = plan_signoff(
+        let (mut out, again) = plan_signoff_with(
             &with_hashes(m, &run_id, &filled),
             &run_id,
             &chosen,
             bump,
             &keep,
             &by,
+            &record,
             now,
         )
         .map_err(|e| replanned_error(&rel, &e))?;
@@ -1629,6 +1765,383 @@ async fn signoff(
         },
         summary,
     ))
+}
+
+/// One file of a version a restore copies: its path inside the version folder, its
+/// workspace-relative and absolute paths, and the SHA-256 it must have (its `hashes` entry;
+/// for a version with none, the file's own).
+struct RestoreFile {
+    inside: String,
+    rel: WsPath,
+    path: PathBuf,
+    sha256: String,
+}
+
+/// The files of version `old` a restore copies (CORE-177; module docs): each top-level file
+/// and each `source/**` file, the snapshot left out. For a version with `hashes` entries the
+/// folder must hold exactly its recorded files, compared by [`path_key`]: a recorded file
+/// that is missing, or a file that was never recorded, is `store.hash_conflict` naming it (the
+/// sealed folder was changed outside the suite). A version with no entries (a true legacy
+/// version) gives the files there are, each with its own hash.
+async fn restore_files(
+    ctx: &CallCtx,
+    a: &Asset,
+    m: &Manifest,
+    old: &VersionDir,
+) -> Result<Vec<RestoreFile>, ErrorBody> {
+    let store = a.store();
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let listed: Vec<(String, PathBuf)> = store
+        .version_files(&old.dir)
+        .await
+        .map_err(error)?
+        .into_iter()
+        .filter(|(inside, _)| inside != SNAPSHOT)
+        .collect();
+    let prefix = path_key(&format!("v{}/", old.version));
+    let skip = prefix.chars().count();
+    let recorded: Vec<(String, String)> = m
+        .view()
+        .hashes
+        .into_iter()
+        .filter(|(key, _)| path_key(key).starts_with(&prefix))
+        .map(|(key, hex)| (key.chars().skip(skip).collect(), hex))
+        .collect();
+    let changed = |inside: &str, why: &str| -> ErrorBody {
+        let shown = old
+            .dir
+            .join(inside)
+            .map_or_else(|_| inside.to_string(), |rel| rel.to_string());
+        ErrorBody::new(
+            &STORE_HASH_CONFLICT,
+            format!(
+                "`{shown}` {why}: the sealed version {} was changed outside LILITH, so it can't \
+                 be restored as it was.",
+                old.version
+            ),
+            ctx.trace_id.clone(),
+        )
+    };
+    let same = |a: &str, b: &str| path_key(a) == path_key(b);
+    if !recorded.is_empty() {
+        if let Some((inside, _)) = recorded
+            .iter()
+            .find(|(inside, _)| !listed.iter().any(|(l, _)| same(l, inside)))
+        {
+            return Err(changed(
+                inside,
+                "is recorded but isn't in the version's folder",
+            ));
+        }
+        if let Some((inside, _)) = listed
+            .iter()
+            .find(|(l, _)| !recorded.iter().any(|(inside, _)| same(l, inside)))
+        {
+            return Err(changed(
+                inside,
+                "is in the version's folder but was never recorded",
+            ));
+        }
+    }
+    let mut files = Vec::with_capacity(listed.len());
+    for (inside, path) in listed
+        .into_iter()
+        .filter(|(inside, _)| !inside.contains('/') || inside.starts_with("source/"))
+    {
+        let rel = old.dir.join(&inside).map_err(error)?;
+        let sha256 = match recorded.iter().find(|(r, _)| same(r, &inside)) {
+            Some((_, hex)) => hex.clone(),
+            None => match store.hash(&rel).await.map_err(error)? {
+                Some(hex) => hex,
+                None => return Err(changed(&inside, "can't be read")),
+            },
+        };
+        files.push(RestoreFile {
+            inside,
+            rel,
+            path,
+            sha256,
+        });
+    }
+    Ok(files)
+}
+
+/// The files `files` of a version copied into the handle `h` for the run `run_id`
+/// (CORE-177), writable, each checked against its SHA-256. Each copy goes into `staged` as it
+/// is made, so a refusal can remove them ([`Store::discard_staged`]). Returns the moves into
+/// `candidates/<run_id>/`.
+async fn stage_restore(
+    a: &Asset,
+    h: &StagingHandle,
+    files: &[RestoreFile],
+    run_id: &str,
+    staged: &mut Vec<(PathBuf, String)>,
+) -> Result<Vec<OutputMove>, StoreError> {
+    let store = a.store();
+    let mut outputs = Vec::with_capacity(files.len());
+    for (i, f) in files.iter().enumerate() {
+        let (copy, sha256) = store
+            .stage_copy_writable(h, &f.path, &format!("f{i}"))
+            .await?;
+        staged.push((copy.clone(), sha256.clone()));
+        if sha256 != f.sha256 {
+            return Err(StoreError::Changed {
+                path: f.rel.clone(),
+                expected: f.sha256.clone(),
+                found: sha256,
+            });
+        }
+        let to = a.dir.join(&format!("candidates/{run_id}/{}", f.inside))?;
+        outputs.push(OutputMove { from: copy, to });
+    }
+    Ok(outputs)
+}
+
+/// The open run a failed restore of `from` left (CORE-177): `restored_from` is `from`, and
+/// its `target_version` has a sealed folder that nothing records (not the approved version,
+/// no run's sign-off, no override). Its id and that version.
+fn leftover_restore(
+    m: &Manifest,
+    from: Version,
+    versions: &[VersionDir],
+) -> Option<(String, Version)> {
+    let view = m.view();
+    let recorded = |v: Version| {
+        view.approved_version == Some(v)
+            || view.candidate_runs.iter().any(|r| {
+                r.signed_off.as_ref().is_some_and(|s| {
+                    s.version == v
+                        || s.overrides_auto_pick
+                            .as_ref()
+                            .is_some_and(|o| o.version == v)
+                })
+            })
+    };
+    view.candidate_runs
+        .iter()
+        .filter(|r| matches!(r.status.as_deref(), None | Some("open")) && r.trashed_utc.is_none())
+        .filter(|r| r.restored_from == Some(from))
+        .find_map(|r| {
+            let target = r.target_version?;
+            (versions.iter().any(|v| v.version == target) && !recorded(target))
+                .then(|| (r.run_id.clone(), target))
+        })
+}
+
+/// Leaves the `restored` event for after the Record stage (`RecordSlot::after`; never when it
+/// fails), after any work already left there, and makes the result.
+fn restored(
+    ctx: &CallCtx,
+    (topic, asset_id): (String, String),
+    from: Version,
+    signed: SignoffResult,
+) -> (RestoreResult, String) {
+    let earlier = ctx.record.take_after();
+    let (events, data) = (
+        ctx.events.clone(),
+        json!({"kind": "restored", "version": signed.version, "restored_from": from.to_string()}),
+    );
+    ctx.record.after(Box::pin(async move {
+        if let Some(earlier) = earlier {
+            earlier.await;
+        }
+        events.publish(&topic, data);
+    }));
+    let summary = format!("restored {asset_id} {from} as {}", signed.version);
+    (
+        RestoreResult {
+            r#ref: signed.r#ref,
+            version: signed.version,
+            restored_from: from.to_string(),
+            handoff: signed.handoff,
+            warnings: signed.warnings,
+        },
+        summary,
+    )
+}
+
+async fn restore_version(
+    ctx: &CallCtx,
+    services: &AssetServices,
+    args: RestoreArgs,
+) -> Result<(RestoreResult, String), ErrorBody> {
+    let Ok(from) = args.version.parse::<Version>() else {
+        return Err(invalid(
+            ctx,
+            "version names a sealed version, as major.minor.patch".to_string(),
+        ));
+    };
+    let a = asset_of(ctx, args.project, &args.asset_id).await?;
+    let store = a.store().clone();
+    let error = |e: StoreError| e.to_error(&ctx.trace_id);
+    let Some(m) = read_manifest(&store, &a.manifest).await.map_err(error)? else {
+        return Err(unknown_asset(ctx, &a));
+    };
+    if !m.view().external.is_empty() {
+        return Err(link_external_refusal(ctx, &a));
+    }
+    // CORE-177: the pre-flight, the copies, the run and the seal under one hold of the version
+    // lock, to the end of the Record stage.
+    let guard = store
+        .version_lock(&a.project, &a.asset_id)
+        .lock_owned()
+        .await;
+    let Some(m) = read_manifest(&store, &a.manifest).await.map_err(error)? else {
+        return Err(unknown_asset(ctx, &a));
+    };
+    if !m.view().external.is_empty() {
+        return Err(link_external_refusal(ctx, &a));
+    }
+
+    // 1. The pre-flight: nothing is staged or written until it passes.
+    let versions = store
+        .versions(&a.project, &a.asset_id)
+        .await
+        .map_err(error)?;
+    let Some(old) = versions.iter().find(|v| v.version == from) else {
+        return Err(ErrorBody::new(
+            &ASSET_UNKNOWN,
+            format!(
+                "`{}` has no version {from}; asset.get lists its versions.",
+                a.asset_id
+            ),
+            ctx.trace_id.clone(),
+        ));
+    };
+    // The old sign-off, from the version's snapshot: none for a legacy version, and one that
+    // doesn't parse is `manifest.needs_repair`.
+    let snapshot_rel = old.dir.join(SNAPSHOT).map_err(error)?;
+    let snapshot = match store.read(&snapshot_rel).await.map_err(error)? {
+        None => None,
+        Some(bytes) => Some(
+            std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| Manifest::parse(text).ok())
+                .map(|(s, _)| s)
+                .ok_or_else(|| error(StoreError::NeedsRepair(snapshot_rel.clone())))?,
+        ),
+    };
+    let files = restore_files(ctx, &a, &m, old).await?;
+    let listed: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.inside.clone(), f.sha256.clone()))
+        .collect();
+    let now = store.now_utc();
+    let actor = actor_of(&ctx.session.caller);
+    let bump = args.bump.unwrap_or(BumpArg::Minor);
+    let names = (a.topic(), a.asset_id.clone());
+
+    // 2. A failed restore's run whose seal made its version: finished as that version (the
+    // seal adopts the folder, ruling Q31), never a new run.
+    if let Some((run_id, target)) = leftover_restore(&m, from, &versions) {
+        let chosen = restored_run(snapshot.as_ref(), from, &run_id, &listed, &actor, now).chosen;
+        let record = SignoffRecord {
+            overrides: None,
+            restored_from: Some(from),
+            at: Some(target),
+        };
+        let call = SignoffCall {
+            run_id,
+            bump: Some(bump),
+            keep_runs: Vec::new(),
+            review_view: None,
+        };
+        let (signed, _) = signoff_locked(ctx, services, a, guard, chosen, call, record).await?;
+        return Ok(restored(ctx, names, from, signed));
+    }
+
+    // The version: the bump on the approved version, or on the highest version folder when
+    // none is approved; its folder must not exist.
+    let base = m
+        .view()
+        .approved_version
+        .or_else(|| versions.iter().map(|v| v.version).max())
+        .unwrap_or(from);
+    let version = base.bump(bump.into());
+    if versions.iter().any(|v| v.version == version) {
+        return Err(ErrorBody::new(
+            &VERSION_EXISTS,
+            format!(
+                "Version {version} of `{}` has a folder already (`v{version}/`); confirm another \
+                 bump.",
+                a.asset_id
+            ),
+            ctx.trace_id.clone(),
+        ));
+    }
+    let run_id = store
+        .next_run_id(&a.dir, Some(&m), now)
+        .await
+        .map_err(error)?;
+    let restored_from = restored_run(snapshot.as_ref(), from, &run_id, &listed, &actor, now);
+    let mut run = restored_from.run.clone();
+    run.insert("target_version".into(), Value::from(version.to_string()));
+    let record = SignoffRecord {
+        overrides: None,
+        restored_from: Some(from),
+        at: Some(version),
+    };
+    // The sign-off as a dry run: status, version and empty-choice refusals, nothing written.
+    let mut planned = m.clone();
+    add_restored_run(&mut planned, &run, from)
+        .map_err(|why| ErrorBody::new(&CORE_BUG, why, ctx.trace_id.clone()))?;
+    plan_signoff_with(
+        &planned,
+        &run_id,
+        &restored_from.chosen,
+        Some(bump.into()),
+        &[],
+        &SignedOffBy::caller(&ctx.session.caller),
+        &record,
+        now,
+    )
+    .map_err(|e| traced(ctx, e))?;
+
+    // 3. The copies, then the run.
+    let handle = store.staging_handle().await.map_err(error)?;
+    let mut staged = Vec::new();
+    let outputs = match stage_restore(&a, &handle, &files, &run_id, &mut staged).await {
+        Ok(outputs) => outputs,
+        Err(e) => {
+            store.discard_staged(&handle, &staged).await;
+            let _ = store.release_handle(handle).await;
+            return Err(error(e));
+        }
+    };
+    let rel = a.manifest.clone();
+    let edit: ManifestEdit = Arc::new(move |m: &mut Manifest| {
+        add_restored_run(m, &run, from).map_err(|why| {
+            tracing::warn!(path = %rel, why = %why, "the manifest changed during a restore");
+            conflict(&rel)
+        })
+    });
+    let committed = store
+        .commit(CommitOp {
+            outputs,
+            moved: Vec::new(),
+            removed: Vec::new(),
+            manifest: Some((a.manifest.clone(), edit)),
+            job_line: None,
+            progress: None,
+        })
+        .await;
+    if committed.is_err() {
+        store.discard_staged(&handle, &staged).await;
+    }
+    let _ = store.release_handle(handle).await;
+    committed.map_err(error)?;
+
+    // 4. The sign-off.
+    let call = SignoffCall {
+        run_id,
+        bump: Some(bump),
+        keep_runs: Vec::new(),
+        // A restore writes no pick-log line.
+        review_view: None,
+    };
+    let (signed, _) =
+        signoff_locked(ctx, services, a, guard, restored_from.chosen, call, record).await?;
+    Ok(restored(ctx, names, from, signed))
 }
 
 async fn request_signoff(
@@ -1903,24 +2416,9 @@ pub(crate) fn resolve_take(
             .find(|t| t.n == n)
             .ok_or_else(|| unknown(format!("take {n}"))),
         (None, Some(file)) => {
-            let given = file.replace('\\', "/").to_lowercase();
-            let mut run_dir = run
-                .path
-                .clone()
-                .unwrap_or_else(|| format!("candidates/{}/", run.run_id))
-                .to_lowercase();
-            if !run_dir.ends_with('/') {
-                run_dir.push('/');
-            }
-            let bare = !given.contains('/');
             let mut found = BTreeSet::new();
             for (f, n) in run.files.iter().zip(file_takes(run)) {
-                let path = f.path.to_lowercase();
-                let hit = if bare {
-                    path.rsplit('/').next() == Some(given.as_str())
-                } else {
-                    path == given || path.strip_prefix(&run_dir) == Some(given.as_str())
-                };
+                let hit = file_named(run, f, file);
                 if let (true, Some(n)) = (hit, n) {
                     found.insert(n);
                 }
@@ -2935,6 +3433,17 @@ pub fn register_asset_tools(reg: &mut Registry, services: &AssetServices) {
         move |ctx, args: SignoffArgs| {
             let services = signing.clone();
             Box::pin(async move { signoff(ctx, &services, args).await })
+        },
+    ));
+    let restoring = services.clone();
+    reg.register(typed_tool(
+        "asset.restore_version",
+        RESTORE_DESCRIPTION,
+        EffectClass::Write,
+        WORKSPACE_MODULE,
+        move |ctx, args: RestoreArgs| {
+            let services = restoring.clone();
+            Box::pin(async move { restore_version(ctx, &services, args).await })
         },
     ));
     reg.register(typed_tool(

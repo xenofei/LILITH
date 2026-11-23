@@ -441,7 +441,8 @@ impl Store {
     /// - `candidates/<run>/` folders that their asset's manifest has no run for (an asset with
     ///   no manifest records none; one whose manifest doesn't parse is skipped);
     /// - `v<semver>/` folders that hold a `manifest.snapshot.json` but whose version is
-    ///   neither the manifest's `approved_version` nor a run's `signed_off.version`;
+    ///   neither the manifest's `approved_version` nor a run's `signed_off.version` or an
+    ///   override's `overrides_auto_pick.version`;
     /// - non-empty staging handles and `seal-*` folders that aren't this store's own (a dead
     ///   core's, at a read-write open);
     /// - conflict copies, `*.lil-conflict-*` and legacy ones.
@@ -556,12 +557,14 @@ impl Store {
             }
         }
 
+        // A version an override replaced in its run's record stays recorded through the
+        // override's `overrides_auto_pick` (P4b-R38).
         let mut recorded: Vec<Version> = view.approved_version.into_iter().collect();
-        recorded.extend(
-            view.candidate_runs
-                .iter()
-                .filter_map(|r| r.signed_off.as_ref().map(|s| s.version)),
-        );
+        recorded.extend(view.candidate_runs.iter().flat_map(|r| {
+            r.signed_off.as_ref().into_iter().flat_map(|s| {
+                std::iter::once(s.version).chain(s.overrides_auto_pick.as_ref().map(|o| o.version))
+            })
+        }));
         let folders = {
             let dir = asset_dir.to_path_buf();
             blocking(move || list(&dir)).await.map_err(io)?
