@@ -4443,6 +4443,20 @@ async fn auto_signed_kite(fx: &Fx) -> String {
     edit_manifest(&fx.ws, KITE, auto);
     // An automatic sign-off writes the same record into its version's snapshot.
     edit_snapshot(fx, "1.0.0", auto);
+    // The watcher records that edit in `human_edits` a moment later: wait for it, so no test
+    // sees the manifest change under it.
+    let snapshot = "v1.0.0/manifest.snapshot.json";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !fx.manifest(KITE)["human_edits"]
+        .as_array()
+        .is_some_and(|edits| edits.iter().any(|e| e["path"] == snapshot))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never recorded the snapshot edit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     run
 }
 
